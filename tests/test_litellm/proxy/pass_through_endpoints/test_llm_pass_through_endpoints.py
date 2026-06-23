@@ -21515,6 +21515,54 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_openrouter_raw_provide
     )
 
 
+def test_auto_agent_alias_route_event_suppresses_healthy_selection(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    emitted = []
+    monkeypatch.setattr(
+        endpoints.verbose_proxy_logger,
+        "info",
+        lambda message: emitted.append(message),
+    )
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_selected",
+            "candidate_status": "selected",
+            "selection_reason": "session_affinity",
+            "provider": "antigravity",
+            "model": "gemini-3.5-flash-low",
+        }
+    )
+
+    assert emitted == []
+
+
+def test_auto_agent_alias_route_event_keeps_failure_warning(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    emitted = []
+    monkeypatch.setattr(
+        endpoints.verbose_proxy_logger,
+        "warning",
+        lambda message: emitted.append(message),
+    )
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "rate_limited",
+            "provider": "antigravity",
+            "model": "gemini-3.5-flash-low",
+        },
+        level="warning",
+    )
+
+    assert len(emitted) == 1
+    assert "AAWM_ALIAS_ROUTE:" in emitted[0]
+
+
 @pytest.mark.asyncio
 async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
     request = _build_codex_auto_agent_request()

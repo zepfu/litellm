@@ -1,4 +1,8 @@
 import logging
+import os
+import threading
+import time
+from collections import deque
 from datetime import datetime
 from typing import Any, Callable, Optional, Union
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -16,6 +20,10 @@ _AAWM_ROUTE_ACCESS_LOGGER_NAME = verbose_aawm_route_logger.name
 _AAWM_ROUTE_ACCESS_LOG_TYPE = "ROUTE"
 _AAWM_ROUTE_LOG_MAX_FIELD_CHARS = 180
 _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS = 96
+_AAWM_ROUTE_LOG_DEDUP_LIMIT = 4096
+_aawm_route_log_dedup_lock = threading.Lock()
+_aawm_route_log_dedup_seen: dict[tuple[str, ...], float] = {}
+_aawm_route_log_dedup_order: deque[tuple[str, ...]] = deque()
 _AAWM_ROUTE_LOG_SAFE_QUERY_KEYS = frozenset(
     {
         "alt",
@@ -153,6 +161,48 @@ _AAWM_ROUTE_LOG_TENANT_REPOSITORY_FRAGMENTS = (
     "harness",
     "validation",
 )
+
+
+def _get_aawm_route_log_dedup_window_seconds() -> float:
+    raw_value = os.getenv("AAWM_ROUTE_LOG_DEDUP_WINDOW_SECONDS", "5")
+    try:
+        return max(0.0, float(raw_value))
+    except Exception:
+        return 5.0
+
+
+def clear_aawm_route_log_dedup_state() -> None:
+    with _aawm_route_log_dedup_lock:
+        _aawm_route_log_dedup_seen.clear()
+        _aawm_route_log_dedup_order.clear()
+
+
+def _should_emit_aawm_route_access_log_key(key: tuple[str, ...]) -> bool:
+    window_seconds = _get_aawm_route_log_dedup_window_seconds()
+    if window_seconds <= 0:
+        return True
+
+    now = time.monotonic()
+    with _aawm_route_log_dedup_lock:
+        expiry = _aawm_route_log_dedup_seen.get(key)
+        if expiry is not None and expiry > now:
+            return False
+
+        _aawm_route_log_dedup_seen[key] = now + window_seconds
+        _aawm_route_log_dedup_order.append(key)
+        while _aawm_route_log_dedup_order:
+            oldest_key = _aawm_route_log_dedup_order[0]
+            oldest_expiry = _aawm_route_log_dedup_seen.get(oldest_key)
+            if (
+                oldest_expiry is not None
+                and oldest_expiry > now
+                and len(_aawm_route_log_dedup_order) <= _AAWM_ROUTE_LOG_DEDUP_LIMIT
+            ):
+                break
+            _aawm_route_log_dedup_order.popleft()
+            if oldest_expiry is None or oldest_expiry <= now:
+                _aawm_route_log_dedup_seen.pop(oldest_key, None)
+        return True
 
 
 def _normalize_aawm_route_log_type(
@@ -570,7 +620,7 @@ def _get_aawm_route_log_trace_user_repository(
     )
 
 
-def build_aawm_route_access_log_line(
+def _build_aawm_route_access_log_line_and_key(
     *,
     request: Request,
     target: Union[str, httpx.URL],
@@ -578,7 +628,7 @@ def build_aawm_route_access_log_line(
     kwargs: Optional[dict] = None,
     route_type: Optional[str] = None,
     now: Optional[datetime] = None,
-) -> str:
+) -> tuple[str, tuple[str, ...]]:
     metadata = _extract_aawm_route_log_metadata(request_body, kwargs)
     headers = dict(getattr(request, "headers", {}) or {})
     client_product_label = _get_aawm_route_log_client_product_label(
@@ -642,7 +692,34 @@ def build_aawm_route_access_log_line(
     if client_label:
         segments.append(client_label)
     segments.append(f"{incoming_endpoint} -> {outgoing_target}")
-    return " ".join(segments)
+    return " ".join(segments), (
+        log_type,
+        client_product_label or "",
+        context_label or "",
+        method,
+        incoming_endpoint,
+        outgoing_target,
+    )
+
+
+def build_aawm_route_access_log_line(
+    *,
+    request: Request,
+    target: Union[str, httpx.URL],
+    request_body: Optional[dict[str, Any]] = None,
+    kwargs: Optional[dict] = None,
+    route_type: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    line, _dedup_key = _build_aawm_route_access_log_line_and_key(
+        request=request,
+        target=target,
+        request_body=request_body,
+        kwargs=kwargs,
+        route_type=route_type,
+        now=now,
+    )
+    return line
 
 
 def emit_aawm_route_access_log(
@@ -660,7 +737,7 @@ def emit_aawm_route_access_log(
             return
         scope[_AAWM_ROUTE_ACCESS_LOG_SCOPE_KEY] = True
 
-    line = build_aawm_route_access_log_line(
+    line, dedup_key = _build_aawm_route_access_log_line_and_key(
         request=request,
         target=target,
         request_body=request_body,
@@ -668,4 +745,6 @@ def emit_aawm_route_access_log(
         route_type=route_type,
     )
     _register_aawm_route_access_log_replacement(request)
+    if not _should_emit_aawm_route_access_log_key(dedup_key):
+        return
     logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info("%s", line)
