@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import importlib
 import json
 import re
+from copy import deepcopy
 from datetime import datetime, timezone
 from time import monotonic
 from pathlib import Path
@@ -51,6 +53,9 @@ _CLAUDE_TOOL_DESCRIPTION_MAX_CHARS = 360
 _CLAUDE_TOOL_SCHEMA_DESCRIPTION_MAX_CHARS = 160
 _CLAUDE_TOOL_SCHEMA_DROP_KEYS = {"$schema"}
 _CLAUDE_TOOL_DESCRIPTION_PRESERVE_NAMES = {"Agent"}
+_CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_NAME = "claude-tool-advertisement-compaction"
+_CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_VERSION = "2026-06-23.1"
+_CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_CACHE_MAX_ENTRIES = 256
 _CLAUDE_KNOWN_TOOL_DESCRIPTIONS = {
     "Bash": (
         "Run a shell command. Prefer dedicated tools for search/read/edit/write. "
@@ -227,6 +232,9 @@ _aawm_context_grab_cache: dict[
 _aawm_context_grab_cache_lock = asyncio.Lock()
 _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
+_claude_tool_advertisement_compaction_cache: dict[
+    str, tuple[dict[str, Any], dict[str, Any]]
+] = {}
 
 
 def _get_aawm_dynamic_injection_cache_ttl_seconds() -> float:
@@ -715,6 +723,62 @@ def _get_claude_tool_name(tool: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _clone_claude_tool_advertisement_value(value: Any) -> Any:
+    return deepcopy(value)
+
+
+def _get_claude_tool_advertisement_compaction_policy() -> tuple[str, str]:
+    return (
+        _CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_NAME,
+        _CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_VERSION,
+    )
+
+
+def _build_claude_tool_advertisement_compaction_fingerprint(
+    *,
+    tool: dict[str, Any],
+    tool_name: str,
+    cc_version: str,
+) -> str:
+    policy_name, policy_version = _get_claude_tool_advertisement_compaction_policy()
+    fingerprint_payload = {
+        "cc_version": cc_version,
+        "tool_name": tool_name,
+        "tool": tool,
+        "compaction_policy_name": policy_name,
+        "compaction_policy_version": policy_version,
+        "schema_description_max_chars": _CLAUDE_TOOL_SCHEMA_DESCRIPTION_MAX_CHARS,
+        "tool_description_max_chars": _CLAUDE_TOOL_DESCRIPTION_MAX_CHARS,
+        "schema_drop_keys": sorted(_CLAUDE_TOOL_SCHEMA_DROP_KEYS),
+        "preserve_tool_names": sorted(_CLAUDE_TOOL_DESCRIPTION_PRESERVE_NAMES),
+    }
+    canonical_payload = json.dumps(
+        fingerprint_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+
+def _remember_claude_tool_advertisement_compaction(
+    compaction_fingerprint: str,
+    updated_tool: dict[str, Any],
+    compaction_event: dict[str, Any],
+) -> None:
+    _claude_tool_advertisement_compaction_cache.pop(compaction_fingerprint, None)
+    _claude_tool_advertisement_compaction_cache[compaction_fingerprint] = (
+        _clone_claude_tool_advertisement_value(updated_tool),
+        _clone_claude_tool_advertisement_value(compaction_event),
+    )
+    while (
+        len(_claude_tool_advertisement_compaction_cache)
+        > _CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_CACHE_MAX_ENTRIES
+    ):
+        oldest_key = next(iter(_claude_tool_advertisement_compaction_cache))
+        _claude_tool_advertisement_compaction_cache.pop(oldest_key, None)
+
+
 def _compact_claude_tool_schema_value(
     value: Any,
 ) -> tuple[Any, int, int]:
@@ -788,6 +852,34 @@ def _compact_claude_tool_advertisement(
         return tool, None
 
     tool_name = _get_claude_tool_name(tool) or "unknown"
+    description = tool.get("description")
+    input_schema = tool.get("input_schema")
+    compaction_fingerprint = _build_claude_tool_advertisement_compaction_fingerprint(
+        tool=tool,
+        tool_name=tool_name,
+        cc_version=cc_version,
+    )
+    cached_entry = _claude_tool_advertisement_compaction_cache.get(
+        compaction_fingerprint
+    )
+    if cached_entry is not None:
+        cached_tool, cached_event = cached_entry
+        _claude_tool_advertisement_compaction_cache.pop(
+            compaction_fingerprint, None
+        )
+        _claude_tool_advertisement_compaction_cache[compaction_fingerprint] = (
+            cached_tool,
+            cached_event,
+        )
+        event = _clone_claude_tool_advertisement_value(cached_event)
+        event["cc_version"] = cc_version
+        event["compaction_cache_status"] = "hit"
+        event["compaction_schema_fingerprint"] = compaction_fingerprint
+        return (
+            _clone_claude_tool_advertisement_value(cached_tool),
+            event,
+        )
+
     original_chars = _json_compact_char_count(tool)
     updated_tool = dict(tool)
     changed = False
@@ -795,7 +887,6 @@ def _compact_claude_tool_advertisement(
     schema_description_count = 0
     schema_dropped_key_count = 0
 
-    description = tool.get("description")
     if (
         isinstance(description, str)
         and tool_name not in _CLAUDE_TOOL_DESCRIPTION_PRESERVE_NAMES
@@ -814,7 +905,6 @@ def _compact_claude_tool_advertisement(
             changed = True
             top_level_description_compacted = True
 
-    input_schema = tool.get("input_schema")
     if isinstance(input_schema, dict):
         compacted_schema, schema_description_count, schema_dropped_key_count = (
             _compact_claude_tool_schema_value(input_schema)
@@ -827,7 +917,7 @@ def _compact_claude_tool_advertisement(
         return tool, None
 
     compacted_chars = _json_compact_char_count(updated_tool)
-    return updated_tool, {
+    compaction_event = {
         "id": "tool-advertisement",
         "status": "resolved",
         "cc_version": cc_version,
@@ -838,7 +928,17 @@ def _compact_claude_tool_advertisement(
         "top_level_description_compacted": top_level_description_compacted,
         "schema_description_compaction_count": schema_description_count,
         "schema_dropped_key_count": schema_dropped_key_count,
+        "compaction_policy_name": _CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_NAME,
+        "compaction_policy_version": _CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_VERSION,
+        "compaction_cache_status": "miss",
+        "compaction_schema_fingerprint": compaction_fingerprint,
     }
+    _remember_claude_tool_advertisement_compaction(
+        compaction_fingerprint,
+        updated_tool,
+        compaction_event,
+    )
+    return updated_tool, compaction_event
 
 
 def _compact_claude_tool_advertisements_in_request_body(
@@ -911,17 +1011,36 @@ def _add_claude_tool_advertisement_compaction_logging_metadata(
         for event in compaction_events
         if isinstance(event.get("saved_chars"), int)
     )
+    compaction_policy_name, compaction_policy_version = (
+        _get_claude_tool_advertisement_compaction_policy()
+    )
+    compaction_cache_hits = sum(
+        1
+        for event in compaction_events
+        if event.get("compaction_cache_status") == "hit"
+    )
+    compaction_cache_misses = sum(
+        1
+        for event in compaction_events
+        if event.get("compaction_cache_status") == "miss"
+    )
 
     span_metadata: dict[str, Any] = {
         "tool_count": len(compaction_events),
         "original_chars": original_chars,
         "compacted_chars": compacted_chars,
         "saved_chars": saved_chars,
+        "compaction_policy_name": compaction_policy_name,
+        "compaction_policy_version": compaction_policy_version,
     }
     if tool_names:
         span_metadata["tool_names"] = tool_names
     if cc_versions:
         span_metadata["cc_versions"] = cc_versions
+    if compaction_cache_hits:
+        span_metadata["compaction_cache_hits"] = compaction_cache_hits
+    if compaction_cache_misses:
+        span_metadata["compaction_cache_misses"] = compaction_cache_misses
 
     return lp._merge_litellm_metadata(
         request_body,
@@ -934,6 +1053,12 @@ def _add_claude_tool_advertisement_compaction_logging_metadata(
             "claude_tool_advertisement_compaction_original_chars": original_chars,
             "claude_tool_advertisement_compaction_compacted_chars": compacted_chars,
             "claude_tool_advertisement_compaction_saved_chars": saved_chars,
+            "claude_tool_advertisement_compaction_policy_name": compaction_policy_name,
+            "claude_tool_advertisement_compaction_policy_version": (
+                compaction_policy_version
+            ),
+            "claude_tool_advertisement_compaction_cache_hits": compaction_cache_hits,
+            "claude_tool_advertisement_compaction_cache_misses": compaction_cache_misses,
             "claude_tool_advertisement_compaction_events": compaction_events,
             "langfuse_spans": [
                 lp._build_langfuse_span_descriptor(
