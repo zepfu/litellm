@@ -14361,7 +14361,9 @@ async def test_persist_session_history_records_writes_rate_limit_observation_and
         evidence={"signals": ["provider_rate_limits"]},
     )
     mock_conn = AsyncMock()
-    mock_conn.fetchrow.return_value = previous
+    mock_conn.fetch.return_value = [
+        dict(previous, input_limit_key="codex_bengalfox:primary")
+    ]
     fake_pool = _FakePool(mock_conn)
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
@@ -14376,14 +14378,15 @@ async def test_persist_session_history_records_writes_rate_limit_observation_and
         [{"_skip_session_history": True, "rate_limit_observations": [current]}]
     )
 
-    mock_conn.fetchrow.assert_awaited_once()
-    fetch_args = mock_conn.fetchrow.await_args.args
+    mock_conn.fetch.assert_awaited_once()
+    fetch_args = mock_conn.fetch.await_args.args
+    assert "WITH candidate AS" in fetch_args[0]
     assert fetch_args[1:6] == (
-        "codex_bengalfox:primary",
-        "openai",
-        "codex",
-        "acct",
-        "codex_token_count",
+        ["codex_bengalfox:primary"],
+        ["openai"],
+        ["codex"],
+        ["acct"],
+        ["codex_token_count"],
     )
     assert mock_conn.executemany.await_count == 2
     observation_args = mock_conn.executemany.await_args_list[0].args
@@ -14422,7 +14425,9 @@ async def test_persist_session_history_records_skips_repeated_rate_limit_snapsho
         litellm_call_id="call-rate-duplicate",
     )
     mock_conn = AsyncMock()
-    mock_conn.fetchrow.return_value = previous
+    mock_conn.fetch.return_value = [
+        dict(previous, input_limit_key="anthropic:claude:acct:claude:seven_day:10080")
+    ]
     fake_pool = _FakePool(mock_conn)
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
@@ -14437,8 +14442,83 @@ async def test_persist_session_history_records_skips_repeated_rate_limit_snapsho
         [{"_skip_session_history": True, "rate_limit_observations": [current]}]
     )
 
-    mock_conn.fetchrow.assert_awaited_once()
+    mock_conn.fetch.assert_awaited_once()
     mock_conn.executemany.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_filter_meaningful_rate_limit_observations_batches_previous_lookup() -> None:
+    first_at = datetime(2026, 5, 5, 12, 1, tzinfo=timezone.utc)
+    second_at = datetime(2026, 5, 5, 12, 2, tzinfo=timezone.utc)
+    previous_first = {
+        "input_limit_key": "codex_bengalfox:primary",
+        "observed_at": datetime(2026, 5, 5, 11, 59, tzinfo=timezone.utc),
+        "provider": "openai",
+        "client_family": "codex",
+        "account_hash": "acct",
+        "source": "codex_token_count",
+        "limit_key": "codex_bengalfox:primary",
+        "provider_resets_at": datetime(2026, 5, 5, 17, 0, tzinfo=timezone.utc),
+        "used_percentage": 90.0,
+        "status": "observed",
+        "exhausted": False,
+        "reset_hint_seconds": None,
+    }
+    previous_second = {
+        "input_limit_key": "anthropic:seven_day",
+        "observed_at": datetime(2026, 5, 5, 11, 58, tzinfo=timezone.utc),
+        "provider": "anthropic",
+        "client_family": "claude",
+        "account_hash": "acct",
+        "source": "anthropic_response_headers",
+        "limit_key": "anthropic:seven_day",
+        "provider_resets_at": datetime(2026, 5, 7, 17, 0, tzinfo=timezone.utc),
+        "used_percentage": 40.0,
+        "status": "observed",
+        "exhausted": False,
+        "reset_hint_seconds": None,
+    }
+    observations = [
+        dict(
+            previous_first,
+            input_limit_key=None,
+            observed_at=first_at,
+            limit_id="codex_bengalfox",
+            limit_scope="primary",
+            used_percentage=91.0,
+        ),
+        dict(
+            previous_second,
+            input_limit_key=None,
+            observed_at=second_at,
+            limit_id="anthropic",
+            limit_scope="seven_day",
+            used_percentage=41.0,
+        ),
+    ]
+    mock_conn = AsyncMock()
+    mock_conn.fetch.return_value = [previous_first, previous_second]
+
+    kept, previous_by_limit_key = (
+        await aawm_agent_identity._filter_meaningful_rate_limit_observations(
+            mock_conn,
+            observations,
+        )
+    )
+
+    mock_conn.fetch.assert_awaited_once()
+    fetch_args = mock_conn.fetch.await_args.args
+    assert fetch_args[1:6] == (
+        ["anthropic:seven_day", "codex_bengalfox:primary"],
+        ["anthropic", "openai"],
+        ["claude", "codex"],
+        ["acct", "acct"],
+        ["anthropic_response_headers", "codex_token_count"],
+    )
+    assert fetch_args[6] == [second_at, first_at]
+    assert kept == observations
+    assert previous_by_limit_key["codex_bengalfox:primary"]["used_percentage"] == 90.0
+    assert previous_by_limit_key["anthropic:seven_day"]["used_percentage"] == 40.0
 
 
 @pytest.mark.asyncio
