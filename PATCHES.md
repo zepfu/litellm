@@ -3021,6 +3021,42 @@ the infrastructure pin, rebuilding/restarting `aawm-litellm`, and validating
 
 ---
 
+### aawm.91 — Codex passthrough content-type and auto-review hosted-tool policy
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.91`. Codex
+OpenAI passthrough requests now preserve JSON `Content-Type` handling when
+the incoming request does not include an explicit media type, avoiding
+provider-side `Unsupported content type` failures for Codex backend traffic.
+The model registry also defines `codex-auto-review` /
+`chatgpt/codex-auto-review` capability metadata so unsupported hosted tools
+such as `custom` and `image_generation` are stripped before forwarding that
+model to the ChatGPT Codex backend.
+
+**Why:** Dev `litellm-dev` traffic exposed two related Codex regressions after
+the `aawm.90` promotion line: passthrough requests could reach
+`chatgpt.com/backend-api/codex/responses` without the expected JSON content
+type, and `codex-auto-review` could forward hosted tool definitions that the
+ChatGPT-account Codex backend rejects. Both failures happened before useful
+agent work could proceed.
+
+**Why not upstream:** This is tied to AAWM's ChatGPT-account Codex passthrough
+and model-capability policy for local auto-agent traffic. The general hosted
+tool stripping mechanism remains local to this fork's passthrough routing and
+model-config release process.
+
+**Validation status:** Focused pytest coverage passed for passthrough JSON
+content-type fallback and `codex-auto-review` hosted-tool filtering.
+`litellm-dev` was rebuilt/recreated on `:4001`, readiness returned healthy,
+runtime inspection showed `codex-auto-review` and
+`chatgpt/codex-auto-review` strip `custom` and `image_generation`, and
+post-restart dev logs showed Codex auto-review traffic without fresh
+`Unsupported content type` tracebacks. Production promotion requires merging
+`develop` to `main`, publishing `v1.82.3-aawm.91`, updating the infrastructure
+pin, rebuilding/restarting `aawm-litellm`, and validating `:4000` health,
+runtime tool policy, and startup logs per `PROD_RELEASE.md`.
+
+---
+
 ### aawm.86 — OpenRouter message-shape failover and Antigravity sidecar auth paths
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.86`. Codex
