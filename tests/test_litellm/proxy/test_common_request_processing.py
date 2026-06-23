@@ -671,11 +671,80 @@ class TestProxyBaseLLMRequestProcessing:
         rendered = "\n".join(flushed)
         assert len(flushed) == 2
         assert (
-            "litellm@Codex[0.141.0] /openai_passthrough/responses -> "
+            "litellm@Codex[0.141.0] /openai_passthrough/responses"
+        ) in rendered
+        assert (
+            " - gpt-5.5 - Turns: 1 -> "
             "chatgpt.com/backend-api/codex/responses"
         ) in rendered
-        assert " - gpt-5.5 - Turns: 1" in rendered
         assert " [ROUTE] " not in rendered
+
+    def test_aawm_route_rollup_groups_by_model_alias_without_agent_breakouts(
+        self,
+        caplog,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        base_metadata = {
+            "repository": "aegis",
+            "client_name": "claude-code",
+            "client_version": "2.1.178",
+        }
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/anthropic/v1/messages?beta=true",
+            headers={"user-agent": "claude-code/2.1.178"},
+        )
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=route_logger.name):
+                first_kwargs = {"litellm_params": {"metadata": {}}}
+                emit_aawm_route_access_log(
+                    request=request,
+                    target="https://api.anthropic.com/v1/messages",
+                    request_body={
+                        "model": "claude-opus-4-8",
+                        "metadata": base_metadata,
+                    },
+                    kwargs=first_kwargs,
+                )
+                record_aawm_route_rollup_turn(first_kwargs)
+
+                second_kwargs = {"litellm_params": {"metadata": {}}}
+                emit_aawm_route_access_log(
+                    request=_build_aawm_route_log_request(
+                        url="http://127.0.0.1:4001/anthropic/v1/messages?beta=true",
+                        headers={"user-agent": "claude-code/2.1.178"},
+                    ),
+                    target="https://api.anthropic.com/v1/messages",
+                    request_body={
+                        "model": "claude-opus-4-8",
+                        "metadata": {
+                            **base_metadata,
+                            "agent_name": "orchestrator",
+                        },
+                    },
+                    kwargs=second_kwargs,
+                )
+                record_aawm_route_rollup_turn(second_kwargs)
+                flushed = flush_aawm_route_rollups(force=True)
+        finally:
+            route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_rollups()
+
+        rendered = "\n".join(flushed)
+        assert len(flushed) == 2
+        assert (
+            "aegis@Claude[2.1.178] /anthropic/v1/messages?beta=true"
+        ) in rendered
+        assert (
+            " - claude-opus-4-8 - Turns: 2 -> "
+            "api.anthropic.com/v1/messages"
+        ) in rendered
+        assert "orchestrator.claude-opus-4-8" not in rendered
 
     def test_aawm_route_rollup_disabled_restores_immediate_route_log(
         self,
@@ -2307,9 +2376,52 @@ class TestAawmRouteRollup:
         assert len(flushed) == 2
         assert (
             flushed[0]
-            == "20260623 01:06:52 litellm@Codex[0.141.0] /openai_passthrough/responses -> chatgpt.com/backend-api/codex/responses"
+            == "20260623 01:06:52 litellm@Codex[0.141.0] /openai_passthrough/responses"
         )
-        assert flushed[1] == " - gemini-3.5-flash-low(aawm-low) - Turns: 3"
+        assert (
+            flushed[1]
+            == " - gemini-3.5-flash-low(aawm-low) - Turns: 3 -> chatgpt.com/backend-api/codex/responses"
+        )
+
+    def test_route_rollup_groups_destinations_under_local_endpoint(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 6, 23, 2, 51, 23)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        header = "aawm@Codex[0.141.0]"
+        endpoint = "/openai_passthrough/responses"
+
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target="daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
+            model_label="gemini-3.5-flash-low(aawm-low)",
+            turns=7,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target="chatgpt.com/backend-api/codex/responses",
+            model_label="gpt-5.5",
+            turns=4,
+            now=now,
+        )
+
+        flushed = accumulator.flush(force=True, now=now)
+        assert flushed == [
+            "20260623 02:51:23 aawm@Codex[0.141.0] /openai_passthrough/responses",
+            (
+                " - gemini-3.5-flash-low(aawm-low) - Turns: 7 -> "
+                "daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+            ),
+            (
+                " - gpt-5.5 - Turns: 4 -> "
+                "chatgpt.com/backend-api/codex/responses"
+            ),
+        ]
 
     def test_route_rollup_status_latest_material_state_wins(self):
         from datetime import datetime
@@ -2342,7 +2454,10 @@ class TestAawmRouteRollup:
             now=now,
         )
         flushed = accumulator.flush(force=True, now=now)
-        assert " - gpt-5.5(aawm-low) - Turns: 3 [Exhausted]" in flushed
+        assert (
+            " - gpt-5.5(aawm-low) - Turns: 3 [Exhausted] -> "
+            "chatgpt.com/backend-api/codex/responses"
+        ) in flushed
 
     def test_route_rollup_interval_zero_disables_accumulation(self, monkeypatch):
         from litellm.proxy.aawm_route_logging import (

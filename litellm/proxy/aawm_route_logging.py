@@ -268,8 +268,7 @@ def _format_aawm_route_rollup_lines(
     *,
     group_header_label: str,
     incoming_endpoint: str,
-    outgoing_target: str,
-    sublines: list[tuple[str, int, Optional[str]]],
+    sublines: list[tuple[str, int, Optional[str], str]],
     now: Optional[datetime] = None,
     early: bool = False,
 ) -> list[str]:
@@ -280,14 +279,15 @@ def _format_aawm_route_rollup_lines(
     header_segments.extend(
         [
             group_header_label,
-            f"{incoming_endpoint} -> {outgoing_target}",
+            incoming_endpoint,
         ]
     )
     lines = [" ".join(header_segments)]
-    for model_label, turns, status in sublines:
+    for model_label, turns, status, outgoing_target in sublines:
         lines.append(
             f" - {model_label} - Turns: {turns}"
             f"{_format_aawm_route_rollup_status_tag(status)}"
+            f" -> {outgoing_target}"
         )
     return lines
 
@@ -303,20 +303,22 @@ class _AawmRouteRollupSubline:
 class _AawmRouteRollupGroup:
     group_header_label: str
     incoming_endpoint: str
-    outgoing_target: str
-    sublines: dict[str, _AawmRouteRollupSubline] = field(default_factory=dict)
-    subline_order: list[str] = field(default_factory=list)
+    sublines: dict[tuple[str, str], _AawmRouteRollupSubline] = field(
+        default_factory=dict
+    )
+    subline_order: list[tuple[str, str]] = field(default_factory=list)
     event_sequence: int = 0
 
-    def ordered_sublines(self) -> list[tuple[str, int, Optional[str]]]:
+    def ordered_sublines(self) -> list[tuple[str, int, Optional[str], str]]:
         return [
             (
-                model_label,
-                self.sublines[model_label].turns,
-                self.sublines[model_label].status,
+                subline_key[0],
+                self.sublines[subline_key].turns,
+                self.sublines[subline_key].status,
+                subline_key[1],
             )
-            for model_label in self.subline_order
-            if model_label in self.sublines
+            for subline_key in self.subline_order
+            if subline_key in self.sublines
         ]
 
 
@@ -335,7 +337,7 @@ class AawmRouteRollupAccumulator:
         )
         self._max_groups = max(1, max_groups)
         self._max_sublines = max(1, max_sublines)
-        self._groups: dict[tuple[str, str, str], _AawmRouteRollupGroup] = {}
+        self._groups: dict[tuple[str, str], _AawmRouteRollupGroup] = {}
         self._last_flush_monotonic = time.monotonic()
 
     def interval_seconds(self) -> int:
@@ -379,7 +381,6 @@ class AawmRouteRollupAccumulator:
         group_key = (
             cleaned_group_header,
             cleaned_incoming_endpoint,
-            cleaned_outgoing_target,
         )
         group = self._groups.get(group_key)
         if group is None and len(self._groups) >= self._max_groups:
@@ -389,11 +390,11 @@ class AawmRouteRollupAccumulator:
             group = _AawmRouteRollupGroup(
                 group_header_label=cleaned_group_header,
                 incoming_endpoint=cleaned_incoming_endpoint,
-                outgoing_target=cleaned_outgoing_target,
             )
             self._groups[group_key] = group
 
-        subline = group.sublines.get(cleaned_model_label)
+        subline_key = (cleaned_model_label, cleaned_outgoing_target)
+        subline = group.sublines.get(subline_key)
         if subline is None:
             if len(group.subline_order) >= self._max_sublines:
                 emitted_lines.extend(
@@ -402,15 +403,14 @@ class AawmRouteRollupAccumulator:
                 group = _AawmRouteRollupGroup(
                     group_header_label=cleaned_group_header,
                     incoming_endpoint=cleaned_incoming_endpoint,
-                    outgoing_target=cleaned_outgoing_target,
                 )
                 self._groups[group_key] = group
                 subline = None
 
         if subline is None:
             subline = _AawmRouteRollupSubline()
-            group.sublines[cleaned_model_label] = subline
-            group.subline_order.append(cleaned_model_label)
+            group.sublines[subline_key] = subline
+            group.subline_order.append(subline_key)
 
         if turns > 0:
             subline.turns += turns
@@ -471,7 +471,6 @@ class AawmRouteRollupAccumulator:
         lines = _format_aawm_route_rollup_lines(
             group_header_label=group.group_header_label,
             incoming_endpoint=group.incoming_endpoint,
-            outgoing_target=group.outgoing_target,
             sublines=group.ordered_sublines(),
             now=now,
             early=early,
@@ -480,7 +479,6 @@ class AawmRouteRollupAccumulator:
             group_key = (
                 group.group_header_label,
                 group.incoming_endpoint,
-                group.outgoing_target,
             )
             self._groups.pop(group_key, None)
         return lines
@@ -633,14 +631,10 @@ def _set_aawm_route_rollup_metadata(
 
 def _get_aawm_route_rollup_model_label(
     *,
-    agent_name: Optional[str],
-    repository: Optional[str],
     model_label: Optional[str],
 ) -> Optional[str]:
     if not model_label:
         return None
-    if agent_name and agent_name != repository:
-        return f"{agent_name}.{model_label}"
     return model_label
 
 
@@ -675,18 +669,7 @@ def build_aawm_route_rollup_context(
         repository=repository,
         client_product_label=client_product_label,
     )
-    agent_name = _first_aawm_route_log_value(
-        metadata,
-        keys=_AAWM_ROUTE_LOG_AGENT_METADATA_KEYS,
-        normalizer=_normalize_aawm_route_log_agent_label,
-    ) or _get_case_insensitive_header_value(
-        headers,
-        _AAWM_ROUTE_LOG_AGENT_HEADER_KEYS,
-        normalizer=_normalize_aawm_route_log_agent_label,
-    )
     model_label = _get_aawm_route_rollup_model_label(
-        agent_name=agent_name,
-        repository=repository,
         model_label=_get_aawm_route_log_model_label(request_body, metadata),
     )
     incoming_endpoint = _safe_aawm_route_endpoint_label(request)

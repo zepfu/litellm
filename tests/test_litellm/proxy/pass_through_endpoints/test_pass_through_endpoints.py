@@ -789,10 +789,12 @@ async def test_pass_through_async_success_handler_records_completed_route_rollup
 
     assert len(flushed) == 2
     assert (
-        "litellm@Codex[0.119.0-alpha.29] /openai_passthrough/responses -> "
+        "litellm@Codex[0.119.0-alpha.29] /openai_passthrough/responses"
+    ) in rendered
+    assert (
+        " - gpt-5.3-codex-spark(aawm-code) - Turns: 1 -> "
         "api.openai.com/v1/responses"
     ) in rendered
-    assert " - gpt-5.3-codex-spark(aawm-code) - Turns: 1" in rendered
     assert kwargs["litellm_params"]["metadata"]["aawm_route_rollup_turn_recorded"] is True
     clear_aawm_route_rollups()
 
