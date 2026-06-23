@@ -356,6 +356,7 @@ _AAWM_READ_AGENT_GUIDANCE_PROMPT = """AAWM read-only agent contract:
 - If the delegated prompt requires the exact final phrase `No files were modified.`, include that phrase truthfully in the final answer.
 - Return findings, evidence, coverage gaps, and recommended next steps. Do not return implementation summaries for read-only work."""
 _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS = 6 * 60 * 60
+_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS = 30.0
 _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = 3 * 60 * 60.0
 _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = (
     _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
@@ -433,12 +434,6 @@ _CODEX_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
 )
 _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
-        "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
-        "model": "claude-sonnet-4-6",
-        "route_family": "codex_antigravity_code_assist_adapter",
-        "last_resort": False,
-    },
-    {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
         "model": "gpt-5.3-codex-spark",
         "route_family": "codex_responses",
@@ -465,12 +460,6 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
 )
 _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
-    {
-        "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
-        "model": "gemini-3.5-flash-low",
-        "route_family": "codex_antigravity_code_assist_adapter",
-        "last_resort": False,
-    },
     {
         "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
         "model": "openrouter/cohere/north-mini-code:free",
@@ -546,12 +535,6 @@ _ANTHROPIC_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
 )
 _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
-        "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
-        "model": "claude-sonnet-4-6",
-        "route_family": "anthropic_antigravity_completion_adapter",
-        "last_resort": False,
-    },
-    {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
         "model": "gpt-5.3-codex-spark",
         "route_family": "anthropic_openai_responses_adapter",
@@ -577,12 +560,6 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
 )
 _ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
-    {
-        "provider": _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
-        "model": "gemini-3.5-flash-low",
-        "route_family": "anthropic_antigravity_completion_adapter",
-        "last_resort": False,
-    },
     {
         "provider": _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
         "model": "openrouter/cohere/north-mini-code:free",
@@ -651,6 +628,11 @@ _codex_auto_agent_lock = asyncio.Lock()
 _anthropic_auto_agent_cooldown_until_monotonic_by_key: dict[str, float] = {}
 _anthropic_auto_agent_session_affinity_by_key: dict[str, dict[str, Any]] = {}
 _anthropic_auto_agent_lock = asyncio.Lock()
+_codex_auto_agent_google_lane_key_until_monotonic_by_key: dict[str, float] = {}
+_codex_auto_agent_google_lane_key_by_key: dict[str, str] = {}
+_codex_auto_agent_antigravity_lane_key_until_monotonic_by_key: dict[str, float] = {}
+_codex_auto_agent_antigravity_lane_key_by_key: dict[str, str] = {}
+_codex_auto_agent_lane_state_cache_lock = asyncio.Lock()
 _AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT = "aawm-routing-v1"
 _AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX = "aawm:alias-routing"
 
@@ -2191,23 +2173,95 @@ def _resolve_codex_auto_agent_openai_cooldown_lane_key(request: Request) -> str:
     )
 
 
+def _get_codex_auto_agent_lane_state_cache_ttl_seconds() -> float:
+    raw_value = _clean_codex_auth_value(
+        os.getenv("AAWM_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS")
+    )
+    if raw_value is None:
+        return _CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS
+    try:
+        parsed = float(raw_value)
+    except Exception:
+        return _CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS
+    return max(0.0, parsed)
+
+
+def _get_codex_auto_agent_google_lane_cache_key() -> str:
+    auth_path = _get_anthropic_adapter_google_auth_file_path()
+    if auth_path is not None:
+        return f"google-auth:{auth_path.expanduser()}"
+    return "google-auth:__default__"
+
+
+def _get_codex_auto_agent_antigravity_lane_cache_key() -> str:
+    auth_path = _get_antigravity_auth_file_path()
+    if auth_path is not None:
+        return f"antigravity-auth:{auth_path.expanduser()}"
+    return "antigravity-auth:__default__"
+
+
+def _invalidate_codex_auto_agent_google_lane_cache() -> None:
+    cache_key = _get_codex_auto_agent_google_lane_cache_key()
+    _codex_auto_agent_google_lane_key_until_monotonic_by_key.pop(cache_key, None)
+    _codex_auto_agent_google_lane_key_by_key.pop(cache_key, None)
+
+
+def _invalidate_codex_auto_agent_antigravity_lane_cache() -> None:
+    cache_key = _get_codex_auto_agent_antigravity_lane_cache_key()
+    _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.pop(
+        cache_key,
+        None,
+    )
+    _codex_auto_agent_antigravity_lane_key_by_key.pop(cache_key, None)
+
+
+def _invalidate_codex_auto_agent_lane_state_caches() -> None:
+    _invalidate_codex_auto_agent_google_lane_cache()
+    _invalidate_codex_auto_agent_antigravity_lane_cache()
+
+
 async def _resolve_codex_auto_agent_google_lane_key() -> str:
+    cache_key = _get_codex_auto_agent_google_lane_cache_key()
+    ttl_seconds = _get_codex_auto_agent_lane_state_cache_ttl_seconds()
+    if ttl_seconds > 0:
+        async with _codex_auto_agent_lane_state_cache_lock:
+            cached_until = (
+                _codex_auto_agent_google_lane_key_until_monotonic_by_key.get(
+                    cache_key, 0.0
+                )
+            )
+            if cached_until > time.monotonic():
+                cached_lane_key = _codex_auto_agent_google_lane_key_by_key.get(
+                    cache_key
+                )
+                if isinstance(cached_lane_key, str) and cached_lane_key:
+                    return cached_lane_key
+
     try:
         google_access_token = await _load_valid_local_google_oauth_access_token()
         google_project = await _get_or_load_google_code_assist_project(
             google_access_token
         )
-        return _get_google_adapter_rate_limit_key(
+        lane_key = _get_google_adapter_rate_limit_key(
             None,
             access_token=google_access_token,
             companion_project=google_project,
         )
     except Exception:
+        _invalidate_codex_auto_agent_google_lane_cache()
         verbose_proxy_logger.warning(
             "Codex auto-agent alias could not resolve Google Code Assist lane; using default lane",
             exc_info=True,
         )
         return "__default__"
+
+    if ttl_seconds > 0:
+        async with _codex_auto_agent_lane_state_cache_lock:
+            _codex_auto_agent_google_lane_key_by_key[cache_key] = lane_key
+            _codex_auto_agent_google_lane_key_until_monotonic_by_key[cache_key] = (
+                time.monotonic() + ttl_seconds
+            )
+    return lane_key
 
 
 def _is_codex_auto_agent_antigravity_auth_degraded_exception(exc: Any) -> bool:
@@ -2242,13 +2296,29 @@ def _log_codex_auto_agent_antigravity_auth_degraded(exc: HTTPException) -> None:
 
 
 async def _resolve_codex_auto_agent_antigravity_lane_key() -> str:
+    cache_key = _get_codex_auto_agent_antigravity_lane_cache_key()
+    ttl_seconds = _get_codex_auto_agent_lane_state_cache_ttl_seconds()
+    if ttl_seconds > 0:
+        async with _codex_auto_agent_lane_state_cache_lock:
+            cached_until = (
+                _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.get(
+                    cache_key, 0.0
+                )
+            )
+            if cached_until > time.monotonic():
+                cached_lane_key = _codex_auto_agent_antigravity_lane_key_by_key.get(
+                    cache_key
+                )
+                if isinstance(cached_lane_key, str) and cached_lane_key:
+                    return cached_lane_key
+
     try:
         antigravity_access_token = await _load_valid_local_antigravity_access_token()
         antigravity_project = await _get_or_load_google_code_assist_project(
             antigravity_access_token,
             adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
         )
-        return "antigravity:{}".format(
+        lane_key = "antigravity:{}".format(
             _get_google_adapter_rate_limit_key(
                 None,
                 access_token=antigravity_access_token,
@@ -2257,13 +2327,23 @@ async def _resolve_codex_auto_agent_antigravity_lane_key() -> str:
         )
     except Exception as exc:
         if _is_codex_auto_agent_antigravity_auth_degraded_exception(exc):
+            _invalidate_codex_auto_agent_antigravity_lane_cache()
             _log_codex_auto_agent_antigravity_auth_degraded(cast(HTTPException, exc))
             return _CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY
+        _invalidate_codex_auto_agent_antigravity_lane_cache()
         verbose_proxy_logger.error(
             "Codex auto-agent alias could not resolve Antigravity Code Assist lane; using default lane",
             exc_info=True,
         )
         return "__default__"
+
+    if ttl_seconds > 0 and lane_key != "__default__":
+        async with _codex_auto_agent_lane_state_cache_lock:
+            _codex_auto_agent_antigravity_lane_key_by_key[cache_key] = lane_key
+            _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key[cache_key] = (
+                time.monotonic() + ttl_seconds
+            )
+    return lane_key
 
 
 async def _resolve_codex_auto_agent_antigravity_lane_state() -> dict[str, Any]:
@@ -4955,6 +5035,7 @@ async def _refresh_local_google_oauth_credentials(
     if expiry_date is not None:
         updated_auth_data["expiry_date"] = expiry_date
 
+    _invalidate_codex_auto_agent_google_lane_cache()
     return updated_auth_data
 
 
@@ -4985,6 +5066,7 @@ async def _load_valid_local_google_oauth_access_token() -> str:
         expiry_date = _get_google_oauth_expiry_date(auth_data)
         if expiry_date is not None:
             _google_oauth_access_token_cache[cache_key] = (access_token, expiry_date)
+        _invalidate_codex_auto_agent_google_lane_cache()
         return access_token
 
 
@@ -21375,6 +21457,7 @@ async def _refresh_local_antigravity_oauth_token_data(
 
     updated_token_data = dict(token_data)
     updated_token_data["token"] = updated_token_block
+    _invalidate_codex_auto_agent_antigravity_lane_cache()
     return updated_token_data
 
 
@@ -21427,6 +21510,7 @@ async def _load_valid_local_antigravity_access_token() -> str:
     expiry_date = _get_antigravity_oauth_expiry_date(token_data)
     if expiry_date is not None:
         _antigravity_oauth_access_token_cache[cache_key] = (access_token, expiry_date)
+    _invalidate_codex_auto_agent_antigravity_lane_cache()
     return access_token
 
 
