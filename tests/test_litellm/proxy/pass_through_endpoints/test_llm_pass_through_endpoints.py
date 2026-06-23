@@ -30139,6 +30139,53 @@ async def test_aawm_code_alias_ignores_stale_antigravity_durable_affinity():
 
 
 @pytest.mark.asyncio
+async def test_aawm_low_alias_ignores_stale_antigravity_durable_affinity():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    stale_candidate = {
+        "provider": "antigravity",
+        "model": "gemini-3.5-flash-low",
+        "route_family": "codex_antigravity_code_assist_adapter",
+        "last_resort": False,
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_session_affinity(
+            "aawm-low:codex-session:session:codex-session",
+            stale_candidate,
+        )
+        _codex_auto_agent_session_affinity_by_key.clear()
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+            new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+        ) as mock_antigravity_lane:
+            selection = await _select_codex_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
+    assert selection["selection_reason"] == "first_available"
+    mock_antigravity_lane.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_aawm_code_anthropic_alias_ignores_stale_antigravity_durable_affinity():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_anthropic_auto_agent_request()
@@ -30182,6 +30229,54 @@ async def test_aawm_code_anthropic_alias_ignores_stale_antigravity_durable_affin
 
     assert selection["candidate"]["provider"] == "openai"
     assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["selection_reason"] == "first_available"
+    mock_antigravity_lane.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aawm_low_anthropic_alias_ignores_stale_antigravity_durable_affinity():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-low-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    stale_candidate = {
+        "provider": "antigravity",
+        "model": "gemini-3.5-flash-low",
+        "route_family": "anthropic_antigravity_completion_adapter",
+        "last_resort": False,
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_anthropic_auto_agent_session_affinity(
+            "aawm-low-anthropic:claude-session:session:claude-session",
+            stale_candidate,
+        )
+        _anthropic_auto_agent_session_affinity_by_key.clear()
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+            new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+        ) as mock_antigravity_lane:
+            selection = await _select_anthropic_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
+
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
     assert selection["selection_reason"] == "first_available"
     mock_antigravity_lane.assert_not_called()
 
