@@ -3323,6 +3323,84 @@ class TestPassThroughTerminalFailureLogging:
         verbose_proxy_logger.setLevel(saved_level)
         verbose_proxy_logger.propagate = saved_propagate
 
+    @staticmethod
+    def _build_codex_unsupported_content_type_fixture(secret_prompt, secret_token):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/openai_passthrough/responses?stream=true"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {secret_token}",
+        }
+        mock_request.query_params = {}
+
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        request_body = {
+            "model": "gpt-5.5",
+            "stream": True,
+            "input": secret_prompt,
+            "instructions": f"use token {secret_token}",
+            "litellm_metadata": {
+                "passthrough_route_family": "codex_responses",
+                "session_id": "session-secret-019ed451",
+            },
+        }
+        req = httpx.Request("POST", target_url)
+        upstream_detail = b'{"detail":"Unsupported content type"}'
+        failing_response = httpx.Response(
+            status_code=400,
+            content=upstream_detail,
+            request=req,
+        )
+
+        httpx_error = httpx.HTTPStatusError(
+            "Client error '400 Bad Request' for url 'https://chatgpt.com/backend-api/codex/responses'",
+            request=req,
+            response=failing_response,
+        )
+        failing_response.aread = AsyncMock(return_value=upstream_detail)
+        failing_response.raise_for_status = MagicMock(side_effect=httpx_error)
+
+        async def fake_send(request, stream=True):
+            return failing_response
+
+        mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=req)
+        mock_client.send = AsyncMock(side_effect=fake_send)
+        return SimpleNamespace(
+            mock_client=mock_client,
+            mock_request=mock_request,
+            request_body=request_body,
+            target_url=target_url,
+        )
+
+    @staticmethod
+    def _assert_codex_unsupported_content_type_error_context(context):
+        assert context["endpoint"] == "/openai_passthrough/responses"
+        assert context["upstream_url"] == "https://chatgpt.com/backend-api/codex/responses"
+        assert context["provider"] == "openai"
+        assert context["model"] == "gpt-5.5"
+        assert context["route_family"] == "codex_responses"
+        assert context["status_code"] == 400
+        assert context["auth_credential_source"] == "route_custom_header"
+        assert context["auth_header_names"] == ["authorization"]
+        assert context["auth_header_sources"] == ["route_custom_header:authorization"]
+        assert context["aawm_passthrough_inbound_content_type"] == "application/json"
+        assert context["aawm_passthrough_json_egress_content_type_removed"] is True
+        assert (
+            context["aawm_passthrough_json_egress_content_type_removed_value"]
+            == "application/json"
+        )
+        assert context["aawm_passthrough_body_container_type"] == "object"
+        assert context["aawm_passthrough_body_top_level_keys"] == [
+            "input",
+            "instructions",
+            "model",
+            "stream",
+        ]
+        assert context["aawm_passthrough_input_container_type"] == "str"
+        assert context["grok_side_channel_request_body_byte_length"] is None
+
     def test_terminal_failure_classifier_matches_exhausted_hidden_retry_status(self):
         kwargs = {
             "litellm_params": {
@@ -3679,6 +3757,88 @@ class TestPassThroughTerminalFailureLogging:
         assert payload["context"]["status_code"] == 507
         assert "buffer limit" in payload["message"]
         assert payload.get("traceback") in (None, "")
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_codex_stream_400_error_intake_omits_raw_request_body(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        secret_prompt = "SUPER_SECRET_CODEX_PROMPT_DO_NOT_LOG"
+        secret_token = "sk-leaked-codex-token"
+        fixture = self._build_codex_unsupported_content_type_fixture(
+            secret_prompt,
+            secret_token,
+        )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value=fixture.request_body,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = fixture.mock_client
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value=fixture.request_body
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=fixture.mock_request,
+                        target=fixture.target_url,
+                        custom_headers={"authorization": f"Bearer {secret_token}"},
+                        user_api_key_dict=MagicMock(),
+                        stream=True,
+                        forward_headers=True,
+                        custom_llm_provider="openai",
+                    )
+
+                assert exc_info.value.code == "400"
+                assert "Unsupported content type" in str(exc_info.value.message)
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                request_headers = fixture.mock_client.build_request.call_args.kwargs[
+                    "headers"
+                ]
+                assert "content-type" not in {
+                    str(header_name).lower() for header_name in request_headers
+                }
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        error_log_path = tmp_path / "dev-error.jsonl"
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        payload = next(
+            item
+            for item in payloads
+            if "Unsupported content type" in item["message"]
+        )
+        context = payload["context"]
+
+        self._assert_codex_unsupported_content_type_error_context(context)
+
+        serialized = json.dumps(payload)
+        assert secret_prompt not in serialized
+        assert secret_token not in serialized
+        assert "session-secret-019ed451" not in serialized
+        assert "SUPER_SECRET" not in serialized
+        assert "sk-leaked" not in serialized
 
     @pytest.mark.asyncio
     async def test_pass_through_request_chatgpt_codex_block_page_warns_with_failure_kind(
@@ -4967,6 +5127,43 @@ async def test_pass_through_request_forwards_raw_body_without_json_parse():
     assert call_kwargs["_parsed_body"]["raw_body_passthrough"] is True
     assert call_kwargs["_parsed_body"]["raw_body_content_type"] == "application/x-protobuf"
     assert call_kwargs["_parsed_body"]["raw_body_bytes"] == len(b"\x08\x01native")
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_http_request_handler_preserves_content_type_for_raw_body():
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = Headers({"content-type": "application/x-protobuf"})
+
+    mock_response = httpx.Response(
+        status_code=204,
+        request=httpx.Request("POST", "https://example.com/v1/traces"),
+        content=b"",
+    )
+
+    async_client = MagicMock()
+    async_client.request = AsyncMock(return_value=mock_response)
+
+    raw_body = b"\x08\x01native"
+    headers = {
+        "content-type": "application/x-protobuf",
+        "authorization": "Bearer test",
+    }
+
+    response = await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
+        request=mock_request,
+        async_client=async_client,
+        url=httpx.URL("https://example.com/v1/traces"),
+        headers=headers,
+        raw_body=raw_body,
+    )
+
+    assert response.status_code == 204
+    async_client.request.assert_awaited_once()
+    call_kwargs = async_client.request.await_args.kwargs
+    assert call_kwargs["content"] == raw_body
+    assert call_kwargs["headers"]["content-type"] == "application/x-protobuf"
+    assert call_kwargs["headers"]["authorization"] == "Bearer test"
 
 
 @pytest.mark.asyncio
