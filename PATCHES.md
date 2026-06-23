@@ -3021,6 +3021,43 @@ the infrastructure pin, rebuilding/restarting `aawm-litellm`, and validating
 
 ---
 
+### aawm.93 — Native Anthropic OAuth passthrough normalization
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.93`. Native
+Anthropic passthrough now recognizes incoming Anthropic OAuth bearer tokens,
+preserves the user `Authorization` header, appends Anthropic's required OAuth
+beta header, and adds the direct browser access header before forwarding to
+`api.anthropic.com`. The native path also normalizes known Claude Code
+shorthand model names such as `opus-4-8` to provider model IDs while retaining
+the inbound alias in metadata.
+
+**Why:** A Windows Claude Code login against prod LiteLLM produced native
+Anthropic passthrough errors: `401 authentication_error: Invalid authentication
+credentials` for `/v1/messages` and `/v1/messages/count_tokens`, followed by a
+`404 not_found_error` for model `opus-4-8`. The error context showed the route
+family was `anthropic_messages` and the credential source was the incoming
+request, meaning the native OAuth path needed the same OAuth header
+normalization as other Anthropic flows and the shorthand model name needed to
+be rewritten before egress.
+
+**Why not upstream:** This is a fork-local passthrough hardening change for
+AAWM's Claude Code / Anthropic OAuth operating mode and error-intake policy.
+The upstream client-auth and model-not-found responses are still returned to
+the caller; the fork only avoids treating the expected provider/client failure
+shapes as internal LiteLLM tracebacks.
+
+**Validation status:** Focused pytest coverage passed for native Anthropic
+OAuth header normalization, shorthand model normalization, and known Anthropic
+client/provider failure logging without traceback intake. `py_compile`, ruff
+on touched files, and `git diff --check` passed. `litellm-dev` was recreated
+on `:4001`, readiness and liveliness returned HTTP 200, and runtime inspection
+inside the container confirmed `opus-4-8` rewrites to `claude-opus-4-8` and
+OAuth headers include `oauth-2025-04-20` plus
+`anthropic-dangerous-direct-browser-access=true`. Production promotion must use
+`v1.82.3-aawm.93` or newer; `v1.82.3-aawm.92` predates this fix.
+
+---
+
 ### aawm.92 — Preserve JSON content type for Codex passthrough egress
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.92`. Codex

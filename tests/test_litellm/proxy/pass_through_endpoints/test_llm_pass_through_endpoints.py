@@ -13849,6 +13849,128 @@ class TestClaudePersistedOutputExpansion:
         mock_create_route.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_anthropic_proxy_route_normalizes_oauth_headers_for_native_passthrough(
+        self,
+    ):
+        request_body = {
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer sk-ant-oat01-fake-token-for-testing",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "mcp-client-2025-11-20",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+            return_value="server-anthropic-key-should-not-be-used",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_create_route.return_value = AsyncMock(return_value={"id": "msg_oauth"})
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        assert result == {"id": "msg_oauth"}
+        mock_create_route.assert_called_once()
+        call_kwargs = mock_create_route.call_args.kwargs
+        assert call_kwargs["target"] == "https://api.anthropic.com/v1/messages"
+        assert "x-api-key" not in call_kwargs["custom_headers"]
+        assert (
+            call_kwargs["custom_headers"]["anthropic-beta"]
+            == "mcp-client-2025-11-20, oauth-2025-04-20"
+        )
+        assert (
+            call_kwargs["custom_headers"][
+                "anthropic-dangerous-direct-browser-access"
+            ]
+            == "true"
+        )
+        mock_set_parsed_body.assert_called_once_with(mock_request, request_body)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_proxy_route_normalizes_native_shorthand_model_alias(
+        self,
+    ):
+        request_body = {
+            "model": "opus-4-8",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer sk-ant-oat01-fake-token-for-testing",
+            "anthropic-version": "2023-06-01",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            new=AsyncMock(return_value=(request_body, 0, set(), {})),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ) as mock_set_parsed_body, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_create_route.return_value = AsyncMock(return_value={"id": "msg_alias"})
+            result = await anthropic_proxy_route(
+                endpoint="v1/messages",
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+        assert result == {"id": "msg_alias"}
+        mock_create_route.assert_called_once()
+        normalized_body = mock_set_parsed_body.call_args.args[1]
+        assert normalized_body["model"] == "claude-opus-4-8"
+        assert request_body["model"] == "opus-4-8"
+        metadata = normalized_body["litellm_metadata"]
+        assert metadata["inbound_model_alias"] == "opus-4-8"
+        assert metadata["requested_model_alias"] == "opus-4-8"
+        assert metadata["model_alias_label"] == "opus-4-8"
+        assert (
+            metadata["anthropic_native_passthrough_normalized_model"]
+            == "claude-opus-4-8"
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("extra_request_headers", "expected_beta"),
         [
