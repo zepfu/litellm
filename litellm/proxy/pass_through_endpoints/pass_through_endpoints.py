@@ -1505,6 +1505,9 @@ def _merge_passthrough_request_shape_metadata(
         metadata["aawm_passthrough_json_egress_content_type_removed_value"] = (
             _clean_passthrough_error_context_value(json_egress_content_type_removed)
         )
+    else:
+        metadata.pop("aawm_passthrough_json_egress_content_type_removed", None)
+        metadata.pop("aawm_passthrough_json_egress_content_type_removed_value", None)
 
     body = provider_bound_body if isinstance(provider_bound_body, dict) else parsed_body
     metadata["aawm_passthrough_body_container_type"] = _passthrough_container_type(body)
@@ -1544,11 +1547,20 @@ def _headers_for_json_passthrough_egress(
 ) -> tuple[Dict[str, Any], Optional[str]]:
     json_headers = dict(headers)
     removed_content_type: Optional[str] = None
+    has_json_content_type = False
     for header_name in list(json_headers.keys()):
         if str(header_name).lower() == "content-type":
-            removed_content_type = _clean_passthrough_error_context_value(
-                json_headers.pop(header_name)
+            content_type = _clean_passthrough_error_context_value(
+                json_headers[header_name]
             )
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if media_type == "application/json" or media_type.endswith("+json"):
+                has_json_content_type = True
+                continue
+            removed_content_type = content_type
+            json_headers.pop(header_name)
+    if not has_json_content_type:
+        json_headers["content-type"] = "application/json"
     return json_headers, removed_content_type
 
 

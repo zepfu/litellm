@@ -44,6 +44,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     build_aawm_route_access_log_line,
     _direct_capture_xai_passthrough_failure,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
+    _headers_for_json_passthrough_egress,
     _is_known_grok_billing_passthrough_timeout_cancel_response,
     _record_grok_billing_passthrough_request_contract,
     _record_passthrough_hidden_retry_metadata,
@@ -82,6 +83,43 @@ def _build_aawm_route_log_request(
         "http_version": http_version,
     }
     return request
+
+
+def test_headers_for_json_passthrough_egress_preserves_json_content_type():
+    headers, removed_content_type = _headers_for_json_passthrough_egress(
+        {
+            "Content-Type": "application/json",
+            "authorization": "Bearer token",
+        }
+    )
+
+    assert removed_content_type is None
+    assert headers["Content-Type"] == "application/json"
+    assert headers["authorization"] == "Bearer token"
+
+
+def test_headers_for_json_passthrough_egress_sets_missing_json_content_type():
+    headers, removed_content_type = _headers_for_json_passthrough_egress(
+        {"authorization": "Bearer token"}
+    )
+
+    assert removed_content_type is None
+    assert headers["content-type"] == "application/json"
+    assert headers["authorization"] == "Bearer token"
+
+
+def test_headers_for_json_passthrough_egress_replaces_stale_non_json_content_type():
+    headers, removed_content_type = _headers_for_json_passthrough_egress(
+        {
+            "Content-Type": "multipart/form-data; boundary=stale",
+            "authorization": "Bearer token",
+        }
+    )
+
+    assert removed_content_type == "multipart/form-data; boundary=stale"
+    assert "Content-Type" not in headers
+    assert headers["content-type"] == "application/json"
+    assert headers["authorization"] == "Bearer token"
 
 
 def _build_uvicorn_access_record(
@@ -3386,10 +3424,9 @@ class TestPassThroughTerminalFailureLogging:
         assert context["auth_header_names"] == ["authorization"]
         assert context["auth_header_sources"] == ["route_custom_header:authorization"]
         assert context["aawm_passthrough_inbound_content_type"] == "application/json"
-        assert context["aawm_passthrough_json_egress_content_type_removed"] is True
+        assert context["aawm_passthrough_json_egress_content_type_removed"] is None
         assert (
-            context["aawm_passthrough_json_egress_content_type_removed_value"]
-            == "application/json"
+            context["aawm_passthrough_json_egress_content_type_removed_value"] is None
         )
         assert context["aawm_passthrough_body_container_type"] == "object"
         assert context["aawm_passthrough_body_top_level_keys"] == [
@@ -3809,9 +3846,11 @@ class TestPassThroughTerminalFailureLogging:
                 request_headers = fixture.mock_client.build_request.call_args.kwargs[
                     "headers"
                 ]
-                assert "content-type" not in {
-                    str(header_name).lower() for header_name in request_headers
+                content_type_headers = {
+                    str(header_name).lower(): value
+                    for header_name, value in request_headers.items()
                 }
+                assert content_type_headers["content-type"] == "application/json"
         finally:
             self._restore_verbose_proxy_logger(
                 saved_handlers,
