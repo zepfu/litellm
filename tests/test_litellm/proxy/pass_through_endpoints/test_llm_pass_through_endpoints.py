@@ -26,6 +26,7 @@ sys.path.insert(
 
 import litellm
 from litellm._logging import AawmErrorLogFileHandler, verbose_proxy_logger
+from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     _add_anthropic_auto_agent_alias_metadata,
@@ -17068,11 +17069,13 @@ def clear_codex_auto_agent_alias_state():
     _codex_auto_agent_session_affinity_by_key.clear()
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
+    clear_aawm_route_rollups()
     yield
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
+    clear_aawm_route_rollups()
 
 
 def test_aawm_alias_candidate_maps_exclude_google_and_retired_free_deepseek():
@@ -17571,6 +17574,127 @@ async def test_anthropic_auto_agent_alias_session_affinity_reports_routing_state
     assert selection["selection_reason"] == "session_affinity"
     assert selection["affinity_state_source"] == "durable_cache"
     assert selection["cooldown_state_source"] == "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_continuation_affinity_uses_single_candidate_state_fast_path():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-codex-agent-auto",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "codex-session:session:codex-session"
+    ] = {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+
+    async def _fail_full_candidate_build(*args, **kwargs):
+        raise AssertionError(
+            "full candidate state build should not run for continuation affinity fast path"
+        )
+
+    async def _fail_unrelated_lane_resolution(*args, **kwargs):
+        raise AssertionError(
+            "unrelated lane resolution should not run for continuation affinity fast path"
+        )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_codex_auto_agent_candidate_states",
+        new=AsyncMock(side_effect=_fail_full_candidate_build),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(side_effect=_fail_unrelated_lane_resolution),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(side_effect=_fail_unrelated_lane_resolution),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "deepseek/deepseek-v4-flash"
+    assert selection["selection_reason"] == "session_affinity"
+    assert selection["lane_key"] == "openrouter"
+    assert selection["cooldown_state_source"] == "local_fallback"
+    assert selection["in_flight_session"] is True
+    assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_continuation_affinity_uses_single_candidate_state_fast_path():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["messages"].append(
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_existing",
+                    "name": "Read",
+                    "input": {"path": "/tmp/example"},
+                }
+            ],
+        }
+    )
+    _anthropic_auto_agent_session_affinity_by_key[
+        "claude-session:session:claude-session"
+    ] = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "anthropic_openai_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+
+    async def _fail_full_candidate_build(*args, **kwargs):
+        raise AssertionError(
+            "full candidate state build should not run for continuation affinity fast path"
+        )
+
+    async def _fail_unrelated_lane_resolution(*args, **kwargs):
+        raise AssertionError(
+            "unrelated lane resolution should not run for continuation affinity fast path"
+        )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_auto_agent_candidate_states",
+        new=AsyncMock(side_effect=_fail_full_candidate_build),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(side_effect=_fail_unrelated_lane_resolution),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(side_effect=_fail_unrelated_lane_resolution),
+    ):
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    assert selection["selection_reason"] == "session_affinity"
+    assert selection["lane_key"] == "__default__"
+    assert selection["cooldown_state_source"] == "local_fallback"
+    assert selection["in_flight_session"] is True
+    assert selection["skipped"] == []
 
 
 @pytest.mark.asyncio
