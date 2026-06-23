@@ -490,15 +490,23 @@ restore immediate per-request `[ROUTE]` lines for debug windows. Rollup headers
 use:
 
 ```text
-YYYYMMDD HH:MM:SS [EARLY] repo@Client[version] /incoming -> outgoing
+YYYYMMDD HH:MM:SS [EARLY] repo@Client[version] /incoming
 ```
 
 `[EARLY]` appears only when a bounded in-memory cap forces a flush before the
 interval elapses. Each rollup subline uses ` - model(alias) - Turns: N` with an
 optional trailing status tag (`[Degraded]`, `[Cooling Down]`, `[Failed]`, or
-`[Exhausted]`). `Turns` counts completed requests only. Alias-route candidate
-events that degrade, cool down, fail, or exhaust before a successful completion
-emit an immediate compact status line:
+`[Exhausted]`). The subline appends ` -> outgoing` only when the model's
+destination differs from the incoming endpoint's default upstream target for
+the group. For example, native Anthropic traffic under `/anthropic/v1/messages`
+omits `api.anthropic.com/v1/messages`, and Codex passthrough traffic under
+`/openai_passthrough/responses` omits
+`chatgpt.com/backend-api/codex/responses`; mixed-provider routes such as Grok
+or Google adapters remain explicit on their own sublines. If LiteLLM cannot
+infer an endpoint default, it suppresses the destination only when every subline
+in the bucket shares the same outgoing target. `Turns` counts completed
+requests only. Alias-route candidate events that degrade, cool down, fail, or
+exhaust before a successful completion emit an immediate compact status line:
 
 ```text
 YYYYMMDD HH:MM:SS - <alias>: <model> Status: <status> - Message: <details>

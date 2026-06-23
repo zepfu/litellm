@@ -673,10 +673,8 @@ class TestProxyBaseLLMRequestProcessing:
         assert (
             "litellm@Codex[0.141.0] /openai_passthrough/responses"
         ) in rendered
-        assert (
-            " - gpt-5.5 - Turns: 1 -> "
-            "chatgpt.com/backend-api/codex/responses"
-        ) in rendered
+        assert " - gpt-5.5 - Turns: 1" in rendered
+        assert "chatgpt.com/backend-api/codex/responses" not in rendered
         assert " [ROUTE] " not in rendered
 
     def test_aawm_route_rollup_groups_by_model_alias_without_agent_breakouts(
@@ -740,10 +738,8 @@ class TestProxyBaseLLMRequestProcessing:
         assert (
             "aegis@Claude[2.1.178] /anthropic/v1/messages?beta=true"
         ) in rendered
-        assert (
-            " - claude-opus-4-8 - Turns: 2 -> "
-            "api.anthropic.com/v1/messages"
-        ) in rendered
+        assert " - claude-opus-4-8 - Turns: 2" in rendered
+        assert "api.anthropic.com/v1/messages" not in rendered
         assert "orchestrator.claude-opus-4-8" not in rendered
 
     def test_aawm_route_rollup_disabled_restores_immediate_route_log(
@@ -2378,10 +2374,7 @@ class TestAawmRouteRollup:
             flushed[0]
             == "20260623 01:06:52 litellm@Codex[0.141.0] /openai_passthrough/responses"
         )
-        assert (
-            flushed[1]
-            == " - gemini-3.5-flash-low(aawm-low) - Turns: 3 -> chatgpt.com/backend-api/codex/responses"
-        )
+        assert flushed[1] == " - gemini-3.5-flash-low(aawm-low) - Turns: 3"
 
     def test_route_rollup_groups_destinations_under_local_endpoint(self):
         from datetime import datetime
@@ -2417,10 +2410,90 @@ class TestAawmRouteRollup:
                 " - gemini-3.5-flash-low(aawm-low) - Turns: 7 -> "
                 "daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
             ),
+            " - gpt-5.5 - Turns: 4",
+        ]
+
+    def test_route_rollup_suppresses_common_destination_on_all_same_bucket(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 6, 23, 22, 1, 9)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        header = "litellm@Codex[0.142.0]"
+        endpoint = "/openai_passthrough/responses"
+        target = "chatgpt.com/backend-api/codex/responses"
+
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=target,
+            model_label="gpt-5.5",
+            turns=4,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=target,
+            model_label="codex-auto-review",
+            turns=1,
+            now=now,
+        )
+
+        flushed = accumulator.flush(force=True, now=now)
+        assert flushed == [
+            "20260623 22:01:09 litellm@Codex[0.142.0] /openai_passthrough/responses",
+            " - gpt-5.5 - Turns: 4",
+            " - codex-auto-review - Turns: 1",
+        ]
+
+    def test_route_rollup_retains_only_divergent_destination_in_mixed_bucket(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 6, 23, 22, 5, 55)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        header = "aegis@Claude[2.1.186]"
+        endpoint = "/anthropic/v1/messages?beta=true"
+        anthropic = "api.anthropic.com/v1/messages"
+        grok = "cli-chat-proxy.grok.com/v1/responses"
+
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=anthropic,
+            model_label="claude-haiku-4-5-20251001",
+            turns=3,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=grok,
+            model_label="grok-composer-2.5-fast(aawm-code-anthropic)",
+            turns=1,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=anthropic,
+            model_label="claude-opus-4-8",
+            turns=4,
+            now=now,
+        )
+
+        flushed = accumulator.flush(force=True, now=now)
+        assert flushed == [
+            "20260623 22:05:55 aegis@Claude[2.1.186] /anthropic/v1/messages?beta=true",
+            " - claude-haiku-4-5-20251001 - Turns: 3",
             (
-                " - gpt-5.5 - Turns: 4 -> "
-                "chatgpt.com/backend-api/codex/responses"
+                " - grok-composer-2.5-fast(aawm-code-anthropic) - Turns: 1 -> "
+                "cli-chat-proxy.grok.com/v1/responses"
             ),
+            " - claude-opus-4-8 - Turns: 4",
         ]
 
     def test_route_rollup_status_latest_material_state_wins(self):
@@ -2454,10 +2527,32 @@ class TestAawmRouteRollup:
             now=now,
         )
         flushed = accumulator.flush(force=True, now=now)
+        assert " - gpt-5.5(aawm-low) - Turns: 3 [Exhausted]" in flushed
+
+    def test_route_rollup_status_event_keeps_immediate_error_shape(self, caplog):
+        from datetime import datetime
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING, logger=route_logger.name):
+                aawm_route_logging.emit_aawm_route_status_event(
+                    alias_model="aawm-low",
+                    model_label="gpt-5.5",
+                    status="Cooling Down",
+                    message="provider capacity",
+                    now=datetime(2026, 6, 23, 22, 7, 5),
+                )
+        finally:
+            route_logger.removeHandler(caplog.handler)
+
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
         assert (
-            " - gpt-5.5(aawm-low) - Turns: 3 [Exhausted] -> "
-            "chatgpt.com/backend-api/codex/responses"
-        ) in flushed
+            "20260623 22:07:05 - aawm-low: gpt-5.5 Status: Cooling Down "
+            "- Message: provider capacity"
+        ) in rendered
+        assert "Turns:" not in rendered
+        assert "->" not in rendered
 
     def test_route_rollup_interval_zero_disables_accumulation(self, monkeypatch):
         from litellm.proxy.aawm_route_logging import (
