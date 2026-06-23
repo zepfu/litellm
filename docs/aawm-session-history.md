@@ -460,7 +460,23 @@ targets are logged as host plus path.
 
 For requests that emit this enriched `[ROUTE]` line, LiteLLM suppresses the
 matching native Uvicorn/Gunicorn access record for that request. Unrelated
-routes should continue to use the normal server access log.
+routes should continue to use the normal server access log. Successful
+health-check access records for `/health`, `/health/readiness`,
+`/health/liveliness`, and `/health/services` are also suppressed because they do
+not carry model-routing context; failed health checks remain visible through the
+native access log. Repeated enriched route lines with the same route type,
+client product, owner/model context, method, incoming endpoint, and outgoing
+target are coalesced for a short window so tight loops do not dominate Docker
+logs. The matching native access record is still suppressed for each coalesced
+request. Set `AAWM_ROUTE_LOG_DEDUP_WINDOW_SECONDS=0` to disable coalescing, or
+increase the value for targeted noisy-window capture reduction.
+
+AAWM alias routing audit events are still attached to request metadata for
+session-history and diagnostic consumers. Container log emission is narrower:
+failures, cooldowns, redispatches, no-candidate outcomes, and explicit warning
+events remain logged, while healthy selected/session-affinity continuation
+events are skipped unless `AAWM_ALIAS_ROUTE_LOG_HEALTHY=1` is set for a targeted
+debug window.
 
 ## Langfuse Event Size Fitting
 

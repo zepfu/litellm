@@ -2406,6 +2406,8 @@ def _emit_auto_agent_alias_route_event(
     *,
     level: str = "info",
 ) -> None:
+    if not _should_emit_auto_agent_alias_route_event(event, level=level):
+        return
     log_payload = {"event": "aawm_alias_route", **event}
     message = "AAWM_ALIAS_ROUTE: {}".format(
         json.dumps(log_payload, sort_keys=True, default=str, separators=(",", ":"))
@@ -2414,6 +2416,40 @@ def _emit_auto_agent_alias_route_event(
         verbose_proxy_logger.warning(message)
     else:
         verbose_proxy_logger.info(message)
+
+
+def _should_emit_auto_agent_alias_route_event(
+    event: dict[str, Any],
+    *,
+    level: str = "info",
+) -> bool:
+    if level == "warning":
+        return True
+
+    if os.getenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return True
+
+    if event.get("failure_class") or event.get("error_status_code"):
+        return True
+    if event.get("redispatch_required") or event.get("redispatch_threshold_crossed"):
+        return True
+
+    event_type = str(event.get("event_type") or "")
+    candidate_status = str(event.get("candidate_status") or "")
+    if event_type in {
+        "candidate_attempt_started",
+        "candidate_selected",
+    }:
+        return False
+    if candidate_status in {"started", "selected"}:
+        return False
+    if event.get("selection_reason") == "session_affinity":
+        return False
+    return True
 
 
 def _emit_auto_agent_alias_no_candidate_event(
