@@ -2973,6 +2973,54 @@ and log/session-history validation from `PROD_RELEASE.md`.
 
 ---
 
+### aawm.90 — Route rollup, passthrough observability, and persistence hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.90`. This
+release carries the post-`aawm.89` production batch for AAWM route rollup
+logging, alias/session-affinity behavior, passthrough request observability,
+stream-finalize summaries, provider-bound body isolation, transient
+session-history persistence, and provider-status anomaly scanning. Healthy
+route logging now rolls up by client/repository/model instead of per-request
+noise, while terminal/anomalous alias outcomes retain enough route detail to
+debug provider selection. Passthrough handlers now keep provider egress bodies
+separate from LiteLLM-internal pricing/logging parameters, and streaming
+finalization records a compact summary path without reprocessing large payloads
+unnecessarily.
+
+The callback overlay also changed for session-history persistence and
+Langfuse/session attribution, so the normal `main` artifact autobump is
+expected to publish `cb-v0.0.54`. The control-plane hook path changed through
+`aawm_claude_control_plane.py`, so the same autobump is expected to publish
+`cp-v0.0.10`. Production infrastructure should rebuild from the exact
+`ghcr.io/zepfu/litellm:1.82.3-aawm.90` base after those overlay releases are
+available.
+
+**Why:** Dev and prod traffic after `aawm.89` exposed two release blockers:
+high-volume route logs made actual provider failures hard to see, and
+passthrough/internal payload sharing risked leaking LiteLLM-only fields into
+provider requests. Session-history queue pressure and transient DB failures
+also needed clearer spooling/replay behavior before prod should carry the
+newer observability paths.
+
+**Why not upstream:** This batch is specific to the AAWM production operating
+model: custom route rollups, AAWM alias/session-affinity metadata, local
+session-history durability, provider-status sidecar checks, and fork-local
+passthrough diagnostics. The provider-bound request-body isolation follows a
+general defensive pattern, but the release motivation and verification are tied
+to AAWM managed passthrough routes.
+
+**Validation status:** The focused dev checks for the latest batch passed before
+promotion: passthrough provider-bound body/copy-on-write pytest coverage,
+targeted `ruff check`, `py_compile` for touched runtime files, `litellm-dev`
+rebuild/recreate, `/health/liveliness` and `/health/readiness` on `:4001`, and
+a bounded post-restart dev log scan without new traceback/error matches.
+Production promotion requires merging `develop` to `main`, waiting for the
+callback/control-plane overlay releases, publishing `v1.82.3-aawm.90`, updating
+the infrastructure pin, rebuilding/restarting `aawm-litellm`, and validating
+`:4000` health plus startup logs per `PROD_RELEASE.md`.
+
+---
+
 ### aawm.86 — OpenRouter message-shape failover and Antigravity sidecar auth paths
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.86`. Codex
