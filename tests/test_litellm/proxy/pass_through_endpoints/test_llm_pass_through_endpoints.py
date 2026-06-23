@@ -6992,6 +6992,128 @@ class TestPassThroughRequestRetryableFailures:
             )
 
     @pytest.mark.asyncio
+    async def test_build_passthrough_logging_input_serializes_body_once(self):
+        from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+        parsed_body = {"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]}
+        call_count = {"count": 0}
+        original_safe_dumps = pte.safe_dumps
+
+        def counting_safe_dumps(value):
+            if value is parsed_body:
+                call_count["count"] += 1
+            return original_safe_dumps(value)
+
+        with patch.object(pte, "safe_dumps", side_effect=counting_safe_dumps):
+            envelope = pte._build_passthrough_logging_input(parsed_body)
+
+        assert call_count["count"] == 1
+        assert envelope == [
+            {"role": "user", "content": original_safe_dumps(parsed_body)}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_reuses_single_passthrough_logging_input(
+        self,
+    ):
+        from litellm.litellm_core_utils.litellm_logging import Logging
+        from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/openai/v1/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        mock_httpx_response = MagicMock()
+        mock_httpx_response.status_code = 200
+        mock_httpx_response.headers = {"content-type": "application/json"}
+        mock_httpx_response.aiter_bytes = AsyncMock(
+            return_value=[b'{"result": "success"}']
+        )
+        mock_httpx_response.aread = AsyncMock(return_value=b'{"result": "success"}')
+
+        custom_body = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "serialize-once"}],
+            "litellm_metadata": {},
+        }
+
+        serialized_target_bodies = []
+        original_safe_dumps = pte.safe_dumps
+
+        def traced_safe_dumps(value):
+            if isinstance(value, dict) and value.get("model") == "gpt-5.4":
+                serialized_target_bodies.append(value)
+            return original_safe_dumps(value)
+
+        captured = {}
+        original_update_messages = Logging.update_messages
+        original_pre_call = Logging.pre_call
+
+        def capture_update_messages(self, messages):
+            captured["messages"] = messages
+            return original_update_messages(self, messages)
+
+        def capture_pre_call(self, input, api_key="", model=None, additional_args=None):
+            if additional_args is None:
+                additional_args = {}
+            captured["pre_call_input"] = input
+            captured["complete_input_dict"] = additional_args.get("complete_input_dict")
+            return original_pre_call(
+                self,
+                input=input,
+                api_key=api_key,
+                model=model,
+                additional_args=additional_args,
+            )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+            new_callable=AsyncMock,
+        ) as mock_success_handler, patch.object(
+            pte, "safe_dumps", side_effect=traced_safe_dumps
+        ), patch.object(
+            Logging, "update_messages", capture_update_messages
+        ), patch.object(Logging, "pre_call", capture_pre_call):
+            mock_client = MagicMock()
+            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = mock_client
+            mock_get_client.return_value = mock_client_obj
+
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+            mock_logging_obj.post_call_success_hook = AsyncMock()
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            await pass_through_request(
+                request=mock_request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=custom_body,
+                stream=False,
+            )
+
+        assert len(serialized_target_bodies) == 1
+        assert captured["pre_call_input"] is captured["messages"]
+        assert captured["complete_input_dict"] == custom_body
+
+        mock_success_handler.assert_called_once()
+        success_payload = mock_success_handler.call_args.kwargs[
+            "passthrough_logging_payload"
+        ]
+        assert success_payload["request_body"] == custom_body
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_uses_logging_metadata_without_changing_raw_body(
         self,
     ):
