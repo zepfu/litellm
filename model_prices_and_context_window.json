@@ -16601,6 +16601,32 @@
         "supports_response_schema": true,
         "supports_vision": true
     },
+    "chatgpt/codex-auto-review": {
+        "cache_read_input_token_cost": 1.75e-07,
+        "cache_read_input_token_cost_priority": 3.5e-07,
+        "input_cost_per_token": 1.75e-06,
+        "input_cost_per_token_priority": 3.5e-06,
+        "litellm_provider": "chatgpt",
+        "max_input_tokens": 128000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "responses",
+        "output_cost_per_token": 1.4e-05,
+        "output_cost_per_token_priority": 2.8e-05,
+        "pricing_note": "community_assumed_same_as_gpt-5.3-codex-spark",
+        "supported_endpoints": [
+            "/v1/responses"
+        ],
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning_summary": false,
+        "supports_response_schema": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation"
+        ],
+        "supports_vision": true
+    },
     "chatgpt/gpt-5.3-codex-spark": {
         "cache_read_input_token_cost": 1.75e-07,
         "cache_read_input_token_cost_priority": 3.5e-07,
@@ -38360,6 +38386,32 @@
         "supports_reasoning_summary": false,
         "supports_response_schema": true,
         "unsupported_hosted_tools": [
+            "image_generation"
+        ],
+        "supports_vision": true
+    },
+    "codex-auto-review": {
+        "cache_read_input_token_cost": 1.75e-07,
+        "cache_read_input_token_cost_priority": 3.5e-07,
+        "input_cost_per_token": 1.75e-06,
+        "input_cost_per_token_priority": 3.5e-06,
+        "litellm_provider": "openai",
+        "max_input_tokens": 128000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "responses",
+        "output_cost_per_token": 1.4e-05,
+        "output_cost_per_token_priority": 2.8e-05,
+        "pricing_note": "community_assumed_same_as_gpt-5.3-codex-spark",
+        "supported_endpoints": [
+            "/v1/responses"
+        ],
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning_summary": false,
+        "supports_response_schema": true,
+        "unsupported_hosted_tools": [
+            "custom",
             "image_generation"
         ],
         "supports_vision": true

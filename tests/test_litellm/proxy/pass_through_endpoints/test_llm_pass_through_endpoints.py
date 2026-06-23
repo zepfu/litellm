@@ -24924,6 +24924,162 @@ async def test_openai_passthrough_codex_spark_drops_image_generation_tool(
     ]
 
 
+def _codex_auto_review_unsupported_hosted_tools_request_body() -> dict:
+    function_tools = [
+        {
+            "type": "function",
+            "name": f"tool_{index}",
+            "description": f"Function tool {index}",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "secret tool arg",
+                    }
+                },
+            },
+        }
+        for index in range(8)
+    ]
+    return {
+        "model": "codex-auto-review",
+        "instructions": "secret prompt instructions for auto-review",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "secret user prompt for auto-review",
+                    }
+                ],
+            }
+            for _ in range(3)
+        ],
+        "tools": [
+            {"type": "custom", "name": "exec_command"},
+            {"type": "image_generation", "partial_images": 2},
+            *function_tools,
+        ],
+        "tool_choice": {"type": "custom", "name": "exec_command"},
+        "stream": True,
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+
+
+def test_codex_auto_review_unsupported_custom_and_image_generation_tools_are_removed():
+    request_body = _codex_auto_review_unsupported_hosted_tools_request_body()
+    function_tools = request_body["tools"][2:]
+
+    updated_body, removed_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(request_body)
+    )
+
+    assert removed_tools == [
+        {"type": "custom", "index": 0, "name": "exec_command"},
+        {"type": "image_generation", "index": 1},
+    ]
+    assert updated_body["tools"] == function_tools
+    assert "tool_choice" not in updated_body
+    litellm_metadata = updated_body["litellm_metadata"]
+    assert "existing-tag" in litellm_metadata["tags"]
+    assert "codex-unsupported-hosted-tool-removed" in litellm_metadata["tags"]
+    assert "codex-unsupported-hosted-tool:custom" in litellm_metadata["tags"]
+    assert (
+        "codex-unsupported-hosted-tool:image_generation" in litellm_metadata["tags"]
+    )
+    assert (
+        "codex-unsupported-hosted-tool-choice-removed" in litellm_metadata["tags"]
+    )
+    assert litellm_metadata["codex_unsupported_hosted_tool_removed_count"] == 2
+    assert litellm_metadata["codex_unsupported_hosted_tool_types_removed"] == [
+        "custom",
+        "image_generation",
+    ]
+    assert litellm_metadata["codex_unsupported_hosted_tools_removed"] == removed_tools
+    assert litellm_metadata["codex_unsupported_hosted_tool_choice_removed"] == {
+        "type": "custom",
+        "name": "exec_command",
+    }
+    metadata_blob = json.dumps(litellm_metadata)
+    assert "secret prompt instructions for auto-review" not in metadata_blob
+    assert "secret user prompt for auto-review" not in metadata_blob
+
+
+@pytest.mark.asyncio
+async def test_openai_passthrough_codex_auto_review_drops_unsupported_hosted_tools(
+    monkeypatch,
+):
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+
+    request_body = _codex_auto_review_unsupported_hosted_tools_request_body()
+    function_tools = request_body["tools"][2:]
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = {
+        "session_id": "codex-session-auto-review",
+        "user-agent": "codex-cli/1.0",
+        "chatgpt-account-id": "acct-auto-review",
+        "originator": "codex_cli_rs",
+    }
+    mock_request.query_params = {}
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(return_value=request_body),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+    ) as mock_set_parsed_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        return_value=AsyncMock(return_value={"ok": True}),
+    ):
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            base_target_url="https://chatgpt.com/backend-api/codex",
+            api_key=None,
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            forward_headers=True,
+        )
+
+    assert result == {"ok": True}
+    mock_set_parsed_body.assert_called_once()
+    prepared_body = mock_set_parsed_body.call_args.args[1]
+    assert prepared_body["model"] == "codex-auto-review"
+    assert prepared_body["tools"] == function_tools
+    assert "tool_choice" not in prepared_body
+    litellm_metadata = prepared_body["litellm_metadata"]
+    assert litellm_metadata["passthrough_route_family"] == "codex_responses"
+    assert litellm_metadata["codex_unsupported_hosted_tool_removed_count"] == 2
+    assert litellm_metadata["codex_unsupported_hosted_tool_types_removed"] == [
+        "custom",
+        "image_generation",
+    ]
+    assert litellm_metadata["codex_unsupported_hosted_tool_choice_removed"] == {
+        "type": "custom",
+        "name": "exec_command",
+    }
+    metadata_blob = json.dumps(litellm_metadata)
+    assert "secret prompt instructions for auto-review" not in metadata_blob
+    assert "secret user prompt for auto-review" not in metadata_blob
+    assert litellm_metadata["aawm_tool_definition_count"] == 8
+    assert litellm_metadata["aawm_tool_definition_types"] == ["function"] * 8
+    assert litellm_metadata["aawm_tool_definition_names"] == [
+        f"tool_{index}" for index in range(8)
+    ]
+    assert (
+        litellm_metadata["aawm_tool_definition_snapshot_storage"]
+        == "session_history_tool_definition_snapshots"
+    )
+
+
 @pytest.mark.asyncio
 async def test_load_valid_local_antigravity_access_token_from_env(
     tmp_path, monkeypatch
