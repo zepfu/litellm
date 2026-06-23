@@ -6576,7 +6576,12 @@ class TestPassThroughRequestRetryableFailures:
         assert payload["context"]["model"] == "grok-composer-2.5-fast"
         assert payload["context"]["model_alias"] == "aawm-code-anthropic"
         assert payload["context"]["route_family"] == "grok_cli_chat_proxy"
-        assert "ReadTimeout" in payload["traceback"]
+        assert payload["context"]["failure_kind"] == "transient_provider_connectivity"
+        assert payload["context"]["hidden_retry_final_outcome"] == "failed_after_retry"
+        assert payload["context"]["hidden_retry_failure_classification"] == (
+            "upstream_connectivity_failure"
+        )
+        assert payload["traceback"] is None
 
     @pytest.mark.asyncio
     async def test_stream_setup_read_timeout_uses_504_proxy_code(self):
@@ -21483,6 +21488,33 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_failed_responses_paylo
     )
 
 
+def test_codex_auto_agent_retryable_exhaustion_classifies_openrouter_raw_provider_error():
+    exc = ProxyException(
+        message="Provider returned error",
+        type="bad_request_error",
+        param="model",
+        code=400,
+    )
+    exc.detail = {
+        "error": {
+            "message": "Provider returned error",
+            "code": 400,
+            "metadata": {
+                "raw": "ERROR",
+                "provider_name": "Stealth",
+                "is_byok": False,
+            },
+        }
+    }
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
+        "provider_terminal_error"
+    )
+    assert "OPENROUTER_PROVIDER_RAW_ERROR" in _extract_codex_auto_agent_error_tokens(
+        exc
+    )
+
+
 @pytest.mark.asyncio
 async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
     request = _build_codex_auto_agent_request()
@@ -22735,6 +22767,82 @@ async def test_codex_auto_agent_alias_openrouter_retryable_failure_reaches_mini(
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_next_openrouter_candidate(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "antigravity:gemini-3.5-flash-low:antigravity-lane",
+        60.0,
+    )
+    raw_provider_error = ProxyException(
+        message="Provider returned error",
+        type="bad_request_error",
+        param="model",
+        code=400,
+    )
+    raw_provider_error.detail = {
+        "error": {
+            "message": "Provider returned error",
+            "code": 400,
+            "metadata": {
+                "raw": "ERROR",
+                "provider_name": "Stealth",
+                "is_byok": False,
+            },
+        }
+    }
+    owl_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(return_value="antigravity-lane"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
+        new=AsyncMock(side_effect=[raw_provider_error, owl_success]),
+    ) as mock_openrouter:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is owl_success
+    assert mock_openrouter.await_count == 2
+    first_call = mock_openrouter.await_args_list[0].kwargs
+    second_call = mock_openrouter.await_args_list[1].kwargs
+    assert first_call["adapter_model"] == "openrouter/cohere/north-mini-code:free"
+    assert second_call["adapter_model"] == "openrouter/owl-alpha"
+    metadata = second_call["request_body"]["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-low"
+    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/owl-alpha",
+    ]
+    first_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert first_attempt["status"] == "cooldown_set"
+    assert first_attempt["error_class"] == "provider_terminal_error"
+    assert "OPENROUTER_PROVIDER_RAW_ERROR" in first_attempt["error_tokens"]
+    skipped_models = {
+        candidate["model"]
+        for candidate in metadata["codex_auto_agent_skipped_candidates"]
+    }
+    assert "gemini-3.5-flash-low" in skipped_models
+    assert "openrouter/cohere/north-mini-code:free" in skipped_models
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_skips_cooled_down_candidates(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
@@ -22962,6 +23070,101 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
         "codex_openrouter_completion_adapter"
     )
     assert litellm_metadata["codex_adapter_model"] == adapter_model
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_low_skips_antigravity_when_sidecar_token_stale(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    stale_token_error = HTTPException(
+        status_code=500,
+        detail=(
+            "Antigravity OAuth token is expired or invalid. The "
+            "provider-status sidecar owns Antigravity auth refresh; confirm the "
+            "sidecar can write the configured token file and refresh "
+            "/root/.litellm/antigravity/antigravity-oauth-token."
+        ),
+    )
+    warning_mock = MagicMock()
+
+    monkeypatch.setattr(
+        endpoints,
+        "_codex_auto_agent_antigravity_auth_degraded_log_until_monotonic",
+        0.0,
+    )
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        new=AsyncMock(side_effect=stale_token_error),
+    ), patch.object(endpoints.verbose_proxy_logger, "warning", warning_mock):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
+    skipped = selection["skipped"][0]
+    assert skipped["provider"] == "antigravity"
+    assert skipped["model"] == "gemini-3.5-flash-low"
+    assert skipped["reason"] == "auth_degraded"
+    assert skipped["lane_key"] == "antigravity:auth_degraded"
+    assert skipped["cooldown_seconds"] == 300.0
+    assert skipped["failure_phase"] == "auth"
+    assert skipped["attempted_provider_call"] is False
+    assert selection["cooldown_state_source"] == "local_fallback"
+    warning_mock.assert_called_once()
+    assert warning_mock.call_args.kwargs.get("exc_info") is None
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_skips_antigravity_when_sidecar_token_stale(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    stale_token_error = HTTPException(
+        status_code=500,
+        detail=(
+            "Antigravity OAuth token is expired or invalid. The "
+            "provider-status sidecar owns Antigravity auth refresh; confirm the "
+            "sidecar can write the configured token file and refresh "
+            "/root/.litellm/antigravity/antigravity-oauth-token."
+        ),
+    )
+
+    monkeypatch.setattr(
+        endpoints,
+        "_codex_auto_agent_antigravity_auth_degraded_log_until_monotonic",
+        0.0,
+    )
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_antigravity_access_token",
+        new=AsyncMock(side_effect=stale_token_error),
+    ), patch.object(endpoints.verbose_proxy_logger, "warning"):
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openai"
+    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
+    skipped = selection["skipped"][0]
+    assert skipped["provider"] == "antigravity"
+    assert skipped["model"] == "claude-sonnet-4-6"
+    assert skipped["reason"] == "auth_degraded"
+    assert skipped["lane_key"] == "antigravity:auth_degraded"
+    assert skipped["cooldown_seconds"] == 300.0
+    assert skipped["attempted_provider_call"] is False
 
 
 @pytest.mark.asyncio

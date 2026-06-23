@@ -343,6 +343,14 @@ valid candidate token and never attempts a direct OAuth refresh or invokes
 `agy`. If all candidate tokens are expired or invalid, LiteLLM fails the
 Antigravity candidate with a clear sidecar-refresh message.
 
+For AAWM auto-agent aliases, stale or missing Antigravity token data is treated
+as provider-auth degradation during candidate selection. The selector records the
+Antigravity candidate under the `antigravity:auth_degraded` lane, marks it
+skipped with `reason=auth_degraded`, applies a short candidate cooldown, and
+continues to the next declared candidate. This expected degraded state logs a
+bounded warning without traceback; unexpected Antigravity lane-resolution
+exceptions still emit traceback-bearing error logs for intake.
+
 The provider-status sidecar is the scheduled Antigravity writer. It mounts the
 managed token directory writable, locks the configured token file, attempts
 direct OAuth refresh using configured/token/CLI-extracted client values, and
@@ -661,6 +669,12 @@ has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or
 `oa_xai/grok-build`. This catches provider-invalid Codex tool variants, including
 `custom`, that could not be classified while the inbound request model was still
 the abstract alias `aawm-code`.
+
+OpenRouter completion-adapter candidates classify provider-wrapped 400 responses
+with `metadata.provider_name` and `metadata.raw=ERROR` as terminal candidate
+failures. Alias probes cool down only that OpenRouter candidate, record
+`OPENROUTER_PROVIDER_RAW_ERROR` in attempt metadata, and continue to the next
+declared candidate rather than surfacing an ASGI traceback to the client.
 
 Grok Composer and Grok Build candidates also drop unsupported reasoning-effort
 fields before egress, including `reasoning`, `reasoning_effort`,
