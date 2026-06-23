@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import litellm
 from litellm._logging import (
+    AawmHealthAccessLogFilter,
     AawmRouteAccessLogReplacementFilter,
     clear_aawm_route_access_log_replacements,
 )
@@ -30,6 +31,10 @@ from litellm.proxy.common_request_processing import (
     create_response,
 )
 from litellm.proxy.dd_span_tagger import DDSpanTagger
+from litellm.proxy.aawm_route_logging import (
+    clear_aawm_route_log_dedup_state,
+    emit_aawm_route_access_log,
+)
 from litellm.proxy.utils import ProxyLogging
 from litellm.types.rerank import RerankResponse
 
@@ -517,6 +522,101 @@ class TestProxyBaseLLMRequestProcessing:
         assert access_filter.filter(
             _build_uvicorn_access_record(full_path="/rerank")
         ) is True
+
+    def test_health_access_log_filter_suppresses_successful_health_checks(self):
+        access_filter = AawmHealthAccessLogFilter()
+
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    method="GET",
+                    full_path="/health/readiness",
+                    status_code=200,
+                )
+            )
+            is False
+        )
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    method="GET",
+                    full_path="/health/liveliness",
+                    status_code=204,
+                )
+            )
+            is False
+        )
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    method="GET",
+                    full_path="/health/readiness",
+                    status_code=503,
+                )
+            )
+            is True
+        )
+        assert access_filter.filter(_build_uvicorn_access_record()) is True
+
+    def test_aawm_route_log_deduplicates_repeated_route_context(
+        self,
+        caplog,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_log_dedup_state()
+        monkeypatch.setenv("AAWM_ROUTE_LOG_DEDUP_WINDOW_SECONDS", "60")
+        request_body = {
+            "model": "text-embedding-3-small",
+            "metadata": {
+                "agent_name": "embed worker",
+                "repository": "litellm",
+                "requested_model_alias": "aawm-mini",
+            },
+        }
+        first_request = _build_aawm_route_log_request(
+            headers={"user-agent": "codex-cli/0.119.0-alpha.29"},
+        )
+        second_request = _build_aawm_route_log_request(
+            client=("172.19.0.1", 52835),
+            headers={"user-agent": "codex-cli/0.119.0-alpha.29"},
+        )
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=route_logger.name):
+                emit_aawm_route_access_log(
+                    request=first_request,
+                    target="https://api.openai.com/v1/embeddings",
+                    request_body=request_body,
+                    route_type="aembedding",
+                )
+                emit_aawm_route_access_log(
+                    request=second_request,
+                    target="https://api.openai.com/v1/embeddings",
+                    request_body=request_body,
+                    route_type="aembedding",
+                )
+        finally:
+            route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_log_dedup_state()
+
+        route_records = [
+            record.getMessage()
+            for record in caplog.records
+            if " [EMBED] " in record.getMessage()
+        ]
+        assert len(route_records) == 1
+
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        assert access_filter.filter(_build_uvicorn_access_record()) is False
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(client_addr="172.19.0.1:52835")
+            )
+            is False
+        )
 
     @pytest.mark.asyncio
     async def test_stream_timeout_header_processing(self):

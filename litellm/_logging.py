@@ -482,6 +482,46 @@ class AawmRouteAccessLogReplacementFilter(logging.Filter):
 _aawm_route_access_log_replacement_filter = AawmRouteAccessLogReplacementFilter()
 
 
+_AAWM_HEALTH_ACCESS_LOG_PATHS = frozenset(
+    {
+        "/health",
+        "/health/",
+        "/health/liveliness",
+        "/health/readiness",
+        "/health/services",
+    }
+)
+_AAWM_HEALTH_ACCESS_LOG_STATUSES = frozenset({200, 204})
+
+
+class AawmHealthAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name not in {"uvicorn.access", "gunicorn.access"}:
+            return True
+
+        args = record.args
+        if not isinstance(args, (list, tuple)) or len(args) < 5:
+            return True
+
+        _client_addr, method, full_path, _http_version, status_code = args[:5]
+        if str(method).upper() != "GET":
+            return True
+        path = _normalize_aawm_route_access_log_replacement_path(full_path).split(
+            "?",
+            1,
+        )[0]
+        if path not in _AAWM_HEALTH_ACCESS_LOG_PATHS:
+            return True
+        try:
+            normalized_status_code = int(status_code)
+        except Exception:
+            return True
+        return normalized_status_code not in _AAWM_HEALTH_ACCESS_LOG_STATUSES
+
+
+_aawm_health_access_log_filter = AawmHealthAccessLogFilter()
+
+
 json_logs = bool(os.getenv("JSON_LOGS", False))
 # Create a handler for the logger (you may need to adapt this based on your needs)
 log_level = os.getenv("LITELLM_LOG", "DEBUG")
@@ -772,8 +812,16 @@ _ensure_filter_on_logger(
     _aawm_route_access_log_replacement_filter,
 )
 _ensure_filter_on_logger(
+    logging.getLogger("uvicorn.access"),
+    _aawm_health_access_log_filter,
+)
+_ensure_filter_on_logger(
     logging.getLogger("gunicorn.access"),
     _aawm_route_access_log_replacement_filter,
+)
+_ensure_filter_on_logger(
+    logging.getLogger("gunicorn.access"),
+    _aawm_health_access_log_filter,
 )
 
 
@@ -889,6 +937,9 @@ def _get_uvicorn_json_log_config():
             "aawm_route_access_replacement": {
                 "()": "litellm._logging.AawmRouteAccessLogReplacementFilter",
             },
+            "aawm_health_access": {
+                "()": "litellm._logging.AawmHealthAccessLogFilter",
+            },
         },
         "handlers": {
             "default": {
@@ -915,7 +966,10 @@ def _get_uvicorn_json_log_config():
             },
             "uvicorn.access": {
                 "handlers": ["access"],
-                "filters": ["aawm_route_access_replacement"],
+                "filters": [
+                    "aawm_route_access_replacement",
+                    "aawm_health_access",
+                ],
                 "level": uvicorn_log_level,
                 "propagate": False,
             },
