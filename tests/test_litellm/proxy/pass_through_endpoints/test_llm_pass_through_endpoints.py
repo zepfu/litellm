@@ -27,6 +27,7 @@ sys.path.insert(
 import litellm
 from litellm._logging import AawmErrorLogFileHandler, verbose_proxy_logger
 from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
+from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     _add_anthropic_auto_agent_alias_metadata,
@@ -14181,6 +14182,115 @@ class TestClaudePersistedOutputExpansion:
         assert "claude_tool_advertisement_compaction_count" not in litellm_metadata
 
     @pytest.mark.asyncio
+    async def test_prepare_anthropic_request_body_reuses_cached_claude_tool_advertisement_compaction(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        long_bash_description = "Run commands safely. " + ("Prefer dedicated tools. " * 80)
+        long_schema_description = (
+            "Clear, concise description of what this command does in active voice. "
+            "Never use words like complex or risk in the description. "
+            + ("Keep it brief. " * 30)
+        )
+        request_body = {
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.113.50e; cc_entrypoint=cli; cch=42aab;",
+                }
+            ],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": long_bash_description,
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command to execute",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": long_schema_description,
+                            },
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "Bash",
+                    "description": long_bash_description,
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The command to execute",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": long_schema_description,
+                            },
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._compact_claude_tool_advertisement",
+            wraps=aawm_claude_control_plane._compact_claude_tool_advertisement,
+        ) as mock_compact_tool:
+            first_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+            second_body, _, _, _ = await _prepare_anthropic_request_body_for_passthrough(
+                mock_request, request_body
+            )
+
+        assert first_body["tools"] == second_body["tools"]
+        assert mock_compact_tool.call_count == 4
+
+        first_metadata = first_body["litellm_metadata"]
+        second_metadata = second_body["litellm_metadata"]
+        assert first_metadata["claude_tool_advertisement_compaction_count"] == 2
+        assert second_metadata["claude_tool_advertisement_compaction_count"] == 2
+        assert first_metadata[
+            "claude_tool_advertisement_compaction_cache_hits"
+        ] == 1
+        assert first_metadata[
+            "claude_tool_advertisement_compaction_cache_misses"
+        ] == 1
+        assert second_metadata[
+            "claude_tool_advertisement_compaction_cache_hits"
+        ] == 2
+        assert second_metadata[
+            "claude_tool_advertisement_compaction_cache_misses"
+        ] == 0
+        first_events = first_metadata["claude_tool_advertisement_compaction_events"]
+        second_events = second_metadata["claude_tool_advertisement_compaction_events"]
+        assert first_events[0]["compaction_cache_status"] == "miss"
+        assert first_events[1]["compaction_cache_status"] == "hit"
+        assert second_events[0]["compaction_cache_status"] == "hit"
+        assert second_events[1]["compaction_cache_status"] == "hit"
+        assert first_events[0]["compaction_schema_fingerprint"] == second_events[0][
+            "compaction_schema_fingerprint"
+        ]
+        assert first_events[0]["saved_chars"] == second_events[0]["saved_chars"]
+
+        first_body["tools"][0]["description"] = "mutated after compaction"
+        assert second_body["tools"][0]["description"].startswith("Run a shell command.")
+
+    @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_applies_claude_prompt_patches(
         self,
     ):
@@ -17203,6 +17313,7 @@ def _build_codex_auto_agent_request(session_id: str = "codex-session"):
 
 @pytest.fixture(autouse=True)
 def clear_codex_auto_agent_alias_state():
+    aawm_claude_control_plane._claude_tool_advertisement_compaction_cache.clear()
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
     _codex_auto_agent_google_lane_key_until_monotonic_by_key.clear()
@@ -17213,6 +17324,7 @@ def clear_codex_auto_agent_alias_state():
     _anthropic_auto_agent_session_affinity_by_key.clear()
     clear_aawm_route_rollups()
     yield
+    aawm_claude_control_plane._claude_tool_advertisement_compaction_cache.clear()
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
     _codex_auto_agent_google_lane_key_until_monotonic_by_key.clear()
