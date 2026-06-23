@@ -96,6 +96,14 @@ fingerprint rather than an active `*-error.jsonl` intake record.
 `AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS` controls the degraded enqueue
 spooling window and defaults to 30 seconds.
 
+If the synchronous flush helper is invoked from an already running event loop,
+LiteLLM does not attempt to nest `run_until_complete`. It durably spools the
+batch for replay, emits degraded telemetry with `spooled=true`, and leaves the
+in-process drainer to recover the rows. Legacy or partially queued records may
+also lack `provider_response_id`; payload construction keeps that column null
+rather than failing the whole batch, while preserving any explicit provider
+response id already present on the record or metadata.
+
 Each `.jsonl` artifact contains one JSON object per line. The first line is a
 metadata/header record with `type=metadata`, `format_version`, `spooled_at`,
 `reason`, `retry_count`, and `record_count`. Each following line is a

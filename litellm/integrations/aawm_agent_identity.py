@@ -3537,6 +3537,36 @@ def _flush_session_history_batch(
     if not records:
         return True
 
+    if loop is not None and loop.is_running():
+        try:
+            spool_paths = _spool_session_history_records(
+                records,
+                reason="session_history batch flush deferred from running event loop",
+            )
+            verbose_logger.warning(
+                "AawmAgentIdentity: deferred session_history flush from a "
+                "running event loop by spooling for replay "
+                "(spooled=true, degraded_telemetry=true, batch_size=%d, "
+                "spool_path_count=%d, %s, %s)",
+                len(records),
+                len(spool_paths),
+                _session_history_queue_depth_summary(),
+                _session_history_spool_summary(),
+            )
+            return True
+        except Exception as exc:
+            if failure_callback is not None:
+                failure_callback(exc)
+            if log_exception:
+                verbose_logger.exception(
+                    "AawmAgentIdentity: failed to defer session_history flush "
+                    "from a running event loop by spooling for replay "
+                    "(spooled=false, degraded_telemetry=false, batch_size=%d, %s)",
+                    len(records),
+                    _session_history_queue_depth_summary(),
+                )
+            return False
+
     started_at = time.perf_counter()
     try:
         if loop is None:
@@ -14026,6 +14056,14 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
 
 
 def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    record["provider_response_id"] = _first_non_empty_string(
+        record.get("provider_response_id"),
+        metadata.get("provider_response_id"),
+        metadata.get("response_id"),
+    )
     _normalize_agent_id_on_record(record)
     _normalize_inbound_model_alias_on_record(record)
     _normalize_reasoning_state(record)
@@ -17278,37 +17316,37 @@ async def _ensure_session_history_schema(conn: Any) -> None:
 def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
     record = _strip_postgres_nul_bytes(_normalize_session_history_record(dict(record)))
     return (
-        record["litellm_call_id"],
-        record["session_id"],
-        record["trace_id"],
-        record["provider_response_id"],
-        record["provider"],
-        record["model"],
-        record["model_group"],
-        record["agent_name"],
-        record["tenant_id"],
-        record["call_type"],
-        record["start_time"],
-        record["end_time"],
-        record["input_tokens"],
-        record["output_tokens"],
-        record["total_tokens"],
-        record["cache_read_input_tokens"],
-        record["cache_creation_input_tokens"],
-        record["reasoning_tokens_reported"],
-        record["reasoning_tokens_estimated"],
-        record["reasoning_tokens_source"],
-        record["reasoning_present"],
-        record["thinking_signature_present"],
+        record.get("litellm_call_id"),
+        record.get("session_id"),
+        record.get("trace_id"),
+        record.get("provider_response_id"),
+        record.get("provider"),
+        record.get("model"),
+        record.get("model_group"),
+        record.get("agent_name"),
+        record.get("tenant_id"),
+        record.get("call_type"),
+        record.get("start_time"),
+        record.get("end_time"),
+        record.get("input_tokens"),
+        record.get("output_tokens"),
+        record.get("total_tokens"),
+        record.get("cache_read_input_tokens"),
+        record.get("cache_creation_input_tokens"),
+        record.get("reasoning_tokens_reported"),
+        record.get("reasoning_tokens_estimated"),
+        record.get("reasoning_tokens_source"),
+        record.get("reasoning_present"),
+        record.get("thinking_signature_present"),
         record.get("provider_cache_attempted", False),
         record.get("provider_cache_status"),
         record.get("provider_cache_miss", False),
         record.get("provider_cache_miss_reason"),
         record.get("provider_cache_miss_token_count"),
         record.get("provider_cache_miss_cost_usd"),
-        record["tool_call_count"],
-        record["invalid_tool_call_count"],
-        json.dumps(record["tool_names"]),
+        record.get("tool_call_count", 0),
+        record.get("invalid_tool_call_count", 0),
+        json.dumps(record.get("tool_names", [])),
         record.get("file_read_count", 0),
         record.get("file_modified_count", 0),
         record.get("changed_pre_commit_config"),
@@ -17317,7 +17355,7 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("changed_gitignore"),
         record.get("git_commit_count", 0),
         record.get("git_push_count", 0),
-        record["response_cost_usd"],
+        record.get("response_cost_usd"),
         record.get("litellm_environment"),
         record.get("litellm_version"),
         record.get("litellm_fork_version"),
@@ -17328,7 +17366,7 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("token_permission_input", 0),
         record.get("token_permission_output", 0),
         record.get("permission_usd_cost", 0),
-        json.dumps(record["metadata"]),
+        json.dumps(record.get("metadata", {})),
         record.get("repository"),
         record.get("input_system_tokens_estimated", 0),
         record.get("input_tool_advertisement_tokens_estimated", 0),
