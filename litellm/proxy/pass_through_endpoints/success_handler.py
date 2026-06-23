@@ -7,6 +7,7 @@ import httpx
 import litellm
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_turn
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
@@ -551,6 +552,7 @@ class PassThroughEndpointLogging:
             standard_pass_through_logging_payload=passthrough_logging_payload,
             **kwargs,
         )
+        record_aawm_route_rollup_turn(kwargs)
 
     def is_vertex_route(self, url_route: str):
         for route in self.TRACKED_VERTEX_ROUTES:

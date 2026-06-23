@@ -453,6 +453,7 @@ class ProxyBaseLLMRequestProcessing:
                 request_body=self.data,
                 kwargs=self.data,
                 route_type=route_type,
+                completed=True,
             )
         except Exception:
             verbose_proxy_logger.debug(

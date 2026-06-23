@@ -12,6 +12,7 @@ from fastapi import Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import litellm
+import litellm.proxy.aawm_route_logging as aawm_route_logging
 from litellm._logging import (
     AawmHealthAccessLogFilter,
     AawmRouteAccessLogReplacementFilter,
@@ -32,8 +33,11 @@ from litellm.proxy.common_request_processing import (
 )
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy.aawm_route_logging import (
+    clear_aawm_route_rollups,
     clear_aawm_route_log_dedup_state,
     emit_aawm_route_access_log,
+    flush_aawm_route_rollups,
+    record_aawm_route_rollup_turn,
 )
 from litellm.proxy.utils import ProxyLogging
 from litellm.types.rerank import RerankResponse
@@ -322,6 +326,8 @@ class TestProxyBaseLLMRequestProcessing:
         monkeypatch,
     ):
         clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
         data = {
             "model": "text-embedding-3-small",
             "input": ["hello"],
@@ -389,6 +395,7 @@ class TestProxyBaseLLMRequestProcessing:
                 )
         finally:
             route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_rollups()
 
         assert response["model"] == "text-embedding-3-small"
         route_records = [
@@ -418,6 +425,8 @@ class TestProxyBaseLLMRequestProcessing:
         tmp_path,
     ):
         clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
         diagnostic_dir = tmp_path / "diagnostic"
         _enable_rerank_diagnostic_capture(monkeypatch, diagnostic_dir)
         data = {
@@ -503,6 +512,7 @@ class TestProxyBaseLLMRequestProcessing:
                 )
         finally:
             route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_rollups()
 
         assert response._hidden_params["api_base"].startswith(
             "https://rerank.example.com/rerank"
@@ -564,7 +574,9 @@ class TestProxyBaseLLMRequestProcessing:
         monkeypatch,
     ):
         clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
         clear_aawm_route_log_dedup_state()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
         monkeypatch.setenv("AAWM_ROUTE_LOG_DEDUP_WINDOW_SECONDS", "60")
         request_body = {
             "model": "text-embedding-3-small",
@@ -600,6 +612,7 @@ class TestProxyBaseLLMRequestProcessing:
                 )
         finally:
             route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_rollups()
             clear_aawm_route_log_dedup_state()
 
         route_records = [
@@ -617,6 +630,83 @@ class TestProxyBaseLLMRequestProcessing:
             )
             is False
         )
+
+    def test_aawm_route_log_rollup_records_completed_turns(
+        self,
+        caplog,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        request_body = {
+            "model": "gpt-5.5",
+            "metadata": {
+                "agent_name": "litellm",
+                "repository": "litellm",
+            },
+        }
+        kwargs = {"litellm_params": {"metadata": {}}}
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={"user-agent": "codex-cli/0.141.0"},
+        )
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=route_logger.name):
+                emit_aawm_route_access_log(
+                    request=request,
+                    target="https://chatgpt.com/backend-api/codex/responses",
+                    request_body=request_body,
+                    kwargs=kwargs,
+                )
+                record_aawm_route_rollup_turn(kwargs)
+                flushed = flush_aawm_route_rollups(force=True)
+        finally:
+            route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_rollups()
+
+        rendered = "\n".join(flushed)
+        assert len(flushed) == 2
+        assert (
+            "litellm@Codex[0.141.0] /openai_passthrough/responses -> "
+            "chatgpt.com/backend-api/codex/responses"
+        ) in rendered
+        assert " - gpt-5.5 - Turns: 1" in rendered
+        assert " [ROUTE] " not in rendered
+
+    def test_aawm_route_rollup_disabled_restores_immediate_route_log(
+        self,
+        caplog,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={"user-agent": "codex-cli/0.141.0"},
+        )
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=route_logger.name):
+                emit_aawm_route_access_log(
+                    request=request,
+                    target="https://chatgpt.com/backend-api/codex/responses",
+                    request_body={"model": "gpt-5.5"},
+                    completed=True,
+                )
+        finally:
+            route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_rollups()
+
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        assert " [ROUTE] Codex/0.141.0" in rendered
+        assert "gpt-5.5" in rendered
 
     @pytest.mark.asyncio
     async def test_stream_timeout_header_processing(self):
@@ -2187,3 +2277,250 @@ class TestHasAttributeErrorInChain:
         exc_a.__context__ = exc_b
         exc_b.__context__ = exc_a  # circular
         assert _has_attribute_error_in_chain(exc_a) is False
+
+
+class TestAawmRouteRollup:
+    def test_route_rollup_header_and_subline_formatting(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import (
+            AawmRouteRollupAccumulator,
+            build_aawm_route_rollup_group_header_label,
+        )
+
+        now = datetime(2026, 6, 23, 1, 6, 52)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        header = build_aawm_route_rollup_group_header_label(
+            repository="litellm",
+            client_product_label="codex-cli/0.141.0",
+        )
+        lines = accumulator.record(
+            group_header_label=header,
+            incoming_endpoint="/openai_passthrough/responses",
+            outgoing_target="chatgpt.com/backend-api/codex/responses",
+            model_label="gemini-3.5-flash-low(aawm-low)",
+            turns=3,
+            now=now,
+        )
+        flushed = accumulator.flush(force=True, now=now)
+        assert lines == []
+        assert len(flushed) == 2
+        assert (
+            flushed[0]
+            == "20260623 01:06:52 litellm@Codex[0.141.0] /openai_passthrough/responses -> chatgpt.com/backend-api/codex/responses"
+        )
+        assert flushed[1] == " - gemini-3.5-flash-low(aawm-low) - Turns: 3"
+
+    def test_route_rollup_status_latest_material_state_wins(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 6, 23, 1, 7, 0)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        header = "litellm@Codex[0.141.0]"
+        endpoint = "/openai_passthrough/responses"
+        target = "chatgpt.com/backend-api/codex/responses"
+        model = "gpt-5.5(aawm-low)"
+
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=target,
+            model_label=model,
+            turns=1,
+            status="Cooling Down",
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=target,
+            model_label=model,
+            turns=2,
+            status="Exhausted",
+            now=now,
+        )
+        flushed = accumulator.flush(force=True, now=now)
+        assert " - gpt-5.5(aawm-low) - Turns: 3 [Exhausted]" in flushed
+
+    def test_route_rollup_interval_zero_disables_accumulation(self, monkeypatch):
+        from litellm.proxy.aawm_route_logging import (
+            AawmRouteRollupAccumulator,
+            aawm_route_rollups_enabled,
+            get_aawm_route_rollup_interval_seconds,
+        )
+
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
+        assert get_aawm_route_rollup_interval_seconds() == 0
+        assert aawm_route_rollups_enabled() is False
+
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=0)
+        assert accumulator.record(
+            group_header_label="litellm@Codex[0.141.0]",
+            incoming_endpoint="/openai_passthrough/responses",
+            outgoing_target="chatgpt.com/backend-api/codex/responses",
+            model_label="gpt-5.5",
+            turns=1,
+        ) == []
+
+    def test_route_rollup_early_flush_prefixes_header(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 6, 23, 1, 8, 12)
+        accumulator = AawmRouteRollupAccumulator(
+            interval_seconds=60,
+            max_sublines=2,
+        )
+        header = "litellm@Codex[0.141.0]"
+        endpoint = "/openai_passthrough/responses"
+        target = "chatgpt.com/backend-api/codex/responses"
+
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=target,
+            model_label="gemini-3.5-flash-low(aawm-low)",
+            turns=1,
+            now=now,
+        )
+        accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=target,
+            model_label="gpt-5.5(aawm-low)",
+            turns=1,
+            now=now,
+        )
+        early_lines = accumulator.record(
+            group_header_label=header,
+            incoming_endpoint=endpoint,
+            outgoing_target=target,
+            model_label="deepseek-v4-flash(aawm-low)",
+            turns=1,
+            now=now,
+        )
+        assert any(line.startswith("20260623 01:08:12 [EARLY]") for line in early_lines)
+        assert "\x1b" not in "\n".join(early_lines)
+
+    def test_route_rollup_output_has_no_ansi_by_default(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 6, 23, 1, 6, 43)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        accumulator.record(
+            group_header_label="litellm@Codex[0.141.0]",
+            incoming_endpoint="/openai_passthrough/responses",
+            outgoing_target="chatgpt.com/backend-api/codex/responses",
+            model_label="gemini-3.5-flash-low(aawm-low)",
+            turns=0,
+            status="Degraded",
+            now=now,
+        )
+        flushed = accumulator.flush(force=True, now=now)
+        rendered = "\n".join(flushed)
+        assert "[Degraded]" in rendered
+        assert "\x1b" not in rendered
+
+    def test_clear_and_flush_aawm_route_rollups_helpers(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import (
+            clear_aawm_route_rollups,
+            flush_aawm_route_rollups,
+            get_aawm_route_rollup_accumulator,
+        )
+
+        now = datetime(2026, 6, 23, 2, 0, 0)
+        accumulator = get_aawm_route_rollup_accumulator()
+        clear_aawm_route_rollups()
+        accumulator.record(
+            group_header_label="aegis@Claude[2.1.178]",
+            incoming_endpoint="/anthropic/v1/messages?beta=true",
+            outgoing_target="api.anthropic.com/v1/messages",
+            model_label="orchestrator.claude-opus-4-8",
+            turns=2,
+            now=now,
+        )
+        flushed = flush_aawm_route_rollups(force=True, now=now)
+        assert any("aegis@Claude[2.1.178]" in line for line in flushed)
+        clear_aawm_route_rollups()
+        assert flush_aawm_route_rollups(force=True, now=now) == []
+
+    def test_route_rollup_flush_due_without_subsequent_record(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 6, 23, 2, 30, 0)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        accumulator.record(
+            group_header_label="litellm@Codex[0.141.0]",
+            incoming_endpoint="/openai_passthrough/responses",
+            outgoing_target="chatgpt.com/backend-api/codex/responses",
+            model_label="gpt-5.5",
+            turns=2,
+            now=now,
+        )
+        accumulator._last_flush_monotonic = 0.0
+        flushed = accumulator.flush_due(now=now, monotonic_now=61.0)
+        assert len(flushed) == 2
+        assert "Turns: 2" in flushed[1]
+        assert accumulator.flush(force=True, now=now) == []
+
+    def test_route_rollup_interval_tick_flushes_idle_bucket(self, monkeypatch):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import (
+            _set_aawm_route_rollup_monotonic_now_for_tests,
+            _stop_aawm_route_rollup_flush_worker,
+            _tick_aawm_route_rollup_interval_flush,
+            clear_aawm_route_rollups,
+            get_aawm_route_rollup_accumulator,
+        )
+
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        clear_aawm_route_rollups()
+        now = datetime(2026, 6, 23, 2, 31, 0)
+
+        def fake_monotonic() -> float:
+            return 61.0
+
+        _set_aawm_route_rollup_monotonic_now_for_tests(fake_monotonic)
+        try:
+            accumulator = get_aawm_route_rollup_accumulator()
+            accumulator.record(
+                group_header_label="litellm@Codex[0.141.0]",
+                incoming_endpoint="/openai_passthrough/responses",
+                outgoing_target="chatgpt.com/backend-api/codex/responses",
+                model_label="gpt-5.5",
+                turns=1,
+                now=now,
+            )
+            accumulator._last_flush_monotonic = 0.0
+            _tick_aawm_route_rollup_interval_flush()
+            assert flush_aawm_route_rollups(force=True, now=now) == []
+        finally:
+            _set_aawm_route_rollup_monotonic_now_for_tests(None)
+            _stop_aawm_route_rollup_flush_worker()
+            clear_aawm_route_rollups()
+
+    def test_route_rollup_interval_zero_skips_background_flush_worker(
+        self,
+        monkeypatch,
+    ):
+        from litellm.proxy.aawm_route_logging import (
+            _stop_aawm_route_rollup_flush_worker,
+            clear_aawm_route_rollups,
+            get_aawm_route_rollup_accumulator,
+        )
+
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
+        _stop_aawm_route_rollup_flush_worker()
+        clear_aawm_route_rollups()
+        get_aawm_route_rollup_accumulator()
+        assert aawm_route_logging._aawm_route_rollup_flush_thread is None
