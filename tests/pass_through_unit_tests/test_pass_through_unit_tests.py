@@ -596,23 +596,41 @@ def test_init_kwargs_filters_pricing_params(mock_request, mock_user_api_key_dict
         ),
     )
     
-    # Verify pricing parameters were filtered out from parsed_body
-    assert "input_cost_per_token" not in parsed_body
-    assert "output_cost_per_token" not in parsed_body
-    assert "input_cost_per_second" not in parsed_body
-    assert "output_cost_per_second" not in parsed_body
-    assert "cache_read_input_token_cost" not in parsed_body
-    assert "cache_creation_input_token_cost" not in parsed_body
-    assert "cache_creation_input_token_cost_above_1hr" not in parsed_body
-    assert "input_cost_per_token_batches" not in parsed_body
-    assert "output_cost_per_token_batches" not in parsed_body
-    assert "input_cost_per_audio_token" not in parsed_body
-    assert "output_cost_per_audio_token" not in parsed_body
-    assert "input_cost_per_character" not in parsed_body
-    assert "output_cost_per_character" not in parsed_body
-    assert "input_cost_per_image" not in parsed_body
-    assert "output_cost_per_image" not in parsed_body
-    assert "tiered_pricing" not in parsed_body
+    # Verify pricing parameters remain on the source body for observability but
+    # are filtered from the provider-bound proxy request body.
+    assert "input_cost_per_token" in parsed_body
+    proxy_body = result["litellm_params"]["proxy_server_request"]["body"]
+    assert "input_cost_per_token" not in proxy_body
+    assert "output_cost_per_token" in parsed_body
+    assert "output_cost_per_token" not in proxy_body
+    assert "input_cost_per_second" in parsed_body
+    assert "input_cost_per_second" not in proxy_body
+    assert "output_cost_per_second" in parsed_body
+    assert "output_cost_per_second" not in proxy_body
+    assert "cache_read_input_token_cost" in parsed_body
+    assert "cache_read_input_token_cost" not in proxy_body
+    assert "cache_creation_input_token_cost" in parsed_body
+    assert "cache_creation_input_token_cost" not in proxy_body
+    assert "cache_creation_input_token_cost_above_1hr" in parsed_body
+    assert "cache_creation_input_token_cost_above_1hr" not in proxy_body
+    assert "input_cost_per_token_batches" in parsed_body
+    assert "input_cost_per_token_batches" not in proxy_body
+    assert "output_cost_per_token_batches" in parsed_body
+    assert "output_cost_per_token_batches" not in proxy_body
+    assert "input_cost_per_audio_token" in parsed_body
+    assert "input_cost_per_audio_token" not in proxy_body
+    assert "output_cost_per_audio_token" in parsed_body
+    assert "output_cost_per_audio_token" not in proxy_body
+    assert "input_cost_per_character" in parsed_body
+    assert "input_cost_per_character" not in proxy_body
+    assert "output_cost_per_character" in parsed_body
+    assert "output_cost_per_character" not in proxy_body
+    assert "input_cost_per_image" in parsed_body
+    assert "input_cost_per_image" not in proxy_body
+    assert "output_cost_per_image" in parsed_body
+    assert "output_cost_per_image" not in proxy_body
+    assert "tiered_pricing" in parsed_body
+    assert "tiered_pricing" not in proxy_body
     
     # Verify valid OpenAI parameters remain in parsed_body
     assert parsed_body["model"] == "gpt-4"

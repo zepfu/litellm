@@ -1,6 +1,5 @@
 import ast
 import asyncio
-import copy
 import hashlib
 import importlib
 import json
@@ -501,6 +500,57 @@ def _build_passthrough_logging_input(
 ) -> List[Dict[str, str]]:
     """Build the serialized passthrough logging envelope once for reuse."""
     return _build_passthrough_request_observability_envelope(parsed_body).logging_input
+
+
+def _shallow_copy_request_dict(body: dict) -> dict:
+    return dict(body)
+
+
+def _copy_custom_body_for_passthrough(custom_body: dict) -> dict:
+    """Shallow-copy route-owned custom bodies instead of deep-copying large payloads."""
+    return _shallow_copy_request_dict(custom_body)
+
+
+def _detach_passthrough_body_for_kwargs(
+    parsed_body: Optional[dict],
+) -> tuple[dict, Optional[dict]]:
+    """
+    Copy-on-write detach for litellm param stripping.
+
+    When litellm-owned keys are present, return a shallow mutable copy for kwargs
+    construction while preserving the original body reference for observability
+    envelopes and logging.
+    """
+    if not isinstance(parsed_body, dict):
+        return {}, None
+
+    from litellm.types.utils import all_litellm_params
+
+    litellm_param_keys = [key for key in all_litellm_params if key in parsed_body]
+    if not litellm_param_keys:
+        return parsed_body, parsed_body
+
+    working_body = _shallow_copy_request_dict(parsed_body)
+    return working_body, parsed_body
+
+
+def _provider_bound_body_from_kwargs(kwargs: Optional[dict]) -> Optional[dict]:
+    if not isinstance(kwargs, dict):
+        return None
+
+    litellm_params = kwargs.get("litellm_params")
+    if not isinstance(litellm_params, dict):
+        return None
+
+    proxy_server_request = litellm_params.get("proxy_server_request")
+    if not isinstance(proxy_server_request, dict):
+        return None
+
+    provider_bound_body = proxy_server_request.get("body")
+    if isinstance(provider_bound_body, dict):
+        return provider_bound_body
+
+    return None
 
 
 def _extract_passthrough_exception_detail(exc: Exception) -> Optional[str]:
@@ -2290,6 +2340,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         _parsed_body = _parsed_body or {}
         from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
 
+        working_body, _provider_body = _detach_passthrough_body_for_kwargs(_parsed_body)
+
         request_headers = dict(request.headers) if request.headers is not None else None
         resolved_end_user_id = (
             get_end_user_id_from_request_body(
@@ -2308,8 +2360,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         litellm_params_in_body = {}
         for k in all_litellm_params:
-            if k in _parsed_body:
-                litellm_params_in_body[k] = _parsed_body.pop(k, None)
+            if k in working_body:
+                litellm_params_in_body[k] = working_body.pop(k, None)
 
         _metadata = dict(
             StandardLoggingUserAPIKeyMetadata(
@@ -2357,7 +2409,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 "proxy_server_request": {
                     "url": str(request.url),
                     "method": request.method,
-                    "body": copy.copy(_parsed_body),  # use copy instead of deepcopy
+                    "body": _shallow_copy_request_dict(working_body),
                     "headers": request_headers or {},
                 },
             },
@@ -2572,7 +2624,7 @@ async def pass_through_request(  # noqa: PLR0915
         )
 
         if custom_body:
-            _parsed_body = copy.deepcopy(custom_body)
+            _parsed_body = _copy_custom_body_for_passthrough(custom_body)
         elif is_multipart:
             # Don't parse multipart body here - it will be handled by make_multipart_http_request
             _parsed_body = {}
@@ -2693,6 +2745,9 @@ async def pass_through_request(  # noqa: PLR0915
             request=request,
             logging_obj=logging_obj,
         )
+        provider_bound_body = _provider_bound_body_from_kwargs(kwargs)
+        if provider_bound_body is None:
+            provider_bound_body = _parsed_body if isinstance(_parsed_body, dict) else {}
         local_prepare_completed_at = datetime.now()
         local_prepare_ms = _record_passthrough_duration(
             kwargs,
@@ -2805,7 +2860,7 @@ async def pass_through_request(  # noqa: PLR0915
                 req = async_client.build_request(
                     "POST",
                     url,
-                    json=_parsed_body,
+                    json=provider_bound_body,
                     params=requested_query_params,
                     headers=headers,
                 )
@@ -2882,7 +2937,7 @@ async def pass_through_request(  # noqa: PLR0915
                     url=url,
                     headers=headers,
                     requested_query_params=requested_query_params,
-                    _parsed_body=_parsed_body,
+                    _parsed_body=provider_bound_body,
                     raw_body=raw_body,
                 )
             )
