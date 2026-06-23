@@ -4532,6 +4532,141 @@ class TestPassThroughTerminalFailureLogging:
 
         assert not (tmp_path / "dev-error.jsonl").exists()
 
+    def _build_anthropic_upstream_failure_fixture(
+        self,
+        *,
+        status_code: int,
+        upstream_detail: str,
+        model: str,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages?beta=true"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer sk-ant-oat01-fake-token-for-testing",
+            "anthropic-version": "2023-06-01",
+        }
+        mock_request.query_params = {"beta": "true"}
+
+        target_url = "https://api.anthropic.com/v1/messages"
+        upstream_response = httpx.Response(
+            status_code=status_code,
+            content=upstream_detail.encode("utf-8"),
+            request=httpx.Request("POST", target_url),
+        )
+        return {
+            "request": mock_request,
+            "request_body": {
+                "model": model,
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "target_url": target_url,
+            "upstream_response": upstream_response,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status_code", "upstream_detail", "model", "expected_failure_kind"),
+        [
+            (
+                401,
+                (
+                    '{"type":"error","error":{"type":"authentication_error",'
+                    '"message":"Invalid authentication credentials"},'
+                    '"request_id":"req_auth"}'
+                ),
+                "claude-haiku-4-5-20251001",
+                "anthropic_client_authentication_error",
+            ),
+            (
+                404,
+                (
+                    '{"type":"error","error":{"type":"not_found_error",'
+                    '"message":"model: opus-4-8"},'
+                    '"request_id":"req_model"}'
+                ),
+                "opus-4-8",
+                "anthropic_model_not_found",
+            ),
+        ],
+    )
+    async def test_pass_through_request_known_anthropic_client_failures_warn_without_traceback(  # noqa: PLR0915
+        self,
+        monkeypatch,
+        tmp_path,
+        status_code,
+        upstream_detail,
+        model,
+        expected_failure_kind,
+    ):
+        fixture = self._build_anthropic_upstream_failure_fixture(
+            status_code=status_code,
+            upstream_detail=upstream_detail,
+            model=model,
+        )
+        handler = AsyncMock(return_value=fixture["upstream_response"])
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch.object(
+                verbose_proxy_logger,
+                "warning",
+            ) as mock_warning:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    side_effect=lambda **kwargs: kwargs["data"]
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=fixture["request"],
+                        target=fixture["target_url"],
+                        custom_headers={},
+                        custom_body=fixture["request_body"],
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                        custom_llm_provider=None,
+                        caller_managed_hidden_retry=True,
+                        retryable_upstream_status_codes=[500, 502, 503, 504],
+                    )
+
+                assert exc_info.value.code == str(status_code)
+                assert handler.await_count == 1
+                mock_warning.assert_called_once()
+                warning_context = mock_warning.call_args.kwargs["extra"]
+                assert warning_context["failure_kind"] == expected_failure_kind
+                assert warning_context["upstream_url"] == fixture["target_url"]
+                assert warning_context["model"] == model
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        assert not (tmp_path / "dev-error.jsonl").exists()
+
     @pytest.mark.asyncio
     async def test_pass_through_request_unexpected_grok_signals_401_keeps_redacted_jsonl_intake(  # noqa: PLR0915
         self,

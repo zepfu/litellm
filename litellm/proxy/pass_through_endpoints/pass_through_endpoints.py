@@ -96,6 +96,8 @@ PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (
 PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset(
     {500, 502, 503, 504, 529}
 )
+_ANTHROPIC_INVALID_AUTHENTICATION_MARKER = "invalid authentication credentials"
+_ANTHROPIC_MODEL_NOT_FOUND_PREFIX = "model:"
 
 # Global registry to track registered pass-through routes and prevent memory leaks
 _registered_pass_through_routes: Dict[
@@ -785,6 +787,60 @@ def _is_known_google_code_assist_tos_violation_response(
 
     payload = _coerce_upstream_error_payload(detail)
     return _is_google_code_assist_tos_violation_payload(payload)
+
+
+def _is_anthropic_passthrough_target(
+    *,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+) -> bool:
+    provider = str(custom_llm_provider or "").strip().lower()
+    hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
+    return provider == "anthropic" or hostname == "api.anthropic.com"
+
+
+def _get_known_anthropic_passthrough_failure_kind(
+    *,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> Optional[str]:
+    if status_code not in {status.HTTP_401_UNAUTHORIZED, status.HTTP_404_NOT_FOUND}:
+        return None
+
+    if not _is_anthropic_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return None
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if detail is None:
+        return None
+
+    payload = _coerce_upstream_error_payload(detail)
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+
+    error_type = str(error.get("type") or "").strip().lower()
+    message = str(error.get("message") or "").strip().lower()
+    if (
+        status_code == status.HTTP_401_UNAUTHORIZED
+        and error_type == "authentication_error"
+        and _ANTHROPIC_INVALID_AUTHENTICATION_MARKER in message
+    ):
+        return "anthropic_client_authentication_error"
+    if (
+        status_code == status.HTTP_404_NOT_FOUND
+        and error_type == "not_found_error"
+        and message.startswith(_ANTHROPIC_MODEL_NOT_FOUND_PREFIX)
+    ):
+        return "anthropic_model_not_found"
+    return None
 
 
 def _get_case_insensitive_mapping_value(
@@ -3395,6 +3451,12 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        known_anthropic_failure_kind = _get_known_anthropic_passthrough_failure_kind(
+            url=url,
+            custom_llm_provider=custom_llm_provider,
+            status_code=status_code,
+            exc=e,
+        )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
@@ -3448,6 +3510,16 @@ async def pass_through_request(  # noqa: PLR0915
                 extra={
                     **error_log_context,
                     "failure_kind": "google_code_assist_tos_violation",
+                },
+            )
+        elif known_anthropic_failure_kind is not None:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced Anthropic provider/client failure status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": known_anthropic_failure_kind,
                 },
             )
         elif suppress_terminal_failure_traceback:
@@ -3521,6 +3593,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_grok_signals_auth_context_traceback
             and not suppress_chatgpt_codex_block_page_traceback
             and not suppress_google_code_assist_tos_traceback
+            and known_anthropic_failure_kind is None
         ):
             traceback_str = traceback.format_exc(
                 limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,

@@ -61,6 +61,12 @@ litellm_settings:
 
 This setting forwards the user's OAuth token (in the `Authorization` header) through LiteLLM to the Anthropic API, enabling per-user authentication with their Max subscription while LiteLLM handles tracking and controls.
 
+For native Anthropic passthrough traffic, LiteLLM preserves the incoming OAuth
+`Authorization` header and adds Anthropic's OAuth passthrough headers when the
+token is an Anthropic OAuth token. If Claude Code sends known shorthand model
+names such as `opus-4-8`, LiteLLM normalizes them to Anthropic provider model
+IDs before forwarding while retaining the inbound alias in logging metadata.
+
 :::
 
 ## Step 2: Start LiteLLM Proxy
