@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import json
 from datetime import datetime, timezone
@@ -11082,6 +11083,72 @@ def test_session_history_spool_drainer_keeps_records_when_flush_fails(
 
     assert flush_attempts == [[record]]
     assert len(aawm_agent_identity._session_history_spool_paths()) == 1
+
+
+@pytest.mark.asyncio
+async def test_flush_session_history_batch_spools_when_loop_is_running(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    record = {
+        "litellm_call_id": "call-running-loop",
+        "trace_id": "trace-running-loop",
+        "start_time": datetime(2026, 6, 22, 20, 26, tzinfo=timezone.utc),
+    }
+    warning_mock = MagicMock()
+    drainer_mock = MagicMock()
+    persist_mock = AsyncMock()
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_persist_session_history_records",
+        persist_mock,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_ensure_session_history_spool_drainer_started",
+        drainer_mock,
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    result = aawm_agent_identity._flush_session_history_batch(
+        [record],
+        loop=asyncio.get_running_loop(),
+    )
+
+    assert result is True
+    persist_mock.assert_not_awaited()
+    drainer_mock.assert_called_once()
+    paths = aawm_agent_identity._session_history_spool_paths()
+    assert len(paths) == 1
+    assert aawm_agent_identity._load_session_history_spool_records(paths[0]) == [
+        record
+    ]
+    assert any(
+        "deferred session_history flush from a running event loop" in call.args[0]
+        for call in warning_mock.call_args_list
+    )
+
+
+def test_build_session_history_db_payload_defaults_missing_provider_response_id() -> None:
+    payload = _build_session_history_db_payload(
+        {
+            "litellm_call_id": "call-missing-provider-response",
+            "trace_id": "trace-missing-provider-response",
+            "metadata": {"response_id": ""},
+        }
+    )
+
+    assert payload[0] == "call-missing-provider-response"
+    assert payload[2] == "trace-missing-provider-response"
+    assert payload[3] is None
 
 
 def test_shutdown_session_history_worker_waits_for_queue_space(monkeypatch) -> None:
