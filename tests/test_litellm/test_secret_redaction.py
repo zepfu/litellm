@@ -268,6 +268,79 @@ def test_aawm_error_log_handler_writes_redacted_traceback(monkeypatch, tmp_path)
     assert "REDACTED" in payload["raw_text"]
 
 
+def test_aawm_error_log_handler_repairs_bind_mount_owner_and_mode(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_FILE_UID", "1234")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_FILE_GID", "5678")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_FILE_MODE", "0601")
+
+    chown_calls = []
+    chmod_calls = []
+
+    def fake_chown(path, uid, gid):
+        chown_calls.append((path, uid, gid))
+
+    def fake_chmod(path, mode):
+        chmod_calls.append((path, mode))
+
+    monkeypatch.setattr("litellm._logging.os.chown", fake_chown)
+    monkeypatch.setattr("litellm._logging.os.chmod", fake_chmod)
+
+    handler = AawmErrorLogFileHandler()
+    record = logging.LogRecord(
+        name="LiteLLM Proxy",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg="managed error",
+        args=(),
+        exc_info=None,
+    )
+
+    handler.emit(record)
+
+    log_path = str(tmp_path / "dev-error.jsonl")
+    assert chown_calls == [(log_path, 1234, 5678)]
+    assert chmod_calls == [(log_path, 0o601)]
+    payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
+    assert payload["message"] == "managed error"
+
+
+def test_aawm_error_log_handler_ignores_owner_repair_failure(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_FILE_UID", "1234")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_FILE_GID", "5678")
+
+    def failing_chown(path, uid, gid):
+        raise PermissionError("cannot chown")
+
+    monkeypatch.setattr("litellm._logging.os.chown", failing_chown)
+
+    handler = AawmErrorLogFileHandler()
+    record = logging.LogRecord(
+        name="LiteLLM Proxy",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg="managed error after chown failure",
+        args=(),
+        exc_info=None,
+    )
+
+    handler.emit(record)
+
+    payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
+    assert payload["message"] == "managed error after chown failure"
+
+
 def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
     monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
     monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")

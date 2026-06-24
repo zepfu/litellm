@@ -152,6 +152,75 @@ def _get_aawm_legacy_error_log_path() -> Optional[str]:
     return os.path.join(log_dir, f"{_get_aawm_error_log_environment()}-error.log")
 
 
+def _parse_aawm_error_log_non_negative_int_env(name: str) -> Optional[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _parse_aawm_error_log_file_mode_env() -> Optional[int]:
+    raw = os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_MODE", "").strip()
+    if not raw:
+        return None
+    try:
+        mode = int(raw, 8)
+    except ValueError:
+        return None
+    if mode < 0 or mode > 0o777:
+        return None
+    return mode
+
+
+def _normalize_aawm_error_log_file_metadata(log_path: str) -> None:
+    """Best-effort host bind-mount ownership repair for runtime JSONL intake."""
+    try:
+        parent_dir = os.path.dirname(os.path.abspath(log_path)) or "."
+        parent_stat = os.stat(parent_dir)
+        target_uid = (
+            _parse_aawm_error_log_non_negative_int_env(
+                "LITELLM_AAWM_ERROR_LOG_FILE_UID"
+            )
+            if os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_UID", "").strip()
+            else parent_stat.st_uid
+        )
+        target_gid = (
+            _parse_aawm_error_log_non_negative_int_env(
+                "LITELLM_AAWM_ERROR_LOG_FILE_GID"
+            )
+            if os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_GID", "").strip()
+            else parent_stat.st_gid
+        )
+        current_stat = os.stat(log_path)
+        if (
+            target_uid is not None
+            and target_gid is not None
+            and (current_stat.st_uid, current_stat.st_gid)
+            != (target_uid, target_gid)
+            and hasattr(os, "chown")
+        ):
+            try:
+                os.chown(log_path, target_uid, target_gid)
+            except OSError:
+                pass
+
+        target_mode = _parse_aawm_error_log_file_mode_env()
+        if target_mode is not None and (current_stat.st_mode & 0o777) != target_mode:
+            try:
+                os.chmod(log_path, target_mode)
+            except OSError:
+                pass
+    except Exception:
+        # Error intake must never fail the application logging path.
+        return
+
+
 _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "source",
     "container",
@@ -322,6 +391,7 @@ class AawmErrorLogFileHandler(logging.Handler):
                 with open(log_path, "a", encoding="utf-8") as error_log:
                     error_log.write(safe_dumps(payload))
                     error_log.write("\n")
+                _normalize_aawm_error_log_file_metadata(log_path)
         except Exception:
             # Never let local error-intake logging break application logging.
             return
