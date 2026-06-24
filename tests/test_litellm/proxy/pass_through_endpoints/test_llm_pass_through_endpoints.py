@@ -6282,23 +6282,31 @@ class TestPassThroughRequestRetryableFailures:
             self._install_aawm_error_log_handler(tmp_path, monkeypatch)
         )
 
+        async def _noop_streaming_logger(**kwargs):
+            return None
+
+        monkeypatch.setattr(
+            PassThroughStreamingHandler,
+            "_route_streaming_logging_to_handler",
+            _noop_streaming_logger,
+        )
+
         chunks: list[bytes] = []
         success_handler_kwargs = {"litellm_params": {"metadata": {}}}
         try:
-            with pytest.raises(httpx.ReadTimeout):
-                async for chunk in PassThroughStreamingHandler.chunk_processor(
-                    response=PartiallyFailingStreamingResponse(),  # type: ignore[arg-type]
-                    request_body={"model": "claude-opus-4-8"},
-                    litellm_logging_obj=MagicMock(),
-                    endpoint_type=EndpointType.ANTHROPIC,
-                    start_time=datetime.now(),
-                    passthrough_success_handler_obj=MagicMock(),
-                    url_route=target_url,
-                    custom_llm_provider="anthropic",
-                    success_handler_kwargs=success_handler_kwargs,
-                    error_log_context=error_context,
-                ):
-                    chunks.append(chunk)
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=PartiallyFailingStreamingResponse(),  # type: ignore[arg-type]
+                request_body={"model": "claude-opus-4-8"},
+                litellm_logging_obj=MagicMock(),
+                endpoint_type=EndpointType.ANTHROPIC,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(),
+                url_route=target_url,
+                custom_llm_provider="anthropic",
+                success_handler_kwargs=success_handler_kwargs,
+                error_log_context=error_context,
+            ):
+                chunks.append(chunk)
         finally:
             self._restore_verbose_proxy_logger(
                 saved_handlers,
@@ -6315,7 +6323,7 @@ class TestPassThroughRequestRetryableFailures:
         payload = next(
             item
             for item in payloads
-            if "Error in chunk_processor" in item["message"]
+            if "Streaming response interrupted after first byte" in item["message"]
         )
 
         assert payload["context"]["failure_kind"] == "streaming_upstream_read_timeout"
@@ -6326,7 +6334,13 @@ class TestPassThroughRequestRetryableFailures:
         assert payload["context"]["stream_hidden_retry_safe"] is False
         assert payload["context"]["stream_chunks_seen"] == 1
         assert payload["context"]["stream_bytes_seen"] == len(chunks[0])
-        assert "ReadTimeout" in payload["traceback"]
+        assert payload["traceback"] is None
+        metadata = success_handler_kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_stream_interrupted"] is True
+        assert metadata["failure_kind"] == "streaming_upstream_read_timeout"
+        assert metadata["stream_failure_stage"] == "stream_interrupted_after_first_byte"
+        assert metadata["stream_chunks_seen"] == 1
+        assert metadata["stream_bytes_seen"] == len(chunks[0])
 
     @pytest.mark.asyncio
     async def test_streaming_post_response_logging_error_jsonl_includes_context(
