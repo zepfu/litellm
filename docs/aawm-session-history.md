@@ -432,7 +432,10 @@ unsupported. This includes `reasoning` items that carry `encrypted_content` from
 another provider's compacted Responses state; forwarding those blobs to Grok can
 trigger provider errors such as `Could not decode the compaction blob`. Ordinary
 non-reasoning continuation items, including `function_call` and
-`function_call_output`, remain in the outbound request. If a Grok-family
+`function_call_output`, remain in the outbound request. For Grok native
+Responses passthrough, `function_call.arguments` is coerced to a JSON object
+before forwarding: existing dicts are preserved, parseable JSON strings are
+parsed, and missing/empty/invalid/non-object values default to `{}`. If a Grok-family
 upstream still rejects a compacted request with `Could not decode the compaction
 blob`, alias-probe mode classifies that 400 as candidate-unavailable so the
 declared failover sequence can continue instead of stranding the worker on the

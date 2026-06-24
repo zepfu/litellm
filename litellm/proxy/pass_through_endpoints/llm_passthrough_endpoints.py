@@ -1558,6 +1558,131 @@ def _sanitize_xai_responses_request_body(
     return updated_body, removed_params, tool_changes
 
 
+def _coerce_grok_native_function_call_arguments_value(
+    arguments_value: Any,
+) -> tuple[dict[str, Any], Optional[str]]:
+    if isinstance(arguments_value, dict):
+        return dict(arguments_value), None
+    if arguments_value is None:
+        return {}, "missing"
+    if isinstance(arguments_value, str):
+        stripped_arguments = arguments_value.strip()
+        if not stripped_arguments:
+            return {}, "empty"
+        try:
+            parsed_arguments = json.loads(stripped_arguments)
+        except json.JSONDecodeError:
+            return {}, "invalid_json"
+        if isinstance(parsed_arguments, dict):
+            return parsed_arguments, "parsed_json_string"
+        return {}, "non_object_json"
+    return {}, "unsupported_type"
+
+
+def _sanitize_grok_native_function_call_arguments_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body, []
+
+    sanitized_items: list[Any] = []
+    changes: list[dict[str, Any]] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            sanitized_items.append(item)
+            continue
+
+        updated_item = dict(item)
+        coerced_arguments, reason = _coerce_grok_native_function_call_arguments_value(
+            updated_item.get("arguments")
+        )
+        if updated_item.get("arguments") != coerced_arguments:
+            updated_item["arguments"] = coerced_arguments
+            change: dict[str, Any] = {
+                "type": "function_call",
+                "index": index,
+            }
+            if (
+                isinstance(updated_item.get("call_id"), str)
+                and updated_item["call_id"].strip()
+            ):
+                change["call_id"] = updated_item["call_id"].strip()
+            if (
+                isinstance(updated_item.get("name"), str)
+                and updated_item["name"].strip()
+            ):
+                change["name"] = updated_item["name"].strip()
+            if reason:
+                change["reason"] = reason
+            changes.append(change)
+        sanitized_items.append(updated_item)
+
+    if not changes:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["input"] = sanitized_items
+    return updated_body, changes
+
+
+def _sanitize_grok_native_function_call_arguments_in_place(
+    request_body: dict[str, Any],
+) -> list[dict[str, Any]]:
+    updated_body, changes = _sanitize_grok_native_function_call_arguments_request_body(
+        request_body
+    )
+    if updated_body is not request_body:
+        request_body.clear()
+        request_body.update(updated_body)
+    if not changes:
+        return []
+
+    reasons = _dedupe_sorted_str_list(
+        [
+            normalized
+            for change in changes
+            if (normalized := _normalize_low_cardinality_tag_value(change.get("reason")))
+        ]
+    )
+    metadata_changes = [
+        {
+            key: value
+            for key, value in change.items()
+            if key in {"type", "index", "call_id", "name", "reason"}
+        }
+        for change in changes
+    ]
+    merged_body = _merge_litellm_metadata(
+        request_body,
+        tags_to_add=[
+            "grok-native-function-call-arguments-sanitized",
+            *(
+                f"grok-native-function-call-arguments-reason:{reason}"
+                for reason in reasons
+            ),
+        ],
+        extra_fields={
+            "grok_native_function_call_arguments_sanitized": True,
+            "grok_native_function_call_arguments_sanitized_count": len(changes),
+            "grok_native_function_call_arguments_sanitized_reasons": reasons,
+            "grok_native_function_call_arguments_sanitized_items": metadata_changes,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="grok.native_function_call_arguments_sanitized",
+                    metadata={
+                        "sanitized_count": len(changes),
+                        "reasons": reasons,
+                    },
+                )
+            ],
+        },
+    )
+    request_body.clear()
+    request_body.update(merged_body)
+    return changes
+
+
 def _sanitize_xai_responses_request_body_in_place(
     request_body: dict[str, Any],
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -1768,6 +1893,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
     prepared_body, _grok_unsupported_input_items = (
         _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     )
+    _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
     _sanitize_xai_responses_request_body_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
@@ -22064,6 +22190,7 @@ def _prepare_grok_request_body_for_passthrough(
     prepared_body, _grok_unsupported_input_items = (
         _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     )
+    _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
     )
