@@ -526,6 +526,14 @@ Those events also contribute zero-turn rollup sublines so multiple failed
 candidates remain visible in the same bucket. Rollups flush on the configured
 interval and at process shutdown via a shutdown-safe flush helper.
 
+Successful Codex auto-agent requests adapted to OpenCode Zen chat completions or
+OpenRouter chat completions also register native access-log replacement and
+completed-turn rollups. Their rollup sublines use the real outbound endpoint
+(`opencode.ai/zen/v1/chat/completions` or
+`openrouter.ai/api/v1/chat/completions`) rather than the internal adapter route
+family, so operators can distinguish provider traffic without also seeing raw
+`adapted_to=...` Uvicorn access records for successful requests.
+
 AAWM alias routing audit events are still attached to request metadata for
 session-history and diagnostic consumers. Container log emission is narrower:
 failures, cooldowns, redispatches, no-candidate outcomes, and explicit warning
@@ -746,6 +754,10 @@ with `metadata.provider_name` and `metadata.raw=ERROR` as terminal candidate
 failures. Alias probes cool down only that OpenRouter candidate, record
 `OPENROUTER_PROVIDER_RAW_ERROR` in attempt metadata, and continue to the next
 declared candidate rather than surfacing an ASGI traceback to the client.
+Successful non-streaming OpenRouter completion-adapter requests also contribute
+completed turns to the AAWM route rollup and suppress their matching native
+`/openai_passthrough/responses?adapted_to=openrouter.ai/api/v1/chat/completions`
+success access record.
 
 Grok Composer and Grok Build candidates also drop unsupported reasoning-effort
 fields before egress, including `reasoning`, `reasoning_effort`,
