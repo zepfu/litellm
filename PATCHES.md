@@ -53,6 +53,34 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.100 — Retain replaced aiohttp sessions for deterministic cleanup
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.100`.
+`LiteLLMAiohttpTransport` now retains owned `aiohttp.ClientSession` instances
+that are replaced on the synchronous session-validation path when the old
+session cannot be closed safely on the current event loop. Retained sessions are
+closed during transport `aclose()`, and shared sessions
+(`owns_session=False`) are neither retained nor closed by the transport. The
+dev compose profile now bind-mounts
+`litellm/llms/custom_httpx/aiohttp_transport.py` so `litellm-dev` can verify
+this lifecycle code without requiring a full image rebuild.
+
+**Why:** Production runtime error intake captured an `asyncio` unclosed
+`ClientSession` warning. The replacement path previously had an explicit
+wrong-loop fallback that relied on garbage collection, which can surface as a
+one-off unclosed-session warning during restarts or event-loop teardown.
+
+**Why not upstream:** This is a conservative lifecycle hardening patch for
+AAWM's deployed aiohttp transport and runtime-error intake workflow. It can be
+evaluated for upstreaming separately if the broader transport ownership model
+is revisited.
+
+**Validation status:** Focused tests cover owned-session retention/cleanup on
+the sync replacement path, no close/retain behavior for shared sessions, and
+the existing async transport behavior.
+
+---
+
 ### aawm.99 — ChatGPT Codex invalid encrypted continuation classification
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.99`. ChatGPT Codex
