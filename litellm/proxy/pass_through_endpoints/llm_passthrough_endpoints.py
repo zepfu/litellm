@@ -2587,13 +2587,14 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
         return _get_anthropic_adapter_access_log_target_label(target_url)
     route_family_target_labels = {
         "codex_opencode_zen_adapter": "opencode.ai/zen/v1/chat/completions",
+        "codex_openrouter_completion_adapter": "openrouter.ai/api/v1/chat/completions",
         "anthropic_opencode_zen_responses_adapter": "opencode.ai/zen/v1/responses",
         "anthropic_opencode_zen_completion_adapter": "opencode.ai/zen/v1/chat/completions",
     }
     return route_family_target_labels.get(cleaned_route_family or "", cleaned_route_family)
 
 
-def _build_opencode_zen_route_rollup_kwargs(
+def _build_adapted_route_rollup_kwargs(
     litellm_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     return {
@@ -2603,12 +2604,13 @@ def _build_opencode_zen_route_rollup_kwargs(
     }
 
 
-def _emit_opencode_zen_route_access_log(
+def _emit_adapted_route_access_log(
     *,
     request: Request,
     target_url: str,
     request_body: dict[str, Any],
     rollup_kwargs: dict[str, Any],
+    adapter_label: str,
 ) -> None:
     try:
         emit_aawm_route_access_log(
@@ -2619,19 +2621,23 @@ def _emit_opencode_zen_route_access_log(
         )
     except Exception:
         verbose_proxy_logger.debug(
-            "Failed to emit AAWM route access log for OpenCode Zen adapter",
+            "Failed to emit AAWM route access log for %s adapter",
+            adapter_label,
             exc_info=True,
         )
 
 
-def _record_opencode_zen_completed_route_rollup_turn(
+def _record_adapted_completed_route_rollup_turn(
     rollup_kwargs: dict[str, Any],
+    *,
+    adapter_label: str,
 ) -> None:
     try:
         record_aawm_route_rollup_turn(rollup_kwargs)
     except Exception:
         verbose_proxy_logger.debug(
-            "Failed to record AAWM route rollup turn for OpenCode Zen adapter",
+            "Failed to record AAWM route rollup turn for %s adapter",
+            adapter_label,
             exc_info=True,
         )
 
@@ -25764,12 +25770,13 @@ async def _handle_codex_opencode_zen_adapter_route(
         expected_target_family="opencode",
     )
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
-    rollup_kwargs = _build_opencode_zen_route_rollup_kwargs(litellm_metadata)
-    _emit_opencode_zen_route_access_log(
+    rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
+    _emit_adapted_route_access_log(
         request=request,
         target_url=target_url,
         request_body=request_body,
         rollup_kwargs=rollup_kwargs,
+        adapter_label="OpenCode Zen",
     )
     try:
         completion_response = await litellm.acompletion(
@@ -25824,7 +25831,10 @@ async def _handle_codex_opencode_zen_adapter_route(
             adapter="codex_opencode_zen_completion_adapter",
             adapter_label="OpenCode Zen chat-completions",
         )
-    _record_opencode_zen_completed_route_rollup_turn(rollup_kwargs)
+    _record_adapted_completed_route_rollup_turn(
+        rollup_kwargs,
+        adapter_label="OpenCode Zen",
+    )
     return _build_responses_response_from_adapter_response(responses_api_response)
 
 
@@ -25934,6 +25944,14 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         expected_target_family="openrouter",
     )
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+    rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
+    _emit_adapted_route_access_log(
+        request=request,
+        target_url=target_url,
+        request_body=request_body,
+        rollup_kwargs=rollup_kwargs,
+        adapter_label="OpenRouter chat-completions",
+    )
 
     completion_response = await _perform_openrouter_completion_adapter_operation(
         adapter_model=upstream_adapter_model,
@@ -25984,6 +26002,10 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             adapter="codex_auto_agent_openrouter_completion_adapter",
             adapter_label="OpenRouter chat-completions",
         )
+    _record_adapted_completed_route_rollup_turn(
+        rollup_kwargs,
+        adapter_label="OpenRouter chat-completions",
+    )
     return _build_responses_response_from_adapter_response(responses_api_response)
 
 
