@@ -21,6 +21,8 @@ from litellm._logging import (
     _LANGFUSE_SUPPORT_STRING,
     _initialize_loggers_with_handler,
     _turn_on_json,
+    clear_langfuse_enqueue_size_audits,
+    record_langfuse_enqueue_size_audit,
     verbose_logger,
     verbose_proxy_logger,
     verbose_router_logger,
@@ -156,6 +158,7 @@ def test_json_formatter_includes_logger_name():
 
 
 def test_json_formatter_adds_langfuse_support_string_diagnostics():
+    clear_langfuse_enqueue_size_audits()
     formatter = JsonFormatter()
     record = logging.LogRecord(
         name="langfuse",
@@ -178,8 +181,14 @@ def test_json_formatter_adds_langfuse_support_string_diagnostics():
     assert obj["langfuse_failure_class"] == (
         "langfuse_sdk_background_ingestion_upload_failure"
     )
+    assert obj["failure_kind"] == "degraded_langfuse_sdk_background_ingestion"
+    assert obj["langfuse_payload_size_state"] == (
+        "enqueued_but_sdk_failed_no_recent_audit"
+    )
     assert "recommended_operator_action" in obj
-    assert "Langfuse ingestion/storage health" in obj["recommended_operator_action"]
+    assert "Telemetry-only Langfuse SDK background upload failed" in obj[
+        "recommended_operator_action"
+    ]
 
 
 def test_langfuse_support_string_filter_preserves_message_for_plain_formatter():
@@ -215,6 +224,7 @@ def test_initialize_loggers_routes_langfuse_support_string_diagnostics(
     test_handler.setFormatter(JsonFormatter())
 
     try:
+        clear_langfuse_enqueue_size_audits()
         monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
         monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
         monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
@@ -248,6 +258,12 @@ def test_initialize_loggers_routes_langfuse_support_string_diagnostics(
             error_record["context"]["langfuse_failure_class"]
             == "langfuse_sdk_background_ingestion_upload_failure"
         )
+        assert error_record["context"]["failure_kind"] == (
+            "degraded_langfuse_sdk_background_ingestion"
+        )
+        assert error_record["context"]["langfuse_payload_size_state"] == (
+            "enqueued_but_sdk_failed_no_recent_audit"
+        )
     finally:
         litellm.success_callback = original_success_callback
         litellm.failure_callback = original_failure_callback
@@ -256,6 +272,94 @@ def test_initialize_loggers_routes_langfuse_support_string_diagnostics(
         langfuse_logger.propagate = original_propagate
         langfuse_logger.setLevel(original_level)
 
+
+
+
+def test_json_formatter_adds_langfuse_support_string_diagnostics_with_recent_audit():
+    clear_langfuse_enqueue_size_audits()
+    record_langfuse_enqueue_size_audit(
+        {
+            "trace_id": "trace-over",
+            "generation_id": "generation-over",
+            "generation_name": "aawm.large",
+            "model": "gpt-test",
+            "call_type": "completion",
+            "total_size_bytes": 1_100_000,
+            "max_event_size_bytes": 1_000_000,
+            "warning_threshold_bytes": 900_000,
+            "event_fit_failed": False,
+        }
+    )
+    formatter = JsonFormatter()
+    record = logging.LogRecord(
+        name="langfuse",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg=_LANGFUSE_SUPPORT_STRING,
+        args=(),
+        exc_info=None,
+    )
+    output = formatter.format(record)
+    obj = json.loads(output)
+    assert obj["langfuse_payload_size_state"] == "over_limit_before_enqueue"
+    assert obj["trace_id"] == "trace-over"
+    assert obj["langfuse_generation_id"] == "generation-over"
+    assert obj["langfuse_total_size_bytes"] == 1_100_000
+    assert obj["langfuse_max_event_size_bytes"] == 1_000_000
+    assert "oversized event" in obj["recommended_operator_action"]
+
+
+def test_aawm_error_log_includes_langfuse_support_string_context(tmp_path, monkeypatch):
+    clear_langfuse_enqueue_size_audits()
+    record_langfuse_enqueue_size_audit(
+        {
+            "trace_id": "trace-near",
+            "generation_id": "generation-near",
+            "generation_name": "aawm.near",
+            "model": "gpt-test",
+            "call_type": "completion",
+            "total_size_bytes": 950_000,
+            "max_event_size_bytes": 1_000_000,
+            "warning_threshold_bytes": 900_000,
+            "event_fit_failed": False,
+        }
+    )
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    from litellm._logging import AawmErrorLogFileHandler
+
+    handler = AawmErrorLogFileHandler()
+    record = logging.LogRecord(
+        name="langfuse",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg=_LANGFUSE_SUPPORT_STRING,
+        args=(),
+        exc_info=None,
+    )
+    handler.emit(record)
+
+    error_log_path = tmp_path / "dev-error.jsonl"
+    error_record = json.loads(error_log_path.read_text().strip())
+    assert error_record["context"]["source"] == "langfuse_sdk"
+    assert error_record["context"]["callback_phase"] == "sdk_background_ingestion_upload"
+    assert (
+        error_record["context"]["langfuse_failure_class"]
+        == "langfuse_sdk_background_ingestion_upload_failure"
+    )
+    assert error_record["context"]["failure_kind"] == (
+        "degraded_langfuse_sdk_background_ingestion"
+    )
+    assert error_record["context"]["langfuse_payload_size_state"] == (
+        "near_limit_before_enqueue"
+    )
+    assert error_record["context"]["trace_id"] == "trace-near"
+    assert error_record["context"]["langfuse_generation_id"] == "generation-near"
+    assert error_record["context"]["langfuse_total_size_bytes"] == 950_000
 
 def test_json_formatter_parses_embedded_python_dict_repr():
     """

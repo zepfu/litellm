@@ -266,10 +266,18 @@ adds structured context for triage:
 - `callback_name=langfuse`
 - `callback_phase=sdk_background_ingestion_upload`
 - `langfuse_failure_class=langfuse_sdk_background_ingestion_upload_failure`
+- `failure_kind=degraded_langfuse_sdk_background_ingestion`
+- `langfuse_payload_size_state` when recent enqueue audit context is available
+- compact payload-size fields such as `langfuse_total_size_bytes`,
+  `langfuse_max_event_size_bytes`, `langfuse_generation_id`, and
+  `langfuse_call_type`
+- `recommended_operator_action` with an operator-facing diagnostic hint
 
-Treat that class as a Langfuse ingestion/upload failure signal. Check the
-Langfuse web/worker/blob-storage logs near the same timestamp before assuming
-the LiteLLM callback wrapper itself failed.
+Treat that class as telemetry-only degradation. Client requests should not fail
+because of this callback error. Check Langfuse web/worker/blob-storage logs near
+the same timestamp and use `langfuse_payload_size_state` to distinguish
+near-limit, over-limit-before-enqueue, fit-failed-before-enqueue, and
+enqueued-but-sdk-failed cases.
 
 When the async logging worker times out or fails while delivering a queued
 callback coroutine, the JSONL record uses `source=logging_worker`. The

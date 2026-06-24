@@ -203,6 +203,18 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "grok_side_channel_request_body_digest_source",
     "grok_side_channel_request_json_container_type",
     "grok_side_channel_request_array_length",
+    "recommended_operator_action",
+    "langfuse_support_string",
+    "langfuse_sdk_background_ingestion_failure",
+    "langfuse_payload_size_state",
+    "langfuse_total_size_bytes",
+    "langfuse_max_event_size_bytes",
+    "langfuse_warning_threshold_bytes",
+    "langfuse_generation_id",
+    "langfuse_generation_name",
+    "langfuse_call_type",
+    "langfuse_event_fit_failed",
+    "langfuse_enqueue_observed_at",
 )
 
 
@@ -303,6 +315,7 @@ class AawmErrorLogFileHandler(logging.Handler):
 
         self._emit_state.active = True
         try:
+            _apply_langfuse_support_string_diagnostics(record)
             payload = _build_aawm_error_log_record(record, formatter=self._formatter)
             with _AAWM_ERROR_LOG_LOCK:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -602,13 +615,123 @@ def _get_standard_record_attrs() -> frozenset:
 
 _STANDARD_RECORD_ATTRS = _get_standard_record_attrs()
 
+_LANGFUSE_RECENT_ENQUEUE_AUDIT_LOCK = threading.Lock()
+_LANGFUSE_RECENT_ENQUEUE_AUDIT_LIMIT = 64
+_LANGFUSE_RECENT_ENQUEUE_AUDIT_TTL_SECONDS = 600
+_langfuse_recent_enqueue_audits: Deque[Dict[str, Any]] = deque()
+
+
+def _compact_langfuse_enqueue_audit_summary(size_summary: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {
+        "observed_at": datetime.now(tz=UTC).isoformat(),
+        "trace_id": size_summary.get("trace_id"),
+        "generation_id": size_summary.get("generation_id"),
+        "generation_name": size_summary.get("generation_name"),
+        "model": size_summary.get("model"),
+        "call_type": size_summary.get("call_type"),
+        "total_size_bytes": size_summary.get("total_size_bytes"),
+        "max_event_size_bytes": size_summary.get("max_event_size_bytes"),
+        "warning_threshold_bytes": size_summary.get("warning_threshold_bytes"),
+        "input_size_bytes": size_summary.get("input_size_bytes"),
+        "output_size_bytes": size_summary.get("output_size_bytes"),
+        "metadata_size_bytes": size_summary.get("metadata_size_bytes"),
+        "event_fit_failed": bool(size_summary.get("event_fit_failed")),
+    }
+    compaction = size_summary.get("compaction_savings_audit")
+    if isinstance(compaction, dict):
+        compact["compaction_event_fit_failed"] = bool(compaction.get("event_fit_failed"))
+        compact["compaction_final_total_size_bytes"] = compaction.get(
+            "final_total_size_bytes"
+        )
+    return compact
+
+
+def record_langfuse_enqueue_size_audit(size_summary: Dict[str, Any]) -> None:
+    """Remember compact Langfuse payload-size context for later SDK failure correlation."""
+    if not isinstance(size_summary, dict):
+        return
+    compact = _compact_langfuse_enqueue_audit_summary(size_summary)
+    with _LANGFUSE_RECENT_ENQUEUE_AUDIT_LOCK:
+        _langfuse_recent_enqueue_audits.append(compact)
+        while len(_langfuse_recent_enqueue_audits) > _LANGFUSE_RECENT_ENQUEUE_AUDIT_LIMIT:
+            _langfuse_recent_enqueue_audits.popleft()
+
+
+def clear_langfuse_enqueue_size_audits() -> None:
+    with _LANGFUSE_RECENT_ENQUEUE_AUDIT_LOCK:
+        _langfuse_recent_enqueue_audits.clear()
+
+
+def _langfuse_payload_size_state_from_audit(audit: Dict[str, Any]) -> str:
+    if bool(audit.get("event_fit_failed")) or bool(audit.get("compaction_event_fit_failed")):
+        return "fit_failed_before_enqueue"
+    total = audit.get("total_size_bytes")
+    max_bytes = audit.get("max_event_size_bytes")
+    threshold = audit.get("warning_threshold_bytes")
+    if isinstance(total, int) and isinstance(max_bytes, int) and total > max_bytes:
+        return "over_limit_before_enqueue"
+    if isinstance(total, int) and isinstance(threshold, int) and total >= threshold:
+        return "near_limit_before_enqueue"
+    return "below_limit_before_enqueue"
+
+
+def _get_recent_langfuse_enqueue_audit() -> Optional[Dict[str, Any]]:
+    now = datetime.now(tz=UTC)
+    with _LANGFUSE_RECENT_ENQUEUE_AUDIT_LOCK:
+        audits = list(_langfuse_recent_enqueue_audits)
+    for audit in reversed(audits):
+        observed_at = audit.get("observed_at")
+        if not isinstance(observed_at, str):
+            continue
+        try:
+            observed_dt = datetime.fromisoformat(observed_at)
+        except ValueError:
+            continue
+        if observed_dt.tzinfo is None:
+            observed_dt = observed_dt.replace(tzinfo=UTC)
+        age_seconds = (now - observed_dt).total_seconds()
+        if age_seconds <= _LANGFUSE_RECENT_ENQUEUE_AUDIT_TTL_SECONDS:
+            return audit
+    return None
+
+
+def _recommended_operator_action_for_langfuse_support_string(
+    *, payload_size_state: str
+) -> str:
+    if payload_size_state == "over_limit_before_enqueue":
+        return (
+            "Telemetry-only Langfuse SDK background upload failed after enqueueing an "
+            "oversized event. Reduce Langfuse payload size (input/output/metadata compaction) "
+            "and inspect Langfuse worker/blob storage health near the same timestamp."
+        )
+    if payload_size_state == "near_limit_before_enqueue":
+        return (
+            "Telemetry-only Langfuse SDK background upload failed after enqueueing a "
+            "near-limit event. Review Langfuse payload shaping/compaction and Langfuse "
+            "ingestion/storage health near the same timestamp."
+        )
+    if payload_size_state == "fit_failed_before_enqueue":
+        return (
+            "Telemetry-only Langfuse SDK background upload failed after enqueueing an event "
+            "that could not be compacted below the SDK size limit. Tighten Langfuse payload "
+            "shaping and inspect Langfuse ingestion health near the same timestamp."
+        )
+    if payload_size_state == "below_limit_before_enqueue":
+        return (
+            "Telemetry-only Langfuse SDK background upload failed for a below-limit event. "
+            "Inspect Langfuse web/worker/blob-storage and network health near the same "
+            "timestamp before assuming LiteLLM callback code failed."
+        )
+    return (
+        "Telemetry-only Langfuse SDK background upload failed. Inspect Langfuse "
+        "web/worker/blob-storage health near the same timestamp and review recent Langfuse "
+        "payload-size warnings for oversized or near-limit events."
+    )
+
+
 _LANGFUSE_SUPPORT_STRING = (
     "Unexpected error occurred. Please check your request and contact support: "
     "https://langfuse.com/support."
-)
-_LANGFUSE_SUPPORT_STRING_RECOMMENDED_OPERATOR_ACTION = (
-    "Inspect Langfuse ingestion/storage health (web/worker/blob storage), then retry "
-    "or reduce oversized Langfuse event payloads before re-exporting traces."
 )
 
 
@@ -626,9 +749,17 @@ def _apply_langfuse_support_string_diagnostics(record: logging.LogRecord) -> Non
     if not _is_langfuse_support_string_message(message):
         return
 
+    recent_audit = _get_recent_langfuse_enqueue_audit()
+    payload_size_state = (
+        _langfuse_payload_size_state_from_audit(recent_audit)
+        if recent_audit is not None
+        else "enqueued_but_sdk_failed_no_recent_audit"
+    )
+
     setattr(record, "source", "langfuse_sdk")
     setattr(record, "callback_name", "langfuse")
     setattr(record, "callback_phase", "sdk_background_ingestion_upload")
+    setattr(record, "failure_kind", "degraded_langfuse_sdk_background_ingestion")
     setattr(record, "langfuse_support_string", True)
     setattr(record, "langfuse_sdk_background_ingestion_failure", True)
     setattr(
@@ -636,11 +767,36 @@ def _apply_langfuse_support_string_diagnostics(record: logging.LogRecord) -> Non
         "langfuse_failure_class",
         "langfuse_sdk_background_ingestion_upload_failure",
     )
+    setattr(record, "langfuse_payload_size_state", payload_size_state)
     setattr(
         record,
         "recommended_operator_action",
-        _LANGFUSE_SUPPORT_STRING_RECOMMENDED_OPERATOR_ACTION,
+        _recommended_operator_action_for_langfuse_support_string(
+            payload_size_state=payload_size_state
+        ),
     )
+
+    if recent_audit is not None:
+        for field, attr in (
+            ("trace_id", "trace_id"),
+            ("generation_id", "langfuse_generation_id"),
+            ("generation_name", "langfuse_generation_name"),
+            ("model", "model"),
+            ("call_type", "langfuse_call_type"),
+            ("total_size_bytes", "langfuse_total_size_bytes"),
+            ("max_event_size_bytes", "langfuse_max_event_size_bytes"),
+            ("warning_threshold_bytes", "langfuse_warning_threshold_bytes"),
+            ("observed_at", "langfuse_enqueue_observed_at"),
+        ):
+            value = recent_audit.get(field)
+            if value is not None and getattr(record, attr, None) is None:
+                setattr(record, attr, value)
+        setattr(
+            record,
+            "langfuse_event_fit_failed",
+            bool(recent_audit.get("event_fit_failed"))
+            or bool(recent_audit.get("compaction_event_fit_failed")),
+        )
 
 
 class LangfuseSupportStringDiagnosticFilter(logging.Filter):

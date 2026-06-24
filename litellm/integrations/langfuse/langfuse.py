@@ -20,7 +20,7 @@ from typing import (
 from packaging.version import Version
 
 import litellm
-from litellm._logging import verbose_logger
+from litellm._logging import record_langfuse_enqueue_size_audit, verbose_logger
 from litellm.constants import MAX_LANGFUSE_INITIALIZED_CLIENTS
 from litellm.litellm_core_utils.core_helpers import (
     safe_deep_copy,
@@ -1731,6 +1731,8 @@ def _log_langfuse_payload_size_if_needed(
     )
     if size_summary is None:
         return
+
+    record_langfuse_enqueue_size_audit(size_summary)
 
     event_fit_failed = bool(size_summary.get("event_fit_failed"))
     total_size_bytes = size_summary.get("total_size_bytes")
