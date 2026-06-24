@@ -708,6 +708,13 @@ def cleanup_router_config_variables():
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
+    try:
+        await litellm.close_litellm_async_clients()
+    except Exception as e:
+        verbose_proxy_logger.error(
+            "Error closing cached LiteLLM async HTTP clients during proxy shutdown: %s",
+            e,
+        )
     if prisma_client:
         verbose_proxy_logger.debug("Disconnecting from Prisma")
         await prisma_client.disconnect()
