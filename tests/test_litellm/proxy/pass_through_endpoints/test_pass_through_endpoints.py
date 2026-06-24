@@ -4571,6 +4571,16 @@ class TestPassThroughTerminalFailureLogging:
         ("status_code", "upstream_detail", "model", "expected_failure_kind"),
         [
             (
+                400,
+                (
+                    '{"type":"error","error":{"type":"invalid_request_error",'
+                    '"message":"prompt is too long: 1002056 tokens > 1000000 maximum"},'
+                    '"request_id":"req_context"}'
+                ),
+                "claude-opus-4-8",
+                "anthropic_context_overflow",
+            ),
+            (
                 401,
                 (
                     '{"type":"error","error":{"type":"authentication_error",'
@@ -4651,6 +4661,88 @@ class TestPassThroughTerminalFailureLogging:
                 assert warning_context["failure_kind"] == expected_failure_kind
                 assert warning_context["upstream_url"] == fixture["target_url"]
                 assert warning_context["model"] == model
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        assert not (tmp_path / "dev-error.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_known_anthropic_context_overflow_preserves_upstream_body(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        upstream_detail = (
+            '{"type":"error","error":{"type":"invalid_request_error",'
+            '"message":"prompt is too long: 1002056 tokens > 1000000 maximum"},'
+            '"request_id":"req_011CcMsoxd3XmSY8aU3rsWXj"}'
+        )
+        fixture = self._build_anthropic_upstream_failure_fixture(
+            status_code=400,
+            upstream_detail=upstream_detail,
+            model="claude-opus-4-8",
+        )
+        handler = AsyncMock(return_value=fixture["upstream_response"])
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=handler,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+                new=AsyncMock(),
+            ) as mock_sleep, patch.object(
+                verbose_proxy_logger,
+                "warning",
+            ) as mock_warning:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = MagicMock()
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    side_effect=lambda **kwargs: kwargs["data"]
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=fixture["request"],
+                        target=fixture["target_url"],
+                        custom_headers={},
+                        custom_body=fixture["request_body"],
+                        user_api_key_dict=MagicMock(),
+                        stream=False,
+                        custom_llm_provider=None,
+                        caller_managed_hidden_retry=True,
+                        retryable_upstream_status_codes=[500, 502, 503, 504],
+                    )
+
+                assert exc_info.value.code == "400"
+                assert exc_info.value.detail == upstream_detail
+                assert handler.await_count == 1
+                mock_sleep.assert_not_awaited()
+                mock_warning.assert_called_once()
+                warning_context = mock_warning.call_args.kwargs["extra"]
+                assert warning_context["failure_kind"] == "anthropic_context_overflow"
+                assert warning_context["upstream_url"] == fixture["target_url"]
+                assert warning_context["model"] == "claude-opus-4-8"
                 mock_logging_obj.post_call_failure_hook.assert_awaited_once()
                 assert (
                     mock_logging_obj.post_call_failure_hook.await_args.kwargs[

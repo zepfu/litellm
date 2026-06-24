@@ -98,6 +98,12 @@ PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset(
 )
 _ANTHROPIC_INVALID_AUTHENTICATION_MARKER = "invalid authentication credentials"
 _ANTHROPIC_MODEL_NOT_FOUND_PREFIX = "model:"
+_ANTHROPIC_CONTEXT_OVERFLOW_MARKERS = (
+    "prompt is too long",
+    "context length exceeded",
+    "maximum context length",
+    "too many tokens",
+)
 
 # Global registry to track registered pass-through routes and prevent memory leaks
 _registered_pass_through_routes: Dict[
@@ -855,6 +861,26 @@ def _is_anthropic_passthrough_target(
     return provider == "anthropic" or hostname == "api.anthropic.com"
 
 
+def _is_known_anthropic_context_overflow_response(
+    *,
+    status_code: Optional[int],
+    payload: dict[str, Any],
+) -> bool:
+    if status_code != status.HTTP_400_BAD_REQUEST:
+        return False
+
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+
+    error_type = str(error.get("type") or "").strip().lower()
+    message = str(error.get("message") or "").strip().lower()
+    if error_type != "invalid_request_error":
+        return False
+
+    return any(marker in message for marker in _ANTHROPIC_CONTEXT_OVERFLOW_MARKERS)
+
+
 def _get_known_anthropic_passthrough_failure_kind(
     *,
     url: Optional[httpx.URL],
@@ -862,7 +888,11 @@ def _get_known_anthropic_passthrough_failure_kind(
     status_code: Optional[int],
     exc: Exception,
 ) -> Optional[str]:
-    if status_code not in {status.HTTP_401_UNAUTHORIZED, status.HTTP_404_NOT_FOUND}:
+    if status_code not in {
+        status.HTTP_400_BAD_REQUEST,
+        status.HTTP_401_UNAUTHORIZED,
+        status.HTTP_404_NOT_FOUND,
+    }:
         return None
 
     if not _is_anthropic_passthrough_target(
@@ -884,6 +914,11 @@ def _get_known_anthropic_passthrough_failure_kind(
 
     error_type = str(error.get("type") or "").strip().lower()
     message = str(error.get("message") or "").strip().lower()
+    if _is_known_anthropic_context_overflow_response(
+        status_code=status_code,
+        payload=payload,
+    ):
+        return "anthropic_context_overflow"
     if (
         status_code == status.HTTP_401_UNAUTHORIZED
         and error_type == "authentication_error"
