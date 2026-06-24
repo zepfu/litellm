@@ -2125,6 +2125,28 @@ def _raise_openrouter_auto_agent_candidate_unavailable(message: str) -> None:
     raise exc
 
 
+async def _maybe_raise_openrouter_adapter_alias_probe_cooldown(
+    adapter_model: Optional[str],
+    *,
+    use_alias_candidate_probe: bool = False,
+) -> None:
+    if not use_alias_candidate_probe:
+        return
+    cooldown_seconds = await _get_openrouter_adapter_active_cooldown_seconds(
+        adapter_model
+    )
+    if cooldown_seconds <= 0:
+        return
+    rounded_wait = max(1, int(cooldown_seconds))
+    model_label = _get_openrouter_adapter_rate_limit_key(adapter_model)
+    _raise_openrouter_auto_agent_candidate_unavailable(
+        (
+            f"OpenRouter auto-agent candidate {model_label} is temporarily cooling down "
+            f"on the adapter. Retry after ~{rounded_wait}s."
+        )
+    )
+
+
 def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
     explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
     if explicit_provider != _OPENCODE_ZEN_PROVIDER or candidate is None:
@@ -8165,7 +8187,10 @@ async def _get_openrouter_adapter_active_cooldown_seconds(
 
 
 async def _wait_for_openrouter_adapter_cooldown_if_needed(
-    rate_limit_keys: Union[str, list[str], tuple[str, ...]]
+    rate_limit_keys: Union[str, list[str], tuple[str, ...]],
+    *,
+    adapter_model: Optional[str] = None,
+    use_alias_candidate_probe: bool = False,
 ) -> None:
     if isinstance(rate_limit_keys, str):
         normalized_keys = [rate_limit_keys]
@@ -8183,6 +8208,11 @@ async def _wait_for_openrouter_adapter_cooldown_if_needed(
             default=0.0,
         )
     if wait_seconds > 0:
+        if use_alias_candidate_probe:
+            await _maybe_raise_openrouter_adapter_alias_probe_cooldown(
+                adapter_model,
+                use_alias_candidate_probe=True,
+            )
         verbose_proxy_logger.warning(
             "OpenRouter adapter cooldown active for %s; sleeping %.1fs before upstream request",
             ", ".join(normalized_keys),
@@ -8213,12 +8243,17 @@ async def _perform_openrouter_completion_adapter_operation(
     adapter_model: Optional[str],
     operation: Callable[[], Awaitable[Any]],
     log_warnings: bool = True,
+    use_alias_candidate_probe: bool = False,
 ) -> Any:
     max_retries = _get_openrouter_adapter_max_retries()
     total_attempts = max_retries + 1
     hidden_retry_budget_seconds = _get_openrouter_adapter_hidden_retry_budget_seconds()
     accumulated_hidden_wait_seconds = 0.0
     wait_keys = _get_openrouter_adapter_wait_keys(adapter_model)
+    await _maybe_raise_openrouter_adapter_alias_probe_cooldown(
+        adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
     await _maybe_raise_openrouter_adapter_failure_circuit_open(adapter_model)
     attempt = 0
     while True:
@@ -8229,7 +8264,11 @@ async def _perform_openrouter_completion_adapter_operation(
             total_attempts,
             adapter_model,
         )
-        await _wait_for_openrouter_adapter_cooldown_if_needed(wait_keys)
+        await _wait_for_openrouter_adapter_cooldown_if_needed(
+            wait_keys,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
         try:
             result = await operation()
             _clear_openrouter_adapter_failure_circuit(adapter_model)
@@ -8307,6 +8346,7 @@ async def _perform_openrouter_adapter_pass_through_request(
     *,
     adapter_model: Optional[str],
     log_warnings: bool = True,
+    use_alias_candidate_probe: bool = False,
     **kwargs: Any,
 ) -> Response:
     max_retries = _get_openrouter_adapter_max_retries()
@@ -8315,6 +8355,10 @@ async def _perform_openrouter_adapter_pass_through_request(
     accumulated_hidden_wait_seconds = 0.0
     model_rate_limit_key = _get_openrouter_adapter_rate_limit_key(adapter_model)
     wait_keys = _get_openrouter_adapter_wait_keys(adapter_model)
+    await _maybe_raise_openrouter_adapter_alias_probe_cooldown(
+        adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
     await _maybe_raise_openrouter_adapter_failure_circuit_open(adapter_model)
     attempt = 0
     while True:
@@ -8325,7 +8369,11 @@ async def _perform_openrouter_adapter_pass_through_request(
             total_attempts,
             model_rate_limit_key,
         )
-        await _wait_for_openrouter_adapter_cooldown_if_needed(wait_keys)
+        await _wait_for_openrouter_adapter_cooldown_if_needed(
+            wait_keys,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
         try:
             result = await pass_through_request(
                 **kwargs,
@@ -16584,6 +16632,7 @@ async def _handle_anthropic_openrouter_completion_adapter_route(
     user_api_key_dict: UserAPIKeyAuth,
     prepared_request_body: dict[str, Any],
     adapter_model: str,
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
         LiteLLMMessagesToCompletionTransformationHandler,
@@ -16686,6 +16735,8 @@ async def _handle_anthropic_openrouter_completion_adapter_route(
                 "body": prepared_request_body,
             },
         ),
+        log_warnings=not use_alias_candidate_probe,
+        use_alias_candidate_probe=use_alias_candidate_probe,
     )
 
     if client_requested_stream:
@@ -16786,6 +16837,7 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
     upstream_response = await _perform_openrouter_adapter_pass_through_request(
         adapter_model=adapter_model,
         log_warnings=not use_alias_candidate_probe,
+        use_alias_candidate_probe=use_alias_candidate_probe,
         request=request,
         target=str(target_url),
         custom_headers=custom_headers,
@@ -23840,6 +23892,7 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=candidate_body,
                 adapter_model=candidate["model"],
+                use_alias_candidate_probe=True,
             )
         else:
             response = await _handle_anthropic_openrouter_responses_adapter_route(
@@ -26136,6 +26189,7 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     endpoint: str,
     adapter_model: str,
     request_body: dict[str, Any],
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     openrouter_api_key = _get_openrouter_api_key()
     if openrouter_api_key is None:
@@ -26179,7 +26233,8 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
 
     response = await _perform_openrouter_adapter_pass_through_request(
         adapter_model=adapter_model,
-        log_warnings=False,
+        log_warnings=not use_alias_candidate_probe,
+        use_alias_candidate_probe=use_alias_candidate_probe,
         request=request,
         target=str(target_url),
         custom_headers=custom_headers,
@@ -26409,6 +26464,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     request: Request,
     adapter_model: str,
     request_body: dict[str, Any],
+    use_alias_candidate_probe: bool = False,
 ) -> Response:
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
@@ -26533,7 +26589,8 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             },
             shared_session=_get_proxy_shared_aiohttp_session(),
         ),
-        log_warnings=False,
+        log_warnings=not use_alias_candidate_probe,
+        use_alias_candidate_probe=use_alias_candidate_probe,
     )
     if bool(request_body.get("stream")):
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
@@ -26615,6 +26672,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
                 request=request,
                 adapter_model=candidate["model"],
                 request_body=candidate_body,
+                use_alias_candidate_probe=True,
             )
         else:
             response = await _perform_codex_auto_agent_openrouter_responses_request(
@@ -26623,6 +26681,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
                 user_api_key_dict=user_api_key_dict,
                 adapter_model=candidate["model"],
                 request_body=candidate_body,
+                use_alias_candidate_probe=True,
             )
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
         if candidate.get("route_family") == "codex_xai_oauth_responses_adapter":

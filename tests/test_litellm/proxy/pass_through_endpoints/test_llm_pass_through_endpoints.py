@@ -7502,6 +7502,70 @@ class TestPassThroughRequestRetryableFailures:
 
 class TestOpenRouterAdapterRetry:
     @pytest.mark.asyncio
+    async def test_openrouter_completion_adapter_alias_probe_fails_fast_on_adapter_cooldown(
+        self,
+    ):
+        adapter_model = "cohere/north-mini-code:free"
+        sleep_mock = AsyncMock()
+        operation = AsyncMock()
+        _openrouter_adapter_rate_limit_until_monotonic_by_key[adapter_model] = (
+            time.monotonic() + 120.0
+        )
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+                new=sleep_mock,
+            ):
+                with pytest.raises(ProxyException) as exc_info:
+                    await _perform_openrouter_completion_adapter_operation(
+                        adapter_model=adapter_model,
+                        operation=operation,
+                        use_alias_candidate_probe=True,
+                    )
+        finally:
+            _openrouter_adapter_rate_limit_until_monotonic_by_key.pop(
+                adapter_model, None
+            )
+
+        operation.assert_not_awaited()
+        sleep_mock.assert_not_awaited()
+        assert exc_info.value.detail["error"]["code"] == (
+            "aawm_codex_auto_agent_candidate_unavailable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_openrouter_adapter_request_still_sleeps_for_non_alias_direct_request(
+        self, monkeypatch
+    ):
+        sleep_mock = AsyncMock()
+        _openrouter_adapter_rate_limit_until_monotonic_by_key["google/gemma-4-31b-it:free"] = (
+            time.monotonic() + 5.0
+        )
+        successful_response = Response(
+            content='{"ok": true}', media_type="application/json"
+        )
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+                new=AsyncMock(return_value=successful_response),
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+                new=sleep_mock,
+            ):
+                result = await _perform_openrouter_adapter_pass_through_request(
+                    adapter_model="google/gemma-4-31b-it:free",
+                    request=MagicMock(),
+                )
+        finally:
+            _openrouter_adapter_rate_limit_until_monotonic_by_key.pop(
+                "google/gemma-4-31b-it:free", None
+            )
+
+        assert result is successful_response
+        sleep_mock.assert_awaited_once()
+        assert 4.0 <= sleep_mock.await_args.args[0] <= 6.0
+
+    @pytest.mark.asyncio
     async def test_openrouter_adapter_request_retries_on_proxy_exception_code(self, monkeypatch):
         monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_MAX_RETRIES", "1")
         monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS", "2")
@@ -32275,6 +32339,115 @@ async def test_aawm_alias_routing_durable_cooldown_payload_is_sanitized():
     assert set(payload.keys()) == {"cooldown_key", "expires_at_epoch"}
     assert payload["cooldown_key"] == cooldown_key
     assert isinstance(payload["expires_at_epoch"], (int, float))
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_low_openrouter_adapter_cooldown_does_not_sleep_and_fails_over(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    cooled_model = "openrouter/cohere/north-mini-code:free"
+    upstream_model = "cohere/north-mini-code:free"
+    success = Response(content='{"ok": true}', media_type="application/json")
+    sleep_mock = AsyncMock()
+
+    _openrouter_adapter_rate_limit_until_monotonic_by_key[upstream_model] = (
+        time.monotonic() + 120.0
+    )
+    try:
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
+            new=AsyncMock(side_effect=[success]),
+        ) as mock_openrouter, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+            new=sleep_mock,
+        ):
+            response = await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+    finally:
+        _openrouter_adapter_rate_limit_until_monotonic_by_key.pop(
+            upstream_model, None
+        )
+
+    assert response is success
+    assert mock_openrouter.await_count == 1
+    assert mock_openrouter.await_args.kwargs["adapter_model"] == "openrouter/owl-alpha"
+    metadata = mock_openrouter.await_args.kwargs["request_body"]["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["codex_auto_agent_attempts"][-1]["model"] == "openrouter/owl-alpha"
+    skipped_models = {
+        candidate["model"]
+        for candidate in metadata.get("codex_auto_agent_skipped_candidates", [])
+    }
+    assert cooled_model in skipped_models
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_low_openrouter_adapter_cooldown_does_not_sleep_and_fails_over(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-low-anthropic"
+    cooled_model = "openrouter/cohere/north-mini-code:free"
+    upstream_model = "cohere/north-mini-code:free"
+    success = Response(content='{"ok": true}', media_type="application/json")
+    sleep_mock = AsyncMock()
+
+    _openrouter_adapter_rate_limit_until_monotonic_by_key[upstream_model] = (
+        time.monotonic() + 120.0
+    )
+    try:
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
+            new=AsyncMock(side_effect=[success]),
+        ) as mock_openrouter, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+            new=sleep_mock,
+        ):
+            response = await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+    finally:
+        _openrouter_adapter_rate_limit_until_monotonic_by_key.pop(
+            upstream_model, None
+        )
+
+    assert response is success
+    assert mock_openrouter.await_count == 1
+    assert mock_openrouter.await_args.kwargs["adapter_model"] == "openrouter/owl-alpha"
+    metadata = mock_openrouter.await_args.kwargs["prepared_request_body"][
+        "litellm_metadata"
+    ]
+    assert metadata["requested_model_alias"] == "aawm-low-anthropic"
+    assert metadata["anthropic_auto_agent_attempts"][-1]["model"] == "openrouter/owl-alpha"
+    skipped_models = {
+        candidate["model"]
+        for candidate in metadata.get("anthropic_auto_agent_skipped_candidates", [])
+    }
+    assert cooled_model in skipped_models
+    sleep_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
