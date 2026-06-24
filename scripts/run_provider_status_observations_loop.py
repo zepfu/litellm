@@ -3117,6 +3117,76 @@ def _observability_anomaly_error_log_path(
     return directory / f"{environment}-error.jsonl"
 
 
+def _parse_error_log_non_negative_int_env(name: str) -> Optional[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _parse_error_log_file_mode_env() -> Optional[int]:
+    raw = os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_MODE", "").strip()
+    if not raw:
+        return None
+    try:
+        mode = int(raw, 8)
+    except ValueError:
+        return None
+    if mode < 0 or mode > 0o777:
+        return None
+    return mode
+
+
+def _normalize_error_log_file_metadata(path: Path) -> None:
+    """Best-effort host bind-mount ownership repair for sidecar JSONL intake."""
+    try:
+        parent_stat = path.parent.stat()
+        uid_raw = os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_UID", "").strip()
+        gid_raw = os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_GID", "").strip()
+        target_uid = (
+            _parse_error_log_non_negative_int_env(
+                "LITELLM_AAWM_ERROR_LOG_FILE_UID"
+            )
+            if uid_raw
+            else parent_stat.st_uid
+        )
+        target_gid = (
+            _parse_error_log_non_negative_int_env(
+                "LITELLM_AAWM_ERROR_LOG_FILE_GID"
+            )
+            if gid_raw
+            else parent_stat.st_gid
+        )
+        current_stat = path.stat()
+        if (
+            target_uid is not None
+            and target_gid is not None
+            and (current_stat.st_uid, current_stat.st_gid)
+            != (target_uid, target_gid)
+            and hasattr(os, "chown")
+        ):
+            try:
+                os.chown(path, target_uid, target_gid)
+            except OSError:
+                pass
+
+        target_mode = _parse_error_log_file_mode_env()
+        if target_mode is not None and (current_stat.st_mode & 0o777) != target_mode:
+            try:
+                os.chmod(path, target_mode)
+            except OSError:
+                pass
+    except Exception:
+        # The anomaly scan should never fail because local intake repair failed.
+        return
+
+
 def _build_observability_anomaly_error_record(
     config: ProviderStatusLoopConfig,
     *,
@@ -3178,6 +3248,7 @@ def _write_observability_anomaly_error_records(
             )
             handle.write("\n")
             written += 1
+    _normalize_error_log_file_metadata(path)
     return written, path
 
 

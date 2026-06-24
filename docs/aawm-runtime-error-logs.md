@@ -31,6 +31,21 @@ container, mounted to this repo's `.analysis/dev-error.jsonl`. The matching
 legacy path is `/app/.analysis/dev-error.log`, mounted to
 `.analysis/dev-error.log`.
 
+When the proxy or provider-status sidecar runs as root inside a container, a
+plain bind-mount append would create root-owned active intake files on the host.
+After each successful append, the JSONL writers therefore make a best-effort
+metadata repair:
+
+- the file owner/group defaults to the owner/group of the mounted target
+  directory;
+- `LITELLM_AAWM_ERROR_LOG_FILE_UID` and
+  `LITELLM_AAWM_ERROR_LOG_FILE_GID` can explicitly override that owner/group;
+- file mode is left as created by the process umask unless
+  `LITELLM_AAWM_ERROR_LOG_FILE_MODE` is set to an octal value such as `0640`.
+
+Ownership or mode repair failures are swallowed after the JSONL line is written.
+Error-intake logging must never fail a client request or the sidecar scan loop.
+
 ## JSONL intake shape
 
 The sink writes append-safe newline-delimited JSON. Each line is one complete
