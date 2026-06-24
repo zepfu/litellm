@@ -53,6 +53,28 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.95 — Transient alias cooldown and observability hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.95`. This release
+line carries transient alias cooldown handling and Grok side-channel 404
+suppression, prod error-intake diagnostics with richer Langfuse support-string
+enrichment, OpenCode Zen success rollups, a Spark cooldown cap, cached async
+client shutdown cleanup, and OpenRouter success rollups.
+
+**Why:** Recent prod and dev intake showed that alias routing failures and
+sparse telemetry strings were still too hard to diagnose, while route rollups
+and cooldown behavior needed tighter guardrails before promotion.
+
+**Why not upstream:** AAWM alias cooldown policy, route rollups, provider
+side-channel handling, and Langfuse enrichment are fork-local operational
+features.
+
+**Validation status:** Release metadata is prepared for promotion. Runtime
+verification in `litellm-dev` and production promotion remain required per
+`PROD_RELEASE.md`.
+
+---
+
 ### aawm.94 — Route rollup redundant destination suppression
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.94`. Periodic
