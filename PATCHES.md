@@ -53,6 +53,41 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.102 — OpenRouter alias-probe cooldowns fail fast instead of sleeping
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.102`.
+OpenRouter adapter-local cooldown handling now distinguishes direct calls from
+AAWM alias candidate probes. When `aawm-low` / `aawm-low-anthropic` reaches an
+OpenRouter candidate that is already cooling down inside the adapter, the
+adapter raises the existing `aawm_codex_auto_agent_candidate_unavailable`
+signal immediately instead of awaiting `asyncio.sleep` before an upstream
+attempt. Direct non-alias OpenRouter calls keep the existing sleep/backoff
+behavior.
+
+**Why:** A read-only explorer dispatch using `aawm-low` repeatedly logged
+`OpenRouter adapter cooldown active ... sleeping ... before upstream request`.
+That meant the subagent was waiting inside LiteLLM rather than receiving model
+output or progressing through the alias fallback chain. Alias-managed routes
+need cooled candidates to become explicit failover evidence so the selector can
+advance to the next declared model and surface the zero-turn cooling-down
+attempt in observability.
+
+**Why not upstream:** This is specific to AAWM's tiered auto-agent aliases and
+their candidate-unavailable / redispatch contract. Generic OpenRouter
+passthrough behavior still benefits from the original direct-call backoff path.
+
+**Validation status:** Focused tests prove alias-probe OpenRouter completion
+adapter calls fail fast without sleeping when adapter-local cooldown is active,
+direct non-alias OpenRouter adapter requests still sleep, and `aawm-low` /
+`aawm-low-anthropic` skip the cooled OpenRouter candidate and progress to the
+next declared candidate. `litellm-dev` was recreated on `:4001`; readiness
+returned healthy, an in-container probe returned
+`aawm_codex_auto_agent_candidate_unavailable` for the cooled OpenRouter
+alias-probe path, and post-restart logs contained no new traceback/error or
+OpenRouter cooldown-sleep entries.
+
+---
+
 ### aawm.101 — Alias exhausted-candidate suppression and Grok permission-denied failover
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.101`.
