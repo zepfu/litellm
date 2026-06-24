@@ -149,8 +149,9 @@ reported as status code `504` so alias wrappers can classify them as upstream
 timeouts. Pre-first-byte `httpx.ConnectError` failures, including DNS
 resolution failures, are retried on the same schedule and reported as status
 code `503` if the retry budget is exhausted. Midstream streaming timeouts are
-logged with the same safe context and traceback, but remain terminal because
-response bytes may already have been sent to the client.
+logged with the same safe context but without exception traceback once response
+bytes have already been emitted. They remain terminal because the response has
+already started and the request cannot be safely replayed.
 
 ## Pass-through hidden upstream retry
 
