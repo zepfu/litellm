@@ -177,6 +177,10 @@ Operational notes:
   alias progression so failover can continue, but they do not write durable
   provider/model cooldown state. Explicit capacity/rate-limit/usage-limit
   failures still use candidate cooldowns.
+- For the `gpt-5.3-codex-spark` candidate only, durable capacity, rate-limit,
+  usage-limit, upstream-overloaded, and upstream-timeout cooldowns are capped at
+  five minutes. Other candidates keep the default durable cooldown behavior, and
+  request-local transient cooldowns remain separate.
 
 ## Alias Routing Audit Metadata
 
