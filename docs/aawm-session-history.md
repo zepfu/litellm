@@ -171,6 +171,12 @@ Operational notes:
   `anthropic_auto_agent_cooldown_state_source` with values `memory`,
   `durable_cache`, or `local_fallback`. These fields do not store prompts, tools,
   credentials, or raw session payloads.
+- Bare transient upstream statuses (`500`, `502`, `503`, and `529`) that do not
+  carry explicit capacity, quota, rate-limit, or usage-limit evidence are
+  treated as request-local alias failures. They are skipped for the current
+  alias progression so failover can continue, but they do not write durable
+  provider/model cooldown state. Explicit capacity/rate-limit/usage-limit
+  failures still use candidate cooldowns.
 
 ## Alias Routing Audit Metadata
 
@@ -844,6 +850,12 @@ They deliberately omit raw body values, auth headers, credential payloads, and
 concrete session ids from path templates. Use these fields to capture real
 native side-channel payload shape for refresh-continuity debugging without
 persisting the payload itself.
+
+Known stale `/grok/v1/sessions/{id}/replicas/update` responses with upstream
+`404 {"error":"Session not found or not owned"}` are treated as degraded
+side-channel telemetry. LiteLLM returns the upstream status to the client, but
+does not emit traceback-style active error intake for that known stale-session
+shape.
 
 Sanitization metadata proves request adaptation only. It does not prove tool
 execution, model tool-use quality, or upstream success by itself; combine it

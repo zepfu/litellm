@@ -369,6 +369,17 @@ _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = (
 _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = (
     _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
 )
+_CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 30.0
+_CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset({500, 502, 503, 529})
+_CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
+    {
+        "capacity_exhausted",
+        "rate_limited",
+        "usage_limit_reached",
+        "upstream_overloaded",
+        "upstream_timeout",
+    }
+)
 _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS = 5 * 60.0
 _CODEX_AUTO_AGENT_AUTH_DEGRADED_LOG_INTERVAL_SECONDS = 60.0
 _CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY = (
@@ -3281,6 +3292,38 @@ async def _apply_anthropic_auto_agent_forced_candidate_cooldown(
     await _set_anthropic_auto_agent_cooldown(cooldown_key, cooldown_seconds)
 
 
+def _apply_codex_auto_agent_request_local_candidate_state(
+    request: Request,
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+) -> tuple[float, Optional[str], Optional[str]]:
+    request_local_cooldown_key = _get_codex_auto_agent_request_local_cooldown_key(
+        candidate=candidate,
+        lane_key=lane_key,
+    )
+    request_local_cooldown_seconds = (
+        _get_codex_auto_agent_request_local_cooldown_seconds(
+            request,
+            cooldown_key=request_local_cooldown_key,
+        )
+    )
+    if request_local_cooldown_seconds > cooldown_seconds:
+        cooldown_seconds = request_local_cooldown_seconds
+        cooldown_state_source = "request_local"
+    if request_local_cooldown_key in _get_codex_auto_agent_request_local_excluded_keys(
+        request
+    ):
+        if request_local_cooldown_seconds <= 0:
+            cooldown_seconds = max(cooldown_seconds, 0.001)
+        cooldown_state_source = "request_local"
+        skip_reason = "request_local_transient_failure"
+    return cooldown_seconds, cooldown_state_source, skip_reason
+
+
 async def _build_codex_auto_agent_candidate_state(
     request: Request,
     *,
@@ -3330,6 +3373,16 @@ async def _build_codex_auto_agent_candidate_state(
     cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
     cooldown_seconds, cooldown_state_source = (
         await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
+    )
+    cooldown_seconds, cooldown_state_source, skip_reason = (
+        _apply_codex_auto_agent_request_local_candidate_state(
+            request,
+            candidate=candidate,
+            lane_key=lane_key,
+            cooldown_seconds=cooldown_seconds,
+            cooldown_state_source=cooldown_state_source,
+            skip_reason=skip_reason,
+        )
     )
     if (
         forced_cooldown_seconds is not None
@@ -3415,6 +3468,16 @@ async def _build_anthropic_auto_agent_candidate_state(
     cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
     cooldown_seconds, cooldown_state_source = (
         await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+    )
+    cooldown_seconds, cooldown_state_source, skip_reason = (
+        _apply_codex_auto_agent_request_local_candidate_state(
+            request,
+            candidate=candidate,
+            lane_key=lane_key,
+            cooldown_seconds=cooldown_seconds,
+            cooldown_state_source=cooldown_state_source,
+            skip_reason=skip_reason,
+        )
     )
     if (
         forced_cooldown_seconds is not None
@@ -3783,6 +3846,162 @@ def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
     return tokens
 
 
+def _is_codex_auto_agent_durable_cooldown_error_class(error_class: Optional[str]) -> bool:
+    return error_class in _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES
+
+
+def _is_codex_auto_agent_transient_internal_error_class(error_class: Optional[str]) -> bool:
+    return error_class in {"upstream_transient_internal", "upstream_transient"}
+
+
+def _get_codex_auto_agent_cooldown_scope(error_class: Optional[str]) -> str:
+    if _is_codex_auto_agent_durable_cooldown_error_class(error_class):
+        return "candidate"
+    return "request_local"
+
+
+def _get_codex_auto_agent_request_local_cooldown_key(
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+) -> str:
+    return _codex_auto_agent_candidate_key(
+        candidate,
+        lane_key or "__default__",
+    )
+
+
+def _get_codex_auto_agent_request_local_cooldown_state(
+    request: Request,
+) -> dict[str, float]:
+    state = getattr(request.state, "aawm_alias_request_local_cooldown_until", None)
+    if isinstance(state, dict):
+        return state
+    state = {}
+    setattr(request.state, "aawm_alias_request_local_cooldown_until", state)
+    return state
+
+
+def _get_codex_auto_agent_request_local_cooldown_seconds(
+    request: Request,
+    *,
+    cooldown_key: str,
+) -> float:
+    until = _get_codex_auto_agent_request_local_cooldown_state(request).get(
+        cooldown_key,
+        0.0,
+    )
+    remaining = max(0.0, until - time.monotonic())
+    if remaining <= 0:
+        _get_codex_auto_agent_request_local_cooldown_state(request).pop(
+            cooldown_key,
+            None,
+        )
+        return 0.0
+    return remaining
+
+
+def _set_codex_auto_agent_request_local_cooldown(
+    request: Request,
+    *,
+    cooldown_key: str,
+    cooldown_seconds: float,
+) -> None:
+    ttl_seconds = max(0.0, float(cooldown_seconds))
+    if ttl_seconds <= 0:
+        return
+    until = time.monotonic() + ttl_seconds
+    state = _get_codex_auto_agent_request_local_cooldown_state(request)
+    current_until = state.get(cooldown_key, 0.0)
+    if until > current_until:
+        state[cooldown_key] = until
+
+
+def _get_codex_auto_agent_request_local_excluded_keys(
+    request: Request,
+) -> set[str]:
+    excluded = getattr(request.state, "aawm_alias_request_local_excluded_keys", None)
+    if isinstance(excluded, set):
+        return excluded
+    excluded = set()
+    setattr(request.state, "aawm_alias_request_local_excluded_keys", excluded)
+    return excluded
+
+
+def _exclude_codex_auto_agent_request_local_candidate(
+    request: Request,
+    *,
+    cooldown_key: str,
+) -> None:
+    _get_codex_auto_agent_request_local_excluded_keys(request).add(cooldown_key)
+
+
+async def _apply_codex_auto_agent_alias_cooldown(
+    *,
+    request: Request,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+) -> str:
+    cooldown_scope = _get_codex_auto_agent_cooldown_scope(error_class)
+    if cooldown_scope == "candidate":
+        await _set_codex_auto_agent_cooldown(
+            selected_cooldown_key,
+            cooldown_seconds,
+        )
+        return cooldown_scope
+
+    request_local_key = _get_codex_auto_agent_request_local_cooldown_key(
+        candidate=candidate,
+        lane_key=lane_key,
+    )
+    _set_codex_auto_agent_request_local_cooldown(
+        request,
+        cooldown_key=request_local_key,
+        cooldown_seconds=cooldown_seconds,
+    )
+    _exclude_codex_auto_agent_request_local_candidate(
+        request,
+        cooldown_key=request_local_key,
+    )
+    return cooldown_scope
+
+
+async def _apply_anthropic_auto_agent_alias_cooldown(
+    *,
+    request: Request,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+) -> str:
+    cooldown_scope = _get_codex_auto_agent_cooldown_scope(error_class)
+    if cooldown_scope == "candidate":
+        await _set_anthropic_auto_agent_cooldown(
+            selected_cooldown_key,
+            cooldown_seconds,
+        )
+        return cooldown_scope
+
+    request_local_key = _get_codex_auto_agent_request_local_cooldown_key(
+        candidate=candidate,
+        lane_key=lane_key,
+    )
+    _set_codex_auto_agent_request_local_cooldown(
+        request,
+        cooldown_key=request_local_key,
+        cooldown_seconds=cooldown_seconds,
+    )
+    _exclude_codex_auto_agent_request_local_candidate(
+        request,
+        cooldown_key=request_local_key,
+    )
+    return cooldown_scope
+
+
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
 ) -> Optional[str]:
@@ -3806,8 +4025,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "rate_limited"
     if status_code == 429:
         return "rate_limited"
-    if status_code in {500, 502, 503, 529}:
-        return "upstream_overloaded"
+    if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
+        return "upstream_transient_internal"
     if status_code == 504:
         return "upstream_timeout"
     return None
@@ -3861,6 +4080,8 @@ def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
         or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
     ):
         return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
+    if _is_codex_auto_agent_transient_internal_error_class(error_class):
+        return _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
     if "usage_limit_reached" in tokens:
         return _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
     if "RESOURCE_EXHAUSTED" in tokens or "RATE_LIMIT_EXCEEDED" in tokens:
@@ -3913,17 +4134,21 @@ def _extract_codex_auto_agent_error_type_and_code(
 
 async def _set_codex_auto_agent_candidate_cooldowns(
     *,
+    request: Request,
     candidate: dict[str, Any],
     lane_key: Optional[str],
     selected_cooldown_key: str,
     cooldown_seconds: float,
-    exc: Any,
+    error_class: Optional[str],
 ) -> str:
-    await _set_codex_auto_agent_cooldown(
-        selected_cooldown_key,
-        cooldown_seconds,
+    return await _apply_codex_auto_agent_alias_cooldown(
+        request=request,
+        candidate=candidate,
+        lane_key=lane_key,
+        selected_cooldown_key=selected_cooldown_key,
+        cooldown_seconds=cooldown_seconds,
+        error_class=error_class,
     )
-    return "candidate"
 
 
 def _update_codex_auto_agent_retryable_attempt_record(
@@ -23102,16 +23327,20 @@ async def _handle_anthropic_auto_agent_alias_route(
                 raise
             last_retryable_exc = exc
             cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
-            await _set_anthropic_auto_agent_cooldown(
-                selection["cooldown_key"],
-                cooldown_seconds,
+            cooldown_scope = await _apply_anthropic_auto_agent_alias_cooldown(
+                request=request,
+                candidate=candidate,
+                lane_key=selection.get("lane_key"),
+                selected_cooldown_key=selection["cooldown_key"],
+                cooldown_seconds=cooldown_seconds,
+                error_class=error_class,
             )
             error_tokens = _update_codex_auto_agent_retryable_attempt_record(
                 attempt_record=attempt_record,
                 exc=exc,
                 error_class=error_class,
                 cooldown_seconds=cooldown_seconds,
-                cooldown_scope="candidate",
+                cooldown_scope=cooldown_scope,
             )
             if has_continuation_state:
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
@@ -25828,11 +26057,12 @@ async def _handle_codex_auto_agent_alias_route(
             last_retryable_exc = exc
             cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
             cooldown_scope = await _set_codex_auto_agent_candidate_cooldowns(
+                request=request,
                 candidate=candidate,
                 lane_key=selection.get("lane_key"),
                 selected_cooldown_key=selection["cooldown_key"],
                 cooldown_seconds=cooldown_seconds,
-                exc=exc,
+                error_class=error_class,
             )
             error_tokens = _update_codex_auto_agent_retryable_attempt_record(
                 attempt_record=attempt_record,

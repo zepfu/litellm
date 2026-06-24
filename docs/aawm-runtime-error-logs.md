@@ -245,10 +245,17 @@ policy: the side-channel call is often stale or missing native Grok CLI auth
 context and should not keep reopening `.analysis/*-error.jsonl` for the same
 fingerprint.
 
-Unexpected `/signals` `401` bodies, other Grok side-channel `401`/`404`
-failures, and any data-bearing side-channel error that does not match that known
-auth-context shape still use the normal failure logging path and remain visible
-for triage.
+Known stale Grok Build `/sessions/{session_id}/replicas/update` `404` responses
+with upstream body `{"error":"Session not found or not owned"}` are also treated
+as degraded side-channel telemetry. LiteLLM still returns the upstream `404` to
+the client, but logs a warning with
+`failure_kind=degraded_grok_replicas_update_not_owned` instead of emitting
+traceback-style active error intake.
+
+Unexpected `/signals` `401` bodies, unexpected `/replicas/update` `404` bodies,
+other Grok side-channel `401`/`404` failures, and any data-bearing side-channel
+error that does not match a known degraded shape still use the normal failure
+logging path and remain visible for triage.
 
 When the Langfuse SDK background ingestion consumer emits its generic support
 message (`Unexpected error occurred. Please check your request and contact
