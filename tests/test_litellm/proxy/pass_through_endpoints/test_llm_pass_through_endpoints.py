@@ -25,8 +25,16 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 import litellm
-from litellm._logging import AawmErrorLogFileHandler, verbose_proxy_logger
-from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
+from litellm._logging import (
+    AawmErrorLogFileHandler,
+    AawmRouteAccessLogReplacementFilter,
+    clear_aawm_route_access_log_replacements,
+    verbose_proxy_logger,
+)
+from litellm.proxy.aawm_route_logging import (
+    clear_aawm_route_rollups,
+    flush_aawm_route_rollups,
+)
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
@@ -111,6 +119,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _handle_anthropic_xai_oauth_responses_adapter_route,
     _handle_anthropic_auto_agent_alias_route,
     _handle_codex_opencode_zen_adapter_route,
+    _resolve_auto_agent_alias_route_rollup_outgoing_target,
     _handle_codex_auto_agent_alias_route,
     _handle_codex_google_code_assist_adapter_route,
     _get_anthropic_auto_agent_candidates_for_alias,
@@ -9882,6 +9891,113 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "id": "resp_codex_antigravity",
             "model": "gpt-oss-120b-medium",
         }
+
+    @pytest.mark.asyncio
+    async def test_codex_opencode_zen_route_registers_access_log_and_completed_rollup(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-opencode-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/responses"
+            "?adapted_to=opencode.ai/zen/v1/chat/completions"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/responses",
+            "query_string": b"adapted_to=opencode.ai/zen/v1/chat/completions",
+            "client": ("172.19.0.1", 52834),
+            "http_version": "1.1",
+        }
+        prepared_body = {
+            "model": "opencode/big-pickle",
+            "input": "just a test msg",
+            "stream": False,
+            "litellm_metadata": {
+                "client_name": "codex_exec",
+                "passthrough_route_family": "codex_responses",
+                "tags": ["route:codex_responses"],
+            },
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.acompletion",
+            new=AsyncMock(
+                return_value={
+                    "id": "chatcmpl_opencode",
+                    "object": "chat.completion",
+                    "created": 1770000000,
+                    "model": "big-pickle",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "OPENCODE CODEX OK",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 4,
+                        "total_tokens": 9,
+                    },
+                }
+            ),
+        ):
+            response = await _handle_codex_opencode_zen_adapter_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="big-pickle",
+            )
+
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        access_record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=(
+                "172.19.0.1:52834",
+                "POST",
+                "/openai_passthrough/responses?adapted_to=opencode.ai/zen/v1/chat/completions -> opencode.ai/zen/v1/chat/completions",
+                "1.1",
+                200,
+            ),
+            exc_info=None,
+        )
+        assert access_filter.filter(access_record) is False
+        assert access_filter.filter(access_record) is True
+
+        flushed = flush_aawm_route_rollups(force=True)
+        rendered = "\n".join(flushed)
+        assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
+        assert (
+            " - big-pickle - Turns: 1 -> opencode.ai/zen/v1/chat/completions"
+            in rendered
+        )
+        assert json.loads(response.body.decode("utf-8"))["id"] == "chatcmpl_opencode"
+        clear_aawm_route_rollups()
 
     @pytest.mark.asyncio
     async def test_codex_opencode_zen_route_uses_saved_opencode_auth_and_responses_envelope(
@@ -22324,6 +22440,55 @@ def test_auto_agent_alias_route_event_records_zero_turn_rollup(monkeypatch):
             "status": "Cooling Down",
         }
     ]
+
+
+def test_auto_agent_alias_route_event_prefers_real_opencode_zen_target(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    rollups = []
+    monkeypatch.setattr(endpoints, "emit_aawm_route_status_event", lambda **kwargs: None)
+    monkeypatch.setattr(
+        endpoints,
+        "record_aawm_route_rollup",
+        lambda **kwargs: rollups.append(kwargs),
+    )
+    monkeypatch.setattr(endpoints.verbose_proxy_logger, "warning", lambda message: None)
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "capacity_exhausted",
+            "alias_model": "aawm-low",
+            "model": "deepseek-v4-flash",
+            "rollup_group_header_label": "litellm@Codex[0.141.0]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "route_family": "codex_opencode_zen_adapter",
+            "target_url": "https://opencode.ai/zen/v1/chat/completions",
+        },
+        level="warning",
+    )
+
+    assert rollups == [
+        {
+            "group_header_label": "litellm@Codex[0.141.0]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "opencode.ai/zen/v1/chat/completions",
+            "model_label": "deepseek-v4-flash(aawm-low)",
+            "turns": 0,
+            "status": "Cooling Down",
+        }
+    ]
+
+
+def test_resolve_auto_agent_alias_route_rollup_outgoing_target_prefers_target_url():
+    assert (
+        _resolve_auto_agent_alias_route_rollup_outgoing_target(
+            route_family="codex_opencode_zen_adapter",
+            target_url="https://opencode.ai/zen/v1/chat/completions",
+        )
+        == "opencode.ai/zen/v1/chat/completions"
+    )
 
 
 @pytest.mark.asyncio

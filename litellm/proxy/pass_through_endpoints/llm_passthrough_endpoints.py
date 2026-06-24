@@ -90,8 +90,10 @@ from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
 )
 from litellm.proxy.aawm_route_logging import (
     build_aawm_route_rollup_group_header_label,
+    emit_aawm_route_access_log,
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
+    record_aawm_route_rollup_turn,
 )
 try:
     from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
@@ -2573,6 +2575,65 @@ def _extract_auto_agent_alias_incoming_endpoint(request: Request) -> str:
     return f"{path}?{urlencode(safe_pairs)}"
 
 
+def _resolve_auto_agent_alias_route_rollup_outgoing_target(
+    *,
+    route_family: Optional[str],
+    target_url: Optional[Union[str, httpx.URL]] = None,
+) -> Optional[str]:
+    cleaned_route_family = _clean_codex_auth_value(route_family)
+    if target_url is not None:
+        return _get_anthropic_adapter_access_log_target_label(target_url)
+    route_family_target_labels = {
+        "codex_opencode_zen_adapter": "opencode.ai/zen/v1/chat/completions",
+        "anthropic_opencode_zen_responses_adapter": "opencode.ai/zen/v1/responses",
+        "anthropic_opencode_zen_completion_adapter": "opencode.ai/zen/v1/chat/completions",
+    }
+    return route_family_target_labels.get(cleaned_route_family or "", cleaned_route_family)
+
+
+def _build_opencode_zen_route_rollup_kwargs(
+    litellm_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "litellm_params": {
+            "metadata": dict(litellm_metadata),
+        }
+    }
+
+
+def _emit_opencode_zen_route_access_log(
+    *,
+    request: Request,
+    target_url: str,
+    request_body: dict[str, Any],
+    rollup_kwargs: dict[str, Any],
+) -> None:
+    try:
+        emit_aawm_route_access_log(
+            request=request,
+            target=target_url,
+            request_body=request_body,
+            kwargs=rollup_kwargs,
+        )
+    except Exception:
+        verbose_proxy_logger.debug(
+            "Failed to emit AAWM route access log for OpenCode Zen adapter",
+            exc_info=True,
+        )
+
+
+def _record_opencode_zen_completed_route_rollup_turn(
+    rollup_kwargs: dict[str, Any],
+) -> None:
+    try:
+        record_aawm_route_rollup_turn(rollup_kwargs)
+    except Exception:
+        verbose_proxy_logger.debug(
+            "Failed to record AAWM route rollup turn for OpenCode Zen adapter",
+            exc_info=True,
+        )
+
+
 def _auto_agent_alias_model_rollup_label(event: dict[str, Any]) -> Optional[str]:
     model = _clean_codex_auth_value(event.get("model"))
     alias_model = _clean_codex_auth_value(event.get("alias_model"))
@@ -2651,8 +2712,13 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
 
     group_header_label = _clean_codex_auth_value(event.get("rollup_group_header_label"))
     incoming_endpoint = _clean_codex_auth_value(event.get("incoming_endpoint"))
-    outgoing_target = _clean_codex_auth_value(event.get("outgoing_target")) or (
-        _clean_codex_auth_value(event.get("route_family")) or "candidate_selection"
+    outgoing_target = (
+        _clean_codex_auth_value(event.get("outgoing_target"))
+        or _resolve_auto_agent_alias_route_rollup_outgoing_target(
+            route_family=_clean_codex_auth_value(event.get("route_family")),
+            target_url=event.get("target_url"),
+        )
+        or "candidate_selection"
     )
     if not group_header_label or not incoming_endpoint:
         return
@@ -2840,7 +2906,11 @@ def _build_auto_agent_alias_audit_event(
             client_product_label=client_product_label,
         ),
         "incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint(request),
-        "outgoing_target": candidate.get("route_family"),
+        "outgoing_target": _resolve_auto_agent_alias_route_rollup_outgoing_target(
+            route_family=candidate.get("route_family"),
+            target_url=candidate.get("target_url"),
+        ),
+        "target_url": candidate.get("target_url"),
         "session_key": selection.get("session_key"),
         "provider": candidate.get("provider"),
         "model": candidate.get("model"),
@@ -25675,6 +25745,13 @@ async def _handle_codex_opencode_zen_adapter_route(
         expected_target_family="opencode",
     )
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+    rollup_kwargs = _build_opencode_zen_route_rollup_kwargs(litellm_metadata)
+    _emit_opencode_zen_route_access_log(
+        request=request,
+        target_url=target_url,
+        request_body=request_body,
+        rollup_kwargs=rollup_kwargs,
+    )
     try:
         completion_response = await litellm.acompletion(
             **completion_kwargs,
@@ -25728,6 +25805,7 @@ async def _handle_codex_opencode_zen_adapter_route(
             adapter="codex_opencode_zen_completion_adapter",
             adapter_label="OpenCode Zen chat-completions",
         )
+    _record_opencode_zen_completed_route_rollup_turn(rollup_kwargs)
     return _build_responses_response_from_adapter_response(responses_api_response)
 
 
