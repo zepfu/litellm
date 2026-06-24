@@ -3268,6 +3268,83 @@ def _raise_codex_auto_agent_in_flight_cooldown(
     )
 
 
+def _build_auto_agent_redispatch_http_exception_detail(
+    *,
+    alias_family: str,
+    alias_model: str,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+    error_tokens: set[str],
+    error_class: Optional[str] = None,
+    cooldown_scope: Optional[str] = None,
+    error_status_code: Optional[Any] = None,
+    error_type: Optional[str] = None,
+    error_code: Optional[Any] = None,
+    retry_after_seconds: Optional[Any] = None,
+    failure_phase: Optional[str] = None,
+    attempted_provider_call: Optional[bool] = None,
+    audit_events: Optional[list[dict[str, Any]]] = None,
+    attempts: Optional[list[dict[str, Any]]] = None,
+    skipped_candidates: Optional[list[dict[str, Any]]] = None,
+    code: str,
+    message: str,
+) -> dict[str, Any]:
+    retry_after = int(
+        max(
+            1.0,
+            float(retry_after_seconds)
+            if retry_after_seconds is not None
+            else cooldown_seconds,
+        )
+    )
+    shaped_candidate = _codex_auto_agent_candidate_public_shape(
+        candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        reason="in_flight_retryable_provider_exhaustion",
+    )
+    detail: dict[str, Any] = {
+        "error": {
+            "message": message,
+            "type": "rate_limit_error",
+            "code": code,
+        },
+        "alias_family": alias_family,
+        "alias_model": alias_model,
+        "redispatch_model": alias_model,
+        "redispatch_reason": "in_flight_retryable_provider_exhaustion",
+        "redispatch_required": True,
+        "selected_provider": candidate.get("provider"),
+        "selected_model": candidate.get("model"),
+        "selected_route_family": candidate.get("route_family"),
+        "cooldown_seconds": round(float(cooldown_seconds), 3),
+        "cooldown_scope": cooldown_scope,
+        "retry_after_seconds": retry_after,
+        "error_tokens": sorted(error_tokens),
+        "candidate": shaped_candidate,
+    }
+    if error_class is not None:
+        detail["failure_class"] = error_class
+    if error_status_code is not None:
+        detail["error_status_code"] = error_status_code
+    if error_type is not None:
+        detail["error_type"] = error_type
+    if error_code is not None:
+        detail["error_code"] = str(error_code)
+    if failure_phase is not None:
+        detail["failure_phase"] = failure_phase
+    if attempted_provider_call is not None:
+        detail["attempted_provider_call"] = attempted_provider_call
+    if isinstance(audit_events, list):
+        detail["aawm_alias_routing_audit_events"] = audit_events
+    if isinstance(attempts, list):
+        detail["attempts"] = attempts
+    if isinstance(skipped_candidates, list):
+        detail["skipped_candidates"] = skipped_candidates
+    return detail
+
+
 def _raise_codex_auto_agent_redispatch_required(
     *,
     candidate: dict[str, Any],
@@ -3275,38 +3352,48 @@ def _raise_codex_auto_agent_redispatch_required(
     cooldown_seconds: float,
     error_tokens: set[str],
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
+    error_class: Optional[str] = None,
+    cooldown_scope: Optional[str] = None,
+    error_status_code: Optional[Any] = None,
+    error_type: Optional[str] = None,
+    error_code: Optional[Any] = None,
+    retry_after_seconds: Optional[Any] = None,
+    failure_phase: Optional[str] = None,
+    attempted_provider_call: Optional[bool] = None,
+    audit_events: Optional[list[dict[str, Any]]] = None,
+    attempts: Optional[list[dict[str, Any]]] = None,
+    skipped_candidates: Optional[list[dict[str, Any]]] = None,
 ) -> None:
-    retry_after_seconds = int(max(1.0, cooldown_seconds))
-    shaped_candidate = _codex_auto_agent_candidate_public_shape(
-        candidate,
+    detail = _build_auto_agent_redispatch_http_exception_detail(
+        alias_family="codex_auto_agent",
+        alias_model=alias_model,
+        candidate=candidate,
         lane_key=lane_key,
         cooldown_seconds=cooldown_seconds,
-        reason="in_flight_retryable_provider_exhaustion",
+        error_tokens=error_tokens,
+        error_class=error_class,
+        cooldown_scope=cooldown_scope,
+        error_status_code=error_status_code,
+        error_type=error_type,
+        error_code=error_code,
+        retry_after_seconds=retry_after_seconds,
+        failure_phase=failure_phase,
+        attempted_provider_call=attempted_provider_call,
+        audit_events=audit_events,
+        attempts=attempts,
+        skipped_candidates=skipped_candidates,
+        code="aawm_codex_auto_agent_redispatch_required",
+        message=(
+            "Codex auto-agent alias target hit retryable provider exhaustion "
+            "for an in-flight session. Do not continue this child agent. "
+            f"Redispatch a fresh subagent using model {alias_model} "
+            "so the auto selector can choose the next available candidate."
+        ),
     )
     raise HTTPException(
         status_code=429,
-        detail={
-            "error": {
-                "message": (
-                    "Codex auto-agent alias target hit retryable provider exhaustion "
-                    "for an in-flight session. Do not continue this child agent. "
-                    f"Redispatch a fresh subagent using model {alias_model} "
-                    "so the auto selector can choose the next available candidate."
-                ),
-                "type": "rate_limit_error",
-                "code": "aawm_codex_auto_agent_redispatch_required",
-            },
-            "redispatch_model": alias_model,
-            "redispatch_reason": "in_flight_retryable_provider_exhaustion",
-            "selected_provider": candidate.get("provider"),
-            "selected_model": candidate.get("model"),
-            "selected_route_family": candidate.get("route_family"),
-            "cooldown_seconds": round(float(cooldown_seconds), 3),
-            "retry_after_seconds": retry_after_seconds,
-            "error_tokens": sorted(error_tokens),
-            "candidate": shaped_candidate,
-        },
-        headers={"Retry-After": str(retry_after_seconds)},
+        detail=detail,
+        headers={"Retry-After": str(detail["retry_after_seconds"])},
     )
 
 
@@ -3531,6 +3618,38 @@ def _apply_codex_auto_agent_request_local_candidate_state(
     return cooldown_seconds, cooldown_state_source, skip_reason
 
 
+async def _apply_codex_auto_agent_adapter_local_candidate_cooldown(
+    *,
+    candidate: dict[str, Any],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+) -> tuple[float, Optional[str], Optional[str]]:
+    """Merge process-local adapter cooldown evidence into alias selection state."""
+    provider = candidate.get("provider")
+    model = candidate.get("model")
+    adapter_seconds = 0.0
+    if provider == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+        adapter_seconds = await _get_openrouter_adapter_active_cooldown_seconds(model)
+    elif provider == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
+        lane_key = await _resolve_codex_auto_agent_google_lane_key()
+        async with _google_adapter_rate_limit_lock:
+            now = time.monotonic()
+            adapter_seconds = max(
+                0.0,
+                _google_adapter_rate_limit_until_monotonic_by_key.get(lane_key, 0.0)
+                - now,
+            )
+    if adapter_seconds <= 0:
+        return cooldown_seconds, cooldown_state_source, skip_reason
+    if adapter_seconds > cooldown_seconds:
+        cooldown_seconds = adapter_seconds
+        cooldown_state_source = "adapter_local"
+    if cooldown_seconds > 0 and skip_reason is None:
+        skip_reason = "adapter_cooldown"
+    return cooldown_seconds, cooldown_state_source, skip_reason
+
+
 async def _build_codex_auto_agent_candidate_state(
     request: Request,
     *,
@@ -3586,6 +3705,14 @@ async def _build_codex_auto_agent_candidate_state(
             request,
             candidate=candidate,
             lane_key=lane_key,
+            cooldown_seconds=cooldown_seconds,
+            cooldown_state_source=cooldown_state_source,
+            skip_reason=skip_reason,
+        )
+    )
+    cooldown_seconds, cooldown_state_source, skip_reason = (
+        await _apply_codex_auto_agent_adapter_local_candidate_cooldown(
+            candidate=candidate,
             cooldown_seconds=cooldown_seconds,
             cooldown_state_source=cooldown_state_source,
             skip_reason=skip_reason,
@@ -3681,6 +3808,14 @@ async def _build_anthropic_auto_agent_candidate_state(
             request,
             candidate=candidate,
             lane_key=lane_key,
+            cooldown_seconds=cooldown_seconds,
+            cooldown_state_source=cooldown_state_source,
+            skip_reason=skip_reason,
+        )
+    )
+    cooldown_seconds, cooldown_state_source, skip_reason = (
+        await _apply_codex_auto_agent_adapter_local_candidate_cooldown(
+            candidate=candidate,
             cooldown_seconds=cooldown_seconds,
             cooldown_state_source=cooldown_state_source,
             skip_reason=skip_reason,
@@ -4907,38 +5042,48 @@ def _raise_anthropic_auto_agent_redispatch_required(
     cooldown_seconds: float,
     error_tokens: set[str],
     alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+    error_class: Optional[str] = None,
+    cooldown_scope: Optional[str] = None,
+    error_status_code: Optional[Any] = None,
+    error_type: Optional[str] = None,
+    error_code: Optional[Any] = None,
+    retry_after_seconds: Optional[Any] = None,
+    failure_phase: Optional[str] = None,
+    attempted_provider_call: Optional[bool] = None,
+    audit_events: Optional[list[dict[str, Any]]] = None,
+    attempts: Optional[list[dict[str, Any]]] = None,
+    skipped_candidates: Optional[list[dict[str, Any]]] = None,
 ) -> None:
-    retry_after_seconds = int(max(1.0, cooldown_seconds))
-    shaped_candidate = _codex_auto_agent_candidate_public_shape(
-        candidate,
+    detail = _build_auto_agent_redispatch_http_exception_detail(
+        alias_family="anthropic_auto_agent",
+        alias_model=alias_model,
+        candidate=candidate,
         lane_key=lane_key,
         cooldown_seconds=cooldown_seconds,
-        reason="in_flight_retryable_provider_exhaustion",
+        error_tokens=error_tokens,
+        error_class=error_class,
+        cooldown_scope=cooldown_scope,
+        error_status_code=error_status_code,
+        error_type=error_type,
+        error_code=error_code,
+        retry_after_seconds=retry_after_seconds,
+        failure_phase=failure_phase,
+        attempted_provider_call=attempted_provider_call,
+        audit_events=audit_events,
+        attempts=attempts,
+        skipped_candidates=skipped_candidates,
+        code="aawm_anthropic_auto_agent_redispatch_required",
+        message=(
+            "Anthropic auto-agent alias target hit retryable provider "
+            "exhaustion for an in-flight session. Do not continue this "
+            f"child agent. Redispatch a fresh subagent using model {alias_model} "
+            "so the auto selector can choose the next available candidate."
+        ),
     )
     raise HTTPException(
         status_code=429,
-        detail={
-            "error": {
-                "message": (
-                    "Anthropic auto-agent alias target hit retryable provider "
-                    "exhaustion for an in-flight session. Do not continue this "
-                    f"child agent. Redispatch a fresh subagent using model {alias_model} "
-                    "so the auto selector can choose the next available candidate."
-                ),
-                "type": "rate_limit_error",
-                "code": "aawm_anthropic_auto_agent_redispatch_required",
-            },
-            "redispatch_model": alias_model,
-            "redispatch_reason": "in_flight_retryable_provider_exhaustion",
-            "selected_provider": candidate.get("provider"),
-            "selected_model": candidate.get("model"),
-            "selected_route_family": candidate.get("route_family"),
-            "cooldown_seconds": round(float(cooldown_seconds), 3),
-            "retry_after_seconds": retry_after_seconds,
-            "error_tokens": sorted(error_tokens),
-            "candidate": shaped_candidate,
-        },
-        headers={"Retry-After": str(retry_after_seconds)},
+        detail=detail,
+        headers={"Retry-After": str(detail["retry_after_seconds"])},
     )
 
 
@@ -7985,6 +8130,38 @@ async def _openrouter_adapter_open_failure_circuit(
 def _clear_openrouter_adapter_failure_circuit(adapter_model: Optional[str]) -> None:
     rate_limit_key = _get_openrouter_adapter_rate_limit_key(adapter_model)
     _openrouter_adapter_failure_circuit_until_monotonic_by_key.pop(rate_limit_key, None)
+
+
+async def _get_openrouter_adapter_active_cooldown_seconds(
+    adapter_model: Optional[str],
+) -> float:
+    """Return remaining adapter-local cooldown for an OpenRouter model key."""
+    candidate_keys = [_get_openrouter_adapter_rate_limit_key(adapter_model)]
+    upstream_model = _get_openrouter_completion_adapter_upstream_model(adapter_model)
+    upstream_key = _get_openrouter_adapter_rate_limit_key(upstream_model)
+    if upstream_key not in candidate_keys:
+        candidate_keys.append(upstream_key)
+    async with _openrouter_adapter_rate_limit_lock:
+        now = time.monotonic()
+        rate_wait = max(
+            (
+                _openrouter_adapter_rate_limit_until_monotonic_by_key.get(key, 0.0)
+                - now
+                for key in candidate_keys
+            ),
+            default=0.0,
+        )
+        circuit_wait = max(
+            (
+                _openrouter_adapter_failure_circuit_until_monotonic_by_key.get(
+                    key, 0.0
+                )
+                - now
+                for key in candidate_keys
+            ),
+            default=0.0,
+        )
+    return max(0.0, rate_wait, circuit_wait)
 
 
 async def _wait_for_openrouter_adapter_cooldown_if_needed(
@@ -12355,8 +12532,11 @@ def _is_grok_unsupported_reasoning_parameter_detail(normalized_detail: str) -> b
 
 
 def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, (dict, list)):
+    status_code = _extract_google_adapter_exception_status_code(exc)
+    detail = _extract_google_adapter_exception_detail(exc)
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="ignore")
+    elif isinstance(detail, (dict, list)):
         detail_text = json.dumps(detail, sort_keys=True, default=str)
     elif detail is not None:
         detail_text = str(detail)
@@ -12366,6 +12546,16 @@ def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
     if _is_grok_unsupported_reasoning_parameter_detail(normalized):
         return detail_text
     if "could not decode the compaction blob" in normalized:
+        return detail_text
+    if (
+        status_code == 403
+        and "permission-denied" in normalized
+        and "access to the chat endpoint is denied" in normalized
+        and (
+            "correct credentials" in normalized
+            or "update the permissions" in normalized
+        )
+    ):
         return detail_text
     if (
         "xai oauth credential" not in normalized
@@ -23800,7 +23990,7 @@ async def _handle_anthropic_auto_agent_alias_route(
             )
             if has_continuation_state:
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
-                _record_auto_agent_alias_attempt_failure(
+                failure_body = _record_auto_agent_alias_attempt_failure(
                     alias_family="anthropic_auto_agent",
                     alias_model=alias_model,
                     request=request,
@@ -23812,6 +24002,7 @@ async def _handle_anthropic_auto_agent_alias_route(
                     add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
                     redispatch_required=True,
                 )
+                failure_metadata = failure_body.get("litellm_metadata") or {}
                 verbose_proxy_logger.debug(
                     "Anthropic auto-agent alias %s target %s/%s hit %s "
                     "for an in-flight session on attempt %s; signaling redispatch",
@@ -23827,6 +24018,19 @@ async def _handle_anthropic_auto_agent_alias_route(
                     cooldown_seconds=cooldown_seconds,
                     error_tokens=error_tokens,
                     alias_model=alias_model,
+                    error_class=error_class,
+                    cooldown_scope=cooldown_scope,
+                    error_status_code=attempt_record.get("error_status_code"),
+                    error_type=attempt_record.get("error_type"),
+                    error_code=attempt_record.get("error_code"),
+                    retry_after_seconds=attempt_record.get("retry_after_seconds"),
+                    failure_phase=attempt_record.get("failure_phase"),
+                    attempted_provider_call=attempt_record.get("attempted_provider_call"),
+                    audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
+                    attempts=failure_metadata.get("anthropic_auto_agent_attempts"),
+                    skipped_candidates=failure_metadata.get(
+                        "anthropic_auto_agent_skipped_candidates"
+                    ),
                 )
             _record_auto_agent_alias_attempt_failure(
                 alias_family="anthropic_auto_agent",
@@ -26555,7 +26759,7 @@ async def _handle_codex_auto_agent_alias_route(
             )
             if has_continuation_state:
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
-                _record_auto_agent_alias_attempt_failure(
+                failure_body = _record_auto_agent_alias_attempt_failure(
                     alias_family="codex_auto_agent",
                     alias_model=alias_model,
                     request=request,
@@ -26567,6 +26771,7 @@ async def _handle_codex_auto_agent_alias_route(
                     add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
                     redispatch_required=True,
                 )
+                failure_metadata = failure_body.get("litellm_metadata") or {}
                 verbose_proxy_logger.debug(
                     "Codex auto-agent alias %s target %s/%s hit %s "
                     "for an in-flight session on attempt %s; signaling redispatch",
@@ -26582,6 +26787,19 @@ async def _handle_codex_auto_agent_alias_route(
                     cooldown_seconds=cooldown_seconds,
                     error_tokens=error_tokens,
                     alias_model=alias_model,
+                    error_class=error_class,
+                    cooldown_scope=cooldown_scope,
+                    error_status_code=attempt_record.get("error_status_code"),
+                    error_type=attempt_record.get("error_type"),
+                    error_code=attempt_record.get("error_code"),
+                    retry_after_seconds=attempt_record.get("retry_after_seconds"),
+                    failure_phase=attempt_record.get("failure_phase"),
+                    attempted_provider_call=attempt_record.get("attempted_provider_call"),
+                    audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
+                    attempts=failure_metadata.get("codex_auto_agent_attempts"),
+                    skipped_candidates=failure_metadata.get(
+                        "codex_auto_agent_skipped_candidates"
+                    ),
                 )
             _record_auto_agent_alias_attempt_failure(
                 alias_family="codex_auto_agent",

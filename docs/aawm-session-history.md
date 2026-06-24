@@ -201,7 +201,19 @@ Common keys include:
 
 For retryable provider errors, the handler records a
 `candidate_retryable_failure` event, cools down that candidate, and selects the
-next configured usable candidate. For tool-bearing or stateful
+next configured usable candidate. Alias selection also honors process-local
+adapter cooldown evidence for OpenRouter and Google Code Assist candidates so
+recent adapter-level exhaustion suppresses those candidates before the next
+dispatch without adding `rate_limit_observations` reads to the request hot path.
+For Grok native alias probes, the specific upstream 403
+`permission-denied` response that says access to the chat endpoint is denied is
+recorded as a candidate-unavailable condition, allowing the alias to progress to
+the next declared model instead of surfacing repeated pass-through tracebacks.
+In-flight redispatch-required 429 responses include bounded audit metadata such
+as `failure_class`, `cooldown_scope`, `error_status_code`, `retry_after_seconds`,
+`aawm_alias_routing_audit_events`, and the attempt/skipped-candidate summaries
+so operators can correlate client-visible redispatch failures with the durable
+cooldown that triggered them. For tool-bearing or stateful
 `aawm-code-anthropic` requests, every declared candidate route is treated as a
 Claude Code tool-contract route: if the alias declares OpenAI, xAI,
 native Anthropic, or another provider/model target, that target must preserve
