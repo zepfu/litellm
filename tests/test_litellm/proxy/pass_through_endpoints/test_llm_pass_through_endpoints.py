@@ -168,6 +168,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _extract_google_code_assist_function_names,
     _expand_claude_persisted_output_text,
     _extract_codex_auto_agent_error_tokens,
+    _get_codex_auto_agent_cooldown_seconds,
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
     _log_grok_forward_header_compare,
@@ -31460,6 +31461,38 @@ async def test_aawm_alias_routing_durable_write_failure_keeps_in_memory_cooldown
     assert source == "memory"
 
 
+def test_codex_auto_agent_spark_durable_cooldown_seconds_are_five_minutes():
+    spark = {"model": "gpt-5.3-codex-spark", "provider": "openai"}
+    capacity_exc = RuntimeError(
+        "Selected model is at capacity. Please try a different model."
+    )
+    usage_exc = RuntimeError("usage_limit_reached for this account")
+    assert _get_codex_auto_agent_cooldown_seconds(capacity_exc, candidate=spark) == 300.0
+    assert _get_codex_auto_agent_cooldown_seconds(usage_exc, candidate=spark) == 300.0
+
+
+def test_codex_auto_agent_non_spark_candidate_keeps_default_durable_cooldown():
+    other = {"model": "oa_xai/grok-build", "provider": "xai"}
+    capacity_exc = RuntimeError(
+        "Selected model is at capacity. Please try a different model."
+    )
+    assert (
+        _get_codex_auto_agent_cooldown_seconds(capacity_exc, candidate=other)
+        == 10800.0
+    )
+
+
+def test_codex_auto_agent_spark_transient_cooldown_unchanged_at_thirty_seconds():
+    spark = {"model": "gpt-5.3-codex-spark", "provider": "openai"}
+    exc = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    assert _get_codex_auto_agent_cooldown_seconds(exc, candidate=spark) == 30.0
+
+
 @pytest.mark.parametrize("status_code", [500, 502, 503, 529])
 def test_codex_auto_agent_retryable_exhaustion_classifies_bare_transient_status_without_durable_cooldown(
     status_code,
@@ -31625,7 +31658,7 @@ async def test_codex_auto_agent_alias_capacity_failure_still_sets_durable_cooldo
     spark_attempt = metadata["codex_auto_agent_attempts"][0]
     assert spark_attempt["cooldown_scope"] == "candidate"
     assert spark_attempt["error_class"] == "capacity_exhausted"
-    assert spark_attempt["cooldown_seconds"] == 10800.0
+    assert spark_attempt["cooldown_seconds"] == 300.0
     durable_seconds, _ = await _get_codex_auto_agent_active_cooldown_state(
         "openai:gpt-5.3-codex-spark:__default__"
     )
