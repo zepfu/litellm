@@ -205,6 +205,23 @@ and lets the alias layer record candidate failure, cooldown, skipped candidates,
 and final redispatch/no-candidate metadata. Direct non-probe routes still use
 their normal logging behavior for exhausted transient upstream failures.
 
+Alias route failure logging uses one canonical warning by default: the route
+status line written through the AAWM route access logger (for example
+`Status: Cooling Down` / `Failed` / `Exhausted`). Rollup buckets still record
+zero-turn status updates for the same failure. Full structured
+`AAWM_ALIAS_ROUTE` JSON audit lines are investigation-only and require
+`AAWM_ALIAS_ROUTE_VERBOSE_JSON=1` (also accepts `true`, `yes`, `debug`, or
+`verbose`). Healthy alias selection events remain suppressed unless
+`AAWM_ALIAS_ROUTE_LOG_HEALTHY=1`.
+
+`provider_terminal_error` and `candidate_unavailable` alias cooldowns are
+durable per-candidate cooldowns because those outcomes are reusable across
+requests. They prevent repeated retry/log spam for the same terminal or
+unavailable candidate until the cooldown expires. Bare transient upstream
+`500`/`502`/`503`/`529` failures remain request-local so temporary provider
+instability does not suppress a route longer than the current progression
+requires.
+
 Successful or exhausted hidden retries add bounded metadata under
 `litellm_params.metadata`, including
 `aawm_passthrough_hidden_retry_attempts`,
