@@ -172,6 +172,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _expand_claude_persisted_output_text,
     _extract_codex_auto_agent_error_tokens,
     _get_codex_auto_agent_cooldown_seconds,
+    _get_codex_auto_agent_cooldown_scope,
+    _apply_codex_auto_agent_alias_cooldown,
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
     _log_grok_forward_header_compare,
@@ -10056,7 +10058,8 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             },
         }
 
-        async def perform_operation(adapter_model, operation):
+        async def perform_operation(adapter_model, operation, log_warnings=True):
+            assert log_warnings is False
             return await operation()
 
         with patch(
@@ -10472,7 +10475,8 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             ],
         }
 
-        async def perform_operation(adapter_model, operation):
+        async def perform_operation(adapter_model, operation, log_warnings=True):
+            assert log_warnings is False
             return await operation()
 
         with patch(
@@ -19479,7 +19483,7 @@ async def test_anthropic_auto_agent_alias_success_preserves_attempt_metadata_wit
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_retryable_failure_emits_warning_alias_route_with_route_context(
+async def test_anthropic_auto_agent_alias_retryable_failure_records_route_context_without_warning_json(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
@@ -19504,7 +19508,7 @@ async def test_anthropic_auto_agent_alias_retryable_failure_emits_warning_alias_
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
         new=AsyncMock(return_value=deepseek_success),
-    ), patch(
+    ) as mock_openrouter, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info"
     ) as mock_info, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
@@ -19523,19 +19527,23 @@ async def test_anthropic_auto_agent_alias_retryable_failure_emits_warning_alias_
         mock_info,
         "candidate_attempt_started",
     )
-    route_logs = _alias_route_log_payloads(mock_warning)
-    failure_log = next(
-        payload
-        for payload in route_logs
-        if payload["event_type"] == "candidate_retryable_failure"
+    metadata = mock_openrouter.await_args.kwargs["prepared_request_body"][
+        "litellm_metadata"
+    ]
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    failure_event = next(
+        event
+        for event in audit_events
+        if event["event_type"] == "candidate_retryable_failure"
     )
-    assert failure_log["alias_family"] == "anthropic_auto_agent"
-    assert failure_log["alias_model"] == "aawm-anthropic-agent-auto"
-    assert failure_log["provider"] == "openai"
-    assert failure_log["model"] == "gpt-5.3-codex-spark"
-    assert failure_log["route_family"] == "anthropic_openai_responses_adapter"
-    assert failure_log["failure_phase"] == "provider_attempt"
-    assert failure_log["attempted_provider_call"] is True
+    assert failure_event["alias_family"] == "anthropic_auto_agent"
+    assert failure_event["alias_model"] == "aawm-anthropic-agent-auto"
+    assert failure_event["provider"] == "openai"
+    assert failure_event["model"] == "gpt-5.3-codex-spark"
+    assert failure_event["route_family"] == "anthropic_openai_responses_adapter"
+    assert failure_event["failure_phase"] == "provider_attempt"
+    assert failure_event["attempted_provider_call"] is True
+    assert _alias_route_log_payloads(mock_warning) == []
     _assert_alias_route_logs_exclude_event_types(
         mock_warning,
         "candidate_attempt_started",
@@ -20571,8 +20579,11 @@ async def test_anthropic_openrouter_completion_adapter_strips_provider_prefix_fo
     body["model"] = adapter_model
     success = {"ok": True}
 
-    async def fake_openrouter_completion_operation(*, adapter_model, operation):
+    async def fake_openrouter_completion_operation(
+        *, adapter_model, operation, log_warnings=True
+    ):
         assert adapter_model == upstream_model
+        assert log_warnings is True
         return await operation()
 
     with patch(
@@ -20796,17 +20807,7 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
     assert redispatch_event["failure_phase"] == "provider_attempt"
     assert redispatch_event["attempted_provider_call"] is True
     assert redispatch_event["redispatch_required"] is True
-    route_logs = _alias_route_log_payloads(mock_warning)
-    redispatch_log = next(
-        payload
-        for payload in route_logs
-        if payload["event_type"] == "redispatch_required"
-    )
-    assert redispatch_log["alias_family"] == "anthropic_auto_agent"
-    assert redispatch_log["provider"] == "openrouter"
-    assert redispatch_log["model"] == "deepseek/deepseek-v4-flash"
-    assert redispatch_log["failure_phase"] == "provider_attempt"
-    assert redispatch_log["attempted_provider_call"] is True
+    assert _alias_route_log_payloads(mock_warning) == []
     mock_openrouter.assert_awaited_once()
     mock_spark.assert_not_called()
     mock_native.assert_not_called()
@@ -20881,13 +20882,7 @@ async def test_anthropic_auto_agent_alias_in_flight_bare_502_redispatches_withou
         event for event in audit_events if event["event_type"] == "redispatch_required"
     )
     assert redispatch_event["failure_class"] == "upstream_transient_internal"
-    route_logs = _alias_route_log_payloads(mock_warning)
-    redispatch_log = next(
-        payload
-        for payload in route_logs
-        if payload["event_type"] == "redispatch_required"
-    )
-    assert redispatch_log["failure_class"] == "upstream_transient_internal"
+    assert _alias_route_log_payloads(mock_warning) == []
     durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
         "xai:grok-composer-2.5-fast:xai_grok_native"
     )
@@ -22153,6 +22148,7 @@ async def test_codex_auto_agent_alias_sota_has_no_fallback_candidates():
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt():
     request = _build_codex_auto_agent_request()
+    route_status = []
     body = {
         "model": "aawm-sota",
         "litellm_metadata": {
@@ -22175,7 +22171,10 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
     ) as mock_warning, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(),
-    ) as mock_pass_through:
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.emit_aawm_route_status_event",
+        side_effect=lambda **kwargs: route_status.append(kwargs),
+    ):
         selection = await _select_codex_auto_agent_candidate(
             request=request,
             request_body=body,
@@ -22195,28 +22194,25 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
 
     assert exc_info.value.status_code == 429
     mock_pass_through.assert_not_called()
-    route_logs = _alias_route_log_payloads(mock_warning)
-    no_candidate_log = next(
-        payload
-        for payload in route_logs
-        if payload["event_type"] == "no_candidate_available"
-    )
-    assert no_candidate_log["alias_family"] == "codex_auto_agent"
-    assert no_candidate_log["alias_model"] == "aawm-sota"
-    assert no_candidate_log["session_id"] == "codex-session"
-    assert no_candidate_log["agent_id"] == "agent-123"
-    assert no_candidate_log["repository"] == "litellm"
-    assert no_candidate_log["failure_phase"] == "candidate_selection"
-    assert no_candidate_log["attempted_provider_call"] is False
-    assert no_candidate_log["error_status_code"] == 429
-    assert no_candidate_log["candidate_count"] == 1
-    assert no_candidate_log["candidates"][0]["provider"] == "openai"
-    assert no_candidate_log["candidates"][0]["model"] == "gpt-5.5"
+    assert route_status == [
+        {
+            "alias_model": "aawm-sota",
+            "model_label": "aawm-sota",
+            "status": "Exhausted",
+            "message": "error_status_code=429; candidate_status=all_candidates_unavailable",
+        },
+        {
+            "alias_model": "aawm-sota",
+            "model_label": "gpt-5.5",
+            "status": "Exhausted",
+            "message": "error_status_code=429; candidate_status=all_candidates_unavailable",
+        },
+    ]
     _assert_alias_route_logs_exclude_event_types(
         mock_info,
         "candidate_attempt_started",
     )
-    assert _alias_route_event_types(mock_warning) == ["no_candidate_available"]
+    assert _alias_route_log_payloads(mock_warning) == []
 
 
 @pytest.mark.asyncio
@@ -22890,6 +22886,89 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_failed_responses_paylo
     )
 
 
+def test_codex_auto_agent_cooldown_scope_promotes_reusable_failures_to_candidate():
+    assert (
+        _get_codex_auto_agent_cooldown_scope("provider_terminal_error")
+        == "candidate"
+    )
+    assert (
+        _get_codex_auto_agent_cooldown_scope("candidate_unavailable")
+        == "candidate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_terminal_error_writes_durable_cooldown():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_codex_auto_agent_request()
+    candidate = {
+        "provider": "openrouter",
+        "model": "openrouter/cohere/north-mini-code:free",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    cooldown_key = "openrouter:openrouter/cohere/north-mini-code:free:openrouter"
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        scope = await _apply_codex_auto_agent_alias_cooldown(
+            request=request,
+            candidate=candidate,
+            lane_key="openrouter",
+            selected_cooldown_key=cooldown_key,
+            cooldown_seconds=30.0,
+            error_class="provider_terminal_error",
+        )
+        _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+        durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+
+    assert scope == "candidate"
+    assert len(dual_cache.set_calls) == 1
+    assert dual_cache.set_calls[0]["key"].endswith(cooldown_key)
+    assert durable_seconds > 0.0
+    assert durable_source == "durable_cache"
+
+
+@pytest.mark.asyncio
+async def test_candidate_unavailable_writes_durable_cooldown():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_codex_auto_agent_request()
+    candidate = {
+        "provider": "xai",
+        "model": "grok-composer-2.5-fast",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+    }
+    cooldown_key = "xai:grok-composer-2.5-fast:xai_grok_native"
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        scope = await _apply_codex_auto_agent_alias_cooldown(
+            request=request,
+            candidate=candidate,
+            lane_key="xai_grok_native",
+            selected_cooldown_key=cooldown_key,
+            cooldown_seconds=30.0,
+            error_class="candidate_unavailable",
+        )
+        _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+        durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+
+    assert scope == "candidate"
+    assert len(dual_cache.set_calls) == 1
+    assert dual_cache.set_calls[0]["key"].endswith(cooldown_key)
+    assert durable_seconds > 0.0
+    assert durable_source == "durable_cache"
+
+
 def test_codex_auto_agent_retryable_exhaustion_classifies_openrouter_raw_provider_error():
     exc = ProxyException(
         message="Provider returned error",
@@ -22940,15 +23019,22 @@ def test_auto_agent_alias_route_event_suppresses_healthy_selection(monkeypatch):
     assert emitted == []
 
 
-def test_auto_agent_alias_route_event_keeps_failure_warning(monkeypatch):
+def test_auto_agent_alias_route_event_keeps_single_canonical_failure_warning(monkeypatch):
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
 
-    emitted = []
+    emitted_warnings = []
+    emitted_info = []
     route_status = []
+    monkeypatch.delenv("AAWM_ALIAS_ROUTE_VERBOSE_JSON", raising=False)
     monkeypatch.setattr(
         endpoints.verbose_proxy_logger,
         "warning",
-        lambda message: emitted.append(message),
+        lambda message: emitted_warnings.append(message),
+    )
+    monkeypatch.setattr(
+        endpoints.verbose_proxy_logger,
+        "info",
+        lambda message: emitted_info.append(message),
     )
     monkeypatch.setattr(
         endpoints,
@@ -22969,8 +23055,8 @@ def test_auto_agent_alias_route_event_keeps_failure_warning(monkeypatch):
         level="warning",
     )
 
-    assert len(emitted) == 1
-    assert "AAWM_ALIAS_ROUTE:" in emitted[0]
+    assert emitted_warnings == []
+    assert emitted_info == []
     assert route_status == [
         {
             "alias_model": "aawm-low",
@@ -22981,6 +23067,36 @@ def test_auto_agent_alias_route_event_keeps_failure_warning(monkeypatch):
             ),
         }
     ]
+
+
+def test_auto_agent_alias_route_event_emits_verbose_json_when_enabled(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    emitted_info = []
+    monkeypatch.setenv("AAWM_ALIAS_ROUTE_VERBOSE_JSON", "true")
+    monkeypatch.setattr(endpoints, "emit_aawm_route_status_event", lambda **kwargs: None)
+    monkeypatch.setattr(endpoints, "record_aawm_route_rollup", lambda **kwargs: None)
+    monkeypatch.setattr(
+        endpoints.verbose_proxy_logger,
+        "info",
+        lambda message: emitted_info.append(message),
+    )
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "provider_terminal_error",
+            "alias_model": "aawm-low",
+            "provider": "openrouter",
+            "model": "openrouter/cohere/north-mini-code:free",
+        },
+        level="warning",
+    )
+
+    assert len(emitted_info) == 1
+    assert "AAWM_ALIAS_ROUTE:" in emitted_info[0]
+    assert "provider_terminal_error" in emitted_info[0]
 
 
 def test_auto_agent_alias_route_event_records_zero_turn_rollup(monkeypatch):
@@ -24383,8 +24499,11 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
     }
     shared_session = object()
 
-    async def fake_openrouter_completion_operation(*, adapter_model, operation):
+    async def fake_openrouter_completion_operation(
+        *, adapter_model, operation, log_warnings=True
+    ):
         assert adapter_model == "deepseek/deepseek-v4-flash"
+        assert log_warnings is False
         return await operation()
 
     with patch(
@@ -24482,8 +24601,11 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
     }
     shared_session = object()
 
-    async def fake_openrouter_completion_operation(*, adapter_model, operation):
+    async def fake_openrouter_completion_operation(
+        *, adapter_model, operation, log_warnings=True
+    ):
         assert adapter_model == upstream_model
+        assert log_warnings is False
         return await operation()
 
     with patch(
@@ -24873,20 +24995,7 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
     )
     assert audit_events[-1]["event_type"] == "candidate_selected"
     assert audit_events[-1]["provider"] == "openrouter"
-    route_logs = _alias_route_log_payloads(mock_warning)
-    failure_log = next(
-        payload
-        for payload in route_logs
-        if payload["event_type"] == "candidate_retryable_failure"
-    )
-    assert failure_log["alias_model"] == "aawm-codex-agent-auto"
-    assert failure_log["provider"] == "openai"
-    assert failure_log["model"] == "gpt-5.3-codex-spark"
-    assert failure_log["route_family"] == "codex_responses"
-    assert failure_log["failure_phase"] == "provider_attempt"
-    assert failure_log["attempted_provider_call"] is True
-    assert failure_log["error_status_code"] == 429
-    assert failure_log["error_code"] == "usage_limit_reached"
+    assert _alias_route_log_payloads(mock_warning) == []
     _assert_alias_route_logs_exclude_event_types(
         mock_warning,
         "candidate_attempt_started",
@@ -25374,16 +25483,7 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
     assert redispatch_event["failure_phase"] == "provider_attempt"
     assert redispatch_event["attempted_provider_call"] is True
     assert redispatch_event["redispatch_required"] is True
-    route_logs = _alias_route_log_payloads(mock_warning)
-    redispatch_log = next(
-        payload
-        for payload in route_logs
-        if payload["event_type"] == "redispatch_required"
-    )
-    assert redispatch_log["provider"] == "openrouter"
-    assert redispatch_log["model"] == "deepseek/deepseek-v4-flash"
-    assert redispatch_log["failure_phase"] == "provider_attempt"
-    assert redispatch_log["attempted_provider_call"] is True
+    assert _alias_route_log_payloads(mock_warning) == []
     mock_openrouter.assert_awaited_once()
     mock_pass_through.assert_not_called()
 
