@@ -104,6 +104,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_google_adapter_semaphore,
     _insert_google_code_assist_missing_claude_function_call_pairs,
     _openrouter_adapter_failure_circuit_until_monotonic_by_key,
+    _openrouter_adapter_rate_limit_until_monotonic_by_key,
     _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME,
     _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION,
     _AAWM_READ_AGENT_GUIDANCE_PROMPT,
@@ -19752,6 +19753,32 @@ def test_grok_candidate_unavailable_detail_matches_compaction_blob_decode_error(
     )
 
 
+def test_grok_candidate_unavailable_detail_matches_chat_permission_denied_error():
+    permission_error = HTTPException(
+        status_code=403,
+        detail=(
+            b'{"code":"permission-denied","error":"Access to the chat endpoint '
+            b"is denied. Please ensure you're using the correct credentials. "
+            b'If you believe this is a mistake, please log into console.x.ai '
+            b'and update the permissions, or contact support."}'
+        ),
+    )
+
+    detail = _grok_native_candidate_unavailable_detail(permission_error) or ""
+
+    assert "permission-denied" in detail
+    assert "Access to the chat endpoint is denied" in detail
+
+
+def test_grok_candidate_unavailable_detail_ignores_unrelated_permission_403():
+    permission_error = HTTPException(
+        status_code=403,
+        detail=b'{"code":"permission-denied","error":"Project access denied."}',
+    )
+
+    assert _grok_native_candidate_unavailable_detail(permission_error) is None
+
+
 @pytest.mark.asyncio
 async def test_anthropic_antigravity_completion_adapter_direct_preserves_not_logged_in_error():
     request = _build_anthropic_auto_agent_request()
@@ -22787,6 +22814,95 @@ async def test_codex_auto_agent_alias_code_falls_back_to_composer_after_spark_42
     selected_event = audit_events[selected_index]
     assert selected_event["provider"] == "xai"
     assert selected_event["model"] == "grok-composer-2.5-fast"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permission_denied():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:__default__",
+        60.0,
+    )
+    permission_error = HTTPException(
+        status_code=403,
+        detail=(
+            b'{"code":"permission-denied","error":"Access to the chat endpoint '
+            b"is denied. Please ensure you're using the correct credentials. "
+            b'If you believe this is a mistake, please log into console.x.ai '
+            b'and update the permissions, or contact support."}'
+        ),
+    )
+    grok_prepared_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "hello",
+        "stream": False,
+    }
+    managed_xai_success = Response(
+        content='{"ok": true}', media_type="application/json"
+    )
+
+    with patch.object(
+        BaseOpenAIPassThroughHandler,
+        "_prepare_openai_grok_native_oauth_context",
+        new=AsyncMock(
+            return_value=(
+                "https://cli-chat-proxy.grok.com",
+                {"authorization": "Bearer grok-oidc-token"},
+                grok_prepared_body,
+                "https://cli-chat-proxy.grok.com/v1/responses",
+            )
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=permission_error),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(return_value=managed_xai_success),
+    ) as mock_xai_oauth:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is managed_xai_success
+    mock_pass_through.assert_awaited_once()
+    mock_xai_oauth.assert_awaited_once()
+    xai_body = mock_xai_oauth.await_args.kwargs["request_body"]
+    assert xai_body["model"] == "oa_xai/grok-build"
+    metadata = xai_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code"
+    assert metadata["codex_auto_agent_selected_provider"] == "xai"
+    assert metadata["codex_auto_agent_selected_model"] == "oa_xai/grok-build"
+    assert metadata["codex_auto_agent_selected_route_family"] == (
+        "codex_xai_oauth_responses_adapter"
+    )
+    assert [
+        attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]
+    ] == [
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+    ]
+    composer_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert composer_attempt["status"] == "cooldown_set"
+    assert composer_attempt["error_class"] == "candidate_unavailable"
+    assert "aawm_codex_auto_agent_candidate_unavailable" in composer_attempt[
+        "error_tokens"
+    ]
+    assert metadata["codex_auto_agent_skipped_candidates"][0]["model"] == (
+        "gpt-5.3-codex-spark"
+    )
 
 
 @pytest.mark.parametrize(
@@ -32053,6 +32169,181 @@ async def test_aawm_alias_routing_durable_cooldown_payload_is_sanitized():
     assert set(payload.keys()) == {"cooldown_key", "expires_at_epoch"}
     assert payload["cooldown_key"] == cooldown_key
     assert isinstance(payload["expires_at_epoch"], (int, float))
+
+
+@pytest.mark.asyncio
+async def test_aawm_low_alias_skips_openrouter_candidate_with_adapter_local_cooldown():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    exhausted_model = "openrouter/cohere/north-mini-code:free"
+    upstream_model = "cohere/north-mini-code:free"
+    _openrouter_adapter_rate_limit_until_monotonic_by_key[upstream_model] = (
+        time.monotonic() + 120.0
+    )
+    try:
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+    finally:
+        _openrouter_adapter_rate_limit_until_monotonic_by_key.pop(
+            upstream_model, None
+        )
+
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/owl-alpha"
+    assert selection["selection_reason"] == "first_available"
+    assert selection["skipped"][0]["provider"] == "openrouter"
+    assert selection["skipped"][0]["model"] == exhausted_model
+    assert selection["skipped"][0]["reason"] == "adapter_cooldown"
+    assert selection["skipped"][0]["cooldown_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_aawm_low_alias_durable_cooldown_blocks_after_memory_clear():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    candidate = {
+        "provider": "openrouter",
+        "model": "openrouter/cohere/north-mini-code:free",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    cooldown_key = "openrouter:openrouter/cohere/north-mini-code:free:openrouter"
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        await _set_codex_auto_agent_cooldown(cooldown_key, 120.0)
+        _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/owl-alpha"
+    assert selection["skipped"][0]["model"] == candidate["model"]
+    assert selection["skipped"][0]["cooldown_seconds"] > 0
+    assert selection["skipped"][0]["reason"] == "cooldown"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_in_flight_redispatch_includes_audit_metadata(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-low:codex-session:session:codex-session"
+    ] = {
+        "provider": "openrouter",
+        "model": "openrouter/cohere/north-mini-code:free",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    openrouter_error = ProxyException(
+        message="openrouter exhausted",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    openrouter_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
+        new=AsyncMock(side_effect=openrouter_error),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    detail = exc_info.value.detail
+    assert detail["error"]["code"] == "aawm_codex_auto_agent_redispatch_required"
+    assert detail["failure_class"] == "rate_limited"
+    assert detail["cooldown_scope"] == "candidate"
+    assert detail["error_status_code"] == 429
+    assert detail["retry_after_seconds"] > 0
+    assert detail["redispatch_required"] is True
+    assert isinstance(detail["aawm_alias_routing_audit_events"], list)
+    assert any(
+        event["event_type"] == "redispatch_required"
+        for event in detail["aawm_alias_routing_audit_events"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_alias_non_inflight_bare_502_does_not_persist_durable_cooldown():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    grok_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    managed_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=grok_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=grok_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(return_value=managed_success),
+    ):
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is managed_success
+    durable_seconds, _ = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:grok-composer-2.5-fast:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
 
 
 @pytest.mark.asyncio
