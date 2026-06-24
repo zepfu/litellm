@@ -53,6 +53,33 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.99 — ChatGPT Codex invalid encrypted continuation classification
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.99`. ChatGPT Codex
+passthrough now classifies upstream `400 invalid_encrypted_content` responses
+from `chatgpt.com/backend-api/codex/*` as a known encrypted continuation
+failure. The client still receives the upstream 400 body, but LiteLLM logs a
+compact warning with
+`failure_kind=openai_chatgpt_codex_invalid_encrypted_content`, passes
+`traceback_str=None` to failure hooks, and avoids writing a misleading generic
+LiteLLM traceback/error-intake record for this known provider/client condition.
+
+**Why:** Production Codex traffic after the `aawm.98` deploy hit a stale or
+invalid encrypted reasoning continuation on `aawm-code` / `gpt-5.3-codex-spark`.
+The upstream rejection was real and should remain visible to the client, but the
+generic traceback made it look like LiteLLM had crashed.
+
+**Why not upstream:** This classification is tied to AAWM's ChatGPT-account
+Codex passthrough runtime-error intake policy and local operator logging shape.
+
+**Validation status:** Focused unit coverage verifies nonstreaming and streaming
+Codex `invalid_encrypted_content` failures warn without traceback, preserve the
+upstream 400 body, and leave unrelated Codex 400s on the generic exception path.
+`litellm-dev` was restarted on `:4001`, readiness returned healthy, and an
+in-container import probe confirmed the classifier is loaded.
+
+---
+
 ### aawm.98 — Alias route warning dedup and terminal cooldown scope
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.98`. Alias candidate

@@ -499,3 +499,19 @@ Treat this class as upstream account quota exhaustion. It is distinct from
 short-lived high-demand throttling, and alias handlers should classify it as
 `usage_limit_reached` when deciding whether a fresh dispatch can advance to the
 next declared candidate.
+
+## ChatGPT Codex encrypted continuations
+
+When ChatGPT Codex passthrough returns HTTP 400 with
+`error.code = invalid_encrypted_content`, LiteLLM treats the response as a known
+client/session continuation failure. This usually means the request carried
+encrypted reasoning or continuation content that the ChatGPT Codex backend could
+not decrypt or parse for that session.
+
+LiteLLM does not retry this class and does not hide the upstream 400 from the
+client. It logs a compact warning with
+`failure_kind=openai_chatgpt_codex_invalid_encrypted_content`, sends
+`traceback_str=None` to failure hooks, and avoids writing an active traceback
+entry to the runtime error JSONL file for this known provider/client condition.
+Unrelated ChatGPT Codex 400 responses still use the normal exception and error
+intake path.
