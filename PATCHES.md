@@ -53,6 +53,27 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.98 — Alias route warning dedup and terminal cooldown scope
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.98`. Alias candidate
+failures now emit one canonical operator-facing route status warning plus rollup
+participation by default. Detailed `AAWM_ALIAS_ROUTE` JSON audit lines are
+suppressed unless `AAWM_ALIAS_ROUTE_VERBOSE_JSON` is enabled. `provider_terminal_error`
+and `candidate_unavailable` now write durable per-candidate cooldown state
+because those outcomes are reusable across requests.
+
+**Why:** Prod/dev alias traffic produced triplicate warning noise (JSON audit,
+human status, compact lines) and request-local-only terminal failures were still
+surfacing as repeated cross-request cooldown noise.
+
+**Why not upstream:** AAWM alias routing observability and cooldown policy are
+fork-local operational behavior.
+
+**Validation status:** Focused unit tests cover verbose JSON gating, canonical
+status emission, and durable cooldown scope for terminal/unavailable errors.
+
+---
+
 ### aawm.97 — Native Anthropic stream timeout traceback suppression
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.97`. Native

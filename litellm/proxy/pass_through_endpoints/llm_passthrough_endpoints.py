@@ -378,12 +378,15 @@ _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset({500, 502, 503, 52
 _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
     {
         "capacity_exhausted",
+        "candidate_unavailable",
+        "provider_terminal_error",
         "rate_limited",
         "usage_limit_reached",
         "upstream_overloaded",
         "upstream_timeout",
     }
 )
+_AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV = "AAWM_ALIAS_ROUTE_VERBOSE_JSON"
 _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS = 5 * 60.0
 _CODEX_AUTO_AGENT_AUTH_DEGRADED_LOG_INTERVAL_SECONDS = 60.0
 _CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY = (
@@ -2875,16 +2878,18 @@ def _emit_auto_agent_alias_route_event(
     level: str = "info",
 ) -> None:
     _record_auto_agent_alias_route_status_rollup(event)
+    if not (
+        _aawm_alias_route_verbose_json_enabled()
+        or _aawm_alias_route_healthy_json_enabled()
+    ):
+        return
     if not _should_emit_auto_agent_alias_route_event(event, level=level):
         return
     log_payload = {"event": "aawm_alias_route", **event}
     message = "AAWM_ALIAS_ROUTE: {}".format(
         json.dumps(log_payload, sort_keys=True, default=str, separators=(",", ":"))
     )
-    if level == "warning":
-        verbose_proxy_logger.warning(message)
-    else:
-        verbose_proxy_logger.info(message)
+    verbose_proxy_logger.info(message)
 
 
 def _should_emit_auto_agent_alias_route_event(
@@ -2895,11 +2900,7 @@ def _should_emit_auto_agent_alias_route_event(
     if level == "warning":
         return True
 
-    if os.getenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }:
+    if _aawm_alias_route_healthy_json_enabled():
         return True
 
     if event.get("failure_class") or event.get("error_status_code"):
@@ -4070,6 +4071,24 @@ def _get_codex_auto_agent_cooldown_scope(error_class: Optional[str]) -> str:
     if _is_codex_auto_agent_durable_cooldown_error_class(error_class):
         return "candidate"
     return "request_local"
+
+
+def _aawm_alias_route_verbose_json_enabled() -> bool:
+    return os.getenv(_AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "debug",
+        "verbose",
+    }
+
+
+def _aawm_alias_route_healthy_json_enabled() -> bool:
+    return os.getenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def _get_codex_auto_agent_request_local_cooldown_key(
@@ -8016,6 +8035,7 @@ async def _perform_openrouter_completion_adapter_operation(
     *,
     adapter_model: Optional[str],
     operation: Callable[[], Awaitable[Any]],
+    log_warnings: bool = True,
 ) -> Any:
     max_retries = _get_openrouter_adapter_max_retries()
     total_attempts = max_retries + 1
@@ -8054,14 +8074,15 @@ async def _perform_openrouter_completion_adapter_operation(
             )
             if status_code == 429 and is_long_window_rate_limit:
                 cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
-                verbose_proxy_logger.warning(
-                    "OpenRouter completion adapter upstream attempt %s hit long-window 429 (%s, provider=%s, raw=%s, reset_wait=%.1fs) and will not be hidden-retried",
-                    attempt,
-                    exc.__class__.__name__,
-                    provider_name,
-                    raw_message,
-                    reset_wait_seconds or 0.0,
-                )
+                if log_warnings:
+                    verbose_proxy_logger.warning(
+                        "OpenRouter completion adapter upstream attempt %s hit long-window 429 (%s, provider=%s, raw=%s, reset_wait=%.1fs) and will not be hidden-retried",
+                        attempt,
+                        exc.__class__.__name__,
+                        provider_name,
+                        raw_message,
+                        reset_wait_seconds or 0.0,
+                    )
                 await _set_openrouter_adapter_cooldown(
                     _get_openrouter_adapter_cooldown_keys(model=adapter_model, exc=exc),
                     cooldown_seconds,
@@ -8069,32 +8090,35 @@ async def _perform_openrouter_completion_adapter_operation(
                 await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
                 raise
             if status_code != 429 or (attempt >= total_attempts and not within_hidden_budget):
-                verbose_proxy_logger.warning(
-                    "OpenRouter completion adapter upstream attempt %s failed with %s (%s, provider=%s, raw=%s) and will not be retried",
-                    attempt,
-                    status_code,
-                    exc.__class__.__name__,
-                    provider_name,
-                    raw_message,
-                )
+                if log_warnings:
+                    verbose_proxy_logger.warning(
+                        "OpenRouter completion adapter upstream attempt %s failed with %s (%s, provider=%s, raw=%s) and will not be retried",
+                        attempt,
+                        status_code,
+                        exc.__class__.__name__,
+                        provider_name,
+                        raw_message,
+                    )
                 if status_code == 429:
                     await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
                 raise
             if attempt >= total_attempts and within_hidden_budget:
+                if log_warnings:
+                    verbose_proxy_logger.warning(
+                        "OpenRouter completion adapter keeping 429 hidden from client for model=%s; hidden retry wait %.1fs/%.1fs",
+                        adapter_model,
+                        projected_hidden_wait_seconds,
+                        hidden_retry_budget_seconds,
+                    )
+            if log_warnings:
                 verbose_proxy_logger.warning(
-                    "OpenRouter completion adapter keeping 429 hidden from client for model=%s; hidden retry wait %.1fs/%.1fs",
-                    adapter_model,
-                    projected_hidden_wait_seconds,
-                    hidden_retry_budget_seconds,
+                    "OpenRouter completion adapter upstream attempt %s hit 429 (%s, provider=%s, raw=%s); backoff %.1fs",
+                    attempt,
+                    exc.__class__.__name__,
+                    provider_name,
+                    raw_message,
+                    wait_seconds,
                 )
-            verbose_proxy_logger.warning(
-                "OpenRouter completion adapter upstream attempt %s hit 429 (%s, provider=%s, raw=%s); backoff %.1fs",
-                attempt,
-                exc.__class__.__name__,
-                provider_name,
-                raw_message,
-                wait_seconds,
-            )
             accumulated_hidden_wait_seconds = projected_hidden_wait_seconds
             await _set_openrouter_adapter_cooldown(
                 _get_openrouter_adapter_cooldown_keys(model=adapter_model, exc=exc),
@@ -8105,6 +8129,7 @@ async def _perform_openrouter_completion_adapter_operation(
 async def _perform_openrouter_adapter_pass_through_request(
     *,
     adapter_model: Optional[str],
+    log_warnings: bool = True,
     **kwargs: Any,
 ) -> Response:
     max_retries = _get_openrouter_adapter_max_retries()
@@ -8149,14 +8174,15 @@ async def _perform_openrouter_adapter_pass_through_request(
             )
             if status_code == 429 and is_long_window_rate_limit:
                 cooldown_seconds = min(max(reset_wait_seconds or 0.0, 30.0), 300.0)
-                verbose_proxy_logger.warning(
-                    "OpenRouter adapter upstream attempt %s hit long-window 429 (%s, provider=%s, raw=%s, reset_wait=%.1fs) and will not be hidden-retried",
-                    attempt,
-                    exc.__class__.__name__,
-                    provider_name,
-                    raw_message,
-                    reset_wait_seconds or 0.0,
-                )
+                if log_warnings:
+                    verbose_proxy_logger.warning(
+                        "OpenRouter adapter upstream attempt %s hit long-window 429 (%s, provider=%s, raw=%s, reset_wait=%.1fs) and will not be hidden-retried",
+                        attempt,
+                        exc.__class__.__name__,
+                        provider_name,
+                        raw_message,
+                        reset_wait_seconds or 0.0,
+                    )
                 await _set_openrouter_adapter_cooldown(
                     _get_openrouter_adapter_cooldown_keys(model=adapter_model, exc=exc),
                     cooldown_seconds,
@@ -8164,32 +8190,35 @@ async def _perform_openrouter_adapter_pass_through_request(
                 await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
                 raise
             if status_code != 429 or (attempt >= total_attempts and not within_hidden_budget):
-                verbose_proxy_logger.warning(
-                    "OpenRouter adapter upstream attempt %s failed with %s (%s, provider=%s, raw=%s) and will not be retried",
-                    attempt,
-                    status_code,
-                    exc.__class__.__name__,
-                    provider_name,
-                    raw_message,
-                )
+                if log_warnings:
+                    verbose_proxy_logger.warning(
+                        "OpenRouter adapter upstream attempt %s failed with %s (%s, provider=%s, raw=%s) and will not be retried",
+                        attempt,
+                        status_code,
+                        exc.__class__.__name__,
+                        provider_name,
+                        raw_message,
+                    )
                 if status_code == 429:
                     await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
                 raise
             if attempt >= total_attempts and within_hidden_budget:
+                if log_warnings:
+                    verbose_proxy_logger.warning(
+                        "OpenRouter adapter keeping 429 hidden from client for model=%s; hidden retry wait %.1fs/%.1fs",
+                        adapter_model,
+                        projected_hidden_wait_seconds,
+                        hidden_retry_budget_seconds,
+                    )
+            if log_warnings:
                 verbose_proxy_logger.warning(
-                    "OpenRouter adapter keeping 429 hidden from client for model=%s; hidden retry wait %.1fs/%.1fs",
-                    adapter_model,
-                    projected_hidden_wait_seconds,
-                    hidden_retry_budget_seconds,
+                    "OpenRouter adapter upstream attempt %s hit 429 (%s, provider=%s, raw=%s); backoff %.1fs",
+                    attempt,
+                    exc.__class__.__name__,
+                    provider_name,
+                    raw_message,
+                    wait_seconds,
                 )
-            verbose_proxy_logger.warning(
-                "OpenRouter adapter upstream attempt %s hit 429 (%s, provider=%s, raw=%s); backoff %.1fs",
-                attempt,
-                exc.__class__.__name__,
-                provider_name,
-                raw_message,
-                wait_seconds,
-            )
             accumulated_hidden_wait_seconds = projected_hidden_wait_seconds
             await _set_openrouter_adapter_cooldown(
                 _get_openrouter_adapter_cooldown_keys(model=adapter_model, exc=exc),
@@ -16566,6 +16595,7 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
 
     upstream_response = await _perform_openrouter_adapter_pass_through_request(
         adapter_model=adapter_model,
+        log_warnings=not use_alias_candidate_probe,
         request=request,
         target=str(target_url),
         custom_headers=custom_headers,
@@ -23782,7 +23812,7 @@ async def _handle_anthropic_auto_agent_alias_route(
                     add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
                     redispatch_required=True,
                 )
-                verbose_proxy_logger.warning(
+                verbose_proxy_logger.debug(
                     "Anthropic auto-agent alias %s target %s/%s hit %s "
                     "for an in-flight session on attempt %s; signaling redispatch",
                     alias_model,
@@ -23809,7 +23839,7 @@ async def _handle_anthropic_auto_agent_alias_route(
                 error_class=error_class,
                 add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
             )
-            verbose_proxy_logger.warning(
+            verbose_proxy_logger.debug(
                 "Anthropic auto-agent alias %s target %s/%s hit %s on attempt %s; "
                 "cooldown %.1fs tokens=%s",
                 alias_model,
@@ -25945,6 +25975,7 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
 
     response = await _perform_openrouter_adapter_pass_through_request(
         adapter_model=adapter_model,
+        log_warnings=False,
         request=request,
         target=str(target_url),
         custom_headers=custom_headers,
@@ -26298,6 +26329,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             },
             shared_session=_get_proxy_shared_aiohttp_session(),
         ),
+        log_warnings=False,
     )
     if bool(request_body.get("stream")):
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
@@ -26535,7 +26567,7 @@ async def _handle_codex_auto_agent_alias_route(
                     add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
                     redispatch_required=True,
                 )
-                verbose_proxy_logger.warning(
+                verbose_proxy_logger.debug(
                     "Codex auto-agent alias %s target %s/%s hit %s "
                     "for an in-flight session on attempt %s; signaling redispatch",
                     alias_model,
@@ -26562,7 +26594,7 @@ async def _handle_codex_auto_agent_alias_route(
                 error_class=error_class,
                 add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
             )
-            verbose_proxy_logger.warning(
+            verbose_proxy_logger.debug(
                 "Codex auto-agent alias %s target %s/%s hit %s on attempt %s; "
                 "cooldown %.1fs scope=%s tokens=%s",
                 alias_model,
