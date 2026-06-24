@@ -10001,6 +10001,130 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         clear_aawm_route_rollups()
 
     @pytest.mark.asyncio
+    async def test_codex_openrouter_completion_route_registers_access_log_and_completed_rollup(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-openrouter-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/responses"
+            "?adapted_to=openrouter.ai/api/v1/chat/completions"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/responses",
+            "query_string": b"adapted_to=openrouter.ai/api/v1/chat/completions",
+            "client": ("172.19.0.1", 52834),
+            "http_version": "1.1",
+        }
+        request_body = {
+            "model": "openrouter/cohere/north-mini-code:free",
+            "input": "just a test msg",
+            "stream": False,
+            "litellm_metadata": {
+                "client_name": "codex_exec",
+                "passthrough_route_family": "codex_responses",
+                "tags": ["route:codex_responses"],
+            },
+        }
+
+        async def perform_operation(adapter_model, operation):
+            return await operation()
+
+        with patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request",
+            return_value={
+                "model": "cohere/north-mini-code:free",
+                "messages": [{"role": "user", "content": "just a test msg"}],
+            },
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
+            new=AsyncMock(side_effect=perform_operation),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.acompletion",
+            new=AsyncMock(
+                return_value={
+                    "id": "chatcmpl_openrouter",
+                    "object": "chat.completion",
+                    "created": 1770000000,
+                    "model": "cohere/north-mini-code:free",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "OPENROUTER CODEX OK",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 4,
+                        "total_tokens": 9,
+                    },
+                }
+            ),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ):
+            response = await _perform_codex_auto_agent_openrouter_completion_request(
+                request=mock_request,
+                adapter_model="openrouter/cohere/north-mini-code:free",
+                request_body=request_body,
+            )
+
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        access_record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=(
+                "172.19.0.1:52834",
+                "POST",
+                "/openai_passthrough/responses?adapted_to=openrouter.ai/api/v1/chat/completions -> openrouter.ai/api/v1/chat/completions",
+                "1.1",
+                200,
+            ),
+            exc_info=None,
+        )
+        assert access_filter.filter(access_record) is False
+        assert access_filter.filter(access_record) is True
+
+        flushed = flush_aawm_route_rollups(force=True)
+        rendered = "\n".join(flushed)
+        assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
+        assert (
+            " - openrouter/cohere/north-mini-code:free - Turns: 1 -> openrouter.ai/api/v1/chat/completions"
+            in rendered
+        )
+        assert json.loads(response.body.decode("utf-8"))["id"] == "chatcmpl_openrouter"
+        clear_aawm_route_rollups()
+
+    def test_resolve_auto_agent_alias_route_rollup_outgoing_target_for_openrouter_completion_adapter(
+        self,
+    ):
+        assert (
+            _resolve_auto_agent_alias_route_rollup_outgoing_target(
+                route_family="codex_openrouter_completion_adapter"
+            )
+            == "openrouter.ai/api/v1/chat/completions"
+        )
+
+    @pytest.mark.asyncio
     async def test_codex_opencode_zen_route_uses_saved_opencode_auth_and_responses_envelope(
         self,
     ):
