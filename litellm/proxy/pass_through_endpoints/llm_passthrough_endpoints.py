@@ -371,6 +371,8 @@ _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = (
 _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = (
     _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS
 )
+_CODEX_AUTO_AGENT_SPARK_MODEL = "gpt-5.3-codex-spark"
+_CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = 300.0
 _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 30.0
 _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset({500, 502, 503, 529})
 _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
@@ -3920,6 +3922,12 @@ def _is_codex_auto_agent_durable_cooldown_error_class(error_class: Optional[str]
     return error_class in _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES
 
 
+def _is_codex_auto_agent_spark_candidate(candidate: Optional[dict[str, Any]]) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    return str(candidate.get("model") or "") == _CODEX_AUTO_AGENT_SPARK_MODEL
+
+
 def _is_codex_auto_agent_transient_internal_error_class(error_class: Optional[str]) -> bool:
     return error_class in {"upstream_transient_internal", "upstream_transient"}
 
@@ -4138,27 +4146,38 @@ def _parse_codex_auto_agent_header_wait_seconds(exc: Any) -> Optional[float]:
     return min(wait_candidates)
 
 
-def _get_codex_auto_agent_cooldown_seconds(exc: Any) -> float:
+def _get_codex_auto_agent_cooldown_seconds(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+) -> float:
     header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
-    if header_wait is not None:
-        return max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
-
     error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if (
+    if header_wait is not None:
+        resolved = max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
+    elif (
         error_class in {"capacity_exhausted", "upstream_overloaded"}
         or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
     ):
-        return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
-    if _is_codex_auto_agent_transient_internal_error_class(error_class):
-        return _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
-    if "usage_limit_reached" in tokens:
-        return _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
-    if "RESOURCE_EXHAUSTED" in tokens or "RATE_LIMIT_EXCEEDED" in tokens:
-        return _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    if _extract_google_adapter_exception_status_code(exc) in {429, 503, 529}:
-        return _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    return _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
+        resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
+    elif _is_codex_auto_agent_transient_internal_error_class(error_class):
+        resolved = _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
+    elif "usage_limit_reached" in tokens:
+        resolved = _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
+    elif "RESOURCE_EXHAUSTED" in tokens or "RATE_LIMIT_EXCEEDED" in tokens:
+        resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    elif _extract_google_adapter_exception_status_code(exc) in {429, 503, 529}:
+        resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    else:
+        resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
+
+    if (
+        _is_codex_auto_agent_spark_candidate(candidate)
+        and _is_codex_auto_agent_durable_cooldown_error_class(error_class)
+    ):
+        return _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS
+    return resolved
 
 
 def _iter_codex_auto_agent_error_blocks(exc: Any) -> list[dict[str, Any]]:
@@ -23396,7 +23415,7 @@ async def _handle_anthropic_auto_agent_alias_route(
             if error_class is None:
                 raise
             last_retryable_exc = exc
-            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
             cooldown_scope = await _apply_anthropic_auto_agent_alias_cooldown(
                 request=request,
                 candidate=candidate,
@@ -26133,7 +26152,7 @@ async def _handle_codex_auto_agent_alias_route(
             if error_class is None:
                 raise
             last_retryable_exc = exc
-            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
             cooldown_scope = await _set_codex_auto_agent_candidate_cooldowns(
                 request=request,
                 candidate=candidate,
