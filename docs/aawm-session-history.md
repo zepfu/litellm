@@ -794,6 +794,13 @@ Rows affected by this path may include:
   removed before egress. For Grok-family routes this includes `reasoning` input
   items and records `encrypted_content=true` when an encrypted compaction blob
   was removed without logging the blob.
+- `grok_native_input_item_rewrite_count`,
+  `grok_native_input_item_rewrite_types`, and
+  `grok_native_input_item_rewrites`: Grok-native Responses input items rewritten
+  before egress because the selected concrete model rejects those typed
+  Responses variants. For `grok-composer-2.5-fast`, `function_call` and
+  `function_call_output` continuation items are preserved as ordinary message
+  text instead of being sent as raw Responses tool items.
 - `xai_responses_request_sanitized`: `true` when the outgoing request body was
   changed before xAI egress.
 - `xai_responses_previous_response_id_decoded`: `true` when a LiteLLM-encoded

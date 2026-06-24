@@ -46,6 +46,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _drop_unsupported_codex_hosted_tools_from_request_body,
     _drop_unsupported_codex_input_items_from_request_body,
     _drop_unsupported_codex_request_params_from_request_body,
+    _rewrite_grok_native_unsupported_input_items_from_request_body,
     _grok_native_candidate_unavailable_detail,
     _xai_oauth_candidate_unavailable_detail,
     _apply_codex_tool_description_patches_to_request_body,
@@ -18043,6 +18044,174 @@ def test_grok_native_function_call_arguments_default_to_empty_object(
     assert updated_body["input"][1] == request_body["input"][1]
 
 
+def _expected_grok_composer_rewritten_tool_input(
+    first_input_item: dict[str, Any],
+    *,
+    arguments: str = "{}",
+) -> list[dict[str, Any]]:
+    return [
+        first_input_item,
+        *_expected_grok_composer_rewritten_tool_pair(arguments=arguments),
+    ]
+
+
+def _expected_grok_composer_rewritten_tool_pair(
+    *,
+    arguments: str = "{}",
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": (
+                "Previous tool call\n"
+                "Name: exec_command\n"
+                "Call ID: call_1\n"
+                f"Arguments: {arguments}"
+            ),
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": "Previous tool result\nCall ID: call_1\nOutput: ok",
+        },
+    ]
+
+
+def _assert_grok_composer_rewrite_metadata(metadata: dict[str, Any]) -> None:
+    assert metadata["grok_native_input_item_rewrite_count"] == 2
+    assert metadata["grok_native_input_item_rewrite_types"] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert "grok-native-input-item-rewritten" in metadata["tags"]
+
+
+def _assert_openai_grok_native_oidc_call_args(
+    call_args: dict[str, Any],
+    *,
+    model: str,
+) -> None:
+    assert call_args["target"] == "http://localhost:4001/grok/v1/responses"
+    assert call_args["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+    assert call_args["custom_headers"]["authorization"] == "Bearer grok-oidc-token"
+    assert call_args["custom_headers"]["x-xai-token-auth"] == "xai-grok-cli"
+    assert call_args["custom_headers"]["x-grok-model-override"] == model
+    assert call_args["custom_headers"]["x-grok-session-id"] == "codex-grok-session"
+    assert call_args["_forward_headers"] is False
+    assert call_args["egress_credential_family"] == "xai"
+    assert call_args["expected_target_family"] == "xai"
+
+
+def _assert_openai_grok_native_oidc_prepared_body(
+    prepared_body: dict[str, Any],
+    *,
+    model: str,
+    source_body: dict[str, Any],
+) -> None:
+    assert prepared_body["model"] == model
+    _assert_grok_build_reasoning_request_params_removed(prepared_body)
+    expected_function_call = {
+        **source_body["input"][2],
+        "arguments": {},
+    }
+    if model == "grok-composer-2.5-fast":
+        assert prepared_body["input"] == _expected_grok_composer_rewritten_tool_input(
+            source_body["input"][0],
+        )
+    else:
+        assert prepared_body["input"] == [
+            source_body["input"][0],
+            expected_function_call,
+            source_body["input"][3],
+        ]
+    _assert_xai_responses_body_sanitized(prepared_body)
+    assert "tool_choice" not in prepared_body
+    assert "api_key" not in prepared_body
+    assert "api_base" not in prepared_body
+    assert "custom_llm_provider" not in prepared_body
+
+
+def _assert_openai_grok_native_oidc_metadata(
+    metadata: dict[str, Any],
+    *,
+    model: str,
+) -> None:
+    assert metadata["client_name"] == "grok-build"
+    assert metadata["grok_native_oauth_managed"] is True
+    assert metadata["grok_model_override"] == model
+    assert metadata["model_group"] == model
+    assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
+    assert metadata["openai_passthrough_route_family"] == "openai_responses"
+    assert metadata["grok_native_entrypoint"] == "openai_responses"
+    assert metadata["codex_unsupported_hosted_tool_removed_count"] == 4
+    assert metadata["codex_unsupported_hosted_tool_types_removed"] == [
+        "custom",
+        "image_generation",
+        "namespace",
+        "tool_search",
+    ]
+    assert metadata["codex_unsupported_input_item_removed_count"] == 1
+    assert metadata["codex_unsupported_input_item_types_removed"] == ["reasoning"]
+    assert metadata["codex_unsupported_input_items_removed"] == [
+        {"type": "reasoning", "index": 1, "encrypted_content": True}
+    ]
+    if model == "grok-composer-2.5-fast":
+        _assert_grok_composer_rewrite_metadata(metadata)
+    assert "route:grok_cli_chat_proxy" in metadata["tags"]
+    assert "openai-grok-native-responses-adapter" in metadata["tags"]
+
+
+def test_grok_composer_rewrites_tool_input_items_to_messages():
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": {"cmd": "pwd"},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
+    }
+
+    updated_body, rewritten_items = (
+        _rewrite_grok_native_unsupported_input_items_from_request_body(request_body)
+    )
+
+    assert rewritten_items == [
+        {
+            "type": "function_call",
+            "index": 1,
+            "rewritten_type": "message",
+            "rewritten_role": "assistant",
+            "call_id": "call_1",
+            "name": "exec_command",
+        },
+        {
+            "type": "function_call_output",
+            "index": 2,
+            "rewritten_type": "message",
+            "rewritten_role": "user",
+            "call_id": "call_1",
+            "output_chars": 2,
+        },
+    ]
+    assert updated_body["input"] == _expected_grok_composer_rewritten_tool_input(
+        request_body["input"][0],
+        arguments='{"cmd": "pwd"}',
+    )
+    metadata = updated_body["litellm_metadata"]
+    _assert_grok_composer_rewrite_metadata(metadata)
+    assert metadata["grok_native_input_item_rewrites"] == rewritten_items
+
+
 @pytest.mark.asyncio
 async def test_prepare_grok_native_oauth_passthrough_request_sanitizes_function_call_arguments(
     monkeypatch,
@@ -18083,8 +18252,9 @@ async def test_prepare_grok_native_oauth_passthrough_request_sanitizes_function_
     assert prepared is True
     assert target_base == "https://cli-chat-proxy.grok.com"
     assert headers["authorization"] == "Bearer grok-oidc-token"
-    assert prepared_body["input"][0]["arguments"] == {"cmd": "pwd"}
-    assert prepared_body["input"][1]["output"] == "ok"
+    assert prepared_body["input"] == _expected_grok_composer_rewritten_tool_pair(
+        arguments='{"cmd": "pwd"}',
+    )
     metadata = prepared_body["litellm_metadata"]
     assert metadata["grok_native_function_call_arguments_sanitized"] is True
     assert metadata["grok_native_function_call_arguments_sanitized_count"] == 1
@@ -18092,6 +18262,8 @@ async def test_prepare_grok_native_oauth_passthrough_request_sanitizes_function_
         "parsed_json_string"
     ]
     assert "grok-native-function-call-arguments-sanitized" in metadata["tags"]
+    _assert_grok_composer_rewrite_metadata(metadata)
+
 
 @pytest.mark.parametrize(
     "model",
@@ -21613,6 +21785,119 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     assert "route:anthropic_grok_native_responses_adapter" in metadata["tags"]
     assert "route:grok_cli_chat_proxy" in metadata["tags"]
     assert "anthropic-grok-native-responses-adapter" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_grok_native_oauth_responses_adapter_rewrites_composer_tool_input_items(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+        "http://localhost:4001/grok/v1",
+    )
+    request = _build_anthropic_auto_agent_request()
+    request.headers = {
+        "authorization": "Bearer inbound-anthropic-key",
+        "session_id": "claude-grok-session",
+        "user-agent": "claude-cli/2.0.0",
+    }
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [
+            {"role": "user", "content": "continue"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": "pwd"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "ok",
+                    }
+                ],
+            },
+        ],
+        "max_tokens": 64,
+        "stream": False,
+        "tools": [
+            {
+                "name": "Bash",
+                "description": "Run a shell command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        ],
+        "litellm_metadata": {"session_id": "claude-grok-session"},
+    }
+    success_response = Response(content='{"ok": true}', media_type="application/json")
+    upstream_response = Response(
+        content='{"id":"resp_123","object":"response","model":"grok-composer-2.5-fast","output":[]}',
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_anthropic_response_from_responses_response",
+        return_value=success_response,
+    ):
+        response = await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            adapter_model="grok-composer-2.5-fast",
+        )
+
+    assert response is success_response
+    custom_body = mock_pass_through.await_args.kwargs["custom_body"]
+    assert custom_body["model"] == "grok-composer-2.5-fast"
+    input_types = [
+        item.get("type")
+        for item in custom_body["input"]
+        if isinstance(item, dict)
+    ]
+    assert "function_call" not in input_types
+    assert "function_call_output" not in input_types
+    assert any(
+        isinstance(item, dict)
+        and item.get("role") == "assistant"
+        and "Previous tool call" in str(item.get("content"))
+        for item in custom_body["input"]
+    )
+    assert any(
+        isinstance(item, dict)
+        and item.get("role") == "user"
+        and "Previous tool result" in str(item.get("content"))
+        for item in custom_body["input"]
+    )
+    metadata = custom_body["litellm_metadata"]
+    assert metadata["grok_native_input_item_rewrite_count"] == 2
+    assert metadata["grok_native_input_item_rewrite_types"] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert metadata["passthrough_route_family"] == (
+        "anthropic_grok_native_responses_adapter"
+    )
 
 
 @pytest.mark.asyncio
@@ -30064,63 +30349,18 @@ class TestOpenAIPassthroughRoute:
         assert result == {"ok": True}
         mock_get_credentials.assert_not_called()
         call_args = mock_create_route.call_args.kwargs
-        assert call_args["target"] == "http://localhost:4001/grok/v1/responses"
-        assert call_args["custom_llm_provider"] == litellm.LlmProviders.XAI.value
-        assert call_args["custom_headers"]["authorization"] == (
-            "Bearer grok-oidc-token"
-        )
-        assert call_args["custom_headers"]["x-xai-token-auth"] == "xai-grok-cli"
-        assert call_args["custom_headers"]["x-grok-model-override"] == model
-        assert call_args["custom_headers"]["x-grok-session-id"] == (
-            "codex-grok-session"
-        )
-        assert call_args["_forward_headers"] is False
-        assert call_args["egress_credential_family"] == "xai"
-        assert call_args["expected_target_family"] == "xai"
+        _assert_openai_grok_native_oidc_call_args(call_args, model=model)
         prepared_body = mock_set_body.call_args.args[1]
-        assert prepared_body["model"] == model
         assert mock_create_route.return_value.await_args.kwargs["custom_body"] == (
             prepared_body
         )
-        _assert_grok_build_reasoning_request_params_removed(prepared_body)
-        expected_function_call = {
-            **body["input"][2],
-            "arguments": {},
-        }
-        assert prepared_body["input"] == [
-            body["input"][0],
-            expected_function_call,
-            body["input"][3],
-        ]
-        _assert_xai_responses_body_sanitized(prepared_body)
-        assert "tool_choice" not in prepared_body
-        assert "api_key" not in prepared_body
-        assert "api_base" not in prepared_body
-        assert "custom_llm_provider" not in prepared_body
+        _assert_openai_grok_native_oidc_prepared_body(
+            prepared_body,
+            model=model,
+            source_body=body,
+        )
         metadata = prepared_body["litellm_metadata"]
-        assert metadata["client_name"] == "grok-build"
-        assert metadata["grok_native_oauth_managed"] is True
-        assert metadata["grok_model_override"] == model
-        assert metadata["model_group"] == model
-        assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
-        assert metadata["openai_passthrough_route_family"] == "openai_responses"
-        assert metadata["grok_native_entrypoint"] == "openai_responses"
-        assert metadata["codex_unsupported_hosted_tool_removed_count"] == 4
-        assert metadata["codex_unsupported_hosted_tool_types_removed"] == [
-            "custom",
-            "image_generation",
-            "namespace",
-            "tool_search",
-        ]
-        assert metadata["codex_unsupported_input_item_removed_count"] == 1
-        assert metadata["codex_unsupported_input_item_types_removed"] == [
-            "reasoning"
-        ]
-        assert metadata["codex_unsupported_input_items_removed"] == [
-            {"type": "reasoning", "index": 1, "encrypted_content": True}
-        ]
-        assert "route:grok_cli_chat_proxy" in metadata["tags"]
-        assert "openai-grok-native-responses-adapter" in metadata["tags"]
+        _assert_openai_grok_native_oidc_metadata(metadata, model=model)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
@@ -30513,6 +30753,69 @@ class TestGrokProxyRoute:
             call_kwargs["passthrough_logging_metadata"]["grok_model_override"]
             == "grok-composer-2.5-fast"
         )
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_rewrites_composer_tool_input_items(self):
+        """should avoid sending Composer Responses tool items rejected by ModelInput"""
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/responses"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "x-xai-token-auth": "xai-grok-cli",
+            "x-grok-client-version": "0.2.50",
+            "x-grok-session-id": "session_123",
+            "x-grok-model-override": "grok-composer-2.5-fast",
+            "user-agent": "grok-shell/0.2.50 (linux; x86_64)",
+            "content-type": "application/json",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+        request_body = {
+            "model": "grok-composer-2.5-fast",
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_1",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                },
+            ],
+        }
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        call_kwargs = mock_pass_through.await_args.kwargs
+        prepared_body = call_kwargs["custom_body"]
+        assert prepared_body["input"] == _expected_grok_composer_rewritten_tool_input(
+            request_body["input"][0]
+        )
+        metadata = prepared_body["litellm_metadata"]
+        _assert_grok_composer_rewrite_metadata(metadata)
+        assert metadata["grok_native_function_call_arguments_sanitized"] is True
+        assert call_kwargs["passthrough_logging_metadata"] == metadata
 
     @pytest.mark.asyncio
     async def test_grok_proxy_route_drops_tool_choice_without_tools(self):
