@@ -53,6 +53,33 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### Unreleased — Guardrail shutdown hooks close lifecycle-owned aiohttp sessions
+
+**What changed:** Proxy shutdown now invokes `async_shutdown_hook()` on
+initialized guardrail callback objects discovered from the in-memory guardrail
+registry, `litellm.callbacks`, and router `guardrail_list` entries. Presidio
+implements that hook by closing its cached main-thread and loop-bound
+`aiohttp.ClientSession` instances. The dev compose file now bind-mounts the
+Presidio guardrail hook so `litellm-dev` can validate this lifecycle path
+without a full image rebuild.
+
+**Why:** Prod runtime error intake captured bare asyncio
+`Unclosed client session` messages during container restarts. The proxy-owned
+shared aiohttp session was already closed by lifespan shutdown, but Presidio
+can cache raw `ClientSession` objects outside that shared-session lifecycle.
+Closing lifecycle-owned guardrail resources during proxy shutdown prevents that
+cache from surfacing as unclosed-session noise.
+
+**Why not upstream:** The generic shutdown hook is reasonable upstream shape,
+but this entry tracks AAWM's runtime-error intake and dev-container bind-mount
+coverage for the fork.
+
+**Validation status:** Focused proxy shutdown and Presidio regression tests
+passed, ruff passed on the touched production code and proxy shutdown tests,
+and `litellm-dev` was recreated with both hooks loaded in-container. Fresh dev
+logs after restart contained no `Unclosed client session`, `Traceback`,
+`ERROR`, or `Exception` entries.
+
 ### aawm.102 — OpenRouter alias-probe cooldowns fail fast instead of sleeping
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.102`.
