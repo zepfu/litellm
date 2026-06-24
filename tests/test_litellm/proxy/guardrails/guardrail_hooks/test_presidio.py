@@ -6,9 +6,11 @@ Tests PII detection and masking for different message formats
 import asyncio
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock, patch
 
+import aiohttp
 import pytest
 
 sys.path.insert(0, os.path.abspath("../../../../../.."))
@@ -1377,7 +1379,56 @@ async def test_get_session_iterator_thread_safety(presidio_guardrail):
     # (Changed behavior: no longer closes immediately, cached per loop for efficiency)
     assert not bg_session.closed, "Background session should remain open for reuse"
 
+    await presidio_guardrail.async_shutdown_hook()
+
     print("✓ Session iterator thread safety test passed")
+
+
+@pytest.mark.asyncio
+async def test_close_http_session_closes_shared_and_loop_cached_sessions():
+    """
+    D1-388: Presidio must close the main-thread shared session and every
+    loop-bound cached session via its proxy shutdown hook.
+    """
+    presidio = _OPTIONAL_PresidioPIIMasking(
+        mock_testing=True,
+        presidio_analyzer_api_base="http://mock-analyzer/",
+        presidio_anonymizer_api_base="http://mock-anonymizer/",
+    )
+
+    async with presidio._get_session_iterator() as main_session:
+        assert isinstance(main_session, aiohttp.ClientSession)
+        assert main_session is presidio._http_session
+
+    loop_session_holder: dict = {}
+
+    def _open_loop_session_in_thread():
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+
+        async def _use_loop_session():
+            async with presidio._get_session_iterator() as loop_session:
+                loop_session_holder["session"] = loop_session
+                loop_session_holder["loop"] = asyncio.get_running_loop()
+
+        new_loop.run_until_complete(_use_loop_session())
+        new_loop.close()
+
+    thread = threading.Thread(target=_open_loop_session_in_thread)
+    thread.start()
+    thread.join()
+
+    loop_session = loop_session_holder["session"]
+    assert loop_session in presidio._loop_sessions.values()
+    assert not presidio._http_session.closed
+    assert not loop_session.closed
+
+    await presidio.async_shutdown_hook()
+
+    assert presidio._http_session is None
+    assert presidio._loop_sessions == {}
+    assert main_session.closed
+    assert loop_session.closed
 
 
 from litellm.types.utils import ModelResponseStream

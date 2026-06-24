@@ -57,6 +57,7 @@ services:
       - ./litellm/proxy/aawm_route_logging.py:/app/litellm/proxy/aawm_route_logging.py
       - ./litellm/proxy/common_request_processing.py:/app/litellm/proxy/common_request_processing.py
       - ./litellm/proxy/proxy_server.py:/app/litellm/proxy/proxy_server.py
+      - ./litellm/proxy/guardrails/guardrail_hooks/presidio.py:/app/litellm/proxy/guardrails/guardrail_hooks/presidio.py
       - ./litellm/proxy/pass_through_endpoints/pass_through_endpoints.py:/app/litellm/proxy/pass_through_endpoints/pass_through_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/streaming_handler.py:/app/litellm/proxy/pass_through_endpoints/streaming_handler.py
       - ./litellm/proxy/pass_through_endpoints/success_handler.py:/app/litellm/proxy/pass_through_endpoints/success_handler.py
