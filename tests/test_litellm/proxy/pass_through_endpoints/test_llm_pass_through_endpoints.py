@@ -152,7 +152,9 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _perform_openrouter_adapter_pass_through_request,
     _perform_openrouter_completion_adapter_operation,
     _prime_google_code_assist_session,
+    _prepare_grok_native_oauth_passthrough_request,
     _prepare_oa_xai_passthrough_request,
+    _sanitize_grok_native_function_call_arguments_request_body,
     _sanitize_xai_responses_request_body,
     _resolve_google_adapter_session_id,
     _resolve_codex_google_code_assist_adapter_model,
@@ -17832,7 +17834,12 @@ async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_p
                 "summary": [],
                 "encrypted_content": "encrypted-prepare-compaction",
             },
-            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": {},
+            },
             {
                 "type": "function_call_output",
                 "call_id": "call_1",
@@ -17863,7 +17870,12 @@ async def test_oa_xai_grok_build_prepare_removes_unsupported_reasoning_request_p
     assert "reasoningEffort" not in request_body
     assert request_body["input"] == [
         {"type": "message", "role": "user", "content": "continue"},
-        {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "call_1",
+            "arguments": {},
+        },
         {
             "type": "function_call_output",
             "call_id": "call_1",
@@ -17917,7 +17929,12 @@ def test_grok_responses_unsupported_reasoning_input_item_is_removed(model):
         "input": [
             {"type": "message", "role": "user", "content": "hello"},
             {"type": "reasoning", "summary": []},
-            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": {},
+            },
             {
                 "type": "function_call_output",
                 "call_id": "call_1",
@@ -17943,6 +17960,139 @@ def test_grok_responses_unsupported_reasoning_input_item_is_removed(model):
     ]
 
 
+def test_grok_native_function_call_arguments_parseable_string_is_coerced_to_object():
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": [
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
+        "litellm_metadata": {"tags": ["existing-tag"]},
+    }
+
+    updated_body, changes = (
+        _sanitize_grok_native_function_call_arguments_request_body(request_body)
+    )
+
+    assert changes == [
+        {
+            "type": "function_call",
+            "index": 0,
+            "call_id": "call_1",
+            "name": "exec_command",
+            "reason": "parsed_json_string",
+        }
+    ]
+    assert updated_body["input"][0]["arguments"] == {"cmd": "pwd"}
+    assert updated_body["input"][1] == request_body["input"][1]
+
+
+@pytest.mark.parametrize(
+    "arguments_value,expected_reason",
+    [
+        (None, "missing"),
+        ("", "empty"),
+        ("[]", "non_object_json"),
+        ("not-json", "invalid_json"),
+    ],
+)
+def test_grok_native_function_call_arguments_default_to_empty_object(
+    arguments_value,
+    expected_reason,
+):
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": [
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": arguments_value,
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
+    }
+
+    updated_body, changes = (
+        _sanitize_grok_native_function_call_arguments_request_body(request_body)
+    )
+
+    assert changes == [
+        {
+            "type": "function_call",
+            "index": 0,
+            "call_id": "call_1",
+            "name": "exec_command",
+            "reason": expected_reason,
+        }
+    ]
+    assert updated_body["input"][0]["arguments"] == {}
+    assert updated_body["input"][1] == request_body["input"][1]
+
+
+@pytest.mark.asyncio
+async def test_prepare_grok_native_oauth_passthrough_request_sanitizes_function_call_arguments(
+    monkeypatch,
+):
+    request = MagicMock(spec=Request)
+    request.headers = {
+        "authorization": "Bearer oidc-token",
+        "x-grok-session-id": "session_123",
+    }
+    request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": [
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ):
+        prepared, target_base, headers, prepared_body = (
+            await _prepare_grok_native_oauth_passthrough_request(
+                request_body,
+                request=request,
+            )
+        )
+
+    assert prepared is True
+    assert target_base == "https://cli-chat-proxy.grok.com"
+    assert headers["authorization"] == "Bearer grok-oidc-token"
+    assert prepared_body["input"][0]["arguments"] == {"cmd": "pwd"}
+    assert prepared_body["input"][1]["output"] == "ok"
+    metadata = prepared_body["litellm_metadata"]
+    assert metadata["grok_native_function_call_arguments_sanitized"] is True
+    assert metadata["grok_native_function_call_arguments_sanitized_count"] == 1
+    assert metadata["grok_native_function_call_arguments_sanitized_reasons"] == [
+        "parsed_json_string"
+    ]
+    assert "grok-native-function-call-arguments-sanitized" in metadata["tags"]
+
 @pytest.mark.parametrize(
     "model",
     ["oa_xai/grok-4.3", "grok-build", "grok-build-0.1", "grok-composer-2.5-fast"],
@@ -17958,7 +18108,12 @@ def test_grok_responses_removes_encrypted_reasoning_compaction_item(model):
                 "summary": [],
                 "encrypted_content": "encrypted-compaction-fixture",
             },
-            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": {},
+            },
             {
                 "type": "function_call_output",
                 "call_id": "call_1",
@@ -29928,9 +30083,13 @@ class TestOpenAIPassthroughRoute:
             prepared_body
         )
         _assert_grok_build_reasoning_request_params_removed(prepared_body)
+        expected_function_call = {
+            **body["input"][2],
+            "arguments": {},
+        }
         assert prepared_body["input"] == [
             body["input"][0],
-            body["input"][2],
+            expected_function_call,
             body["input"][3],
         ]
         _assert_xai_responses_body_sanitized(prepared_body)
@@ -30465,9 +30624,13 @@ class TestGrokProxyRoute:
         assert result == {"ok": True}
         call_kwargs = mock_pass_through.await_args.kwargs
         prepared_body = call_kwargs["custom_body"]
+        expected_function_call = {
+            **request_body["input"][2],
+            "arguments": {},
+        }
         assert prepared_body["input"] == [
             request_body["input"][0],
-            request_body["input"][2],
+            expected_function_call,
             request_body["input"][3],
         ]
         metadata = prepared_body["litellm_metadata"]
@@ -30478,6 +30641,11 @@ class TestGrokProxyRoute:
         assert metadata["codex_unsupported_input_items_removed"] == [
             {"type": "reasoning", "index": 1, "encrypted_content": True}
         ]
+        assert metadata["grok_native_function_call_arguments_sanitized"] is True
+        assert metadata["grok_native_function_call_arguments_sanitized_reasons"] == [
+            "missing"
+        ]
+        assert "grok-native-function-call-arguments-sanitized" in metadata["tags"]
         assert call_kwargs["passthrough_logging_metadata"] == metadata
 
     @pytest.mark.asyncio
