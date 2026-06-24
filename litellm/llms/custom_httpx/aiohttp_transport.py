@@ -162,6 +162,12 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         # Store the client factory for recreating sessions when needed
         if callable(client):
             self._client_factory = client
+        self._retained_replaced_sessions: list[Any] = []
+
+    async def aclose(self) -> None:
+        await self._close_retained_replaced_sessions()
+        if self._owns_session and isinstance(self.client, ClientSession):
+            await self._close_owned_replaced_session(self.client)
 
     def _create_replacement_client_session(self) -> ClientSession:
         if hasattr(self, "_client_factory") and callable(self._client_factory):
@@ -181,6 +187,40 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 await result
         except Exception as e:
             verbose_logger.debug(f"Error closing old session: {e}")
+
+    def _retain_replaced_owned_session(self, session: Any) -> None:
+        if not self._owns_session:
+            return
+        if getattr(session, "closed", False):
+            return
+        self._retained_replaced_sessions.append(session)
+
+    def _release_or_retain_replaced_owned_session(self, session: Any) -> None:
+        """Sync replacement-path cleanup: close immediately when safe, otherwise retain."""
+        if not self._owns_session or getattr(session, "closed", False):
+            return
+        try:
+            session_loop = getattr(session, "_loop", None)
+            current_loop = asyncio.get_running_loop()
+            if (
+                session_loop is None
+                or session_loop != current_loop
+                or session_loop.is_closed()
+            ):
+                self._retain_replaced_owned_session(session)
+                return
+            asyncio.create_task(session.close())
+        except RuntimeError:
+            self._retain_replaced_owned_session(session)
+        except Exception as e:
+            verbose_logger.debug(f"Error scheduling old session close: {e}")
+            self._retain_replaced_owned_session(session)
+
+    async def _close_retained_replaced_sessions(self) -> None:
+        retained = self._retained_replaced_sessions
+        self._retained_replaced_sessions = []
+        for session in retained:
+            await self._close_owned_replaced_session(session)
 
     async def _get_valid_client_session_for_request(self) -> ClientSession:
         """
@@ -233,7 +273,8 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         # Check if the session itself is closed
         if self.client.closed:
             verbose_logger.debug("Session is closed, creating new session")
-            # Create a new session
+            old_session = self.client
+            self._release_or_retain_replaced_owned_session(old_session)
             self.client = self._create_replacement_client_session()
             return self.client
 
@@ -248,26 +289,14 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 or session_loop != current_loop
                 or session_loop.is_closed()
             ):
-                # Close old session to prevent leaks
                 old_session = self.client
-                if self._owns_session:
-                    try:
-                        if not old_session.closed:
-                            try:
-                                asyncio.create_task(old_session.close())
-                            except RuntimeError:
-                                # Different event loop - can't schedule task, rely on GC
-                                verbose_logger.debug(
-                                    "Old session from different loop, relying on GC"
-                                )
-                    except Exception as e:
-                        verbose_logger.debug(f"Error closing old session: {e}")
-
-                # Create a new session in the current event loop
+                self._release_or_retain_replaced_owned_session(old_session)
                 self.client = self._create_replacement_client_session()
 
         except (RuntimeError, AttributeError):
-            # If we can't check the loop or session is invalid, recreate it
+            old_session = self.client if isinstance(self.client, ClientSession) else None
+            if old_session is not None:
+                self._release_or_retain_replaced_owned_session(old_session)
             self.client = self._create_replacement_client_session()
 
         return self.client

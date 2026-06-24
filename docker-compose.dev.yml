@@ -35,6 +35,7 @@ services:
       - ./litellm/types/llms/openai.py:/app/litellm/types/llms/openai.py
       - ./litellm/types/llms/vertex_ai.py:/app/litellm/types/llms/vertex_ai.py
       - ./litellm/types/utils.py:/app/litellm/types/utils.py
+      - ./litellm/llms/custom_httpx/aiohttp_transport.py:/app/litellm/llms/custom_httpx/aiohttp_transport.py
       - ./litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py:/app/litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py
       - ./litellm/llms/base_llm/rerank/transformation.py:/app/litellm/llms/base_llm/rerank/transformation.py
       - ./litellm/llms/hosted_vllm/embedding/transformation.py:/app/litellm/llms/hosted_vllm/embedding/transformation.py
