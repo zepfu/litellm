@@ -59,7 +59,8 @@ passed the local acceptance suite with artifact
 line carries transient alias cooldown handling and Grok side-channel 404
 suppression, prod error-intake diagnostics with richer Langfuse support-string
 enrichment, OpenCode Zen success rollups, a Spark cooldown cap, cached async
-client shutdown cleanup, and OpenRouter success rollups.
+client shutdown cleanup, OpenRouter success rollups, and Grok native
+function-call argument coercion for CLI proxy Responses traffic.
 
 **Why:** Recent prod and dev intake showed that alias routing failures and
 sparse telemetry strings were still too hard to diagnose, while route rollups
