@@ -53,6 +53,31 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.104 — OpenRouter free-tier suppression for AAWM-low aliases with bounded rate-limit cache
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.104`. `aawm-low`
+and `aawm-low-anthropic` now suppress retries when OpenRouter already reported
+the free daily quota condition via `rate_limit_observations` evidence that is
+read through a bounded cached lookup. This keeps alias-probe redispatch from
+burning additional attempts on the known-suppressed OpenRouter path and preserves
+downstream candidate progression for AAWM low-cost models.
+
+**Why:** Repeated read-only and setup-style alias dispatches were spending
+work on OpenRouter calls after the free-day quota bucket had already been hit,
+because suppression state was not durable across requests. The bounded cached
+lookup records and reuses the cooldown/suppression signal so subsequent probes
+can fail over quickly and consistently until the cached state ages out.
+
+**Why not upstream:** This behavior is tailored to AAWM’s `aawm-low` alias
+contract and `rate_limit_observations` signal usage; upstream OpenRouter fallback
+logic remains unchanged for non-AAWM alias routing.
+
+**Validation status:** Focused checks for `aawm-low` / `aawm-low-anthropic`
+confirm the free-tier suppression path is reused from cache and no longer forces
+repeated upstream OpenRouter retries under the cached suppression signal. The
+lookup now fail-opens on cache miss, read/parse errors, and stale-entry
+conditions to avoid blocking healthy fallback paths.
+
 ### aawm.103 — Guardrail shutdown hooks close lifecycle-owned aiohttp sessions
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.103`. Proxy
