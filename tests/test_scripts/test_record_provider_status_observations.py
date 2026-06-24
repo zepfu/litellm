@@ -2440,6 +2440,51 @@ def test_run_due_sidecar_tasks_writes_observability_anomaly_jsonl(
     assert "Clean up" in record["cleanup_requirement"]
 
 
+def test_observability_anomaly_jsonl_repairs_bind_mount_owner_and_mode(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_poll_enabled=False,
+        observability_anomaly_scan_enabled=True,
+        observability_anomaly_scan_error_log_dir=str(tmp_path),
+    )
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_FILE_UID", "1234")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_FILE_GID", "5678")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_FILE_MODE", "0601")
+    chown_calls = []
+    chmod_calls = []
+
+    def fake_chown(path, uid, gid):
+        chown_calls.append((path, uid, gid))
+
+    def fake_chmod(path, mode):
+        chmod_calls.append((path, mode))
+
+    monkeypatch.setattr(loop.os, "chown", fake_chown)
+    monkeypatch.setattr(loop.os, "chmod", fake_chmod)
+
+    written, path = loop._write_observability_anomaly_error_records(
+        config,
+        observed_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
+        anomalies=[
+            {
+                "anomaly_class": "missing_repository_for_agent_context",
+                "expected": "repository should be derivable",
+                "row_count": 1,
+                "examples": [{"row_id": 123}],
+            }
+        ],
+    )
+
+    assert written == 1
+    assert path == tmp_path / "dev-error.jsonl"
+    assert chown_calls == [(path, 1234, 5678)]
+    assert chmod_calls == [(path, 0o601)]
+    record = json.loads(path.read_text().strip())
+    assert record["event"] == "aawm_observability_anomaly"
+
+
 def test_run_due_sidecar_tasks_reports_observability_anomaly_scan_failure(
     monkeypatch,
     tmp_path,
