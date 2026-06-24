@@ -709,23 +709,83 @@ class PassThroughStreamingHandler:
                 )
             )
         except Exception as e:
+            local_chunk_count = chunk_count if "chunk_count" in locals() else 0
+            local_total_stream_bytes = (
+                total_stream_bytes if "total_stream_bytes" in locals() else 0
+            )
+            local_first_chunk_at = (
+                first_chunk_at if "first_chunk_at" in locals() else None
+            )
+            local_first_emitted_at = (
+                first_emitted_at if "first_emitted_at" in locals() else None
+            )
+            exception_context = (
+                PassThroughStreamingHandler._build_streaming_exception_log_context(
+                    error_log_context=error_log_context,
+                    exc=e,
+                    chunk_count=local_chunk_count,
+                    total_stream_bytes=local_total_stream_bytes,
+                    first_chunk_at=local_first_chunk_at,
+                    first_emitted_at=local_first_emitted_at,
+                )
+            )
+            if (
+                isinstance(e, httpx.ReadTimeout)
+                and local_first_emitted_at is not None
+            ):
+                verbose_proxy_logger.error(
+                    "Streaming response interrupted after first byte in chunk_processor: %s",
+                    str(e),
+                    extra=exception_context,
+                )
+                end_time = datetime.now()
+                local_raw_bytes = raw_bytes if "raw_bytes" in locals() else []
+                local_line_accumulator = (
+                    line_accumulator if "line_accumulator" in locals() else None
+                )
+                precomputed_lines: Optional[List[str]] = None
+                if local_line_accumulator is not None:
+                    precomputed_lines = local_line_accumulator.finish()
+                if isinstance(success_handler_kwargs, dict):
+                    metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
+                        success_handler_kwargs
+                    )
+                    metadata["aawm_stream_chunk_count"] = local_chunk_count
+                    metadata["aawm_stream_total_bytes"] = local_total_stream_bytes
+                    metadata["aawm_stream_interrupted"] = True
+                    metadata.update(
+                        PassThroughStreamingHandler._build_streaming_failure_context(
+                            exc=e,
+                            chunk_count=local_chunk_count,
+                            total_stream_bytes=local_total_stream_bytes,
+                            first_chunk_at=local_first_chunk_at,
+                            first_emitted_at=local_first_emitted_at,
+                        )
+                    )
+                asyncio.create_task(
+                    PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                        litellm_logging_obj=litellm_logging_obj,
+                        passthrough_success_handler_obj=passthrough_success_handler_obj,
+                        response=response,
+                        url_route=url_route,
+                        request_body=request_body or {},
+                        endpoint_type=endpoint_type,
+                        start_time=start_time,
+                        raw_bytes=local_raw_bytes,
+                        precomputed_lines=precomputed_lines,
+                        end_time=end_time,
+                        passthrough_logging_payload=passthrough_logging_payload,
+                        custom_llm_provider=custom_llm_provider,
+                        success_handler_kwargs=success_handler_kwargs,
+                        local_prepare_ms=local_prepare_ms,
+                        error_log_context=error_log_context,
+                    )
+                )
+                return
             verbose_proxy_logger.exception(
                 "Error in chunk_processor: %s",
                 str(e),
-                extra=PassThroughStreamingHandler._build_streaming_exception_log_context(
-                    error_log_context=error_log_context,
-                    exc=e,
-                    chunk_count=chunk_count if "chunk_count" in locals() else 0,
-                    total_stream_bytes=(
-                        total_stream_bytes if "total_stream_bytes" in locals() else 0
-                    ),
-                    first_chunk_at=(
-                        first_chunk_at if "first_chunk_at" in locals() else None
-                    ),
-                    first_emitted_at=(
-                        first_emitted_at if "first_emitted_at" in locals() else None
-                    ),
-                ),
+                extra=exception_context,
             )
             raise
 

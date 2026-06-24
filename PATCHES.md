@@ -53,6 +53,36 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.97 — Native Anthropic stream timeout traceback suppression
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.97`. Native
+Anthropic passthrough streaming now treats `httpx.ReadTimeout` after the first
+emitted response byte as a terminal interrupted stream instead of re-raising
+into Starlette/ASGI. The runtime still records safe structured context,
+including `failure_kind=streaming_upstream_read_timeout`,
+`stream_failure_stage=stream_interrupted_after_first_byte`, chunk count, byte
+count, and `stream_hidden_retry_safe=false`, but it avoids traceback-style log
+emission for the expected post-first-byte timeout path.
+
+**Why:** Production native Anthropic streams could time out after bytes were
+already sent to Claude Code. Retrying at that point is not protocol-safe, but
+re-raising the timeout caused raw ASGI traceback spam and made an expected
+terminal stream interruption look like an internal LiteLLM crash.
+
+**Why not upstream:** This is AAWM runtime-error intake policy for fork-local
+pass-through observability and dev/prod error JSONL handling. Upstream may want
+a different client-visible stream error contract.
+
+**Validation status:** Focused unit coverage verifies pre-first-byte timeouts
+still raise while post-first-byte timeouts yield prior chunks, mark stream
+metadata as interrupted, and write structured error JSONL without traceback.
+`litellm-dev` was restarted on `:4001`; an in-container probe exercised the
+post-first-byte timeout branch and fresh dev logs showed no traceback/ASGI
+signatures. Production promotion to `v1.82.3-aawm.97` remains required per
+`PROD_RELEASE.md`.
+
+---
+
 ### aawm.96 — Grok Composer Responses ModelInput rewrite
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.96`. Grok Composer
