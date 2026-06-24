@@ -32515,6 +32515,183 @@ async def test_aawm_low_alias_durable_cooldown_blocks_after_memory_clear():
 
 
 @pytest.mark.asyncio
+async def test_aawm_low_alias_skips_openrouter_candidates_with_durable_quota_exhaustion():
+    _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+    _codex_auto_agent_session_affinity_by_key.clear()
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds",
+        new=AsyncMock(return_value=600.0),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "opencode_zen"
+    assert selection["candidate"]["model"] == "deepseek-v4-flash"
+    skipped = selection["skipped"]
+    skipped_models = {candidate["model"] for candidate in skipped}
+    assert {
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/owl-alpha",
+    } <= skipped_models
+    assert all(
+        candidate["reason"] == "durable_quota_exhausted"
+        and candidate["cooldown_state_source"] == "durable_quota"
+        and candidate["cooldown_seconds"] > 0
+        for candidate in skipped
+        if candidate["provider"] == "openrouter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_aawm_low_anthropic_alias_skips_openrouter_candidates_with_durable_quota_exhaustion():
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
+    _anthropic_auto_agent_session_affinity_by_key.clear()
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-low-anthropic"
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds",
+        new=AsyncMock(return_value=600.0),
+    ):
+        selection = await _select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "opencode_zen"
+    assert selection["candidate"]["model"] == "deepseek-v4-flash"
+    skipped = selection["skipped"]
+    skipped_models = {candidate["model"] for candidate in skipped}
+    assert {
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/owl-alpha",
+    } <= skipped_models
+    assert all(
+        candidate["reason"] == "durable_quota_exhausted"
+        and candidate["cooldown_state_source"] == "durable_quota"
+        and candidate["cooldown_seconds"] > 0
+        for candidate in skipped
+        if candidate["provider"] == "openrouter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_aawm_low_alias_keeps_openrouter_first_without_durable_quota_exhaustion():
+    _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+    _codex_auto_agent_session_affinity_by_key.clear()
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds",
+        new=AsyncMock(return_value=0.0),
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+
+    assert selection["candidate"]["provider"] == "openrouter"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
+    assert selection["skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_openrouter_free_daily_quota_cache_expires_at_reset_before_ttl(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+
+    fetch_count = 0
+
+    async def fake_fetch_openrouter_free_daily_quota_row():
+        nonlocal fetch_count
+        fetch_count += 1
+        return {
+            "remaining_pct": 0,
+            "expected_reset_at": datetime.now(timezone.utc) + timedelta(seconds=0.05),
+        }
+
+    llm_passthrough_endpoints._reset_openrouter_free_daily_quota_cache()
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_fetch_openrouter_free_daily_quota_row",
+        fake_fetch_openrouter_free_daily_quota_row,
+    )
+    try:
+        first = await llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds()
+        await asyncio.sleep(0.08)
+        second = await llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds()
+    finally:
+        llm_passthrough_endpoints._reset_openrouter_free_daily_quota_cache()
+
+    assert first > 0
+    assert second == 0
+    assert fetch_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_free_daily_quota_lookup_failure_fails_open(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+
+    async def fake_fetch_openrouter_free_daily_quota_row():
+        raise RuntimeError("database unavailable")
+
+    llm_passthrough_endpoints._reset_openrouter_free_daily_quota_cache()
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_fetch_openrouter_free_daily_quota_row",
+        fake_fetch_openrouter_free_daily_quota_row,
+    )
+    try:
+        cooldown = await llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds()
+    finally:
+        llm_passthrough_endpoints._reset_openrouter_free_daily_quota_cache()
+
+    assert cooldown == 0
+
+
+@pytest.mark.asyncio
+async def test_openrouter_free_daily_quota_does_not_apply_to_non_declared_free_candidate():
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+
+    candidate = {
+        "provider": "openrouter",
+        "model": "openrouter/example-paid-model",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds",
+        new=AsyncMock(side_effect=AssertionError("quota helper must not run")),
+    ):
+        cooldown_seconds, cooldown_state_source, skip_reason = (
+            await llm_passthrough_endpoints._apply_openrouter_durable_quota_candidate_cooldown(
+                candidate=candidate,
+                cooldown_seconds=0.0,
+                cooldown_state_source=None,
+                skip_reason=None,
+            )
+        )
+
+    assert cooldown_seconds == 0
+    assert cooldown_state_source is None
+    assert skip_reason is None
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_in_flight_redispatch_includes_audit_metadata(
     monkeypatch,
 ):

@@ -169,8 +169,11 @@ Operational notes:
   `codex_auto_agent_affinity_state_source`, `codex_auto_agent_cooldown_state_source`,
   `anthropic_auto_agent_affinity_state_source`, and
   `anthropic_auto_agent_cooldown_state_source` with values `memory`,
-  `durable_cache`, or `local_fallback`. These fields do not store prompts, tools,
-  credentials, or raw session payloads.
+  `durable_cache`, `durable_quota`, or `local_fallback`. These fields do not
+  store prompts, tools, credentials, or raw session payloads. `durable_quota`
+  means the selector skipped a candidate because a separate quota observation,
+  rather than candidate-specific cooldown state, showed the provider account or
+  lane was exhausted until a known reset time.
 - Bare transient upstream statuses (`500`, `502`, `503`, and `529`) that do not
   carry explicit capacity, quota, rate-limit, or usage-limit evidence are
   treated as request-local alias failures. They are skipped for the current
@@ -204,7 +207,14 @@ For retryable provider errors, the handler records a
 next configured usable candidate. Alias selection also honors process-local
 adapter cooldown evidence for OpenRouter and Google Code Assist candidates so
 recent adapter-level exhaustion suppresses those candidates before the next
-dispatch without adding `rate_limit_observations` reads to the request hot path.
+dispatch. Declared OpenRouter free daily candidates are additionally checked
+from `rate_limit_observations` through a short-timeout, short-TTL cache. When
+the latest `openrouter_free_daily_requests:requests` observation reports
+`remaining_pct <= 0` and a future `expected_reset_at`, those free daily
+candidates are skipped before upstream attempts with
+`reason=durable_quota_exhausted` and `cooldown_state_source=durable_quota`; if
+the lookup fails or expires, selection fails open and preserves the declared
+alias order.
 For Grok native alias probes, the specific upstream 403
 `permission-denied` response that says access to the chat endpoint is denied is
 recorded as a candidate-unavailable condition, allowing the alias to progress to
