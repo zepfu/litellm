@@ -180,6 +180,9 @@ _GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS = (
     "x_xai_token_auth=xai-grok-cli",
     "no auth context",
 )
+_GROK_REPLICAS_UPDATE_NOT_OWNED_ERROR_MARKERS = (
+    "session not found or not owned",
+)
 _CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
     "unable to load site",
     "cdn-cgi/challenge-platform",
@@ -660,6 +663,59 @@ def _is_grok_signals_path(path: str) -> bool:
         normalized_path.startswith("/v1/sessions/")
         and normalized_path.endswith("/signals")
     )
+
+
+def _is_grok_replicas_update_path(path: str) -> bool:
+    normalized_path = path.rstrip("/")
+    return (
+        normalized_path.startswith("/grok/v1/sessions/")
+        and normalized_path.endswith("/replicas/update")
+    ) or (
+        normalized_path.startswith("/v1/sessions/")
+        and normalized_path.endswith("/replicas/update")
+    )
+
+
+def _is_known_grok_replicas_update_not_owned_response(
+    *,
+    request: Request,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_404_NOT_FOUND:
+        return False
+
+    if not _is_xai_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return False
+
+    request_path = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
+        request
+    )
+    upstream_path = urlparse(str(url or "")).path
+    if not (
+        _is_grok_replicas_update_path(request_path)
+        or _is_grok_replicas_update_path(upstream_path)
+    ):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if not detail:
+        return False
+
+    normalized_detail = str(detail).strip().lower()
+    return all(
+        marker in normalized_detail
+        for marker in _GROK_REPLICAS_UPDATE_NOT_OWNED_ERROR_MARKERS
+    )
+
+
+def _get_passthrough_grok_replicas_update_not_owned_failure_kind() -> str:
+    return "degraded_grok_replicas_update_not_owned"
 
 
 def _is_known_grok_signals_auth_context_response(
@@ -3436,6 +3492,15 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        suppress_grok_replicas_update_not_owned_traceback = (
+            _is_known_grok_replicas_update_not_owned_response(
+                request=request,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         suppress_chatgpt_codex_block_page_traceback = (
             _is_known_chatgpt_codex_block_page_response(
                 url=url,
@@ -3490,6 +3555,16 @@ async def pass_through_request(  # noqa: PLR0915
                 extra={
                     **error_log_context,
                     "failure_kind": _get_passthrough_grok_signals_auth_context_failure_kind(),
+                },
+            )
+        elif suppress_grok_replicas_update_not_owned_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced known Grok replicas/update not-owned status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": _get_passthrough_grok_replicas_update_not_owned_failure_kind(),
                 },
             )
         elif suppress_chatgpt_codex_block_page_traceback:
@@ -3591,6 +3666,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_provider_rate_limit_traceback
             and not suppress_grok_billing_timeout_traceback
             and not suppress_grok_signals_auth_context_traceback
+            and not suppress_grok_replicas_update_not_owned_traceback
             and not suppress_chatgpt_codex_block_page_traceback
             and not suppress_google_code_assist_tos_traceback
             and known_anthropic_failure_kind is None
@@ -3602,6 +3678,7 @@ async def pass_through_request(  # noqa: PLR0915
             not suppress_retryable_failure_logging
             and not suppress_grok_billing_timeout_traceback
             and not suppress_grok_signals_auth_context_traceback
+            and not suppress_grok_replicas_update_not_owned_traceback
         ):
             try:
                 await proxy_logging_obj.post_call_failure_hook(

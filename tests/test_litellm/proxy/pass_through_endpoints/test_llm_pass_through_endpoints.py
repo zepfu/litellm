@@ -20231,6 +20231,92 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
 
 
 @pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_in_flight_bare_502_redispatches_without_durable_cooldown():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "xai",
+        "model": "grok-composer-2.5-fast",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    composer_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=composer_error),
+    ) as mock_composer, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_redispatch_required"
+    )
+    assert exc_info.value.detail["selected_provider"] == "xai"
+    assert exc_info.value.detail["selected_model"] == "grok-composer-2.5-fast"
+    assert exc_info.value.detail["cooldown_seconds"] == 30
+    parsed_body = request.scope["parsed_body"][1]
+    audit_events = parsed_body["litellm_metadata"]["aawm_alias_routing_audit_events"]
+    redispatch_event = next(
+        event for event in audit_events if event["event_type"] == "redispatch_required"
+    )
+    assert redispatch_event["failure_class"] == "upstream_transient_internal"
+    route_logs = _alias_route_log_payloads(mock_warning)
+    redispatch_log = next(
+        payload
+        for payload in route_logs
+        if payload["event_type"] == "redispatch_required"
+    )
+    assert redispatch_log["failure_class"] == "upstream_transient_internal"
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:grok-composer-2.5-fast:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+    mock_composer.assert_awaited_once()
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_in_flight_redispatch_uses_requested_alias(
     monkeypatch,
 ):
@@ -22082,7 +22168,7 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_transient_upstream_sta
     )
 
     assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
-        "upstream_overloaded"
+        "upstream_transient_internal"
     )
 
 
@@ -31207,3 +31293,255 @@ async def test_aawm_alias_routing_durable_write_failure_keeps_in_memory_cooldown
 
     assert seconds > 0
     assert source == "memory"
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 529])
+def test_codex_auto_agent_retryable_exhaustion_classifies_bare_transient_status_without_durable_cooldown(
+    status_code,
+):
+    exc = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=status_code,
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
+        "upstream_transient_internal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(monkeypatch):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    fallback_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=transient_error),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=transient_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(return_value=fallback_success),
+    ) as mock_xai_oauth:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is fallback_success
+    mock_spark.assert_awaited_once()
+    mock_grok_native.assert_awaited_once()
+    mock_xai_oauth.assert_awaited_once()
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    grok_attempt = metadata["anthropic_auto_agent_attempts"][1]
+    assert grok_attempt["model"] == "grok-composer-2.5-fast"
+    assert grok_attempt["status"] == "cooldown_set"
+    assert grok_attempt["error_class"] == "upstream_transient_internal"
+    assert grok_attempt["cooldown_scope"] == "request_local"
+    assert grok_attempt["cooldown_seconds"] == 30.0
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:grok-composer-2.5-fast:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_alias_non_inflight_bare_502_selects_next_candidate_without_durable_cooldown():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    grok_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    managed_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=grok_error),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=grok_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(return_value=managed_success),
+    ) as mock_xai_oauth:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is managed_success
+    assert mock_spark.await_count == 1
+    assert mock_grok_native.await_count == 1
+    mock_xai_oauth.assert_awaited_once()
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    assert metadata["anthropic_auto_agent_selected_model"] == "oa_xai/grok-build"
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert [attempt["model"] for attempt in attempts] == [
+        "gpt-5.3-codex-spark",
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+    ]
+    assert attempts[0]["cooldown_scope"] == "request_local"
+    assert attempts[1]["cooldown_scope"] == "request_local"
+    assert attempts[0]["error_class"] == "upstream_transient_internal"
+    assert attempts[1]["error_class"] == "upstream_transient_internal"
+    durable_seconds, _ = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:grok-composer-2.5-fast:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_capacity_failure_still_sets_durable_cooldown():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    spark_error = RuntimeError(
+        "Selected model is at capacity. Please try a different model."
+    )
+    grok_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch.dict(
+        os.environ,
+        {"GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL": "https://api.x.ai/v1"},
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=[spark_error, grok_success]),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
+    ):
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is grok_success
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    spark_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert spark_attempt["cooldown_scope"] == "candidate"
+    assert spark_attempt["error_class"] == "capacity_exhausted"
+    assert spark_attempt["cooldown_seconds"] == 10800.0
+    durable_seconds, _ = await _get_codex_auto_agent_active_cooldown_state(
+        "openai:gpt-5.3-codex-spark:__default__"
+    )
+    assert durable_seconds > 0.0
+
+
+@pytest.mark.asyncio
+async def test_pass_through_request_suppresses_grok_replicas_update_not_owned_traceback():
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        pass_through_request,
+    )
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4000/grok/v1/sessions/session_123/replicas/update"
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.query_params = {}
+
+    target_url = (
+        "https://cli-chat-proxy.grok.com/v1/sessions/session_123/replicas/update"
+    )
+    upstream_response = httpx.Response(
+        status_code=404,
+        content=b'{"error":"Session not found or not owned"}',
+        request=httpx.Request("POST", target_url),
+    )
+    custom_body = {
+        "summary": "updated summary",
+        "litellm_metadata": {
+            "grok_side_channel": True,
+            "grok_side_channel_endpoint_type": "sessions_replicas_update",
+            "grok_side_channel_endpoint_path_template": (
+                "/sessions/{session_id}/replicas/update"
+            ),
+        },
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+        return_value=custom_body,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=upstream_response),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+    ) as mock_get_client, patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.verbose_proxy_logger.exception"
+    ) as mock_log_exception, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.verbose_proxy_logger.warning"
+    ) as mock_log_warning:
+        mock_client_obj = MagicMock()
+        mock_client_obj.client = MagicMock()
+        mock_get_client.return_value = mock_client_obj
+        mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+        mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+        with pytest.raises(ProxyException) as exc_info:
+            await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer test"},
+                user_api_key_dict=MagicMock(),
+                stream=False,
+                custom_body=custom_body,
+                custom_llm_provider="xai",
+                passthrough_logging_metadata=custom_body["litellm_metadata"],
+            )
+
+    assert exc_info.value.code == "404"
+    mock_log_exception.assert_not_called()
+    warning_call = next(
+        call
+        for call in mock_log_warning.call_args_list
+        if "known Grok replicas/update not-owned" in str(call.args[0])
+    )
+    assert warning_call.kwargs["extra"]["failure_kind"] == (
+        "degraded_grok_replicas_update_not_owned"
+    )
+    assert warning_call.kwargs["extra"]["grok_side_channel_endpoint_type"] == (
+        "sessions_replicas_update"
+    )
+    mock_logging_obj.post_call_failure_hook.assert_not_awaited()
