@@ -53,6 +53,29 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.96 — Grok Composer Responses ModelInput rewrite
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.96`. Grok Composer
+Responses traffic now rewrites OpenAI-style `function_call` and
+`function_call_output` input items into the provider-native shape expected by
+xAI Grok before the request is sent, so CLI proxy `/responses` calls with tool
+history no longer fail provider validation on mixed message/input-item payloads.
+
+**Why:** Production Grok Composer routes were still rejecting valid proxy
+Responses requests that carried tool-call turns using the OpenAI input-item
+schema. Prod needs a tagged fork release carrying this rewrite so promoted
+images pick up the fix without manual hotpatching.
+
+**Why not upstream:** The rewrite is tied to AAWM Grok Composer adapter routing,
+fork-local alias behavior, and the current passthrough/Responses operational
+shape rather than a generic upstream LiteLLM provider contract.
+
+**Validation status:** Focused unit coverage and `litellm-dev` smoke exercise
+the `function_call` / `function_call_output` rewrite path. Production promotion
+to `v1.82.3-aawm.96` remains required per `PROD_RELEASE.md`.
+
+---
+
 ### aawm.95 — Transient alias cooldown and observability hardening
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.95`. This release
