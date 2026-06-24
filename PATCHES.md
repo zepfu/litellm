@@ -53,6 +53,45 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.101 — Alias exhausted-candidate suppression and Grok permission-denied failover
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.101`.
+AAWM auto-agent alias selection now merges process-local OpenRouter and Google
+adapter cooldown evidence into candidate selection, so recently exhausted
+adapter candidates can be skipped before another upstream attempt without
+adding `rate_limit_observations` reads to the request hot path. In-flight
+redispatch-required 429 responses now include bounded audit metadata
+(`failure_class`, `cooldown_scope`, upstream status/code, attempts, and skipped
+candidate summaries) so client-visible redispatch failures can be correlated
+with the cooldown that triggered them. Grok native alias probes now classify
+the specific upstream 403 `permission-denied` response that says access to the
+chat endpoint is denied as `candidate_unavailable`, allowing `aawm-code` and
+`aawm-code-anthropic` to cool `grok-composer-2.5-fast` and progress to the next
+declared xAI candidate instead of emitting repeated pass-through tracebacks.
+
+**Why:** Production `aawm-code` traffic on `v1.82.3-aawm.100` repeatedly selected
+`grok-composer-2.5-fast`, received the Grok native 403
+`Access to the chat endpoint is denied`, and surfaced the upstream response as
+an unhandled pass-through traceback. The same broken alias route blocked worker
+subagent dispatches, preventing the normal fanout path from helping with the
+fix.
+
+**Why not upstream:** This behavior is specific to AAWM tiered aliases, local
+adapter cooldown state, Grok OIDC/OAuth candidate ordering, and the
+operator-facing redispatch contract used by AAWM subagent workflows.
+
+**Validation status:** Focused tests cover OpenRouter adapter-local cooldown
+skips, durable cooldown recovery after memory clear, enriched in-flight
+redispatch metadata, non-durable transient Anthropic alias failures, exact Grok
+403 classifier matching for bytes/dict/string details, unrelated 403 rejection,
+Codex `aawm-code` Composer 403 failover to `oa_xai/grok-build`, and Anthropic
+`aawm-code-anthropic` parity. `litellm-dev` was restarted on `:4001`; `/health`
+responded, an in-container probe returned `True` for the exact Grok 403
+classifier, and post-restart logs showed no fresh `Traceback`, `ERROR`,
+`permission-denied`, or `403 Forbidden` entries.
+
+---
+
 ### aawm.100 — Retain replaced aiohttp sessions for deterministic cleanup
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.100`.
