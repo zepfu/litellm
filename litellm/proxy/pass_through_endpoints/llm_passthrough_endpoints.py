@@ -1245,6 +1245,7 @@ _CODEX_CORE_TOOL_GUIDANCE_PATCH_PREFIX = "core-tool-guidance"
 _CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD = "unsupported_hosted_tools"
 _CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD = "unsupported_request_params"
 _CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "unsupported_input_item_types"
+_CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "rewrite_input_item_types"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "Use subagents to parallelize independent work while keeping one local owner "
     "on the critical path. Follow the current operator and project instructions "
@@ -1894,6 +1895,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
         _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     )
     _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
+    _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
     _sanitize_xai_responses_request_body_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
@@ -19080,6 +19082,36 @@ def _get_unsupported_input_item_types_for_model(model: Any) -> set[str]:
     return set()
 
 
+def _get_rewrite_input_item_types_for_model(model: Any) -> set[str]:
+    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
+    if not candidate_model_cost_keys:
+        return set()
+
+    model_cost_sources = [
+        litellm.model_cost,
+        _load_bundled_model_cost_map_for_codex_tool_policy(),
+    ]
+    for model_cost in model_cost_sources:
+        for key in candidate_model_cost_keys:
+            model_info = model_cost.get(key)
+            if not isinstance(model_info, dict):
+                continue
+
+            rewrite_input_item_types = model_info.get(
+                _CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD
+            )
+            if not isinstance(rewrite_input_item_types, list):
+                continue
+
+            return {
+                normalized
+                for value in rewrite_input_item_types
+                if (normalized := _normalize_low_cardinality_tag_value(value))
+            }
+
+    return set()
+
+
 def _openai_tool_choice_references_tool_type(
     tool_choice: Any,
     tool_types: set[str],
@@ -19421,6 +19453,177 @@ def _drop_unsupported_codex_input_items_from_request_body(
         removed_items=removed_items,
     )
     return updated_body, removed_items
+
+
+def _stringify_grok_native_input_item_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _format_grok_native_function_call_input_message(item: dict[str, Any]) -> str:
+    parts = ["Previous tool call"]
+    name = item.get("name")
+    if isinstance(name, str) and name.strip():
+        parts.append(f"Name: {name.strip()}")
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id.strip():
+        parts.append(f"Call ID: {call_id.strip()}")
+    arguments = _stringify_grok_native_input_item_value(item.get("arguments")).strip()
+    if arguments:
+        parts.append(f"Arguments: {arguments}")
+    return "\n".join(parts)
+
+
+def _format_grok_native_function_call_output_input_message(
+    item: dict[str, Any],
+) -> str:
+    parts = ["Previous tool result"]
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id.strip():
+        parts.append(f"Call ID: {call_id.strip()}")
+    output = _stringify_grok_native_input_item_value(item.get("output")).strip()
+    if output:
+        parts.append(f"Output: {output}")
+    return "\n".join(parts)
+
+
+def _rewrite_grok_native_input_item_for_model_input(
+    item: dict[str, Any],
+    *,
+    item_type: str,
+) -> Optional[dict[str, Any]]:
+    if item_type == "function_call":
+        return {
+            "type": "message",
+            "role": "assistant",
+            "content": _format_grok_native_function_call_input_message(item),
+        }
+    if item_type == "function_call_output":
+        return {
+            "type": "message",
+            "role": "user",
+            "content": _format_grok_native_function_call_output_input_message(item),
+        }
+    return None
+
+
+def _add_grok_native_input_item_rewrite_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    rewritten_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rewritten_item_types = _dedupe_sorted_str_list(
+        [
+            item["type"]
+            for item in rewritten_items
+            if isinstance(item.get("type"), str) and item["type"]
+        ]
+    )
+    span_metadata: dict[str, Any] = {
+        "rewritten_count": len(rewritten_items),
+        "rewritten_item_types": rewritten_item_types,
+    }
+
+    tags_to_add = ["grok-native-input-item-rewritten"]
+    tags_to_add.extend(
+        f"grok-native-input-item:{item_type}" for item_type in rewritten_item_types
+    )
+
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields={
+            "grok_native_input_item_rewrite_count": len(rewritten_items),
+            "grok_native_input_item_rewrite_types": rewritten_item_types,
+            "grok_native_input_item_rewrites": rewritten_items,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="grok.native_input_item_rewritten",
+                    metadata=span_metadata,
+                )
+            ],
+        },
+    )
+
+
+def _rewrite_grok_native_unsupported_input_items_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    rewrite_input_item_types = _get_rewrite_input_item_types_for_model(
+        request_body.get("model")
+    )
+    if not rewrite_input_item_types:
+        return request_body, []
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body, []
+
+    updated_input_items: list[Any] = []
+    rewritten_items: list[dict[str, Any]] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            updated_input_items.append(item)
+            continue
+
+        item_type = _normalize_low_cardinality_tag_value(item.get("type"))
+        if item_type not in rewrite_input_item_types:
+            updated_input_items.append(item)
+            continue
+
+        rewritten_item = _rewrite_grok_native_input_item_for_model_input(
+            item,
+            item_type=item_type,
+        )
+        if rewritten_item is None:
+            updated_input_items.append(item)
+            continue
+
+        metadata_item: dict[str, Any] = {
+            "type": item_type,
+            "index": index,
+            "rewritten_type": rewritten_item.get("type"),
+            "rewritten_role": rewritten_item.get("role"),
+        }
+        if isinstance(item.get("call_id"), str) and item["call_id"].strip():
+            metadata_item["call_id"] = item["call_id"].strip()
+        if isinstance(item.get("name"), str) and item["name"].strip():
+            metadata_item["name"] = item["name"].strip()
+        if item_type == "function_call_output":
+            metadata_item["output_chars"] = len(
+                _stringify_grok_native_input_item_value(item.get("output"))
+            )
+        rewritten_items.append(metadata_item)
+        updated_input_items.append(rewritten_item)
+
+    if not rewritten_items:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["input"] = updated_input_items
+    updated_body = _add_grok_native_input_item_rewrite_logging_metadata(
+        updated_body,
+        rewritten_items=rewritten_items,
+    )
+    return updated_body, rewritten_items
+
+
+def _rewrite_grok_native_unsupported_input_items_in_place(
+    request_body: dict[str, Any],
+) -> list[dict[str, Any]]:
+    updated_body, rewritten_items = (
+        _rewrite_grok_native_unsupported_input_items_from_request_body(request_body)
+    )
+    if updated_body is not request_body:
+        request_body.clear()
+        request_body.update(updated_body)
+    return rewritten_items
 
 
 def _drop_unsupported_codex_hosted_tools_from_request_body(
@@ -22191,6 +22394,7 @@ def _prepare_grok_request_body_for_passthrough(
         _drop_unsupported_codex_input_items_from_request_body(prepared_body)
     )
     _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
+    _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
     prepared_body, _removed_tool_choice = (
         _drop_tool_choice_without_tools_from_request_body(prepared_body)
     )

@@ -33498,6 +33498,10 @@
         ],
         "unsupported_input_item_types": [
             "reasoning"
+        ],
+        "rewrite_input_item_types": [
+            "function_call",
+            "function_call_output"
         ]
     },
     "xai/grok-4-fast-reasoning": {
