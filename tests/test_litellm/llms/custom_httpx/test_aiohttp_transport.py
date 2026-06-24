@@ -585,3 +585,42 @@ async def test_handle_session_closed_during_request():
     assert counts["requests"] == 2  # First request failed, second succeeded
     assert counts["sessions"] == 2  # Created 2 sessions for retry
     assert response.status_code == 200
+
+@pytest.mark.asyncio
+async def test_sync_get_valid_client_session_retains_owned_session_when_close_unsafe():
+    """Owned sessions replaced on the sync path must be retained for later aclose()."""
+    old_session = aiohttp.ClientSession()
+    old_session._loop = object()  # type: ignore[attr-defined]
+
+    transport = LiteLLMAiohttpTransport(client=old_session, owns_session=True)
+
+    replacement = transport._get_valid_client_session()
+
+    assert replacement is not old_session
+    assert transport._retained_replaced_sessions == [old_session]
+    assert not old_session.closed
+
+    await transport.aclose()
+
+    assert old_session.closed
+    assert replacement.closed
+
+
+@pytest.mark.asyncio
+async def test_sync_get_valid_client_session_does_not_retain_shared_session():
+    """Shared sessions must not be retained or closed by sync replacement logic."""
+    shared_session = aiohttp.ClientSession()
+    shared_session._loop = object()  # type: ignore[attr-defined]
+
+    transport = LiteLLMAiohttpTransport(client=shared_session, owns_session=False)
+
+    replacement = transport._get_valid_client_session()
+
+    assert replacement is not shared_session
+    assert transport._retained_replaced_sessions == []
+    assert not shared_session.closed
+
+    await transport.aclose()
+
+    assert not shared_session.closed
+    await shared_session.close()
