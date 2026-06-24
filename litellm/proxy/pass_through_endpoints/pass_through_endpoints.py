@@ -193,6 +193,7 @@ _CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
     "unable to load site",
     "cdn-cgi/challenge-platform",
 )
+_CHATGPT_CODEX_INVALID_ENCRYPTED_CONTENT_ERROR_CODE = "invalid_encrypted_content"
 _GOOGLE_CODE_ASSIST_HOST_SUFFIX = "cloudcode-pa.googleapis.com"
 _GOOGLE_CODE_ASSIST_TOS_REASON = "TOS_VIOLATION"
 _GOOGLE_CODE_ASSIST_PERMISSION_DENIED_STATUS = "PERMISSION_DENIED"
@@ -782,6 +783,40 @@ def _is_known_chatgpt_codex_block_page_response(
     normalized_detail = str(detail).lower()
     return any(
         marker in normalized_detail for marker in _CHATGPT_CODEX_BLOCK_PAGE_MARKERS
+    )
+
+
+def _is_known_chatgpt_codex_invalid_encrypted_content_response(
+    *,
+    url: Optional[httpx.URL],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_400_BAD_REQUEST:
+        return False
+
+    parsed_url = urlparse(str(url or ""))
+    if (
+        str(parsed_url.hostname or "").lower() != "chatgpt.com"
+        or "/backend-api/codex/" not in str(parsed_url.path or "").lower()
+    ):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if detail is None:
+        return False
+
+    payload = _coerce_upstream_error_payload(detail)
+    if not isinstance(payload, dict):
+        return False
+
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+
+    return (
+        str(error.get("code") or "").strip()
+        == _CHATGPT_CODEX_INVALID_ENCRYPTED_CONTENT_ERROR_CODE
     )
 
 
@@ -3543,6 +3578,13 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        suppress_chatgpt_codex_invalid_encrypted_content_traceback = (
+            _is_known_chatgpt_codex_invalid_encrypted_content_response(
+                url=url,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         suppress_google_code_assist_tos_traceback = (
             _is_known_google_code_assist_tos_violation_response(
                 url=url,
@@ -3610,6 +3652,16 @@ async def pass_through_request(  # noqa: PLR0915
                 extra={
                     **error_log_context,
                     "failure_kind": "openai_chatgpt_codex_block_page",
+                },
+            )
+        elif suppress_chatgpt_codex_invalid_encrypted_content_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced ChatGPT Codex invalid encrypted content status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": "openai_chatgpt_codex_invalid_encrypted_content",
                 },
             )
         elif suppress_google_code_assist_tos_traceback:
@@ -3703,6 +3755,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_grok_signals_auth_context_traceback
             and not suppress_grok_replicas_update_not_owned_traceback
             and not suppress_chatgpt_codex_block_page_traceback
+            and not suppress_chatgpt_codex_invalid_encrypted_content_traceback
             and not suppress_google_code_assist_tos_traceback
             and known_anthropic_failure_kind is None
         ):

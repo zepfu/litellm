@@ -3362,7 +3362,13 @@ class TestPassThroughTerminalFailureLogging:
         verbose_proxy_logger.propagate = saved_propagate
 
     @staticmethod
-    def _build_codex_unsupported_content_type_fixture(secret_prompt, secret_token):
+    def _build_codex_unsupported_content_type_fixture(
+        secret_prompt,
+        secret_token,
+        *,
+        model="gpt-5.5",
+        upstream_detail=b'{"detail":"Unsupported content type"}',
+    ):
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
         mock_request.url = "http://localhost:4001/openai_passthrough/responses?stream=true"
@@ -3374,7 +3380,7 @@ class TestPassThroughTerminalFailureLogging:
 
         target_url = "https://chatgpt.com/backend-api/codex/responses"
         request_body = {
-            "model": "gpt-5.5",
+            "model": model,
             "stream": True,
             "input": secret_prompt,
             "instructions": f"use token {secret_token}",
@@ -3384,7 +3390,6 @@ class TestPassThroughTerminalFailureLogging:
             },
         }
         req = httpx.Request("POST", target_url)
-        upstream_detail = b'{"detail":"Unsupported content type"}'
         failing_response = httpx.Response(
             status_code=400,
             content=upstream_detail,
@@ -3880,6 +3885,96 @@ class TestPassThroughTerminalFailureLogging:
         assert "sk-leaked" not in serialized
 
     @pytest.mark.asyncio
+    async def test_pass_through_request_codex_stream_invalid_encrypted_content_warns_without_traceback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        upstream_detail = (
+            b'{\n  "error": {\n'
+            b'    "message": "The encrypted content A3Sc...4ndF could not be verified.",\n'
+            b'    "type": "invalid_request_error",\n'
+            b'    "param": null,\n'
+            b'    "code": "invalid_encrypted_content"\n'
+            b'  }\n}'
+        )
+        fixture = self._build_codex_unsupported_content_type_fixture(
+            "redacted prompt",
+            "sk-redacted",
+            model="gpt-5.3-codex-spark",
+            upstream_detail=upstream_detail,
+        )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        try:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+                return_value=fixture.request_body,
+            ), patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+            ) as mock_get_client, patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj"
+            ) as mock_logging_obj, patch.object(
+                verbose_proxy_logger,
+                "warning",
+            ) as mock_warning, patch.object(
+                verbose_proxy_logger,
+                "exception",
+            ) as mock_exception:
+                mock_client_obj = MagicMock()
+                mock_client_obj.client = fixture.mock_client
+                mock_get_client.return_value = mock_client_obj
+                mock_logging_obj.pre_call_hook = AsyncMock(
+                    return_value=fixture.request_body
+                )
+                mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+                with pytest.raises(ProxyException) as exc_info:
+                    await pass_through_request(
+                        request=fixture.mock_request,
+                        target=fixture.target_url,
+                        custom_headers={"authorization": "Bearer sk-redacted"},
+                        user_api_key_dict=MagicMock(),
+                        stream=True,
+                        forward_headers=True,
+                        custom_llm_provider="openai",
+                    )
+
+                assert exc_info.value.code == "400"
+                assert "invalid_encrypted_content" in str(exc_info.value.detail)
+                mock_exception.assert_not_called()
+                invalid_warning = next(
+                    call
+                    for call in mock_warning.call_args_list
+                    if "invalid encrypted content" in str(call.args[0])
+                )
+                assert (
+                    invalid_warning.kwargs["extra"]["failure_kind"]
+                    == "openai_chatgpt_codex_invalid_encrypted_content"
+                )
+                assert invalid_warning.kwargs["extra"]["upstream_url"] == (
+                    fixture.target_url
+                )
+                mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+                assert (
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                        "traceback_str"
+                    ]
+                    is None
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        assert not (tmp_path / "dev-error.jsonl").exists()
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_chatgpt_codex_block_page_warns_with_failure_kind(
         self,
     ):
@@ -3950,6 +4045,147 @@ class TestPassThroughTerminalFailureLogging:
         assert (
             mock_logging_obj.post_call_failure_hook.await_args.kwargs["traceback_str"]
             is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_chatgpt_codex_invalid_encrypted_content_warns_with_failure_kind(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        upstream_detail = (
+            b'{\n  "error": {\n'
+            b'    "message": "The encrypted content A3Sc...4ndF could not be verified.",\n'
+            b'    "type": "invalid_request_error",\n'
+            b'    "param": null,\n'
+            b'    "code": "invalid_encrypted_content"\n'
+            b'  }\n}'
+        )
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=upstream_detail,
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "gpt-5.3-codex-spark"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch.object(
+            verbose_proxy_logger,
+            "warning",
+        ) as mock_warning, patch.object(
+            verbose_proxy_logger,
+            "exception",
+        ) as mock_exception:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "gpt-5.3-codex-spark"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+
+        assert exc_info.value.code == "400"
+        assert str(upstream_detail, "utf-8") in str(exc_info.value.detail)
+        assert handler.await_count == 1
+        mock_exception.assert_not_called()
+        invalid_warning = next(
+            call
+            for call in mock_warning.call_args_list
+            if "invalid encrypted content" in str(call.args[0])
+        )
+        assert (
+            invalid_warning.kwargs["extra"]["failure_kind"]
+            == "openai_chatgpt_codex_invalid_encrypted_content"
+        )
+        assert invalid_warning.kwargs["extra"]["upstream_url"] == target_url
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert (
+            mock_logging_obj.post_call_failure_hook.await_args.kwargs["traceback_str"]
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_chatgpt_codex_unrelated_400_keeps_exception_logging(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        upstream_detail = b'{"detail":"Unsupported content type"}'
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=upstream_detail,
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "gpt-5.5"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch.object(
+            verbose_proxy_logger,
+            "exception",
+        ) as mock_exception:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value={"model": "gpt-5.5"})
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+
+        assert exc_info.value.code == "400"
+        assert str(upstream_detail, "utf-8") in str(exc_info.value.detail)
+        mock_exception.assert_called_once()
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert (
+            "Unsupported content type"
+            in mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                "traceback_str"
+            ]
         )
 
     @pytest.mark.asyncio
