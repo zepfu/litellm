@@ -19753,15 +19753,38 @@ def test_grok_candidate_unavailable_detail_matches_compaction_blob_decode_error(
     )
 
 
-def test_grok_candidate_unavailable_detail_matches_chat_permission_denied_error():
-    permission_error = HTTPException(
-        status_code=403,
-        detail=(
+@pytest.mark.parametrize(
+    "detail",
+    [
+        (
             b'{"code":"permission-denied","error":"Access to the chat endpoint '
             b"is denied. Please ensure you're using the correct credentials. "
             b'If you believe this is a mistake, please log into console.x.ai '
             b'and update the permissions, or contact support."}'
         ),
+        {
+            "code": "permission-denied",
+            "error": (
+                "Access to the chat endpoint is denied. Please ensure you're "
+                "using the correct credentials. If you believe this is a "
+                "mistake, please log into console.x.ai and update the "
+                "permissions, or contact support."
+            ),
+        },
+        (
+            "{\"code\":\"permission-denied\",\"error\":\"Access to the chat "
+            "endpoint is denied. Please ensure you're using the correct "
+            "credentials. If you believe this is a mistake, please log into "
+            "console.x.ai and update the permissions, or contact support.\"}"
+        ),
+    ],
+)
+def test_grok_candidate_unavailable_detail_matches_chat_permission_denied_error(
+    detail,
+):
+    permission_error = HTTPException(
+        status_code=403,
+        detail=detail,
     )
 
     detail = _grok_native_candidate_unavailable_detail(permission_error) or ""
@@ -20276,6 +20299,89 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
         "oa_xai/grok-build",
     ]
     assert metadata["anthropic_auto_agent_attempts"][1]["status"] == "cooldown_set"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permission_denied():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    await _set_anthropic_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:__default__",
+        60.0,
+    )
+    permission_error = HTTPException(
+        status_code=403,
+        detail=(
+            b'{"code":"permission-denied","error":"Access to the chat endpoint '
+            b"is denied. Please ensure you're using the correct credentials. "
+            b'If you believe this is a mistake, please log into console.x.ai '
+            b'and update the permissions, or contact support."}'
+        ),
+    )
+    translated_request_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "hello",
+        "stream": False,
+    }
+    managed_xai_success = Response(
+        content='{"ok": true}', media_type="application/json"
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_grok_native_oauth_passthrough_request",
+        new=AsyncMock(
+            return_value=(
+                True,
+                "https://cli-chat-proxy.grok.com",
+                {"authorization": "Bearer grok-oidc-token"},
+                translated_request_body,
+            )
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=permission_error),
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(return_value=managed_xai_success),
+    ) as mock_xai_oauth:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is managed_xai_success
+    mock_pass_through.assert_awaited_once()
+    mock_xai_oauth.assert_awaited_once()
+    assert mock_xai_oauth.await_args.kwargs["adapter_model"] == "oa_xai/grok-build"
+    xai_body = mock_xai_oauth.await_args.kwargs["prepared_request_body"]
+    metadata = xai_body["litellm_metadata"]
+    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "oa_xai/grok-build"
+    assert metadata["anthropic_auto_agent_selected_route_family"] == (
+        "anthropic_xai_oauth_responses_adapter"
+    )
+    assert [
+        attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]
+    ] == [
+        "grok-composer-2.5-fast",
+        "oa_xai/grok-build",
+    ]
+    composer_attempt = metadata["anthropic_auto_agent_attempts"][0]
+    assert composer_attempt["status"] == "cooldown_set"
+    assert composer_attempt["error_class"] == "candidate_unavailable"
+    assert "aawm_codex_auto_agent_candidate_unavailable" in composer_attempt[
+        "error_tokens"
+    ]
+    assert metadata["anthropic_auto_agent_skipped_candidates"][0]["model"] == (
+        "gpt-5.3-codex-spark"
+    )
 
 
 @pytest.mark.asyncio
