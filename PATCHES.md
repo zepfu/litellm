@@ -53,6 +53,32 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.106 — Deterministic aiohttp shutdown cleanup and ownership accounting
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.106`.
+`BaseLLMAIOHTTPHandler` now preserves externally supplied/shared transport
+session ownership, closes handler-owned and transport-owned aiohttp sessions
+through an explicit `close()` path, and makes repeated cleanup idempotent. The
+global async-client cleanup helper now records bounded shutdown cleanup
+failures instead of silently swallowing every cleanup exception. Focused tests
+cover owned handler/transport cleanup, shared transport ownership, and fresh
+event-loop cleanup.
+
+**Why:** Prod error intake showed recurrent `asyncio` `Unclosed client session`
+events during container lifecycle transitions. The previous cleanup path relied
+too heavily on destructor-time cleanup and could not explain which cleanup phase
+failed. D1-394 makes shutdown cleanup deterministic and gives future incidents a
+bounded failure summary without spamming normal shutdown logs.
+
+**Why not upstream:** This is tied to AAWM prod error-intake requirements and
+the local proxy lifecycle expectations around shared aiohttp sessions,
+pass-through routing, and structured runtime-error visibility.
+
+**Validation status:** Focused aiohttp cleanup tests passed, py_compile passed,
+ruff passed on the touched runtime/test files, `git diff --check` passed, and
+`litellm-dev` restarted healthy with no fresh `Unclosed client session`,
+traceback, ASGI, or generic error matches in the post-restart log scan.
+
 ### aawm.105 — Route-rollup completion guard for streamed AAWM auto-agent turns
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.105`.
