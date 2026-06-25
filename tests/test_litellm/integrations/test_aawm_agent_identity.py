@@ -9835,6 +9835,180 @@ def test_retryable_session_history_failure_keeps_write_ahead_spool_after_retry_b
     )
 
 
+
+
+def test_session_history_persistence_telemetry_suffix_includes_retry_budget() -> None:
+    suffix = aawm_agent_identity._session_history_persistence_telemetry_suffix(
+        retry_count=2,
+        max_retries=5,
+        retry_write_ahead_spool_path="/tmp/retry-wa.jsonl",
+        spooled=True,
+        degraded_telemetry=True,
+        at_risk_of_loss=False,
+    )
+    assert "retry_count=2" in suffix
+    assert "retry_budget_remaining=3" in suffix
+    assert "retry_write_ahead_spooled=true" in suffix
+    assert "retry_write_ahead_spool_path_present=true" in suffix
+    assert "spooled=true" in suffix
+    assert "degraded_telemetry=true" in suffix
+    assert "at_risk_of_loss=false" in suffix
+
+
+def test_asyncpg_timeout_error_is_retryable_session_history_failure() -> None:
+    class TimeoutError(Exception):
+        pass
+
+    exc = TimeoutError("timeout during connection acquire")
+    assert aawm_agent_identity._is_retryable_session_history_persistence_failure(exc)
+
+
+def test_retryable_asyncpg_timeout_logs_warning_with_protection_telemetry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class TimeoutError(Exception):
+        pass
+
+    records = [{"litellm_call_id": "call-timeout-retry", "trace_id": "trace-timeout"}]
+    attempts = []
+
+    async def flaky_persist(batch):
+        attempts.append(batch)
+        if len(attempts) == 1:
+            raise TimeoutError("timeout during connection acquire")
+
+    def fake_secret(key: str):
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV:
+            return str(tmp_path)
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES":
+            return "2"
+        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS":
+            return "0"
+        return None
+
+    exception_mock = MagicMock()
+    warning_mock = MagicMock()
+
+    monkeypatch.setattr(aawm_agent_identity, "get_secret_str", fake_secret)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_persist_session_history_records",
+        flaky_persist,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_reset_session_history_pool_after_retryable_failure",
+        lambda loop: 0,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_ensure_session_history_spool_drainer_started",
+        lambda: None,
+    )
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    loop = aawm_agent_identity.asyncio.new_event_loop()
+    try:
+        aawm_agent_identity._flush_session_history_batch_with_retry(
+            records,
+            loop=loop,
+        )
+    finally:
+        loop.close()
+
+    assert attempts == [records, records]
+    assert exception_mock.call_count == 0
+    combined = " ".join(
+        " ".join(str(a) for a in (call.args or ())) for call in warning_mock.call_args_list
+    )
+    assert "retryable session_history persistence degradation" in combined
+    assert "at_risk_of_loss=false" in combined
+    assert "degraded_telemetry=true" in combined
+    assert "retry_write_ahead_spooled=true" in combined
+    assert "flush_recovered=true" in combined
+
+
+def test_retry_write_ahead_spool_failure_logs_at_risk_telemetry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class TimeoutError(Exception):
+        pass
+
+    records = [{"litellm_call_id": "call-at-risk", "trace_id": "trace-at-risk"}]
+    exception_mock = MagicMock()
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_spool_session_history_records",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_reset_session_history_pool_after_retryable_failure",
+        lambda loop: 0,
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+
+    aawm_agent_identity._prepare_session_history_retry_after_failure(
+        records,
+        loop=None,
+        retry_message="session_history batch flush",
+        retry_count=0,
+        last_failure=TimeoutError("timeout during connection acquire"),
+        retry_write_ahead_spool_path=None,
+    )
+
+    exception_mock.assert_called_once()
+    exc_combined = " ".join(str(a) for a in exception_mock.call_args.args)
+    assert "at_risk_of_loss=true" in exc_combined
+    assert "potential session_history data loss" in exc_combined
+
+
+def test_handle_session_history_retry_exhaustion_spool_failure_logs_at_risk(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    records = [{"litellm_call_id": "call-exhaust-at-risk"}]
+    exception_mock = MagicMock()
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_spool_session_history_records",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+
+    protected = aawm_agent_identity._handle_session_history_retry_exhaustion(
+        records,
+        retry_message="session_history batch flush",
+        retry_count=3,
+        last_failure=OSError("pg down"),
+        retry_write_ahead_spool_path=None,
+    )
+
+    assert protected is False
+    exception_mock.assert_called_once()
+    assert "at_risk_of_loss=true" in str(exception_mock.call_args.args)
+
+
 def test_enqueue_session_history_record_retries_queue_when_overflow_busy(monkeypatch) -> None:
     class FullThenAvailableQueue:
         def __init__(self):
@@ -10544,10 +10718,18 @@ def test_failed_session_history_batch_spools_after_retry_budget(
     assert all(line["type"] == "record" for line in raw_lines[1:])
     assert exception_mock.call_count == 1
     warning_messages = [call.args[0] for call in warning_mock.call_args_list]
-    assert (
-        "AawmAgentIdentity: session_history flush still failing within "
-        "the configured retry budget: %s (batch_size=%d, %s)"
-    ) in warning_messages
+    retry_warning = next(
+        message
+        for message in warning_messages
+        if "session_history flush still failing within the configured retry budget"
+        in message
+    )
+    assert "%s, %s)" in retry_warning
+    warning_text = " ".join(
+        " ".join(str(arg) for arg in call.args) for call in warning_mock.call_args_list
+    )
+    assert "retry_write_ahead_spooled=false" in warning_text
+    assert "at_risk_of_loss=false" in warning_text
     assert any(
         "protected batch by spooling for replay" in message
         for message in warning_messages
