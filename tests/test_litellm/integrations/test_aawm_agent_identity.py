@@ -9863,6 +9863,32 @@ def test_asyncpg_timeout_error_is_retryable_session_history_failure() -> None:
     assert aawm_agent_identity._is_retryable_session_history_persistence_failure(exc)
 
 
+def _load_callback_overlay_agent_identity_module():
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parents[3]
+    overlay_path = repo_root / ".wheel-build/aawm_litellm_callbacks/agent_identity.py"
+    spec = importlib.util.spec_from_file_location(
+        "callback_overlay_aawm_agent_identity_for_test",
+        overlay_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_callback_overlay_asyncpg_timeout_error_is_retryable_session_history_failure() -> None:
+    overlay = _load_callback_overlay_agent_identity_module()
+
+    class TimeoutError(Exception):
+        pass
+
+    exc = TimeoutError("timeout during connection acquire")
+    assert overlay._is_retryable_session_history_persistence_failure(exc)
+    assert "TimeoutError" in overlay._AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES
+
+
 def test_retryable_asyncpg_timeout_logs_warning_with_protection_telemetry(
     monkeypatch,
     tmp_path,
