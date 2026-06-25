@@ -850,7 +850,10 @@ Rows affected by this path may include:
   before egress because the selected concrete model rejects those typed
   Responses variants. For `grok-composer-2.5-fast`, `function_call` and
   `function_call_output` continuation items are preserved as ordinary message
-  text instead of being sent as raw Responses tool items.
+  text instead of being sent as raw Responses tool items. The preserved message
+  text uses neutral context-note wording, not `Previous tool call`, `Name`,
+  `Call ID`, or `Arguments` transcript fields, so Grok Composer is not primed to
+  re-emit a non-executing tool-call template as assistant output.
 - `xai_responses_request_sanitized`: `true` when the outgoing request body was
   changed before xAI egress.
 - `xai_responses_previous_response_id_decoded`: `true` when a LiteLLM-encoded
