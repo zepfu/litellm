@@ -1966,6 +1966,150 @@ def test_should_score_malformed_success_output_shape_as_contract_failure() -> No
     ]
 
 
+def test_should_score_literal_composer_call_text_in_output_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Run the requested step."}],
+        {
+            "role": "assistant",
+            "content": "composer_call(task='build')",
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 0.0
+    assert evidence.output_contract_compliance_score == 0.0
+    assert evidence.output_contract_failure_class == "literal_tool_call_text"
+    assert evidence.output_contract_failure_count == 1
+    assert evidence.agent_score_reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+
+def test_should_score_serialized_composer_call_tool_text_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Run this step."}],
+        {
+            "role": "assistant",
+            "content": (
+                "Previous tool call\n"
+                "Name: exec_command\n"
+                "Call ID: call-123-composer_call_abc\n"
+                'Arguments: {"cmd": "echo hello"}'
+            ),
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 0.0
+    assert evidence.output_contract_compliance_score == 0.0
+    assert evidence.output_contract_failure_class == "literal_tool_call_text"
+    assert evidence.agent_score_reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+
+def test_should_score_same_line_serialized_composer_call_tool_text_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Run this step."}],
+        {
+            "role": "assistant",
+            "content": (
+                'Name: Bash  Call ID: call-abc-composer_call_qz904 '
+                'Arguments: {"command":"grep"}'
+            ),
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 0.0
+    assert evidence.output_contract_compliance_score == 0.0
+    assert evidence.output_contract_failure_class == "literal_tool_call_text"
+    assert evidence.agent_score_reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+
+def test_should_not_flag_benign_composer_call_prose_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Summarize the incident."}],
+        {
+            "role": "assistant",
+            "content": (
+                "The transcript mentioned composer_call and the id "
+                "call-123-composer_call_abc, but no tool was executed."
+            ),
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.output_contract_failure_class is None
+    assert "output_contract_literal_tool_call_text" not in evidence.reasons
+
+
+def test_should_not_flag_real_tool_calls_for_output_contract_when_solved() -> None:
+    payload = _payload(
+        [
+            {"role": "user", "content": "Run this command."},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {"cmd": "echo hello"},
+                    }
+                ],
+            },
+        ],
+        {"role": "assistant", "content": "Done.", "tool_calls": None},
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.output_contract_compliance_score == 1.0
+    assert evidence.output_contract_failure_class is None
+    assert "output_contract_literal_tool_call_text" not in evidence.reasons
+    assert "output_contract_malformed_tool_call_text" not in evidence.reasons
+
+
 def test_should_score_missing_required_final_phrase_as_contract_failure() -> None:
     payload = _payload(
         [
