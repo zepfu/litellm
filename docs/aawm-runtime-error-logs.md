@@ -31,6 +31,15 @@ container, mounted to this repo's `.analysis/dev-error.jsonl`. The matching
 legacy path is `/app/.analysis/dev-error.log`, mounted to
 `.analysis/dev-error.log`.
 
+Malformed tool-call detections use the same local intake directory and append
+to `.analysis/malformed-error.jsonl`. This file is intentionally separate from
+`<environment>-error.jsonl` so investigations can inspect the raw malformed
+tool-call text or payload without scraping container logs. Enable it with
+`LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED=1`, or by enabling the generic AAWM
+error sink or setting `LITELLM_AAWM_ERROR_LOG_DIR`. The malformed-specific
+enable flag is enough to default the path to the current working directory's
+`.analysis/malformed-error.jsonl`.
+
 When the proxy or provider-status sidecar runs as root inside a container, a
 plain bind-mount append would create root-owned active intake files on the host.
 After each successful append, the JSONL writers therefore make a best-effort
@@ -51,6 +60,17 @@ Error-intake logging must never fail a client request or the sidecar scan loop.
 The sink writes append-safe newline-delimited JSON. Each line is one complete
 JSON object, so repeated runtime failures can be appended without rewriting the
 file.
+
+`malformed-error.jsonl` follows the same append-only JSONL convention, with one
+row per detected malformed tool call. Rows include route/session identity
+fields such as `provider`, `model`, `model_alias`, `route_family`, `endpoint`,
+`upstream_url`, `repository`, `agent_name`, `agent_id`, `session_id`,
+`trace_id`, and `litellm_call_id`, plus the bounded
+`malformed_tool_call_text` or `malformed_tool_call_payload` that triggered the
+detection. Individual text and payload fields are truncated to bounded previews;
+the file keeps appending by default. Operators can set
+`LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES` as an explicit safety ceiling if a
+runtime needs to stop appending after a known size.
 
 Each event should include at least:
 
@@ -181,6 +201,17 @@ The retry wrapper intentionally stops at the pre-first-byte boundary. Once a
 streaming response has been handed to the client, midstream failures remain
 terminal for that stream and are recorded through the streaming error context
 path instead of replaying the request.
+
+Post-first-byte upstream read timeouts also emit an explicit terminal stream
+event to the client after any bytes already forwarded. The proxy preserves the
+partial stream, appends a route-family-specific terminal failure chunk, and does
+not pass the partial byte stream through the normal success-callback pipeline.
+It records `failure_kind=streaming_upstream_read_timeout`,
+`stream_failure_stage=stream_interrupted_after_first_byte`,
+`stream_hidden_retry_safe=false`, and stream progress counters in both runtime
+error intake and `litellm_params.metadata`. AAWM route status/rollup surfaces
+the interruption as `Status: Failed` instead of leaving the turn looking
+successful.
 
 Any runtime path that emits a traceback is active error intake, independent of
 the logger level that produced it. Expected degraded states should avoid

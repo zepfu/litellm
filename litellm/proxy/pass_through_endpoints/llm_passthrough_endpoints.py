@@ -48,6 +48,9 @@ from litellm.integrations.aawm_agent_quality_rules import (
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
 )
+from litellm.proxy.aawm_runtime_error_logging import (
+    persist_malformed_tool_call_detection,
+)
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_API_BASE,
     get_chatgpt_default_headers,
@@ -14658,6 +14661,71 @@ def _is_failed_responses_body(response_body: dict[str, Any]) -> bool:
     )
 
 
+def _build_malformed_tool_call_intake_context(
+    request: Optional[Request] = None,
+    request_body: Optional[dict[str, Any]] = None,
+    *,
+    adapter: Optional[str] = None,
+    upstream_url: Optional[str] = None,
+    provider: Optional[str] = None,
+    model_alias: Optional[str] = None,
+) -> dict[str, Any]:
+    body = request_body if isinstance(request_body, dict) else {}
+    metadata = body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    passthrough_metadata = body.get("metadata")
+    if not isinstance(passthrough_metadata, dict):
+        passthrough_metadata = {}
+
+    def _meta(*keys: str) -> Optional[str]:
+        for key in keys:
+            for source in (metadata, passthrough_metadata):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
+
+    context: dict[str, Any] = {
+        "provider": provider,
+        "model_alias": model_alias or _meta("model_alias", "alias_model", "requested_model")
+        or (body.get("model") if isinstance(body.get("model"), str) else None),
+        "route_family": _meta("passthrough_route_family", "route_family") or adapter,
+        "endpoint": None,
+        "upstream_url": upstream_url,
+        "repository": _extract_auto_agent_alias_metadata_value(
+            body,
+            "repository",
+            "repo",
+            "repo_name",
+            "repository_name",
+        ),
+        "agent_name": _meta("agent_name", "aawm_claude_agent_name"),
+        "agent_id": _extract_auto_agent_alias_metadata_value(
+            body,
+            "agent_id",
+            "aawm_agent_id",
+            "codex_agent_id",
+            "claude_agent_id",
+        ),
+        "session_id": None,
+        "trace_id": _meta("trace_id", "existing_trace_id"),
+        "litellm_call_id": _meta("litellm_call_id"),
+        "request_started_at": _meta("request_started_at", "start_time"),
+    }
+    if request is not None:
+        context["endpoint"] = _extract_auto_agent_alias_incoming_endpoint(request)
+        context["session_id"] = _extract_auto_agent_alias_session_id(request, body)
+        if not context["repository"]:
+            context["repository"] = _extract_passthrough_repository(request, body)
+        if not context["trace_id"]:
+            context["trace_id"] = (
+                _get_request_header_or_passthrough_alias(request, "langfuse_trace_id")
+                or _get_request_header_or_passthrough_alias(request, "trace_id")
+            )
+    return {key: value for key, value in context.items() if value is not None}
+
+
 def _is_codex_auto_agent_malformed_tool_call_text_output(
     response_body: dict[str, Any],
 ) -> bool:
@@ -14696,14 +14764,28 @@ async def _validate_alias_candidate_responses_stream_if_needed(
     adapter_model: str,
     adapter: str,
     adapter_label: str,
+    request: Optional[Request] = None,
+    request_body: Optional[dict[str, Any]] = None,
+    upstream_url: Optional[str] = None,
+    provider: Optional[str] = None,
+    model_alias: Optional[str] = None,
 ) -> Response:
     if not enabled or not isinstance(response, StreamingResponse):
         return response
+    intake_context = _build_malformed_tool_call_intake_context(
+        request,
+        request_body,
+        adapter=adapter,
+        upstream_url=upstream_url,
+        provider=provider,
+        model_alias=model_alias,
+    )
     return await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=adapter_model,
         adapter=adapter,
         adapter_label=adapter_label,
+        intake_context=intake_context,
     )
 
 
@@ -14893,8 +14975,20 @@ def _raise_codex_auto_agent_malformed_tool_call_text_payload(
     adapter_model: str,
     adapter: str,
     adapter_label: str,
+    intake_context: Optional[dict[str, Any]] = None,
     stream_event_summaries: Optional[list[dict[str, Any]]] = None,
 ) -> None:
+    try:
+        persist_malformed_tool_call_detection(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            adapter=adapter,
+            adapter_label=adapter_label,
+            intake_context=intake_context,
+            stream_event_summaries=stream_event_summaries,
+        )
+    except Exception:
+        pass
     diagnostic = _build_failed_responses_diagnostic(
         response_body=response_body,
         adapter=adapter,
@@ -15004,6 +15098,7 @@ async def _validate_codex_auto_agent_responses_payload(
     adapter_model: str,
     adapter: str,
     adapter_label: str,
+    intake_context: Optional[dict[str, Any]] = None,
 ) -> Response:
     if isinstance(response, StreamingResponse):
         buffered_chunks: list[Any] = []
@@ -15038,6 +15133,7 @@ async def _validate_codex_auto_agent_responses_payload(
                 adapter_model=adapter_model,
                 adapter=adapter,
                 adapter_label=adapter_label,
+                intake_context=intake_context,
                 stream_event_summaries=event_summaries,
             )
 
@@ -15073,6 +15169,7 @@ async def _validate_codex_auto_agent_responses_payload(
                 adapter_model=adapter_model,
                 adapter=adapter,
                 adapter_label=adapter_label,
+                intake_context=intake_context,
             )
     return response
 
@@ -16248,6 +16345,10 @@ async def _handle_anthropic_openai_responses_adapter_route(
             adapter_model=adapter_model,
             adapter="anthropic_openai_responses_adapter",
             adapter_label="OpenAI",
+            request=request,
+            request_body=translated_request_body,
+            upstream_url=str(target_url),
+            provider="openai",
         )
         if not client_requested_stream:
             response_body = await _collect_responses_response_from_stream(
@@ -16425,6 +16526,10 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
             adapter_model=adapter_model,
             adapter="anthropic_xai_oauth_responses_adapter",
             adapter_label="xAI OAuth",
+            request=request,
+            request_body=translated_request_body,
+            upstream_url=str(target_url),
+            provider="xai",
         )
         if not client_requested_stream:
             response_body = await _collect_responses_response_from_stream(
@@ -16604,6 +16709,10 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
             adapter_model=adapter_model,
             adapter="anthropic_grok_native_responses_adapter",
             adapter_label="Grok native",
+            request=request,
+            request_body=translated_request_body,
+            upstream_url=str(target_url),
+            provider="grok",
         )
         if not client_requested_stream:
             response_body = await _collect_responses_response_from_stream(
@@ -17125,6 +17234,10 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
             adapter_model=adapter_model,
             adapter="anthropic_openrouter_responses_adapter",
             adapter_label="OpenRouter",
+            request=request,
+            request_body=translated_request_body,
+            upstream_url=str(target_url),
+            provider="openrouter",
         )
         if not client_requested_stream:
             response_event_summaries: list[dict[str, Any]] = []
@@ -26317,6 +26430,13 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         adapter_model=str(grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_grok_native_responses",
         adapter_label="Grok native",
+        intake_context=_build_malformed_tool_call_intake_context(
+            request,
+            request_body,
+            adapter="codex_auto_agent_grok_native_responses",
+            upstream_url=str(updated_url),
+            provider="grok",
+        ),
     )
 
 
@@ -26377,6 +26497,13 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         adapter_model=str(oa_xai_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_xai_oauth_responses",
         adapter_label="xAI OAuth",
+        intake_context=_build_malformed_tool_call_intake_context(
+            request,
+            request_body,
+            adapter="codex_auto_agent_xai_oauth_responses",
+            upstream_url=str(updated_url),
+            provider="xai",
+        ),
     )
 
 
@@ -26384,6 +26511,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
     response: StreamingResponse,
     *,
     adapter_model: str,
+    intake_context: Optional[dict[str, Any]] = None,
 ) -> StreamingResponse:
     buffered_chunks: list[Any] = []
     event_summaries: list[dict[str, Any]] = []
@@ -26432,6 +26560,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
             adapter_model=adapter_model,
             adapter="codex_auto_agent_openrouter_responses",
             adapter_label="OpenRouter",
+            intake_context=intake_context,
             stream_event_summaries=event_summaries,
         )
     if _is_failed_responses_body(response_body):
@@ -26525,6 +26654,13 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
         return await _validate_codex_auto_agent_openrouter_responses_stream(
             response,
             adapter_model=adapter_model,
+            intake_context=_build_malformed_tool_call_intake_context(
+                request,
+                request_body,
+                adapter="codex_auto_agent_openrouter_responses",
+                upstream_url=str(target_url),
+                provider="openrouter",
+            ),
         )
     if isinstance(response, Response) and not isinstance(response, StreamingResponse):
         try:
@@ -26548,6 +26684,13 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
                 adapter_model=adapter_model,
                 adapter="codex_auto_agent_openrouter_responses",
                 adapter_label="OpenRouter",
+                intake_context=_build_malformed_tool_call_intake_context(
+                    request,
+                    request_body,
+                    adapter="codex_auto_agent_openrouter_responses",
+                    upstream_url=str(target_url),
+                    provider="openrouter",
+                ),
             )
         if isinstance(response_body, dict) and _is_failed_responses_body(response_body):
             _raise_codex_auto_agent_failed_responses_payload(
@@ -26916,6 +27059,13 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             adapter_model=adapter_model,
             adapter="codex_auto_agent_openrouter_completion_adapter",
             adapter_label="OpenRouter chat-completions",
+            intake_context=_build_malformed_tool_call_intake_context(
+                request,
+                request_body,
+                adapter="codex_auto_agent_openrouter_completion_adapter",
+                upstream_url=target_url,
+                provider="openrouter",
+            ),
         )
     if _is_codex_auto_agent_empty_success_responses_body(response_body):
         _raise_codex_auto_agent_empty_success_response(

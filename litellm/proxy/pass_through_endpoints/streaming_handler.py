@@ -1,5 +1,6 @@
 import asyncio
 import codecs
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -15,7 +16,11 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
-from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_turn
+from litellm.proxy.aawm_route_logging import (
+    emit_aawm_route_status_event,
+    record_aawm_route_rollup,
+    record_aawm_route_rollup_turn,
+)
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
     sanitize_google_code_assist_quota_for_logging,
@@ -738,14 +743,20 @@ class PassThroughStreamingHandler:
                     str(e),
                     extra=exception_context,
                 )
-                end_time = datetime.now()
-                local_raw_bytes = raw_bytes if "raw_bytes" in locals() else []
-                local_line_accumulator = (
-                    line_accumulator if "line_accumulator" in locals() else None
+                failure_context = (
+                    PassThroughStreamingHandler._build_streaming_failure_context(
+                        exc=e,
+                        chunk_count=local_chunk_count,
+                        total_stream_bytes=local_total_stream_bytes,
+                        first_chunk_at=local_first_chunk_at,
+                        first_emitted_at=local_first_emitted_at,
+                    )
                 )
-                precomputed_lines: Optional[List[str]] = None
-                if local_line_accumulator is not None:
-                    precomputed_lines = local_line_accumulator.finish()
+                if isinstance(error_log_context, dict):
+                    failure_context = {
+                        **error_log_context,
+                        **failure_context,
+                    }
                 if isinstance(success_handler_kwargs, dict):
                     metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
                         success_handler_kwargs
@@ -753,34 +764,28 @@ class PassThroughStreamingHandler:
                     metadata["aawm_stream_chunk_count"] = local_chunk_count
                     metadata["aawm_stream_total_bytes"] = local_total_stream_bytes
                     metadata["aawm_stream_interrupted"] = True
-                    metadata.update(
-                        PassThroughStreamingHandler._build_streaming_failure_context(
-                            exc=e,
-                            chunk_count=local_chunk_count,
-                            total_stream_bytes=local_total_stream_bytes,
-                            first_chunk_at=local_first_chunk_at,
-                            first_emitted_at=local_first_emitted_at,
-                        )
-                    )
-                asyncio.create_task(
-                    PassThroughStreamingHandler._route_streaming_logging_to_handler(
-                        litellm_logging_obj=litellm_logging_obj,
-                        passthrough_success_handler_obj=passthrough_success_handler_obj,
-                        response=response,
-                        url_route=url_route,
-                        request_body=request_body or {},
-                        endpoint_type=endpoint_type,
-                        start_time=start_time,
-                        raw_bytes=local_raw_bytes,
-                        precomputed_lines=precomputed_lines,
-                        end_time=end_time,
-                        passthrough_logging_payload=passthrough_logging_payload,
-                        custom_llm_provider=custom_llm_provider,
-                        success_handler_kwargs=success_handler_kwargs,
-                        local_prepare_ms=local_prepare_ms,
-                        error_log_context=error_log_context,
-                    )
+                    metadata["aawm_stream_terminal_emitted"] = True
+                    metadata["aawm_route_rollup_turn_suppressed"] = True
+                    metadata.update(failure_context)
+                PassThroughStreamingHandler._record_post_first_byte_stream_terminal_rollup(
+                    success_handler_kwargs=success_handler_kwargs,
+                    failure_context=failure_context,
+                    exc=e,
                 )
+                # The stream has already emitted bytes to the client, so this
+                # cannot be retried or completed truthfully. Error intake and
+                # route rollup above carry the terminal failure; do not send
+                # partial chunks through the normal success callback pipeline.
+                for terminal_chunk in (
+                    PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                        endpoint_type=endpoint_type,
+                        url_route=url_route,
+                        custom_llm_provider=custom_llm_provider,
+                        failure_context=failure_context,
+                        exc=e,
+                    )
+                ):
+                    yield terminal_chunk
                 return
             verbose_proxy_logger.exception(
                 "Error in chunk_processor: %s",
@@ -836,7 +841,142 @@ class PassThroughStreamingHandler:
         }
         if isinstance(exc, httpx.ReadTimeout):
             context["failure_kind"] = "streaming_upstream_read_timeout"
+            context["status_code"] = 504
+            context["recommended_operator_action"] = (
+                "Treat as terminal upstream stream timeout after bytes were already "
+                "emitted; do not hidden-retry this request. Inspect provider/model "
+                "health and stream progress counters before redispatching a new turn."
+            )
         return context
+
+    @staticmethod
+    def _build_post_first_byte_terminal_stream_chunks(
+        *,
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+        failure_context: Dict[str, Any],
+        exc: Exception,
+    ) -> List[bytes]:
+        message = (
+            "Streaming response interrupted after first byte due to upstream read "
+            f"timeout: {exc}"
+        )
+        error_payload = {
+            "type": "proxy_stream_terminal_error",
+            "code": failure_context.get("failure_kind")
+            or "streaming_upstream_read_failure",
+            "message": message,
+            "param": None,
+        }
+        terminal_metadata = {
+            "stream_failure_stage": failure_context.get("stream_failure_stage"),
+            "stream_chunks_seen": failure_context.get("stream_chunks_seen"),
+            "stream_bytes_seen": failure_context.get("stream_bytes_seen"),
+            "stream_hidden_retry_safe": failure_context.get("stream_hidden_retry_safe"),
+            "provider": custom_llm_provider or endpoint_type.value,
+            "model": failure_context.get("model"),
+            "model_alias": failure_context.get("model_alias"),
+            "route_family": failure_context.get("route_family"),
+        }
+
+        if endpoint_type == EndpointType.ANTHROPIC:
+            payload = {
+                "type": "error",
+                "error": {
+                    "type": error_payload["type"],
+                    "message": message,
+                },
+            }
+            return [
+                (
+                    "event: error\ndata: "
+                    + json.dumps(payload, separators=(",", ":"))
+                    + "\n\n"
+                ).encode("utf-8")
+            ]
+
+        if endpoint_type == EndpointType.OPENAI and (
+            OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+        ):
+            payload = {
+                "type": "response.failed",
+                "response": {
+                    "object": "response",
+                    "status": "failed",
+                    "error": error_payload,
+                    "metadata": terminal_metadata,
+                },
+            }
+            chunks = [
+                (
+                    "event: response.failed\ndata: "
+                    + json.dumps(payload, separators=(",", ":"))
+                    + "\n\n"
+                ).encode("utf-8")
+            ]
+            chunks.append(b"data: [DONE]\n\n")
+            return chunks
+
+        payload = {
+            "error": error_payload,
+            "aawm_stream_terminal": terminal_metadata,
+        }
+        return [
+            (
+                "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
+            ).encode("utf-8")
+        ]
+
+    @staticmethod
+    def _record_post_first_byte_stream_terminal_rollup(
+        *,
+        success_handler_kwargs: Optional[Dict[str, Any]],
+        failure_context: Dict[str, Any],
+        exc: Exception,
+    ) -> None:
+        if not isinstance(success_handler_kwargs, dict):
+            return
+        litellm_params = success_handler_kwargs.get("litellm_params")
+        metadata = (
+            litellm_params.get("metadata")
+            if isinstance(litellm_params, dict)
+            and isinstance(litellm_params.get("metadata"), dict)
+            else None
+        )
+        if not isinstance(metadata, dict):
+            return
+        context = metadata.get("aawm_route_rollup_context")
+        if not isinstance(context, dict):
+            return
+
+        model_label = (
+            failure_context.get("model_alias")
+            or failure_context.get("model")
+            or context.get("model_label")
+            or "unknown-model"
+        )
+        detail = (
+            f"stream_failure_stage={failure_context.get('stream_failure_stage')}; "
+            f"stream_chunks_seen={failure_context.get('stream_chunks_seen')}; "
+            f"stream_bytes_seen={failure_context.get('stream_bytes_seen')}; "
+            f"failure_kind={failure_context.get('failure_kind')}; "
+            f"message={exc}"
+        )
+        emit_aawm_route_status_event(
+            alias_model=failure_context.get("model_alias") or model_label,
+            model_label=str(model_label),
+            status="Failed",
+            message=detail,
+        )
+        record_aawm_route_rollup(
+            group_header_label=str(context.get("group_header_label") or ""),
+            incoming_endpoint=str(context.get("incoming_endpoint") or ""),
+            outgoing_target=str(context.get("outgoing_target") or ""),
+            model_label=str(model_label),
+            turns=0,
+            status="Failed",
+        )
 
     @staticmethod
     def _set_streaming_handler_branch(
@@ -1166,7 +1306,12 @@ class PassThroughStreamingHandler:
                 litellm_logging_obj,
                 kwargs,
             )
-            record_aawm_route_rollup_turn(kwargs)
+            metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
+            if not (
+                metadata.get("aawm_stream_interrupted")
+                or metadata.get("aawm_route_rollup_turn_suppressed")
+            ):
+                record_aawm_route_rollup_turn(kwargs)
             handler_branch = (
                 await PassThroughStreamingHandler._dispatch_streaming_success_callbacks(
                     litellm_logging_obj=litellm_logging_obj,
