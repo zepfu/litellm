@@ -21607,7 +21607,8 @@ async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redi
     assert exc_info.value.detail["selected_route_family"] == (
         "anthropic_grok_native_responses_adapter"
     )
-    assert exc_info.value.detail["failure_class"] == "provider_format_rejected"
+    assert exc_info.value.detail["failure_class"] == "malformed_tool_call_text"
+    assert exc_info.value.detail["cooldown_scope"] == "candidate"
     assert "aawm_auto_agent_malformed_tool_call_text" in exc_info.value.detail[
         "error_tokens"
     ]
@@ -21618,7 +21619,8 @@ async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redi
     assert attempts[0]["provider"] == "xai"
     assert attempts[0]["model"] == "grok-composer-2.5-fast"
     assert attempts[0]["status"] == "terminal_in_flight_cooldown_set"
-    assert attempts[0]["error_class"] == "provider_format_rejected"
+    assert attempts[0]["error_class"] == "malformed_tool_call_text"
+    assert attempts[0]["cooldown_scope"] == "candidate"
     assert "aawm_auto_agent_malformed_tool_call_text" in attempts[0]["error_tokens"]
     audit_events = metadata["aawm_alias_routing_audit_events"]
     redispatch_event = next(
@@ -21626,9 +21628,14 @@ async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redi
     )
     assert redispatch_event["provider"] == "xai"
     assert redispatch_event["model"] == "grok-composer-2.5-fast"
-    assert redispatch_event["failure_class"] == "provider_format_rejected"
+    assert redispatch_event["failure_class"] == "malformed_tool_call_text"
     assert redispatch_event["redispatch_required"] is True
     assert _alias_route_log_payloads(mock_warning) == []
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:grok-composer-2.5-fast:xai_grok_native"
+    )
+    assert durable_seconds > 0.0
+    assert durable_source in {"durable_cache", "memory"}
     mock_composer.assert_awaited_once()
     mock_spark.assert_not_called()
     mock_xai_oauth.assert_not_called()
@@ -24063,8 +24070,9 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_malformed_tool_call_te
         }
     }
 
-    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
-        "provider_format_rejected"
+    assert (
+        _classify_codex_auto_agent_retryable_exhaustion(exc)
+        == "malformed_tool_call_text"
     )
     assert "aawm_auto_agent_malformed_tool_call_text" in _extract_codex_auto_agent_error_tokens(
         exc
@@ -24079,6 +24087,14 @@ def test_codex_auto_agent_cooldown_scope_promotes_reusable_failures_to_candidate
     assert (
         _get_codex_auto_agent_cooldown_scope("candidate_unavailable")
         == "candidate"
+    )
+    assert (
+        _get_codex_auto_agent_cooldown_scope("malformed_tool_call_text")
+        == "candidate"
+    )
+    assert (
+        _get_codex_auto_agent_cooldown_scope("provider_format_rejected")
+        == "request_local"
     )
 
 
@@ -24141,6 +24157,42 @@ async def test_candidate_unavailable_writes_durable_cooldown():
             selected_cooldown_key=cooldown_key,
             cooldown_seconds=30.0,
             error_class="candidate_unavailable",
+        )
+        _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+        durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+
+    assert scope == "candidate"
+    assert len(dual_cache.set_calls) == 1
+    assert dual_cache.set_calls[0]["key"].endswith(cooldown_key)
+    assert durable_seconds > 0.0
+    assert durable_source == "durable_cache"
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_call_text_writes_durable_cooldown():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_codex_auto_agent_request()
+    candidate = {
+        "provider": "xai",
+        "model": "grok-composer-2.5-fast",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+    }
+    cooldown_key = "xai:grok-composer-2.5-fast:xai_grok_native"
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        scope = await _apply_codex_auto_agent_alias_cooldown(
+            request=request,
+            candidate=candidate,
+            lane_key="xai_grok_native",
+            selected_cooldown_key=cooldown_key,
+            cooldown_seconds=30.0,
+            error_class="malformed_tool_call_text",
         )
         _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
         durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
@@ -26543,7 +26595,8 @@ async def test_codex_auto_agent_alias_openrouter_malformed_composer_call_rolls_o
     attempts = mini_body["litellm_metadata"]["codex_auto_agent_attempts"]
     assert attempts[0]["provider"] == "openrouter"
     assert attempts[0]["status"] == "cooldown_set"
-    assert attempts[0]["error_class"] == "provider_format_rejected"
+    assert attempts[0]["error_class"] == "malformed_tool_call_text"
+    assert attempts[0]["cooldown_scope"] == "candidate"
     assert "aawm_auto_agent_malformed_tool_call_text" in attempts[0]["error_tokens"]
     assert mini_body["litellm_metadata"]["codex_auto_agent_selected_model"] == (
         "gpt-5.4-mini"
