@@ -96,6 +96,34 @@ fingerprint rather than an active `*-error.jsonl` intake record.
 `AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS` controls the degraded enqueue
 spooling window and defaults to 30 seconds.
 
+### Flush retry telemetry semantics
+
+Operators should treat session-history persistence logs as a small state machine,
+not as implicit data-loss signals.
+
+- **Transient retry (in budget):** Retryable failures such as asyncpg
+  `TimeoutError`, connection drops, or pool acquire timeouts emit **WARNING**
+  (not ERROR) with `degraded_telemetry=true`, `at_risk_of_loss=false`, and
+  `retry_count` / `retry_budget_remaining` when the outer retry loop is active.
+  Records are not considered lost while retries continue or a retry write-ahead
+  spool exists.
+- **Write-ahead protection:** Before an inline retry, LiteLLM may create a
+  temporary retry write-ahead spool file. Logs include
+  `retry_write_ahead_spooled=true` and `retry_write_ahead_spool_path_present=true`
+  when that artifact exists. While protected, exhaustion logs state that the
+  batch remains on disk for replay (`spooled=true`, `at_risk_of_loss=false`).
+- **Recovery:** Successful flush after retry logs `flush_recovered=true` with
+  `degraded_telemetry=false`, `spooled=false`, and optional
+  `retry_spool_removed=true` when the write-ahead file is deleted.
+- **Durable spool replay:** After retry budget exhaustion, batches move to the
+  durable JSONL spool directory for the in-process drainer (`spool_replay_*`
+  telemetry). That is replay protection, not loss.
+- **True at-risk / error cases:** ERROR or `exception` logs with
+  `at_risk_of_loss=true` indicate spool creation failed, deferred flush from a
+  running loop could not spool, or retry exhaustion could not write any
+  protection artifact. Non-retryable flush failures still use `exception` on
+  the first failure in a window.
+
 If the synchronous flush helper is invoked from an already running event loop,
 LiteLLM does not attempt to nest `run_until_complete`. It durably spools the
 batch for replay, emits degraded telemetry with `spooled=true`, and leaves the
