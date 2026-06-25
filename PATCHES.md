@@ -53,6 +53,29 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.105 — Route-rollup completion guard for streamed AAWM auto-agent turns
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.105`.
+OpenCode/OpenRouter streaming Codex auto-agent responses now record completed
+AAWM route-rollup turns only after the normal stream completion path. Failed or
+interrupted iterators no longer emit completed rollup turns. Docs and tests were
+updated to cover the streaming completion invariant and interrupted iterator
+behavior.
+
+**Why:** During a completed stream, route-rollup instrumentation in AAWM could
+miss turns because the streaming response returned before the completed-turn
+rollup was recorded. D1-393 now defers completion writes for AAWM alias rollups
+until normal stream completion, so
+route rollup visibility stays aligned with actual turn outcomes.
+
+**Why not upstream:** This is specific to AAWM auto-agent and
+Codex OpenCode/OpenRouter routing telemetry semantics for route-rollup
+completion in the face of streaming and interrupted iterator exits.
+
+**Validation status:** Focused docs/tests were updated and updated behavior was
+validated in the dev environment before production promotion, including the
+completed-stream success path and the interrupted/failed iterator path.
+
 ### aawm.104 — OpenRouter free-tier suppression for AAWM-low aliases with bounded rate-limit cache
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.104`. `aawm-low`
