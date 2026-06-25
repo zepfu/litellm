@@ -20233,30 +20233,36 @@ def _stringify_grok_native_input_item_value(value: Any) -> str:
 
 
 def _format_grok_native_function_call_input_message(item: dict[str, Any]) -> str:
-    parts = ["Previous tool call"]
+    """Neutral prior-tool summary for Grok input (not executable tool-call shape)."""
+    lines = [
+        "[Context note - prior assistant step; not an executable tool invocation]",
+    ]
     name = item.get("name")
     if isinstance(name, str) and name.strip():
-        parts.append(f"Name: {name.strip()}")
+        lines.append(f"Tool label: {name.strip()}")
     call_id = item.get("call_id")
     if isinstance(call_id, str) and call_id.strip():
-        parts.append(f"Call ID: {call_id.strip()}")
+        lines.append(f"Correlation ref: {call_id.strip()}")
     arguments = _stringify_grok_native_input_item_value(item.get("arguments")).strip()
     if arguments:
-        parts.append(f"Arguments: {arguments}")
-    return "\n".join(parts)
+        lines.append(f"Input payload: {arguments}")
+    return "\n".join(lines)
 
 
 def _format_grok_native_function_call_output_input_message(
     item: dict[str, Any],
 ) -> str:
-    parts = ["Previous tool result"]
+    """Neutral prior outcome summary for Grok input (not executable tool-call shape)."""
+    lines = [
+        "[Context note - prior tool outcome; not an executable tool invocation]",
+    ]
     call_id = item.get("call_id")
     if isinstance(call_id, str) and call_id.strip():
-        parts.append(f"Call ID: {call_id.strip()}")
+        lines.append(f"Correlation ref: {call_id.strip()}")
     output = _stringify_grok_native_input_item_value(item.get("output")).strip()
     if output:
-        parts.append(f"Output: {output}")
-    return "\n".join(parts)
+        lines.append(f"Outcome text: {output}")
+    return "\n".join(lines)
 
 
 def _rewrite_grok_native_input_item_for_model_input(
