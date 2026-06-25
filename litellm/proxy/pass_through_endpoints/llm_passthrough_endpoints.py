@@ -12250,14 +12250,19 @@ def _build_responses_response_from_adapter_response(response_obj: Any) -> Respon
     )
 
 
-async def _responses_sse_from_iterator(responses_iterator: Any) -> Any:
+async def _responses_sse_from_iterator(
+    responses_iterator: Any,
+    on_complete: Optional[Callable[[], None]] = None,
+) -> Any:
     async for event in responses_iterator:
         event_type = getattr(event, "type", None)
         serialized = _serialize_responses_adapter_response(event)
         if isinstance(event_type, str) and event_type:
             yield f"event: {event_type}\ndata: {serialized}\n\n"
-        else:
-            yield f"data: {serialized}\n\n"
+            continue
+        yield f"data: {serialized}\n\n"
+    if on_complete is not None:
+        on_complete()
     yield "data: [DONE]\n\n"
 
 
@@ -26597,7 +26602,11 @@ async def _handle_codex_opencode_zen_adapter_route(
                     responses_api_request=responses_api_request,
                     custom_llm_provider=litellm.LlmProviders.OPENAI.value,
                     litellm_metadata=litellm_metadata,
-                )
+                ),
+                on_complete=lambda: _record_adapted_completed_route_rollup_turn(
+                    rollup_kwargs,
+                    adapter_label="OpenCode Zen",
+                ),
             ),
             media_type="text/event-stream",
         )
@@ -26771,7 +26780,11 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
                     responses_api_request=responses_api_request,
                     custom_llm_provider=litellm.LlmProviders.OPENROUTER.value,
                     litellm_metadata=litellm_metadata,
-                )
+                ),
+                on_complete=lambda: _record_adapted_completed_route_rollup_turn(
+                    rollup_kwargs,
+                    adapter_label="OpenRouter chat-completions",
+                ),
             ),
             media_type="text/event-stream",
         )

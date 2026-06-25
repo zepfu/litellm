@@ -551,10 +551,10 @@ Those events also contribute zero-turn rollup sublines so multiple failed
 candidates remain visible in the same bucket. Rollups flush on the configured
 interval and at process shutdown via a shutdown-safe flush helper.
 
-Successful Codex auto-agent requests adapted to OpenCode Zen chat completions or
-OpenRouter chat completions also register native access-log replacement and
-completed-turn rollups. Their rollup sublines use the real outbound endpoint
-(`opencode.ai/zen/v1/chat/completions` or
+Successful streaming and non-streaming Codex auto-agent requests adapted to
+OpenCode Zen chat completions or OpenRouter chat completions also register
+native access-log replacement and completed-turn rollups. Their rollup sublines
+use the real outbound endpoint (`opencode.ai/zen/v1/chat/completions` or
 `openrouter.ai/api/v1/chat/completions`) rather than the internal adapter route
 family, so operators can distinguish provider traffic without also seeing raw
 `adapted_to=...` Uvicorn access records for successful requests.
