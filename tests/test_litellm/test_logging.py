@@ -22,6 +22,7 @@ from litellm._logging import (
     _initialize_loggers_with_handler,
     _turn_on_json,
     clear_langfuse_enqueue_size_audits,
+    clear_langfuse_support_string_coalesce_state,
     record_langfuse_enqueue_size_audit,
     verbose_logger,
     verbose_proxy_logger,
@@ -361,6 +362,130 @@ def test_aawm_error_log_includes_langfuse_support_string_context(tmp_path, monke
     assert error_record["context"]["langfuse_generation_id"] == "generation-near"
     assert error_record["context"]["langfuse_total_size_bytes"] == 950_000
 
+
+
+def test_aawm_error_log_coalesces_duplicate_langfuse_support_string_rows(
+    tmp_path, monkeypatch
+):
+    clear_langfuse_enqueue_size_audits()
+    clear_langfuse_support_string_coalesce_state()
+    record_langfuse_enqueue_size_audit(
+        {
+            "trace_id": "trace-coalesce",
+            "generation_id": "generation-coalesce",
+            "generation_name": "aawm.coalesce",
+            "model": "gpt-test",
+            "call_type": "completion",
+            "total_size_bytes": 950_000,
+            "max_event_size_bytes": 1_000_000,
+            "warning_threshold_bytes": 900_000,
+            "event_fit_failed": False,
+        }
+    )
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "LITELLM_AAWM_ERROR_LOG_LANGFUSE_SUPPORT_STRING_COALESCE_TTL_SECONDS",
+        "300",
+    )
+
+    from litellm._logging import AawmErrorLogFileHandler
+
+    handler = AawmErrorLogFileHandler()
+    record = logging.LogRecord(
+        name="langfuse",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg=_LANGFUSE_SUPPORT_STRING,
+        args=(),
+        exc_info=None,
+    )
+    handler.emit(record)
+    handler.emit(record)
+
+    error_log_path = tmp_path / "dev-error.jsonl"
+    lines = [line for line in error_log_path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1
+    error_record = json.loads(lines[0])
+    assert error_record["context"]["trace_id"] == "trace-coalesce"
+    assert error_record["context"]["langfuse_generation_id"] == "generation-coalesce"
+
+
+def test_aawm_error_log_still_appends_non_langfuse_errors(tmp_path, monkeypatch):
+    clear_langfuse_support_string_coalesce_state()
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    from litellm._logging import AawmErrorLogFileHandler
+
+    handler = AawmErrorLogFileHandler()
+    record = logging.LogRecord(
+        name="LiteLLM",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg="provider exploded",
+        args=(),
+        exc_info=None,
+    )
+    handler.emit(record)
+    handler.emit(record)
+
+    error_log_path = tmp_path / "dev-error.jsonl"
+    lines = [line for line in error_log_path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 2
+
+
+def test_aawm_error_log_reopens_langfuse_support_string_after_ttl(
+    tmp_path, monkeypatch
+):
+    clear_langfuse_enqueue_size_audits()
+    clear_langfuse_support_string_coalesce_state()
+    record_langfuse_enqueue_size_audit(
+        {
+            "trace_id": "trace-ttl",
+            "generation_id": "generation-ttl",
+            "generation_name": "aawm.ttl",
+            "model": "gpt-test",
+            "call_type": "completion",
+            "total_size_bytes": 950_000,
+            "max_event_size_bytes": 1_000_000,
+            "warning_threshold_bytes": 900_000,
+            "event_fit_failed": False,
+        }
+    )
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "LITELLM_AAWM_ERROR_LOG_LANGFUSE_SUPPORT_STRING_COALESCE_TTL_SECONDS",
+        "1",
+    )
+
+    from litellm._logging import AawmErrorLogFileHandler
+
+    handler = AawmErrorLogFileHandler()
+    record = logging.LogRecord(
+        name="langfuse",
+        level=logging.ERROR,
+        pathname="",
+        lineno=0,
+        msg=_LANGFUSE_SUPPORT_STRING,
+        args=(),
+        exc_info=None,
+    )
+    handler.emit(record)
+    import time
+
+    time.sleep(1.1)
+    handler.emit(record)
+
+    error_log_path = tmp_path / "dev-error.jsonl"
+    lines = [line for line in error_log_path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 2
 def test_json_formatter_parses_embedded_python_dict_repr():
     """
     Test that JsonFormatter parses Python dict repr (str/deployment) embedded in

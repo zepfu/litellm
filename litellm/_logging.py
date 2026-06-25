@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from logging import Formatter
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
@@ -103,6 +104,79 @@ _secret_filter = SecretRedactionFilter()
 
 _AAWM_ERROR_LOG_HANDLER_NAME = "aawm_error_log_file_handler"
 _AAWM_ERROR_LOG_LOCK = threading.Lock()
+
+
+_LANGFUSE_SUPPORT_STRING_COALESCE_DEFAULT_TTL_SECONDS = 300
+_LANGFUSE_SUPPORT_STRING_COALESCE_LOCK = threading.Lock()
+_langfuse_support_string_coalesce_state: Dict[str, float] = {}
+
+
+def _get_langfuse_support_string_coalesce_ttl_seconds() -> int:
+    configured = _parse_aawm_error_log_non_negative_int_env(
+        "LITELLM_AAWM_ERROR_LOG_LANGFUSE_SUPPORT_STRING_COALESCE_TTL_SECONDS"
+    )
+    if configured is None:
+        return _LANGFUSE_SUPPORT_STRING_COALESCE_DEFAULT_TTL_SECONDS
+    return configured
+
+
+def clear_langfuse_support_string_coalesce_state() -> None:
+    with _LANGFUSE_SUPPORT_STRING_COALESCE_LOCK:
+        _langfuse_support_string_coalesce_state.clear()
+
+
+def _prune_langfuse_support_string_coalesce_state(*, now: float, ttl_seconds: int) -> None:
+    expired_keys = [
+        key
+        for key, first_seen_at in _langfuse_support_string_coalesce_state.items()
+        if (now - first_seen_at) >= ttl_seconds
+    ]
+    for key in expired_keys:
+        _langfuse_support_string_coalesce_state.pop(key, None)
+
+
+def _build_langfuse_support_string_coalesce_key(payload: Dict[str, Any]) -> Optional[str]:
+    context = payload.get("context")
+    if not isinstance(context, dict) or not context.get("langfuse_support_string"):
+        return None
+
+    key_source = {
+        "fingerprint": payload.get("fingerprint"),
+        "trace_id": context.get("trace_id"),
+        "langfuse_generation_id": context.get("langfuse_generation_id"),
+        "langfuse_generation_name": context.get("langfuse_generation_name"),
+        "langfuse_call_type": context.get("langfuse_call_type"),
+        "langfuse_payload_size_state": context.get("langfuse_payload_size_state"),
+        "langfuse_failure_class": context.get("langfuse_failure_class"),
+        "langfuse_event_fit_failed": context.get("langfuse_event_fit_failed"),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            key_source,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _should_suppress_langfuse_support_string_coalesce(payload: Dict[str, Any]) -> bool:
+    coalesce_key = _build_langfuse_support_string_coalesce_key(payload)
+    if coalesce_key is None:
+        return False
+
+    ttl_seconds = _get_langfuse_support_string_coalesce_ttl_seconds()
+    now = time.time()
+    with _LANGFUSE_SUPPORT_STRING_COALESCE_LOCK:
+        _prune_langfuse_support_string_coalesce_state(
+            now=now,
+            ttl_seconds=ttl_seconds,
+        )
+        first_seen_at = _langfuse_support_string_coalesce_state.get(coalesce_key)
+        if first_seen_at is not None and (now - first_seen_at) < ttl_seconds:
+            return True
+        _langfuse_support_string_coalesce_state[coalesce_key] = now
+        return False
 
 
 def _env_truthy(value: Optional[str]) -> bool:
@@ -386,6 +460,8 @@ class AawmErrorLogFileHandler(logging.Handler):
         try:
             _apply_langfuse_support_string_diagnostics(record)
             payload = _build_aawm_error_log_record(record, formatter=self._formatter)
+            if _should_suppress_langfuse_support_string_coalesce(payload):
+                return
             with _AAWM_ERROR_LOG_LOCK:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 with open(log_path, "a", encoding="utf-8") as error_log:
