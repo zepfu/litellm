@@ -21525,6 +21525,117 @@ async def test_anthropic_auto_agent_alias_in_flight_bare_502_redispatches_withou
 
 
 @pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redispatches_without_fallback(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "xai",
+        "model": "grok-composer-2.5-fast",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    malformed_error = ProxyException(
+        message=(
+            "Codex auto-agent Grok native candidate returned a malformed "
+            "Responses marker payload."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    malformed_error.detail = {
+        "error": {
+            "message": malformed_error.message,
+            "code": "aawm_auto_agent_malformed_tool_call_text",
+            "status": "RESPONSES_MALFORMED_TOOL_CALL",
+            "type": "rate_limit_error",
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=malformed_error),
+    ) as mock_composer, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
+        new=AsyncMock(),
+    ) as mock_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_redispatch_required"
+    )
+    assert exc_info.value.detail["redispatch_required"] is True
+    assert exc_info.value.detail["redispatch_model"] == "aawm-code-anthropic"
+    assert exc_info.value.detail["selected_provider"] == "xai"
+    assert exc_info.value.detail["selected_model"] == "grok-composer-2.5-fast"
+    assert exc_info.value.detail["selected_route_family"] == (
+        "anthropic_grok_native_responses_adapter"
+    )
+    assert exc_info.value.detail["failure_class"] == "provider_format_rejected"
+    assert "aawm_auto_agent_malformed_tool_call_text" in exc_info.value.detail[
+        "error_tokens"
+    ]
+    parsed_body = request.scope["parsed_body"][1]
+    metadata = parsed_body["litellm_metadata"]
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["provider"] == "xai"
+    assert attempts[0]["model"] == "grok-composer-2.5-fast"
+    assert attempts[0]["status"] == "terminal_in_flight_cooldown_set"
+    assert attempts[0]["error_class"] == "provider_format_rejected"
+    assert "aawm_auto_agent_malformed_tool_call_text" in attempts[0]["error_tokens"]
+    audit_events = metadata["aawm_alias_routing_audit_events"]
+    redispatch_event = next(
+        event for event in audit_events if event["event_type"] == "redispatch_required"
+    )
+    assert redispatch_event["provider"] == "xai"
+    assert redispatch_event["model"] == "grok-composer-2.5-fast"
+    assert redispatch_event["failure_class"] == "provider_format_rejected"
+    assert redispatch_event["redispatch_required"] is True
+    assert _alias_route_log_payloads(mock_warning) == []
+    mock_composer.assert_awaited_once()
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+    mock_native.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_in_flight_redispatch_uses_requested_alias(
     monkeypatch,
 ):
@@ -22425,6 +22536,102 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     assert "route:anthropic_grok_native_responses_adapter" in metadata["tags"]
     assert "route:grok_cli_chat_proxy" in metadata["tags"]
     assert "anthropic-grok-native-responses-adapter" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_build_anthropic_response_from_responses_response_rejects_malformed_composer_call_payload():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _build_anthropic_response_from_responses_response,
+    )
+
+    malformed_payload = {
+        "id": "resp_malformed_grok",
+        "status": "completed",
+        "model": "grok-composer-2.5-fast",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "composer_call"}],
+            }
+        ],
+    }
+
+    with pytest.raises(ProxyException) as exc_info:
+        _build_anthropic_response_from_responses_response(
+            malformed_payload,
+            failed_response_adapter_model="grok-composer-2.5-fast",
+            failed_response_adapter="anthropic_grok_native_responses_adapter",
+            failed_response_adapter_label="Grok native",
+        )
+
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_auto_agent_malformed_tool_call_text"
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_grok_native_oauth_responses_adapter_rejects_malformed_composer_call_upstream_payload(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv(
+        "GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL",
+        "http://localhost:4001/grok/v1",
+    )
+    monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    request = _build_anthropic_auto_agent_request()
+    body = {
+        "model": "aawm-code-anthropic",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 64,
+        "stream": False,
+        "litellm_metadata": {"session_id": "claude-grok-session"},
+    }
+    upstream_response = Response(
+        content=json.dumps(
+            {
+                "id": "resp_upstream_malformed",
+                "status": "completed",
+                "model": "grok-composer-2.5-fast",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "composer_call",
+                        "call_id": "call-abc-composer_call_qz904",
+                        "arguments": "{}",
+                    }
+                ],
+            }
+        ),
+        media_type="application/json",
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_anthropic_grok_native_oauth_responses_adapter_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="grok-composer-2.5-fast",
+            )
+
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_auto_agent_malformed_tool_call_text"
+    )
+    log_path = tmp_path / "malformed-error.jsonl"
+    assert log_path.exists()
+    record = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[0])
+    assert record["malformed_tool_call_text"] == "composer_call"
+    assert record["route_family"] == "anthropic_grok_native_responses_adapter"
 
 
 @pytest.mark.asyncio
