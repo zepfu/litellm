@@ -14190,6 +14190,7 @@ def _build_anthropic_response_from_responses_response(
     failed_response_adapter_model: Optional[str] = None,
     failed_response_adapter: str = "anthropic_responses_adapter",
     failed_response_adapter_label: str = "Responses",
+    malformed_intake_context: Optional[dict[str, Any]] = None,
 ) -> Response:
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
         LiteLLMAnthropicToResponsesAPIAdapter,
@@ -14204,6 +14205,16 @@ def _build_anthropic_response_from_responses_response(
             adapter=failed_response_adapter,
             adapter_label=failed_response_adapter_label,
             retryable_alias_candidate=retryable_failed_response,
+        )
+
+    if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+        _raise_codex_auto_agent_malformed_tool_call_text_payload(
+            response_body=response_body,
+            adapter_model=failed_response_adapter_model
+            or str(response_body.get("model") or "unknown-model"),
+            adapter=failed_response_adapter,
+            adapter_label=failed_response_adapter_label,
+            intake_context=malformed_intake_context,
         )
 
     if reject_empty_success and _is_empty_success_responses_body(response_body):
@@ -14786,6 +14797,30 @@ async def _validate_alias_candidate_responses_stream_if_needed(
         adapter=adapter,
         adapter_label=adapter_label,
         intake_context=intake_context,
+    )
+
+
+def _build_malformed_intake_context_for_anthropic_responses_adapter(
+    *,
+    request: Optional[Request],
+    request_body: Optional[dict[str, Any]],
+    adapter: str,
+    adapter_model: str,
+    upstream_url: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> dict[str, Any]:
+    return _build_malformed_tool_call_intake_context(
+        request,
+        request_body,
+        adapter=adapter,
+        upstream_url=upstream_url,
+        provider=provider,
+        model_alias=(
+            request_body.get("model")
+            if isinstance(request_body, dict)
+            and isinstance(request_body.get("model"), str)
+            else None
+        ),
     )
 
 
@@ -16361,6 +16396,14 @@ async def _handle_anthropic_openai_responses_adapter_route(
                 failed_response_adapter_model=adapter_model,
                 failed_response_adapter="anthropic_openai_responses_adapter",
                 failed_response_adapter_label="OpenAI",
+                malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+                    request=request,
+                    request_body=translated_request_body,
+                    adapter="anthropic_openai_responses_adapter",
+                    adapter_model=adapter_model,
+                    upstream_url=str(target_url),
+                    provider="openai",
+                ),
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -16389,6 +16432,14 @@ async def _handle_anthropic_openai_responses_adapter_route(
         failed_response_adapter_model=adapter_model,
         failed_response_adapter="anthropic_openai_responses_adapter",
         failed_response_adapter_label="OpenAI",
+        malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+            request=request,
+            request_body=translated_request_body,
+            adapter="anthropic_openai_responses_adapter",
+            adapter_model=adapter_model,
+            upstream_url=str(target_url),
+            provider="openai",
+        ),
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
@@ -16541,6 +16592,14 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
                 failed_response_adapter_model=adapter_model,
                 failed_response_adapter="anthropic_xai_oauth_responses_adapter",
                 failed_response_adapter_label="xAI OAuth",
+                malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+                    request=request,
+                    request_body=translated_request_body,
+                    adapter="anthropic_xai_oauth_responses_adapter",
+                    adapter_model=adapter_model,
+                    upstream_url=str(target_url),
+                    provider="xai",
+                ),
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -16567,6 +16626,14 @@ async def _handle_anthropic_xai_oauth_responses_adapter_route(
         failed_response_adapter_model=adapter_model,
         failed_response_adapter="anthropic_xai_oauth_responses_adapter",
         failed_response_adapter_label="xAI OAuth",
+        malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+            request=request,
+            request_body=translated_request_body,
+            adapter="anthropic_xai_oauth_responses_adapter",
+            adapter_model=adapter_model,
+            upstream_url=str(target_url),
+            provider="xai",
+        ),
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
@@ -16724,6 +16791,14 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
                 failed_response_adapter_model=adapter_model,
                 failed_response_adapter="anthropic_grok_native_responses_adapter",
                 failed_response_adapter_label="Grok native",
+                malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+                    request=request,
+                    request_body=translated_request_body,
+                    adapter="anthropic_grok_native_responses_adapter",
+                    adapter_model=adapter_model,
+                    upstream_url=str(target_url),
+                    provider="grok",
+                ),
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -16750,6 +16825,14 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
         failed_response_adapter_model=adapter_model,
         failed_response_adapter="anthropic_grok_native_responses_adapter",
         failed_response_adapter_label="Grok native",
+        malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+            request=request,
+            request_body=translated_request_body,
+            adapter="anthropic_grok_native_responses_adapter",
+            adapter_model=adapter_model,
+            upstream_url=str(target_url),
+            provider="grok",
+        ),
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
@@ -17259,6 +17342,14 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
                 failed_response_adapter_model=adapter_model,
                 failed_response_adapter="anthropic_openrouter_responses_adapter",
                 failed_response_adapter_label="OpenRouter",
+                malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+                    request=request,
+                    request_body=translated_request_body,
+                    adapter="anthropic_openrouter_responses_adapter",
+                    adapter_model=adapter_model,
+                    upstream_url=str(target_url),
+                    provider="openrouter",
+                ),
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -17293,6 +17384,14 @@ async def _handle_anthropic_openrouter_responses_adapter_route(
         failed_response_adapter_model=adapter_model,
         failed_response_adapter="anthropic_openrouter_responses_adapter",
         failed_response_adapter_label="OpenRouter",
+        malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+            request=request,
+            request_body=translated_request_body,
+            adapter="anthropic_openrouter_responses_adapter",
+            adapter_model=adapter_model,
+            upstream_url=str(target_url),
+            provider="openrouter",
+        ),
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
@@ -17416,6 +17515,14 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
                     "request_model": translated_request_body.get("model"),
                     "request_stream": translated_request_body.get("stream"),
                 },
+                malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+                    request=request,
+                    request_body=translated_request_body,
+                    adapter="anthropic_opencode_zen_responses_adapter",
+                    adapter_model=adapter_model,
+                    upstream_url=target_url,
+                    provider="opencode",
+                ),
             )
             _copy_translated_anthropic_adapter_response_headers(
                 translated_response=translated_response,
@@ -17446,6 +17553,14 @@ async def _handle_anthropic_opencode_zen_responses_adapter_route(
             "request_model": translated_request_body.get("model"),
             "request_stream": translated_request_body.get("stream"),
         },
+        malformed_intake_context=_build_malformed_intake_context_for_anthropic_responses_adapter(
+            request=request,
+            request_body=translated_request_body,
+            adapter="anthropic_opencode_zen_responses_adapter",
+            adapter_model=adapter_model,
+            upstream_url=target_url,
+            provider="opencode",
+        ),
     )
     _copy_translated_anthropic_adapter_response_headers(
         translated_response=translated_response,
