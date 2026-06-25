@@ -18576,21 +18576,33 @@ def _expected_grok_composer_rewritten_tool_pair(
     *,
     arguments: str = "{}",
 ) -> list[dict[str, Any]]:
+    assistant_content = (
+        "[Context note - prior assistant step; not an executable tool invocation]\n"
+        "Tool label: exec_command\n"
+        "Correlation ref: call_1\n"
+        f"Input payload: {arguments}"
+    )
+    user_content = (
+        "[Context note - prior tool outcome; not an executable tool invocation]\n"
+        "Correlation ref: call_1\n"
+        "Outcome text: ok"
+    )
+    from litellm.integrations.aawm_agent_quality_rules import (
+        is_malformed_composer_call_literal_text,
+    )
+
+    assert not is_malformed_composer_call_literal_text(assistant_content)
+    assert not is_malformed_composer_call_literal_text(user_content)
     return [
         {
             "type": "message",
             "role": "assistant",
-            "content": (
-                "Previous tool call\n"
-                "Name: exec_command\n"
-                "Call ID: call_1\n"
-                f"Arguments: {arguments}"
-            ),
+            "content": assistant_content,
         },
         {
             "type": "message",
             "role": "user",
-            "content": "Previous tool result\nCall ID: call_1\nOutput: ok",
+            "content": user_content,
         },
     ]
 
@@ -22734,13 +22746,13 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rewrites_composer_t
     assert any(
         isinstance(item, dict)
         and item.get("role") == "assistant"
-        and "Previous tool call" in str(item.get("content"))
+        and "prior assistant step" in str(item.get("content"))
         for item in custom_body["input"]
     )
     assert any(
         isinstance(item, dict)
         and item.get("role") == "user"
-        and "Previous tool result" in str(item.get("content"))
+        and "prior tool outcome" in str(item.get("content"))
         for item in custom_body["input"]
     )
     metadata = custom_body["litellm_metadata"]
