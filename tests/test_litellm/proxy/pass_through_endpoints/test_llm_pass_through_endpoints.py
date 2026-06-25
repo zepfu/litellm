@@ -6287,7 +6287,10 @@ class TestPassThroughRequestRetryableFailures:
             self._install_aawm_error_log_handler(tmp_path, monkeypatch)
         )
 
+        streaming_logger_calls: list[dict[str, Any]] = []
+
         async def _noop_streaming_logger(**kwargs):
+            streaming_logger_calls.append(kwargs)
             return None
 
         monkeypatch.setattr(
@@ -6319,7 +6322,10 @@ class TestPassThroughRequestRetryableFailures:
                 saved_propagate,
             )
 
-        assert chunks == [b"data: {\"type\":\"message_start\"}\n\n"]
+        assert chunks[0] == b"data: {\"type\":\"message_start\"}\n\n"
+        assert len(chunks) == 2
+        assert b"event: error" in chunks[1]
+        assert b"proxy_stream_terminal_error" in chunks[1]
         error_log_path = tmp_path / "dev-error.jsonl"
         payloads = [
             json.loads(line)
@@ -6346,6 +6352,123 @@ class TestPassThroughRequestRetryableFailures:
         assert metadata["stream_failure_stage"] == "stream_interrupted_after_first_byte"
         assert metadata["stream_chunks_seen"] == 1
         assert metadata["stream_bytes_seen"] == len(chunks[0])
+        assert metadata["aawm_stream_terminal_emitted"] is True
+        assert metadata["aawm_route_rollup_turn_suppressed"] is True
+        assert metadata["status_code"] == 504
+        assert b"event: error" in b"".join(chunks)
+        assert b"proxy_stream_terminal_error" in b"".join(chunks)
+        assert streaming_logger_calls == []
+
+    @pytest.mark.asyncio
+    async def test_streaming_timeout_after_first_chunk_emits_codex_terminal_failed_event(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        error_context = {
+            "source": "pass_through_endpoint",
+            "container": "test-container",
+            "endpoint": "/openai_passthrough/responses",
+            "upstream_url": target_url,
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "model_alias": "aawm-low",
+            "route_family": "codex_responses",
+            "status_code": None,
+            "trace_id": "trace-codex-after-first-byte",
+            "litellm_call_id": "call-codex-after-first-byte",
+        }
+
+        class PartiallyFailingCodexStreamingResponse:
+            headers = httpx.Headers({})
+
+            async def aiter_bytes(self):
+                yield b'event: response.created\ndata: {"type":"response.created"}\n\n'
+                raise httpx.ReadTimeout(
+                    "Timeout on reading data from socket",
+                    request=httpx.Request("POST", target_url),
+                )
+
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+
+        streaming_logger_calls: list[dict[str, Any]] = []
+
+        async def _noop_streaming_logger(**kwargs):
+            streaming_logger_calls.append(kwargs)
+            return None
+
+        monkeypatch.setattr(
+            PassThroughStreamingHandler,
+            "_route_streaming_logging_to_handler",
+            _noop_streaming_logger,
+        )
+        status_events: list[dict[str, Any]] = []
+        rollup_events: list[dict[str, Any]] = []
+
+        def _capture_status_event(**kwargs):
+            status_events.append(kwargs)
+
+        def _capture_rollup(**kwargs):
+            rollup_events.append(kwargs)
+
+        monkeypatch.setattr(
+            "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event",
+            _capture_status_event,
+        )
+        monkeypatch.setattr(
+            "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup",
+            _capture_rollup,
+        )
+
+        chunks: list[bytes] = []
+        success_handler_kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    "aawm_route_rollup_context": {
+                        "group_header_label": "Codex/litellm",
+                        "incoming_endpoint": "/openai_passthrough/responses",
+                        "outgoing_target": target_url,
+                        "model_label": "aawm-low",
+                    }
+                }
+            }
+        }
+        try:
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=PartiallyFailingCodexStreamingResponse(),  # type: ignore[arg-type]
+                request_body={"model": "gpt-5.4-mini"},
+                litellm_logging_obj=MagicMock(),
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(),
+                url_route=target_url,
+                custom_llm_provider="openai",
+                success_handler_kwargs=success_handler_kwargs,
+                error_log_context=error_context,
+            ):
+                chunks.append(chunk)
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers,
+                saved_level,
+                saved_propagate,
+            )
+
+        combined = b"".join(chunks)
+        assert combined.startswith(b'event: response.created')
+        assert b"event: response.failed" in combined
+        assert b"streaming_upstream_read_timeout" in combined
+        assert b"data: [DONE]" in combined
+        assert status_events
+        assert status_events[0]["status"] == "Failed"
+        assert status_events[0]["alias_model"] == "aawm-low"
+        assert rollup_events
+        assert rollup_events[0]["status"] == "Failed"
+        assert rollup_events[0]["model_label"] == "aawm-low"
+        assert streaming_logger_calls == []
 
     @pytest.mark.asyncio
     async def test_streaming_post_response_logging_error_jsonl_includes_context(
@@ -33741,3 +33864,307 @@ async def test_pass_through_request_suppresses_grok_replicas_update_not_owned_tr
         "sessions_replicas_update"
     )
     mock_logging_obj.post_call_failure_hook.assert_not_awaited()
+
+
+def test_malformed_tool_call_intake_appends_single_json_object(tmp_path, monkeypatch):
+    from litellm.proxy.aawm_runtime_error_logging import (
+        MALFORMED_TOOL_CALL_ERROR_CODE,
+        persist_malformed_tool_call_detection,
+    )
+
+    monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+
+    malformed_payload = {
+        "id": "resp_malformed",
+        "status": "completed",
+        "model": "grok-composer-2.5-fast",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "composer_call",
+                    }
+                ],
+            }
+        ],
+    }
+    intake_context = {
+        "provider": "openrouter",
+        "model_alias": "aawm-code-anthropic",
+        "route_family": "codex_openrouter_responses",
+        "endpoint": "/openai_passthrough/responses",
+        "upstream_url": "https://openrouter.ai/api/v1/responses",
+        "repository": "litellm",
+        "agent_name": "worker",
+        "agent_id": "agent-123",
+        "session_id": "sess-456",
+        "trace_id": "trace-789",
+        "litellm_call_id": "call-abc",
+        "request_started_at": "2026-06-25T16:00:00+00:00",
+    }
+
+    assert persist_malformed_tool_call_detection(
+        response_body=malformed_payload,
+        adapter_model="grok-composer-2.5-fast",
+        adapter="codex_auto_agent_openrouter_responses",
+        adapter_label="OpenRouter",
+        intake_context=intake_context,
+    )
+
+    log_path = tmp_path / "malformed-error.jsonl"
+    assert log_path.exists()
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+
+    import json
+
+    record = json.loads(lines[0])
+    for field in (
+        "schema_version",
+        "observed_at",
+        "environment",
+        "failure_kind",
+        "error_code",
+        "provider",
+        "model",
+        "model_alias",
+        "route_family",
+        "endpoint",
+        "upstream_url",
+        "repository",
+        "agent_name",
+        "agent_id",
+        "session_id",
+        "trace_id",
+        "litellm_call_id",
+        "request_started_at",
+    ):
+        assert field in record, field
+        assert record[field] is not None, field
+
+    assert record["error_code"] == MALFORMED_TOOL_CALL_ERROR_CODE
+    assert record["malformed_tool_call_text"] == "composer_call"
+    assert record["environment"] == "test"
+
+
+def test_malformed_tool_call_intake_defaults_to_analysis_with_specific_flag(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.aawm_runtime_error_logging import (
+        persist_malformed_tool_call_detection,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+    monkeypatch.delenv("LITELLM_AAWM_ERROR_LOG_ENABLED", raising=False)
+    monkeypatch.delenv("LITELLM_AAWM_ERROR_LOG_DIR", raising=False)
+
+    assert persist_malformed_tool_call_detection(
+        response_body={
+            "status": "completed",
+            "model": "test-model",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "composer_call",
+                    "call_id": "call-specific-flag",
+                }
+            ],
+        },
+        adapter_model="test-model",
+        adapter="codex_auto_agent_openrouter_responses",
+        adapter_label="OpenRouter",
+    )
+
+    assert (tmp_path / ".analysis" / "malformed-error.jsonl").exists()
+
+
+def test_malformed_tool_call_intake_context_includes_endpoint_from_request():
+    from types import SimpleNamespace
+
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _build_malformed_tool_call_intake_context,
+    )
+
+    request = SimpleNamespace(
+        url="http://testserver/openai_passthrough/responses",
+        headers={},
+        path="/openai_passthrough/responses",
+    )
+
+    context = _build_malformed_tool_call_intake_context(
+        request,
+        {
+            "model": "aawm-codex-agent-auto",
+            "litellm_metadata": {
+                "trace_id": "trace-from-meta",
+                "litellm_call_id": "call-from-meta",
+            },
+        },
+        adapter="codex_auto_agent_openrouter_responses",
+        upstream_url="https://openrouter.ai/api/v1/responses",
+        provider="openrouter",
+    )
+
+    assert context["endpoint"] == "/openai_passthrough/responses"
+    assert context["upstream_url"] == "https://openrouter.ai/api/v1/responses"
+    assert context["trace_id"] == "trace-from-meta"
+
+
+def test_raise_codex_auto_agent_malformed_tool_call_text_payload_persists_once(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _raise_codex_auto_agent_malformed_tool_call_text_payload,
+    )
+
+    monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+
+    response_body = {
+        "id": "resp_raise",
+        "status": "completed",
+        "model": "test-model",
+        "output": [
+            {
+                "type": "function_call",
+                "name": "composer_call",
+                "call_id": "call-d1fb2f0a",
+            }
+        ],
+    }
+
+    with pytest.raises(ProxyException) as exc_info:
+        _raise_codex_auto_agent_malformed_tool_call_text_payload(
+            response_body=response_body,
+            adapter_model="test-model",
+            adapter="codex_auto_agent_openrouter_responses",
+            adapter_label="OpenRouter",
+            intake_context={
+                "repository": "litellm",
+                "session_id": "sess-1",
+                "endpoint": "/openai_passthrough/responses",
+            },
+        )
+
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_auto_agent_malformed_tool_call_text"
+    )
+
+    log_path = tmp_path / "malformed-error.jsonl"
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    import json
+
+    record = json.loads(lines[0])
+    assert record["malformed_tool_call_text"] == "composer_call"
+    assert record["repository"] == "litellm"
+    assert record["session_id"] == "sess-1"
+    assert record["endpoint"] == "/openai_passthrough/responses"
+    assert record["malformed_tool_call_index"] == 0
+    assert record["malformed_tool_call_count"] == 1
+
+
+def test_malformed_tool_call_intake_appends_one_row_per_detected_tool_call(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.aawm_runtime_error_logging import (
+        persist_malformed_tool_call_detection,
+    )
+
+    monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+
+    response_body = {
+        "id": "resp_multi",
+        "status": "completed",
+        "model": "test-model",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "composer_call"},
+                    {
+                        "type": "output_text",
+                        "text": 'Name: Bash Call ID: call-composer_call_2 Arguments: {"command":"pwd"}',
+                    },
+                ],
+            },
+            {
+                "type": "function_call",
+                "name": "composer_call",
+                "call_id": "call-structured",
+            },
+        ],
+    }
+
+    assert persist_malformed_tool_call_detection(
+        response_body=response_body,
+        adapter_model="test-model",
+        adapter="codex_auto_agent_openrouter_responses",
+        adapter_label="OpenRouter",
+        intake_context={"repository": "litellm", "session_id": "sess-1"},
+    )
+
+    import json
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "malformed-error.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(records) == 3
+    assert [record["malformed_tool_call_index"] for record in records] == [0, 1, 2]
+    assert {record["malformed_tool_call_count"] for record in records} == {3}
+    assert [record["malformed_tool_call_text"] for record in records] == [
+        "composer_call",
+        'Name: Bash Call ID: call-composer_call_2 Arguments: {"command":"pwd"}',
+        "composer_call",
+    ]
+
+
+def test_malformed_tool_call_intake_write_failure_does_not_break_raise(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _raise_codex_auto_agent_malformed_tool_call_text_payload,
+    )
+
+    def _failing_persist(**_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.persist_malformed_tool_call_detection",
+        _failing_persist,
+    )
+
+    response_body = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "composer_call"}],
+            }
+        ],
+    }
+
+    with pytest.raises(ProxyException) as exc_info:
+        _raise_codex_auto_agent_malformed_tool_call_text_payload(
+            response_body=response_body,
+            adapter_model="m",
+            adapter="a",
+            adapter_label="L",
+        )
+
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_auto_agent_malformed_tool_call_text"
+    )
