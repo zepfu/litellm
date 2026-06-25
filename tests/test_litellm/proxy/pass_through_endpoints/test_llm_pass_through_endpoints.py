@@ -23208,6 +23208,116 @@ async def test_codex_auto_agent_grok_native_marks_transient_statuses_alias_manag
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_agent_grok_native_rejects_literal_composer_tool_transcript(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+    request = _build_codex_auto_agent_request("codex-grok-session")
+    request_body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {
+            "requested_model_alias": "aawm-code",
+            "repository": "aawm-tap",
+        },
+    }
+    grok_prepared_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "hello",
+        "stream": False,
+    }
+    malformed_text = (
+        "Polling the precommit run output.\n\n"
+        "Previous tool call\n"
+        "Name: exec_command\n"
+        "Call ID: call-abc-composer_call_n9P0Z\n"
+        'Arguments: {"cmd": "rg -n expected tests"}\n'
+        "Previous tool call\n"
+        "Name: write_stdin\n"
+        "Call ID: call-def-composer_call_7rCba\n"
+        'Arguments: {"chars": "", "session_id": 15049.0}'
+    )
+    upstream_response = Response(
+        content=json.dumps(
+            {
+                "id": "resp_grok_malformed_literal",
+                "object": "response",
+                "status": "completed",
+                "model": "grok-composer-2.5-fast",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": malformed_text}
+                        ],
+                    }
+                ],
+            }
+        ),
+        media_type="application/json",
+    )
+
+    with patch.object(
+        BaseOpenAIPassThroughHandler,
+        "_prepare_openai_grok_native_oauth_context",
+        new=AsyncMock(
+            return_value=(
+                "http://localhost:4001/grok",
+                {"authorization": "Bearer grok-oidc-token"},
+                grok_prepared_body,
+                "http://localhost:4001/grok/v1/responses",
+            )
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await _perform_codex_auto_agent_grok_native_responses_request(
+                endpoint="/v1/responses",
+                request=request,
+                user_api_key_dict=MagicMock(),
+                request_body=request_body,
+            )
+
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_auto_agent_malformed_tool_call_text"
+    )
+    assert exc_info.value.detail["error"]["status"] == (
+        "RESPONSES_MALFORMED_TOOL_CALL"
+    )
+
+    log_path = tmp_path / "malformed-error.jsonl"
+    records = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record["environment"] == "test"
+    assert record["provider"] == "grok"
+    assert record["model"] == "grok-composer-2.5-fast"
+    assert record["model_alias"] == "aawm-code"
+    assert record["route_family"] == "codex_auto_agent_grok_native_responses"
+    assert record["endpoint"] == "/openai_passthrough/v1/responses"
+    assert record["upstream_url"] == "http://localhost:4001/grok/v1/responses"
+    assert record["repository"] == "aawm-tap"
+    assert record["session_id"] == "codex-grok-session"
+    assert record["adapter"] == "codex_auto_agent_grok_native_responses"
+    assert record["adapter_label"] == "Grok native"
+    assert record["malformed_tool_call_index"] == 0
+    assert record["malformed_tool_call_count"] == 1
+    assert "Name: exec_command" in record["malformed_tool_call_text"]
+    assert "Name: write_stdin" in record["malformed_tool_call_text"]
+    assert "composer_call" in record["malformed_tool_call_text"]
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_oa_xai_marks_transient_statuses_alias_managed():
     request = _build_codex_auto_agent_request()
     request_body = {
