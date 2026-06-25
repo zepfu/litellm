@@ -343,6 +343,17 @@ the same timestamp and use `langfuse_payload_size_state` to distinguish
 near-limit, over-limit-before-enqueue, fit-failed-before-enqueue, and
 enqueued-but-sdk-failed cases.
 
+Repeated Langfuse SDK support-string rows with the same active error fingerprint
+and stable Langfuse context (trace/generation/payload-state fields) are
+coalesced in `AawmErrorLogFileHandler` for a bounded TTL. The first row is
+always written to `*-error.jsonl`; duplicates inside the TTL are suppressed.
+Non-Langfuse `ERROR` rows are unaffected.
+
+Configure the TTL with
+`LITELLM_AAWM_ERROR_LOG_LANGFUSE_SUPPORT_STRING_COALESCE_TTL_SECONDS`. The
+default is `300` seconds.
+
+
 When the async logging worker times out or fails while delivering a queued
 callback coroutine, the JSONL record uses `source=logging_worker`. The
 `callback_name` and `callback_phase` fields identify the active callback or
