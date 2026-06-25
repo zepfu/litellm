@@ -1,3 +1,4 @@
+import inspect
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, Union, cast
 
 import aiohttp
@@ -18,6 +19,7 @@ from litellm.llms.custom_httpx.http_handler import (
     _get_httpx_client,
 )
 from litellm.llms.custom_httpx.aiohttp_transport import LiteLLMAiohttpTransport
+from litellm._logging import verbose_logger
 from litellm.types.llms.openai import FileTypes
 from litellm.types.utils import HttpHandlerRequestFields, ImageResponse, LlmProviders
 from litellm.utils import CustomStreamWrapper, ModelResponse, ProviderConfigManager
@@ -109,65 +111,79 @@ class BaseLLMAIOHTTPHandler:
         else:
             # Create client session using transport/connector if available
             self.client_session = self._create_client_session_with_transport()
-            self._owns_session = True  # We created this session, so we own it
+            # Only mark ownership when the transport/session source is owned.
+            # This avoids closing shared sessions passed in from external transport users.
+            self._owns_session = self.transport is None or bool(
+                getattr(self.transport, "_owns_session", False)
+            )
             return self.client_session
+
+    @staticmethod
+    async def _await_if_awaitable(maybe_awaitable):
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
+
+    async def _close_owned_session(self, session) -> bool:
+        """Close a handler-owned aiohttp session. Returns True when close is attempted."""
+        if session is None:
+            return False
+        if getattr(session, "closed", True):
+            return False
+
+        close = getattr(session, "close", None)
+        if not callable(close):
+            return False
+
+        try:
+            await self._await_if_awaitable(close())
+            return True
+        except Exception as e:
+            verbose_logger.warning(
+                "Failed to close aiohttp session during BaseLLMAIOHTTPHandler cleanup: %s",
+                e,
+            )
+            return False
 
     async def close(self):
         """Close the aiohttp client session and transport if we own them."""
-        # Close client session if we own it
-        if (
-            self.client_session
-            and not self.client_session.closed
-            and self._owns_session
-        ):
-            await self.client_session.close()
+        closed_session_ids: set[int] = set()
+        handler_owned_closed = False
 
-        # Close transport if we own it
-        if (
-            self.transport
-            and self._owns_transport
-            and hasattr(self.transport, "aclose")
-        ):
-            try:
-                await self.transport.aclose()
-            except Exception:
-                # Ignore errors during transport cleanup
-                pass
+        # Close handler-owned session.
+        if self.client_session and self._owns_session:
+            handler_owned_closed = await self._close_owned_session(self.client_session)
+            closed_session_ids.add(id(self.client_session))
+            if handler_owned_closed:
+                verbose_logger.debug(
+                    "Closed handler-owned aiohttp session in BaseLLMAIOHTTPHandler.close()"
+                )
+            self.client_session = None
 
-    def __del__(self):
-        """
-        Cleanup: close aiohttp session on instance destruction.
+        # Close transport-owned session.
+        if self._owns_transport and self.transport is not None:
+            transport_client = getattr(self.transport, "client", None)
+            if isinstance(transport_client, ClientSession):
+                if id(transport_client) not in closed_session_ids:
+                    closed_session = await self._close_owned_session(transport_client)
+                    closed_session_ids.add(id(transport_client))
+                    if closed_session:
+                        verbose_logger.debug(
+                            "Closed transport-owned aiohttp session in BaseLLMAIOHTTPHandler.close()"
+                        )
 
-        Provides defense-in-depth for issue #12443 - ensures cleanup happens
-        even if atexit handler doesn't run (abnormal termination).
-        """
-        if (
-            self.client_session is not None
-            and not self.client_session.closed
-            and self._owns_session
-        ):
-            try:
-                import asyncio
-
+            transport_close = getattr(self.transport, "aclose", None)
+            if callable(transport_close):
                 try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        # Event loop is running - schedule cleanup task
-                        asyncio.create_task(self.close())
-                    else:
-                        # Event loop exists but not running - run cleanup
-                        loop.run_until_complete(self.close())
-                except RuntimeError:
-                    # No event loop available - create one for cleanup
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        loop.run_until_complete(self.close())
-                    finally:
-                        loop.close()
-            except Exception:
-                # Silently ignore errors during __del__ to avoid issues
-                pass
+                    await self._await_if_awaitable(transport_close())
+                    verbose_logger.debug(
+                        "Closed owned aiohttp transport in BaseLLMAIOHTTPHandler.close()"
+                    )
+                    self.transport = None
+                except Exception as e:
+                    verbose_logger.warning(
+                        "Failed to close owned aiohttp transport during BaseLLMAIOHTTPHandler cleanup: %s",
+                        e,
+                    )
 
     async def _make_common_async_call(
         self,
