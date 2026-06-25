@@ -385,6 +385,7 @@ _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
     {
         "capacity_exhausted",
         "candidate_unavailable",
+        "malformed_tool_call_text",
         "provider_terminal_error",
         "rate_limited",
         "usage_limit_reached",
@@ -4583,7 +4584,7 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     if "aawm_auto_agent_failed_responses_payload" in tokens:
         return "provider_terminal_error"
     if "aawm_auto_agent_malformed_tool_call_text" in tokens:
-        return "provider_format_rejected"
+        return "malformed_tool_call_text"
     if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
         return "rate_limited"
     if status_code == 429:
