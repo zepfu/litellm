@@ -128,6 +128,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_codex_auto_agent_candidates_for_alias,
     _is_oa_xai_responses_model,
     _is_codex_google_code_assist_empty_success_model_response,
+    _is_codex_auto_agent_malformed_tool_call_text_output,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
     _perform_codex_auto_agent_openrouter_completion_request,
@@ -23482,6 +23483,154 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_failed_responses_paylo
     )
 
 
+def test_codex_auto_agent_helpers_detect_malformed_composer_call_message():
+    malformed_payload = {
+        "id": "resp_bad_composer_call",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "composer_call",
+                    }
+                ],
+            }
+        ],
+    }
+    serialized_payload = {
+        "id": "resp_serialized_composer_call",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "Previous tool call\n"
+                            "Name: exec_command\n"
+                            "Call ID: call-123-composer_call_abc\n"
+                            'Arguments: {"cmd": "echo hello"}'
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+
+    same_line_serialized_payload = {
+        "id": "resp_same_line_serialized_composer_call",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            'Name: Bash  Call ID: call-abc-composer_call_qz904 '
+                            'Arguments: {"command":"grep"}'
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+    structured_payload = {
+        "id": "resp_structured_tool",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call-123-composer_call_abc",
+                "arguments": '{"cmd": "echo hello"}',
+            }
+        ],
+    }
+    benign_prose_payload = {
+        "id": "resp_benign_prose",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "The engineer route discussed composer_call and quoted "
+                            "call-123-composer_call_abc without emitting a tool."
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+    clean_payload = {
+        "id": "resp_ok",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "continue",
+                    }
+                ],
+            }
+        ],
+    }
+
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(
+        malformed_payload
+    ) is True
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(
+        serialized_payload
+    ) is True
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(
+        same_line_serialized_payload
+    ) is True
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(
+        structured_payload
+    ) is False
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(
+        benign_prose_payload
+    ) is False
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(clean_payload) is False
+
+
+def test_codex_auto_agent_retryable_exhaustion_classifies_malformed_tool_call_text():
+    exc = ProxyException(
+        message="Codex auto-agent candidate returned a malformed tool-call marker.",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    exc.detail = {
+        "error": {
+            "message": "Malformed tool-call marker in response.",
+            "code": "aawm_auto_agent_malformed_tool_call_text",
+            "status": "RESPONSES_MALFORMED_TOOL_CALL",
+            "type": "rate_limit_error",
+        }
+    }
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
+        "provider_format_rejected"
+    )
+    assert "aawm_auto_agent_malformed_tool_call_text" in _extract_codex_auto_agent_error_tokens(
+        exc
+    )
+
+
 def test_codex_auto_agent_cooldown_scope_promotes_reusable_failures_to_candidate():
     assert (
         _get_codex_auto_agent_cooldown_scope("provider_terminal_error")
@@ -25876,6 +26025,89 @@ async def test_codex_auto_agent_alias_openrouter_one_token_text_is_success(
     assert translated["output"][0]["content"][0]["text"] == "ok"
     mock_openrouter.assert_awaited_once()
     mock_pass_through.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_openrouter_malformed_composer_call_rolls_over_to_mini(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-composer-call"},
+    }
+    monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+    monkeypatch.setitem(
+        _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
+        "aawm-low",
+        (
+            {
+                "provider": "openrouter",
+                "model": "openrouter/composer-call-test",
+                "route_family": "codex_openrouter_completion_adapter",
+                "last_resort": False,
+            },
+            {
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "route_family": "codex_responses",
+                "last_resort": True,
+            },
+        ),
+    )
+    malformed_responses_payload = {
+        "id": "resp_composer_call",
+        "object": "response",
+        "status": "completed",
+        "model": "openrouter/composer-call-test",
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "composer_call"}],
+            }
+        ],
+    }
+    mini_success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response",
+        return_value=malformed_responses_payload,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
+        new=AsyncMock(return_value=object()),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=mini_success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is mini_success
+    mock_pass_through.assert_awaited_once()
+    mini_body = mock_pass_through.await_args.kwargs["custom_body"]
+    attempts = mini_body["litellm_metadata"]["codex_auto_agent_attempts"]
+    assert attempts[0]["provider"] == "openrouter"
+    assert attempts[0]["status"] == "cooldown_set"
+    assert attempts[0]["error_class"] == "provider_format_rejected"
+    assert "aawm_auto_agent_malformed_tool_call_text" in attempts[0]["error_tokens"]
+    assert mini_body["litellm_metadata"]["codex_auto_agent_selected_model"] == (
+        "gpt-5.4-mini"
+    )
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,58 @@ def test_score_agent_quality_context_returns_core_policy_fields() -> None:
     assert "discovery_inventory_coverage_score" in result.fields
 
 
+def test_score_agent_quality_context_flags_literal_composer_call_text() -> None:
+    result = score_agent_quality_context(
+        assistant_texts=['{"name": "composer_call", "arguments": {"cmd": "pwd"}}'],
+    )
+
+    assert result.fields["output_contract_compliance_score"] == 0.0
+    assert result.fields["output_contract_failure_class"] == "literal_tool_call_text"
+    assert result.reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+
+def test_score_agent_quality_context_flags_composer_call_tool_marker() -> None:
+    result = score_agent_quality_context(
+        assistant_texts=["Done."],
+        tool_call_names=["composer_call"],
+    )
+
+    assert result.fields["output_contract_compliance_score"] == 0.0
+    assert result.fields["output_contract_failure_class"] == "malformed_tool_call_text"
+    assert result.reasons["output_contract_compliance"] == [
+        "malformed_tool_call_text"
+    ]
+
+
+def test_score_agent_quality_context_ignores_benign_composer_call_prose() -> None:
+    result = score_agent_quality_context(
+        user_texts=["Explain what happened with the engineer route."],
+        assistant_texts=[
+            "The model discussed composer_call in prose and quoted "
+            "call-123-composer_call_abc without emitting a tool call."
+        ],
+    )
+
+    assert result.fields.get("output_contract_failure_class") is None
+    assert result.reasons.get("output_contract_compliance") == []
+
+
+def test_score_agent_quality_context_flags_same_line_serialized_composer_call_text() -> None:
+    result = score_agent_quality_context(
+        assistant_texts=[
+            'Name: Bash  Call ID: call-abc-composer_call_qz904 Arguments: {"command":"grep"}'
+        ],
+    )
+
+    assert result.fields["output_contract_compliance_score"] == 0.0
+    assert result.fields["output_contract_failure_class"] == "literal_tool_call_text"
+    assert result.reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+
 def test_ignored_path_tracking_flags_forced_adds() -> None:
     result = score_agent_quality_context(
         commands=[
