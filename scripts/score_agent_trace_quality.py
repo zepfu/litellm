@@ -2524,10 +2524,15 @@ def _agent_quality_context_from_messages(
         for tool_use in tool_uses
         if tool_use.command
     ]
+    tool_call_names: List[str] = []
+    for tool_use in tool_uses:
+        if tool_use.name:
+            tool_call_names.append(tool_use.name)
     result = score_agent_quality_context(
         user_texts=user_texts,
         assistant_texts=assistant_texts,
         tool_result_texts=tool_result_texts,
+        tool_call_names=tool_call_names,
         commands=commands,
         input_tokens=input_tokens,
         output_tokens=output_tokens,

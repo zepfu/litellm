@@ -42,6 +42,9 @@ from litellm.constants import (
     BEDROCK_AGENT_RUNTIME_PASS_THROUGH_ROUTES,
     XAI_API_BASE,
 )
+from litellm.integrations.aawm_agent_quality_rules import (
+    is_malformed_composer_call_literal_text,
+)
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
 )
@@ -4319,6 +4322,8 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("aawm_codex_auto_agent_candidate_unavailable")
     if "aawm_auto_agent_failed_responses_payload" in text_lower:
         tokens.add("aawm_auto_agent_failed_responses_payload")
+    if "aawm_auto_agent_malformed_tool_call_text" in text_lower:
+        tokens.add("aawm_auto_agent_malformed_tool_call_text")
     if (
         "error from provider (deepseek)" in text_lower
         and "assistant message with 'tool_calls' must be followed by tool messages"
@@ -4574,6 +4579,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "provider_terminal_error"
     if "aawm_auto_agent_failed_responses_payload" in tokens:
         return "provider_terminal_error"
+    if "aawm_auto_agent_malformed_tool_call_text" in tokens:
+        return "provider_format_rejected"
     if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
         return "rate_limited"
     if status_code == 429:
@@ -14651,6 +14658,37 @@ def _is_failed_responses_body(response_body: dict[str, Any]) -> bool:
     )
 
 
+def _is_codex_auto_agent_malformed_tool_call_text_output(
+    response_body: dict[str, Any],
+) -> bool:
+    output = response_body.get("output")
+    if not isinstance(output, list):
+        return False
+
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") not in {"text", "output_text"}:
+                    continue
+                if is_malformed_composer_call_literal_text(part.get("text") or ""):
+                    return True
+            continue
+
+        if item.get("type") in {"function_call", "mcp_call"}:
+            name = item.get("name")
+            if isinstance(name, str) and name.strip().lower() == "composer_call":
+                return True
+            continue
+    return False
+
+
 async def _validate_alias_candidate_responses_stream_if_needed(
     response: Response,
     *,
@@ -14849,6 +14887,45 @@ def _build_failed_responses_diagnostic(
     return diagnostic
 
 
+def _raise_codex_auto_agent_malformed_tool_call_text_payload(
+    *,
+    response_body: dict[str, Any],
+    adapter_model: str,
+    adapter: str,
+    adapter_label: str,
+    stream_event_summaries: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    diagnostic = _build_failed_responses_diagnostic(
+        response_body=response_body,
+        adapter=adapter,
+        adapter_model=adapter_model,
+        stream_event_summaries=stream_event_summaries,
+    )
+    exc = ProxyException(
+        message=(
+            f"Codex auto-agent {adapter_label} candidate returned a malformed "
+            "Responses marker payload."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_auto_agent_malformed_tool_call_text",
+                "status": "RESPONSES_MALFORMED_TOOL_CALL",
+                "type": "rate_limit_error",
+            },
+            "diagnostic": diagnostic,
+        },
+    )
+    raise exc
+
+
 def _raise_codex_auto_agent_failed_responses_payload(
     *,
     response_body: dict[str, Any],
@@ -14955,6 +15032,14 @@ async def _validate_codex_auto_agent_responses_payload(
                 adapter_label=adapter_label,
                 stream_event_summaries=event_summaries,
             )
+        if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+            _raise_codex_auto_agent_malformed_tool_call_text_payload(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+                stream_event_summaries=event_summaries,
+            )
 
         async def _replay_iterator() -> Any:
             for raw_chunk in buffered_chunks:
@@ -14974,6 +15059,16 @@ async def _validate_codex_auto_agent_responses_payload(
             return response
         if isinstance(response_body, dict) and _is_failed_responses_body(response_body):
             _raise_codex_auto_agent_failed_responses_payload(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+            )
+        if (
+            isinstance(response_body, dict)
+            and _is_codex_auto_agent_malformed_tool_call_text_output(response_body)
+        ):
+            _raise_codex_auto_agent_malformed_tool_call_text_payload(
                 response_body=response_body,
                 adapter_model=adapter_model,
                 adapter=adapter,
@@ -26331,6 +26426,14 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
             adapter_model=adapter_model,
             stream_event_summaries=event_summaries,
         )
+    if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+        _raise_codex_auto_agent_malformed_tool_call_text_payload(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            adapter="codex_auto_agent_openrouter_responses",
+            adapter_label="OpenRouter",
+            stream_event_summaries=event_summaries,
+        )
     if _is_failed_responses_body(response_body):
         _raise_codex_auto_agent_failed_responses_payload(
             response_body=response_body,
@@ -26435,6 +26538,16 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
             _raise_codex_auto_agent_empty_success_response(
                 response_body=response_body,
                 adapter_model=adapter_model,
+            )
+        if (
+            isinstance(response_body, dict)
+            and _is_codex_auto_agent_malformed_tool_call_text_output(response_body)
+        ):
+            _raise_codex_auto_agent_malformed_tool_call_text_payload(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter="codex_auto_agent_openrouter_responses",
+                adapter_label="OpenRouter",
             )
         if isinstance(response_body, dict) and _is_failed_responses_body(response_body):
             _raise_codex_auto_agent_failed_responses_payload(
@@ -26797,6 +26910,13 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     response_body = json.loads(
         _serialize_responses_adapter_response(responses_api_response)
     )
+    if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+        _raise_codex_auto_agent_malformed_tool_call_text_payload(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            adapter="codex_auto_agent_openrouter_completion_adapter",
+            adapter_label="OpenRouter chat-completions",
+        )
     if _is_codex_auto_agent_empty_success_responses_body(response_body):
         _raise_codex_auto_agent_empty_success_response(
             response_body=response_body,

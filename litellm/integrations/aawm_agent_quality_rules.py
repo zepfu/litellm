@@ -115,6 +115,52 @@ _OUTPUT_CONTRACT_COMPLETION_MARKERS = (
     ".py",
     ".md",
 )
+_COMPOSER_CALL_TEXT_MARKERS = (
+    re.compile(r"^\s*composer_call\s*$", re.IGNORECASE),
+    re.compile(r"\bcomposer_call\s*\(", re.IGNORECASE),
+    re.compile(r"['\"]name['\"]\s*:\s*['\"]composer_call['\"]", re.IGNORECASE),
+)
+_COMPOSER_CALL_NAME = "composer_call"
+_COMPOSER_CALL_TRANSCRIPT_FIELD_RE = re.compile(
+    r"(?im)^(?:name|arguments):\s*",
+)
+_COMPOSER_CALL_CALL_ID_LINE_RE = re.compile(
+    r"(?im)^call id:\s*[^\n]*composer_call",
+)
+_COMPOSER_CALL_SAME_LINE_TRANSCRIPT_RE = re.compile(
+    r"(?is)"
+    r"(?:^|\b)name:\s*\S+.*?"
+    r"call\s*id:\s*[^\s\n]*composer_call[^\s\n]*.*?"
+    r"arguments:\s*",
+)
+_COMPOSER_CALL_TOOL_CALL_MARKERS = (
+    "<｜tool▁calls▁begin｜>",
+    "<｜tool▁calls▁end｜>",
+)
+
+
+def is_malformed_composer_call_literal_text(value: str) -> bool:
+    """Detect non-executing composer_call text without flagging benign prose."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    normalized = _normalize_contract_text(value)
+    if "composer_call" not in normalized:
+        return False
+    if any(pattern.search(value) for pattern in _COMPOSER_CALL_TEXT_MARKERS):
+        return True
+    if _COMPOSER_CALL_SAME_LINE_TRANSCRIPT_RE.search(value):
+        return True
+    if any(marker in value for marker in _COMPOSER_CALL_TOOL_CALL_MARKERS):
+        return True
+    if _COMPOSER_CALL_CALL_ID_LINE_RE.search(value) and (
+        _COMPOSER_CALL_TRANSCRIPT_FIELD_RE.search(value)
+        or "previous tool call" in normalized
+        or "arguments:" in normalized
+    ):
+        return True
+    return False
+
+
 _DISCOVERY_PATH_RE = re.compile(
     r"(?<![\w@:/.-])(?:\./|\.\./|/|[A-Za-z0-9_.-]+/)"
     r"[A-Za-z0-9_./{}@%+=,:~#-]*[A-Za-z0-9_./{}@%+=~#-]"
@@ -475,6 +521,7 @@ def _score_output_contract(
     *,
     user_text: str,
     assistant_texts: Sequence[str],
+    tool_call_names: Sequence[str] = (),
 ) -> Dict[str, Any]:
     final_text = _last_non_empty_text(assistant_texts)
     required_phrase, required_phrase_source = _extract_required_final_phrase(user_text)
@@ -488,8 +535,23 @@ def _score_output_contract(
         failure_class = "missing_required_final_phrase"
     if setup_markers:
         failure_class = "setup_only_completion"
+    composer_call_markers = [
+        name
+        for name in tool_call_names
+        if isinstance(name, str)
+        and name.strip().lower() == _COMPOSER_CALL_NAME
+    ]
+    if not composer_call_markers and final_text:
+        if is_malformed_composer_call_literal_text(final_text):
+            failure_class = failure_class or "literal_tool_call_text"
+    elif composer_call_markers:
+        failure_class = failure_class or "malformed_tool_call_text"
 
-    contract_observed = required_phrase is not None or bool(setup_markers)
+    contract_observed = (
+        required_phrase is not None
+        or bool(setup_markers)
+        or bool(failure_class)
+    )
     compliance_score: Optional[float] = None
     if contract_observed:
         compliance_score = 0.0 if failure_class else 1.0
@@ -1000,6 +1062,7 @@ def score_agent_quality_context(
     user_texts: Sequence[str] = (),
     assistant_texts: Sequence[str] = (),
     tool_result_texts: Sequence[str] = (),
+    tool_call_names: Sequence[str] = (),
     commands: Sequence[AgentQualityCommand] = (),
     input_tokens: int = 0,
     output_tokens: int = 0,
@@ -1024,6 +1087,11 @@ def score_agent_quality_context(
         )
         for command in commands[:max_commands]
         if command.command
+    ]
+    clipped_tool_call_names = [
+        _clip_text(str(name or ""), 240)
+        for name in tool_call_names[:max_commands]
+        if isinstance(name, str) and name.strip()
     ]
     raw_user_text = _joined_text_preserve_case(user_texts, max_bytes=max_text_bytes)
     user_text = raw_user_text.lower()
@@ -1061,6 +1129,7 @@ def score_agent_quality_context(
     output_contract = _score_output_contract(
         user_text=raw_user_text,
         assistant_texts=assistant_texts,
+        tool_call_names=clipped_tool_call_names,
     )
     fields: Dict[str, Any] = {}
     fields.update(ignored)
