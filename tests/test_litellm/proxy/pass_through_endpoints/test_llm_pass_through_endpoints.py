@@ -189,6 +189,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _maybe_force_explicit_bash_tool_choice_for_completion_adapter,
     _maybe_force_explicit_bash_tool_choice_for_responses_adapter,
     _release_google_adapter_semaphore_once,
+    _responses_sse_from_iterator,
     _wrap_streaming_response_with_release_callback,
     anthropic_proxy_route,
     bedrock_llm_proxy_route,
@@ -10085,6 +10086,128 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         clear_aawm_route_rollups()
 
     @pytest.mark.asyncio
+    async def test_codex_opencode_zen_route_stream_registers_access_log_and_completed_rollup(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-opencode-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/responses"
+            "?adapted_to=opencode.ai/zen/v1/chat/completions"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/responses",
+            "query_string": b"adapted_to=opencode.ai/zen/v1/chat/completions",
+            "client": ("172.19.0.1", 52834),
+            "http_version": "1.1",
+        }
+        prepared_body = {
+            "model": "big-pickle",
+            "input": "just a test msg",
+            "stream": True,
+            "litellm_metadata": {
+                "client_name": "codex_exec",
+                "passthrough_route_family": "codex_responses",
+                "requested_model_alias": "aawm-low",
+                "tags": ["route:codex_responses"],
+            },
+        }
+
+        class _FakeResponseEvent(SimpleNamespace):
+            def model_dump_json(self, exclude_none=True):
+                _ = exclude_none
+                return json.dumps(self.__dict__)
+
+        async def _responses_events():
+            yield _FakeResponseEvent(
+                type="response.completed",
+                response={"status": "completed", "model": "big-pickle"},
+            )
+
+        iterator_inits = []
+
+        class _FakeCompletionStreamingIterator:
+            def __init__(self, **kwargs):
+                iterator_inits.append(kwargs)
+
+            def __aiter__(self):
+                return _responses_events()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_opencode_zen_api_key_for_candidate",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.acompletion",
+            new=AsyncMock(return_value=object()),
+        ) as mock_acompletion, patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            _FakeCompletionStreamingIterator,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ):
+            response = await _handle_codex_opencode_zen_adapter_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=prepared_body,
+                adapter_model="big-pickle",
+            )
+
+        assert iterator_inits
+        assert iterator_inits[0]["model"] == "big-pickle"
+        assert isinstance(response, StreamingResponse)
+        assert mock_acompletion.await_count == 1
+
+        chunks = [chunk async for chunk in response.body_iterator]
+        payload = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            for chunk in chunks
+        )
+        assert "event: response.completed" in payload
+        assert "big-pickle" in payload
+        assert payload.rstrip().endswith("data: [DONE]")
+
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        access_record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=(
+                "172.19.0.1:52834",
+                "POST",
+                "/openai_passthrough/responses?adapted_to=opencode.ai/zen/v1/chat/completions -> opencode.ai/zen/v1/chat/completions",
+                "1.1",
+                200,
+            ),
+            exc_info=None,
+        )
+        assert access_filter.filter(access_record) is False
+        assert access_filter.filter(access_record) is True
+
+        flushed = flush_aawm_route_rollups(force=True)
+        rendered = "\n".join(flushed)
+        assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
+        assert (
+            " - big-pickle(aawm-low) - Turns: 1 -> opencode.ai/zen/v1/chat/completions"
+            in rendered
+        )
+        clear_aawm_route_rollups()
+
+    @pytest.mark.asyncio
     async def test_codex_openrouter_completion_route_registers_access_log_and_completed_rollup(
         self,
         monkeypatch,
@@ -10123,8 +10246,13 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             },
         }
 
-        async def perform_operation(adapter_model, operation, log_warnings=True):
-            assert log_warnings is False
+        async def perform_operation(
+            adapter_model,
+            operation,
+            log_warnings=True,
+            **kwargs: Any,
+        ):
+            assert log_warnings is True
             return await operation()
 
         with patch(
@@ -10208,6 +10336,188 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             )
             == "openrouter.ai/api/v1/chat/completions"
         )
+
+    @pytest.mark.asyncio
+    async def test_codex_openrouter_completion_route_stream_registers_access_log_and_completed_rollup(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "originator": "codex_cli_rs",
+            "user-agent": "codex_cli_rs/0.0.0",
+            "session_id": "codex-openrouter-session",
+        }
+        mock_request.url = httpx.URL(
+            "http://127.0.0.1:4001/openai_passthrough/responses"
+            "?adapted_to=openrouter.ai/api/v1/chat/completions"
+        )
+        mock_request.scope = {
+            "path": "/openai_passthrough/responses",
+            "query_string": b"adapted_to=openrouter.ai/api/v1/chat/completions",
+            "client": ("172.19.0.1", 52834),
+            "http_version": "1.1",
+        }
+
+        adapter_model = "openrouter/cohere/north-mini-code:free"
+        request_body = {
+            "model": adapter_model,
+            "input": "just a test msg",
+            "stream": True,
+            "litellm_metadata": {
+                "client_name": "codex_exec",
+                "passthrough_route_family": "codex_responses",
+                "tags": ["route:codex_responses"],
+                "requested_model_alias": "aawm-low",
+            },
+        }
+        fake_stream_wrapper = object()
+        iterator_inits = []
+
+        class _FakeResponseEvent(SimpleNamespace):
+            def model_dump_json(self, exclude_none=True):
+                _ = exclude_none
+                return json.dumps(self.__dict__)
+
+        async def _responses_events():
+            yield _FakeResponseEvent(
+                type="response.output_text.delta",
+                delta="OPENROUTER CODEX STREAM ROLLUP OK",
+            )
+
+        class _FakeCompletionStreamingIterator:
+            def __init__(self, **kwargs):
+                iterator_inits.append(kwargs)
+
+            def __aiter__(self):
+                return _responses_events()
+
+        def _fake_transform(*args, **kwargs):
+            return {
+                "model": "cohere/north-mini-code:free",
+                "messages": [{"role": "user", "content": "just a test msg"}],
+            }
+
+        async def perform_operation(
+            adapter_model,
+            operation,
+            log_warnings=True,
+            **kwargs: Any,
+        ):
+            assert log_warnings is True
+            assert adapter_model == "cohere/north-mini-code:free"
+            return await operation()
+
+        with patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request",
+            side_effect=_fake_transform,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_openrouter_completion_adapter_operation",
+            new=AsyncMock(side_effect=perform_operation),
+        ) as mock_openrouter, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.litellm.acompletion",
+            new=AsyncMock(return_value=fake_stream_wrapper),
+        ) as mock_acompletion, patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            _FakeCompletionStreamingIterator,
+        ):
+            response = await _perform_codex_auto_agent_openrouter_completion_request(
+                request=mock_request,
+                adapter_model=adapter_model,
+                request_body=request_body,
+            )
+
+        assert mock_openrouter.await_count == 1
+        assert mock_openrouter.await_args.kwargs["adapter_model"] == (
+            "cohere/north-mini-code:free"
+        )
+        assert mock_acompletion.await_count == 1
+        acompletion_kwargs = mock_acompletion.await_args.kwargs
+        assert acompletion_kwargs["model"] == "cohere/north-mini-code:free"
+        assert acompletion_kwargs["api_key"] == "or-test-key"
+        assert acompletion_kwargs["api_base"] == "https://openrouter.ai/api/v1"
+        assert acompletion_kwargs["shared_session"] is None
+        assert iterator_inits[0]["model"] == "cohere/north-mini-code:free"
+        assert iterator_inits[0]["custom_llm_provider"] == "openrouter"
+        assert iterator_inits[0]["litellm_custom_stream_wrapper"] is fake_stream_wrapper
+        assert iterator_inits[0]["model"] == "cohere/north-mini-code:free"
+        assert isinstance(response, StreamingResponse)
+
+        chunks = [chunk async for chunk in response.body_iterator]
+        payload = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            for chunk in chunks
+        )
+        assert "event: response.output_text.delta" in payload
+        assert "OPENROUTER CODEX STREAM ROLLUP OK" in payload
+        assert payload.rstrip().endswith("data: [DONE]")
+
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        access_record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=(
+                "172.19.0.1:52834",
+                "POST",
+                "/openai_passthrough/responses?adapted_to=openrouter.ai/api/v1/chat/completions -> openrouter.ai/api/v1/chat/completions",
+                "1.1",
+                200,
+            ),
+            exc_info=None,
+        )
+        assert access_filter.filter(access_record) is False
+        assert access_filter.filter(access_record) is True
+
+        flushed = flush_aawm_route_rollups(force=True)
+        rendered = "\n".join(flushed)
+        assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
+        assert (
+            " - openrouter/cohere/north-mini-code:free(aawm-low) - Turns: 1 -> openrouter.ai/api/v1/chat/completions"
+            in rendered
+        )
+        clear_aawm_route_rollups()
+
+    @pytest.mark.asyncio
+    async def test_responses_sse_from_iterator_does_not_call_on_complete_or_emit_done_on_iterator_error(
+        self,
+    ):
+        class _FakeResponseEvent(SimpleNamespace):
+            def model_dump_json(self, exclude_none=True):
+                _ = exclude_none
+                return json.dumps(self.__dict__)
+
+        async def _responses_events():
+            yield _FakeResponseEvent(type="response.output_text.delta", delta="partial")
+            raise RuntimeError("iterator failed before normal completion")
+
+        on_complete = Mock()
+
+        chunks: list[bytes | str] = []
+        with pytest.raises(RuntimeError, match="iterator failed before normal completion"):
+            async for chunk in _responses_sse_from_iterator(
+                responses_iterator=_responses_events(),
+                on_complete=on_complete,
+            ):
+                chunks.append(chunk)
+
+        payload = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            for chunk in chunks
+        )
+        assert on_complete.call_count == 0
+        assert payload.startswith("event: response.output_text.delta")
+        assert not payload.rstrip().endswith("data: [DONE]")
+        assert "data: [DONE]" not in payload
 
     @pytest.mark.asyncio
     async def test_codex_opencode_zen_route_uses_saved_opencode_auth_and_responses_envelope(
