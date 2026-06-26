@@ -14181,6 +14181,70 @@ def _apply_openrouter_adapter_parallel_instruction_policy(
     )
 
 
+def _drop_anthropic_grok_native_prior_function_call_replay(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body, []
+
+    updated_input_items: list[Any] = []
+    dropped_items: list[dict[str, Any]] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            updated_input_items.append(item)
+            continue
+
+        metadata_item: dict[str, Any] = {
+            "type": "function_call",
+            "index": index,
+        }
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            metadata_item["name"] = name.strip()
+        call_id = item.get("call_id")
+        if isinstance(call_id, str) and call_id.strip():
+            metadata_item["call_id_hash"] = hashlib.sha256(
+                call_id.strip().encode("utf-8", errors="replace")
+            ).hexdigest()[:12]
+        dropped_items.append(metadata_item)
+
+    if not dropped_items:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["input"] = updated_input_items
+    dropped_names = _dedupe_sorted_str_list(
+        [
+            item["name"]
+            for item in dropped_items
+            if isinstance(item.get("name"), str) and item["name"]
+        ]
+    )
+    updated_body = _merge_litellm_metadata(
+        updated_body,
+        tags_to_add=[
+            "anthropic-grok-native-prior-function-call-replay-dropped",
+        ],
+        extra_fields={
+            "anthropic_grok_native_prior_function_call_replay_dropped_count": len(
+                dropped_items
+            ),
+            "anthropic_grok_native_prior_function_call_replay_dropped_items": dropped_items,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="anthropic.grok_native_prior_function_call_replay_dropped",
+                    metadata={
+                        "dropped_count": len(dropped_items),
+                        "dropped_names": dropped_names,
+                    },
+                )
+            ],
+        },
+    )
+    return updated_body, dropped_items
+
+
 def _build_anthropic_response_from_responses_response(
     response_body: dict[str, Any],
     *,
@@ -16695,6 +16759,12 @@ async def _handle_anthropic_grok_native_oauth_responses_adapter_route(
         _drop_unsupported_codex_request_params_from_request_body(
             translated_request_body
         )
+    )
+    (
+        translated_request_body,
+        _dropped_prior_function_call_replay,
+    ) = _drop_anthropic_grok_native_prior_function_call_replay(
+        translated_request_body
     )
 
     try:
@@ -20232,7 +20302,11 @@ def _stringify_grok_native_input_item_value(value: Any) -> str:
         return str(value)
 
 
-def _format_grok_native_function_call_input_message(item: dict[str, Any]) -> str:
+def _format_grok_native_function_call_input_message(
+    item: dict[str, Any],
+    *,
+    include_correlation_ref: bool = True,
+) -> str:
     """Neutral prior-tool summary for Grok input (not executable tool-call shape)."""
     lines = [
         "[Context note - prior assistant step; not an executable tool invocation]",
@@ -20241,7 +20315,7 @@ def _format_grok_native_function_call_input_message(item: dict[str, Any]) -> str
     if isinstance(name, str) and name.strip():
         lines.append(f"Tool label: {name.strip()}")
     call_id = item.get("call_id")
-    if isinstance(call_id, str) and call_id.strip():
+    if include_correlation_ref and isinstance(call_id, str) and call_id.strip():
         lines.append(f"Correlation ref: {call_id.strip()}")
     arguments = _stringify_grok_native_input_item_value(item.get("arguments")).strip()
     if arguments:
@@ -20251,13 +20325,15 @@ def _format_grok_native_function_call_input_message(item: dict[str, Any]) -> str
 
 def _format_grok_native_function_call_output_input_message(
     item: dict[str, Any],
+    *,
+    include_correlation_ref: bool = True,
 ) -> str:
     """Neutral prior outcome summary for Grok input (not executable tool-call shape)."""
     lines = [
         "[Context note - prior tool outcome; not an executable tool invocation]",
     ]
     call_id = item.get("call_id")
-    if isinstance(call_id, str) and call_id.strip():
+    if include_correlation_ref and isinstance(call_id, str) and call_id.strip():
         lines.append(f"Correlation ref: {call_id.strip()}")
     output = _stringify_grok_native_input_item_value(item.get("output")).strip()
     if output:
@@ -20269,20 +20345,40 @@ def _rewrite_grok_native_input_item_for_model_input(
     item: dict[str, Any],
     *,
     item_type: str,
+    include_correlation_ref: bool = True,
 ) -> Optional[dict[str, Any]]:
     if item_type == "function_call":
         return {
             "type": "message",
             "role": "assistant",
-            "content": _format_grok_native_function_call_input_message(item),
+            "content": _format_grok_native_function_call_input_message(
+                item,
+                include_correlation_ref=include_correlation_ref,
+            ),
         }
     if item_type == "function_call_output":
         return {
             "type": "message",
             "role": "user",
-            "content": _format_grok_native_function_call_output_input_message(item),
+            "content": _format_grok_native_function_call_output_input_message(
+                item,
+                include_correlation_ref=include_correlation_ref,
+            ),
         }
     return None
+
+
+def _is_anthropic_grok_native_responses_adapter_body(
+    request_body: dict[str, Any],
+) -> bool:
+    metadata = request_body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        metadata.get("route_family") == "anthropic_grok_native_responses_adapter"
+        or metadata.get("passthrough_route_family")
+        == "anthropic_grok_native_responses_adapter"
+    )
 
 
 def _add_grok_native_input_item_rewrite_logging_metadata(
@@ -20339,6 +20435,9 @@ def _rewrite_grok_native_unsupported_input_items_from_request_body(
 
     updated_input_items: list[Any] = []
     rewritten_items: list[dict[str, Any]] = []
+    include_correlation_ref = not _is_anthropic_grok_native_responses_adapter_body(
+        request_body
+    )
     for index, item in enumerate(input_items):
         if not isinstance(item, dict):
             updated_input_items.append(item)
@@ -20352,6 +20451,7 @@ def _rewrite_grok_native_unsupported_input_items_from_request_body(
         rewritten_item = _rewrite_grok_native_input_item_for_model_input(
             item,
             item_type=item_type,
+            include_correlation_ref=include_correlation_ref,
         )
         if rewritten_item is None:
             updated_input_items.append(item)
@@ -20364,7 +20464,13 @@ def _rewrite_grok_native_unsupported_input_items_from_request_body(
             "rewritten_role": rewritten_item.get("role"),
         }
         if isinstance(item.get("call_id"), str) and item["call_id"].strip():
-            metadata_item["call_id"] = item["call_id"].strip()
+            call_id = item["call_id"].strip()
+            if include_correlation_ref:
+                metadata_item["call_id"] = call_id
+            else:
+                metadata_item["call_id_hash"] = hashlib.sha256(
+                    call_id.encode("utf-8", errors="replace")
+                ).hexdigest()[:12]
         if isinstance(item.get("name"), str) and item["name"].strip():
             metadata_item["name"] = item["name"].strip()
         if item_type == "function_call_output":
