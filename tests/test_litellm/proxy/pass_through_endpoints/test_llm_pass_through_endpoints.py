@@ -129,6 +129,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _is_oa_xai_responses_model,
     _is_codex_google_code_assist_empty_success_model_response,
     _is_codex_auto_agent_malformed_tool_call_text_output,
+    _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body,
+    _validate_codex_auto_agent_responses_payload,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
     _perform_codex_auto_agent_openrouter_completion_request,
@@ -23353,6 +23355,254 @@ async def test_codex_auto_agent_grok_native_rejects_literal_composer_tool_transc
     assert "Name: exec_command" in record["malformed_tool_call_text"]
     assert "Name: write_stdin" in record["malformed_tool_call_text"]
     assert "composer_call" in record["malformed_tool_call_text"]
+
+
+def _grok_composer_exec_command_tool_request_body() -> dict[str, Any]:
+    return {
+        "model": "aawm-code",
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+    }
+
+
+def _grok_composer_literal_exec_command_response_payload() -> dict[str, Any]:
+    literal_text = (
+        "Inspecting the target files before editing.\n"
+        "Tool label: exec_command\n"
+        "Correlation ref: call-abc-composer_call_n9P0Z\n"
+        'Input payload: {"cmd": "rg -n expected tests"}'
+    )
+    return {
+        "id": "resp_grok_literal_tool_label",
+        "object": "response",
+        "status": "completed",
+        "model": "grok-composer-2.5-fast",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": literal_text}],
+            }
+        ],
+    }
+
+
+def test_codex_auto_agent_grok_native_repairs_literal_tool_label_exec_command_payload():
+    request_body = _grok_composer_exec_command_tool_request_body()
+    response_body = _grok_composer_literal_exec_command_response_payload()
+
+    repaired = _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+        response_body,
+        request_body=request_body,
+    )
+
+    assert repaired is not None
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(repaired) is False
+    function_calls = [
+        item
+        for item in repaired["output"]
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+    assert len(function_calls) == 1
+    assert function_calls[0]["name"] == "exec_command"
+    assert function_calls[0]["call_id"] == "call-abc-composer_call_n9P0Z"
+    assert json.loads(function_calls[0]["arguments"]) == {
+        "cmd": "rg -n expected tests"
+    }
+
+
+def test_codex_auto_agent_grok_native_repairs_advertised_tool_from_mixed_literal_blocks():
+    request_body = _grok_composer_exec_command_tool_request_body()
+    response_body = _grok_composer_literal_exec_command_response_payload()
+    response_body["output"][0]["content"][0]["text"] = (
+        "Delegating work to a worker first.\n"
+        "Tool label: spawn_agent\n"
+        "Correlation ref: call-abc-composer_call_spawn\n"
+        'Input payload: {"agent_type": "worker", "message": "fix it"}\n'
+        "Outcome text: spawn_agent failed: unknown agent type worker\n"
+        "Inspecting directly.\n"
+        "Tool label: exec_command\n"
+        "Correlation ref: call-def-composer_call_exec\n"
+        'Input payload: {"cmd": "git status -sb"}'
+    )
+
+    repaired = _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+        response_body,
+        request_body=request_body,
+    )
+
+    assert repaired is not None
+    rendered_repaired = json.dumps(repaired)
+    assert "Tool label:" not in rendered_repaired
+    assert "Input payload:" not in rendered_repaired
+    function_calls = [
+        item
+        for item in repaired["output"]
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+    assert len(function_calls) == 1
+    assert function_calls[0]["name"] == "exec_command"
+    assert function_calls[0]["call_id"] == "call-def-composer_call_exec"
+    assert json.loads(function_calls[0]["arguments"]) == {"cmd": "git status -sb"}
+
+
+@pytest.mark.parametrize(
+    "literal_text",
+    [
+        ("Tool label: exec_command\n" 'Input payload: {}'),
+        (
+            "Tool label: write_stdin\n"
+            'Input payload: {"chars": "", "session_id": 1}'
+        ),
+        (
+            "Tool label: exec_command\n"
+            'Input payload: {"cmd": 123}'
+        ),
+    ],
+)
+def test_codex_auto_agent_grok_native_literal_tool_label_repair_fails_closed(
+    literal_text: str,
+):
+    request_body = _grok_composer_exec_command_tool_request_body()
+    response_body = {
+        "id": "resp_grok_literal_reject",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": literal_text}],
+            }
+        ],
+    }
+
+    assert (
+        _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+            response_body,
+            request_body=request_body,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_grok_native_request_repairs_literal_tool_label_exec_command():
+    request = _build_codex_auto_agent_request("codex-grok-session")
+    request_body = _grok_composer_exec_command_tool_request_body()
+    request_body.update(
+        {
+            "input": "hello",
+            "stream": False,
+            "litellm_metadata": {"requested_model_alias": "aawm-code"},
+        }
+    )
+    grok_prepared_body = {
+        "model": "grok-composer-2.5-fast",
+        "input": "hello",
+        "stream": False,
+        "tools": request_body["tools"],
+    }
+    upstream_response = Response(
+        content=json.dumps(_grok_composer_literal_exec_command_response_payload()),
+        media_type="application/json",
+    )
+
+    with patch.object(
+        BaseOpenAIPassThroughHandler,
+        "_prepare_openai_grok_native_oauth_context",
+        new=AsyncMock(
+            return_value=(
+                "http://localhost:4001/grok",
+                {"authorization": "Bearer grok-oidc-token"},
+                grok_prepared_body,
+                "http://localhost:4001/grok/v1/responses",
+            )
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=upstream_response),
+    ):
+        response = await _perform_codex_auto_agent_grok_native_responses_request(
+            endpoint="/v1/responses",
+            request=request,
+            user_api_key_dict=MagicMock(),
+            request_body=request_body,
+        )
+
+    repaired_body = json.loads(response.body)
+    function_calls = [
+        item
+        for item in repaired_body["output"]
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+    assert len(function_calls) == 1
+    assert function_calls[0]["name"] == "exec_command"
+    assert json.loads(function_calls[0]["arguments"]) == {
+        "cmd": "rg -n expected tests"
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_grok_native_stream_repairs_literal_tool_label_exec_command():
+    response_body = _grok_composer_literal_exec_command_response_payload()
+
+    async def _chunks():
+        yield (
+            "event: response.completed\n"
+            + "data: "
+            + json.dumps(
+                {"type": "response.completed", "response": response_body}
+            )
+            + "\n\n"
+        ).encode("utf-8")
+
+    upstream_response = StreamingResponse(
+        _chunks(),
+        media_type="text/event-stream",
+    )
+
+    repaired_response = await _validate_codex_auto_agent_responses_payload(
+        upstream_response,
+        adapter_model="grok-composer-2.5-fast",
+        adapter="codex_auto_agent_grok_native_responses",
+        adapter_label="Grok native",
+        request_body=_grok_composer_exec_command_tool_request_body(),
+    )
+
+    chunks: list[str] = []
+    async for chunk in repaired_response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk))
+    rendered_stream = "".join(chunks)
+
+    assert "Tool label:" not in rendered_stream
+    assert "Input payload:" not in rendered_stream
+    assert '"type": "function_call"' in rendered_stream
+    assert '"name": "exec_command"' in rendered_stream
+    assert "event: response.completed" in rendered_stream
+    completed_line = next(
+        line
+        for line in rendered_stream.splitlines()
+        if line.startswith('data: {"type": "response.completed"')
+    )
+    completed_event = json.loads(completed_line.removeprefix("data: "))
+    function_call = next(
+        item
+        for item in completed_event["response"]["output"]
+        if item.get("type") == "function_call"
+    )
+    assert json.loads(function_call["arguments"]) == {
+        "cmd": "rg -n expected tests"
+    }
 
 
 @pytest.mark.asyncio

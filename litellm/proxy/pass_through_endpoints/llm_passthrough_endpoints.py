@@ -14802,6 +14802,471 @@ def _build_malformed_tool_call_intake_context(
     return {key: value for key, value in context.items() if value is not None}
 
 
+_GROK_COMPOSER_LITERAL_TOOL_LABEL_LINE_RE = re.compile(
+    r"(?im)^Tool label:\s*(?P<name>[^\n]+)\s*$"
+)
+_GROK_COMPOSER_LITERAL_CORRELATION_REF_LINE_RE = re.compile(
+    r"(?im)^Correlation ref:\s*(?P<call_id>[^\n]+)\s*$"
+)
+_GROK_COMPOSER_LITERAL_INPUT_PAYLOAD_LINE_RE = re.compile(
+    r"(?im)^Input payload:\s*(?P<payload>.+?)\s*$"
+)
+
+
+def _parse_grok_composer_literal_tool_label_blocks(
+    text: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    blocks: list[dict[str, Any]] = []
+    current_name: Optional[str] = None
+    current_call_id: Optional[str] = None
+    current_payload: Optional[str] = None
+
+    def _flush_current() -> None:
+        nonlocal current_name, current_call_id, current_payload
+        if current_name is None and current_payload is None:
+            return
+        blocks.append(
+            {
+                "name": current_name,
+                "call_id": current_call_id,
+                "payload": current_payload or "",
+            }
+        )
+        current_name = None
+        current_call_id = None
+        current_payload = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        label_match = _GROK_COMPOSER_LITERAL_TOOL_LABEL_LINE_RE.match(line)
+        if label_match:
+            _flush_current()
+            current_name = label_match.group("name").strip()
+            continue
+        correlation_match = _GROK_COMPOSER_LITERAL_CORRELATION_REF_LINE_RE.match(line)
+        if correlation_match and current_name is not None:
+            current_call_id = correlation_match.group("call_id").strip()
+            continue
+        payload_match = _GROK_COMPOSER_LITERAL_INPUT_PAYLOAD_LINE_RE.match(line)
+        if payload_match and current_name is not None:
+            current_payload = payload_match.group("payload").strip()
+            _flush_current()
+            continue
+    _flush_current()
+
+    return [
+        block
+        for block in blocks
+        if isinstance(block.get("name"), str)
+        and block["name"].strip()
+        and isinstance(block.get("payload"), str)
+        and block["payload"].strip()
+    ]
+
+
+def _parse_grok_composer_literal_tool_payload_json(payload: str) -> Any:
+    if not isinstance(payload, str) or not payload.strip():
+        raise ValueError("empty_tool_payload")
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid_tool_payload_json") from exc
+
+
+def _build_advertised_openai_function_tools_index(
+    request_body: Optional[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(request_body, dict):
+        return {}
+
+    tools_index: dict[str, dict[str, Any]] = {}
+    for source in (request_body.get("tools"), request_body.get("functions")):
+        if not isinstance(source, list):
+            continue
+        for tool in source:
+            if not isinstance(tool, dict):
+                continue
+            tool_name = _tool_definition_name(tool)
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                continue
+            parameters = _tool_definition_parameters(tool)
+            tools_index[tool_name] = _normalize_openai_function_tool_parameters(
+                parameters
+            )
+    return tools_index
+
+
+def _json_schema_value_matches_type(value: Any, schema_type: str) -> bool:
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "object":
+        return isinstance(value, dict)
+    if schema_type == "null":
+        return value is None
+    return True
+
+
+def _validate_tool_arguments_against_openai_parameters(
+    *,
+    tool_name: str,
+    arguments: Any,
+    parameters: dict[str, Any],
+) -> Optional[str]:
+    if not isinstance(arguments, dict):
+        return "tool_arguments_not_object"
+
+    if parameters.get("type") not in {None, "object"}:
+        return "tool_schema_unsupported_root_type"
+
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+
+    required = parameters.get("required")
+    required_fields: list[str] = []
+    if isinstance(required, list):
+        required_fields = [
+            field
+            for field in required
+            if isinstance(field, str) and field.strip()
+        ]
+
+    for field in required_fields:
+        if field not in arguments:
+            return f"missing_required_argument:{field}"
+
+    additional_properties = parameters.get("additionalProperties", True)
+    if additional_properties is False:
+        unknown_keys = sorted(
+            key for key in arguments.keys() if key not in properties
+        )
+        if unknown_keys:
+            return f"unknown_argument:{unknown_keys[0]}"
+
+    for key, value in arguments.items():
+        property_schema = properties.get(key)
+        if not isinstance(property_schema, dict):
+            if additional_properties is False:
+                return f"unknown_argument:{key}"
+            continue
+        schema_type = property_schema.get("type")
+        if isinstance(schema_type, list):
+            if not any(
+                _json_schema_value_matches_type(value, candidate)
+                for candidate in schema_type
+                if isinstance(candidate, str)
+            ):
+                return f"argument_type_mismatch:{key}"
+            continue
+        if isinstance(schema_type, str) and not _json_schema_value_matches_type(
+            value, schema_type
+        ):
+            return f"argument_type_mismatch:{key}"
+
+    return None
+
+
+def _build_repaired_grok_composer_function_call_output_item(
+    *,
+    tool_name: str,
+    call_id: Optional[str],
+    arguments: dict[str, Any],
+    block_index: int,
+) -> dict[str, Any]:
+    resolved_call_id = (
+        call_id.strip()
+        if isinstance(call_id, str) and call_id.strip()
+        else f"call_repaired_{block_index}_{uuid4().hex[:12]}"
+    )
+    return {
+        "type": "function_call",
+        "name": tool_name,
+        "call_id": resolved_call_id,
+        "arguments": json.dumps(arguments, ensure_ascii=False, sort_keys=True),
+    }
+
+
+def _repair_grok_composer_literal_tool_calls_in_text(
+    text: str,
+    *,
+    advertised_tools: dict[str, dict[str, Any]],
+) -> tuple[Optional[str], list[dict[str, Any]]]:
+    blocks = _parse_grok_composer_literal_tool_label_blocks(text)
+    if not blocks:
+        return None, []
+
+    repaired_items: list[dict[str, Any]] = []
+    for block_index, block in enumerate(blocks):
+        tool_name = str(block.get("name") or "").strip()
+        if tool_name not in advertised_tools:
+            continue
+        try:
+            parsed_arguments = _parse_grok_composer_literal_tool_payload_json(
+                str(block.get("payload") or "")
+            )
+        except ValueError:
+            return None, []
+        validation_error = _validate_tool_arguments_against_openai_parameters(
+            tool_name=tool_name,
+            arguments=parsed_arguments,
+            parameters=advertised_tools[tool_name],
+        )
+        if validation_error is not None:
+            return None, []
+        if not isinstance(parsed_arguments, dict):
+            return None, []
+        repaired_items.append(
+            _build_repaired_grok_composer_function_call_output_item(
+                tool_name=tool_name,
+                call_id=block.get("call_id")
+                if isinstance(block.get("call_id"), str)
+                else None,
+                arguments=parsed_arguments,
+                block_index=block_index,
+            )
+        )
+    if not repaired_items:
+        return None, []
+
+    stripped_text = text
+    for block in blocks:
+        name = str(block.get("name") or "").strip()
+        payload = str(block.get("payload") or "").strip()
+        call_id = (
+            str(block.get("call_id") or "").strip()
+            if isinstance(block.get("call_id"), str)
+            else ""
+        )
+        for pattern in (
+            rf"(?im)^Tool label:\s*{re.escape(name)}\s*$",
+            rf"(?im)^Correlation ref:\s*{re.escape(call_id)}\s*$" if call_id else None,
+            rf"(?im)^Input payload:\s*{re.escape(payload)}\s*$",
+        ):
+            if pattern is None:
+                continue
+            stripped_text = re.sub(pattern, "", stripped_text)
+    stripped_text = re.sub(r"\n{3,}", "\n\n", stripped_text).strip()
+    if stripped_text and is_malformed_composer_call_literal_text(stripped_text):
+        return None, []
+    return stripped_text or None, repaired_items
+
+
+def _response_body_has_grok_composer_literal_tool_label_blocks(
+    response_body: dict[str, Any],
+) -> bool:
+    output = response_body.get("output")
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in {"text", "output_text"}:
+                continue
+            if _parse_grok_composer_literal_tool_label_blocks(part.get("text") or ""):
+                return True
+    return False
+
+
+def _repair_grok_composer_literal_tool_calls_in_message_item(
+    item: dict[str, Any],
+    *,
+    advertised_tools: dict[str, dict[str, Any]],
+) -> Optional[tuple[list[dict[str, Any]], bool]]:
+    content = item.get("content")
+    if not isinstance(content, list):
+        return [item], False
+
+    message_items: list[dict[str, Any]] = []
+    leftover_text_parts: list[str] = []
+    message_has_literal_blocks = False
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") not in {"text", "output_text"}:
+            return None if message_has_literal_blocks else ([item], False)
+
+        text = part.get("text") or ""
+        if not _parse_grok_composer_literal_tool_label_blocks(text):
+            if isinstance(text, str) and text.strip():
+                leftover_text_parts.append(text.strip())
+            continue
+
+        message_has_literal_blocks = True
+        leftover_text, repaired_calls = _repair_grok_composer_literal_tool_calls_in_text(
+            text,
+            advertised_tools=advertised_tools,
+        )
+        if not repaired_calls:
+            return None
+        if isinstance(leftover_text, str) and leftover_text.strip():
+            leftover_text_parts.append(leftover_text.strip())
+        message_items.extend(repaired_calls)
+
+    if not message_items:
+        return [item], False
+
+    repaired_items: list[dict[str, Any]] = []
+    if leftover_text_parts:
+        repaired_items.append(
+            {
+                **item,
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "\n\n".join(leftover_text_parts),
+                    }
+                ],
+            }
+        )
+    repaired_items.extend(message_items)
+    return repaired_items, True
+
+
+def _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+    response_body: dict[str, Any],
+    *,
+    request_body: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not isinstance(response_body, dict):
+        return None
+    if not (
+        _is_codex_auto_agent_malformed_tool_call_text_output(response_body)
+        or _response_body_has_grok_composer_literal_tool_label_blocks(response_body)
+    ):
+        return None
+
+    advertised_tools = _build_advertised_openai_function_tools_index(request_body)
+    if not advertised_tools:
+        return None
+
+    output = response_body.get("output")
+    if not isinstance(output, list):
+        return None
+
+    repaired_output: list[dict[str, Any]] = []
+    repaired_any = False
+    for item in output:
+        if not isinstance(item, dict):
+            repaired_output.append(item)
+            continue
+        if item.get("type") != "message":
+            repaired_output.append(item)
+            continue
+
+        repaired_message = _repair_grok_composer_literal_tool_calls_in_message_item(
+            item,
+            advertised_tools=advertised_tools,
+        )
+        if repaired_message is None:
+            return None
+        repaired_items, repaired_item = repaired_message
+        repaired_output.extend(repaired_items)
+        repaired_any = repaired_any or repaired_item
+
+    if not repaired_any:
+        return None
+
+    repaired_body = dict(response_body)
+    repaired_body["output"] = repaired_output
+    if _is_codex_auto_agent_malformed_tool_call_text_output(repaired_body):
+        return None
+    return repaired_body
+
+
+def _responses_repaired_output_item_id(item: dict[str, Any], index: int) -> str:
+    for key in ("id", "call_id"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return f"item_{index}"
+
+
+async def _responses_sse_from_repaired_response_body(
+    response_body: dict[str, Any],
+) -> Any:
+    output = response_body.get("output")
+    if not isinstance(output, list):
+        output = []
+    for index, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+        item_id = _responses_repaired_output_item_id(item, index)
+        yield (
+            "event: response.output_item.added\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": index,
+                    "item": item,
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n"
+        )
+        if item.get("type") == "function_call":
+            arguments = item.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = _stringify_grok_native_input_item_value(arguments)
+            yield (
+                "event: response.function_call_arguments.done\n"
+                + "data: "
+                + json.dumps(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item_id,
+                        "output_index": index,
+                        "arguments": arguments,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+        yield (
+            "event: response.output_item.done\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": index,
+                    "item": item,
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n"
+        )
+    yield (
+        "event: response.completed\n"
+        + "data: "
+        + json.dumps(
+            {
+                "type": "response.completed",
+                "response": response_body,
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
+    yield "data: [DONE]\n\n"
+
+
 def _is_codex_auto_agent_malformed_tool_call_text_output(
     response_body: dict[str, Any],
 ) -> bool:
@@ -15199,6 +15664,7 @@ async def _validate_codex_auto_agent_responses_payload(
     adapter: str,
     adapter_label: str,
     intake_context: Optional[dict[str, Any]] = None,
+    request_body: Optional[dict[str, Any]] = None,
 ) -> Response:
     if isinstance(response, StreamingResponse):
         buffered_chunks: list[Any] = []
@@ -15226,6 +15692,22 @@ async def _validate_codex_auto_agent_responses_payload(
                 adapter=adapter,
                 adapter_label=adapter_label,
                 stream_event_summaries=event_summaries,
+            )
+        repaired_body = (
+            _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+                response_body,
+                request_body=request_body,
+            )
+            if adapter == "codex_auto_agent_grok_native_responses"
+            else None
+        )
+        if isinstance(repaired_body, dict):
+            response_body = repaired_body
+            return StreamingResponse(
+                _responses_sse_from_repaired_response_body(response_body),
+                headers=dict(response.headers),
+                status_code=response.status_code,
+                media_type=response.media_type or "text/event-stream",
             )
         if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
             _raise_codex_auto_agent_malformed_tool_call_text_payload(
@@ -15260,17 +15742,31 @@ async def _validate_codex_auto_agent_responses_payload(
                 adapter=adapter,
                 adapter_label=adapter_label,
             )
-        if (
-            isinstance(response_body, dict)
-            and _is_codex_auto_agent_malformed_tool_call_text_output(response_body)
-        ):
-            _raise_codex_auto_agent_malformed_tool_call_text_payload(
-                response_body=response_body,
-                adapter_model=adapter_model,
-                adapter=adapter,
-                adapter_label=adapter_label,
-                intake_context=intake_context,
+        if isinstance(response_body, dict):
+            repaired_body = (
+                _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+                    response_body,
+                    request_body=request_body,
+                )
+                if adapter == "codex_auto_agent_grok_native_responses"
+                else None
             )
+            if isinstance(repaired_body, dict):
+                response_body = repaired_body
+                return Response(
+                    content=json.dumps(response_body),
+                    media_type=response.media_type or "application/json",
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                )
+            if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+                _raise_codex_auto_agent_malformed_tool_call_text_payload(
+                    response_body=response_body,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    intake_context=intake_context,
+                )
     return response
 
 
@@ -26665,6 +27161,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
             upstream_url=str(updated_url),
             provider="grok",
         ),
+        request_body=request_body,
     )
 
 
