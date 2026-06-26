@@ -53,7 +53,7 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
-### aawm.107 — Composer-call malformed tool text quarantine for auto-agent aliases
+### aawm.107 — Composer-call malformed tool text quarantine and bounded Grok literal-tool repair for auto-agent aliases
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.107`.
 AAWM agent quality scoring now detects literal/non-executing `composer_call`
@@ -65,7 +65,14 @@ Codex auto-agent passthrough validation applies the same detection to Responses
 payloads and rejects malformed candidate output as
 `aawm_auto_agent_malformed_tool_call_text` / `provider_format_rejected` so alias
 routing can cool down that candidate and continue failover instead of trusting a
-fake tool call as a successful worker result.
+fake tool call as a successful worker result. When Grok Composer emits literal
+`Tool label:` / `Input payload:` blocks inside assistant text, Codex auto-agent
+Grok native passthrough can repair advertised, schema-valid tool calls into
+structured `function_call` output items the parent harness can execute.
+Unadvertised tools, invalid JSON payloads, schema-invalid arguments, ambiguous
+literal blocks, and text that still matches malformed composer-call patterns
+fail closed and remain subject to quarantine/rejection rather than speculative
+repair.
 
 **Why:** Engineer/tool-bearing agents routed through non-Claude models were
 sometimes emitting composer-style tool-call text with `composer_call` call IDs
@@ -73,21 +80,30 @@ and special tool-call terminator tokens as plain assistant output. The parent
 harness did not execute those fake calls, so the agent appeared to do nothing
 and could silently stop. D1-396 makes that malformed output deterministic and
 visible while preserving valid structured tool calls whose `call_id` merely
-contains `composer_call`.
+contains `composer_call`. D1-411 adds a bounded repair path for Grok Composer's
+literal tool transcript shape so advertised tools with valid arguments can
+execute instead of being discarded when the model formats the call as prose.
 
 **Why not upstream:** This is specific to AAWM auto-agent alias routing,
 LiteLLM-side subagent quality scoring, and local operator requirements for
-malformed worker-output quarantine and redispatch/failover visibility.
+malformed worker-output quarantine, Grok Composer literal-tool repair, and
+redispatch/failover visibility.
 
 **Validation status:** Focused agent-quality and scorer tests passed (`10
-passed`), focused passthrough tests passed (`4 passed`), py_compile passed on
-the touched runtime/scoring files, `git diff --check` passed, and
-`litellm-dev` restarted healthy. In-container smoke validation after restart
-showed same-line and multi-line serialized composer-call text return `True`
-while benign prose returns `False`. Dev route logs also showed a live
-`aawm-code-anthropic` Grok Composer candidate classified as
-`aawm_auto_agent_malformed_tool_call_text` / `provider_format_rejected` and
-cooled down instead of accepted as successful output.
+passed`), focused passthrough quarantine tests passed (`4 passed`), focused
+Grok Composer literal `Tool label:` / `Input payload:` repair tests passed for
+non-stream repair, stream `response.completed` repair, mixed-block advertised
+tool recovery, and fail-closed invalid/unadvertised payload cases. py_compile
+passed on the touched runtime/scoring files, `git diff --check` passed, and
+`litellm-dev` restarted healthy with the source-mounted repair code. In-container
+smoke validation after restart showed same-line and multi-line serialized
+composer-call text return `True` while benign prose returns `False`, and a dev
+in-container repair probe confirmed literal `exec_command` payloads are
+rewritten to structured `function_call` output when the request advertises a
+matching tool schema. Dev route logs also showed a live `aawm-code-anthropic`
+Grok Composer candidate classified as `aawm_auto_agent_malformed_tool_call_text`
+/ `provider_format_rejected` and cooled down instead of accepted as successful
+output when repair did not apply.
 
 ### aawm.106 — Deterministic aiohttp shutdown cleanup and ownership accounting
 
