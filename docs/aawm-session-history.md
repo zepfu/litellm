@@ -854,6 +854,13 @@ Rows affected by this path may include:
   text uses neutral context-note wording, not `Previous tool call`, `Name`,
   `Call ID`, or `Arguments` transcript fields, so Grok Composer is not primed to
   re-emit a non-executing tool-call template as assistant output.
+- `anthropic_grok_native_prior_function_call_replay_dropped_count` and
+  `anthropic_grok_native_prior_function_call_replay_dropped_items`: Anthropic
+  Grok-native adapter requests drop prior assistant `tool_use` replay before
+  Grok-native input-item rewriting. Paired tool-result observations remain
+  available as user-side context, but prior tool calls are not sent as
+  assistant-authored text because Grok Composer can copy that context forward as
+  malformed tool-call output.
 - `xai_responses_request_sanitized`: `true` when the outgoing request body was
   changed before xAI egress.
 - `xai_responses_previous_response_id_decoded`: `true` when a LiteLLM-encoded

@@ -22654,7 +22654,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rejects_malformed_c
 
 
 @pytest.mark.asyncio
-async def test_anthropic_grok_native_oauth_responses_adapter_rewrites_composer_tool_input_items(
+async def test_anthropic_grok_native_oauth_responses_adapter_drops_prior_tool_call_replay(
     monkeypatch,
 ):
     monkeypatch.setenv(
@@ -22667,6 +22667,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rewrites_composer_t
         "session_id": "claude-grok-session",
         "user-agent": "claude-cli/2.0.0",
     }
+    tool_use_id = "call-7b0e3b7b-composer_call_EHQUZ"
     body = {
         "model": "aawm-code-anthropic",
         "messages": [
@@ -22676,7 +22677,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rewrites_composer_t
                 "content": [
                     {
                         "type": "tool_use",
-                        "id": "toolu_1",
+                        "id": tool_use_id,
                         "name": "Bash",
                         "input": {"command": "pwd"},
                     }
@@ -22687,7 +22688,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rewrites_composer_t
                 "content": [
                     {
                         "type": "tool_result",
-                        "tool_use_id": "toolu_1",
+                        "tool_use_id": tool_use_id,
                         "content": "ok",
                     }
                 ],
@@ -22743,24 +22744,42 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rewrites_composer_t
     ]
     assert "function_call" not in input_types
     assert "function_call_output" not in input_types
-    assert any(
-        isinstance(item, dict)
-        and item.get("role") == "assistant"
-        and "prior assistant step" in str(item.get("content"))
-        for item in custom_body["input"]
-    )
+    rendered_input = json.dumps(custom_body["input"], ensure_ascii=False)
+    rendered_body = json.dumps(custom_body, ensure_ascii=False)
+    assert "prior assistant step" not in rendered_input
+    assert "Tool label" not in rendered_input
+    assert "Input payload" not in rendered_input
+    assert "composer_call" not in rendered_input
+    assert "composer_call" not in rendered_body
     assert any(
         isinstance(item, dict)
         and item.get("role") == "user"
         and "prior tool outcome" in str(item.get("content"))
         for item in custom_body["input"]
     )
+    from litellm.integrations.aawm_agent_quality_rules import (
+        is_malformed_composer_call_literal_text,
+    )
+
+    assert not is_malformed_composer_call_literal_text(rendered_input)
     metadata = custom_body["litellm_metadata"]
-    assert metadata["grok_native_input_item_rewrite_count"] == 2
-    assert metadata["grok_native_input_item_rewrite_types"] == [
-        "function_call",
-        "function_call_output",
-    ]
+    assert metadata["grok_native_input_item_rewrite_count"] == 1
+    assert metadata["grok_native_input_item_rewrite_types"] == ["function_call_output"]
+    assert metadata["grok_native_input_item_rewrites"][0]["type"] == (
+        "function_call_output"
+    )
+    assert "call_id_hash" in metadata["grok_native_input_item_rewrites"][0]
+    assert "call_id" not in metadata["grok_native_input_item_rewrites"][0]
+    assert (
+        metadata["anthropic_grok_native_prior_function_call_replay_dropped_count"]
+        == 1
+    )
+    assert metadata["anthropic_grok_native_prior_function_call_replay_dropped_items"][
+        0
+    ]["name"] == "Bash"
+    assert "call_id_hash" in metadata[
+        "anthropic_grok_native_prior_function_call_replay_dropped_items"
+    ][0]
     assert metadata["passthrough_route_family"] == (
         "anthropic_grok_native_responses_adapter"
     )
