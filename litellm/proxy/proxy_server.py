@@ -221,7 +221,7 @@ from litellm.constants import (
     PROXY_BUDGET_RESCHEDULER_MIN_TIME,
 )
 from litellm.exceptions import RejectedRequestError
-from litellm.integrations.custom_guardrail import ModifyResponseException
+from litellm.integrations.custom_guardrail import CustomGuardrail, ModifyResponseException
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
 from litellm.litellm_core_utils.core_helpers import (
@@ -748,31 +748,42 @@ async def _close_guardrail_shutdown_hooks() -> None:
     """Close lifecycle-owned resources on initialized guardrail callbacks."""
     guardrail_callbacks: List[Any] = []
 
+    def _append_guardrail_callback(callback: Any) -> None:
+        if callback is not None:
+            guardrail_callbacks.append(callback)
+
     try:
         from litellm.proxy.guardrails.guardrail_registry import (
             IN_MEMORY_GUARDRAIL_HANDLER,
         )
 
-        guardrail_callbacks.extend(
-            callback
-            for callback in IN_MEMORY_GUARDRAIL_HANDLER.guardrail_id_to_custom_guardrail.values()
-            if callback is not None
-        )
+        for callback in (
+            IN_MEMORY_GUARDRAIL_HANDLER.guardrail_id_to_custom_guardrail.values()
+        ):
+            _append_guardrail_callback(callback)
     except Exception as e:
         verbose_proxy_logger.debug(
             "Guardrail shutdown registry lookup failed: %s", e
         )
 
-    for callback in litellm.callbacks:
-        if not isinstance(callback, str):
-            guardrail_callbacks.append(callback)
+    try:
+        for callback in litellm.logging_callback_manager.get_custom_loggers_for_type(
+            CustomGuardrail
+        ):
+            _append_guardrail_callback(callback)
+    except Exception as e:
+        verbose_proxy_logger.debug(
+            "Guardrail shutdown callback manager lookup failed: %s", e
+        )
+
+    # litellm.guardrail_name_config_map stores GuardrailItem config (callback
+    # names), not initialized callback instances. Initialized instances are
+    # reached through the registry and logging callback lists above.
 
     if llm_router is not None and hasattr(llm_router, "guardrail_list"):
         for guardrail in getattr(llm_router, "guardrail_list", []) or []:
             if isinstance(guardrail, dict):
-                callback = guardrail.get("callback")
-                if callback is not None:
-                    guardrail_callbacks.append(callback)
+                _append_guardrail_callback(guardrail.get("callback"))
 
     seen_callback_ids: Set[int] = set()
     for callback in guardrail_callbacks:

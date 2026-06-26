@@ -34,11 +34,24 @@ async def test_proxy_shutdown_event_runs_guardrail_shutdown_hooks():
 
     guardrail = GuardrailWithShutdown()
 
+    empty_handler = type(
+        "Handler",
+        (),
+        {"guardrail_id_to_custom_guardrail": {}},
+    )()
+
     with patch.object(
         proxy_server_module.litellm,
         "close_litellm_async_clients",
         new=AsyncMock(name="close_litellm_async_clients"),
-    ), patch.object(proxy_server_module.litellm, "callbacks", [guardrail]):
+    ), patch(
+        "litellm.proxy.guardrails.guardrail_registry.IN_MEMORY_GUARDRAIL_HANDLER",
+        empty_handler,
+    ), patch.object(
+        proxy_server_module.litellm.logging_callback_manager,
+        "get_custom_loggers_for_type",
+        return_value=[guardrail],
+    ):
         await proxy_server_module.proxy_shutdown_event()
 
     assert guardrail.shutdown_calls == 1
@@ -56,12 +69,23 @@ async def test_proxy_shutdown_event_logs_guardrail_shutdown_hook_errors():
 
     guardrail = FailingGuardrailShutdown()
 
+    empty_handler = type(
+        "Handler",
+        (),
+        {"guardrail_id_to_custom_guardrail": {}},
+    )()
+
     with patch.object(
         proxy_server_module.litellm,
         "close_litellm_async_clients",
         new=AsyncMock(name="close_litellm_async_clients"),
+    ), patch(
+        "litellm.proxy.guardrails.guardrail_registry.IN_MEMORY_GUARDRAIL_HANDLER",
+        empty_handler,
     ), patch.object(
-        proxy_server_module.litellm, "callbacks", [guardrail]
+        proxy_server_module.litellm.logging_callback_manager,
+        "get_custom_loggers_for_type",
+        return_value=[guardrail],
     ), patch.object(
         proxy_server_module.verbose_proxy_logger,
         "error",
@@ -96,3 +120,139 @@ async def test_proxy_shutdown_event_logs_error_when_cached_async_client_cleanup_
     close_cached_clients.assert_awaited_once()
     mock_error.assert_called()
     assert "cached LiteLLM async HTTP clients" in str(mock_error.call_args)
+
+@pytest.mark.asyncio
+async def test_proxy_shutdown_event_closes_guardrail_from_in_memory_registry_only():
+    """Guardrails reachable only via IN_MEMORY_GUARDRAIL_HANDLER still shut down."""
+    from litellm.proxy import proxy_server as proxy_server_module
+
+    class RegistryOnlyGuardrail:
+        guardrail_name = "registry-only-guardrail"
+
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        async def async_shutdown_hook(self):
+            self.shutdown_calls += 1
+
+    guardrail = RegistryOnlyGuardrail()
+    mock_handler = type(
+        "Handler",
+        (),
+        {"guardrail_id_to_custom_guardrail": {"gid-1": guardrail}},
+    )()
+
+    with patch.object(
+        proxy_server_module.litellm,
+        "close_litellm_async_clients",
+        new=AsyncMock(name="close_litellm_async_clients"),
+    ), patch.object(
+        proxy_server_module.litellm,
+        "callbacks",
+        [],
+    ), patch(
+        "litellm.proxy.guardrails.guardrail_registry.IN_MEMORY_GUARDRAIL_HANDLER",
+        mock_handler,
+    ), patch.object(
+        proxy_server_module.litellm.logging_callback_manager,
+        "get_custom_loggers_for_type",
+        return_value=[],
+    ):
+        await proxy_server_module.proxy_shutdown_event()
+
+    assert guardrail.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_proxy_shutdown_event_closes_guardrail_from_logging_callback_manager_only():
+    """Session-owning guardrails registered only on logging_callback_manager close once."""
+    from litellm.proxy import proxy_server as proxy_server_module
+
+    class ManagerOnlyGuardrail:
+        guardrail_name = "manager-only-guardrail"
+
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        async def async_shutdown_hook(self):
+            self.shutdown_calls += 1
+
+    guardrail = ManagerOnlyGuardrail()
+    empty_handler = type(
+        "Handler",
+        (),
+        {"guardrail_id_to_custom_guardrail": {}},
+    )()
+
+    with patch.object(
+        proxy_server_module.litellm,
+        "close_litellm_async_clients",
+        new=AsyncMock(name="close_litellm_async_clients"),
+    ), patch.object(
+        proxy_server_module.litellm,
+        "callbacks",
+        [],
+    ), patch(
+        "litellm.proxy.guardrails.guardrail_registry.IN_MEMORY_GUARDRAIL_HANDLER",
+        empty_handler,
+    ), patch.object(
+        proxy_server_module.litellm.logging_callback_manager,
+        "get_custom_loggers_for_type",
+        return_value=[guardrail],
+    ):
+        await proxy_server_module.proxy_shutdown_event()
+
+    assert guardrail.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_proxy_shutdown_event_deduplicates_guardrail_shutdown_hooks():
+    from litellm.proxy import proxy_server as proxy_server_module
+
+    class SharedGuardrail:
+        guardrail_name = "deduped-guardrail"
+
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        async def async_shutdown_hook(self):
+            self.shutdown_calls += 1
+
+    guardrail = SharedGuardrail()
+    mock_handler = type(
+        "Handler",
+        (),
+        {"guardrail_id_to_custom_guardrail": {"gid-1": guardrail}},
+    )()
+
+    with patch.object(
+        proxy_server_module.litellm,
+        "close_litellm_async_clients",
+        new=AsyncMock(name="close_litellm_async_clients"),
+    ), patch.object(
+        proxy_server_module.litellm,
+        "callbacks",
+        [guardrail],
+    ), patch(
+        "litellm.proxy.guardrails.guardrail_registry.IN_MEMORY_GUARDRAIL_HANDLER",
+        mock_handler,
+    ), patch.object(
+        proxy_server_module.litellm.logging_callback_manager,
+        "get_custom_loggers_for_type",
+        return_value=[guardrail],
+    ), patch.object(
+        proxy_server_module,
+        "llm_router",
+        type(
+            "Router",
+            (),
+            {
+                "guardrail_list": [
+                    {"callback": guardrail, "guardrail_name": "deduped-guardrail"}
+                ]
+            },
+        )(),
+    ):
+        await proxy_server_module.proxy_shutdown_event()
+
+    assert guardrail.shutdown_calls == 1
