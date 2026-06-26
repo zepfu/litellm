@@ -84,6 +84,17 @@ If you need more fine-grained control, you can implement individual event hooks 
 
 :::
 
+### Resource Cleanup
+
+If a custom guardrail owns async resources such as an `aiohttp.ClientSession`,
+database pool, or background client, implement `async_shutdown_hook()` on the
+guardrail class and close those resources there. LiteLLM calls guardrail
+shutdown hooks during proxy shutdown for initialized guardrails registered
+through the in-memory guardrail registry, the logging callback manager, and
+router guardrail load-balancing entries. The hook may be either sync or async,
+but async resources should be closed from the hook instead of request-time
+cleanup or object destructors.
+
 ### 2. Pass your custom guardrail class in LiteLLM `config.yaml`
 
 In the config below, we point the guardrail to our custom guardrail by setting `guardrail: custom_guardrail.myCustomGuardrail`
