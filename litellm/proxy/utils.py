@@ -19,6 +19,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Set,
     Union,
     cast,
     overload,
@@ -1732,7 +1733,9 @@ class ProxyLogging:
         # Track the first HTTPException returned or raised by any callback
         transformed_exception: Optional[HTTPException] = None
 
+        seen_callback_ids: Set[int] = set()
         for callback in litellm.callbacks:
+            seen_callback_ids.add(id(callback))
             try:
                 _callback: Optional[CustomLogger] = None
                 if isinstance(callback, str):
@@ -1767,6 +1770,38 @@ class ProxyLogging:
             except Exception as e:
                 verbose_proxy_logger.exception(
                     f"[Non-Blocking] Error setting up post_call_failure_hook callback: {e}"
+                )
+
+        for callback in litellm.failure_callback:
+            if id(callback) in seen_callback_ids:
+                continue
+            try:
+                _callback = None
+                if isinstance(callback, str):
+                    _callback = litellm.litellm_core_utils.litellm_logging.get_custom_logger_compatible_class(
+                        cast(_custom_logger_compatible_callbacks_literal, callback)
+                    )
+                else:
+                    _callback = callback  # type: ignore
+                if _callback is not None and isinstance(_callback, CustomLogger):
+                    try:
+                        await _callback.async_post_call_failure_hook(
+                            request_data=request_data,
+                            user_api_key_dict=user_api_key_dict,
+                            original_exception=original_exception,
+                            traceback_str=traceback_str,
+                        )
+                    except HTTPException:
+                        # failure_callback is a logging surface; keep response
+                        # transformation semantics limited to litellm.callbacks.
+                        pass
+                    except Exception as e:
+                        verbose_proxy_logger.exception(
+                            f"[Non-Blocking] Error in failure_callback async_post_call_failure_hook callback: {e}"
+                        )
+            except Exception as e:
+                verbose_proxy_logger.exception(
+                    f"[Non-Blocking] Error setting up failure_callback post_call_failure_hook callback: {e}"
                 )
 
         return transformed_exception

@@ -243,6 +243,19 @@ candidates are skipped before upstream attempts with
 `reason=durable_quota_exhausted` and `cooldown_state_source=durable_quota`; if
 the lookup fails or expires, selection fails open and preserves the declared
 alias order.
+
+Expected upstream provider `429` responses that are returned directly to the
+requester are still durable provider-error observations. The
+`provider_error_observations` row should preserve the requested `model_group`,
+`provider`, `model`, `status_code`, and `error_class=rate_limited`. For
+OpenRouter provider-capacity errors, metadata also records bounded
+`upstream_provider_name`, `upstream_is_byok`, `upstream_error_raw`,
+`litellm_retry_count`, `litellm_max_retries`, `litellm_retries_exhausted`,
+`available_model_group_fallbacks`, `no_model_group_fallbacks`, and
+`provider_error_fingerprint` fields. These fields are the maintainer-facing
+record for expected provider errors that should not reopen traceback-style
+runtime error intake.
+
 For Grok native alias probes, the specific upstream 403
 `permission-denied` response that says access to the chat endpoint is denied is
 recorded as a candidate-unavailable condition, allowing the alias to progress to
