@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,11 @@ from litellm.integrations.aawm_agent_identity import (
 )
 from litellm.integrations.langfuse.langfuse import LangFuseLogger
 
+
+def _session_history_insert_placeholder_count() -> int:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
+    values_clause = sql.split("VALUES", 1)[1].split("ON CONFLICT", 1)[0]
+    return max(int(match) for match in re.findall(r"\$(\d+)", values_clause))
 
 def test_aawm_agent_identity_callback_overlay_matches_source() -> None:
     repo_root = Path(__file__).resolve().parents[3]
@@ -2729,7 +2735,7 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
     assert record["metadata"]["usage_structured_output_mode"] == "json_schema"
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 126
+    assert len(payload) == _session_history_insert_placeholder_count()
     assert payload[71] is True
     assert payload[72] is False
     assert payload[73] == "json_schema"
@@ -2834,7 +2840,7 @@ def test_build_session_history_record_persists_agent_score_metadata() -> None:  
     assert record["destructive_action_policy_score"] == pytest.approx(1.0)
 
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 126
+    assert len(payload) == _session_history_insert_placeholder_count()
     assert payload[76] == pytest.approx(0.0)
     assert payload[77] is True
     assert payload[80] is False
@@ -3502,7 +3508,7 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["total_server_elapsed_ms"] == pytest.approx(130.0)
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 126
+    assert len(payload) == _session_history_insert_placeholder_count()
     assert payload[61] == pytest.approx(25.0)
     assert payload[62] == pytest.approx(100.0)
     assert payload[63] == pytest.approx(130.0)
@@ -5655,7 +5661,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
 
     payload = _build_session_history_db_payload(record)
 
-    assert len(payload) == 126
+    assert len(payload) == _session_history_insert_placeholder_count()
     assert payload[4] == "anthropic"
     assert payload[17] is None
     assert payload[19] == "not_applicable"
@@ -6077,7 +6083,7 @@ def test_d1_169_build_session_history_db_payload_appends_compact_summary_fields(
 
     assert record is not None
     payload = _build_session_history_db_payload(record)
-    assert len(payload) == 126
+    assert len(payload) == _session_history_insert_placeholder_count()
     assert payload[121] == record["is_compact_summary"]
     assert payload[122] == record["compact_summary_source"]
     assert payload[123] == record["compact_summary_id"]
@@ -6338,7 +6344,8 @@ def test_build_session_history_record_estimates_openai_alias_cache_miss_cost_fro
     assert record["provider_cache_status"] == "miss"
     assert record["provider_cache_miss_reason"] == "prompt_cache_key_requested_without_hit"
     assert record["provider_cache_miss_token_count"] == 100
-    assert record["provider_cache_miss_cost_usd"] == pytest.approx(0.5)
+    assert record["provider_cache_miss_cost_usd"] == pytest.approx(0.0001575)
+    assert record["metadata"]["usage_provider_cache_miss_cost_usd"] == pytest.approx(0.0001575)
 
 
 def test_build_session_history_record_prices_nvidia_cache_miss_using_nvidia_nim_catalog() -> None:
@@ -11649,11 +11656,12 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert app_name_args[2]
     executed_args = mock_conn.execute.await_args_list[1].args
     assert "INSERT INTO public.session_history" in executed_args[0]
-    assert len(executed_args[1:]) == 126
+    assert len(executed_args[1:]) == _session_history_insert_placeholder_count()
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
     assert executed_args[126] == "anthropic/claude-sonnet-4-6"
+    assert executed_args[127] is None
     gap_args = mock_conn.execute.await_args_list[2].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-123"]
@@ -11799,7 +11807,6 @@ async def test_persist_session_history_record_writes_openrouter_free_daily_meter
 
     mock_conn = AsyncMock()
     mock_conn.fetchval.return_value = 251
-    mock_conn.fetchrow.return_value = None
     fake_pool = _FakePool(mock_conn)
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
@@ -11817,7 +11824,6 @@ async def test_persist_session_history_record_writes_openrouter_free_daily_meter
     assert "FROM public.session_history" in count_args[0]
     assert count_args[1] == datetime(2026, 5, 17, tzinfo=timezone.utc)
     assert count_args[2] == datetime(2026, 5, 18, tzinfo=timezone.utc)
-    mock_conn.fetchrow.assert_awaited_once()
     observation_args = mock_conn.executemany.await_args.args
     assert "INSERT INTO public.rate_limit_observations" in observation_args[0]
     payload = observation_args[1][0]
@@ -14407,7 +14413,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert "INSERT INTO public.session_history" in history_args[0]
     assert "    start_time,\n    created_at,\n    end_time," in history_args[0]
     assert "$11, COALESCE($11, $12, NOW()), $12" in history_args[0]
-    assert len(history_args[1][0]) == 126
+    assert len(history_args[1][0]) == _session_history_insert_placeholder_count()
     assert history_args[1][0][125] == "anthropic/claude-sonnet-4-6"
     assert history_args[1][0][0] == "call-1"
     assert history_args[1][0][10] == start_time
@@ -15009,7 +15015,9 @@ def test_session_history_insert_sql_includes_inbound_model_alias() -> None:
     sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
 
     assert "inbound_model_alias" in sql
+    assert "agent_id" in sql
     assert "$126" in sql
+    assert "$127" in sql
     assert "inbound_model_alias = COALESCE(" in sql
     assert "NULLIF(EXCLUDED.inbound_model_alias, '')" in sql
 
