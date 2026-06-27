@@ -167,6 +167,45 @@ values, raw auth payloads, resolved IP addresses, and the configured
 sidecar `request_contract_fingerprint` when investigating sidecar billing poll
 parity.
 
+## Codex Reset-Credit Poll Task
+
+The same sidecar can run an explicit hourly Codex banked usage-limit reset-credit
+poll. This is telemetry-only and separate from the five-minute provider front-door
+probes, Codex OAuth refresh, and Grok billing poll. The poll reads the current
+Codex OAuth credential from `AAWM_CODEX_AUTH_FILE`, calls the native ChatGPT
+usage endpoint (default `https://chatgpt.com/backend-api/wham/usage`) with
+`Authorization: Bearer <token>` and `ChatGPT-Account-Id` when the auth file
+includes an account id, and persists sanitized rows to
+`public.provider_credit_observations` (not `public.rate_limit_observations`).
+
+Relevant environment variables:
+
+- `AAWM_CODEX_RESET_CREDIT_POLL_ENABLED`: enables the scheduled poll.
+- `AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS`: minimum seconds between poll
+  attempts (default `3600`).
+- `AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS`: HTTP timeout.
+- `AAWM_CODEX_USAGE_URL`: usage endpoint URL.
+- `AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS`: max attempts per scheduled run.
+- `AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS`: retry backoff base.
+
+The parser reads `rate_limit_reset_credits.available_count` from the native
+snake_case JSON. Tests may use camelCase `rateLimitResetCredits.availableCount`;
+production polling expects snake_case. `expires_at` is stored only when a
+credit-specific expiry field is present on the payload; rate-limit window reset
+times are not treated as credit expiry.
+
+Account identity is hashed (stable short SHA-256 prefix) before storage. Rows
+omit `client` and `client_version`. Unchanged hourly polls that match the latest
+row for the same environment, provider, account hash, credit family, and source
+insert zero rows.
+
+Each due attempt emits `codex_reset_credit_poll` with sanitized fields such as
+`attempted`, `persisted`, `status_code`, `attempt_count`, `retry_count`,
+`available_count`, `inserted_count`, `error_class`, and `error_message`. Events
+must not contain access tokens, refresh tokens, raw auth headers, account ids, or
+emails.
+
+
 ## Observability Anomaly Scan Task
 
 The same sidecar can also run a scheduled session-history and rate-limit
