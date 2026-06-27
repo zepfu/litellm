@@ -8,18 +8,22 @@ from typing import AsyncGenerator, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import Request, status
+from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import litellm
 import litellm.proxy.aawm_route_logging as aawm_route_logging
 from litellm._logging import (
+    AawmErrorLogFileHandler,
     AawmHealthAccessLogFilter,
     AawmRouteAccessLogReplacementFilter,
     clear_aawm_route_access_log_replacements,
+    verbose_proxy_logger,
 )
 from litellm._uuid import uuid
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.opentelemetry import UserAPIKeyAuth
+from litellm.proxy._types import ProxyException
 from litellm.proxy.common_request_processing import (
     ProxyBaseLLMRequestProcessing,
     ProxyConfig,
@@ -157,6 +161,189 @@ def _enable_rerank_diagnostic_capture(monkeypatch, diagnostic_dir) -> None:
 
 
 class TestProxyBaseLLMRequestProcessing:
+
+    @staticmethod
+    def _build_user_api_key_auth_for_exception_tests() -> MagicMock:
+        mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        mock_user_api_key_dict.tpm_limit = None
+        mock_user_api_key_dict.rpm_limit = None
+        mock_user_api_key_dict.max_budget = None
+        mock_user_api_key_dict.spend = 0.0
+        mock_user_api_key_dict.allowed_model_region = None
+        return mock_user_api_key_dict
+
+    @staticmethod
+    def _install_verbose_proxy_aawm_error_log_handler(tmp_path, monkeypatch):
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+        handler = AawmErrorLogFileHandler()
+        saved_handlers = verbose_proxy_logger.handlers[:]
+        saved_level = verbose_proxy_logger.level
+        saved_propagate = verbose_proxy_logger.propagate
+        verbose_proxy_logger.handlers.clear()
+        verbose_proxy_logger.addHandler(handler)
+        verbose_proxy_logger.setLevel(logging.DEBUG)
+        verbose_proxy_logger.propagate = False
+        return saved_handlers, saved_level, saved_propagate
+
+    @staticmethod
+    def _restore_verbose_proxy_logger(saved_handlers, saved_level, saved_propagate):
+        verbose_proxy_logger.handlers.clear()
+        for saved_handler in saved_handlers:
+            verbose_proxy_logger.addHandler(saved_handler)
+        verbose_proxy_logger.setLevel(saved_level)
+        verbose_proxy_logger.propagate = saved_propagate
+
+    @pytest.mark.asyncio
+    async def test_handle_llm_api_exception_rate_limit_skips_error_intake_jsonl(
+        self, monkeypatch, tmp_path
+    ):
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_verbose_proxy_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+        error_log_path = tmp_path / "dev-error.jsonl"
+
+        processing_obj = ProxyBaseLLMRequestProcessing(data={"model": "gpt-4"})
+        mock_user_api_key_dict = self._build_user_api_key_auth_for_exception_tests()
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value=None
+        )
+
+        rate_limit_exc = litellm.RateLimitError(
+            message="provider rate limited",
+            llm_provider="openai",
+            model="gpt-4",
+        )
+
+        try:
+            with pytest.raises(ProxyException) as raised:
+                await processing_obj._handle_llm_api_exception(
+                    e=rate_limit_exc,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers, saved_level, saved_propagate
+            )
+
+        assert raised.value.code == "429"
+        mock_proxy_logging_obj.post_call_failure_hook.assert_awaited_once_with(
+            user_api_key_dict=mock_user_api_key_dict,
+            original_exception=rate_limit_exc,
+            request_data=processing_obj.data,
+        )
+        assert not error_log_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_handle_llm_api_exception_generic_error_writes_error_intake_jsonl(
+        self, monkeypatch, tmp_path
+    ):
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_verbose_proxy_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+        error_log_path = tmp_path / "dev-error.jsonl"
+
+        processing_obj = ProxyBaseLLMRequestProcessing(data={"model": "gpt-4"})
+        mock_user_api_key_dict = self._build_user_api_key_auth_for_exception_tests()
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value=None
+        )
+
+        generic_exc = RuntimeError("unexpected upstream failure")
+
+        try:
+            with pytest.raises(ProxyException):
+                await processing_obj._handle_llm_api_exception(
+                    e=generic_exc,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers, saved_level, saved_propagate
+            )
+
+        assert error_log_path.exists()
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(payloads) == 1
+        assert "unexpected upstream failure" in payloads[0]["message"]
+        assert payloads[0]["traceback"]
+        assert "RuntimeError" in payloads[0]["traceback"]
+
+    @pytest.mark.asyncio
+    async def test_post_call_failure_hook_routes_original_exception_to_failure_callbacks(
+        self, monkeypatch
+    ):
+        class FailureHookRecorder(CustomLogger):
+            def __init__(self):
+                self.calls = []
+
+            async def async_post_call_failure_hook(
+                self,
+                request_data,
+                original_exception,
+                user_api_key_dict,
+                traceback_str=None,
+            ):
+                self.calls.append(
+                    {
+                        "request_data": request_data,
+                        "original_exception": original_exception,
+                        "user_api_key_dict": user_api_key_dict,
+                        "traceback_str": traceback_str,
+                    }
+                )
+                return HTTPException(status_code=418, detail="ignored")
+
+        recorder = FailureHookRecorder()
+        original_callbacks = litellm.callbacks[:]
+        original_failure_callbacks = litellm.failure_callback[:]
+        monkeypatch.setattr(litellm, "callbacks", [])
+        monkeypatch.setattr(litellm, "failure_callback", [recorder])
+
+        proxy_logging_obj = ProxyLogging(user_api_key_cache=MagicMock())
+        request_data = {"model": "openrouter/inclusionai/ling-2.6-flash"}
+        user_api_key_dict = MagicMock()
+        user_api_key_dict.request_route = None
+        original_exception = litellm.RateLimitError(
+            message="provider rate limited",
+            llm_provider="openrouter",
+            model="openrouter/inclusionai/ling-2.6-flash",
+        )
+
+        try:
+            transformed = await proxy_logging_obj.post_call_failure_hook(
+                request_data=request_data,
+                original_exception=original_exception,
+                user_api_key_dict=user_api_key_dict,
+                traceback_str="traceback text",
+            )
+        finally:
+            monkeypatch.setattr(litellm, "callbacks", original_callbacks)
+            monkeypatch.setattr(
+                litellm,
+                "failure_callback",
+                original_failure_callbacks,
+            )
+
+        assert transformed is None
+        assert len(recorder.calls) == 1
+        assert recorder.calls[0]["request_data"] is request_data
+        assert recorder.calls[0]["original_exception"] is original_exception
+        assert recorder.calls[0]["user_api_key_dict"] is user_api_key_dict
+        assert recorder.calls[0]["traceback_str"] == "traceback text"
+
     @pytest.mark.asyncio
     async def test_common_processing_pre_call_logic_pre_call_hook_receives_litellm_call_id(
         self, monkeypatch

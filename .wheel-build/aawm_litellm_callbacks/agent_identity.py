@@ -9250,6 +9250,14 @@ def _extract_provider_error_dicts(value: Any) -> List[Dict[str, Any]]:
     if isinstance(value, dict):
         dicts.append(value)
     dicts.extend(_extract_error_payload_dicts(value))
+    for source in (
+        value,
+        str(value) if value is not None else None,
+        getattr(value, "detail", None),
+        getattr(value, "message", None),
+        getattr(value, "body", None),
+    ):
+        dicts.extend(_extract_embedded_json_payload_dicts(source))
 
     seen: set[str] = set()
     deduped: List[Dict[str, Any]] = []
@@ -9267,6 +9275,25 @@ def _extract_provider_error_dicts(value: Any) -> List[Dict[str, Any]]:
         seen.add(key)
         deduped.append(candidate)
     return deduped
+
+
+def _extract_embedded_json_payload_dicts(value: Any) -> List[Dict[str, Any]]:
+    text = _clean_non_empty_string(value)
+    if text is None:
+        return []
+
+    decoder = json.JSONDecoder()
+    dicts: List[Dict[str, Any]] = []
+    for match in re.finditer(r"\{", text[:20000]):
+        if len(dicts) >= 20:
+            break
+        try:
+            parsed, _end = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, (dict, list)):
+            dicts.extend(_iter_rate_limit_dicts(parsed))
+    return dicts
 
 
 def _extract_provider_error_headers(value: Any) -> Dict[str, str]:
@@ -9420,6 +9447,189 @@ def _extract_provider_error_retry_after_seconds(
                 return parsed
     reset_hint = _parse_reset_hint_seconds(error_text)
     return float(reset_hint) if reset_hint is not None else None
+
+
+_LITELLM_PROVIDER_ERROR_MODEL_GROUP_RE = re.compile(
+    r"Received Model Group=(?P<model_group>[^\n\r]+)"
+)
+_LITELLM_PROVIDER_ERROR_FALLBACKS_RE = re.compile(
+    r"Available Model Group Fallbacks=(?P<fallbacks>.*?)(?:\s+LiteLLM Retried:|$)",
+    re.DOTALL,
+)
+_LITELLM_PROVIDER_ERROR_RETRIES_RE = re.compile(
+    r"LiteLLM Retried:\s*(?P<retry_count>\d+)\s*times,\s*"
+    r"LiteLLM Max Retries:\s*(?P<max_retries>\d+)"
+)
+
+
+def _extract_litellm_provider_error_model_group(error_text: str) -> Optional[str]:
+    match = _LITELLM_PROVIDER_ERROR_MODEL_GROUP_RE.search(error_text)
+    if not match:
+        return None
+    return _clean_non_empty_string(match.group("model_group"))
+
+
+def _clean_litellm_provider_error_fallbacks(value: Any) -> Optional[str]:
+    fallbacks = _clean_non_empty_string(value)
+    if fallbacks is None:
+        return None
+    for marker in (
+        " LiteLLM Retried:",
+        " litellm.",
+        " RateLimitError:",
+        " Traceback ",
+        " During handling ",
+    ):
+        marker_index = fallbacks.find(marker)
+        if marker_index > 0:
+            fallbacks = fallbacks[:marker_index].strip()
+    if fallbacks.lower().startswith("none"):
+        return "None"
+    return fallbacks[:500]
+
+
+def _extract_litellm_provider_error_retry_context(error_text: str) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    retry_match = _LITELLM_PROVIDER_ERROR_RETRIES_RE.search(error_text)
+    if retry_match:
+        retry_count = _safe_int(retry_match.group("retry_count"))
+        max_retries = _safe_int(retry_match.group("max_retries"))
+        if retry_count is not None:
+            metadata["litellm_retry_count"] = retry_count
+        if max_retries is not None:
+            metadata["litellm_max_retries"] = max_retries
+        if retry_count is not None and max_retries is not None:
+            metadata["litellm_retries_exhausted"] = retry_count >= max_retries
+
+    fallbacks_match = _LITELLM_PROVIDER_ERROR_FALLBACKS_RE.search(error_text)
+    if fallbacks_match:
+        fallbacks = _clean_litellm_provider_error_fallbacks(
+            fallbacks_match.group("fallbacks")
+        )
+        if fallbacks is not None:
+            metadata["available_model_group_fallbacks"] = fallbacks
+            metadata["no_model_group_fallbacks"] = fallbacks.lower() in {
+                "none",
+                "null",
+                "[]",
+            }
+    return metadata
+
+
+def _extract_provider_error_payload_metadata_value(
+    dicts: List[Dict[str, Any]],
+    *keys: str,
+) -> Any:
+    for candidate in dicts:
+        pools: List[Dict[str, Any]] = []
+        if isinstance(candidate, dict):
+            pools.append(candidate)
+            error = candidate.get("error")
+            if isinstance(error, dict):
+                pools.append(error)
+                error_metadata = error.get("metadata")
+                if isinstance(error_metadata, dict):
+                    pools.append(error_metadata)
+            metadata = candidate.get("metadata")
+            if isinstance(metadata, dict):
+                pools.append(metadata)
+        for pool in pools:
+            for key in keys:
+                if key in pool and pool[key] not in (None, ""):
+                    return pool[key]
+    return None
+
+
+def _resolve_provider_error_model_group(
+    *,
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+    standard_logging_object: Dict[str, Any],
+    error_text: str,
+    model: str,
+) -> Optional[str]:
+    return _first_non_empty_string(
+        _get_session_history_model_group(metadata, standard_logging_object),
+        _maybe_get_path(
+            kwargs.get("litellm_params"),
+            "proxy_server_request",
+            "body",
+            "model",
+        ),
+        _maybe_get_path(
+            kwargs.get("passthrough_logging_payload"),
+            "request_body",
+            "model",
+        ),
+        _maybe_get_path(
+            kwargs.get("standard_pass_through_logging_payload"),
+            "request_body",
+            "model",
+        ),
+        _maybe_get_path(standard_logging_object, "request_body", "model"),
+        _extract_litellm_provider_error_model_group(error_text),
+        kwargs.get("model"),
+        metadata.get("model"),
+        model if model != "unknown" else None,
+    )
+
+
+def _build_provider_error_fingerprint(
+    *,
+    provider: str,
+    model: Optional[str],
+    model_group: Optional[str],
+    status_code: Optional[int],
+    error_code: Optional[str],
+    error_type: Optional[str],
+    error_class: str,
+    observation_metadata: Dict[str, Any],
+) -> str:
+    fingerprint_source = {
+        "provider": provider,
+        "model": model,
+        "model_group": model_group,
+        "status_code": status_code,
+        "error_code": error_code,
+        "error_type": error_type,
+        "error_class": error_class,
+        "upstream_provider_name": observation_metadata.get("upstream_provider_name"),
+        "upstream_error_raw": observation_metadata.get("upstream_error_raw"),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            _json_safe_rate_limit_value(fingerprint_source),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _enrich_provider_error_observation_metadata(
+    *,
+    observation_metadata: Dict[str, Any],
+    dicts: List[Dict[str, Any]],
+    error_text: str,
+) -> None:
+    upstream_provider_name = _clean_non_empty_string(
+        _extract_provider_error_payload_metadata_value(dicts, "provider_name")
+    )
+    if upstream_provider_name is not None:
+        observation_metadata["upstream_provider_name"] = upstream_provider_name
+
+    upstream_is_byok = _extract_provider_error_payload_metadata_value(dicts, "is_byok")
+    if upstream_is_byok is not None:
+        observation_metadata["upstream_is_byok"] = _metadata_bool(upstream_is_byok)
+
+    upstream_error_raw = _clean_non_empty_string(
+        _extract_provider_error_payload_metadata_value(dicts, "raw")
+    )
+    if upstream_error_raw is not None:
+        observation_metadata["upstream_error_raw"] = upstream_error_raw[:1000]
+
+    observation_metadata.update(
+        _extract_litellm_provider_error_retry_context(error_text)
+    )
 
 
 def _classify_provider_error(
@@ -9589,6 +9799,11 @@ def _build_provider_error_observation(
             observation_metadata[
                 "structured_output_failure_reason"
             ] = structured_failure_reason
+    _enrich_provider_error_observation_metadata(
+        observation_metadata=observation_metadata,
+        dicts=dicts,
+        error_text=error_text,
+    )
     if _is_claude_permission_check_metadata(metadata):
         for key in (
             "source_model",
@@ -9630,15 +9845,31 @@ def _build_provider_error_observation(
         value = metadata.get(key)
         if value is not None:
             observation_metadata[key] = value
+    model_group = _resolve_provider_error_model_group(
+        kwargs=kwargs,
+        metadata=metadata,
+        standard_logging_object=standard_logging_object,
+        error_text=error_text,
+        model=model,
+    )
+    observation_metadata["provider_error_fingerprint"] = (
+        _build_provider_error_fingerprint(
+            provider=provider,
+            model=model if model != "unknown" else None,
+            model_group=model_group,
+            status_code=status_code,
+            error_code=error_code,
+            error_type=error_type,
+            error_class=error_class,
+            observation_metadata=observation_metadata,
+        )
+    )
     return {
         "observed_at": observed_at,
         "environment": runtime_identity.get("litellm_environment"),
         "provider": provider,
         "model": model if model != "unknown" else None,
-        "model_group": _get_session_history_model_group(
-            metadata,
-            standard_logging_object,
-        ),
+        "model_group": model_group,
         "route_family": _clean_non_empty_string(
             metadata.get("passthrough_route_family")
             or metadata.get("codex_auto_agent_selected_route_family")
