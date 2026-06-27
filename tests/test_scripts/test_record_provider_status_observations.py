@@ -306,6 +306,10 @@ def test_setup_schema_executes_provider_status_ddl_with_timeouts(monkeypatch) ->
     for statement in probes.PROVIDER_AUTH_OBSERVATIONS_INDEX_STATEMENTS:
         assert statement in ddl_statements
     assert probes.PROVIDER_AUTH_CURRENT_VIEW_SQL in ddl_statements
+    assert probes.PROVIDER_CREDIT_OBSERVATIONS_TABLE_SQL in ddl_statements
+    for statement in probes.PROVIDER_CREDIT_OBSERVATIONS_INDEX_STATEMENTS:
+        assert statement in ddl_statements
+    assert probes.PROVIDER_CREDIT_CURRENT_VIEW_SQL in ddl_statements
     assert fake_conn.cursor_instance.executemany_calls == []
     assert fake_conn.commit_count == 1
     assert fake_conn.rollback_count == 0
@@ -3862,3 +3866,309 @@ def test_run_due_sidecar_tasks_marks_grok_oidc_auth_persistence_failure(
     assert refresh_event["auth_observation_inserted_count"] == 0
     assert refresh_event["auth_observation_skip_error_class"] == "OperationalError"
     assert refresh_event["auth_observation_skip_reason"] == "connection refused"
+
+
+def _codex_reset_credit_poll_config(**overrides):
+    from dataclasses import replace
+
+    config = loop.ProviderStatusLoopConfig(
+        apply=True,
+        dsn="postgresql://example/db",
+        environment="dev",
+        interval_seconds=300.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=False,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
+        grok_oidc_refresh_enabled=False,
+        codex_oauth_refresh_enabled=False,
+        codex_auth_file="/home/zepfu/.codex/auth.json",
+        codex_auth_file_source="AAWM_CODEX_AUTH_FILE",
+        codex_reset_credit_poll_enabled=True,
+        codex_reset_credit_poll_interval_seconds=3600.0,
+        codex_reset_credit_poll_http_timeout_seconds=30.0,
+        codex_usage_url="https://chatgpt.com/backend-api/wham/usage",
+        codex_reset_credit_poll_max_attempts=3,
+        codex_reset_credit_poll_retry_backoff_seconds=0.5,
+        grok_billing_poll_enabled=False,
+    )
+    if overrides:
+        config = replace(config, **overrides)
+    return config
+
+
+def _codex_reset_credit_payload_snake(**overrides) -> dict:
+    payload = {
+        "rate_limit_reset_credits": {
+            "available_count": 2,
+        }
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _codex_reset_credit_auth_context(**overrides) -> dict:
+    context = {
+        "access_token": "access-token-secret",
+        "account_id": "acct-openai-primary",
+    }
+    context.update(overrides)
+    return context
+
+
+def test_parse_codex_reset_credit_available_count_accepts_snake_and_camel() -> None:
+    assert (
+        loop._parse_codex_reset_credit_available_count(
+            _codex_reset_credit_payload_snake()
+        )
+        == 2
+    )
+    assert (
+        loop._parse_codex_reset_credit_available_count(
+            {"rateLimitResetCredits": {"availableCount": 5}}
+        )
+        == 5
+    )
+
+
+def test_parse_codex_reset_credit_expires_at_ignores_missing_credit_expiry() -> None:
+    assert (
+        loop._parse_codex_reset_credit_expires_at(
+            {"rate_limit_reset_credits": {"available_count": 1}}
+        )
+        is None
+    )
+
+
+def test_build_codex_reset_credit_request_headers_includes_account_id_without_secrets() -> None:
+    headers = loop._build_codex_reset_credit_request_headers(
+        _codex_reset_credit_auth_context()
+    )
+
+    assert headers["authorization"] == "Bearer access-token-secret"
+    assert headers["ChatGPT-Account-Id"] == "acct-openai-primary"
+    headers_json = json.dumps(headers)
+    assert "refresh_token" not in headers_json
+    assert "acct-openai-primary" in headers_json
+
+
+def test_account_identity_hash_uses_stable_short_sha256_prefix() -> None:
+    assert probes.account_identity_hash("acct-openai-primary") == hashlib.sha256(
+        b"acct-openai-primary"
+    ).hexdigest()[:12]
+
+
+def test_provider_credit_insert_sql_dedupes_unchanged_snapshots() -> None:
+    sql = probes.PROVIDER_CREDIT_OBSERVATIONS_INSERT_SQL
+
+    assert "latest.available_count IS NOT DISTINCT FROM candidate.available_count" in sql
+    assert "latest.expires_at IS NOT DISTINCT FROM candidate.expires_at" not in sql
+    assert "latest.raw_provider_fields IS NOT DISTINCT FROM" not in sql
+    assert "latest.evidence IS NOT DISTINCT FROM" not in sql
+    assert "latest.account_hash IS NOT DISTINCT FROM candidate.account_hash" in sql
+
+
+def test_build_codex_reset_credit_observation_keeps_raw_fields_narrow() -> None:
+    observation = loop._build_codex_reset_credit_observation(
+        _codex_reset_credit_poll_config(),
+        observed_at=datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc),
+        response_body={
+            "rate_limit_reset_credits": {"available_count": 2},
+            "plan": "plus",
+            "account_id": "acct-openai-primary",
+            "email": "operator@example.com",
+        },
+        auth_context=_codex_reset_credit_auth_context(),
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+    )
+
+    assert observation["raw_provider_fields"] == {
+        "rate_limit_reset_credits": {"available_count": 2}
+    }
+    raw_json = json.dumps(observation["raw_provider_fields"])
+    assert "plan" not in raw_json
+    assert "acct-openai-primary" not in raw_json
+    assert "operator@example.com" not in raw_json
+
+
+def test_insert_provider_credit_observations_returns_changed_rowcount(monkeypatch) -> None:
+    fake_conn = _FakeProviderStatusConnection()
+    fake_conn.cursor_instance.rowcount = 0
+    monkeypatch.setattr(probes.psycopg, "connect", lambda _dsn: fake_conn)
+
+    inserted = probes.insert_provider_credit_observations(
+        "postgresql://example/db",
+        [
+            {
+                "observed_at": datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc),
+                "environment": "dev",
+                "provider": "openai",
+                "account_hash": "abc123def456",
+                "credit_family": "codex_rate_limit_reset",
+                "credit_type": "reset_credit",
+                "available_count": 2,
+                "expires_at": None,
+                "raw_provider_fields": {"rate_limit_reset_credits": {"available_count": 2}},
+                "evidence": {"signals": ["codex_reset_credit_poll"]},
+                "source": "codex_reset_credit_poll",
+            }
+        ],
+    )
+
+    assert inserted == 0
+    insert_sql, payload = fake_conn.cursor_instance.execute_calls[3]
+    assert insert_sql == probes.PROVIDER_CREDIT_OBSERVATIONS_INSERT_SQL
+    assert payload[6] == 2
+
+    fake_conn.cursor_instance.rowcount = 1
+    inserted_changed = probes.insert_provider_credit_observations(
+        "postgresql://example/db",
+        [
+            {
+                "observed_at": datetime(2026, 6, 27, 13, 0, tzinfo=timezone.utc),
+                "environment": "dev",
+                "provider": "openai",
+                "account_hash": "abc123def456",
+                "credit_family": "codex_rate_limit_reset",
+                "credit_type": "reset_credit",
+                "available_count": 1,
+                "expires_at": None,
+                "raw_provider_fields": {"rate_limit_reset_credits": {"available_count": 1}},
+                "evidence": {"signals": ["codex_reset_credit_poll"]},
+                "source": "codex_reset_credit_poll",
+            }
+        ],
+    )
+    assert inserted_changed == 1
+
+
+def test_loop_config_reads_codex_reset_credit_poll_env_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_ENABLED", "1")
+    monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS", "7200")
+    monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv(
+        "AAWM_CODEX_USAGE_URL",
+        "https://chatgpt.com/backend-api/wham/usage?lane=dev",
+    )
+    monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS", "1.25")
+
+    config = loop.parse_config([])
+
+    assert config.codex_reset_credit_poll_enabled is True
+    assert config.codex_reset_credit_poll_interval_seconds == 7200.0
+    assert config.codex_reset_credit_poll_http_timeout_seconds == 45.0
+    assert config.codex_usage_url == "https://chatgpt.com/backend-api/wham/usage?lane=dev"
+    assert config.codex_reset_credit_poll_max_attempts == 5
+    assert config.codex_reset_credit_poll_retry_backoff_seconds == 1.25
+
+
+def test_run_due_sidecar_tasks_skips_when_codex_reset_credit_poll_disabled(monkeypatch) -> None:
+    config = _codex_reset_credit_poll_config(codex_reset_credit_poll_enabled=False)
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_codex_reset_credit_payload",
+        lambda *_args, **_kwargs: pytest.fail("Codex reset-credit poll should not run"),
+    )
+
+    assert loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    ) == []
+
+
+def test_run_due_sidecar_tasks_throttles_codex_reset_credit_poll(monkeypatch) -> None:
+    config = _codex_reset_credit_poll_config(apply=False)
+    calls = {"fetch": 0}
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_codex_reset_credit_payload",
+        lambda *_args, **_kwargs: (
+            calls.__setitem__("fetch", calls["fetch"] + 1)
+            or {
+                "status_code": 200,
+                "payload": _codex_reset_credit_payload_snake(),
+                "auth_context": _codex_reset_credit_auth_context(),
+                "attempt_count": 1,
+                "retry_count": 0,
+            }
+        ),
+    )
+
+    state = loop.SidecarTaskState()
+    first_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
+    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3701.0)
+
+    assert calls == {"fetch": 2}
+    assert first_events[-1]["event"] == "codex_reset_credit_poll"
+    assert first_events[-1]["available_count"] == 2
+    assert first_events[-1]["inserted_count"] == 0
+    assert second_events == []
+    assert third_events[-1]["event"] == "codex_reset_credit_poll"
+
+
+def test_run_due_sidecar_tasks_emits_codex_reset_credit_poll_event(monkeypatch) -> None:
+    config = _codex_reset_credit_poll_config()
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_codex_reset_credit_payload",
+        lambda *_args, **_kwargs: {
+            "status_code": 200,
+            "payload": _codex_reset_credit_payload_snake(),
+            "auth_context": _codex_reset_credit_auth_context(),
+            "attempt_count": 1,
+            "retry_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_reset_credit_observation",
+        lambda *_args, **_kwargs: (1, 1),
+    )
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    poll_events = [
+        event for event in events if event.get("event") == "codex_reset_credit_poll"
+    ]
+    assert len(poll_events) == 1
+    assert poll_events[0]["persisted"] is True
+    assert poll_events[0]["available_count"] == 2
+    assert poll_events[0]["inserted_count"] == 1
+    assert poll_events[0]["status_code"] == 200
+    event_json = json.dumps(poll_events)
+    assert "access-token-secret" not in event_json
+    assert "acct-openai-primary" not in event_json
+    assert '"account_id"' not in event_json
+
+
+def test_compose_wires_codex_reset_credit_poll_defaults() -> None:
+    compose_text = Path("/home/zepfu/projects/litellm/docker-compose.dev.yml").read_text()
+
+    assert (
+        "AAWM_CODEX_RESET_CREDIT_POLL_ENABLED=${AAWM_CODEX_RESET_CREDIT_POLL_ENABLED:-1}"
+        in compose_text
+    )
+    assert (
+        "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS=${AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS:-3600}"
+        in compose_text
+    )
+    assert (
+        "AAWM_CODEX_USAGE_URL=${AAWM_CODEX_USAGE_URL:-https://chatgpt.com/backend-api/wham/usage}"
+        in compose_text
+    )

@@ -60,6 +60,27 @@ quota fields null rather than inventing counts. xAI OAuth rate-limit headers
 populate absolute request/token amounts and carry billing period ends when the
 provider config or managed subscription context exposes one.
 
+## Provider Credit Observations
+
+`public.provider_credit_observations` stores provider banked reset-credit
+snapshots from scheduled sidecar polls (for example Codex usage-limit reset
+credits). Canonical grouping fields are `environment`, `provider`,
+`account_hash`, `credit_family`, `credit_type`, and `source`. There are no
+`client` or `client_version` columns.
+
+Normalized fields:
+
+- `available_count`: banked credits currently available.
+- `expires_at`: credit-specific expiry when the provider exposes it; otherwise
+  null.
+- `raw_provider_fields` and `evidence`: sanitized JSONB interpretation notes.
+
+`public.provider_credit_current` exposes the latest row per identity group for
+dashboards and investigations. These observations are distinct from
+`public.rate_limit_observations`, which capture quota windows and billing
+snapshots from request traffic.
+
+
 ## Session History Outage Spool
 
 `session_history` rows are normally written directly to

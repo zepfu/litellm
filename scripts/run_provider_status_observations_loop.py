@@ -119,6 +119,15 @@ DEFAULT_GROK_BILLING_MODEL = "grok-build"
 DEFAULT_GROK_BILLING_HTTP_METHOD = "GET"
 DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS = 3
 DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS = 0.5
+DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED = False
+DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS = 3
+DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS = 0.5
+DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY = "codex_rate_limit_reset"
+DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE = "reset_credit"
+DEFAULT_CODEX_RESET_CREDIT_SOURCE = "codex_reset_credit_poll"
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED = False
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS = 3600.0
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS = 4.0
@@ -146,6 +155,7 @@ GROK_BILLING_RETRYABLE_ERROR_HINTS = (
     "timeout expired",
 )
 GROK_BILLING_POLL_SLEEP_FN: Callable[[float], None] = time.sleep
+CODEX_RESET_CREDIT_POLL_SLEEP_FN: Callable[[float], None] = time.sleep
 OBSERVABILITY_ANOMALY_ALIAS_METADATA_KEYS = (
     "requested_model_alias",
     "model_alias_label",
@@ -174,6 +184,23 @@ PROVIDER_FAILURE_SECRET_RE = re.compile(
 
 class GrokBillingPollError(ValueError):
     """Sanitized billing poll failure with retry metadata for sidecar events."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int],
+        attempt_count: int,
+        retry_count: int,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.attempt_count = max(1, attempt_count)
+        self.retry_count = max(0, retry_count)
+
+
+class CodexResetCreditPollError(ValueError):
+    """Sanitized Codex reset-credit poll failure with retry metadata."""
 
     def __init__(
         self,
@@ -854,6 +881,18 @@ class ProviderStatusLoopConfig:
     grok_billing_poll_retry_backoff_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
     )
+    codex_reset_credit_poll_enabled: bool = DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED
+    codex_reset_credit_poll_interval_seconds: float = (
+        DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS
+    )
+    codex_reset_credit_poll_http_timeout_seconds: float = (
+        DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS
+    )
+    codex_usage_url: str = DEFAULT_CODEX_USAGE_URL
+    codex_reset_credit_poll_max_attempts: int = DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS
+    codex_reset_credit_poll_retry_backoff_seconds: float = (
+        DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS
+    )
     observability_anomaly_scan_enabled: bool = (
         DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED
     )
@@ -875,6 +914,7 @@ class SidecarTaskState:
     codex_oauth_last_attempt_monotonic: Optional[float] = None
     xai_oauth_last_attempt_monotonic: Optional[float] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
+    codex_reset_credit_last_attempt_monotonic: Optional[float] = None
     observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
 
 
@@ -1648,6 +1688,84 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "Defaults to AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS or 0.5."
         ),
     )
+
+    codex_credit_group = parser.add_mutually_exclusive_group()
+    codex_credit_group.add_argument(
+        "--codex-reset-credit-poll-enabled",
+        dest="codex_reset_credit_poll_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_CODEX_RESET_CREDIT_POLL_ENABLED",
+            DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED,
+        ),
+        help=(
+            "Run the hourly Codex reset-credit poll from this sidecar loop. "
+            "Defaults to AAWM_CODEX_RESET_CREDIT_POLL_ENABLED or false."
+        ),
+    )
+    codex_credit_group.add_argument(
+        "--no-codex-reset-credit-poll",
+        dest="codex_reset_credit_poll_enabled",
+        action="store_false",
+        help="Disable the hourly Codex reset-credit poll task.",
+    )
+    parser.add_argument(
+        "--codex-reset-credit-poll-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS",
+            DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Codex reset-credit poll attempts. Defaults "
+            "to AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--codex-reset-credit-poll-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Codex reset-credit poll calls. Defaults to "
+            "AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
+    parser.add_argument(
+        "--codex-usage-url",
+        default=os.getenv("AAWM_CODEX_USAGE_URL", DEFAULT_CODEX_USAGE_URL),
+        help=(
+            "Codex usage endpoint polled by the sidecar. Defaults to "
+            "AAWM_CODEX_USAGE_URL or the native ChatGPT wham usage URL."
+        ),
+    )
+    parser.add_argument(
+        "--codex-reset-credit-poll-max-attempts",
+        type=int,
+        default=_env_int(
+            "AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS",
+            DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS,
+        ),
+        help=(
+            "Maximum Codex reset-credit poll attempts per scheduled run, including "
+            "retries. Defaults to AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS or 3."
+        ),
+    )
+    parser.add_argument(
+        "--codex-reset-credit-poll-retry-backoff-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS",
+            DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS,
+        ),
+        help=(
+            "Base backoff seconds between retryable Codex reset-credit poll "
+            "failures. Defaults to "
+            "AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS or 0.5."
+        ),
+    )
     anomaly_group = parser.add_mutually_exclusive_group()
     anomaly_group.add_argument(
         "--observability-anomaly-scan-enabled",
@@ -1720,6 +1838,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_xai_oauth_config_args(args)
     _validate_grok_billing_config_args(args)
     _validate_observability_anomaly_scan_config_args(args)
+    _validate_codex_reset_credit_poll_config_args(args)
 
 
 def _validate_core_config_args(args: argparse.Namespace) -> None:
@@ -1818,6 +1937,27 @@ def _validate_observability_anomaly_scan_config_args(args: argparse.Namespace) -
         raise SystemExit("--observability-anomaly-scan-error-log-dir must not be empty")
 
 
+def _validate_codex_reset_credit_poll_config_args(args: argparse.Namespace) -> None:
+    if args.codex_reset_credit_poll_interval_seconds <= 0:
+        raise SystemExit(
+            "--codex-reset-credit-poll-interval-seconds must be greater than 0"
+        )
+    if args.codex_reset_credit_poll_http_timeout_seconds <= 0:
+        raise SystemExit(
+            "--codex-reset-credit-poll-http-timeout-seconds must be greater than 0"
+        )
+    if not str(args.codex_usage_url).strip():
+        raise SystemExit("--codex-usage-url must not be empty")
+    if args.codex_reset_credit_poll_max_attempts <= 0:
+        raise SystemExit(
+            "--codex-reset-credit-poll-max-attempts must be greater than 0"
+        )
+    if args.codex_reset_credit_poll_retry_backoff_seconds < 0:
+        raise SystemExit(
+            "--codex-reset-credit-poll-retry-backoff-seconds must be non-negative"
+        )
+
+
 def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConfig:
     args = _build_parser().parse_args(argv)
     _validate_config_args(args)
@@ -1901,6 +2041,18 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_poll_max_attempts=args.grok_billing_poll_max_attempts,
         grok_billing_poll_retry_backoff_seconds=(
             args.grok_billing_poll_retry_backoff_seconds
+        ),
+        codex_reset_credit_poll_enabled=args.codex_reset_credit_poll_enabled,
+        codex_reset_credit_poll_interval_seconds=(
+            args.codex_reset_credit_poll_interval_seconds
+        ),
+        codex_reset_credit_poll_http_timeout_seconds=(
+            args.codex_reset_credit_poll_http_timeout_seconds
+        ),
+        codex_usage_url=args.codex_usage_url,
+        codex_reset_credit_poll_max_attempts=args.codex_reset_credit_poll_max_attempts,
+        codex_reset_credit_poll_retry_backoff_seconds=(
+            args.codex_reset_credit_poll_retry_backoff_seconds
         ),
         observability_anomaly_scan_enabled=(
             args.observability_anomaly_scan_enabled
@@ -2403,6 +2555,479 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
         summary["failure_summaries"] = failure_summaries
         summary["failure_summaries_omitted_count"] = omitted_count
     return summary
+
+
+
+CODEX_RESET_CREDIT_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 500, 502, 503, 504}
+CODEX_RESET_CREDIT_NON_RETRYABLE_HTTP_STATUS_CODES = {400, 401, 403, 404, 405, 409, 422, 429}
+CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS = (
+    "operation was cancelled",
+    "timeout expired",
+)
+
+
+def _codex_reset_credit_poll_sleep(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    CODEX_RESET_CREDIT_POLL_SLEEP_FN(seconds)
+
+
+def _codex_reset_credit_poll_backoff_seconds(
+    config: ProviderStatusLoopConfig,
+    *,
+    retry_count: int,
+) -> float:
+    if config.codex_reset_credit_poll_retry_backoff_seconds <= 0:
+        return 0.0
+    return config.codex_reset_credit_poll_retry_backoff_seconds * retry_count
+
+
+def _codex_reset_credit_poll_failure_message(
+    *,
+    status_code: Optional[int],
+    error_hint: Optional[str],
+    fallback_message: str,
+) -> str:
+    message = "Codex reset-credit poll failed"
+    if status_code is not None:
+        message += f" with HTTP {status_code}"
+    if error_hint:
+        message += f" ({error_hint})"
+    elif fallback_message:
+        message += f" ({fallback_message})"
+    return message + "."
+
+
+def _load_codex_reset_credit_auth_context(auth_file: str) -> Dict[str, Any]:
+    auth_data = codex_oauth_refresh._read_auth_data(Path(auth_file).expanduser())
+    token_data = codex_oauth_refresh._get_token_data(auth_data)
+    access_token = codex_oauth_refresh._clean_string(token_data.get("access_token"))
+    if access_token is None:
+        raise ValueError(
+            "Codex OAuth auth file does not contain a usable access token for reset-credit poll."
+        )
+    account_id = codex_oauth_refresh._extract_account_id(token_data)
+    return {
+        "access_token": access_token,
+        "account_id": account_id,
+    }
+
+
+def _build_codex_reset_credit_request_headers(
+    auth_context: Mapping[str, Any],
+) -> Dict[str, str]:
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {auth_context['access_token']}",
+    }
+    account_id = auth_context.get("account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        headers["ChatGPT-Account-Id"] = account_id.strip()
+    return headers
+
+
+def _json_safe_codex_reset_credit_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _parse_codex_reset_credit_available_count(response_body: Mapping[str, Any]) -> int:
+    credits = response_body.get("rate_limit_reset_credits")
+    if isinstance(credits, dict):
+        available = credits.get("available_count")
+        if isinstance(available, bool):
+            raise ValueError("Codex reset-credit payload available_count was not an integer.")
+        if isinstance(available, int):
+            return available
+        if isinstance(available, float) and available.is_integer():
+            return int(available)
+        if isinstance(available, str) and available.strip().isdigit():
+            return int(available.strip())
+    camel_credits = response_body.get("rateLimitResetCredits")
+    if isinstance(camel_credits, dict):
+        available = camel_credits.get("availableCount")
+        if isinstance(available, bool):
+            raise ValueError("Codex reset-credit payload availableCount was not an integer.")
+        if isinstance(available, int):
+            return available
+        if isinstance(available, float) and available.is_integer():
+            return int(available)
+        if isinstance(available, str) and available.strip().isdigit():
+            return int(available.strip())
+    raise ValueError(
+        "Codex reset-credit payload did not include rate_limit_reset_credits.available_count."
+    )
+
+
+def _parse_codex_reset_credit_expires_at(
+    response_body: Mapping[str, Any],
+) -> Optional[datetime]:
+    for credits_key, expires_key in (
+        ("rate_limit_reset_credits", "expires_at"),
+        ("rateLimitResetCredits", "expiresAt"),
+    ):
+        credits = response_body.get(credits_key)
+        if not isinstance(credits, dict):
+            continue
+        if expires_key not in credits:
+            continue
+        value = credits.get(expires_key)
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(value), timezone.utc)
+            except (OSError, OverflowError, ValueError):
+                return None
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                return None
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _build_codex_reset_credit_raw_provider_fields(
+    response_body: Mapping[str, Any],
+    *,
+    available_count: int,
+) -> Dict[str, Any]:
+    for credits_key, count_key, expires_key in (
+        ("rate_limit_reset_credits", "available_count", "expires_at"),
+        ("rateLimitResetCredits", "availableCount", "expiresAt"),
+    ):
+        credits = response_body.get(credits_key)
+        if not isinstance(credits, dict) or count_key not in credits:
+            continue
+        fields: Dict[str, Any] = {
+            credits_key: {
+                count_key: available_count,
+            }
+        }
+        if expires_key in credits:
+            fields[credits_key][expires_key] = _json_safe_codex_reset_credit_value(
+                credits.get(expires_key)
+            )
+        return fields
+    return {
+        "rate_limit_reset_credits": {
+            "available_count": available_count,
+        }
+    }
+
+
+def _build_codex_reset_credit_observation(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    response_body: Mapping[str, Any],
+    auth_context: Mapping[str, Any],
+    status_code: int,
+    attempt_count: int,
+    retry_count: int,
+) -> Dict[str, Any]:
+    available_count = _parse_codex_reset_credit_available_count(response_body)
+    expires_at = _parse_codex_reset_credit_expires_at(response_body)
+    account_id = auth_context.get("account_id")
+    account_hash = probes.account_identity_hash(account_id)
+    if account_hash is None:
+        raise ValueError(
+            "Codex reset-credit poll could not derive a stable hashed account identity."
+        )
+    raw_provider_fields = _build_codex_reset_credit_raw_provider_fields(
+        response_body,
+        available_count=available_count,
+    )
+    evidence = {
+        "signals": ["codex_reset_credit_poll"],
+        "provider_fields": [
+            "rate_limit_reset_credits.available_count",
+            "rateLimitResetCredits.availableCount",
+        ],
+        "usage_url": config.codex_usage_url,
+        "status_code": status_code,
+        "attempt_count": attempt_count,
+        "retry_count": retry_count,
+        "account_id_present": bool(account_id),
+        "chatgpt_account_id_header_present": bool(account_id),
+    }
+    return {
+        "observed_at": observed_at,
+        "environment": config.environment,
+        "provider": "openai",
+        "account_hash": account_hash,
+        "credit_family": DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+        "credit_type": DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE,
+        "available_count": available_count,
+        "expires_at": expires_at,
+        "raw_provider_fields": raw_provider_fields,
+        "evidence": evidence,
+        "source": DEFAULT_CODEX_RESET_CREDIT_SOURCE,
+    }
+
+
+def _codex_reset_credit_retryable_http_error(
+    exc: urllib_error.HTTPError,
+    *,
+    error_hint: Optional[str],
+) -> bool:
+    status_code = exc.code
+    if status_code in {401, 403, 429}:
+        return False
+    normalized_hint = (error_hint or "").strip().lower()
+    if status_code == 400 and normalized_hint and any(
+        hint in normalized_hint for hint in CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS
+    ):
+        return True
+    if status_code in CODEX_RESET_CREDIT_NON_RETRYABLE_HTTP_STATUS_CODES:
+        return False
+    if status_code in CODEX_RESET_CREDIT_RETRYABLE_HTTP_STATUS_CODES:
+        return True
+    return False
+
+
+def _codex_reset_credit_retryable_url_error(exc: urllib_error.URLError) -> bool:
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, TimeoutError):
+        return True
+    if isinstance(reason, OSError) and getattr(reason, "errno", None) in {110, 111, 113}:
+        return True
+    message = str(reason or exc).strip().lower()
+    return any(hint in message for hint in CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS)
+
+
+def _fetch_codex_reset_credit_payload(
+    config: ProviderStatusLoopConfig,
+) -> Dict[str, Any]:
+    max_attempts = max(1, config.codex_reset_credit_poll_max_attempts)
+    attempt_count = 0
+    retry_count = 0
+    last_status_code: Optional[int] = None
+    last_error_hint: Optional[str] = None
+    last_error_message = "Codex reset-credit poll failed."
+
+    while attempt_count < max_attempts:
+        attempt_count += 1
+        try:
+            auth_context = _load_codex_reset_credit_auth_context(config.codex_auth_file)
+            request = urllib_request.Request(
+                config.codex_usage_url,
+                headers=_build_codex_reset_credit_request_headers(auth_context),
+                method="GET",
+            )
+            with urllib_request.urlopen(
+                request,
+                timeout=config.codex_reset_credit_poll_http_timeout_seconds,
+            ) as response:
+                status_code = getattr(response, "status", None) or response.getcode()
+                response_body = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            last_status_code = exc.code
+            last_error_hint = codex_oauth_refresh._extract_oauth_error_hint(
+                exc.read().decode("utf-8", errors="replace")
+            )
+            last_error_message = _codex_reset_credit_poll_failure_message(
+                status_code=last_status_code,
+                error_hint=last_error_hint,
+                fallback_message="",
+            )
+            if (
+                attempt_count < max_attempts
+                and _codex_reset_credit_retryable_http_error(
+                    exc,
+                    error_hint=last_error_hint,
+                )
+            ):
+                retry_count += 1
+                _codex_reset_credit_poll_sleep(
+                    _codex_reset_credit_poll_backoff_seconds(
+                        config,
+                        retry_count=retry_count,
+                    )
+                )
+                continue
+            raise CodexResetCreditPollError(
+                last_error_message,
+                status_code=last_status_code,
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+            ) from exc
+        except urllib_error.URLError as exc:
+            last_status_code = None
+            last_error_hint = None
+            last_error_message = (
+                "Codex reset-credit poll failed while contacting the usage endpoint."
+            )
+            if attempt_count < max_attempts and _codex_reset_credit_retryable_url_error(exc):
+                retry_count += 1
+                _codex_reset_credit_poll_sleep(
+                    _codex_reset_credit_poll_backoff_seconds(
+                        config,
+                        retry_count=retry_count,
+                    )
+                )
+                continue
+            raise CodexResetCreditPollError(
+                last_error_message,
+                status_code=last_status_code,
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+            ) from exc
+
+        try:
+            payload = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise CodexResetCreditPollError(
+                "Codex usage endpoint returned invalid JSON.",
+                status_code=int(status_code),
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise CodexResetCreditPollError(
+                "Codex usage endpoint returned a non-object payload.",
+                status_code=int(status_code),
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+            )
+        return {
+            "status_code": int(status_code),
+            "payload": payload,
+            "auth_context": auth_context,
+            "attempt_count": attempt_count,
+            "retry_count": retry_count,
+        }
+
+    raise CodexResetCreditPollError(
+        last_error_message,
+        status_code=last_status_code,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+    )
+
+
+def _persist_codex_reset_credit_observation(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    response_body: Mapping[str, Any],
+    auth_context: Mapping[str, Any],
+    status_code: int,
+    attempt_count: int,
+    retry_count: int,
+) -> tuple[int, int]:
+    observation = _build_codex_reset_credit_observation(
+        config,
+        observed_at=observed_at,
+        response_body=response_body,
+        auth_context=auth_context,
+        status_code=status_code,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+    )
+    dsn = _resolve_dsn(config)
+    inserted_count = probes.insert_provider_credit_observations(
+        dsn,
+        [observation],
+        lock_timeout_ms=config.db_lock_timeout_ms,
+        statement_timeout_ms=config.db_statement_timeout_ms,
+    )
+    return 1, inserted_count
+
+
+def _run_codex_reset_credit_poll_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.codex_reset_credit_poll_enabled:
+        return None
+    last_attempt = state.codex_reset_credit_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt < config.codex_reset_credit_poll_interval_seconds
+    ):
+        return None
+
+    state.codex_reset_credit_last_attempt_monotonic = now_monotonic
+    observed_at = datetime.now(timezone.utc)
+    summary: Dict[str, Any] = {
+        "attempted": True,
+        "persisted": False,
+        "skipped": False,
+        "auth_file": config.codex_auth_file,
+        "resolved_auth_file": config.codex_auth_file,
+        "auth_file_source": config.codex_auth_file_source,
+        "usage_url": config.codex_usage_url,
+        "available_count": None,
+        "inserted_count": 0,
+        "status_code": None,
+        "attempt_count": 0,
+        "retry_count": 0,
+        "poll_max_attempts": max(1, config.codex_reset_credit_poll_max_attempts),
+        "error_class": None,
+        "error_message": None,
+    }
+    try:
+        fetched = _fetch_codex_reset_credit_payload(config)
+        summary["status_code"] = fetched["status_code"]
+        summary["attempt_count"] = fetched.get("attempt_count", 1)
+        summary["retry_count"] = fetched.get("retry_count", 0)
+        available_count = _parse_codex_reset_credit_available_count(fetched["payload"])
+        summary["available_count"] = available_count
+        if config.apply:
+            observation_count, inserted_count = _persist_codex_reset_credit_observation(
+                config,
+                observed_at=observed_at,
+                response_body=fetched["payload"],
+                auth_context=fetched["auth_context"],
+                status_code=fetched["status_code"],
+                attempt_count=summary["attempt_count"],
+                retry_count=summary["retry_count"],
+            )
+            summary["inserted_count"] = inserted_count
+            summary["persisted"] = observation_count > 0 and inserted_count >= 0
+        else:
+            _build_codex_reset_credit_observation(
+                config,
+                observed_at=observed_at,
+                response_body=fetched["payload"],
+                auth_context=fetched["auth_context"],
+                status_code=fetched["status_code"],
+                attempt_count=summary["attempt_count"],
+                retry_count=summary["retry_count"],
+            )
+            summary["persisted"] = False
+    except Exception as exc:
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
+        if isinstance(exc, CodexResetCreditPollError):
+            summary["status_code"] = exc.status_code
+            summary["attempt_count"] = exc.attempt_count
+            summary["retry_count"] = exc.retry_count
+        elif summary["status_code"] is None:
+            status_match = re.search(r"with HTTP (\d{3})", str(exc))
+            if status_match is not None:
+                summary["status_code"] = int(status_match.group(1))
+        if summary["attempt_count"] == 0:
+            summary["attempt_count"] = 1
+
+    return {
+        "event": "codex_reset_credit_poll",
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        **summary,
+    }
 
 
 def _load_grok_billing_access_token(auth_file: str) -> str:
@@ -3691,6 +4316,7 @@ def run_due_sidecar_tasks(
         (_run_codex_oauth_refresh_task, "codex_oauth_refresh"),
         (_run_xai_oauth_refresh_task, "xai_oauth_refresh"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
+        (_run_codex_reset_credit_poll_task, "codex_reset_credit_poll"),
         (_run_observability_anomaly_scan_task, "observability_anomaly_scan"),
     ):
         try:

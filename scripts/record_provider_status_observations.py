@@ -242,6 +242,135 @@ ORDER BY
 """
 
 
+PROVIDER_CREDIT_OBSERVATIONS_INSERT_SQL = """
+WITH candidate AS (
+    SELECT
+        %s::timestamptz AS observed_at,
+        %s::text AS environment,
+        %s::text AS provider,
+        %s::text AS account_hash,
+        %s::text AS credit_family,
+        %s::text AS credit_type,
+        %s::integer AS available_count,
+        %s::timestamptz AS expires_at,
+        %s::jsonb AS raw_provider_fields,
+        %s::jsonb AS evidence,
+        %s::text AS source
+),
+locked AS (
+    SELECT pg_advisory_xact_lock(
+        hashtext(
+            CONCAT_WS(
+                '|',
+                candidate.environment,
+                candidate.provider,
+                COALESCE(candidate.account_hash, '<null>'),
+                candidate.credit_family,
+                COALESCE(candidate.source, '<null>')
+            )
+        )::bigint
+    ) AS lock_acquired
+    FROM candidate
+)
+INSERT INTO public.provider_credit_observations (
+    observed_at,
+    environment,
+    provider,
+    account_hash,
+    credit_family,
+    credit_type,
+    available_count,
+    expires_at,
+    raw_provider_fields,
+    evidence,
+    source
+)
+SELECT
+    candidate.observed_at,
+    candidate.environment,
+    candidate.provider,
+    candidate.account_hash,
+    candidate.credit_family,
+    candidate.credit_type,
+    candidate.available_count,
+    candidate.expires_at,
+    COALESCE(candidate.raw_provider_fields, '{}'::jsonb),
+    COALESCE(candidate.evidence, '{}'::jsonb),
+    candidate.source
+FROM candidate
+CROSS JOIN locked
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM (
+        SELECT latest.available_count
+        FROM public.provider_credit_observations AS latest
+        WHERE latest.environment = candidate.environment
+          AND latest.provider = candidate.provider
+          AND latest.credit_family = candidate.credit_family
+          AND latest.account_hash IS NOT DISTINCT FROM candidate.account_hash
+          AND latest.source IS NOT DISTINCT FROM candidate.source
+        ORDER BY latest.observed_at DESC, latest.id DESC
+        LIMIT 1
+    ) AS latest
+    WHERE latest.available_count IS NOT DISTINCT FROM candidate.available_count
+)
+"""
+PROVIDER_CREDIT_OBSERVATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.provider_credit_observations (
+    id BIGSERIAL PRIMARY KEY,
+    observed_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    environment TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    account_hash TEXT NOT NULL,
+    credit_family TEXT NOT NULL,
+    credit_type TEXT NOT NULL,
+    available_count INTEGER NOT NULL,
+    expires_at TIMESTAMPTZ,
+    source TEXT NOT NULL,
+    raw_provider_fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb
+)
+"""
+PROVIDER_CREDIT_OBSERVATIONS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS provider_credit_observations_provider_time_idx ON public.provider_credit_observations (provider, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_credit_observations_identity_time_idx ON public.provider_credit_observations (environment, provider, account_hash, credit_family, source, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_credit_observations_expires_idx ON public.provider_credit_observations (expires_at)",
+)
+PROVIDER_CREDIT_CURRENT_VIEW_SQL = """
+CREATE OR REPLACE VIEW public.provider_credit_current AS
+SELECT DISTINCT ON (
+    environment,
+    provider,
+    account_hash,
+    credit_family,
+    COALESCE(source, '')
+)
+    id,
+    observed_at,
+    created_at,
+    environment,
+    provider,
+    account_hash,
+    credit_family,
+    credit_type,
+    available_count,
+    expires_at,
+    source,
+    raw_provider_fields,
+    evidence
+FROM public.provider_credit_observations
+ORDER BY
+    environment,
+    provider,
+    account_hash,
+    credit_family,
+    COALESCE(source, ''),
+    observed_at DESC,
+    id DESC
+"""
+
+
 class ProviderStatusDatabaseWriteSkipped(RuntimeError):
     def __init__(self, *, error_class: str, message: str) -> None:
         super().__init__(message)
@@ -704,6 +833,10 @@ def setup_schema(
                 for statement in PROVIDER_AUTH_OBSERVATIONS_INDEX_STATEMENTS:
                     cur.execute(statement)
                 cur.execute(PROVIDER_AUTH_CURRENT_VIEW_SQL)
+                cur.execute(PROVIDER_CREDIT_OBSERVATIONS_TABLE_SQL)
+                for statement in PROVIDER_CREDIT_OBSERVATIONS_INDEX_STATEMENTS:
+                    cur.execute(statement)
+                cur.execute(PROVIDER_CREDIT_CURRENT_VIEW_SQL)
         except (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled) as exc:
             conn.rollback()
             raise ProviderStatusDatabaseWriteSkipped(
@@ -811,6 +944,66 @@ def _json_default(value: Any) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+def account_identity_hash(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:12]
+
+
+def _provider_credit_db_payload(row: Dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("observed_at"),
+        row.get("environment"),
+        row.get("provider"),
+        row.get("account_hash"),
+        row.get("credit_family"),
+        row.get("credit_type"),
+        row.get("available_count"),
+        row.get("expires_at"),
+        json.dumps(row.get("raw_provider_fields") or {}, sort_keys=True, default=_json_default),
+        json.dumps(row.get("evidence") or {}, sort_keys=True, default=_json_default),
+        row.get("source"),
+    )
+
+
+def insert_provider_credit_observations(
+    dsn: str,
+    rows: List[Dict[str, Any]],
+    *,
+    lock_timeout_ms: int = DEFAULT_DB_LOCK_TIMEOUT_MS,
+    statement_timeout_ms: int = DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+) -> int:
+    if not rows:
+        return 0
+
+    with psycopg.connect(dsn) as conn:
+        try:
+            with conn.cursor() as cur:
+                _set_database_timeouts(
+                    cur,
+                    lock_timeout_ms=lock_timeout_ms,
+                    statement_timeout_ms=statement_timeout_ms,
+                )
+                inserted_count = 0
+                for row in rows:
+                    cur.execute(
+                        PROVIDER_CREDIT_OBSERVATIONS_INSERT_SQL,
+                        _provider_credit_db_payload(row),
+                    )
+                    inserted_count += max(0, cur.rowcount)
+        except (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled) as exc:
+            conn.rollback()
+            raise ProviderStatusDatabaseWriteSkipped(
+                error_class=exc.__class__.__name__,
+                message=str(exc),
+            ) from exc
+        conn.commit()
+    return inserted_count
 
 
 def main() -> int:
