@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import traceback
 from base64 import b64encode
 from datetime import datetime, timezone
@@ -168,6 +169,44 @@ _AAWM_PASSTHROUGH_ERROR_LOG_REQUEST_SHAPE_KEYS = (
     "aawm_passthrough_input_item_type_counts",
     "aawm_passthrough_tool_count",
     "aawm_passthrough_tool_type_counts",
+    "aawm_passthrough_request_shape_error_class",
+    "aawm_passthrough_request_shape_error_message_class",
+    "aawm_passthrough_request_shape_error_body_preview",
+    "aawm_passthrough_request_shape_summary",
+    "aawm_passthrough_request_shape_fingerprint",
+    "aawm_passthrough_request_shape_error_fingerprint",
+)
+_AAWM_PASSTHROUGH_REQUEST_SHAPE_DESERIALIZATION_MARKERS = (
+    "failed to deserialize the json body",
+    "failed to deserialize json body",
+)
+_AAWM_PASSTHROUGH_REQUEST_SHAPE_DESERIALIZATION_VARIANT_MARKERS = (
+    "untagged enum modelinput",
+    "unknown variant",
+    "did not match any variant",
+    "expected one of",
+)
+_AAWM_PASSTHROUGH_REQUEST_SHAPE_FAILURE_LOGGING_PAYLOAD_ALLOWLIST = (
+    "url",
+    "request_method",
+    "cost_per_request",
+    "start_time",
+    "end_time",
+)
+_AAWM_PASSTHROUGH_REQUEST_SHAPE_ERROR_PREVIEW_TRUNCATE_PATTERNS = (
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?prompt"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;]|^)\s*input\s*='),
+    re.compile(r'(?i)"input"\s*:'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?messages"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?content"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?tools?"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?arguments"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?output"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?authorization"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?api[_-]?key"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?token"?\s*[:=]'),
+    re.compile(r'(?i)(?:[;,\s{]|^)\s*"?bearer"?\s*[:=]'),
+    re.compile(r'(?i)\bsk-[a-z0-9_-]+\b'),
 )
 _AAWM_PASSTHROUGH_ERROR_LOG_GROK_SIDE_CHANNEL_FIELDS = (
     "grok_side_channel",
@@ -1565,6 +1604,366 @@ def _passthrough_error_context_metadata_value(value: Any) -> Any:
         return cleaned_dict
     return _clean_passthrough_error_context_value(value)
 
+
+
+
+def _is_openai_passthrough_responses_error_context(
+    error_log_context: Dict[str, Any],
+) -> bool:
+    endpoint = str(error_log_context.get("endpoint") or "").lower()
+    if "/openai_passthrough/responses" in endpoint:
+        return True
+
+    upstream_url = str(error_log_context.get("upstream_url") or "").lower()
+    parsed_upstream = urlparse(upstream_url)
+    upstream_path = (parsed_upstream.path or "").rstrip("/")
+    return upstream_path in {
+        "/v1/responses",
+        "/backend-api/codex/responses",
+        "/responses",
+    } or upstream_path.startswith(
+        (
+            "/v1/responses/",
+            "/backend-api/codex/responses/",
+            "/responses/",
+        )
+    )
+
+
+def _extract_passthrough_upstream_error_text(exc: Exception) -> str:
+    detail: Any = None
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+    elif isinstance(exc, httpx.HTTPStatusError):
+        try:
+            detail = exc.response.text
+        except Exception:
+            detail = None
+        if not detail:
+            try:
+                detail = exc.response.content
+            except Exception:
+                detail = None
+
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="replace")
+    elif isinstance(detail, dict):
+        error_value = detail.get("error")
+        if isinstance(error_value, dict):
+            detail_text = str(error_value.get("message") or error_value)
+        else:
+            detail_text = str(error_value or detail)
+    elif detail is not None:
+        detail_text = str(detail)
+    else:
+        detail_text = str(exc)
+
+    stripped_detail = detail_text.strip()
+    if stripped_detail.startswith(("b'", 'b"')):
+        try:
+            literal_detail = ast.literal_eval(stripped_detail)
+        except Exception:
+            literal_detail = None
+        if isinstance(literal_detail, bytes):
+            detail_text = literal_detail.decode("utf-8", errors="replace")
+        elif isinstance(literal_detail, str):
+            detail_text = literal_detail
+
+    upstream_payload = _coerce_upstream_error_payload(detail_text)
+    if isinstance(upstream_payload, dict):
+        error_value = upstream_payload.get("error")
+        if isinstance(error_value, dict):
+            return str(error_value.get("message") or error_value)
+        if error_value is not None:
+            return str(error_value)
+    return detail_text
+
+
+
+def _sanitize_passthrough_request_shape_error_preview(error_text: str) -> Optional[str]:
+    """Bounded upstream deserialization error text without echoed request secrets."""
+    normalized = " ".join(str(error_text).split())
+    if not normalized:
+        return None
+
+    truncate_at = len(normalized)
+    for pattern in _AAWM_PASSTHROUGH_REQUEST_SHAPE_ERROR_PREVIEW_TRUNCATE_PATTERNS:
+        match = pattern.search(normalized)
+        if match is not None:
+            truncate_at = min(truncate_at, match.start())
+    preview = normalized[:truncate_at].rstrip(" ;,{")
+    if truncate_at < len(normalized) and preview and not preview.endswith("[REDACTED]"):
+        preview = f"{preview} [REDACTED]"
+
+    redacted = re.sub(
+        r"(?i)\b(?:bearer\s+)?sk-[a-z0-9_-]+\b",
+        "[REDACTED]",
+        preview,
+    )
+    redacted = re.sub(
+        r"(?i)\bbearer\s+[a-z0-9._-]+\b",
+        "[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)\b(?:prompt|input|messages|content|tools?|arguments|output|token|authorization|api[_-]?key|bearer)\s*=\s*[^;]+",
+        "[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(
+        r'(?i)"(?:prompt|input|messages|content|tools?|arguments|output|authorization|api[_-]?key|token)"\s*:\s*[^,}\]]+',
+        '"[REDACTED]"',
+        redacted,
+    )
+    return _clean_passthrough_error_context_value(redacted)
+
+
+def _build_passthrough_request_shape_failure_request_payload(
+    *,
+    error_log_context: Dict[str, Any],
+    kwargs: Optional[dict],
+    custom_llm_provider: Optional[str],
+) -> dict:
+    """Minimal failure-hook payload for request-shape 422 without raw body or secrets."""
+    request_payload: Dict[str, Any] = {
+        "call_type": "pass_through_endpoint",
+    }
+
+    litellm_call_id = None
+    passthrough_logging_payload = None
+    if isinstance(kwargs, dict):
+        litellm_call_id = kwargs.get("litellm_call_id")
+        passthrough_logging_payload = kwargs.get("passthrough_logging_payload")
+        if kwargs.get("call_type"):
+            request_payload["call_type"] = kwargs.get("call_type")
+
+    if litellm_call_id:
+        request_payload["litellm_call_id"] = litellm_call_id
+    elif error_log_context.get("litellm_call_id"):
+        request_payload["litellm_call_id"] = error_log_context.get("litellm_call_id")
+
+    model = _clean_passthrough_error_context_value(error_log_context.get("model"))
+    if model:
+        request_payload["model"] = model
+
+    provider = _clean_passthrough_error_context_value(
+        custom_llm_provider or error_log_context.get("provider")
+    )
+    if provider:
+        request_payload["custom_llm_provider"] = provider
+
+    metadata: Dict[str, Any] = {}
+    for metadata_key, context_key in (
+        ("route_family", "route_family"),
+        ("model_alias", "model_alias"),
+        ("provider", "provider"),
+        ("endpoint", "endpoint"),
+        ("upstream_url", "upstream_url"),
+        ("status_code", "status_code"),
+        ("failure_kind", "failure_kind"),
+    ):
+        value = _passthrough_error_context_metadata_value(
+            error_log_context.get(context_key)
+        )
+        if value is not None:
+            metadata[metadata_key] = value
+
+    for field_name in _AAWM_PASSTHROUGH_ERROR_LOG_REQUEST_SHAPE_KEYS:
+        value = _passthrough_error_context_metadata_value(
+            error_log_context.get(field_name)
+        )
+        if value is not None:
+            metadata[field_name] = value
+
+    if metadata:
+        request_payload["litellm_params"] = {"metadata": metadata}
+
+    if error_log_context.get("failure_kind"):
+        request_payload["failure_kind"] = error_log_context.get("failure_kind")
+
+    for field_name in (
+        "aawm_passthrough_request_shape_error_class",
+        "aawm_passthrough_request_shape_error_message_class",
+        "aawm_passthrough_request_shape_error_body_preview",
+        "aawm_passthrough_request_shape_summary",
+        "aawm_passthrough_request_shape_fingerprint",
+        "aawm_passthrough_request_shape_error_fingerprint",
+    ):
+        value = _passthrough_error_context_metadata_value(
+            error_log_context.get(field_name)
+        )
+        if value is not None:
+            request_payload[field_name] = value
+
+    if passthrough_logging_payload is not None:
+        safe_logging_payload: Dict[str, Any] = {}
+        if isinstance(passthrough_logging_payload, dict):
+            for key in _AAWM_PASSTHROUGH_REQUEST_SHAPE_FAILURE_LOGGING_PAYLOAD_ALLOWLIST:
+                if key not in passthrough_logging_payload:
+                    continue
+                value = passthrough_logging_payload[key]
+                cleaned_value = _passthrough_error_context_metadata_value(value)
+                if cleaned_value is not None:
+                    safe_logging_payload[key] = cleaned_value
+        if safe_logging_payload:
+            request_payload["passthrough_logging_payload"] = safe_logging_payload
+
+    return request_payload
+
+
+def _classify_passthrough_request_shape_deserialization_422(
+    *,
+    status_code: Optional[int],
+    error_log_context: Dict[str, Any],
+    exc: Exception,
+) -> Optional[Dict[str, Any]]:
+    if status_code != 422:
+        return None
+    if not _is_openai_passthrough_responses_error_context(error_log_context):
+        return None
+
+    error_text = _extract_passthrough_upstream_error_text(exc)
+    normalized_error_text = " ".join(error_text.lower().split())
+    if not any(
+        marker in normalized_error_text
+        for marker in _AAWM_PASSTHROUGH_REQUEST_SHAPE_DESERIALIZATION_MARKERS
+    ):
+        return None
+    if not any(
+        marker in normalized_error_text
+        for marker in _AAWM_PASSTHROUGH_REQUEST_SHAPE_DESERIALIZATION_VARIANT_MARKERS
+    ):
+        return None
+
+    if "modelinput" in normalized_error_text:
+        message_class = "model_input_deserialization_failed"
+    elif "unknown variant" in normalized_error_text or "expected one of" in normalized_error_text:
+        message_class = "unsupported_variant_deserialization_failed"
+    else:
+        message_class = "generic_deserialization_failed"
+
+    preview = _sanitize_passthrough_request_shape_error_preview(error_text)
+    if preview is None:
+        preview = _sanitize_passthrough_request_shape_error_preview(
+            normalized_error_text[:_AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS]
+        )
+
+    return {
+        "failure_kind": "request_shape_deserialization_failed",
+        "aawm_passthrough_request_shape_error_class": (
+            "request_shape_deserialization_failed"
+        ),
+        "aawm_passthrough_request_shape_error_message_class": message_class,
+        "aawm_passthrough_request_shape_error_body_preview": preview,
+    }
+
+
+def _build_passthrough_request_shape_summary(
+    error_log_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    summary_fields = (
+        "aawm_passthrough_body_container_type",
+        "aawm_passthrough_body_top_level_keys",
+        "aawm_passthrough_input_container_type",
+        "aawm_passthrough_input_item_count",
+        "aawm_passthrough_input_item_type_counts",
+        "aawm_passthrough_tool_count",
+        "aawm_passthrough_tool_type_counts",
+    )
+    summary: Dict[str, Any] = {}
+    for field_name in summary_fields:
+        value = _passthrough_error_context_metadata_value(
+            error_log_context.get(field_name)
+        )
+        if value is not None:
+            summary[field_name.removeprefix("aawm_passthrough_")] = value
+    return summary
+
+
+def _build_passthrough_request_shape_fingerprint(
+    error_log_context: Dict[str, Any],
+) -> str:
+    fingerprint_source = _build_passthrough_request_shape_summary(error_log_context)
+    fingerprint_source.update(
+        {
+            "endpoint": error_log_context.get("endpoint"),
+            "route_family": error_log_context.get("route_family"),
+            "model": error_log_context.get("model"),
+            "model_alias": error_log_context.get("model_alias"),
+            "provider": error_log_context.get("provider"),
+        }
+    )
+    return hashlib.sha256(
+        json.dumps(
+            fingerprint_source,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_passthrough_request_shape_error_fingerprint(
+    *,
+    message_class: str,
+    preview: Optional[str],
+    endpoint: Optional[str],
+) -> str:
+    fingerprint_source = {
+        "endpoint": endpoint,
+        "message_class": message_class,
+        "preview": preview,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            fingerprint_source,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _enrich_passthrough_error_log_context_for_request_shape_422(
+    *,
+    error_log_context: Dict[str, Any],
+    exc: Exception,
+) -> Dict[str, Any]:
+    classification = _classify_passthrough_request_shape_deserialization_422(
+        status_code=error_log_context.get("status_code"),
+        error_log_context=error_log_context,
+        exc=exc,
+    )
+    if classification is None:
+        return error_log_context
+
+    enriched_context = {
+        **error_log_context,
+        **classification,
+    }
+    summary = _build_passthrough_request_shape_summary(enriched_context)
+    if summary:
+        enriched_context["aawm_passthrough_request_shape_summary"] = summary
+    enriched_context["aawm_passthrough_request_shape_fingerprint"] = (
+        _build_passthrough_request_shape_fingerprint(enriched_context)
+    )
+    enriched_context["aawm_passthrough_request_shape_error_fingerprint"] = (
+        _build_passthrough_request_shape_error_fingerprint(
+            message_class=str(
+                classification.get(
+                    "aawm_passthrough_request_shape_error_message_class"
+                )
+                or ""
+            ),
+            preview=classification.get(
+                "aawm_passthrough_request_shape_error_body_preview"
+            ),
+            endpoint=_clean_passthrough_error_context_value(
+                enriched_context.get("endpoint")
+            ),
+        )
+    )
+    return enriched_context
 
 def _build_passthrough_error_log_request_shape_context(
     metadata: Dict[str, Any],
@@ -3534,6 +3933,10 @@ async def pass_through_request(  # noqa: PLR0915
                 **error_log_context,
                 "status_code": status_code,
             }
+        error_log_context = _enrich_passthrough_error_log_context_for_request_shape_422(
+            error_log_context=error_log_context,
+            exc=e,
+        )
         suppress_terminal_failure_traceback = (
             _should_log_passthrough_terminal_failure_without_traceback(
                 exc=e,
@@ -3684,6 +4087,15 @@ async def pass_through_request(  # noqa: PLR0915
                     "failure_kind": known_anthropic_failure_kind,
                 },
             )
+        elif error_log_context.get("failure_kind") == (
+            "request_shape_deserialization_failed"
+        ):
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced Responses request-shape deserialization failure status=%s error=%s",
+                status_code,
+                str(e),
+                extra=error_log_context,
+            )
         elif suppress_terminal_failure_traceback:
             hidden_retry_metadata = _ensure_passthrough_metadata(kwargs)
             hidden_retry_failure_classification = hidden_retry_metadata.get(
@@ -3726,26 +4138,36 @@ async def pass_through_request(  # noqa: PLR0915
         # Monitoring: Trigger post_call_failure_hook
         # for pass through endpoint failure
         #########################################################
-        request_payload: dict = dict(_parsed_body or {})
-        # add user_api_key_dict, litellm_call_id, passthrough_logging_payloa for logging
-        if kwargs:
-            for key, value in kwargs.items():
-                request_payload[key] = value
-
         if (
-            "model" not in request_payload
-            and _parsed_body
-            and isinstance(_parsed_body, dict)
+            error_log_context.get("failure_kind")
+            == "request_shape_deserialization_failed"
         ):
-            request_payload["model"] = _parsed_body.get("model", "")
-        if "custom_llm_provider" not in request_payload and custom_llm_provider:
-            request_payload["custom_llm_provider"] = custom_llm_provider
-        _enrich_passthrough_failure_request_payload(
-            request_payload=request_payload,
-            request=request,
-            url=url,
-            custom_llm_provider=custom_llm_provider,
-        )
+            request_payload = _build_passthrough_request_shape_failure_request_payload(
+                error_log_context=error_log_context,
+                kwargs=kwargs,
+                custom_llm_provider=custom_llm_provider,
+            )
+        else:
+            request_payload = dict(_parsed_body or {})
+            # add user_api_key_dict, litellm_call_id, passthrough_logging_payloa for logging
+            if kwargs:
+                for key, value in kwargs.items():
+                    request_payload[key] = value
+
+            if (
+                "model" not in request_payload
+                and _parsed_body
+                and isinstance(_parsed_body, dict)
+            ):
+                request_payload["model"] = _parsed_body.get("model", "")
+            if "custom_llm_provider" not in request_payload and custom_llm_provider:
+                request_payload["custom_llm_provider"] = custom_llm_provider
+            _enrich_passthrough_failure_request_payload(
+                request_payload=request_payload,
+                request=request,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+            )
 
         traceback_str = None
         if (
@@ -3758,6 +4180,8 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_chatgpt_codex_invalid_encrypted_content_traceback
             and not suppress_google_code_assist_tos_traceback
             and known_anthropic_failure_kind is None
+            and error_log_context.get("failure_kind")
+            != "request_shape_deserialization_failed"
         ):
             traceback_str = traceback.format_exc(
                 limit=MAXIMUM_TRACEBACK_LINES_TO_LOG,

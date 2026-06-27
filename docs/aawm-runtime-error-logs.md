@@ -118,6 +118,12 @@ Practical `context` fields to inspect are:
 - `aawm_passthrough_input_item_type_counts`
 - `aawm_passthrough_tool_count`
 - `aawm_passthrough_tool_type_counts`
+- `aawm_passthrough_request_shape_error_class`
+- `aawm_passthrough_request_shape_error_message_class`
+- `aawm_passthrough_request_shape_error_body_preview`
+- `aawm_passthrough_request_shape_summary`
+- `aawm_passthrough_request_shape_fingerprint`
+- `aawm_passthrough_request_shape_error_fingerprint`
 - `grok_side_channel`
 - `grok_side_channel_endpoint_type`
 - `grok_side_channel_endpoint_path_template`
@@ -139,6 +145,35 @@ different event shape. Each detected anomaly class is written as one line with
 - `examples`
 - `recommended_todo`
 - `cleanup_requirement`
+
+
+
+## Pass-through Responses request-shape 422 instrumentation
+
+When `/openai_passthrough/responses` returns HTTP `422` because the upstream
+could not deserialize the provider-bound JSON body (for example `ModelInput` or
+unknown tool/input variant errors), LiteLLM classifies the failure as
+`failure_kind=request_shape_deserialization_failed` and adds sanitized
+request-shape fields to the runtime error JSONL `context`.
+
+The instrumentation is detection-only: LiteLLM still returns the upstream `422`
+to the caller and does not retry or rewrite the request body on this path.
+
+Recorded fields include:
+
+- `aawm_passthrough_request_shape_error_class`
+- `aawm_passthrough_request_shape_error_message_class` such as
+  `model_input_deserialization_failed`, `unsupported_variant_deserialization_failed`,
+  or `generic_deserialization_failed`
+- `aawm_passthrough_request_shape_error_body_preview` (bounded upstream error text)
+- `aawm_passthrough_request_shape_summary` (container/top-level keys, input/tool counts)
+- `aawm_passthrough_request_shape_fingerprint` (stable grouping key for request shape)
+- `aawm_passthrough_request_shape_error_fingerprint` (stable grouping key for error class)
+
+These records intentionally omit raw request bodies, prompts, tool arguments,
+authorization headers, and API keys. Use the fingerprints to group repeated
+same-profile worker dispatch failures before starting a payload rewrite or route
+fix.
 
 These records summarize telemetry consistency findings from recent database rows.
 They are not traceback-style LiteLLM runtime failures and may omit logger,
