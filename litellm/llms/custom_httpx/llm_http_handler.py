@@ -151,6 +151,18 @@ else:
 
 
 class BaseLLMHTTPHandler:
+    @staticmethod
+    def _resolve_shared_session_for_http_client(
+        litellm_params: Optional[dict],
+        shared_session: Optional["ClientSession"] = None,
+    ) -> Optional["ClientSession"]:
+        """Explicit shared_session wins over litellm_params['shared_session']."""
+        if shared_session is not None:
+            return shared_session
+        if litellm_params is not None:
+            return litellm_params.get("shared_session")
+        return None
+
     async def _make_common_async_call(
         self,
         async_httpx_client: AsyncHTTPHandler,
@@ -827,6 +839,7 @@ class BaseLLMHTTPHandler:
         client: Optional[Union[HTTPHandler, AsyncHTTPHandler]] = None,
         aembedding: Optional[bool] = False,
         headers: Optional[Dict[str, Any]] = None,
+        shared_session: Optional["ClientSession"] = None,
     ) -> EmbeddingResponse:
         provider_config = ProviderConfigManager.get_provider_embedding_config(
             model=model, provider=litellm.LlmProviders(custom_llm_provider)
@@ -886,6 +899,7 @@ class BaseLLMHTTPHandler:
                 client=client,
                 optional_params=optional_params,
                 litellm_params=litellm_params,
+                shared_session=shared_session,
             )
 
         if client is None or not isinstance(client, HTTPHandler):
@@ -934,11 +948,17 @@ class BaseLLMHTTPHandler:
         api_key: Optional[str] = None,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[Union[HTTPHandler, AsyncHTTPHandler]] = None,
+        shared_session: Optional["ClientSession"] = None,
     ) -> EmbeddingResponse:
+        resolved_shared_session = self._resolve_shared_session_for_http_client(
+            litellm_params=litellm_params,
+            shared_session=shared_session,
+        )
         if client is None or not isinstance(client, AsyncHTTPHandler):
             async_httpx_client = get_async_httpx_client(
                 llm_provider=litellm.LlmProviders(custom_llm_provider),
                 params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                shared_session=resolved_shared_session,
             )
         else:
             async_httpx_client = client

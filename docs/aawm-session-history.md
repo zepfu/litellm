@@ -985,3 +985,11 @@ directly instead of routing through the proxy's common `route_request` helper.
 Those direct calls should still pass the proxy-owned shared aiohttp session when
 one is available, including candidate-unavailable and rate-limited probe paths,
 so failed candidate attempts do not create orphan per-request client sessions.
+
+Proxy-routed embedding requests should also retain the proxy-owned shared
+aiohttp session when they reach `BaseLLMHTTPHandler` providers such as local
+hosted embeddings, OpenRouter embeddings, Cohere-compatible embeddings, and
+similar OpenAI-compatible embedding endpoints. The shared session remains
+externally owned by the proxy; provider handlers may reuse it for async request
+transport, but cleanup still happens through proxy shutdown and
+`close_litellm_async_clients()`, not cache eviction.

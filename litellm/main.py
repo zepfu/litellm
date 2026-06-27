@@ -4939,6 +4939,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params=litellm_params_dict,
+                shared_session=shared_session,
             )
         elif (
             custom_llm_provider == "openai"
@@ -5050,6 +5051,7 @@ def embedding(  # noqa: PLR0915
                 aembedding=aembedding,
                 litellm_params=litellm_params_dict,
                 headers=headers or {},
+                shared_session=shared_session,
             )
         elif (
             custom_llm_provider == "openai_like"
@@ -5113,6 +5115,7 @@ def embedding(  # noqa: PLR0915
                 aembedding=aembedding,
                 litellm_params=litellm_params_dict,
                 headers=headers,
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "openrouter":
             api_base = (
@@ -5159,6 +5162,7 @@ def embedding(  # noqa: PLR0915
                 aembedding=aembedding,
                 litellm_params=litellm_params_dict,
                 headers=headers,
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "vercel_ai_gateway":
             api_base = (
@@ -5189,6 +5193,7 @@ def embedding(  # noqa: PLR0915
                 aembedding=aembedding,
                 litellm_params=litellm_params_dict,
                 headers=headers,
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "huggingface":
             api_key = (
@@ -5250,6 +5255,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "gemini":
             gemini_api_key = api_key or get_api_key_from_env() or litellm.api_key
@@ -5517,6 +5523,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "voyage":
             response = base_llm_http_handler.embedding(
@@ -5532,6 +5539,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "infinity":
             response = base_llm_http_handler.embedding(
@@ -5547,6 +5555,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "watsonx":
             credentials = IBMWatsonXMixin.get_watsonx_credentials(
@@ -5572,6 +5581,7 @@ def embedding(  # noqa: PLR0915
                 litellm_params={},
                 client=client,
                 aembedding=aembedding,
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "xinference":
             api_key = (
@@ -5612,6 +5622,7 @@ def embedding(  # noqa: PLR0915
                 litellm_params={},
                 client=client,
                 aembedding=aembedding,
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "azure_ai":
             api_base = (
@@ -5639,6 +5650,7 @@ def embedding(  # noqa: PLR0915
                 optional_params=optional_params,
                 client=client,
                 aembedding=aembedding,
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "jina_ai":
             if isinstance(input, str):
@@ -5658,6 +5670,7 @@ def embedding(  # noqa: PLR0915
                 litellm_params={},
                 client=client,
                 aembedding=aembedding,
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "volcengine":
             volcengine_key = (
@@ -5688,6 +5701,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 headers=headers,
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "ovhcloud":
             api_key = api_key or litellm.api_key or get_secret_str("OVHCLOUD_API_KEY")
@@ -5710,6 +5724,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "cometapi":
             api_key = (
@@ -5737,6 +5752,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                shared_session=shared_session,
             )
         elif custom_llm_provider in litellm._custom_providers:
             custom_handler: Optional[CustomLLM] = None
@@ -5782,6 +5798,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "gigachat":
             api_key = (
@@ -5804,6 +5821,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={"ssl_verify": kwargs.get("ssl_verify", None)},
+                shared_session=shared_session,
             )
         elif custom_llm_provider == "perplexity":
             response = base_llm_http_handler.embedding(
@@ -5819,6 +5837,7 @@ def embedding(  # noqa: PLR0915
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                shared_session=shared_session,
             )
         else:
             raise LiteLLMUnknownProvider(
