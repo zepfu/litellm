@@ -2078,6 +2078,62 @@ def test_should_not_flag_benign_composer_call_prose_as_contract_failure() -> Non
     assert "output_contract_literal_tool_call_text" not in evidence.reasons
 
 
+def test_should_score_literal_claude_xml_invoke_text_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Run the requested step."}],
+        {
+            "role": "assistant",
+            "content": (
+                '<invoke name="Bash">\n'
+                '<parameter name="command">pwd</parameter>\n'
+                "</invoke>"
+            ),
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 0.0
+    assert evidence.output_contract_compliance_score == 0.0
+    assert evidence.output_contract_failure_class == "literal_tool_call_text"
+    assert evidence.output_contract_failure_count == 1
+    assert evidence.agent_score_reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+
+def test_should_not_flag_benign_claude_xml_prose_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Summarize the incident."}],
+        {
+            "role": "assistant",
+            "content": (
+                'The model printed the string <invoke name="Bash"> in prose '
+                "but did not emit structured tool_use."
+            ),
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=12),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.output_contract_failure_class is None
+    assert "output_contract_literal_tool_call_text" not in evidence.reasons
+
+
 def test_should_not_flag_real_tool_calls_for_output_contract_when_solved() -> None:
     payload = _payload(
         [

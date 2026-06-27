@@ -673,6 +673,24 @@ WHERE h.session_id = $1
 The durable table stores sanitized/redacted definitions only. It should be used
 for drill-down and attribution evidence, not as proof that any tool was called.
 
+## Output Contract Metadata
+
+Runtime session-history scoring records bounded output-contract classifications in
+`session_history` columns and mirrored `usage_*` metadata fields. These checks are
+metadata-only: they do not execute, rewrite, or convert assistant text into tool
+calls.
+
+When assistant output prints literal tool-invocation text instead of structured
+`tool_use`, LiteLLM classifies the generation with
+`output_contract_failure_class=literal_tool_call_text`,
+`output_contract_compliance_score=0.0`, and
+`agent_score_reasons.output_contract_compliance=["literal_tool_call_text"]`.
+This includes serialized `composer_call` transcript text and Claude-style XML
+literals such as line-start `<invoke name="Bash">` blocks with `<parameter>`
+content. Benign prose that merely discusses those strings inline is not flagged.
+Request-side `<tool_use_error>` content and normal structured `tool_use` blocks
+remain distinct from this assistant-side literal-text failure class.
+
 Langfuse-only historical backfills cannot reconstruct a full snapshot once
 generation metadata has been compacted. They preserve the compact hash/reference
 fields when present, but the durable table is populated only by runtime
