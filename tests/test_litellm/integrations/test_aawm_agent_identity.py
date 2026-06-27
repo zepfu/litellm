@@ -2951,6 +2951,62 @@ def test_build_session_history_record_persists_output_contract_metadata() -> Non
     )
 
 
+def test_build_session_history_record_flags_literal_claude_xml_output_contract() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-output-contract-literal-xml"
+    kwargs["litellm_params"]["metadata"].update(
+        {"session_id": "session-output-contract-literal-xml"}
+    )
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
+        {"role": "user", "content": "Run the requested step."}
+    ]
+    result = {
+        "id": "resp-output-contract-literal-xml",
+        "usage": {"prompt_tokens": 20, "completion_tokens": 12, "total_tokens": 32},
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        '<invoke name="Bash">\n'
+                        '<parameter name="command">pwd</parameter>\n'
+                        "</invoke>"
+                    ),
+                }
+            }
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["output_contract_compliance_score"] == pytest.approx(0.0)
+    assert record["output_contract_failure_class"] == "literal_tool_call_text"
+    assert record["output_contract_failure_count"] == 1
+    assert record["agent_score_reasons"]["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+    payload_metadata = record["metadata"]
+    assert payload_metadata["usage_output_contract_failure_class"] == "literal_tool_call_text"
+    assert payload_metadata["usage_output_contract_failure_count"] == 1
+    assert (
+        payload_metadata["usage_agent_score_reasons"]["output_contract_compliance"]
+        == ["literal_tool_call_text"]
+    )
+    serialized = json.dumps(record)
+    assert '<invoke name="Bash">' not in serialized
+    assert "literal_tool_call_text" in serialized
+
+
 def test_build_session_history_record_scores_runtime_ignored_path_tracking() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"
