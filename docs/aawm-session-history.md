@@ -732,6 +732,29 @@ When a Langfuse payload-size audit log is emitted, the JSON summary may include
 `entries`. Use it to tell whether a warning is input-dominated or a metadata
 regression, not to recover raw request content.
 
+## Worker Context Exhaustion Metadata (D1-412)
+
+Upstream orchestrators may attach bounded worker failure context on
+`litellm_metadata` when a worker subagent hits context-window exhaustion or
+stops with partial telemetry. LiteLLM copies only the allowlisted keys into
+`session_history.metadata` without treating partial model output as success.
+
+Allowlisted keys:
+
+- `worker_context_exhaustion_failure_class`
+- `worker_context_exhaustion_failure_reason`
+- `worker_context_exhaustion_partial_output_summary`
+- `worker_context_exhaustion_changed_paths_hint` (string or bounded path list)
+- `worker_context_exhaustion_attempted_patch_scope`
+- `worker_context_exhaustion_last_visible_message`
+- `worker_context_exhaustion_success` (when supplied as `false`, persisted as `false`)
+- `worker_context_exhaustion_completed` (when supplied as `false`, persisted as `false`)
+
+Values are truncated to secret-safe string limits; raw transcripts, prompts,
+tool arguments, and API secrets must not be placed in these fields. LiteLLM does
+not infer `worker_context_exhaustion_success` or `worker_context_exhaustion_completed`
+from a non-empty assistant completion when the orchestrator supplied `false`.
+
 ## Diagnostic Payload Capture Boundary
 
 Opt-in pass-through diagnostic payload capture writes local JSON artifacts under
