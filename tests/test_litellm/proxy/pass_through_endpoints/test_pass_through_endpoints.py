@@ -23,6 +23,7 @@ sys.path.insert(
 
 from litellm._logging import (
     AawmErrorLogFileHandler,
+    _AAWM_ERROR_LOG_CONTEXT_FIELDS,
     _build_aawm_error_log_record,
     AawmRouteAccessLogReplacementFilter,
     clear_aawm_route_access_log_replacements,
@@ -42,7 +43,11 @@ from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
     build_aawm_route_access_log_line,
+    _build_passthrough_request_shape_failure_request_payload,
+    _classify_passthrough_request_shape_deserialization_422,
     _direct_capture_xai_passthrough_failure,
+    _enrich_passthrough_error_log_context_for_request_shape_422,
+    _sanitize_passthrough_request_shape_error_preview,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
     _headers_for_json_passthrough_egress,
     _is_known_grok_billing_passthrough_timeout_cancel_response,
@@ -84,6 +89,349 @@ def _build_aawm_route_log_request(
     }
     return request
 
+
+
+
+def test_request_shape_422_modelinput_enrichment_is_sanitized_and_fingerprinted():
+    secret_prompt = "SUPER_SECRET_MODELINPUT_PROMPT"
+    secret_token = "sk-leaked-modelinput-token"
+    base_context = {
+        "source": "pass_through_endpoint",
+        "endpoint": "/openai_passthrough/responses",
+        "upstream_url": "https://chatgpt.com/backend-api/codex/responses",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "model_alias": "aawm-code",
+        "route_family": "codex_responses",
+        "status_code": 422,
+        "auth_credential_source": "route_custom_header",
+        "auth_header_names": ["authorization"],
+        "auth_header_sources": ["route_custom_header:authorization"],
+        "aawm_passthrough_body_container_type": "object",
+        "aawm_passthrough_body_top_level_keys": ["input", "model", "tools"],
+        "aawm_passthrough_input_container_type": "array",
+        "aawm_passthrough_input_item_count": 3,
+        "aawm_passthrough_input_item_type_counts": {
+            "message": 1,
+            "function_call": 1,
+            "function_call_output": 1,
+        },
+        "aawm_passthrough_tool_count": 2,
+        "aawm_passthrough_tool_type_counts": {"function": 2},
+    }
+    exc = HTTPException(
+        status_code=422,
+        detail=(
+            '{"error":"Failed to deserialize the JSON body into the target type: '
+            f"data did not match any variant of untagged enum ModelInput; prompt={secret_prompt}; "
+            f'token={secret_token}"}}'
+        ),
+    )
+
+    enriched = _enrich_passthrough_error_log_context_for_request_shape_422(
+        error_log_context=dict(base_context),
+        exc=exc,
+    )
+
+    assert enriched["failure_kind"] == "request_shape_deserialization_failed"
+    assert (
+        enriched["aawm_passthrough_request_shape_error_class"]
+        == "request_shape_deserialization_failed"
+    )
+    assert (
+        enriched["aawm_passthrough_request_shape_error_message_class"]
+        == "model_input_deserialization_failed"
+    )
+    assert "ModelInput" in enriched["aawm_passthrough_request_shape_error_body_preview"]
+    assert enriched["aawm_passthrough_request_shape_summary"]["input_item_count"] == 3
+    assert enriched["aawm_passthrough_request_shape_fingerprint"]
+    assert enriched["aawm_passthrough_request_shape_error_fingerprint"]
+
+    repeat = _enrich_passthrough_error_log_context_for_request_shape_422(
+        error_log_context=dict(base_context),
+        exc=exc,
+    )
+    assert (
+        repeat["aawm_passthrough_request_shape_fingerprint"]
+        == enriched["aawm_passthrough_request_shape_fingerprint"]
+    )
+    assert (
+        repeat["aawm_passthrough_request_shape_error_fingerprint"]
+        == enriched["aawm_passthrough_request_shape_error_fingerprint"]
+    )
+
+    serialized = json.dumps(enriched)
+    assert secret_prompt not in serialized
+    assert secret_token not in serialized
+    assert "sk-leaked" not in serialized
+
+
+def test_request_shape_422_classification_skips_non_responses_route():
+    context = {
+        "endpoint": "/anthropic/v1/messages",
+        "upstream_url": "https://api.anthropic.com/v1/messages",
+        "status_code": 422,
+    }
+    exc = HTTPException(
+        status_code=422,
+        detail=(
+            '{"error":"Failed to deserialize the JSON body into the target type: '
+            'data did not match any variant of untagged enum ModelInput"}'
+        ),
+    )
+
+    assert (
+        _classify_passthrough_request_shape_deserialization_422(
+            status_code=422,
+            error_log_context=context,
+            exc=exc,
+        )
+        is None
+    )
+
+
+def test_request_shape_422_classification_skips_unrelated_responses_422():
+    context = {
+        "endpoint": "/openai_passthrough/responses",
+        "upstream_url": "https://chatgpt.com/backend-api/codex/responses",
+        "status_code": 422,
+    }
+    exc = HTTPException(status_code=422, detail='{"error":"validation failed for stream"}')
+
+    assert (
+        _classify_passthrough_request_shape_deserialization_422(
+            status_code=422,
+            error_log_context=context,
+            exc=exc,
+        )
+        is None
+    )
+
+
+def test_aawm_error_log_context_allowlist_preserves_request_shape_fields():
+    required_fields = {
+        "aawm_passthrough_request_shape_error_class",
+        "aawm_passthrough_request_shape_error_message_class",
+        "aawm_passthrough_request_shape_error_body_preview",
+        "aawm_passthrough_request_shape_summary",
+        "aawm_passthrough_request_shape_fingerprint",
+        "aawm_passthrough_request_shape_error_fingerprint",
+        "failure_kind",
+    }
+    assert required_fields.issubset(set(_AAWM_ERROR_LOG_CONTEXT_FIELDS))
+
+    record = logging.LogRecord(
+        name="litellm.proxy",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="request-shape failure",
+        args=(),
+        exc_info=None,
+    )
+    for field_name in required_fields:
+        setattr(record, field_name, field_name)
+    built = _build_aawm_error_log_record(record, formatter=logging.Formatter())
+    context = built["context"]
+    for field_name in required_fields:
+        assert context[field_name] == field_name
+
+
+
+def test_sanitize_passthrough_request_shape_error_preview_redacts_secrets():
+    raw = (
+        "Failed to deserialize the JSON body into the target type: "
+        "data did not match any variant of untagged enum ModelInput; "
+        'prompt=SUPER_SECRET_PROMPT; token=sk-leaked-token-abc; '
+        'authorization=Bearer secret; api_key=mykey123; '
+        '"input": "JSON_INPUT_LEAK", "content": "JSON_CONTENT_LEAK", '
+        '"arguments": {"tool": "TOOL_ARG_LEAK"}, "output": "OUTPUT_LEAK"'
+    )
+    preview = _sanitize_passthrough_request_shape_error_preview(raw)
+    assert preview is not None
+    assert "ModelInput" in preview or "deserialize" in preview.lower()
+    assert "SUPER_SECRET" not in preview
+    assert "sk-leaked" not in preview
+    assert "mykey123" not in preview
+    assert "JSON_INPUT_LEAK" not in preview
+    assert "JSON_CONTENT_LEAK" not in preview
+    assert "TOOL_ARG_LEAK" not in preview
+    assert "OUTPUT_LEAK" not in preview
+    assert "prompt" not in preview.lower() or "[REDACTED]" in preview
+    assert "api_key" not in preview.lower() or "[REDACTED]" in preview
+    assert "[REDACTED]" in preview
+
+    bearer_preview = _sanitize_passthrough_request_shape_error_preview(
+        "Failed to deserialize the JSON body into the target type: "
+        "data did not match any variant of untagged enum ModelInput; Bearer abc.def"
+    )
+    assert bearer_preview is not None
+    assert "Bearer abc.def" not in bearer_preview
+    assert "[REDACTED]" in bearer_preview
+
+
+def test_build_request_shape_failure_request_payload_omits_raw_body_and_secrets():
+    secret_prompt = "RAW_PROMPT_LEAK"
+    secret_tool = "tool_output_secret_xyz"
+    error_log_context = {
+        "endpoint": "/openai_passthrough/responses",
+        "upstream_url": "https://chatgpt.com/backend-api/codex/responses",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "model_alias": "aawm-code",
+        "route_family": "codex_responses",
+        "status_code": 422,
+        "litellm_call_id": "call-shape-422",
+        "failure_kind": "request_shape_deserialization_failed",
+        "aawm_passthrough_request_shape_error_class": "request_shape_deserialization_failed",
+        "aawm_passthrough_request_shape_error_message_class": "model_input_deserialization_failed",
+        "aawm_passthrough_request_shape_error_body_preview": "ModelInput variant mismatch",
+        "aawm_passthrough_input_item_count": 2,
+    }
+    kwargs = {
+        "call_type": "pass_through_endpoint",
+        "litellm_call_id": "call-shape-422",
+        "passthrough_logging_payload": {
+            "url": "https://chatgpt.com/backend-api/codex/responses",
+            "request_method": "POST",
+            "cost_per_request": 0.01,
+            "start_time": "2026-06-27T12:00:00Z",
+            "end_time": "2026-06-27T12:00:01Z",
+            "request_body": {
+                "input": [{"type": "message", "content": secret_prompt}],
+                "tools": [{"type": "function", "name": "x", "output": secret_tool}],
+                "authorization": "Bearer sk-hook-leak",
+            },
+            "request_headers": {"authorization": "Bearer sk-header-leak"},
+            "response_body": {"output": secret_tool, "prompt": secret_prompt},
+            "raw_body": secret_prompt,
+            "body": {"content": secret_prompt},
+            "headers": {"authorization": "Bearer sk-header-leak"},
+            "extra": {"prompt": secret_prompt, "tool": secret_tool},
+        },
+        "api_key": "sk-kwargs-leak",
+        "authorization": "Bearer kwargs-auth",
+    }
+
+    payload = _build_passthrough_request_shape_failure_request_payload(
+        error_log_context=error_log_context,
+        kwargs=kwargs,
+        custom_llm_provider="openai",
+    )
+
+    serialized = json.dumps(payload)
+    assert secret_prompt not in serialized
+    assert secret_tool not in serialized
+    assert "sk-hook-leak" not in serialized
+    assert "sk-header-leak" not in serialized
+    assert "sk-kwargs-leak" not in serialized
+    assert "kwargs-auth" not in serialized
+    assert "input" not in serialized or "RAW_PROMPT" not in serialized
+    assert payload.get("model") == "gpt-5.5"
+    assert payload.get("custom_llm_provider") == "openai"
+    assert payload["failure_kind"] == "request_shape_deserialization_failed"
+    assert payload["litellm_params"]["metadata"]["route_family"] == "codex_responses"
+    logging_payload = payload.get("passthrough_logging_payload", {})
+    assert set(logging_payload.keys()) <= {
+        "url",
+        "request_method",
+        "cost_per_request",
+        "start_time",
+        "end_time",
+    }
+    assert logging_payload.get("url") == (
+        "https://chatgpt.com/backend-api/codex/responses"
+    )
+    assert logging_payload.get("request_method") == "POST"
+    assert "request_body" not in logging_payload
+    assert "response_body" not in logging_payload
+    assert "raw_body" not in logging_payload
+    assert "body" not in logging_payload
+    assert "headers" not in logging_payload
+    assert "extra" not in logging_payload
+
+
+@pytest.mark.asyncio
+async def test_pass_through_request_shape_422_failure_hook_payload_is_sanitized():
+    secret_prompt = "HOOK_SECRET_PROMPT_VALUE"
+    secret_token = "sk-hook-failure-token"
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+    mock_request.headers = Headers({"content-type": "application/json"})
+    mock_request.query_params = QueryParams({})
+
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    upstream_detail = (
+        '{"error":"Failed to deserialize the JSON body into the target type: '
+        f"data did not match any variant of untagged enum ModelInput; prompt={secret_prompt}; "
+        f'token={secret_token}"}}'
+    )
+    upstream_response = httpx.Response(
+        status_code=422,
+        content=upstream_detail.encode("utf-8"),
+        request=httpx.Request("POST", target_url),
+    )
+    request_body = {
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "content": secret_prompt}],
+        "tools": [{"type": "function", "name": "run", "output": "TOOL_OUT_LEAK"}],
+        "litellm_metadata": {
+            "route_family": "codex_responses",
+            "inbound_model_alias": "aawm-code",
+            "aawm_passthrough_body_container_type": "object",
+            "aawm_passthrough_input_item_count": 1,
+        },
+    }
+
+    post_failure_mock = AsyncMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=MagicMock(client=MagicMock()),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=upstream_response),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.pre_call_hook",
+        new=AsyncMock(side_effect=lambda **kw: kw["data"]),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+        new=post_failure_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+        return_value={},
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": f"Bearer {secret_token}"},
+                user_api_key_dict=MagicMock(),
+                custom_body=request_body,
+                custom_llm_provider="openai",
+                stream=False,
+            )
+
+    assert exc_info.value.code == "422"
+    post_failure_mock.assert_awaited_once()
+    hook_kwargs = post_failure_mock.await_args.kwargs
+    assert hook_kwargs["traceback_str"] is None
+    request_data = hook_kwargs["request_data"]
+    serialized = json.dumps(request_data)
+    assert secret_prompt not in serialized
+    assert secret_token not in serialized
+    assert "TOOL_OUT_LEAK" not in serialized
+    assert "sk-hook" not in serialized
+    assert request_data.get("failure_kind") == "request_shape_deserialization_failed"
+    assert "aawm_passthrough_request_shape_error_body_preview" in request_data or (
+        request_data.get("litellm_params", {})
+        .get("metadata", {})
+        .get("aawm_passthrough_request_shape_error_body_preview")
+    )
 
 def test_headers_for_json_passthrough_egress_preserves_json_content_type():
     headers, removed_content_type = _headers_for_json_passthrough_egress(
