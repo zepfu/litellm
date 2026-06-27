@@ -1,6 +1,5 @@
-import io
+import inspect
 import os
-import pathlib
 import ssl
 import sys
 from unittest.mock import MagicMock, patch
@@ -658,3 +657,99 @@ async def test_httpx_handler_uses_env_user_agent(monkeypatch):
         assert req.headers.get("User-Agent") == "Claude Code"
     finally:
         await handler.close()
+
+
+@pytest.mark.asyncio
+async def test_base_llm_http_handler_aembedding_passes_litellm_params_shared_session():
+    """BaseLLMHTTPHandler.aembedding must pass litellm_params['shared_session'] to get_async_httpx_client."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+    from litellm.types.utils import EmbeddingResponse
+
+    mock_session = MockClientSession()
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(
+        return_value=MagicMock(status_code=200, json=lambda: {"data": []})
+    )
+
+    provider_config = MagicMock()
+    provider_config.transform_embedding_response.return_value = EmbeddingResponse()
+
+    with patch(
+        "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+        return_value=mock_client,
+    ) as mock_get_client:
+        handler = BaseLLMHTTPHandler()
+        await handler.aembedding(
+            request_data={"input": "hello", "model": "test-model"},
+            api_base="https://example.com/v1/embeddings",
+            headers={},
+            model="test-model",
+            custom_llm_provider="openrouter",
+            provider_config=provider_config,
+            model_response=EmbeddingResponse(),
+            logging_obj=MagicMock(),
+            optional_params={},
+            litellm_params={"shared_session": mock_session},
+        )
+
+        mock_get_client.assert_called_once()
+        _, kwargs = mock_get_client.call_args
+        assert kwargs.get("shared_session") is mock_session
+
+
+@pytest.mark.asyncio
+async def test_base_llm_http_handler_aembedding_explicit_shared_session_precedence():
+    """Explicit shared_session argument must override litellm_params['shared_session']."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+    from litellm.types.utils import EmbeddingResponse
+
+    params_session = MockClientSession()
+    explicit_session = MockClientSession()
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(
+        return_value=MagicMock(status_code=200, json=lambda: {"data": []})
+    )
+
+    provider_config = MagicMock()
+    provider_config.transform_embedding_response.return_value = EmbeddingResponse()
+
+    with patch(
+        "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+        return_value=mock_client,
+    ) as mock_get_client:
+        handler = BaseLLMHTTPHandler()
+        await handler.aembedding(
+            request_data={"input": "hello", "model": "test-model"},
+            api_base="https://example.com/v1/embeddings",
+            headers={},
+            model="test-model",
+            custom_llm_provider="local_embed",
+            provider_config=provider_config,
+            model_response=EmbeddingResponse(),
+            logging_obj=MagicMock(),
+            optional_params={},
+            litellm_params={"shared_session": params_session},
+            shared_session=explicit_session,  # type: ignore[arg-type]
+        )
+
+        mock_get_client.assert_called_once()
+        _, kwargs = mock_get_client.call_args
+        assert kwargs.get("shared_session") is explicit_session
+        assert kwargs.get("shared_session") is not params_session
+
+
+def test_handler_embedding_passes_shared_session_to_aembedding():
+    """embedding(aembedding=True) must forward shared_session to aembedding()."""
+    from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+
+    source = inspect.getsource(BaseLLMHTTPHandler.embedding)
+    found = False
+    for line in source.split("\n"):
+        if "shared_session=shared_session" in line and not line.strip().startswith("#"):
+            found = True
+            break
+    assert found

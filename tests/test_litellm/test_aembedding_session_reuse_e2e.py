@@ -59,3 +59,48 @@ def test_openai_embedding_passes_shared_session():
     # Step 6: _create_aiohttp_transport uses it
     aiohttp_transport_source = inspect.getsource(AsyncHTTPHandler._create_aiohttp_transport)
     assert 'shared_session' in aiohttp_transport_source
+
+
+def _extract_call_blocks(source: str, call: str):
+    blocks = []
+    start_index = 0
+    while True:
+        start = source.find(call, start_index)
+        if start == -1:
+            return blocks
+
+        depth = 0
+        for index in range(start, len(source)):
+            char = source[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(source[start : index + 1])
+                    start_index = index + 1
+                    break
+        else:
+            raise AssertionError(f"Unclosed call block for {call!r}")
+
+
+def test_base_llm_embedding_branches_pass_shared_session():
+    """
+    Proxy embedding routes inject shared_session before litellm.embedding().
+    Every BaseLLMHTTPHandler embedding branch must forward it so local/OpenRouter
+    style async embeddings reuse the proxy-owned aiohttp session.
+    """
+    import litellm
+
+    main_source = inspect.getsource(litellm.embedding)
+    call_blocks = _extract_call_blocks(
+        main_source, "base_llm_http_handler.embedding("
+    )
+    assert call_blocks
+
+    missing_blocks = [
+        block
+        for block in call_blocks
+        if "shared_session=shared_session" not in block
+    ]
+    assert missing_blocks == []
