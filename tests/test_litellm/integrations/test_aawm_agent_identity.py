@@ -8943,6 +8943,74 @@ def test_build_provider_error_observation_classifies_openrouter_5xx() -> None:
     assert observation["trace_id"] == "trace-provider-error"
 
 
+def test_build_provider_error_observation_preserves_openrouter_429_context() -> None:
+    class DuplicatedLiteLLMRateLimitError:
+        status_code = 429
+
+        def __init__(self, message: str):
+            self._full_message = message
+            self.message = message.split(" LiteLLM Retried:", 1)[0]
+
+        def __str__(self) -> str:
+            return self._full_message
+
+    kwargs = _base_kwargs()
+    kwargs["model"] = "openrouter/inclusionai/ling-2.6-flash"
+    kwargs["custom_llm_provider"] = "openrouter"
+    kwargs["litellm_call_id"] = "call-openrouter-ling-429"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openrouter-ling-429",
+            "trace_id": "trace-openrouter-ling-429",
+            "litellm_environment": "dev",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": {"model": "openrouter/inclusionai/ling-2.6-flash"}
+    }
+    error_message = (
+        'litellm.RateLimitError: RateLimitError: OpenrouterException - '
+        '{"error":{"message":"Provider returned error","code":429,'
+        '"metadata":{"raw":"inclusionai/ling-2.6-flash is temporarily '
+        'rate-limited upstream. Please retry shortly, or add your own key",'
+        '"provider_name":"Novita","is_byok":false}},'
+        '"user_id":"user_test"}. Received Model '
+        "Group=openrouter/inclusionai/ling-2.6-flash\n"
+        "Available Model Group Fallbacks=None LiteLLM Retried: 2 times, "
+        "LiteLLM Max Retries: 2"
+    )
+    error = DuplicatedLiteLLMRateLimitError(error_message)
+
+    observation = aawm_agent_identity._build_provider_error_observation(
+        kwargs=kwargs,
+        result=error,
+        start_time="2026-06-27T13:50:51Z",
+        end_time="2026-06-27T13:50:52Z",
+    )
+
+    assert observation is not None
+    assert observation["environment"] == "dev"
+    assert observation["provider"] == "openrouter"
+    assert observation["model"] == "openrouter/inclusionai/ling-2.6-flash"
+    assert observation["model_group"] == "openrouter/inclusionai/ling-2.6-flash"
+    assert observation["status_code"] == 429
+    assert observation["error_class"] == "rate_limited"
+    assert observation["session_id"] == "session-openrouter-ling-429"
+    assert observation["trace_id"] == "trace-openrouter-ling-429"
+    assert observation["litellm_call_id"] == "call-openrouter-ling-429"
+
+    metadata = observation["metadata"]
+    assert metadata["upstream_provider_name"] == "Novita"
+    assert metadata["upstream_is_byok"] is False
+    assert "temporarily rate-limited upstream" in metadata["upstream_error_raw"]
+    assert metadata["litellm_retry_count"] == 2
+    assert metadata["litellm_max_retries"] == 2
+    assert metadata["litellm_retries_exhausted"] is True
+    assert metadata["available_model_group_fallbacks"] == "None"
+    assert metadata["no_model_group_fallbacks"] is True
+    assert len(metadata["provider_error_fingerprint"]) == 64
+
+
 def test_build_provider_error_observation_classifies_google_capacity() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gemini/gemini-3.1-pro-preview"
