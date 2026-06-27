@@ -68,6 +68,56 @@ def test_score_agent_quality_context_flags_same_line_serialized_composer_call_te
     ]
 
 
+def test_score_agent_quality_context_flags_literal_claude_xml_invoke_text() -> None:
+    result = score_agent_quality_context(
+        assistant_texts=['<invoke name="Bash">\n<parameter name="command">pwd</parameter>\n</invoke>'],
+    )
+
+    assert result.fields["output_contract_compliance_score"] == 0.0
+    assert result.fields["output_contract_failure_class"] == "literal_tool_call_text"
+    assert result.reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+
+def test_score_agent_quality_context_ignores_benign_claude_xml_prose() -> None:
+    result = score_agent_quality_context(
+        user_texts=["Explain the failure mode."],
+        assistant_texts=[
+            'The model printed the string <invoke name="Bash"> in prose but did not emit tool_use.'
+        ],
+    )
+
+    assert result.fields.get("output_contract_failure_class") is None
+    assert result.reasons.get("output_contract_compliance") == []
+
+
+def test_score_agent_quality_context_does_not_flag_structured_tool_use_as_literal_xml() -> None:
+    result = score_agent_quality_context(
+        assistant_texts=["Done."],
+        tool_call_names=["Bash"],
+    )
+
+    assert result.fields.get("output_contract_failure_class") is None
+    assert result.reasons.get("output_contract_compliance") == []
+
+
+def test_score_agent_quality_context_ignores_request_side_tool_use_error_text() -> None:
+    result = score_agent_quality_context(
+        user_texts=[
+            (
+                "<tool_use_error>Previous assistant text contained "
+                '<invoke name="Bash"> but the current answer should not inherit it.'
+                "</tool_use_error>"
+            )
+        ],
+        assistant_texts=["Done."],
+    )
+
+    assert result.fields.get("output_contract_failure_class") is None
+    assert result.reasons.get("output_contract_compliance") == []
+
+
 def test_ignored_path_tracking_flags_forced_adds() -> None:
     result = score_agent_quality_context(
         commands=[

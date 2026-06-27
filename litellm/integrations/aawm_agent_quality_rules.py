@@ -137,6 +137,34 @@ _COMPOSER_CALL_TOOL_CALL_MARKERS = (
     "<｜tool▁calls▁begin｜>",
     "<｜tool▁calls▁end｜>",
 )
+_CLAUDE_XML_INVOKE_LINE_RE = re.compile(
+    r"^\s*<invoke\s+[^>]*\bname\s*=\s*['\"][^'\"\n]+['\"][^>]*>?",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CLAUDE_XML_INVOKE_BLOCK_RE = re.compile(
+    r"(?is)<invoke\b[^>]*>.*?<\s*parameter\b[^>]*>.*?</\s*invoke\s*>",
+)
+_CLAUDE_XML_INVOKE_CLOSE_RE = re.compile(r"</\s*invoke\s*>", re.IGNORECASE)
+
+
+def is_malformed_claude_xml_literal_invocation_text(value: str) -> bool:
+    """Detect assistant text that prints Claude-style XML tool invocations."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    lowered = value.lower()
+    if "<invoke" not in lowered:
+        return False
+    if _CLAUDE_XML_INVOKE_LINE_RE.search(value):
+        return True
+    if _CLAUDE_XML_INVOKE_BLOCK_RE.search(value):
+        return True
+    if (
+        _CLAUDE_XML_INVOKE_CLOSE_RE.search(value)
+        and re.search(r"<\s*parameter\b", value, re.IGNORECASE)
+        and re.search(r"<invoke\b", value, re.IGNORECASE)
+    ):
+        return True
+    return False
 
 
 def is_malformed_composer_call_literal_text(value: str) -> bool:
@@ -543,6 +571,8 @@ def _score_output_contract(
     ]
     if not composer_call_markers and final_text:
         if is_malformed_composer_call_literal_text(final_text):
+            failure_class = failure_class or "literal_tool_call_text"
+        elif is_malformed_claude_xml_literal_invocation_text(final_text):
             failure_class = failure_class or "literal_tool_call_text"
     elif composer_call_markers:
         failure_class = failure_class or "malformed_tool_call_text"
