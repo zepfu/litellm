@@ -1318,6 +1318,78 @@ def test_extract_repository_identity_from_text_skips_marker_free_large_text(
     )
 
 
+def test_build_session_history_record_preserves_worker_context_exhaustion_metadata() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-worker-exhaustion"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-worker-exhaustion"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": {
+            "litellm_metadata": {
+                "worker_context_exhaustion_failure_class": "context_window_exhaustion",
+                "worker_context_exhaustion_failure_reason": "output truncated before patch summary",
+                "worker_context_exhaustion_partial_output_summary": "Implemented partial fix in litellm/foo.py",
+                "worker_context_exhaustion_changed_paths_hint": [
+                    "litellm/integrations/aawm_agent_identity.py",
+                ],
+                "worker_context_exhaustion_attempted_patch_scope": "agent_identity metadata only",
+                "worker_context_exhaustion_last_visible_message": "Stopped after tool budget",
+                "worker_context_exhaustion_success": False,
+                "worker_context_exhaustion_completed": False,
+            }
+        }
+    }
+
+    result = {
+        "id": "resp-worker-exhaustion",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "partial assistant text"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-06-27T12:00:00Z",
+        end_time="2026-06-27T12:00:01Z",
+    )
+
+    assert record is not None
+    meta = record["metadata"]
+    assert meta["worker_context_exhaustion_failure_class"] == "context_window_exhaustion"
+    assert meta["worker_context_exhaustion_failure_reason"] == (
+        "output truncated before patch summary"
+    )
+    assert meta["worker_context_exhaustion_partial_output_summary"] == (
+        "Implemented partial fix in litellm/foo.py"
+    )
+    assert meta["worker_context_exhaustion_changed_paths_hint"] == [
+        "litellm/integrations/aawm_agent_identity.py",
+    ]
+    assert meta["worker_context_exhaustion_success"] is False
+    assert meta["worker_context_exhaustion_completed"] is False
+    assert meta.get("worker_context_exhaustion_success") is not True
+    assert meta.get("worker_context_exhaustion_completed") is not True
+
+
+def test_build_session_history_metadata_does_not_flip_worker_exhaustion_to_success() -> None:
+    from litellm.integrations.aawm_agent_identity import _build_session_history_metadata
+
+    metadata = {
+        "worker_context_exhaustion_success": True,
+        "worker_context_exhaustion_completed": True,
+        "worker_context_exhaustion_failure_class": "context_window_exhaustion",
+    }
+    history = _build_session_history_metadata(
+        metadata=metadata,
+        request_tags=[],
+        tenant_id=None,
+    )
+    assert history["worker_context_exhaustion_success"] is False
+    assert history["worker_context_exhaustion_completed"] is False
+
+
 def test_build_session_history_record_uses_repository_header_and_metadata() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"

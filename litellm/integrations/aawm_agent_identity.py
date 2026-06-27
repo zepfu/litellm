@@ -2566,6 +2566,38 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "prompt_overhead_classifier_version",
     "prompt_overhead_component_paths",
     "prompt_overhead_excluded_component_paths",
+    "worker_context_exhaustion_failure_class",
+    "worker_context_exhaustion_failure_reason",
+    "worker_context_exhaustion_partial_output_summary",
+    "worker_context_exhaustion_changed_paths_hint",
+    "worker_context_exhaustion_attempted_patch_scope",
+    "worker_context_exhaustion_last_visible_message",
+    "worker_context_exhaustion_success",
+    "worker_context_exhaustion_completed",
+)
+_WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS = (
+    "worker_context_exhaustion_failure_class",
+    "worker_context_exhaustion_failure_reason",
+    "worker_context_exhaustion_partial_output_summary",
+    "worker_context_exhaustion_changed_paths_hint",
+    "worker_context_exhaustion_attempted_patch_scope",
+    "worker_context_exhaustion_last_visible_message",
+    "worker_context_exhaustion_success",
+    "worker_context_exhaustion_completed",
+)
+_WORKER_CONTEXT_EXHAUSTION_STRING_MAX_LEN = {
+    "worker_context_exhaustion_failure_class": 128,
+    "worker_context_exhaustion_failure_reason": 512,
+    "worker_context_exhaustion_partial_output_summary": 2000,
+    "worker_context_exhaustion_changed_paths_hint": 2000,
+    "worker_context_exhaustion_attempted_patch_scope": 2000,
+    "worker_context_exhaustion_last_visible_message": 2000,
+}
+_WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS = frozenset(
+    {
+        "worker_context_exhaustion_success",
+        "worker_context_exhaustion_completed",
+    }
 )
 _PROMPT_OVERHEAD_TOKEN_FIELDS = (
     "input_system_tokens_estimated",
@@ -16675,12 +16707,130 @@ def _derive_langfuse_trace_tags_from_langfuse_trace(
     )
 
 
+
+
+def _iter_litellm_metadata_sources(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Iterator[Dict[str, Any]]:
+    litellm_params = kwargs.get("litellm_params")
+    if not isinstance(litellm_params, dict):
+        litellm_params = {}
+    standard_logging_object = kwargs.get("standard_logging_object")
+    if not isinstance(standard_logging_object, dict):
+        standard_logging_object = {}
+    passthrough_payload = kwargs.get("passthrough_logging_payload")
+    if not isinstance(passthrough_payload, dict):
+        passthrough_payload = {}
+    proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
+    proxy_body = _coerce_mapping(proxy_request.get("body"))
+    passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
+
+    for candidate in (
+        metadata,
+        litellm_params.get("metadata"),
+        litellm_params.get("litellm_metadata"),
+        standard_logging_object.get("metadata"),
+        kwargs.get("metadata"),
+        proxy_body.get("metadata"),
+        proxy_body.get("litellm_metadata"),
+        passthrough_body.get("metadata"),
+        passthrough_body.get("litellm_metadata"),
+    ):
+        source = _coerce_mapping(candidate)
+        if source:
+            yield source
+
+
+def _bound_worker_context_exhaustion_string(
+    key: str,
+    value: Any,
+) -> Optional[str]:
+    cleaned = _clean_non_empty_string(value)
+    if cleaned is None:
+        return None
+    max_len = _WORKER_CONTEXT_EXHAUSTION_STRING_MAX_LEN.get(key, 512)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned
+
+
+def _normalize_worker_context_exhaustion_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _sanitize_worker_context_exhaustion_metadata(metadata: Dict[str, Any]) -> None:
+    """Bound orchestrator worker exhaustion fields; never infer success from LLM output."""
+    for key in _WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS:
+        if key not in metadata:
+            continue
+        raw_value = metadata.get(key)
+        if key in _WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS:
+            normalized_bool = _normalize_worker_context_exhaustion_bool(raw_value)
+            if normalized_bool is None:
+                metadata.pop(key, None)
+            else:
+                metadata[key] = normalized_bool
+            continue
+
+        if isinstance(raw_value, list):
+            bounded_items = []
+            for item in raw_value[:50]:
+                item_text = _bound_worker_context_exhaustion_string(key, item)
+                if item_text is not None:
+                    bounded_items.append(item_text)
+            if bounded_items:
+                metadata[key] = bounded_items
+            else:
+                metadata.pop(key, None)
+            continue
+
+        bounded = _bound_worker_context_exhaustion_string(key, raw_value)
+        if bounded is None:
+            metadata.pop(key, None)
+        else:
+            metadata[key] = bounded
+
+    if metadata.get("worker_context_exhaustion_failure_class"):
+        metadata["worker_context_exhaustion_success"] = False
+        metadata["worker_context_exhaustion_completed"] = False
+
+
+def _promote_worker_context_exhaustion_metadata(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> None:
+    """Copy allowlisted worker exhaustion keys from upstream litellm_metadata without overwriting."""
+    for source in _iter_litellm_metadata_sources(kwargs, metadata):
+        for key in _WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS:
+            if key in metadata:
+                continue
+            if key not in source:
+                continue
+            value = source.get(key)
+            if value is None:
+                continue
+            metadata[key] = value
+    _sanitize_worker_context_exhaustion_metadata(metadata)
+
+
 def _build_session_history_metadata(
     *,
     metadata: Dict[str, Any],
     request_tags: List[str],
     tenant_id: Optional[str],
 ) -> Dict[str, Any]:
+    _sanitize_worker_context_exhaustion_metadata(metadata)
     history_metadata: Dict[str, Any] = {"request_tags": request_tags}
     if tenant_id:
         history_metadata["tenant_id"] = tenant_id
@@ -17218,6 +17368,7 @@ def _build_session_history_record(  # noqa: PLR0915
         metadata = {}
         litellm_params["metadata"] = metadata
         kwargs["litellm_params"] = litellm_params
+    _promote_worker_context_exhaustion_metadata(kwargs, metadata)
     standard_logging_object = kwargs.get("standard_logging_object") or {}
     _enrich_claude_permission_check_metadata(
         kwargs,
