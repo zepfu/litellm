@@ -137,6 +137,12 @@ _COMPOSER_CALL_TOOL_CALL_MARKERS = (
     "<｜tool▁calls▁begin｜>",
     "<｜tool▁calls▁end｜>",
 )
+_GROK_LITERAL_TOOL_LABEL_LINE_RE = re.compile(
+    r"(?im)^Tool label:\s*(?P<name>[^\n]+)\s*$"
+)
+_GROK_LITERAL_INPUT_PAYLOAD_LINE_RE = re.compile(
+    r"(?im)^Input payload:\s*(?P<payload>.+?)\s*$"
+)
 _CLAUDE_XML_INVOKE_LINE_RE = re.compile(
     r"^\s*<invoke\s+[^>]*\bname\s*=\s*['\"][^'\"\n]+['\"][^>]*>?",
     re.IGNORECASE | re.MULTILINE,
@@ -186,6 +192,30 @@ def is_malformed_composer_call_literal_text(value: str) -> bool:
         or "arguments:" in normalized
     ):
         return True
+    return False
+
+
+def is_malformed_grok_literal_tool_label_transcript_text(value: str) -> bool:
+    """Detect assistant text that prints Grok-style Tool label / Input payload blocks."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+
+    current_name: Optional[str] = None
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        label_match = _GROK_LITERAL_TOOL_LABEL_LINE_RE.match(line)
+        if label_match:
+            current_name = label_match.group("name").strip()
+            continue
+        payload_match = _GROK_LITERAL_INPUT_PAYLOAD_LINE_RE.match(line)
+        if payload_match and current_name:
+            payload = payload_match.group("payload").strip()
+            if payload:
+                return True
+            current_name = None
+            continue
     return False
 
 
@@ -571,6 +601,8 @@ def _score_output_contract(
     ]
     if not composer_call_markers and final_text:
         if is_malformed_composer_call_literal_text(final_text):
+            failure_class = failure_class or "literal_tool_call_text"
+        elif is_malformed_grok_literal_tool_label_transcript_text(final_text):
             failure_class = failure_class or "literal_tool_call_text"
         elif is_malformed_claude_xml_literal_invocation_text(final_text):
             failure_class = failure_class or "literal_tool_call_text"
