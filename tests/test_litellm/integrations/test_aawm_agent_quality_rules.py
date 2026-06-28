@@ -54,6 +54,25 @@ def test_score_agent_quality_context_ignores_benign_composer_call_prose() -> Non
     assert result.reasons.get("output_contract_compliance") == []
 
 
+def test_score_agent_quality_context_flags_literal_grok_tool_label_apply_patch_text() -> None:
+    result = score_agent_quality_context(
+        assistant_texts=[
+            (
+                "[Context note - prior assistant step; not an executable tool invocation]\n"
+                "Tool label: apply_patch\n"
+                "Correlation ref: call-retry-d1024-composer_call_patch2\n"
+                'Input payload: {"file_path": "/tmp/x.py", "patch": "bad"}'
+            )
+        ],
+    )
+
+    assert result.fields["output_contract_compliance_score"] == 0.0
+    assert result.fields["output_contract_failure_class"] == "literal_tool_call_text"
+    assert result.reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
+
 def test_score_agent_quality_context_flags_same_line_serialized_composer_call_text() -> None:
     result = score_agent_quality_context(
         assistant_texts=[

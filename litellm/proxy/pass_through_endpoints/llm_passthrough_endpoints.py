@@ -44,6 +44,7 @@ from litellm.constants import (
 )
 from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_composer_call_literal_text,
+    is_malformed_grok_literal_tool_label_transcript_text,
 )
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
@@ -15286,7 +15287,10 @@ def _is_codex_auto_agent_malformed_tool_call_text_output(
                     continue
                 if part.get("type") not in {"text", "output_text"}:
                     continue
-                if is_malformed_composer_call_literal_text(part.get("text") or ""):
+                part_text = part.get("text") or ""
+                if is_malformed_composer_call_literal_text(part_text):
+                    return True
+                if is_malformed_grok_literal_tool_label_transcript_text(part_text):
                     return True
             continue
 

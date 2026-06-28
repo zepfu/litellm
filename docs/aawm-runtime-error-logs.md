@@ -67,8 +67,11 @@ fields such as `provider`, `model`, `model_alias`, `route_family`, `endpoint`,
 `upstream_url`, `repository`, `agent_name`, `agent_id`, `session_id`,
 `trace_id`, and `litellm_call_id`, plus the bounded
 `malformed_tool_call_text` or `malformed_tool_call_payload` that triggered the
-detection. Individual text and payload fields are truncated to bounded previews;
-the file keeps appending by default. Operators can set
+detection. The text detector treats literal tool-call transcript blocks, such
+as `composer_call` markers or `Tool label:` / `Input payload:` output, as
+malformed when they appear in an assistant final response instead of an
+executable tool call. Individual text and payload fields are truncated to
+bounded previews; the file keeps appending by default. Operators can set
 `LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES` as an explicit safety ceiling if a
 runtime needs to stop appending after a known size.
 
