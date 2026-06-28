@@ -29,6 +29,46 @@ import psycopg
 DEFAULT_DB_LOCK_TIMEOUT_MS = 1000
 DEFAULT_DB_STATEMENT_TIMEOUT_MS = 5000
 DEFAULT_DB_APPLICATION_NAME = "aawm-provider-status-observations"
+DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL = (
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+)
+LEGACY_CODEX_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+CODEX_RESET_CREDIT_SEED_METADATA: tuple[Dict[str, Any], ...] = (
+    {
+        "granted_at": datetime(2026, 6, 12, 16, 17, tzinfo=timezone.utc),
+        "expires_at": datetime(2026, 7, 12, 16, 17, tzinfo=timezone.utc),
+        "reset_type": "codex_rate_limits",
+        "operator_annotation": None,
+        "source_url": "https://x.com/thsottiaux/status/2065468501750649006",
+    },
+    {
+        "granted_at": datetime(2026, 6, 19, 0, 10, tzinfo=timezone.utc),
+        "expires_at": datetime(2026, 7, 19, 0, 10, tzinfo=timezone.utc),
+        "reset_type": "codex_rate_limits",
+        "operator_annotation": None,
+        "source_url": "https://x.com/thsottiaux/status/2067399435009622521",
+    },
+    {
+        "granted_at": datetime(2026, 6, 24, 21, 53, tzinfo=timezone.utc),
+        "expires_at": datetime(2026, 7, 24, 21, 53, tzinfo=timezone.utc),
+        "reset_type": "codex_rate_limits",
+        "operator_annotation": "Invite Promotion",
+        "source_url": None,
+    },
+    {
+        "granted_at": datetime(
+            2026, 6, 24, 22, 41, 38, 714466, tzinfo=timezone.utc
+        ),
+        "expires_at": datetime(
+            2026, 7, 24, 22, 41, 38, 714466, tzinfo=timezone.utc
+        ),
+        "reset_type": "codex_rate_limits",
+        "operator_annotation": "Invite Promotion",
+        "source_url": None,
+    },
+)
+
 
 
 PING_STATS_RE = re.compile(
@@ -251,8 +291,15 @@ WITH candidate AS (
         %s::text AS account_hash,
         %s::text AS credit_family,
         %s::text AS credit_type,
+        %s::text AS credit_identity,
         %s::integer AS available_count,
+        %s::timestamptz AS granted_at,
         %s::timestamptz AS expires_at,
+        %s::text AS status,
+        %s::timestamptz AS redeem_started_at,
+        %s::timestamptz AS redeemed_at,
+        %s::text AS operator_annotation,
+        %s::text AS source_url,
         %s::jsonb AS raw_provider_fields,
         %s::jsonb AS evidence,
         %s::text AS source
@@ -266,6 +313,7 @@ locked AS (
                 candidate.provider,
                 COALESCE(candidate.account_hash, '<null>'),
                 candidate.credit_family,
+                COALESCE(candidate.credit_identity, '<null>'),
                 COALESCE(candidate.source, '<null>')
             )
         )::bigint
@@ -279,8 +327,15 @@ INSERT INTO public.provider_credit_observations (
     account_hash,
     credit_family,
     credit_type,
+    credit_identity,
     available_count,
+    granted_at,
     expires_at,
+    status,
+    redeem_started_at,
+    redeemed_at,
+    operator_annotation,
+    source_url,
     raw_provider_fields,
     evidence,
     source
@@ -292,8 +347,15 @@ SELECT
     candidate.account_hash,
     candidate.credit_family,
     candidate.credit_type,
+    candidate.credit_identity,
     candidate.available_count,
+    candidate.granted_at,
     candidate.expires_at,
+    candidate.status,
+    candidate.redeem_started_at,
+    candidate.redeemed_at,
+    candidate.operator_annotation,
+    candidate.source_url,
     COALESCE(candidate.raw_provider_fields, '{}'::jsonb),
     COALESCE(candidate.evidence, '{}'::jsonb),
     candidate.source
@@ -302,17 +364,33 @@ CROSS JOIN locked
 WHERE NOT EXISTS (
     SELECT 1
     FROM (
-        SELECT latest.available_count
+        SELECT
+            latest.available_count,
+            latest.granted_at,
+            latest.expires_at,
+            latest.status,
+            latest.redeem_started_at,
+            latest.redeemed_at,
+            latest.operator_annotation,
+            latest.source_url
         FROM public.provider_credit_observations AS latest
         WHERE latest.environment = candidate.environment
           AND latest.provider = candidate.provider
           AND latest.credit_family = candidate.credit_family
           AND latest.account_hash IS NOT DISTINCT FROM candidate.account_hash
+          AND latest.credit_identity IS NOT DISTINCT FROM candidate.credit_identity
           AND latest.source IS NOT DISTINCT FROM candidate.source
         ORDER BY latest.observed_at DESC, latest.id DESC
         LIMIT 1
     ) AS latest
     WHERE latest.available_count IS NOT DISTINCT FROM candidate.available_count
+      AND latest.granted_at IS NOT DISTINCT FROM candidate.granted_at
+      AND latest.expires_at IS NOT DISTINCT FROM candidate.expires_at
+      AND latest.status IS NOT DISTINCT FROM candidate.status
+      AND latest.redeem_started_at IS NOT DISTINCT FROM candidate.redeem_started_at
+      AND latest.redeemed_at IS NOT DISTINCT FROM candidate.redeemed_at
+      AND latest.operator_annotation IS NOT DISTINCT FROM candidate.operator_annotation
+      AND latest.source_url IS NOT DISTINCT FROM candidate.source_url
 )
 """
 PROVIDER_CREDIT_OBSERVATIONS_TABLE_SQL = """
@@ -325,17 +403,35 @@ CREATE TABLE IF NOT EXISTS public.provider_credit_observations (
     account_hash TEXT NOT NULL,
     credit_family TEXT NOT NULL,
     credit_type TEXT NOT NULL,
+    credit_identity TEXT NOT NULL DEFAULT '',
     available_count INTEGER NOT NULL,
+    granted_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'available',
+    redeem_started_at TIMESTAMPTZ,
+    redeemed_at TIMESTAMPTZ,
+    operator_annotation TEXT,
+    source_url TEXT,
     source TEXT NOT NULL,
     raw_provider_fields JSONB NOT NULL DEFAULT '{}'::jsonb,
     evidence JSONB NOT NULL DEFAULT '{}'::jsonb
 )
 """
+PROVIDER_CREDIT_OBSERVATIONS_ALTER_STATEMENTS = (
+    "ALTER TABLE public.provider_credit_observations ADD COLUMN IF NOT EXISTS credit_identity TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE public.provider_credit_observations ADD COLUMN IF NOT EXISTS granted_at TIMESTAMPTZ",
+    "ALTER TABLE public.provider_credit_observations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'available'",
+    "ALTER TABLE public.provider_credit_observations ADD COLUMN IF NOT EXISTS redeem_started_at TIMESTAMPTZ",
+    "ALTER TABLE public.provider_credit_observations ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMPTZ",
+    "ALTER TABLE public.provider_credit_observations ADD COLUMN IF NOT EXISTS operator_annotation TEXT",
+    "ALTER TABLE public.provider_credit_observations ADD COLUMN IF NOT EXISTS source_url TEXT",
+)
 PROVIDER_CREDIT_OBSERVATIONS_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS provider_credit_observations_provider_time_idx ON public.provider_credit_observations (provider, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS provider_credit_observations_identity_time_idx ON public.provider_credit_observations (environment, provider, account_hash, credit_family, source, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS provider_credit_observations_credit_identity_time_idx ON public.provider_credit_observations (environment, provider, account_hash, credit_family, credit_identity, source, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS provider_credit_observations_expires_idx ON public.provider_credit_observations (expires_at)",
+    "CREATE INDEX IF NOT EXISTS provider_credit_observations_status_time_idx ON public.provider_credit_observations (status, observed_at DESC)",
 )
 PROVIDER_CREDIT_CURRENT_VIEW_SQL = """
 CREATE OR REPLACE VIEW public.provider_credit_current AS
@@ -344,6 +440,7 @@ SELECT DISTINCT ON (
     provider,
     account_hash,
     credit_family,
+    credit_identity,
     COALESCE(source, '')
 )
     id,
@@ -358,16 +455,64 @@ SELECT DISTINCT ON (
     expires_at,
     source,
     raw_provider_fields,
-    evidence
-FROM public.provider_credit_observations
+    evidence,
+    credit_identity,
+    granted_at,
+    status,
+    redeem_started_at,
+    redeemed_at,
+    operator_annotation,
+    source_url
+FROM public.provider_credit_observations AS current_credit
+WHERE current_credit.credit_identity <> ''
+   OR NOT EXISTS (
+       SELECT 1
+       FROM public.provider_credit_observations AS detail_credit
+       WHERE detail_credit.environment = current_credit.environment
+         AND detail_credit.provider = current_credit.provider
+         AND detail_credit.account_hash = current_credit.account_hash
+         AND detail_credit.credit_family = current_credit.credit_family
+         AND detail_credit.source IS NOT DISTINCT FROM current_credit.source
+         AND detail_credit.credit_identity <> ''
+   )
 ORDER BY
     environment,
     provider,
     account_hash,
     credit_family,
+    credit_identity,
     COALESCE(source, ''),
     observed_at DESC,
     id DESC
+"""
+
+PROVIDER_CREDIT_CURRENT_SELECT_SQL = """
+SELECT
+    id,
+    observed_at,
+    environment,
+    provider,
+    account_hash,
+    credit_family,
+    credit_type,
+    credit_identity,
+    available_count,
+    granted_at,
+    expires_at,
+    status,
+    redeem_started_at,
+    redeemed_at,
+    operator_annotation,
+    source_url,
+    source,
+    raw_provider_fields,
+    evidence
+FROM public.provider_credit_current
+WHERE environment = %s
+  AND provider = %s
+  AND account_hash = %s
+  AND credit_family = %s
+  AND source = %s
 """
 
 
@@ -834,6 +979,8 @@ def setup_schema(
                     cur.execute(statement)
                 cur.execute(PROVIDER_AUTH_CURRENT_VIEW_SQL)
                 cur.execute(PROVIDER_CREDIT_OBSERVATIONS_TABLE_SQL)
+                for statement in PROVIDER_CREDIT_OBSERVATIONS_ALTER_STATEMENTS:
+                    cur.execute(statement)
                 for statement in PROVIDER_CREDIT_OBSERVATIONS_INDEX_STATEMENTS:
                     cur.execute(statement)
                 cur.execute(PROVIDER_CREDIT_CURRENT_VIEW_SQL)
@@ -955,6 +1102,128 @@ def account_identity_hash(value: Any) -> Optional[str]:
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:12]
 
 
+
+
+def _normalize_provider_credit_timestamp(value: Any) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        try:
+            parsed = datetime.fromtimestamp(float(value), timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    elif isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def derive_provider_credit_identity(
+    *,
+    account_hash: str,
+    credit_family: str,
+    granted_at: Optional[datetime],
+    expires_at: Optional[datetime],
+    reset_type: Optional[str],
+    provider_credit_id: Optional[str] = None,
+) -> str:
+    if isinstance(provider_credit_id, str) and provider_credit_id.strip():
+        return provider_credit_id.strip()
+    identity_material = "|".join(
+        [
+            account_hash,
+            credit_family,
+            granted_at.isoformat() if granted_at is not None else "",
+            expires_at.isoformat() if expires_at is not None else "",
+            (reset_type or "").strip(),
+        ]
+    )
+    return hashlib.sha256(identity_material.encode("utf-8")).hexdigest()[:16]
+
+
+def _provider_credit_seed_metadata_match(
+    *,
+    granted_at: Optional[datetime],
+    expires_at: Optional[datetime],
+) -> Dict[str, Optional[str]]:
+    if granted_at is None:
+        return {"operator_annotation": None, "source_url": None}
+    if not isinstance(granted_at, datetime):
+        granted_at = _normalize_provider_credit_timestamp(granted_at)
+    if granted_at is None:
+        return {"operator_annotation": None, "source_url": None}
+    if not isinstance(expires_at, datetime):
+        expires_at = _normalize_provider_credit_timestamp(expires_at)
+    for seed in CODEX_RESET_CREDIT_SEED_METADATA:
+        seed_granted = seed.get("granted_at")
+        if not isinstance(seed_granted, datetime):
+            continue
+        if abs((granted_at - seed_granted).total_seconds()) > 120:
+            continue
+        seed_expires = seed.get("expires_at")
+        if isinstance(seed_expires, datetime) and expires_at is not None:
+            if abs((expires_at - seed_expires).total_seconds()) > 120:
+                continue
+        return {
+            "operator_annotation": seed.get("operator_annotation"),
+            "source_url": seed.get("source_url"),
+        }
+    return {"operator_annotation": None, "source_url": None}
+
+
+def apply_provider_credit_seed_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
+    granted_at = row.get("granted_at")
+    expires_at = row.get("expires_at")
+    seed = _provider_credit_seed_metadata_match(
+        granted_at=granted_at,
+        expires_at=expires_at,
+    )
+    updated = dict(row)
+    if seed["operator_annotation"] and not updated.get("operator_annotation"):
+        updated["operator_annotation"] = seed["operator_annotation"]
+    if seed["source_url"] and not updated.get("source_url"):
+        updated["source_url"] = seed["source_url"]
+    return updated
+
+
+def load_provider_credit_current_rows(
+    dsn: str,
+    *,
+    environment: str,
+    provider: str,
+    account_hash: str,
+    credit_family: str,
+    source: str,
+    lock_timeout_ms: int = DEFAULT_DB_LOCK_TIMEOUT_MS,
+    statement_timeout_ms: int = DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+) -> List[Dict[str, Any]]:
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            _set_database_timeouts(
+                cur,
+                lock_timeout_ms=lock_timeout_ms,
+                statement_timeout_ms=statement_timeout_ms,
+            )
+            cur.execute(
+                PROVIDER_CREDIT_CURRENT_SELECT_SQL,
+                (environment, provider, account_hash, credit_family, source),
+            )
+            columns = [desc.name for desc in cur.description or ()]
+            return [dict(zip(columns, row)) for row in cur.fetchall()]
+
 def _provider_credit_db_payload(row: Dict[str, Any]) -> tuple[Any, ...]:
     return (
         row.get("observed_at"),
@@ -963,8 +1232,15 @@ def _provider_credit_db_payload(row: Dict[str, Any]) -> tuple[Any, ...]:
         row.get("account_hash"),
         row.get("credit_family"),
         row.get("credit_type"),
+        row.get("credit_identity") or "",
         row.get("available_count"),
+        row.get("granted_at"),
         row.get("expires_at"),
+        row.get("status") or "available",
+        row.get("redeem_started_at"),
+        row.get("redeemed_at"),
+        row.get("operator_annotation"),
+        row.get("source_url"),
         json.dumps(row.get("raw_provider_fields") or {}, sort_keys=True, default=_json_default),
         json.dumps(row.get("evidence") or {}, sort_keys=True, default=_json_default),
         row.get("source"),
@@ -991,9 +1267,10 @@ def insert_provider_credit_observations(
                 )
                 inserted_count = 0
                 for row in rows:
+                    payload_row = apply_provider_credit_seed_metadata(row)
                     cur.execute(
                         PROVIDER_CREDIT_OBSERVATIONS_INSERT_SQL,
-                        _provider_credit_db_payload(row),
+                        _provider_credit_db_payload(payload_row),
                     )
                     inserted_count += max(0, cur.rowcount)
         except (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled) as exc:
