@@ -1077,3 +1077,9 @@ similar OpenAI-compatible embedding endpoints. The shared session remains
 externally owned by the proxy; provider handlers may reuse it for async request
 transport, but cleanup still happens through proxy shutdown and
 `close_litellm_async_clients()`, not cache eviction.
+
+`LLMClientCache` must not close HTTP or SDK clients when TTL eviction removes a
+cache key; in-flight requests can still hold those clients. Evicted client-like
+values are retained on the cache until `close_litellm_async_clients()` runs, so
+they do not fall out of scope and emit unclosed aiohttp session warnings before
+the explicit shutdown cleanup path can close them.

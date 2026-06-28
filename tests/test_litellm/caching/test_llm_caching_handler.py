@@ -12,6 +12,7 @@ import asyncio
 import os
 import sys
 import warnings
+from unittest.mock import patch
 
 import pytest
 
@@ -172,3 +173,42 @@ def test_remove_key_removes_plain_values():
 
     assert "str-key" not in cache.cache_dict
     assert "dict-key" not in cache.cache_dict
+
+
+@pytest.mark.asyncio
+async def test_remove_key_retains_evicted_client_without_closing():
+    """Evicted client-like values stay referenced for shutdown cleanup, not closed."""
+    cache = LLMClientCache(max_size_in_memory=2)
+
+    mock_client = MockAsyncClient()
+    cache.cache_dict["test-key"] = mock_client
+    cache.ttl_dict["test-key"] = 0
+
+    cache._remove_key("test-key")
+    await asyncio.sleep(0.1)
+
+    assert mock_client.closed is False
+    assert cache._evicted_clients_retained == [mock_client]
+
+
+@pytest.mark.asyncio
+async def test_close_litellm_async_clients_closes_retained_evicted_clients():
+    from litellm.llms.custom_httpx.async_client_cleanup import (
+        close_litellm_async_clients,
+    )
+
+    cache = LLMClientCache(max_size_in_memory=2)
+    mock_client = MockAsyncClient()
+    cache._evicted_clients_retained.append(mock_client)
+
+    import litellm
+
+    with patch.object(
+        litellm,
+        "in_memory_llm_clients_cache",
+        cache,
+    ), patch.object(litellm, "base_llm_aiohttp_handler", None):
+        await close_litellm_async_clients()
+
+    assert mock_client.closed is True
+    assert cache._evicted_clients_retained == []
