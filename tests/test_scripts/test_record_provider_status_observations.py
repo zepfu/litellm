@@ -3891,7 +3891,7 @@ def _codex_reset_credit_poll_config(**overrides):
         codex_reset_credit_poll_enabled=True,
         codex_reset_credit_poll_interval_seconds=3600.0,
         codex_reset_credit_poll_http_timeout_seconds=30.0,
-        codex_usage_url="https://chatgpt.com/backend-api/wham/usage",
+        codex_usage_url="https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
         codex_reset_credit_poll_max_attempts=3,
         codex_reset_credit_poll_retry_backoff_seconds=0.5,
         grok_billing_poll_enabled=False,
@@ -3910,6 +3910,31 @@ def _codex_reset_credit_payload_snake(**overrides) -> dict:
     payload.update(overrides)
     return payload
 
+
+
+
+def _codex_reset_credit_payload_detail(**overrides) -> dict:
+    granted_a = datetime(2026, 6, 24, 18, 0, tzinfo=timezone.utc)
+    granted_b = datetime(2026, 6, 25, 12, 0, tzinfo=timezone.utc)
+    payload = {
+        "credits": [
+            {
+                "id": "credit-visible-1",
+                "status": "available",
+                "reset_type": "refer_a_friend",
+                "granted_at": granted_a.isoformat().replace("+00:00", "Z"),
+                "expires_at": "2026-07-24T18:00:00Z",
+            },
+            {
+                "status": "available",
+                "reset_type": "refer_a_friend",
+                "granted_at": granted_b.isoformat().replace("+00:00", "Z"),
+                "expires_at": "2026-07-25T12:00:00Z",
+            },
+        ]
+    }
+    payload.update(overrides)
+    return payload
 
 def _codex_reset_credit_auth_context(**overrides) -> dict:
     context = {
@@ -3964,12 +3989,20 @@ def test_account_identity_hash_uses_stable_short_sha256_prefix() -> None:
 
 def test_provider_credit_insert_sql_dedupes_unchanged_snapshots() -> None:
     sql = probes.PROVIDER_CREDIT_OBSERVATIONS_INSERT_SQL
+    view_sql = probes.PROVIDER_CREDIT_CURRENT_VIEW_SQL
 
     assert "latest.available_count IS NOT DISTINCT FROM candidate.available_count" in sql
-    assert "latest.expires_at IS NOT DISTINCT FROM candidate.expires_at" not in sql
+    assert "latest.granted_at IS NOT DISTINCT FROM candidate.granted_at" in sql
+    assert "latest.expires_at IS NOT DISTINCT FROM candidate.expires_at" in sql
+    assert "latest.status IS NOT DISTINCT FROM candidate.status" in sql
+    assert "latest.credit_identity IS NOT DISTINCT FROM candidate.credit_identity" in sql
+    assert "latest.operator_annotation IS NOT DISTINCT FROM candidate.operator_annotation" in sql
+    assert "latest.source_url IS NOT DISTINCT FROM candidate.source_url" in sql
     assert "latest.raw_provider_fields IS NOT DISTINCT FROM" not in sql
-    assert "latest.evidence IS NOT DISTINCT FROM" not in sql
-    assert "latest.account_hash IS NOT DISTINCT FROM candidate.account_hash" in sql
+    assert "credit_identity," in view_sql
+    assert "operator_annotation," in view_sql
+    assert "granted_at," in view_sql
+    assert "detail_credit.credit_identity <> ''" in view_sql
 
 
 def test_build_codex_reset_credit_observation_keeps_raw_fields_narrow() -> None:
@@ -4012,7 +4045,10 @@ def test_insert_provider_credit_observations_returns_changed_rowcount(monkeypatc
                 "account_hash": "abc123def456",
                 "credit_family": "codex_rate_limit_reset",
                 "credit_type": "reset_credit",
+                "credit_identity": "legacy-aggregate",
                 "available_count": 2,
+                "granted_at": None,
+                "status": "available",
                 "expires_at": None,
                 "raw_provider_fields": {"rate_limit_reset_credits": {"available_count": 2}},
                 "evidence": {"signals": ["codex_reset_credit_poll"]},
@@ -4024,7 +4060,7 @@ def test_insert_provider_credit_observations_returns_changed_rowcount(monkeypatc
     assert inserted == 0
     insert_sql, payload = fake_conn.cursor_instance.execute_calls[3]
     assert insert_sql == probes.PROVIDER_CREDIT_OBSERVATIONS_INSERT_SQL
-    assert payload[6] == 2
+    assert payload[7] == 2
 
     fake_conn.cursor_instance.rowcount = 1
     inserted_changed = probes.insert_provider_credit_observations(
@@ -4037,7 +4073,10 @@ def test_insert_provider_credit_observations_returns_changed_rowcount(monkeypatc
                 "account_hash": "abc123def456",
                 "credit_family": "codex_rate_limit_reset",
                 "credit_type": "reset_credit",
+                "credit_identity": "legacy-aggregate",
                 "available_count": 1,
+                "granted_at": None,
+                "status": "available",
                 "expires_at": None,
                 "raw_provider_fields": {"rate_limit_reset_credits": {"available_count": 1}},
                 "evidence": {"signals": ["codex_reset_credit_poll"]},
@@ -4100,6 +4139,7 @@ def test_run_due_sidecar_tasks_throttles_codex_reset_credit_poll(monkeypatch) ->
                 "auth_context": _codex_reset_credit_auth_context(),
                 "attempt_count": 1,
                 "retry_count": 0,
+                "poll_url": "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
             }
         ),
     )
@@ -4129,6 +4169,7 @@ def test_run_due_sidecar_tasks_emits_codex_reset_credit_poll_event(monkeypatch) 
             "auth_context": _codex_reset_credit_auth_context(),
             "attempt_count": 1,
             "retry_count": 0,
+            "poll_url": "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
         },
     )
     monkeypatch.setattr(
@@ -4169,6 +4210,321 @@ def test_compose_wires_codex_reset_credit_poll_defaults() -> None:
         in compose_text
     )
     assert (
-        "AAWM_CODEX_USAGE_URL=${AAWM_CODEX_USAGE_URL:-https://chatgpt.com/backend-api/wham/usage}"
+        "AAWM_CODEX_USAGE_URL=${AAWM_CODEX_USAGE_URL:-https://chatgpt.com/backend-api/wham/rate-limit-reset-credits}"
         in compose_text
     )
+
+
+def test_resolve_codex_reset_credit_poll_url_maps_legacy_usage_to_detail() -> None:
+    config = _codex_reset_credit_poll_config(
+        codex_usage_url="https://chatgpt.com/backend-api/wham/usage"
+    )
+    assert (
+        loop._resolve_codex_reset_credit_poll_url(config)
+        == probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
+    )
+
+
+def test_parse_codex_reset_credit_detail_credits_builds_per_credit_rows() -> None:
+    config = _codex_reset_credit_poll_config()
+    observed_at = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+    rows = loop._build_codex_reset_credit_observations(
+        config,
+        observed_at=observed_at,
+        response_body=_codex_reset_credit_payload_detail(),
+        auth_context=_codex_reset_credit_auth_context(),
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+        poll_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+    )
+
+    assert len(rows) == 2
+    assert all(row["status"] == "available" for row in rows)
+    assert rows[0]["credit_identity"] == "credit-visible-1"
+    assert rows[0]["granted_at"] == datetime(2026, 6, 24, 18, 0, tzinfo=timezone.utc)
+    assert rows[1]["credit_identity"] != rows[0]["credit_identity"]
+    identity_b = probes.derive_provider_credit_identity(
+        account_hash=rows[1]["account_hash"],
+        credit_family="codex_rate_limit_reset",
+        granted_at=rows[1]["granted_at"],
+        expires_at=rows[1]["expires_at"],
+        reset_type="refer_a_friend",
+        provider_credit_id=None,
+    )
+    assert rows[1]["credit_identity"] == identity_b
+    newest = max(rows, key=lambda row: row["granted_at"])
+    assert newest["source_url"] == loop.DEFAULT_CODEX_RESET_CREDIT_LATEST_VISIBLE_SOURCE_URL
+    event_json = json.dumps(rows, default=str)
+    assert "access-token-secret" not in event_json
+    assert "acct-openai-primary" not in event_json
+
+
+def test_derive_provider_credit_identity_is_stable_without_provider_id() -> None:
+    granted = datetime(2026, 6, 24, 18, 0, tzinfo=timezone.utc)
+    expires = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
+    first = probes.derive_provider_credit_identity(
+        account_hash="abc123def456",
+        credit_family="codex_rate_limit_reset",
+        granted_at=granted,
+        expires_at=expires,
+        reset_type="refer_a_friend",
+        provider_credit_id=None,
+    )
+    second = probes.derive_provider_credit_identity(
+        account_hash="abc123def456",
+        credit_family="codex_rate_limit_reset",
+        granted_at=granted,
+        expires_at=expires,
+        reset_type="refer_a_friend",
+        provider_credit_id=None,
+    )
+    assert first == second
+    assert len(first) == 16
+
+
+def test_apply_provider_credit_seed_metadata_matches_invite_promotion_grant() -> None:
+    row = {
+        "granted_at": datetime(2026, 6, 24, 21, 53, tzinfo=timezone.utc),
+        "expires_at": datetime(2026, 7, 24, 21, 53, tzinfo=timezone.utc),
+        "operator_annotation": None,
+        "source_url": None,
+    }
+    updated = probes.apply_provider_credit_seed_metadata(row)
+    assert updated["operator_annotation"] == "Invite Promotion"
+
+
+def test_apply_provider_credit_seed_metadata_matches_visible_invite_promotion_credit() -> None:
+    row = {
+        "granted_at": datetime(
+            2026, 6, 24, 22, 41, 38, 714466, tzinfo=timezone.utc
+        ),
+        "expires_at": datetime(
+            2026, 7, 24, 22, 41, 38, 714466, tzinfo=timezone.utc
+        ),
+        "operator_annotation": None,
+        "source_url": None,
+    }
+    updated = probes.apply_provider_credit_seed_metadata(row)
+    assert updated["operator_annotation"] == "Invite Promotion"
+
+
+def test_apply_provider_credit_seed_metadata_sets_source_url_for_june_12_credit() -> None:
+    row = {
+        "granted_at": datetime(2026, 6, 12, 16, 17, tzinfo=timezone.utc),
+        "expires_at": datetime(2026, 7, 12, 16, 17, tzinfo=timezone.utc),
+        "operator_annotation": None,
+        "source_url": None,
+    }
+    updated = probes.apply_provider_credit_seed_metadata(row)
+    assert (
+        updated["source_url"]
+        == "https://x.com/thsottiaux/status/2065468501750649006"
+    )
+
+
+def test_build_codex_reset_credit_seed_observations_emits_missing_seed_rows() -> None:
+    config = _codex_reset_credit_poll_config()
+    account_hash = probes.account_identity_hash("acct-openai-primary")
+    rows = loop._build_codex_reset_credit_seed_observations(
+        config,
+        observed_at=datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc),
+        account_hash=account_hash,
+        visible_identities=set(),
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+        poll_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+    )
+
+    assert len(rows) == len(probes.CODEX_RESET_CREDIT_SEED_METADATA)
+    by_grant = {row["granted_at"]: row for row in rows}
+    assert by_grant[datetime(2026, 6, 24, 21, 53, tzinfo=timezone.utc)][
+        "status"
+    ] == "used"
+    assert by_grant[datetime(2026, 6, 24, 21, 53, tzinfo=timezone.utc)][
+        "operator_annotation"
+    ] == "Invite Promotion"
+    assert by_grant[datetime(2026, 6, 12, 16, 17, tzinfo=timezone.utc)][
+        "source_url"
+    ] == "https://x.com/thsottiaux/status/2065468501750649006"
+    assert all(row["available_count"] == 0 for row in rows)
+    assert all(row["evidence"]["seed_backfill"] is True for row in rows)
+
+
+def test_build_codex_reset_credit_seed_observations_skips_visible_seed_identity() -> None:
+    config = _codex_reset_credit_poll_config()
+    account_hash = probes.account_identity_hash("acct-openai-primary")
+    granted_at = datetime(2026, 6, 24, 22, 41, 38, 714466, tzinfo=timezone.utc)
+    expires_at = datetime(2026, 7, 24, 22, 41, 38, 714466, tzinfo=timezone.utc)
+    visible_identity = probes.derive_provider_credit_identity(
+        account_hash=account_hash,
+        credit_family="codex_rate_limit_reset",
+        granted_at=granted_at,
+        expires_at=expires_at,
+        reset_type="codex_rate_limits",
+        provider_credit_id=None,
+    )
+
+    rows = loop._build_codex_reset_credit_seed_observations(
+        config,
+        observed_at=datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc),
+        account_hash=account_hash,
+        visible_identities={visible_identity},
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+        poll_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+    )
+
+    assert visible_identity not in {row["credit_identity"] for row in rows}
+
+
+def test_build_codex_reset_credit_seed_observations_skips_visible_grant_window() -> None:
+    config = _codex_reset_credit_poll_config()
+    account_hash = probes.account_identity_hash("acct-openai-primary")
+    granted_at = datetime(2026, 6, 24, 22, 41, 38, 714466, tzinfo=timezone.utc)
+    expires_at = datetime(2026, 7, 24, 22, 41, 38, 714466, tzinfo=timezone.utc)
+
+    rows = loop._build_codex_reset_credit_seed_observations(
+        config,
+        observed_at=datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc),
+        account_hash=account_hash,
+        visible_identities={"RateLimitResetCredit_provider_id"},
+        visible_credit_windows={(granted_at, expires_at)},
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+        poll_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+    )
+
+    assert all(row["granted_at"] != granted_at for row in rows)
+
+
+def test_visible_past_expiry_credit_is_marked_expired() -> None:
+    rows = loop._build_codex_reset_credit_observations(
+        _codex_reset_credit_poll_config(),
+        observed_at=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+        response_body={
+            "credits": [
+                {
+                    "status": "available",
+                    "reset_type": "codex_rate_limits",
+                    "granted_at": "2026-06-24T12:00:00Z",
+                    "expires_at": "2026-07-24T12:00:00Z",
+                }
+            ]
+        },
+        auth_context=_codex_reset_credit_auth_context(),
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+        poll_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+    )
+
+    assert rows[0]["status"] == "expired"
+    assert rows[0]["available_count"] == 0
+
+
+def test_synthesize_codex_reset_credit_lifecycle_marks_missing_credit_used(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config()
+    observed_at = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+    missing_identity = "missing-credit-id"
+    monkeypatch.setattr(
+        loop,
+        "_resolve_dsn",
+        lambda _config: "postgresql://example/db",
+    )
+    monkeypatch.setattr(
+        probes,
+        "load_provider_credit_current_rows",
+        lambda *_args, **_kwargs: [
+            {
+                "credit_identity": missing_identity,
+                "credit_type": "reset_credit",
+                "status": "available",
+                "granted_at": datetime(2026, 6, 24, 21, 53, tzinfo=timezone.utc),
+                "expires_at": datetime(2026, 7, 24, 21, 53, tzinfo=timezone.utc),
+                "redeem_started_at": None,
+                "redeemed_at": None,
+                "operator_annotation": "Invite Promotion",
+                "source_url": None,
+                "raw_provider_fields": {"credit": {"status": "available"}},
+                "evidence": {"signals": ["codex_reset_credit_poll"]},
+            }
+        ],
+    )
+
+    rows = loop._synthesize_codex_reset_credit_lifecycle_observations(
+        config,
+        observed_at=observed_at,
+        account_hash=probes.account_identity_hash("acct-openai-primary"),
+        visible_identities={"still-visible"},
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+        poll_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "used"
+    assert rows[0]["credit_identity"] == missing_identity
+    assert rows[0]["available_count"] == 0
+    assert rows[0]["evidence"]["lifecycle_reason"] == "credit_missing_before_expiry"
+
+
+def test_synthesize_codex_reset_credit_lifecycle_marks_past_expiry_expired(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config()
+    observed_at = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(loop, "_resolve_dsn", lambda _config: "postgresql://example/db")
+    monkeypatch.setattr(
+        probes,
+        "load_provider_credit_current_rows",
+        lambda *_args, **_kwargs: [
+            {
+                "credit_identity": "expired-credit",
+                "credit_type": "reset_credit",
+                "status": "available",
+                "granted_at": datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+                "expires_at": datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc),
+                "redeem_started_at": None,
+                "redeemed_at": None,
+                "operator_annotation": None,
+                "source_url": None,
+                "raw_provider_fields": {},
+                "evidence": {},
+            }
+        ],
+    )
+
+    rows = loop._synthesize_codex_reset_credit_lifecycle_observations(
+        config,
+        observed_at=observed_at,
+        account_hash="abc123def456",
+        visible_identities=set(),
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+        poll_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "expired"
+    assert rows[0]["evidence"]["lifecycle_reason"] == "credit_past_expiry"
+
+
+def test_parse_codex_reset_credit_credit_entry_prefers_redeemed_at_for_used() -> None:
+    parsed = loop._parse_codex_reset_credit_credit_entry(
+        {
+            "status": "available",
+            "granted_at": "2026-06-20T12:00:00Z",
+            "expires_at": "2026-07-20T12:00:00Z",
+            "redeemed_at": "2026-06-21T10:00:00Z",
+        }
+    )
+    assert parsed["status"] == "used"
+    assert parsed["redeemed_at"] == datetime(2026, 6, 21, 10, 0, tzinfo=timezone.utc)

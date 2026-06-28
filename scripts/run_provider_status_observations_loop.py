@@ -122,12 +122,33 @@ DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED = False
 DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS = 30.0
-DEFAULT_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+DEFAULT_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS = 3
 DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY = "codex_rate_limit_reset"
 DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE = "reset_credit"
 DEFAULT_CODEX_RESET_CREDIT_SOURCE = "codex_reset_credit_poll"
+DEFAULT_CODEX_RESET_CREDIT_LATEST_VISIBLE_SOURCE_URL = (
+    "https://x.com/thsottiaux/status/2070653282440405046"
+)
+CODEX_RESET_CREDIT_SANITIZED_RAW_FIELD_KEYS = frozenset(
+    {
+        "id",
+        "credit_id",
+        "status",
+        "reset_type",
+        "resetType",
+        "granted_at",
+        "grantedAt",
+        "expires_at",
+        "expiresAt",
+        "redeem_started_at",
+        "redeemStartedAt",
+        "redeemed_at",
+        "redeemedAt",
+    }
+)
+
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED = False
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS = 3600.0
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS = 4.0
@@ -1738,7 +1759,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=os.getenv("AAWM_CODEX_USAGE_URL", DEFAULT_CODEX_USAGE_URL),
         help=(
             "Codex usage endpoint polled by the sidecar. Defaults to "
-            "AAWM_CODEX_USAGE_URL or the native ChatGPT wham usage URL."
+            "AAWM_CODEX_USAGE_URL or the native ChatGPT wham rate-limit-reset-credits URL."
         ),
     )
     parser.add_argument(
@@ -2632,10 +2653,27 @@ def _json_safe_codex_reset_credit_value(value: Any) -> Any:
     return str(value)
 
 
+def _resolve_codex_reset_credit_poll_url(config: ProviderStatusLoopConfig) -> str:
+    configured = str(config.codex_usage_url).strip()
+    if not configured:
+        return probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
+    legacy = getattr(probes, "LEGACY_CODEX_WHAM_USAGE_URL", "https://chatgpt.com/backend-api/wham/usage")
+    if configured.rstrip("/") == legacy.rstrip("/"):
+        return probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
+    return configured
+
+
 def _parse_codex_reset_credit_available_count(response_body: Mapping[str, Any]) -> int:
-    credits = response_body.get("rate_limit_reset_credits")
-    if isinstance(credits, dict):
-        available = credits.get("available_count")
+    """Aggregate available count for poll events; prefers per-credit detail payloads."""
+    try:
+        credits = _parse_codex_reset_credit_detail_credits(response_body)
+    except ValueError:
+        credits = []
+    if credits:
+        return sum(1 for credit in credits if credit.get("status") == "available")
+    legacy = response_body.get("rate_limit_reset_credits")
+    if isinstance(legacy, dict):
+        available = legacy.get("available_count")
         if isinstance(available, bool):
             raise ValueError("Codex reset-credit payload available_count was not an integer.")
         if isinstance(available, int):
@@ -2655,14 +2693,128 @@ def _parse_codex_reset_credit_available_count(response_body: Mapping[str, Any]) 
             return int(available)
         if isinstance(available, str) and available.strip().isdigit():
             return int(available.strip())
+    if isinstance(response_body.get("credits"), list):
+        return 0
     raise ValueError(
-        "Codex reset-credit payload did not include rate_limit_reset_credits.available_count."
+        "Codex reset-credit payload did not include credits[] or rate_limit_reset_credits.available_count."
     )
+
+
+def _parse_codex_reset_credit_field(
+    entry: Mapping[str, Any],
+    *keys: str,
+) -> Any:
+    for key in keys:
+        if key in entry:
+            return entry.get(key)
+    return None
+
+
+def _parse_codex_reset_credit_credit_entry(
+    entry: Mapping[str, Any],
+) -> Dict[str, Any]:
+    provider_credit_id = _parse_codex_reset_credit_field(entry, "id", "credit_id", "creditId")
+    if provider_credit_id is not None:
+        provider_credit_id = str(provider_credit_id).strip() or None
+    granted_at = probes._normalize_provider_credit_timestamp(
+        _parse_codex_reset_credit_field(entry, "granted_at", "grantedAt")
+    )
+    expires_at = probes._normalize_provider_credit_timestamp(
+        _parse_codex_reset_credit_field(entry, "expires_at", "expiresAt")
+    )
+    redeem_started_at = probes._normalize_provider_credit_timestamp(
+        _parse_codex_reset_credit_field(entry, "redeem_started_at", "redeemStartedAt")
+    )
+    redeemed_at = probes._normalize_provider_credit_timestamp(
+        _parse_codex_reset_credit_field(entry, "redeemed_at", "redeemedAt")
+    )
+    reset_type = _parse_codex_reset_credit_field(entry, "reset_type", "resetType")
+    if reset_type is not None:
+        reset_type = str(reset_type).strip() or None
+    provider_status = _parse_codex_reset_credit_field(entry, "status")
+    if provider_status is not None:
+        provider_status = str(provider_status).strip().lower() or None
+    status = _normalize_codex_reset_credit_status(
+        provider_status,
+        redeemed_at=redeemed_at,
+        redeem_started_at=redeem_started_at,
+        expires_at=expires_at,
+        observed_at=None,
+    )
+    return {
+        "provider_credit_id": provider_credit_id,
+        "granted_at": granted_at,
+        "expires_at": expires_at,
+        "redeem_started_at": redeem_started_at,
+        "redeemed_at": redeemed_at,
+        "reset_type": reset_type,
+        "status": status,
+        "provider_status": provider_status,
+    }
+
+
+def _parse_codex_reset_credit_detail_credits(
+    response_body: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    credits_value = response_body.get("credits")
+    if credits_value is None:
+        raise ValueError("Codex reset-credit detail payload did not include credits[].")
+    if not isinstance(credits_value, list):
+        raise ValueError("Codex reset-credit detail payload credits was not a list.")
+    parsed: List[Dict[str, Any]] = []
+    for item in credits_value:
+        if not isinstance(item, dict):
+            continue
+        parsed.append(_parse_codex_reset_credit_credit_entry(item))
+    return parsed
+
+
+def _normalize_codex_reset_credit_status(
+    provider_status: Optional[str],
+    *,
+    redeemed_at: Optional[datetime],
+    redeem_started_at: Optional[datetime],
+    expires_at: Optional[datetime],
+    observed_at: Optional[datetime],
+) -> str:
+    if redeemed_at is not None:
+        return "used"
+    if redeem_started_at is not None:
+        return "used"
+    if provider_status in {"used", "redeemed", "consumed", "expired"}:
+        return "used" if provider_status != "expired" else "expired"
+    if (
+        observed_at is not None
+        and expires_at is not None
+        and observed_at > expires_at
+    ):
+        return "expired"
+    if provider_status in {"available", "active", "unused"}:
+        return "available"
+    if provider_status:
+        return provider_status
+    return "available"
+
+
+def _sanitize_codex_reset_credit_raw_fields(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for key, value in entry.items():
+        if key not in CODEX_RESET_CREDIT_SANITIZED_RAW_FIELD_KEYS:
+            continue
+        sanitized[key] = _json_safe_codex_reset_credit_value(value)
+    return sanitized
 
 
 def _parse_codex_reset_credit_expires_at(
     response_body: Mapping[str, Any],
 ) -> Optional[datetime]:
+    try:
+        credits = _parse_codex_reset_credit_detail_credits(response_body)
+    except ValueError:
+        credits = []
+    if credits:
+        expiries = [credit["expires_at"] for credit in credits if credit.get("expires_at")]
+        return max(expiries) if expiries else None
     for credits_key, expires_key in (
         ("rate_limit_reset_credits", "expires_at"),
         ("rateLimitResetCredits", "expiresAt"),
@@ -2673,34 +2825,18 @@ def _parse_codex_reset_credit_expires_at(
         if expires_key not in credits:
             continue
         value = credits.get(expires_key)
-        if value is None or value == "":
-            return None
-        if isinstance(value, (int, float)):
-            try:
-                return datetime.fromtimestamp(float(value), timezone.utc)
-            except (OSError, OverflowError, ValueError):
-                return None
-        if isinstance(value, str):
-            normalized = value.strip()
-            if not normalized:
-                return None
-            if normalized.endswith("Z"):
-                normalized = normalized[:-1] + "+00:00"
-            try:
-                parsed = datetime.fromisoformat(normalized)
-            except ValueError:
-                return None
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc)
+        return probes._normalize_provider_credit_timestamp(value)
     return None
 
 
 def _build_codex_reset_credit_raw_provider_fields(
     response_body: Mapping[str, Any],
     *,
-    available_count: int,
+    credit_entry: Optional[Mapping[str, Any]] = None,
+    available_count: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if credit_entry is not None:
+        return {"credit": _sanitize_codex_reset_credit_raw_fields(credit_entry)}
     for credits_key, count_key, expires_key in (
         ("rate_limit_reset_credits", "available_count", "expires_at"),
         ("rateLimitResetCredits", "availableCount", "expiresAt"),
@@ -2710,7 +2846,7 @@ def _build_codex_reset_credit_raw_provider_fields(
             continue
         fields: Dict[str, Any] = {
             credits_key: {
-                count_key: available_count,
+                count_key: available_count if available_count is not None else credits.get(count_key),
             }
         }
         if expires_key in credits:
@@ -2718,10 +2854,242 @@ def _build_codex_reset_credit_raw_provider_fields(
                 credits.get(expires_key)
             )
         return fields
-    return {
-        "rate_limit_reset_credits": {
-            "available_count": available_count,
+    if available_count is not None:
+        return {
+            "rate_limit_reset_credits": {
+                "available_count": available_count,
+            }
         }
+    return {}
+
+
+def _codex_reset_credit_poll_evidence(
+    config: ProviderStatusLoopConfig,
+    *,
+    poll_url: str,
+    status_code: int,
+    attempt_count: int,
+    retry_count: int,
+    account_id: Any,
+    detail_endpoint: bool,
+    visible_credit_count: int,
+) -> Dict[str, Any]:
+    return {
+        "signals": ["codex_reset_credit_poll"],
+        "provider_fields": [
+            "credits[].status",
+            "credits[].reset_type",
+            "credits[].granted_at",
+            "credits[].expires_at",
+            "credits[].redeem_started_at",
+            "credits[].redeemed_at",
+        ],
+        "detail_endpoint": detail_endpoint,
+        "poll_url": poll_url,
+        "usage_url": poll_url,
+        "status_code": status_code,
+        "attempt_count": attempt_count,
+        "retry_count": retry_count,
+        "account_id_present": bool(account_id),
+        "chatgpt_account_id_header_present": bool(account_id),
+        "visible_credit_count": visible_credit_count,
+    }
+
+
+def _apply_codex_reset_credit_visible_source_url(
+    observations: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not observations:
+        return observations
+    available_rows = [
+        row for row in observations if row.get("status") == "available"
+    ]
+    if not available_rows:
+        return observations
+    newest = max(
+        available_rows,
+        key=lambda row: row.get("granted_at") or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    updated: List[Dict[str, Any]] = []
+    for row in observations:
+        if row is newest and not row.get("source_url"):
+            merged = dict(row)
+            merged["source_url"] = DEFAULT_CODEX_RESET_CREDIT_LATEST_VISIBLE_SOURCE_URL
+            updated.append(merged)
+        else:
+            updated.append(row)
+    return updated
+
+
+def _build_codex_reset_credit_observations(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    response_body: Mapping[str, Any],
+    auth_context: Mapping[str, Any],
+    status_code: int,
+    attempt_count: int,
+    retry_count: int,
+    poll_url: str,
+) -> List[Dict[str, Any]]:
+    account_id = auth_context.get("account_id")
+    account_hash = probes.account_identity_hash(account_id)
+    if account_hash is None:
+        raise ValueError(
+            "Codex reset-credit poll could not derive a stable hashed account identity."
+        )
+    detail_endpoint = True
+    try:
+        parsed_credits = _parse_codex_reset_credit_detail_credits(response_body)
+    except ValueError:
+        detail_endpoint = False
+        parsed_credits = []
+
+    observations: List[Dict[str, Any]] = []
+    if parsed_credits:
+        for parsed in parsed_credits:
+            credit_identity = probes.derive_provider_credit_identity(
+                account_hash=account_hash,
+                credit_family=DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+                granted_at=parsed.get("granted_at"),
+                expires_at=parsed.get("expires_at"),
+                reset_type=parsed.get("reset_type"),
+                provider_credit_id=parsed.get("provider_credit_id"),
+            )
+            status = _normalize_codex_reset_credit_status(
+                parsed.get("provider_status"),
+                redeemed_at=parsed.get("redeemed_at"),
+                redeem_started_at=parsed.get("redeem_started_at"),
+                expires_at=parsed.get("expires_at"),
+                observed_at=observed_at,
+            )
+            available_count = 1 if status == "available" else 0
+            raw_provider_fields = _build_codex_reset_credit_raw_provider_fields(
+                response_body,
+                credit_entry={
+                    "id": parsed.get("provider_credit_id"),
+                    "status": parsed.get("provider_status"),
+                    "reset_type": parsed.get("reset_type"),
+                    "granted_at": parsed.get("granted_at"),
+                    "expires_at": parsed.get("expires_at"),
+                    "redeem_started_at": parsed.get("redeem_started_at"),
+                    "redeemed_at": parsed.get("redeemed_at"),
+                },
+            )
+            evidence = _codex_reset_credit_poll_evidence(
+                config,
+                poll_url=poll_url,
+                status_code=status_code,
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+                account_id=account_id,
+                detail_endpoint=True,
+                visible_credit_count=len(parsed_credits),
+            )
+            observations.append(
+                {
+                    "observed_at": observed_at,
+                    "environment": config.environment,
+                    "provider": "openai",
+                    "account_hash": account_hash,
+                    "credit_family": DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+                    "credit_type": DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE,
+                    "credit_identity": credit_identity,
+                    "available_count": available_count,
+                    "granted_at": parsed.get("granted_at"),
+                    "expires_at": parsed.get("expires_at"),
+                    "status": status,
+                    "redeem_started_at": parsed.get("redeem_started_at"),
+                    "redeemed_at": parsed.get("redeemed_at"),
+                    "operator_annotation": None,
+                    "source_url": None,
+                    "raw_provider_fields": raw_provider_fields,
+                    "evidence": evidence,
+                    "source": DEFAULT_CODEX_RESET_CREDIT_SOURCE,
+                }
+            )
+        observations = [
+            probes.apply_provider_credit_seed_metadata(row) for row in observations
+        ]
+        return _apply_codex_reset_credit_visible_source_url(observations)
+    if detail_endpoint:
+        return []
+
+    legacy = _build_codex_reset_credit_observation_legacy(
+        config,
+        observed_at=observed_at,
+        response_body=response_body,
+        auth_context=auth_context,
+        status_code=status_code,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+        poll_url=poll_url,
+        detail_endpoint=False,
+    )
+    return [probes.apply_provider_credit_seed_metadata(legacy)]
+
+
+def _build_codex_reset_credit_observation_legacy(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    response_body: Mapping[str, Any],
+    auth_context: Mapping[str, Any],
+    status_code: int,
+    attempt_count: int,
+    retry_count: int,
+    poll_url: str,
+    detail_endpoint: bool,
+) -> Dict[str, Any]:
+    available_count = _parse_codex_reset_credit_available_count(response_body)
+    expires_at = _parse_codex_reset_credit_expires_at(response_body)
+    account_id = auth_context.get("account_id")
+    account_hash = probes.account_identity_hash(account_id)
+    if account_hash is None:
+        raise ValueError(
+            "Codex reset-credit poll could not derive a stable hashed account identity."
+        )
+    credit_identity = probes.derive_provider_credit_identity(
+        account_hash=account_hash,
+        credit_family=DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+        granted_at=None,
+        expires_at=expires_at,
+        reset_type="aggregate",
+        provider_credit_id=None,
+    )
+    raw_provider_fields = _build_codex_reset_credit_raw_provider_fields(
+        response_body,
+        available_count=available_count,
+    )
+    evidence = _codex_reset_credit_poll_evidence(
+        config,
+        poll_url=poll_url,
+        status_code=status_code,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+        account_id=account_id,
+        detail_endpoint=detail_endpoint,
+        visible_credit_count=0,
+    )
+    return {
+        "observed_at": observed_at,
+        "environment": config.environment,
+        "provider": "openai",
+        "account_hash": account_hash,
+        "credit_family": DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+        "credit_type": DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE,
+        "credit_identity": credit_identity,
+        "available_count": available_count,
+        "granted_at": None,
+        "expires_at": expires_at,
+        "status": "available" if available_count > 0 else "used",
+        "redeem_started_at": None,
+        "redeemed_at": None,
+        "operator_annotation": None,
+        "source_url": None,
+        "raw_provider_fields": raw_provider_fields,
+        "evidence": evidence,
+        "source": DEFAULT_CODEX_RESET_CREDIT_SOURCE,
     }
 
 
@@ -2735,44 +3103,220 @@ def _build_codex_reset_credit_observation(
     attempt_count: int,
     retry_count: int,
 ) -> Dict[str, Any]:
-    available_count = _parse_codex_reset_credit_available_count(response_body)
-    expires_at = _parse_codex_reset_credit_expires_at(response_body)
-    account_id = auth_context.get("account_id")
-    account_hash = probes.account_identity_hash(account_id)
-    if account_hash is None:
-        raise ValueError(
-            "Codex reset-credit poll could not derive a stable hashed account identity."
-        )
-    raw_provider_fields = _build_codex_reset_credit_raw_provider_fields(
-        response_body,
-        available_count=available_count,
+    poll_url = _resolve_codex_reset_credit_poll_url(config)
+    rows = _build_codex_reset_credit_observations(
+        config,
+        observed_at=observed_at,
+        response_body=response_body,
+        auth_context=auth_context,
+        status_code=status_code,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+        poll_url=poll_url,
     )
-    evidence = {
-        "signals": ["codex_reset_credit_poll"],
-        "provider_fields": [
-            "rate_limit_reset_credits.available_count",
-            "rateLimitResetCredits.availableCount",
-        ],
-        "usage_url": config.codex_usage_url,
-        "status_code": status_code,
-        "attempt_count": attempt_count,
-        "retry_count": retry_count,
-        "account_id_present": bool(account_id),
-        "chatgpt_account_id_header_present": bool(account_id),
-    }
-    return {
-        "observed_at": observed_at,
-        "environment": config.environment,
-        "provider": "openai",
-        "account_hash": account_hash,
-        "credit_family": DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
-        "credit_type": DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE,
-        "available_count": available_count,
-        "expires_at": expires_at,
-        "raw_provider_fields": raw_provider_fields,
-        "evidence": evidence,
-        "source": DEFAULT_CODEX_RESET_CREDIT_SOURCE,
-    }
+    if not rows:
+        raise ValueError("Codex reset-credit poll produced no observations.")
+    return rows[0]
+
+
+def _synthesize_codex_reset_credit_lifecycle_observations(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    account_hash: str,
+    visible_identities: set[str],
+    status_code: int,
+    attempt_count: int,
+    retry_count: int,
+    poll_url: str,
+) -> List[Dict[str, Any]]:
+    dsn = _resolve_dsn(config)
+    if not dsn:
+        return []
+    current_rows = probes.load_provider_credit_current_rows(
+        dsn,
+        environment=config.environment,
+        provider="openai",
+        account_hash=account_hash,
+        credit_family=DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+        source=DEFAULT_CODEX_RESET_CREDIT_SOURCE,
+        lock_timeout_ms=config.db_lock_timeout_ms,
+        statement_timeout_ms=config.db_statement_timeout_ms,
+    )
+    synthesized: List[Dict[str, Any]] = []
+    for current in current_rows:
+        identity = str(current.get("credit_identity") or "").strip()
+        if not identity or identity in visible_identities:
+            continue
+        if str(current.get("status") or "").lower() != "available":
+            continue
+        expires_at = current.get("expires_at")
+        if isinstance(expires_at, str):
+            expires_at = probes._normalize_provider_credit_timestamp(expires_at)
+        if expires_at is not None and observed_at > expires_at:
+            next_status = "expired"
+        else:
+            next_status = "used"
+        evidence = dict(current.get("evidence") or {})
+        evidence.update(
+            {
+                "lifecycle_inference": next_status,
+                "lifecycle_reason": (
+                    "credit_missing_before_expiry"
+                    if next_status == "used"
+                    else "credit_past_expiry"
+                ),
+                "detail_endpoint": True,
+                "poll_url": poll_url,
+                "status_code": status_code,
+                "attempt_count": attempt_count,
+                "retry_count": retry_count,
+            }
+        )
+        synthesized.append(
+            {
+                "observed_at": observed_at,
+                "environment": config.environment,
+                "provider": "openai",
+                "account_hash": account_hash,
+                "credit_family": DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+                "credit_type": current.get("credit_type")
+                or DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE,
+                "credit_identity": identity,
+                "available_count": 0,
+                "granted_at": current.get("granted_at"),
+                "expires_at": expires_at,
+                "status": next_status,
+                "redeem_started_at": current.get("redeem_started_at"),
+                "redeemed_at": current.get("redeemed_at"),
+                "operator_annotation": current.get("operator_annotation"),
+                "source_url": current.get("source_url"),
+                "raw_provider_fields": current.get("raw_provider_fields") or {},
+                "evidence": evidence,
+                "source": DEFAULT_CODEX_RESET_CREDIT_SOURCE,
+            }
+        )
+    return synthesized
+
+
+def _build_codex_reset_credit_seed_observations(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    account_hash: str,
+    visible_identities: set[str],
+    visible_credit_windows: Optional[
+        set[tuple[Optional[datetime], Optional[datetime]]]
+    ] = None,
+    status_code: int,
+    attempt_count: int,
+    retry_count: int,
+    poll_url: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for seed in probes.CODEX_RESET_CREDIT_SEED_METADATA:
+        granted_at = probes._normalize_provider_credit_timestamp(seed.get("granted_at"))
+        expires_at = probes._normalize_provider_credit_timestamp(seed.get("expires_at"))
+        if granted_at is None:
+            continue
+        reset_type = str(seed.get("reset_type") or "codex_rate_limits").strip()
+        credit_identity = probes.derive_provider_credit_identity(
+            account_hash=account_hash,
+            credit_family=DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+            granted_at=granted_at,
+            expires_at=expires_at,
+            reset_type=reset_type,
+            provider_credit_id=None,
+        )
+        if credit_identity in visible_identities:
+            continue
+        if visible_credit_windows:
+            if any(
+                _codex_reset_credit_seed_matches_visible_window(
+                    granted_at=granted_at,
+                    expires_at=expires_at,
+                    visible_granted_at=visible_granted_at,
+                    visible_expires_at=visible_expires_at,
+                )
+                for visible_granted_at, visible_expires_at in visible_credit_windows
+            ):
+                continue
+        status = "expired" if expires_at is not None and observed_at > expires_at else "used"
+        raw_provider_fields = {
+            "seed": {
+                "granted_at": granted_at.isoformat().replace("+00:00", "Z"),
+                "expires_at": (
+                    expires_at.isoformat().replace("+00:00", "Z")
+                    if expires_at is not None
+                    else None
+                ),
+                "reset_type": reset_type,
+                "operator_annotation": seed.get("operator_annotation"),
+                "source_url": seed.get("source_url"),
+            }
+        }
+        evidence = _codex_reset_credit_poll_evidence(
+            config,
+            poll_url=poll_url,
+            status_code=status_code,
+            attempt_count=attempt_count,
+            retry_count=retry_count,
+            account_id=True,
+            detail_endpoint=True,
+            visible_credit_count=len(visible_identities),
+        )
+        evidence.update(
+            {
+                "seed_backfill": True,
+                "lifecycle_inference": status,
+                "lifecycle_reason": (
+                    "seed_credit_absent_before_expiry"
+                    if status == "used"
+                    else "seed_credit_past_expiry"
+                ),
+            }
+        )
+        rows.append(
+            probes.apply_provider_credit_seed_metadata(
+                {
+                    "observed_at": observed_at,
+                    "environment": config.environment,
+                    "provider": "openai",
+                    "account_hash": account_hash,
+                    "credit_family": DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY,
+                    "credit_type": DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE,
+                    "credit_identity": credit_identity,
+                    "available_count": 0,
+                    "granted_at": granted_at,
+                    "expires_at": expires_at,
+                    "status": status,
+                    "redeem_started_at": None,
+                    "redeemed_at": None,
+                    "operator_annotation": seed.get("operator_annotation"),
+                    "source_url": seed.get("source_url"),
+                    "raw_provider_fields": raw_provider_fields,
+                    "evidence": evidence,
+                    "source": DEFAULT_CODEX_RESET_CREDIT_SOURCE,
+                }
+            )
+        )
+    return rows
+
+
+def _codex_reset_credit_seed_matches_visible_window(
+    *,
+    granted_at: Optional[datetime],
+    expires_at: Optional[datetime],
+    visible_granted_at: Optional[datetime],
+    visible_expires_at: Optional[datetime],
+) -> bool:
+    if granted_at is None or visible_granted_at is None:
+        return False
+    if abs((granted_at - visible_granted_at).total_seconds()) > 120:
+        return False
+    if expires_at is None or visible_expires_at is None:
+        return True
+    return abs((expires_at - visible_expires_at).total_seconds()) <= 120
 
 
 def _codex_reset_credit_retryable_http_error(
@@ -2814,13 +3358,14 @@ def _fetch_codex_reset_credit_payload(
     last_status_code: Optional[int] = None
     last_error_hint: Optional[str] = None
     last_error_message = "Codex reset-credit poll failed."
+    poll_url = _resolve_codex_reset_credit_poll_url(config)
 
     while attempt_count < max_attempts:
         attempt_count += 1
         try:
             auth_context = _load_codex_reset_credit_auth_context(config.codex_auth_file)
             request = urllib_request.Request(
-                config.codex_usage_url,
+                poll_url,
                 headers=_build_codex_reset_credit_request_headers(auth_context),
                 method="GET",
             )
@@ -2865,7 +3410,7 @@ def _fetch_codex_reset_credit_payload(
             last_status_code = None
             last_error_hint = None
             last_error_message = (
-                "Codex reset-credit poll failed while contacting the usage endpoint."
+                "Codex reset-credit poll failed while contacting the reset-credit detail endpoint."
             )
             if attempt_count < max_attempts and _codex_reset_credit_retryable_url_error(exc):
                 retry_count += 1
@@ -2887,14 +3432,14 @@ def _fetch_codex_reset_credit_payload(
             payload = json.loads(response_body)
         except json.JSONDecodeError as exc:
             raise CodexResetCreditPollError(
-                "Codex usage endpoint returned invalid JSON.",
+                "Codex reset-credit endpoint returned invalid JSON.",
                 status_code=int(status_code),
                 attempt_count=attempt_count,
                 retry_count=retry_count,
             ) from exc
         if not isinstance(payload, dict):
             raise CodexResetCreditPollError(
-                "Codex usage endpoint returned a non-object payload.",
+                "Codex reset-credit endpoint returned a non-object payload.",
                 status_code=int(status_code),
                 attempt_count=attempt_count,
                 retry_count=retry_count,
@@ -2905,6 +3450,7 @@ def _fetch_codex_reset_credit_payload(
             "auth_context": auth_context,
             "attempt_count": attempt_count,
             "retry_count": retry_count,
+            "poll_url": poll_url,
         }
 
     raise CodexResetCreditPollError(
@@ -2924,8 +3470,10 @@ def _persist_codex_reset_credit_observation(
     status_code: int,
     attempt_count: int,
     retry_count: int,
+    poll_url: Optional[str] = None,
 ) -> tuple[int, int]:
-    observation = _build_codex_reset_credit_observation(
+    resolved_poll_url = poll_url or _resolve_codex_reset_credit_poll_url(config)
+    observations = _build_codex_reset_credit_observations(
         config,
         observed_at=observed_at,
         response_body=response_body,
@@ -2933,15 +3481,62 @@ def _persist_codex_reset_credit_observation(
         status_code=status_code,
         attempt_count=attempt_count,
         retry_count=retry_count,
+        poll_url=resolved_poll_url,
     )
+    account_hash = (
+        observations[0]["account_hash"]
+        if observations
+        else probes.account_identity_hash(auth_context.get("account_id"))
+    )
+    if account_hash is None:
+        raise ValueError(
+            "Codex reset-credit poll could not derive a stable hashed account identity."
+        )
+    visible_identities = {
+        str(row.get("credit_identity") or "").strip()
+        for row in observations
+        if str(row.get("credit_identity") or "").strip()
+    }
+    visible_credit_windows = {
+        (row.get("granted_at"), row.get("expires_at"))
+        for row in observations
+        if row.get("granted_at") is not None
+    }
+    seed_rows = _build_codex_reset_credit_seed_observations(
+        config,
+        observed_at=observed_at,
+        account_hash=account_hash,
+        visible_identities=visible_identities,
+        visible_credit_windows=visible_credit_windows,
+        status_code=status_code,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+        poll_url=resolved_poll_url,
+    )
+    represented_identities = visible_identities | {
+        str(row.get("credit_identity") or "").strip()
+        for row in seed_rows
+        if str(row.get("credit_identity") or "").strip()
+    }
+    lifecycle_rows = _synthesize_codex_reset_credit_lifecycle_observations(
+        config,
+        observed_at=observed_at,
+        account_hash=account_hash,
+        visible_identities=represented_identities,
+        status_code=status_code,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+        poll_url=resolved_poll_url,
+    )
+    rows = observations + seed_rows + lifecycle_rows
     dsn = _resolve_dsn(config)
     inserted_count = probes.insert_provider_credit_observations(
         dsn,
-        [observation],
+        rows,
         lock_timeout_ms=config.db_lock_timeout_ms,
         statement_timeout_ms=config.db_statement_timeout_ms,
     )
-    return 1, inserted_count
+    return len(rows), inserted_count
 
 
 def _run_codex_reset_credit_poll_task(
@@ -2968,7 +3563,8 @@ def _run_codex_reset_credit_poll_task(
         "auth_file": config.codex_auth_file,
         "resolved_auth_file": config.codex_auth_file,
         "auth_file_source": config.codex_auth_file_source,
-        "usage_url": config.codex_usage_url,
+        "usage_url": _resolve_codex_reset_credit_poll_url(config),
+        "poll_url": _resolve_codex_reset_credit_poll_url(config),
         "available_count": None,
         "inserted_count": 0,
         "status_code": None,
@@ -2994,11 +3590,12 @@ def _run_codex_reset_credit_poll_task(
                 status_code=fetched["status_code"],
                 attempt_count=summary["attempt_count"],
                 retry_count=summary["retry_count"],
+                poll_url=fetched.get("poll_url"),
             )
             summary["inserted_count"] = inserted_count
             summary["persisted"] = observation_count > 0 and inserted_count >= 0
         else:
-            _build_codex_reset_credit_observation(
+            _build_codex_reset_credit_observations(
                 config,
                 observed_at=observed_at,
                 response_body=fetched["payload"],
@@ -3006,6 +3603,8 @@ def _run_codex_reset_credit_poll_task(
                 status_code=fetched["status_code"],
                 attempt_count=summary["attempt_count"],
                 retry_count=summary["retry_count"],
+                poll_url=fetched.get("poll_url")
+                or _resolve_codex_reset_credit_poll_url(config),
             )
             summary["persisted"] = False
     except Exception as exc:

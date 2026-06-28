@@ -173,10 +173,18 @@ The same sidecar can run an explicit hourly Codex banked usage-limit reset-credi
 poll. This is telemetry-only and separate from the five-minute provider front-door
 probes, Codex OAuth refresh, and Grok billing poll. The poll reads the current
 Codex OAuth credential from `AAWM_CODEX_AUTH_FILE`, calls the native ChatGPT
-usage endpoint (default `https://chatgpt.com/backend-api/wham/usage`) with
+reset-credit **detail** endpoint (default
+`https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`) with
 `Authorization: Bearer <token>` and `ChatGPT-Account-Id` when the auth file
 includes an account id, and persists sanitized rows to
 `public.provider_credit_observations` (not `public.rate_limit_observations`).
+
+`AAWM_CODEX_USAGE_URL` remains the backward-compatible env name for the poll URL.
+If it is still set to the legacy aggregate URL (`/backend-api/wham/usage`), the
+sidecar maps it to the detail endpoint automatically. The aggregate `/wham/usage`
+response and its rate-limit window reset fields are **not** credit expiry; only
+per-credit `expires_at` from the detail `credits[]` entries (or explicit
+credit-level fields) define banked credit expiry.
 
 Relevant environment variables:
 
@@ -184,26 +192,40 @@ Relevant environment variables:
 - `AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS`: minimum seconds between poll
   attempts (default `3600`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS`: HTTP timeout.
-- `AAWM_CODEX_USAGE_URL`: usage endpoint URL.
+- `AAWM_CODEX_USAGE_URL`: poll URL (defaults to rate-limit-reset-credits).
 - `AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS`: max attempts per scheduled run.
 - `AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS`: retry backoff base.
 
-The parser reads `rate_limit_reset_credits.available_count` from the native
-snake_case JSON. Tests may use camelCase `rateLimitResetCredits.availableCount`;
-production polling expects snake_case. `expires_at` is stored only when a
-credit-specific expiry field is present on the payload; rate-limit window reset
-times are not treated as credit expiry.
+The detail parser reads `credits[]` with `status`, `reset_type`, `granted_at`,
+`expires_at`, `redeem_started_at`, and `redeemed_at` when present. Each visible
+credit becomes one observation row with stable `credit_identity` (provider `id`
+when present, otherwise a derived hash from account, family, grant/expiry, and
+reset type). Normalized columns include `granted_at`, `expires_at`, `status`,
+`redeem_started_at`, `redeemed_at`, `operator_annotation`, and `source_url`.
+`available_count` is `1` per available credit row (aggregate available count in
+poll events is the number of visible available credits). Seed/backfill metadata
+in the recorder applies operator annotations and source URLs for known historical
+credits and emits absent historical credits as `used` or `expired` rows without
+storing secrets or raw account ids.
+
+Lifecycle: credits still returned by the detail endpoint keep provider-derived
+status (typically `available`) until `expires_at`; a visible or stored
+`available` credit past `expires_at` without provider redemption timestamps is
+inferred as `expired`. A previously stored `available` credit that no longer
+appears before `expires_at` is inferred as `used`. Provider `redeemed_at` /
+`redeem_started_at` are preferred when present.
 
 Account identity is hashed (stable short SHA-256 prefix) before storage. Rows
-omit `client` and `client_version`. Unchanged hourly polls that match the latest
-row for the same environment, provider, account hash, credit family, and source
-insert zero rows.
+omit `client` and `client_version`. Inserts dedupe on the latest row per
+`credit_identity` when status, counts, timestamps, and annotations are unchanged.
 
 Each due attempt emits `codex_reset_credit_poll` with sanitized fields such as
 `attempted`, `persisted`, `status_code`, `attempt_count`, `retry_count`,
-`available_count`, `inserted_count`, `error_class`, and `error_message`. Events
-must not contain access tokens, refresh tokens, raw auth headers, account ids, or
-emails.
+`available_count`, `inserted_count`, `poll_url`, `error_class`, and
+`error_message`. Events must not contain access tokens, refresh tokens, raw auth
+headers, account ids, or emails.
+
+The detail endpoint is undocumented and provider-owned; shape may change without notice.
 
 
 ## Observability Anomaly Scan Task
