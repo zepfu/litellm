@@ -33,7 +33,7 @@ def _provider_status_row() -> dict:
         "observed_at": datetime(2026, 5, 14, 12, 0, tzinfo=timezone.utc),
         "environment": "dev",
         "provider": "control",
-        "endpoint_key": "control:google.com",
+        "endpoint_key": "api.openai.com:443",
         "probe_type": "dns",
         "success": True,
         "status_code": None,
@@ -209,8 +209,8 @@ def test_db_payload_preserves_icmp_fields() -> None:
     row = {
         "observed_at": observed_at,
         "environment": "dev",
-        "provider": "control",
-        "endpoint_key": "control:google.com",
+        "provider": "openai",
+        "endpoint_key": "api.openai.com:443",
         "probe_type": "icmp_ping",
         "success": True,
         "status_code": None,
@@ -235,7 +235,7 @@ def test_db_payload_preserves_icmp_fields() -> None:
     payload = probes._db_payload(row)
 
     assert payload[0] == observed_at
-    assert payload[2] == "control"
+    assert payload[2] == "openai"
     assert payload[4] == "icmp_ping"
     assert payload[9] == 0.0
     assert payload[11] == 34.297
@@ -254,6 +254,20 @@ def test_default_endpoints_include_xai_front_doors() -> None:
         "cli-chat-proxy.grok.com",
     ) in endpoints
     assert ("xai", "api.x.ai:443", "api.x.ai") in endpoints
+
+
+def test_default_endpoints_exclude_google_gemini_monitoring() -> None:
+    endpoints = {
+        (endpoint.provider, endpoint.endpoint_key, endpoint.host)
+        for endpoint in probes.DEFAULT_ENDPOINTS
+    }
+
+    assert not any(provider in {"gemini", "control"} for provider, _, _ in endpoints)
+    assert "generativelanguage.googleapis.com" not in {host for _, _, host in endpoints}
+    assert "cloudcode-pa.googleapis.com" not in {host for _, _, host in endpoints}
+    assert "google.com" not in {host for _, _, host in endpoints}
+    assert ("anthropic", "api.anthropic.com:443", "api.anthropic.com") in endpoints
+    assert ("openai", "api.openai.com:443", "api.openai.com") in endpoints
 
 
 def test_provider_status_schema_matches_callback_schema() -> None:
@@ -500,51 +514,6 @@ def test_resolve_grok_sidecar_auth_file_uses_grok_home_and_default(tmp_path, mon
     assert source == "GROK_HOME"
 
 
-def test_resolve_antigravity_sidecar_auth_file_prefers_aawm_override(
-    tmp_path, monkeypatch
-) -> None:
-    aawm_auth = tmp_path / "aawm-antigravity-token"
-    managed_auth = tmp_path / "managed-antigravity-token"
-    aawm_auth.write_text("{}", encoding="utf-8")
-    managed_auth.write_text("{}", encoding="utf-8")
-
-    monkeypatch.setenv("AAWM_ANTIGRAVITY_AUTH_FILE", str(aawm_auth))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_auth))
-
-    resolved_path, source = loop._resolve_antigravity_sidecar_auth_file(
-        loop.DEFAULT_ANTIGRAVITY_AUTH_FILE
-    )
-
-    assert resolved_path == str(aawm_auth)
-    assert source == "AAWM_ANTIGRAVITY_AUTH_FILE"
-
-
-def test_resolve_antigravity_sidecar_auth_file_uses_managed_litellm_env(
-    tmp_path, monkeypatch
-) -> None:
-    managed_auth = tmp_path / "managed-antigravity-token"
-    legacy_auth = tmp_path / "legacy-antigravity-token"
-    managed_auth.write_text("{}", encoding="utf-8")
-    legacy_auth.write_text("{}", encoding="utf-8")
-
-    for env_name in (
-        "AAWM_ANTIGRAVITY_AUTH_FILE",
-        "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE",
-        "LITELLM_ANTIGRAVITY_AUTH_FILE",
-        "ANTIGRAVITY_OAUTH_TOKEN_FILE",
-    ):
-        monkeypatch.delenv(env_name, raising=False)
-
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE", str(managed_auth))
-    monkeypatch.setenv("LITELLM_ANTIGRAVITY_AUTH_FILE", str(legacy_auth))
-
-    resolved_path, source = loop._resolve_antigravity_sidecar_auth_file(
-        loop.DEFAULT_ANTIGRAVITY_AUTH_FILE
-    )
-
-    assert resolved_path == str(managed_auth)
-    assert source == "LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE"
-
 
 def test_resolve_grok_billing_client_version_prefers_grok_client_version(monkeypatch) -> None:
     for env_name in (
@@ -701,9 +670,9 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     )
     assert "/home/zepfu/.grok:/home/zepfu/.grok:ro" in compose_text
     assert "/home/zepfu/.grok:/home/zepfu/.grok" in compose_text
-    assert "/home/zepfu/.gemini:/home/zepfu/.gemini:ro" in compose_text
-    assert "/home/zepfu/.gemini:/home/zepfu/.gemini" in compose_text
-    assert "/home/zepfu/.local/bin/agy:/home/zepfu/.local/bin/agy:ro" in compose_text
+    provider_status_block = compose_text.split("provider-status-observations:", 1)[1].split("\nnetworks:", 1)[0] if "provider-status-observations:" in compose_text else compose_text
+    assert "/home/zepfu/.gemini:/home/zepfu/.gemini" not in provider_status_block
+    assert "/home/zepfu/.local/bin/agy" not in provider_status_block
     assert (
         "LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}"
         in compose_text
@@ -739,22 +708,9 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}" in compose_text
-    assert (
-        "AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED=${AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED:-1}"
-        in compose_text
-    )
-    assert (
-        "AAWM_ANTIGRAVITY_AUTH_FILE=${AAWM_ANTIGRAVITY_AUTH_FILE:-/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token}"
-        in compose_text
-    )
-    assert (
-        "AAWM_ANTIGRAVITY_FORCE_REFRESH=${AAWM_ANTIGRAVITY_FORCE_REFRESH:-1}"
-        in compose_text
-    )
-    assert (
-        "AAWM_ANTIGRAVITY_CLI_PATH=${AAWM_ANTIGRAVITY_CLI_PATH:-/home/zepfu/.local/bin/agy}"
-        in compose_text
-    )
+    assert "AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED" not in provider_status_block
+    assert "AAWM_ANTIGRAVITY_AUTH_FILE" not in provider_status_block
+    assert "AAWM_ANTIGRAVITY_CLI_PATH" not in provider_status_block
     assert "- /home/zepfu/.codex:/home/zepfu/.codex" in compose_text
     for expected_codex_setting in (
         "AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}",
@@ -805,10 +761,7 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE=${AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE:-1}"
         in compose_text
     )
-    assert (
-        "COPY scripts/antigravity_oauth_refresh.py "
-        "/app/scripts/antigravity_oauth_refresh.py"
-    ) in dockerfile_text
+    assert "antigravity_oauth_refresh.py" not in dockerfile_text
     assert (
         "COPY scripts/codex_oauth_refresh.py "
         "/app/scripts/codex_oauth_refresh.py"
@@ -883,7 +836,7 @@ def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
     rows = [
         {
             "provider": "control",
-            "endpoint_key": "control:google.com",
+            "endpoint_key": "api.openai.com:443",
             "probe_type": "dns",
             "success": True,
         },
@@ -1190,7 +1143,7 @@ def test_run_cycle_omits_failure_summaries_for_green_cycle(monkeypatch) -> None:
     rows = [
         {
             "provider": "control",
-            "endpoint_key": "control:google.com",
+            "endpoint_key": "api.openai.com:443",
             "probe_type": "dns",
             "success": True,
         }
@@ -2607,6 +2560,11 @@ def test_collect_observability_anomalies_runs_read_only_queries(monkeypatch) -> 
             "examples": [{"row_id": 123}],
         }
     ]
+    assert (
+        "LEFT(COALESCE(inbound_model_alias, ''), 5) = 'aawm-'"
+        in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
+    )
+    assert "LIKE 'aawm-%'" not in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
     assert fake_conn.rollback_count == 0
     assert fake_conn.cursor_instance.execute_calls[:3] == [
         (
@@ -3615,148 +3573,6 @@ def test_run_due_sidecar_tasks_persists_xai_oauth_auth_observation_when_apply_en
     assert captured["config"] is config
     assert captured["event"]["scope"] == config.xai_oauth_scope
 
-
-def _antigravity_auth_persist_config(**overrides):
-    from dataclasses import replace
-
-    config = _grok_oidc_auth_persist_config(
-        grok_oidc_refresh_enabled=False,
-        antigravity_oauth_refresh_enabled=True,
-        antigravity_auth_file=(
-            "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token"
-        ),
-        antigravity_auth_file_source="default",
-        antigravity_lock_file=(
-            "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token.lock"
-        ),
-        antigravity_refresh_interval_seconds=3600.0,
-        antigravity_refresh_buffer_seconds=300,
-        antigravity_force_refresh=False,
-        antigravity_http_timeout_seconds=30.0,
-        antigravity_cli_timeout_seconds=30.0,
-        antigravity_cli_path="/home/zepfu/.local/bin/agy",
-    )
-    if overrides:
-        config = replace(config, **overrides)
-    return config
-
-
-def _antigravity_refresh_sidecar_event(**overrides) -> dict:
-    event = {
-        "event": "antigravity_oauth_refresh",
-        "observed_at": "2026-06-19T12:00:00Z",
-        "environment": "dev",
-        "attempted": True,
-        "refreshed": True,
-        "skipped": False,
-        "auth_file": "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token",
-        "expires_at": "2026-06-19T13:00:00Z",
-        "refresh_method": "direct",
-        "error_class": None,
-        "error_message": None,
-    }
-    event.update(overrides)
-    return event
-
-
-def test_build_antigravity_auth_observation_maps_successful_refresh() -> None:
-    config = _antigravity_auth_persist_config()
-    event = _antigravity_refresh_sidecar_event()
-
-    observation = loop._build_antigravity_auth_observation(config, event)
-
-    assert observation["observed_at"] == datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
-    assert observation["environment"] == "dev"
-    assert observation["provider"] == "antigravity"
-    assert observation["auth_family"] == "antigravity_oauth"
-    assert observation["credential_scope"] is None
-    assert observation["auth_file_hash"] == hashlib.sha256(
-        event["auth_file"].encode("utf-8")
-    ).hexdigest()
-    assert observation["status"] == "refreshed"
-    assert observation["attempted"] is True
-    assert observation["refreshed"] is True
-    assert observation["skipped"] is False
-    assert observation["expires_at"] == datetime(2026, 6, 19, 13, 0, tzinfo=timezone.utc)
-    assert observation["last_success_at"] == observation["observed_at"]
-    assert observation["source_task"] == "antigravity_oauth_refresh"
-    assert observation["metadata"]["refresh_method"] == "direct"
-    observation_json = json.dumps(observation, default=str)
-    assert "refresh_token" not in observation_json
-    assert "access_token" not in observation_json
-    assert "/home/zepfu/.gemini" not in observation_json
-
-
-def test_build_antigravity_auth_observation_sanitizes_refresh_failure() -> None:
-    config = _antigravity_auth_persist_config()
-    event = _antigravity_refresh_sidecar_event(
-        refreshed=False,
-        skipped=False,
-        expires_at=None,
-        error_class="ValueError",
-        error_message=(
-            "token refresh failed with refresh_token=super-secret "
-            "and Authorization=Bearer leaked-token"
-        ),
-    )
-
-    observation = loop._build_antigravity_auth_observation(config, event)
-
-    assert observation["status"] == "failed"
-    assert observation["last_success_at"] is None
-    assert observation["error_class"] == "ValueError"
-    assert "REDACTED" in observation["error_message"]
-    assert "super-secret" not in json.dumps(observation, default=str)
-    assert "leaked-token" not in json.dumps(observation, default=str)
-
-
-def test_run_due_sidecar_tasks_persists_antigravity_auth_observation_when_apply_enabled(
-    monkeypatch,
-) -> None:
-    config = _antigravity_auth_persist_config(
-        antigravity_force_refresh=True,
-        antigravity_refresh_interval_seconds=3600.0,
-    )
-    captured = {}
-
-    monkeypatch.setattr(
-        loop.antigravity_oauth_refresh,
-        "refresh_antigravity_oauth_token_file",
-        lambda *_args, **_kwargs: {
-            "attempted": True,
-            "refreshed": True,
-            "skipped": False,
-            "auth_file": config.antigravity_auth_file,
-            "expires_at": "2026-06-19T13:00:00Z",
-            "refresh_method": "direct",
-            "error_class": None,
-            "error_message": None,
-        },
-    )
-
-    def fake_persist(cfg, event):
-        captured["config"] = cfg
-        captured["event"] = event
-        return True, 1, None, None
-
-    monkeypatch.setattr(loop, "_persist_antigravity_auth_observation", fake_persist)
-
-    events = loop.run_due_sidecar_tasks(
-        config,
-        loop.SidecarTaskState(),
-        now_monotonic=100.0,
-    )
-
-    refresh_events = [
-        event for event in events if event.get("event") == "antigravity_oauth_refresh"
-    ]
-    assert len(refresh_events) == 1
-    assert captured["config"] is config
-    assert captured["event"]["refreshed"] is True
-    assert refresh_events[0]["auth_observation_status"] == "refreshed"
-    assert refresh_events[0]["auth_observation_persisted"] is True
-    assert refresh_events[0]["auth_observation_inserted_count"] == 1
-    assert "access-token" not in json.dumps(refresh_events)
 
 
 def test_run_due_sidecar_tasks_persists_grok_oidc_auth_observation_when_apply_enabled(
