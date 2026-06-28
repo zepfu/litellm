@@ -11100,6 +11100,68 @@ def test_session_history_spool_drainer_flushes_and_removes_records(
     assert aawm_agent_identity._session_history_spool_paths() == []
 
 
+def test_session_history_spool_drainer_skips_disappeared_records_without_quarantine(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    record = {"litellm_call_id": "call-spool-disappeared"}
+    warning_mock = MagicMock()
+    exception_mock = MagicMock()
+    flush_mock = MagicMock(return_value=True)
+    bad_record_mock = MagicMock()
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_flush_session_history_batch",
+        flush_mock,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_session_history_spool_bad_record",
+        bad_record_mock,
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+
+    path = aawm_agent_identity._spool_session_history_records(
+        [record],
+        reason="test disappeared",
+        start_drainer=False,
+    )
+
+    def disappearing_loader(load_path: str):
+        Path(load_path).unlink()
+        raise FileNotFoundError(2, "No such file or directory", load_path)
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_load_session_history_spool_records",
+        disappearing_loader,
+    )
+
+    aawm_agent_identity._session_history_spool_drainer_main()
+
+    flush_mock.assert_not_called()
+    bad_record_mock.assert_not_called()
+    exception_mock.assert_not_called()
+    assert not Path(f"{path}.bad").exists()
+    assert aawm_agent_identity._session_history_spool_paths() == []
+    assert any(
+        "skipped missing session_history spool record during replay" in call.args[0]
+        for call in warning_mock.call_args_list
+    )
+
+
 def test_aawm_agent_identity_bootstraps_existing_spool_drainer_once(monkeypatch) -> None:
     starts = []
 

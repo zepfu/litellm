@@ -3304,6 +3304,15 @@ def _load_session_history_spool_record(path: str) -> Dict[str, Any]:
 
 
 def _session_history_spool_bad_record(path: str, exc: Exception) -> None:
+    if isinstance(exc, FileNotFoundError):
+        verbose_logger.warning(
+            "AawmAgentIdentity: skipped missing session_history spool record "
+            "during replay (path=%s): %s",
+            path,
+            _format_exception_for_warning(exc),
+        )
+        return
+
     bad_path = f"{path}.bad"
     try:
         os.replace(path, bad_path)
@@ -3352,6 +3361,13 @@ def _session_history_spool_drainer_main() -> None:
                 try:
                     batch.extend(_load_session_history_spool_records(path))
                     kept_paths.append(path)
+                except FileNotFoundError as exc:
+                    verbose_logger.warning(
+                        "AawmAgentIdentity: skipped missing session_history "
+                        "spool record during replay (path=%s): %s",
+                        path,
+                        _format_exception_for_warning(exc),
+                    )
                 except Exception as exc:
                     _session_history_spool_bad_record(path, exc)
 

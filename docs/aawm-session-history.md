@@ -147,7 +147,10 @@ not as implicit data-loss signals.
   `retry_spool_removed=true` when the write-ahead file is deleted.
 - **Durable spool replay:** After retry budget exhaustion, batches move to the
   durable JSONL spool directory for the in-process drainer (`spool_replay_*`
-  telemetry). That is replay protection, not loss.
+  telemetry). That is replay protection, not loss. If a spool artifact
+  disappears between listing and load because another recovery path already
+  removed it, the drainer skips that stale path instead of quarantining it as a
+  bad record.
 - **True at-risk / error cases:** ERROR or `exception` logs with
   `at_risk_of_loss=true` indicate spool creation failed, deferred flush from a
   running loop could not spool, or retry exhaustion could not write any
