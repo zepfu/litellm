@@ -98,9 +98,6 @@ DEFAULT_ENDPOINTS: tuple[Endpoint, ...] = (
     Endpoint("xai", "cli-chat-proxy.grok.com:443", "cli-chat-proxy.grok.com"),
     Endpoint("xai", "api.x.ai:443", "api.x.ai"),
     Endpoint("nvidia_nim", "integrate.api.nvidia.com:443", "integrate.api.nvidia.com"),
-    Endpoint("gemini", "generativelanguage.googleapis.com:443", "generativelanguage.googleapis.com"),
-    Endpoint("gemini", "cloudcode-pa.googleapis.com:443", "cloudcode-pa.googleapis.com"),
-    Endpoint("control", "control:google.com", "google.com"),
 )
 
 
