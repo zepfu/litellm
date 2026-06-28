@@ -87,7 +87,7 @@ services:
       # OpenCode Zen auth for native OpenCode and Codex/Claude adapter testing
       - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
       # Gemini and Antigravity OAuth tokens for adapter testing. LiteLLM reads
-      # only; provider-status-observations owns scheduled Antigravity refresh writes.
+      # only; provider-status-observations does not monitor or refresh them.
       - /home/zepfu/.gemini:/home/zepfu/.gemini:ro
       # Grok CLI OAuth tokens for native Grok OIDC passthrough. LiteLLM reads only;
       # provider-status-observations owns scheduled refresh writes.
@@ -200,14 +200,10 @@ services:
       - ./.analysis:/app/.analysis
       # The provider-status sidecar is the scheduled writer for Grok OIDC.
       - /home/zepfu/.grok:/home/zepfu/.grok
-      # The provider-status sidecar is the scheduled writer for Antigravity OAuth.
-      - /home/zepfu/.gemini:/home/zepfu/.gemini
       # The provider-status sidecar is the scheduled writer for Codex OAuth.
       - /home/zepfu/.codex:/home/zepfu/.codex
       # The provider-status sidecar is the scheduled writer for managed xAI OAuth.
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
-      # Antigravity CLI binary for OAuth client extraction and fallback refresh.
-      - /home/zepfu/.local/bin/agy:/home/zepfu/.local/bin/agy:ro
     environment:
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}
@@ -253,15 +249,6 @@ services:
       - AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=${AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS:-300}
       - AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}
       - AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS:-30}
-      - AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED=${AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED:-1}
-      - AAWM_ANTIGRAVITY_AUTH_FILE=${AAWM_ANTIGRAVITY_AUTH_FILE:-/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token}
-      - AAWM_ANTIGRAVITY_LOCK_FILE=${AAWM_ANTIGRAVITY_LOCK_FILE:-/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token.lock}
-      - AAWM_ANTIGRAVITY_REFRESH_INTERVAL_SECONDS=${AAWM_ANTIGRAVITY_REFRESH_INTERVAL_SECONDS:-3600}
-      - AAWM_ANTIGRAVITY_REFRESH_BUFFER_SECONDS=${AAWM_ANTIGRAVITY_REFRESH_BUFFER_SECONDS:-300}
-      - AAWM_ANTIGRAVITY_FORCE_REFRESH=${AAWM_ANTIGRAVITY_FORCE_REFRESH:-1}
-      - AAWM_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS=${AAWM_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS:-30}
-      - AAWM_ANTIGRAVITY_CLI_TIMEOUT_SECONDS=${AAWM_ANTIGRAVITY_CLI_TIMEOUT_SECONDS:-30}
-      - AAWM_ANTIGRAVITY_CLI_PATH=${AAWM_ANTIGRAVITY_CLI_PATH:-/home/zepfu/.local/bin/agy}
       - AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}
       - AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}
       - AAWM_CODEX_LOCK_FILE=${AAWM_CODEX_LOCK_FILE:-/home/zepfu/.codex/auth.json.lock}

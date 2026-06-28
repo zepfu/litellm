@@ -388,7 +388,9 @@ or otherwise mutate the Grok CLI credential during model requests.
 The provider-status sidecar is the scheduled writer. It mounts
 `/home/zepfu/.grok` writable, takes a file lock, refreshes the credential on the
 configured cadence, and writes the updated JSON atomically with file mode
-`0600`. The atomic write preserves existing file ownership/private mode unless
+`0600`. Scheduled endpoint probes cover Anthropic, OpenAI, OpenRouter, xAI, and
+NVIDIA NIM front doors only; Google/Gemini control-plane hosts are outside
+provider-status monitoring. The atomic write preserves existing file ownership/private mode unless
 `AAWM_GROK_OIDC_AUTH_FILE_UID`, `AAWM_GROK_OIDC_AUTH_FILE_GID`, or
 `AAWM_GROK_OIDC_AUTH_FILE_MODE` are set; group/other-readable or writable modes
 are clamped back to `0600`. Dev compose sets those ownership
@@ -446,16 +448,15 @@ auth-file path.
 
 ## Antigravity OAuth Credentials
 
-Antigravity Code Assist routes use sidecar-managed OAuth token data. In prod,
-LiteLLM should be configured with
-`LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` for the provider-status sidecar's
-refreshed token copy and `LITELLM_ANTIGRAVITY_SEED_AUTH_FILE` for the
+Antigravity Code Assist routes use OAuth token files on the host. In prod,
+LiteLLM should be configured with `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` for
+the refreshed token copy and `LITELLM_ANTIGRAVITY_SEED_AUTH_FILE` for the
 read-only Antigravity CLI login seed, normally
 `/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`. LiteLLM is a
 read-only consumer of those files. During request handling it loads the first
 valid candidate token and never attempts a direct OAuth refresh or invokes
 `agy`. If all candidate tokens are expired or invalid, LiteLLM fails the
-Antigravity candidate with a clear sidecar-refresh message.
+Antigravity candidate with a clear refresh-required message.
 
 For AAWM auto-agent aliases, stale or missing Antigravity token data is treated
 as provider-auth degradation during candidate selection. The selector records the
@@ -465,26 +466,12 @@ continues to the next declared candidate. This expected degraded state logs a
 bounded warning without traceback; unexpected Antigravity lane-resolution
 exceptions still emit traceback-bearing error logs for intake.
 
-The provider-status sidecar is the scheduled Antigravity writer. It mounts the
-managed token directory writable, locks the configured token file, attempts
-direct OAuth refresh using configured/token/CLI-extracted client values, and
-falls back to `agy models` for Antigravity CLI silent refresh when the direct
-client pair is rejected. It also needs access to the seed Antigravity CLI
-directory and `agy` binary when CLI fallback is expected. In dev compose the
-sidecar runs with `AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED=1`,
-`AAWM_ANTIGRAVITY_AUTH_FILE=/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`,
-and a one-hour refresh interval; prod may instead point
-`AAWM_ANTIGRAVITY_AUTH_FILE` at the managed auth copy while LiteLLM also has
-`LITELLM_ANTIGRAVITY_SEED_AUTH_FILE` for read-only fallback.
-
-Each Antigravity refresh attempt writes sanitized provider-auth telemetry into
-the same `provider_auth_observations` table and `provider_auth_current` view
-used by Grok OIDC. Rows use provider `antigravity`, auth family
-`antigravity_oauth`, source task `antigravity_oauth_refresh`, the auth-file
-identity hash, attempted/refreshed/skipped flags, expiry, last successful
-validation time, and redacted failure class/message. Rows must never include
-access tokens, refresh tokens, raw auth-file contents, or the raw auth-file
-path.
+The provider-status sidecar does not schedule Antigravity OAuth refresh, persist
+Antigravity auth telemetry, or probe Google/Gemini front-door endpoints.
+Antigravity token maintenance remains outside provider-status ownership (for
+example `scripts/antigravity_oauth_refresh.py` for manual or non-sidecar use).
+Historical `provider_auth_observations` rows for Antigravity may still exist in
+the database.
 
 ## Codex OAuth Credentials
 
