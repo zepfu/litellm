@@ -7,11 +7,38 @@ import inspect
 MAX_CLEANUP_FAILURE_LOGS = 3
 
 
+async def _close_cached_client_entry(handler, label: str, _safe_close) -> int:
+    """Close one cache entry or retained evicted client-like value."""
+    from litellm.llms.custom_httpx.aiohttp_handler import BaseLLMAIOHTTPHandler
+
+    if isinstance(handler, BaseLLMAIOHTTPHandler) and hasattr(handler, "close"):
+        await _safe_close(handler.close, f"{label} BaseLLMAIOHTTPHandler.close")
+        return 1
+    elif hasattr(handler, "client"):
+        client = handler.client
+        if hasattr(client, "_transport") and hasattr(client._transport, "aclose"):
+            await _safe_close(
+                client._transport.aclose,
+                f"{label} client._transport.aclose",
+            )
+        if hasattr(client, "aclose"):
+            await _safe_close(client.aclose, f"{label} client.aclose")
+        return 1
+    elif hasattr(handler, "aclose"):
+        await _safe_close(handler.aclose, f"{label} generic.aclose")
+        return 1
+    elif hasattr(handler, "close"):
+        await _safe_close(handler.close, f"{label} generic.close")
+        return 1
+    return 0
+
+
 async def close_litellm_async_clients():
     """
     Close all cached async HTTP clients to prevent resource leaks.
 
-    This function iterates through all cached clients in litellm's in-memory cache
+    This function iterates through all cached clients in litellm's in-memory cache,
+    closes any retained evicted client-like entries held by ``LLMClientCache``,
     and closes any aiohttp client sessions that are still open. Also closes the
     global base_llm_aiohttp_handler instance (issue #12443).
     """
@@ -56,25 +83,22 @@ async def close_litellm_async_clients():
             )
 
     for key, handler in cache_dict.items():
-        if (
-            isinstance(handler, BaseLLMAIOHTTPHandler)
-            and hasattr(handler, "close")
-        ):
-            await _safe_close(handler.close, f"cache[{key}] BaseLLMAIOHTTPHandler.close")
-            close_count += 1
-        elif hasattr(handler, "client"):
-            client = handler.client
-            if hasattr(client, "_transport") and hasattr(client._transport, "aclose"):
-                await _safe_close(
-                    client._transport.aclose,
-                    f"cache[{key}] client._transport.aclose",
-                )
-            if hasattr(client, "aclose"):
-                await _safe_close(client.aclose, f"cache[{key}] client.aclose")
-            close_count += 1
-        elif hasattr(handler, "aclose"):
-            await _safe_close(handler.aclose, f"cache[{key}] generic.aclose")
-            close_count += 1
+        close_count += await _close_cached_client_entry(
+            handler,
+            f"cache[{key}]",
+            _safe_close,
+        )
+
+    client_cache = getattr(litellm, "in_memory_llm_clients_cache", None)
+    retained = getattr(client_cache, "_evicted_clients_retained", None)
+    if retained:
+        for index, handler in enumerate(list(retained)):
+            close_count += await _close_cached_client_entry(
+                handler,
+                f"retained_evicted[{index}]",
+                _safe_close,
+            )
+        retained.clear()
 
     if hasattr(litellm, "base_llm_aiohttp_handler"):
         base_handler = getattr(litellm, "base_llm_aiohttp_handler", None)
