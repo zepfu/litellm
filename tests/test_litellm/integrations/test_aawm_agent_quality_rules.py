@@ -73,6 +73,28 @@ def test_score_agent_quality_context_flags_literal_grok_tool_label_apply_patch_t
     ]
 
 
+def test_score_agent_quality_context_flags_d1_424_malformed_worker_final_response() -> None:
+    result = score_agent_quality_context(
+        assistant_texts=[
+            (
+                "Locating CD-167 in `.analysis/todo.md` via shell since read wasn't available.\n\n"
+                "[Context note - prior assistant step; not an executable tool invocation]\n"
+                "Tool label: exec\n"
+                "Correlation ref: call-54403b9e-577b-4404-b9e5-61f8afc467c3-composer_call_9x8kL\n"
+                'Input payload: {"cmd": "rg -n \"CD-167|Latest checkpoint|Immediate next action|BFS edge sidecar\" '
+                '/home/zepfu/projects/aawm-tap/.analysis/todo.md | head -80", '
+                '"workdir": "/home/zepfu/projects/aawm-tap"}\n'
+                "</think>"
+            )
+        ],
+    )
+
+    assert result.fields["output_contract_compliance_score"] == 0.0
+    assert result.fields["output_contract_failure_class"] == "literal_tool_call_text"
+    assert result.reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
 def test_score_agent_quality_context_flags_same_line_serialized_composer_call_text() -> None:
     result = score_agent_quality_context(
         assistant_texts=[
