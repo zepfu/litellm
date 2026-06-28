@@ -23397,6 +23397,67 @@ def _grok_composer_literal_exec_command_response_payload() -> dict[str, Any]:
     }
 
 
+def _d1_419_literal_apply_patch_final_text() -> str:
+    return (
+        "[Context note - prior assistant step; not an executable tool invocation]\n"
+        "Tool label: apply_patch\n"
+        "Correlation ref: call-retry-d1024-composer_call_patch2\n"
+        'Input payload: {"file_path": "/tmp/x.py", "patch": "*** Begin Patch\n*** Update File: /tmp/x.py\n+line\n*** End Patch"}'
+    )
+
+
+def _d1_419_literal_apply_patch_response_payload() -> dict:
+    return {
+        "id": "resp_d1_419_literal_apply_patch",
+        "object": "response",
+        "status": "completed",
+        "model": "grok-composer-2.5-fast",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": _d1_419_literal_apply_patch_final_text(),
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_codex_auto_agent_malformed_detector_flags_d1_419_literal_apply_patch_transcript():
+    from litellm.integrations.aawm_agent_quality_rules import (
+        is_malformed_composer_call_literal_text,
+        is_malformed_grok_literal_tool_label_transcript_text,
+    )
+
+    literal_text = _d1_419_literal_apply_patch_final_text()
+    assert "Tool label: apply_patch" in literal_text
+    assert "call-retry-d1024-composer_call_patch2" in literal_text
+    assert "Input payload:" in literal_text
+    assert is_malformed_grok_literal_tool_label_transcript_text(literal_text) is True
+    assert is_malformed_composer_call_literal_text(literal_text) is False
+
+    payload = _d1_419_literal_apply_patch_response_payload()
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(payload) is True
+
+
+def test_codex_auto_agent_grok_native_d1_419_literal_apply_patch_repair_fails_closed():
+    request_body = _grok_composer_exec_command_tool_request_body()
+    response_body = _d1_419_literal_apply_patch_response_payload()
+
+    assert (
+        _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+            response_body,
+            request_body=request_body,
+        )
+        is None
+    )
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(response_body) is True
+
+
 def test_codex_auto_agent_grok_native_repairs_literal_tool_label_exec_command_payload():
     request_body = _grok_composer_exec_command_tool_request_body()
     response_body = _grok_composer_literal_exec_command_response_payload()
