@@ -23427,6 +23427,43 @@ def _d1_419_literal_apply_patch_response_payload() -> dict:
     }
 
 
+def _d1_424_literal_exec_final_text() -> str:
+    return (
+        "Locating CD-167 in `.analysis/todo.md` via shell since read wasn't "
+        "available.\n\n"
+        "[Context note - prior assistant step; not an executable tool invocation]\n"
+        "Tool label: exec\n"
+        "Correlation ref: call-54403b9e-577b-4404-b9e5-61f8afc467c3-"
+        "composer_call_9x8kL\n"
+        'Input payload: {"cmd": "rg -n \\"CD-167|Latest checkpoint|Immediate '
+        'next action|BFS edge sidecar\\" '
+        '/home/zepfu/projects/aawm-tap/.analysis/todo.md | head -80", '
+        '"workdir": "/home/zepfu/projects/aawm-tap"}\n'
+        "</think>"
+    )
+
+
+def _d1_424_literal_exec_response_payload() -> dict:
+    return {
+        "id": "resp_d1_424_literal_exec",
+        "object": "response",
+        "status": "completed",
+        "model": "grok-composer-2.5-fast",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": _d1_424_literal_exec_final_text(),
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def test_codex_auto_agent_malformed_detector_flags_d1_419_literal_apply_patch_transcript():
     from litellm.integrations.aawm_agent_quality_rules import (
         is_malformed_composer_call_literal_text,
@@ -23441,6 +23478,22 @@ def test_codex_auto_agent_malformed_detector_flags_d1_419_literal_apply_patch_tr
     assert is_malformed_composer_call_literal_text(literal_text) is False
 
     payload = _d1_419_literal_apply_patch_response_payload()
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(payload) is True
+
+
+def test_codex_auto_agent_malformed_detector_flags_d1_424_literal_exec_transcript():
+    from litellm.integrations.aawm_agent_quality_rules import (
+        is_malformed_grok_literal_tool_label_transcript_text,
+    )
+
+    literal_text = _d1_424_literal_exec_final_text()
+    assert "Tool label: exec" in literal_text
+    assert "call-54403b9e-577b-4404-b9e5-61f8afc467c3-composer_call_9x8kL" in literal_text
+    assert "Input payload:" in literal_text
+    assert "</think>" in literal_text
+    assert is_malformed_grok_literal_tool_label_transcript_text(literal_text) is True
+
+    payload = _d1_424_literal_exec_response_payload()
     assert _is_codex_auto_agent_malformed_tool_call_text_output(payload) is True
 
 
