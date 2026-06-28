@@ -1993,6 +1993,42 @@ def test_should_score_literal_composer_call_text_in_output_as_contract_failure()
     ]
 
 
+def test_should_score_d1_424_malformed_worker_final_response_as_literal_tool_call_text() -> None:
+    malformed_final_response = (
+        "Locating CD-167 in `.analysis/todo.md` via shell since read wasn't available.\n\n"
+        "[Context note - prior assistant step; not an executable tool invocation]\n"
+        "Tool label: exec\n"
+        "Correlation ref: call-54403b9e-577b-4404-b9e5-61f8afc467c3-composer_call_9x8kL\n"
+        'Input payload: {"cmd": "rg -n \"CD-167|Latest checkpoint|Immediate next action|BFS edge sidecar\" '
+        '/home/zepfu/projects/aawm-tap/.analysis/todo.md | head -80", '
+        '"workdir": "/home/zepfu/projects/aawm-tap"}\n'
+        "</think>"
+    )
+    payload = _payload(
+        [{"role": "user", "content": "Retry local bookkeeping in aawm-tap."}],
+        {
+            "role": "assistant",
+            "content": malformed_final_response,
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=120),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 0.0
+    assert evidence.output_contract_compliance_score == 0.0
+    assert evidence.output_contract_failure_class == "literal_tool_call_text"
+    assert evidence.output_contract_failure_count == 1
+    assert evidence.agent_score_reasons["output_contract_compliance"] == [
+        "literal_tool_call_text"
+    ]
+
 def test_should_score_serialized_composer_call_tool_text_as_contract_failure() -> None:
     payload = _payload(
         [{"role": "user", "content": "Run this step."}],
