@@ -864,6 +864,93 @@ class TestProxyBaseLLMRequestProcessing:
         assert "chatgpt.com/backend-api/codex/responses" not in rendered
         assert " [ROUTE] " not in rendered
 
+    def test_aawm_route_log_rollup_prefers_codex_turn_repository_over_placeholder_metadata(
+        self,
+        caplog,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        request_body = {
+            "model": "gpt-5.5",
+            "metadata": {
+                "repository": "wt-ops-xyz",
+                "client_name": "codex-tui",
+            },
+        }
+        kwargs = {"litellm_params": {"metadata": {}}}
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={
+                "user-agent": "codex-tui/0.142.4",
+                "x-codex-turn-metadata": json.dumps(
+                    {"project_path": "/home/zepfu/projects/litellm"}
+                ),
+            },
+        )
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=route_logger.name):
+                emit_aawm_route_access_log(
+                    request=request,
+                    target="https://chatgpt.com/backend-api/codex/responses",
+                    request_body=request_body,
+                    kwargs=kwargs,
+                )
+                record_aawm_route_rollup_turn(kwargs)
+                flushed = flush_aawm_route_rollups(force=True)
+        finally:
+            route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_rollups()
+
+        rendered = "\n".join(flushed)
+        assert "litellm@Codex[0.142.4] /openai_passthrough/responses" in rendered
+        assert "wt-ops-xyz@Codex" not in rendered
+
+    def test_aawm_route_log_rollup_drops_codex_placeholder_repository_without_turn_metadata(
+        self,
+        caplog,
+        monkeypatch,
+    ):
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        request_body = {
+            "model": "gpt-5.4-mini",
+            "metadata": {
+                "repository": "x",
+                "client_name": "codex-tui",
+            },
+        }
+        kwargs = {"litellm_params": {"metadata": {}}}
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={"user-agent": "codex-tui/0.142.4"},
+        )
+
+        route_logger = logging.getLogger("LiteLLM AAWM Route")
+        route_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=route_logger.name):
+                emit_aawm_route_access_log(
+                    request=request,
+                    target="https://chatgpt.com/backend-api/codex/responses",
+                    request_body=request_body,
+                    kwargs=kwargs,
+                )
+                record_aawm_route_rollup_turn(kwargs)
+                flushed = flush_aawm_route_rollups(force=True)
+        finally:
+            route_logger.removeHandler(caplog.handler)
+            clear_aawm_route_rollups()
+
+        rendered = "\n".join(flushed)
+        assert "Codex[0.142.4] /openai_passthrough/responses" in rendered
+        assert "x@Codex" not in rendered
+
     def test_aawm_route_rollup_groups_by_model_alias_without_agent_breakouts(
         self,
         caplog,

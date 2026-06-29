@@ -36,8 +36,12 @@ only falls back from repository to tenant when metadata records a trusted
 Trusted repository sources include explicit repository headers, explicit
 metadata or `litellm_metadata` keys, and current workspace context such as
 `<environment_context><cwd>...</cwd></environment_context>`,
-`AGENTS.md instructions for ...`, or workspace-directory blocks. Recursive text
-scans intentionally ignore assistant history and tool-output items such as
+`AGENTS.md instructions for ...`, or workspace-directory blocks. Codex traffic
+uses a narrower tenant fallback rule: generic `metadata.repository` remains a
+diagnostic repository label, but it is not enough to set `tenant_id` unless the
+repository came from explicit headers, current `x-codex-turn-metadata`
+`project_path`, or current workspace/cwd text. Recursive text scans
+intentionally ignore assistant history and tool-output items such as
 `function_call_output`, `custom_tool_call_output`, `tool_search_output`, and
 reasoning blocks, because those can contain stale worktree paths or fixture
 strings from earlier turns.
@@ -46,6 +50,15 @@ Rows where repository was inferred from untrusted text keep the repository label
 for diagnosis but do not promote it to `tenant_id`. These records include
 `metadata.repository_tenant_fallback_skipped=true` so downstream reporting can
 distinguish "unknown tenant" from an omitted attribution field.
+
+Stale Codex `metadata.trace_user_id` values from compact/resume history are
+diagnostic only. They may remain in `metadata.trace_user_id` for Langfuse and
+session-history inspection, but LiteLLM does not promote them to
+`session_history.tenant_id` unless the tenant came from an explicitly trusted
+current source such as tenant headers, current `x-codex-turn-metadata`
+`project_path`, or current workspace/cwd text. Rejected promotions are marked with
+`metadata.tenant_id_source=trace_user_untrusted` and
+`metadata.trace_user_tenant_fallback_skipped=true`.
 
 ## Rate Limit And Billing Observations
 
@@ -609,6 +622,11 @@ use:
 ```text
 YYYYMMDD HH:MM:SS [EARLY] repo@Client[version] /incoming
 ```
+
+Codex rollup headers prefer the current `x-codex-turn-metadata.project_path`
+repository when available. Known placeholder or fixture-like repository labels
+such as `x`, `wt`, and `wt-ops-xyz` are suppressed instead of being printed as
+the route owner.
 
 `[EARLY]` appears only when a bounded in-memory cap forces a flush before the
 interval elapses. Each rollup subline uses ` - model(alias) - Turns: N` with an
