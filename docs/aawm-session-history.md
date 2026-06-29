@@ -26,6 +26,27 @@ for reporting and grouping by requested alias.
 Historical rows written before this field existed may be `NULL` unless they were
 explicitly backfilled from prior metadata.
 
+## Repository And Tenant Attribution
+
+`session_history.repository` identifies the workspace or project label used for
+route grouping and drill-down. `session_history.tenant_id` is stricter: LiteLLM
+only falls back from repository to tenant when metadata records a trusted
+`repository_source`.
+
+Trusted repository sources include explicit repository headers, explicit
+metadata or `litellm_metadata` keys, and current workspace context such as
+`<environment_context><cwd>...</cwd></environment_context>`,
+`AGENTS.md instructions for ...`, or workspace-directory blocks. Recursive text
+scans intentionally ignore assistant history and tool-output items such as
+`function_call_output`, `custom_tool_call_output`, `tool_search_output`, and
+reasoning blocks, because those can contain stale worktree paths or fixture
+strings from earlier turns.
+
+Rows where repository was inferred from untrusted text keep the repository label
+for diagnosis but do not promote it to `tenant_id`. These records include
+`metadata.repository_tenant_fallback_skipped=true` so downstream reporting can
+distinguish "unknown tenant" from an omitted attribution field.
+
 ## Rate Limit And Billing Observations
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing
