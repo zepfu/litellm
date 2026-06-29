@@ -1,4 +1,5 @@
 import atexit
+import json
 import logging
 import os
 import threading
@@ -181,6 +182,20 @@ _AAWM_ROUTE_LOG_TENANT_REPOSITORY_FRAGMENTS = (
     "harness",
     "validation",
 )
+_AAWM_ROUTE_LOG_REPOSITORY_PLACEHOLDER_VALUES = {
+    ".analysis",
+    ".codex",
+    "agent-ok",
+    "deep",
+    "docker-compose.yml",
+    "fixture",
+    "myapp",
+    "nonexistent-worktree",
+    "two",
+    "wt",
+    "wt-ops-xyz",
+    "x",
+}
 
 
 def _get_aawm_route_log_dedup_window_seconds() -> float:
@@ -706,7 +721,9 @@ def build_aawm_route_rollup_context(
     metadata = _extract_aawm_route_log_metadata(request_body, kwargs)
     headers = dict(getattr(request, "headers", {}) or {})
     client_product_label = _get_aawm_route_log_client_product_label(metadata, headers)
-    repository = _first_aawm_route_log_value(
+    repository = _get_aawm_route_log_codex_turn_repository(
+        headers
+    ) or _first_aawm_route_log_value(
         metadata,
         keys=_AAWM_ROUTE_LOG_REPOSITORY_METADATA_KEYS,
         normalizer=_normalize_aawm_route_log_repository_label,
@@ -976,6 +993,8 @@ def _normalize_aawm_route_log_repository_label(value: Any) -> Optional[str]:
         cleaned = path_parts[-1]
 
     if _is_aawm_route_log_slug(cleaned):
+        if cleaned.lower() in _AAWM_ROUTE_LOG_REPOSITORY_PLACEHOLDER_VALUES:
+            return None
         return cleaned
     return None
 
@@ -1089,6 +1108,27 @@ def _get_case_insensitive_header_value(
         if value:
             return value
     return None
+
+
+def _get_aawm_route_log_codex_turn_repository(
+    headers: Optional[dict[str, Any]],
+) -> Optional[str]:
+    raw_value = _get_case_insensitive_header_value(
+        headers,
+        ("x-codex-turn-metadata",),
+        normalizer=_clean_aawm_route_log_field,
+    )
+    if not raw_value:
+        return None
+    try:
+        parsed_value = json.loads(raw_value)
+    except Exception:
+        return None
+    if not isinstance(parsed_value, dict):
+        return None
+    return _normalize_aawm_route_log_repository_label(
+        parsed_value.get("project_path")
+    )
 
 
 def _get_aawm_route_log_client_product_label(

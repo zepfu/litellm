@@ -4716,6 +4716,30 @@ def _extract_tenant_identity_from_kwargs(
         ("standard_logging_object", standard_logging_object),
         ("kwargs", kwargs),
     )
+    metadata_mapping = _coerce_mapping(metadata or litellm_params.get("metadata"))
+    if tenant_id and _is_codex_passthrough_tenant_extraction_context(
+        kwargs,
+        metadata=metadata_mapping,
+    ):
+        trace_user_id = _normalize_repository_identity(
+            metadata_mapping.get("trace_user_id")
+        )
+        tenant_source = _clean_non_empty_string(metadata_mapping.get("tenant_id_source"))
+        if _is_codex_trace_user_tenant_source(source) or _is_codex_trace_user_tenant_source(
+            tenant_source
+        ):
+            tenant_id, source = None, None
+        elif isinstance(source, str) and source.endswith(".trace_user_id"):
+            tenant_id, source = None, None
+        elif trace_user_id and tenant_id == trace_user_id and not _is_repository_source_trusted_for_codex_tenant(
+            metadata_mapping.get("repository_source")
+        ):
+            tenant_id, source = None, None
+        elif isinstance(source, str) and any(
+            source.endswith(marker)
+            for marker in (".tenant_id", ".aawm_tenant_id")
+        ) and trace_user_id and tenant_id == trace_user_id:
+            tenant_id, source = None, None
     if tenant_id:
         return tenant_id, source
 
@@ -13837,8 +13861,17 @@ def _is_repository_source_trusted_for_tenant(value: Any) -> bool:
     source = _clean_non_empty_string(value)
     if not source:
         return False
+    is_codex_memory_workflow = source.endswith(".codex_memory_workflow")
     if source.endswith(".codex_memory_workflow"):
         source = source[: -len(".codex_memory_workflow")]
+    if is_codex_memory_workflow and any(
+        marker in source
+        for marker in (
+            ".metadata.",
+            ".litellm_metadata.",
+        )
+    ):
+        return True
     if source == "tenant_id.request_headers":
         return True
     if source.startswith("request_headers."):
@@ -13869,6 +13902,276 @@ def _is_repository_source_trusted_for_tenant(value: Any) -> bool:
     )
 
 
+
+def _is_codex_trace_user_tenant_source(value: Any) -> bool:
+    source = _clean_non_empty_string(value)
+    if not source:
+        return False
+    normalized = source.lower()
+    return normalized.endswith(".trace_user_id") or normalized == "trace_user_id"
+
+
+def _is_codex_passthrough_tenant_extraction_context(
+    kwargs: Dict[str, Any],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    litellm_params = kwargs.get("litellm_params") or {}
+    metadata = metadata or litellm_params.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    return bool(
+        _is_native_codex_passthrough_context(metadata, headers)
+        or _is_codex_client_identity(metadata, headers)
+    )
+
+
+def _is_repository_source_trusted_for_codex_tenant(value: Any) -> bool:
+    source = _clean_non_empty_string(value)
+    if not source:
+        return False
+    is_codex_memory_workflow = source.endswith(".codex_memory_workflow")
+    if source.endswith(".codex_memory_workflow"):
+        source = source[: -len(".codex_memory_workflow")]
+    if is_codex_memory_workflow and any(
+        marker in source
+        for marker in (
+            ".metadata.",
+            ".litellm_metadata.",
+        )
+    ):
+        return True
+    if source == "tenant_id.request_headers":
+        return True
+    if source.startswith("request_headers."):
+        return True
+    if (
+        "x-codex-turn-metadata" in source
+        and source.endswith(".text.project_path")
+    ):
+        return True
+    return any(
+        source.endswith(marker)
+        for marker in (
+            ".text.environment_context.cwd",
+            ".text.cwd_tag",
+            ".text.agents_instructions",
+            ".text.workspace_directories",
+        )
+    )
+
+
+def _is_codex_session_history_record(record: Dict[str, Any]) -> bool:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    route_family = _clean_non_empty_string(
+        _first_non_none(
+            metadata.get("passthrough_route_family"),
+            metadata.get("openai_passthrough_route_family"),
+        )
+    )
+    if route_family and route_family.lower() == "codex_responses":
+        return True
+    client_name = _clean_non_empty_string(
+        _first_non_none(record.get("client_name"), metadata.get("client_name"))
+    )
+    if client_name and "codex" in client_name.lower():
+        return True
+    trace_name = _clean_non_empty_string(metadata.get("trace_name"))
+    user_agent = _clean_non_empty_string(
+        _first_non_none(
+            record.get("client_user_agent"),
+            metadata.get("client_user_agent"),
+            metadata.get("user_agent"),
+        )
+    )
+    return bool(
+        trace_name
+        and trace_name.lower() == "codex"
+        and user_agent
+        and "codex" in user_agent.lower()
+    )
+
+
+def _codex_repository_source_trusted_for_record(record: Dict[str, Any]) -> bool:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    repository_source = metadata.get("repository_source")
+    if _is_codex_session_history_record(record):
+        return _is_repository_source_trusted_for_codex_tenant(repository_source)
+    return _is_repository_source_trusted_for_tenant(repository_source)
+
+
+def _clear_untrusted_codex_trace_user_tenant_on_record(
+    record: Dict[str, Any],
+    tenant_id: str,
+) -> bool:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if not _is_codex_session_history_record(record):
+        return False
+    if not _is_codex_trace_user_tenant_source(metadata.get("tenant_id_source")):
+        trace_user_id = _normalize_repository_identity(metadata.get("trace_user_id"))
+        normalized_tenant = _normalize_tenant_identity(tenant_id)
+        if not (
+            trace_user_id
+            and normalized_tenant
+            and trace_user_id == normalized_tenant
+            and not _codex_tenant_source_trusted_for_record(record)
+        ):
+            return False
+
+    metadata = dict(metadata)
+    metadata["aawm_original_tenant_id"] = tenant_id
+    metadata.pop("tenant_id", None)
+    metadata["tenant_id_source"] = "trace_user_untrusted"
+    metadata["trace_user_tenant_fallback_skipped"] = True
+    record["tenant_id"] = None
+    record["metadata"] = metadata
+    return True
+
+
+def _mark_codex_trace_user_tenant_skipped(
+    record: Dict[str, Any],
+    original_tenant_id: Optional[str],
+) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = dict(metadata)
+    if original_tenant_id:
+        metadata.setdefault("aawm_original_tenant_id", original_tenant_id)
+    metadata.pop("tenant_id", None)
+    metadata["tenant_id_source"] = "trace_user_untrusted"
+    metadata["trace_user_tenant_fallback_skipped"] = True
+    record["tenant_id"] = None
+    record["metadata"] = metadata
+
+
+def _mark_codex_repository_tenant_skipped(
+    record: Dict[str, Any],
+    original_tenant_id: Optional[str] = None,
+) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = dict(metadata)
+    if original_tenant_id:
+        metadata["aawm_original_tenant_id"] = original_tenant_id
+    metadata.pop("tenant_id", None)
+    metadata["tenant_id_source"] = "repository_untrusted"
+    metadata["repository_tenant_fallback_skipped"] = True
+    record["tenant_id"] = None
+    record["metadata"] = metadata
+
+
+def _clear_codex_trace_user_tenant_source_on_record(record: Dict[str, Any]) -> bool:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if not (
+        _is_codex_session_history_record(record)
+        and _is_codex_trace_user_tenant_source(metadata.get("tenant_id_source"))
+    ):
+        return False
+
+    original_tenant_id = _clean_non_empty_string(
+        record.get("tenant_id")
+    ) or _clean_non_empty_string(metadata.get("tenant_id"))
+    if original_tenant_id is None:
+        original_tenant_id = _normalize_repository_identity(metadata.get("trace_user_id"))
+    _mark_codex_trace_user_tenant_skipped(record, original_tenant_id)
+    return True
+
+
+def _clear_untrusted_codex_tenant_on_record(
+    record: Dict[str, Any],
+    tenant_id: str,
+) -> bool:
+    if not _is_codex_session_history_record(record):
+        return False
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if (
+        _is_codex_trace_user_tenant_source(metadata.get("tenant_id_source"))
+        or (
+            _normalize_repository_identity(metadata.get("trace_user_id")) == tenant_id
+            and not _codex_tenant_source_trusted_for_record(record)
+        )
+    ):
+        _mark_codex_trace_user_tenant_skipped(record, tenant_id)
+        return True
+    if _clear_untrusted_codex_trace_user_tenant_on_record(record, tenant_id):
+        return True
+    if _clear_untrusted_codex_repository_tenant_on_record(record, tenant_id):
+        return True
+    if not _codex_tenant_source_trusted_for_record(record):
+        _mark_codex_repository_tenant_skipped(record, tenant_id)
+        return True
+    return False
+
+
+def _codex_tenant_source_trusted_for_record(record: Dict[str, Any]) -> bool:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    tenant_source = metadata.get("tenant_id_source")
+    if _is_codex_trace_user_tenant_source(tenant_source):
+        return False
+    if tenant_source == "repository":
+        return _codex_repository_source_trusted_for_record(record)
+    if tenant_source in {
+        "request_headers",
+        "harness_tenant_repository",
+        "agent_context_text",
+    }:
+        return True
+    if isinstance(tenant_source, str) and tenant_source.startswith("request_headers."):
+        return True
+    if isinstance(tenant_source, str) and ".trace_user_id" in tenant_source:
+        return False
+    if isinstance(tenant_source, str) and any(
+        marker in tenant_source
+        for marker in (
+            ".metadata.tenant_id",
+            ".metadata.aawm_tenant_id",
+            ".litellm_metadata.tenant_id",
+            ".litellm_metadata.aawm_tenant_id",
+        )
+    ):
+        return _codex_repository_source_trusted_for_record(record)
+    return tenant_source is None
+
+
+def _clear_untrusted_codex_repository_tenant_on_record(
+    record: Dict[str, Any],
+    tenant_id: str,
+) -> bool:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if not (
+        _is_codex_session_history_record(record)
+        and metadata.get("tenant_id_source") == "repository"
+        and not _codex_repository_source_trusted_for_record(record)
+    ):
+        return False
+
+    metadata = dict(metadata)
+    metadata["aawm_original_tenant_id"] = tenant_id
+    metadata.pop("tenant_id", None)
+    metadata["tenant_id_source"] = "repository_untrusted"
+    metadata["repository_tenant_fallback_skipped"] = True
+    record["tenant_id"] = None
+    record["metadata"] = metadata
+    return True
+
+
 def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
     repository = _normalize_repository_identity(record.get("repository"))
     metadata = record.get("metadata")
@@ -13895,6 +14198,9 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
 
 
 def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
+    if _clear_codex_trace_user_tenant_source_on_record(record):
+        return
+
     raw_tenant_id = record.get("tenant_id")
     if _is_harness_tenant_identity(raw_tenant_id):
         metadata = record.get("metadata")
@@ -13924,6 +14230,8 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
 
     tenant_id = _normalize_tenant_identity(record.get("tenant_id"))
     if tenant_id:
+        if _clear_untrusted_codex_tenant_on_record(record, tenant_id):
+            return
         record["tenant_id"] = tenant_id
         return
 
@@ -13935,13 +14243,8 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
-    repository_source = metadata.get("repository_source")
-    if not _is_repository_source_trusted_for_tenant(repository_source):
-        record["tenant_id"] = None
-        metadata = dict(metadata)
-        metadata["tenant_id_source"] = "repository_untrusted"
-        metadata["repository_tenant_fallback_skipped"] = True
-        record["metadata"] = metadata
+    if not _codex_repository_source_trusted_for_record(record):
+        _mark_codex_repository_tenant_skipped(record)
         return
 
     record["tenant_id"] = repository
@@ -14127,7 +14430,12 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:  # no
         metadata["tenant_id"] = tenant_id
     else:
         metadata.pop("tenant_id", None)
-        metadata.pop("tenant_id_source", None)
+        if metadata.get("trace_user_tenant_fallback_skipped") is True:
+            metadata.setdefault("tenant_id_source", "trace_user_untrusted")
+        elif metadata.get("repository_tenant_fallback_skipped") is True:
+            metadata.setdefault("tenant_id_source", "repository_untrusted")
+        else:
+            metadata.pop("tenant_id_source", None)
 
     if _is_numeric_identity_placeholder(metadata.get("trace_user_id")):
         metadata.pop("trace_user_id", None)
