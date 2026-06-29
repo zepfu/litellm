@@ -2303,6 +2303,95 @@ def test_build_session_history_record_does_not_trust_inferred_metadata_repositor
     assert "tenant_id" not in record["metadata"]
 
 
+def test_build_session_history_record_does_not_promote_codex_metadata_repository_to_tenant() -> None:
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-generic-metadata-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-generic-metadata-repository",
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "client_user_agent": "codex-tui/0.142.4",
+            "repository": "aawm-tap",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-generic-metadata-repository",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-29T21:18:00Z",
+        end_time="2026-06-29T21:18:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "aawm-tap"
+    assert record["tenant_id"] is None
+    assert record["metadata"]["repository"] == "aawm-tap"
+    assert record["metadata"]["repository_source"] == "litellm_params.metadata.repository"
+    assert record["metadata"]["repository_tenant_fallback_skipped"] is True
+    assert record["metadata"]["tenant_id_source"] == "repository_untrusted"
+    assert "tenant_id" not in record["metadata"]
+
+
+def test_build_session_history_record_rejects_stale_codex_trace_user_tenant() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-stale-trace-user-tenant"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-stale-trace-user-tenant",
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "client_user_agent": "codex-tui/0.142.4",
+            "trace_user_id": "aawm-tap",
+            "tenant_id": "aawm-tap",
+            "tenant_id_source": "litellm_params.metadata.trace_user_id",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "langfuse_trace_user_id": "aawm-tap",
+            "user-agent": "codex-tui/0.142.4",
+        }
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-stale-trace-user-tenant",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-29T21:18:00Z",
+        end_time="2026-06-29T21:18:01Z",
+    )
+
+    assert record is not None
+    assert record["tenant_id"] is None
+    assert record["metadata"]["trace_user_id"] == "aawm-tap"
+    assert record["metadata"]["tenant_id_source"] == "trace_user_untrusted"
+    assert record["metadata"]["trace_user_tenant_fallback_skipped"] is True
+    assert "tenant_id" not in record["metadata"]
+
+
 def test_build_session_history_record_prefers_codex_turn_metadata_over_stale_repository() -> None:
     kwargs = _base_kwargs(trace_name="orchestrator")
     kwargs["model"] = "gpt-5.5"
