@@ -1261,10 +1261,23 @@ def test_normalize_repository_identity_accepts_repo_shapes(
         "rollout-2026-05-21T19-34-36-019e4ce4-136c-78f2-bf86-0e3f7a0d95db.json (memory)",
         "agent-ac357ffbc895e51d4",
         "agent-abc",
+        "agent-ok",
+        "deep",
+        "docker-compose.yml",
+        "fixture",
+        "myapp",
+        "nonexistent-worktree",
         "orchestrator",
         "wave8-engineer",
         "path",
         "project",
+        "two",
+        "wt",
+        "wt-ops-xyz",
+        "wt-ops-xyz (memory)",
+        "x",
+        ".analysis",
+        ".codex",
     ],
 )
 def test_normalize_repository_identity_rejects_metadata_noise(
@@ -1792,6 +1805,7 @@ def test_build_session_history_record_uses_repository_as_tenant_fallback() -> No
     assert record["metadata"]["repository"] == "zepfu/litellm"
     assert record["metadata"]["tenant_id"] == "zepfu/litellm"
     assert record["metadata"]["tenant_id_source"] == "repository"
+    assert record["metadata"]["repository_source"] == "request_headers.x-aawm-repository"
 
 
 def test_build_session_history_record_rejects_numeric_identity_placeholders() -> None:
@@ -2104,6 +2118,9 @@ def test_build_session_history_record_infers_repository_from_codex_workspace_tex
     assert record["tenant_id"] == "aawm"
     assert record["metadata"]["repository"] == "aawm"
     assert record["metadata"]["tenant_id"] == "aawm"
+    assert record["metadata"]["repository_source"].endswith(
+        ".text.environment_context.cwd"
+    )
 
 
 def test_build_session_history_record_stops_cwd_at_rollout_fragment() -> None:
@@ -2147,8 +2164,189 @@ def test_build_session_history_record_stops_cwd_at_rollout_fragment() -> None:
 
     assert record is not None
     assert record["repository"] == "aawm-tap"
-    assert record["tenant_id"] == "aawm-tap"
+    assert record["tenant_id"] is None
     assert record["metadata"]["repository"] == "aawm-tap"
+    assert record["metadata"]["repository_tenant_fallback_skipped"] is True
+
+
+def test_build_session_history_record_ignores_codex_tool_output_worktree_repository() -> None:
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-tool-output-worktree-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-tool-output-worktree-repository",
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "client_user_agent": "codex-tui/0.142.4",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": (
+                    "created /home/user/projects/repo/.claude/worktrees/agent-ok"
+                ),
+            },
+            {"type": "message", "role": "user", "content": "continue"},
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-tool-output-worktree-repository",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-29T20:19:00Z",
+        end_time="2026-06-29T20:19:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert "repository" not in record["metadata"]
+    assert "tenant_id" not in record["metadata"]
+
+
+def test_build_session_history_record_ignores_assistant_compaction_repository_text() -> None:
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-assistant-compaction-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-assistant-compaction-repository",
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "client_user_agent": "codex-tui/0.142.4",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": (
+                    "Earlier context claimed cwd=/home/zepfu/projects/wt-ops-xyz"
+                ),
+            },
+            {"type": "message", "role": "user", "content": "continue"},
+        ],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-assistant-compaction-repository",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-29T20:15:00Z",
+        end_time="2026-06-29T20:15:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert "repository" not in record["metadata"]
+    assert "tenant_id" not in record["metadata"]
+
+
+def test_build_session_history_record_does_not_trust_inferred_metadata_repository() -> None:
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-inferred-metadata-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-inferred-metadata-repository",
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "client_user_agent": "codex-tui/0.142.4",
+            "repository": "wt-ops-xyz",
+            "repository_source": (
+                "passthrough_logging_payload.request_body.input[0].content."
+                "text.cwd_assignment"
+            ),
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-inferred-metadata-repository",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-29T20:48:00Z",
+        end_time="2026-06-29T20:48:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert "repository" not in record["metadata"]
+    assert "tenant_id" not in record["metadata"]
+
+
+def test_build_session_history_record_prefers_codex_turn_metadata_over_stale_repository() -> None:
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-turn-metadata-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-turn-metadata-repository",
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "client_user_agent": "codex-tui/0.142.4",
+            "repository": "wt-ops-xyz",
+        }
+    )
+    kwargs["standard_logging_object"]["metadata"] = {
+        "requester_custom_headers": {
+            "x-codex-turn-metadata": json.dumps(
+                {"project_path": "/home/zepfu/projects/aawm-hook"}
+            )
+        }
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-turn-metadata-repository",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-29T20:51:00Z",
+        end_time="2026-06-29T20:51:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "aawm-hook"
+    assert record["tenant_id"] == "aawm-hook"
+    assert "x-codex-turn-metadata" in record["metadata"]["repository_source"]
+    assert record["metadata"]["repository_source"].endswith(".text.project_path")
+    assert record["metadata"]["tenant_id_source"] == "repository"
 
 
 def test_build_session_history_record_prefers_current_codex_cwd_over_stale_context() -> None:

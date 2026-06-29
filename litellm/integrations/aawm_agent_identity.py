@@ -2297,6 +2297,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "agent_id",
     "agent_id_source",
     "tenant_id_source",
+    "repository_source",
     "workload_type",
     "workload_subtype",
     "source_repository",
@@ -2768,6 +2769,14 @@ _AAWM_REPOSITORY_TEXT_PATTERNS = (
     ),
     re.compile(r"(?P<path>/home/zepfu/projects/[^,\s`'\"<)]+)"),
 )
+_AAWM_REPOSITORY_TEXT_PATTERN_SOURCES = (
+    "text.environment_context.cwd",
+    "text.cwd_tag",
+    "text.agents_instructions",
+    "text.cwd_assignment",
+    "text.workspace_directories",
+    "text.project_path",
+)
 _AAWM_REPOSITORY_TEXT_MARKERS = (
     "<environment_context",
     "<cwd>",
@@ -2776,11 +2785,28 @@ _AAWM_REPOSITORY_TEXT_MARKERS = (
     "cwd",
     "workspace directories",
 )
+_AAWM_REPOSITORY_UNTRUSTED_TEXT_ITEM_TYPES = {
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "function_call",
+    "function_call_output",
+    "reasoning",
+    "tool_search_call",
+    "tool_search_output",
+}
 _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
     "...",
     "0",
+    ".analysis",
+    ".codex",
+    "agent-ok",
+    "deep",
+    "docker-compose.yml",
+    "fixture",
     "memories",
+    "myapp",
     "new",
+    "nonexistent-worktree",
     "none",
     "null",
     "path",
@@ -2788,7 +2814,11 @@ _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
     "remote",
     "repo",
     "repository",
+    "two",
     "unknown",
+    "wt",
+    "wt-ops-xyz",
+    "x",
 }
 _AAWM_REPOSITORY_AGENT_ROLE_VALUES = {
     "agent",
@@ -5026,17 +5056,87 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
     return cleaned
 
 
-def _extract_repository_identity_from_text(value: str) -> Optional[str]:
+def _extract_repository_identity_from_text_with_source(
+    value: str,
+) -> Tuple[Optional[str], Optional[str]]:
     normalized_value = value.lower()
     if not any(marker in normalized_value for marker in _AAWM_REPOSITORY_TEXT_MARKERS):
-        return None
-    for pattern in _AAWM_REPOSITORY_TEXT_PATTERNS:
+        return None, None
+    for index, pattern in enumerate(_AAWM_REPOSITORY_TEXT_PATTERNS):
         matches = list(pattern.finditer(value))
         for match in reversed(matches):
             repository = _normalize_repository_identity(match.group("path"))
             if repository:
-                return repository
-    return None
+                source = (
+                    _AAWM_REPOSITORY_TEXT_PATTERN_SOURCES[index]
+                    if index < len(_AAWM_REPOSITORY_TEXT_PATTERN_SOURCES)
+                    else "text"
+                )
+                return repository, source
+    return None, None
+
+
+def _extract_repository_identity_from_text(value: str) -> Optional[str]:
+    repository, _source = _extract_repository_identity_from_text_with_source(value)
+    return repository
+
+
+def _repository_text_scan_blocked_by_mapping(value: Dict[str, Any]) -> bool:
+    item_type = _clean_non_empty_string(value.get("type"))
+    if item_type and item_type.lower() in _AAWM_REPOSITORY_UNTRUSTED_TEXT_ITEM_TYPES:
+        return True
+    role = _clean_non_empty_string(value.get("role"))
+    return bool(role and role.lower() == "assistant")
+
+
+def _extract_repository_identity_from_value_with_source(
+    value: Any,
+    *,
+    source_prefix: str,
+    _seen: Optional[set[int]] = None,
+    _depth: int = 0,
+) -> Tuple[Optional[str], Optional[str]]:
+    if _depth > 12:
+        return None, None
+    if isinstance(value, (dict, list)):
+        if _seen is None:
+            _seen = set()
+        value_id = id(value)
+        if value_id in _seen:
+            return None, None
+        _seen.add(value_id)
+    if isinstance(value, str):
+        repository, source = _extract_repository_identity_from_text_with_source(value)
+        if repository:
+            return repository, f"{source_prefix}.{source}" if source else source_prefix
+        return None, None
+    if isinstance(value, dict):
+        if _repository_text_scan_blocked_by_mapping(value):
+            return None, None
+        for key, child in list(value.items()):
+            if key in _AAWM_REPOSITORY_METADATA_KEYS:
+                repository = _normalize_repository_identity(child)
+                if repository:
+                    return repository, f"{source_prefix}.{key}"
+            repository, source = _extract_repository_identity_from_value_with_source(
+                child,
+                source_prefix=f"{source_prefix}.{key}",
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
+            if repository:
+                return repository, source
+    if isinstance(value, list):
+        for index, child in reversed(list(enumerate(value))):
+            repository, source = _extract_repository_identity_from_value_with_source(
+                child,
+                source_prefix=f"{source_prefix}[{index}]",
+                _seen=_seen,
+                _depth=_depth + 1,
+            )
+            if repository:
+                return repository, source
+    return None, None
 
 
 def _extract_repository_identity_from_value(
@@ -5045,53 +5145,31 @@ def _extract_repository_identity_from_value(
     _seen: Optional[set[int]] = None,
     _depth: int = 0,
 ) -> Optional[str]:
-    if _depth > 12:
-        return None
-    if isinstance(value, (dict, list)):
-        if _seen is None:
-            _seen = set()
-        value_id = id(value)
-        if value_id in _seen:
-            return None
-        _seen.add(value_id)
-    if isinstance(value, str):
-        return _extract_repository_identity_from_text(value)
-    if isinstance(value, dict):
-        for key, child in list(value.items()):
-            if key in _AAWM_REPOSITORY_METADATA_KEYS:
-                repository = _normalize_repository_identity(child)
-                if repository:
-                    return repository
-            repository = _extract_repository_identity_from_value(
-                child,
-                _seen=_seen,
-                _depth=_depth + 1,
-            )
-            if repository:
-                return repository
-    if isinstance(value, list):
-        for child in reversed(value):
-            repository = _extract_repository_identity_from_value(
-                child,
-                _seen=_seen,
-                _depth=_depth + 1,
-            )
-            if repository:
-                return repository
-    return None
+    repository, _source = _extract_repository_identity_from_value_with_source(
+        value,
+        source_prefix="value",
+        _seen=_seen,
+        _depth=_depth,
+    )
+    return repository
 
 
-def _extract_repository_identity_from_metadata_sources(
+def _extract_repository_identity_from_metadata_sources_with_source(
     *sources: Tuple[str, Any],
-) -> Optional[str]:
-    for _source_name, raw_source in sources:
+) -> Tuple[Optional[str], Optional[str]]:
+    for source_name, raw_source in sources:
         source = _coerce_mapping(raw_source)
         if not source:
             continue
         for key in _AAWM_REPOSITORY_METADATA_KEYS:
             repository = _normalize_repository_identity(source.get(key))
             if repository:
-                return repository
+                source_detail = (
+                    _clean_non_empty_string(source.get("repository_source"))
+                    if key == "repository"
+                    else None
+                )
+                return repository, source_detail or f"{source_name}.{key}"
 
         for nested_key in (
             "metadata",
@@ -5105,23 +5183,47 @@ def _extract_repository_identity_from_metadata_sources(
             for key in _AAWM_REPOSITORY_METADATA_KEYS:
                 repository = _normalize_repository_identity(nested_source.get(key))
                 if repository:
-                    return repository
+                    source_detail = (
+                        _clean_non_empty_string(nested_source.get("repository_source"))
+                        if key == "repository"
+                        else None
+                    )
+                    return (
+                        repository,
+                        source_detail or f"{source_name}.{nested_key}.{key}",
+                    )
 
-        repository = _extract_repository_identity_from_value(source)
+        repository, source_detail = _extract_repository_identity_from_value_with_source(
+            source,
+            source_prefix=source_name,
+        )
         if repository:
-            return repository
+            return repository, source_detail
 
-    return None
+    return None, None
 
 
-def _extract_repository_identity_from_kwargs(
+def _extract_repository_identity_from_metadata_sources(
+    *sources: Tuple[str, Any],
+) -> Optional[str]:
+    repository, _source = _extract_repository_identity_from_metadata_sources_with_source(
+        *sources
+    )
+    return repository
+
+
+def _extract_repository_identity_from_kwargs_with_source(
     kwargs: Dict[str, Any],
     *,
     metadata: Optional[Dict[str, Any]] = None,
     standard_logging_object: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
+) -> Tuple[Optional[str], Optional[str]]:
     litellm_params = kwargs.get("litellm_params") or {}
     standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
+    standard_metadata = _coerce_mapping(standard_logging_object.get("metadata"))
+    requester_custom_headers = _coerce_mapping(
+        standard_metadata.get("requester_custom_headers")
+    )
     passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
     proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
     proxy_body = _coerce_mapping(proxy_request.get("body"))
@@ -5133,25 +5235,29 @@ def _extract_repository_identity_from_kwargs(
             _get_header_value(headers, header_name)
         )
         if repository:
-            return repository
+            return repository, f"request_headers.{header_name}"
 
-    repository = _extract_repository_identity_from_metadata_sources(
+    repository, source = _extract_repository_identity_from_metadata_sources_with_source(
+        (
+            "standard_logging_object.metadata.requester_custom_headers.x-codex-turn-metadata",
+            requester_custom_headers.get("x-codex-turn-metadata"),
+        ),
         ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
         ("litellm_params.litellm_metadata", litellm_params.get("litellm_metadata")),
-        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
+        ("standard_logging_object.metadata", standard_metadata),
         ("kwargs.metadata", kwargs.get("metadata")),
-        ("litellm_params.proxy_server_request.body", proxy_body),
         ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
         ("litellm_params.proxy_server_request.body.litellm_metadata", proxy_body.get("litellm_metadata")),
-        ("passthrough_logging_payload", passthrough_payload),
-        ("passthrough_logging_payload.request_body", passthrough_body),
+        ("litellm_params.proxy_server_request.body", proxy_body),
         ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
         ("passthrough_logging_payload.request_body.litellm_metadata", passthrough_body.get("litellm_metadata")),
+        ("passthrough_logging_payload.request_body", passthrough_body),
+        ("passthrough_logging_payload", passthrough_payload),
         ("standard_logging_object", standard_logging_object),
         ("kwargs", kwargs),
     )
     if repository:
-        return repository
+        return repository, source
 
     repository, _source = _extract_claude_trace_user_identity_from_metadata_sources(
         ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
@@ -5168,9 +5274,37 @@ def _extract_repository_identity_from_kwargs(
         ("kwargs", kwargs),
     )
     if repository:
-        return repository
+        return repository, _source
 
-    return None
+    return None, None
+
+
+def _extract_repository_identity_from_kwargs(
+    kwargs: Dict[str, Any],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    standard_logging_object: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    repository, _source = _extract_repository_identity_from_kwargs_with_source(
+        kwargs,
+        metadata=metadata,
+        standard_logging_object=standard_logging_object,
+    )
+    return repository
+
+
+def _extract_repository_identity_from_langfuse_trace_observation_with_source(
+    trace: Dict[str, Any],
+    observation: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
+    return _extract_repository_identity_from_metadata_sources_with_source(
+        ("observation.metadata", metadata or observation.get("metadata")),
+        ("trace.metadata", trace_metadata),
+        ("observation", observation),
+        ("trace", trace),
+    )
 
 
 def _extract_repository_identity_from_langfuse_trace_observation(
@@ -5178,13 +5312,12 @@ def _extract_repository_identity_from_langfuse_trace_observation(
     observation: Dict[str, Any],
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
-    return _extract_repository_identity_from_metadata_sources(
-        ("observation.metadata", metadata or observation.get("metadata")),
-        ("trace.metadata", trace_metadata),
-        ("observation", observation),
-        ("trace", trace),
+    repository, _source = _extract_repository_identity_from_langfuse_trace_observation_with_source(
+        trace,
+        observation,
+        metadata,
     )
+    return repository
 
 
 def _payload_contains_codex_memory_workflow_markers(value: Any) -> bool:
@@ -5816,15 +5949,20 @@ def _promote_codex_repository_trace_user_id(
         metadata.get("trace_user_id")
     )
     header_trace_user_id = _get_header_value(headers, "langfuse_trace_user_id")
-    repository = _extract_repository_identity_from_kwargs(
+    repository, repository_source = _extract_repository_identity_from_kwargs_with_source(
         kwargs,
         metadata=metadata,
     )
+    repository_before_memory_workflow = repository
     repository = _apply_codex_memory_workflow_repository(
         kwargs,
         metadata,
         repository,
     )
+    if repository and repository_source:
+        if repository != repository_before_memory_workflow:
+            repository_source = f"{repository_source}.codex_memory_workflow"
+        metadata["repository_source"] = repository_source
 
     desired_trace_user_id: Optional[str] = None
     if metadata_trace_user_id and not _is_generic_codex_trace_user_id(
@@ -5833,6 +5971,7 @@ def _promote_codex_repository_trace_user_id(
         desired_trace_user_id = metadata_trace_user_id
     elif (
         repository
+        and _is_repository_source_trusted_for_tenant(repository_source)
         and (
             metadata_trace_user_id is None
             or _is_generic_codex_trace_user_id(metadata_trace_user_id)
@@ -13694,15 +13833,55 @@ def _normalize_request_header_tenant_repository(value: Any) -> Optional[str]:
     return repository
 
 
+def _is_repository_source_trusted_for_tenant(value: Any) -> bool:
+    source = _clean_non_empty_string(value)
+    if not source:
+        return False
+    if source.endswith(".codex_memory_workflow"):
+        source = source[: -len(".codex_memory_workflow")]
+    if source == "tenant_id.request_headers":
+        return True
+    if source.startswith("request_headers."):
+        return True
+    if any(
+        marker in source
+        for marker in (
+            ".metadata.",
+            ".litellm_metadata.",
+            ".request_metadata.",
+            ".user_api_key_metadata.",
+        )
+    ):
+        return True
+    if (
+        "x-codex-turn-metadata" in source
+        and source.endswith(".text.project_path")
+    ):
+        return True
+    return any(
+        source.endswith(marker)
+        for marker in (
+            ".text.environment_context.cwd",
+            ".text.cwd_tag",
+            ".text.agents_instructions",
+            ".text.workspace_directories",
+        )
+    )
+
+
 def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
     repository = _normalize_repository_identity(record.get("repository"))
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
     if repository is None:
-        repository = _extract_repository_identity_from_metadata_sources(
+        repository, repository_source = _extract_repository_identity_from_metadata_sources_with_source(
             ("record.metadata", metadata)
         )
+        if repository is not None and repository_source:
+            metadata = dict(metadata)
+            metadata.setdefault("repository_source", repository_source)
+            record["metadata"] = metadata
     if repository is None and metadata.get("tenant_id_source") == "request_headers":
         repository = (
             _normalize_request_header_tenant_repository(record.get("tenant_id"))
@@ -13753,12 +13932,20 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
         record["tenant_id"] = None
         return
 
-    record["tenant_id"] = repository
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
-    else:
+    repository_source = metadata.get("repository_source")
+    if not _is_repository_source_trusted_for_tenant(repository_source):
+        record["tenant_id"] = None
         metadata = dict(metadata)
+        metadata["tenant_id_source"] = "repository_untrusted"
+        metadata["repository_tenant_fallback_skipped"] = True
+        record["metadata"] = metadata
+        return
+
+    record["tenant_id"] = repository
+    metadata = dict(metadata)
     metadata["tenant_id"] = repository
     metadata["tenant_id_source"] = "repository"
     record["metadata"] = metadata
@@ -16522,13 +16709,15 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         metadata["tenant_id_source"] = tenant_source
     elif tenant_id:
         metadata["tenant_id_source"] = "agent_context_text"
-    repository = _extract_repository_identity_from_langfuse_trace_observation(
+    repository, repository_source = _extract_repository_identity_from_langfuse_trace_observation_with_source(
         trace,
         observation,
         metadata,
     )
     if repository:
         metadata["repository"] = repository
+        if repository_source:
+            metadata["repository_source"] = repository_source
     agent_id, agent_id_source = _extract_agent_id_from_langfuse_trace_observation(
         trace,
         observation,
@@ -17571,11 +17760,12 @@ def _build_session_history_record(  # noqa: PLR0915
         metadata["tenant_id_source"] = tenant_source
     elif tenant_id:
         metadata["tenant_id_source"] = "agent_context_text"
-    repository = _extract_repository_identity_from_kwargs(
+    repository, repository_source = _extract_repository_identity_from_kwargs_with_source(
         kwargs,
         metadata=metadata,
         standard_logging_object=standard_logging_object,
     )
+    repository_before_memory_workflow = repository
     repository = _apply_codex_memory_workflow_repository(
         kwargs,
         metadata,
@@ -17584,6 +17774,10 @@ def _build_session_history_record(  # noqa: PLR0915
     )
     if repository:
         metadata["repository"] = repository
+        if repository_source:
+            if repository != repository_before_memory_workflow:
+                repository_source = f"{repository_source}.codex_memory_workflow"
+            metadata["repository_source"] = repository_source
     agent_id, agent_id_source = _extract_agent_id_from_kwargs(
         kwargs,
         metadata=metadata,
