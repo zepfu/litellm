@@ -73,7 +73,11 @@ malformed when they appear in an assistant final response instead of an
 executable tool call. Individual text and payload fields are truncated to
 bounded previews; the file keeps appending by default. Operators can set
 `LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES` as an explicit safety ceiling if a
-runtime needs to stop appending after a known size.
+runtime needs to stop appending after a known size. When these literal tool-call
+blocks are in the explicit grok pattern and arguments validate against the
+advertised tool schema, LiteLLM now repairs them into executable `function_call`
+items instead of immediately logging a malformed-tool-call failure, so repaired
+rows no longer emit `aawm_auto_agent_malformed_tool_call_text`.
 
 Each event should include at least:
 

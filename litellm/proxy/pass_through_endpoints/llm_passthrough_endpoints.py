@@ -14815,6 +14815,7 @@ _GROK_COMPOSER_LITERAL_CORRELATION_REF_LINE_RE = re.compile(
 _GROK_COMPOSER_LITERAL_INPUT_PAYLOAD_LINE_RE = re.compile(
     r"(?im)^Input payload:\s*(?P<payload>.+?)\s*$"
 )
+_GROK_COMPOSER_LITERAL_TOOL_ARGUMENT_METADATA_KEYS = frozenset({"description"})
 
 
 def _parse_grok_composer_literal_tool_label_blocks(
@@ -14824,62 +14825,171 @@ def _parse_grok_composer_literal_tool_label_blocks(
         return []
 
     blocks: list[dict[str, Any]] = []
-    current_name: Optional[str] = None
-    current_call_id: Optional[str] = None
-    current_payload: Optional[str] = None
+    label_matches = list(_GROK_COMPOSER_LITERAL_TOOL_LABEL_LINE_RE.finditer(text))
+    if not label_matches:
+        return []
 
-    def _flush_current() -> None:
-        nonlocal current_name, current_call_id, current_payload
-        if current_name is None and current_payload is None:
-            return
+    for index, label_match in enumerate(label_matches):
+        block_start = label_match.start()
+        block_end = (
+            label_matches[index + 1].start()
+            if index + 1 < len(label_matches)
+            else len(text)
+        )
+        block_text = text[block_start:block_end]
+
+        current_name = label_match.group("name").strip()
+        if not current_name:
+            continue
+        correlation_match = _GROK_COMPOSER_LITERAL_CORRELATION_REF_LINE_RE.search(
+            block_text
+        )
+        payload_match = _GROK_COMPOSER_LITERAL_INPUT_PAYLOAD_LINE_RE.search(block_text)
+        if not payload_match:
+            continue
+
+        payload_source = block_text[payload_match.start("payload") :]
+        payload_leading_ws = len(payload_source) - len(payload_source.lstrip())
+        raw_payload = payload_source.strip()
+        if not raw_payload:
+            continue
+        payload_end = block_end
+        payload_source_for_parse = payload_source.lstrip()
+        payload_candidates = [
+            payload_source_for_parse,
+            _escape_unescaped_newlines_in_json_payload(payload_source_for_parse),
+        ]
+        for payload_candidate in payload_candidates:
+            try:
+                _, payload_decode_end = json.JSONDecoder().raw_decode(
+                    payload_candidate
+                )
+                payload_end = (
+                    block_start
+                    + payload_match.start("payload")
+                    + payload_leading_ws
+                    + payload_decode_end
+                )
+                trailing = payload_candidate[payload_decode_end:]
+                if trailing.strip():
+                    trailing_ws = 0
+                    has_newline = False
+                    while trailing_ws < len(trailing) and trailing[trailing_ws].isspace():
+                        if trailing[trailing_ws] in "\n\r":
+                            has_newline = True
+                        trailing_ws += 1
+                    trailing_text = trailing[trailing_ws:]
+                    if has_newline and trailing_text:
+                        try:
+                            json.JSONDecoder().raw_decode(trailing_text)
+                        except json.JSONDecodeError:
+                            raw_payload = payload_candidate[:payload_decode_end].strip()
+                break
+            except json.JSONDecodeError:
+                continue
+
         blocks.append(
             {
                 "name": current_name,
-                "call_id": current_call_id,
-                "payload": current_payload or "",
+                "call_id": (
+                    correlation_match.group("call_id").strip()
+                    if correlation_match
+                    else None
+                ),
+                "payload": raw_payload,
+                "start": block_start,
+                "end": payload_end,
             }
         )
-        current_name = None
-        current_call_id = None
-        current_payload = None
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        label_match = _GROK_COMPOSER_LITERAL_TOOL_LABEL_LINE_RE.match(line)
-        if label_match:
-            _flush_current()
-            current_name = label_match.group("name").strip()
-            continue
-        correlation_match = _GROK_COMPOSER_LITERAL_CORRELATION_REF_LINE_RE.match(line)
-        if correlation_match and current_name is not None:
-            current_call_id = correlation_match.group("call_id").strip()
-            continue
-        payload_match = _GROK_COMPOSER_LITERAL_INPUT_PAYLOAD_LINE_RE.match(line)
-        if payload_match and current_name is not None:
-            current_payload = payload_match.group("payload").strip()
-            _flush_current()
-            continue
-    _flush_current()
-
-    return [
-        block
-        for block in blocks
-        if isinstance(block.get("name"), str)
-        and block["name"].strip()
-        and isinstance(block.get("payload"), str)
-        and block["payload"].strip()
-    ]
+    return blocks
 
 
 def _parse_grok_composer_literal_tool_payload_json(payload: str) -> Any:
     if not isinstance(payload, str) or not payload.strip():
         raise ValueError("empty_tool_payload")
+
+    def _parse_single_json_value(payload_text: str) -> Any:
+        parsed_value, decode_index = json.JSONDecoder().raw_decode(payload_text)
+        if payload_text[decode_index:].strip():
+            raise ValueError("invalid_tool_payload_json")
+        return parsed_value
+
     try:
-        return json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise ValueError("invalid_tool_payload_json") from exc
+        return _parse_single_json_value(payload.strip())
+    except (json.JSONDecodeError, ValueError) as first_error:
+        escaped_payload = _escape_unescaped_newlines_in_json_payload(payload)
+        try:
+            return _parse_single_json_value(escaped_payload.strip())
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError("invalid_tool_payload_json") from first_error
+
+
+def _sanitize_grok_composer_literal_tool_arguments(
+    arguments: Any,
+    parameters: dict[str, Any],
+) -> Any:
+    if not isinstance(arguments, dict):
+        return arguments
+    if parameters.get("additionalProperties") is not False:
+        return arguments
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    sanitized = dict(arguments)
+    for key in _GROK_COMPOSER_LITERAL_TOOL_ARGUMENT_METADATA_KEYS:
+        if key not in properties:
+            sanitized.pop(key, None)
+    return sanitized
+
+
+def _escape_unescaped_newlines_in_json_payload(payload: str) -> str:
+    if not isinstance(payload, str) or not payload:
+        return payload
+
+    output_chars: list[str] = []
+    in_json_string = False
+    escape_next = False
+    for char in payload:
+        if escape_next:
+            output_chars.append(char)
+            escape_next = False
+            continue
+        if char == "\\":
+            output_chars.append(char)
+            escape_next = True
+            continue
+        if char == '"':
+            in_json_string = not in_json_string
+            output_chars.append(char)
+            continue
+        if char == "\n" and in_json_string:
+            output_chars.append("\\n")
+            continue
+        output_chars.append(char)
+    return "".join(output_chars)
+
+
+def _strip_text_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    normalized_spans = [
+        (start, end)
+        for start, end in spans
+        if isinstance(start, int) and isinstance(end, int)
+    ]
+    if not normalized_spans:
+        return text
+    segments: list[str] = []
+    cursor = 0
+    for start, end in sorted(normalized_spans, key=lambda span: span[0]):
+        if start < cursor:
+            continue
+        if start > cursor:
+            segments.append(text[cursor:start])
+        cursor = max(cursor, end)
+    segments.append(text[cursor:])
+    return "".join(segments)
 
 
 def _build_advertised_openai_function_tools_index(
@@ -15013,16 +15123,22 @@ def _repair_grok_composer_literal_tool_calls_in_text(
         return None, []
 
     repaired_items: list[dict[str, Any]] = []
+    strip_spans: list[tuple[int, int]] = []
     for block_index, block in enumerate(blocks):
         tool_name = str(block.get("name") or "").strip()
-        if tool_name not in advertised_tools:
-            continue
         try:
             parsed_arguments = _parse_grok_composer_literal_tool_payload_json(
                 str(block.get("payload") or "")
             )
         except ValueError:
             return None, []
+        strip_spans.append((int(block["start"]), int(block["end"])))
+        if tool_name not in advertised_tools:
+            continue
+        parsed_arguments = _sanitize_grok_composer_literal_tool_arguments(
+            parsed_arguments,
+            advertised_tools[tool_name],
+        )
         validation_error = _validate_tool_arguments_against_openai_parameters(
             tool_name=tool_name,
             arguments=parsed_arguments,
@@ -15045,23 +15161,9 @@ def _repair_grok_composer_literal_tool_calls_in_text(
     if not repaired_items:
         return None, []
 
-    stripped_text = text
-    for block in blocks:
-        name = str(block.get("name") or "").strip()
-        payload = str(block.get("payload") or "").strip()
-        call_id = (
-            str(block.get("call_id") or "").strip()
-            if isinstance(block.get("call_id"), str)
-            else ""
-        )
-        for pattern in (
-            rf"(?im)^Tool label:\s*{re.escape(name)}\s*$",
-            rf"(?im)^Correlation ref:\s*{re.escape(call_id)}\s*$" if call_id else None,
-            rf"(?im)^Input payload:\s*{re.escape(payload)}\s*$",
-        ):
-            if pattern is None:
-                continue
-            stripped_text = re.sub(pattern, "", stripped_text)
+    if not strip_spans:
+        return None, []
+    stripped_text = _strip_text_spans(text, strip_spans)
     stripped_text = re.sub(r"\n{3,}", "\n\n", stripped_text).strip()
     if stripped_text and is_malformed_composer_call_literal_text(stripped_text):
         return None, []
@@ -15078,6 +15180,10 @@ def _response_body_has_grok_composer_literal_tool_label_blocks(
         if not isinstance(item, dict) or item.get("type") != "message":
             continue
         content = item.get("content")
+        if isinstance(content, str):
+            if _parse_grok_composer_literal_tool_label_blocks(content):
+                return True
+            continue
         if not isinstance(content, list):
             continue
         for part in content:
@@ -15096,13 +15202,17 @@ def _repair_grok_composer_literal_tool_calls_in_message_item(
     advertised_tools: dict[str, dict[str, Any]],
 ) -> Optional[tuple[list[dict[str, Any]], bool]]:
     content = item.get("content")
-    if not isinstance(content, list):
+    if isinstance(content, str):
+        content_parts: list[Any] = [{"type": "output_text", "text": content}]
+    elif isinstance(content, list):
+        content_parts = content
+    else:
         return [item], False
 
     message_items: list[dict[str, Any]] = []
     leftover_text_parts: list[str] = []
     message_has_literal_blocks = False
-    for part in content:
+    for part in content_parts:
         if not isinstance(part, dict) or part.get("type") not in {"text", "output_text"}:
             return None if message_has_literal_blocks else ([item], False)
 
@@ -15283,6 +15393,12 @@ def _is_codex_auto_agent_malformed_tool_call_text_output(
             continue
         if item.get("type") == "message":
             content = item.get("content")
+            if isinstance(content, str):
+                if is_malformed_composer_call_literal_text(content):
+                    return True
+                if is_malformed_grok_literal_tool_label_transcript_text(content):
+                    return True
+                continue
             if not isinstance(content, list):
                 continue
             for part in content:
