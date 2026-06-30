@@ -969,6 +969,12 @@ Rows affected by this path may include:
   text uses neutral context-note wording, not `Previous tool call`, `Name`,
   `Call ID`, or `Arguments` transcript fields, so Grok Composer is not primed to
   re-emit a non-executing tool-call template as assistant output.
+- If Grok Composer still emits explicit literal tool-call blocks in assistant
+  output, LiteLLM repairs only the bounded pattern with `Tool label:`,
+  optional `Correlation ref:`, and JSON `Input payload:` fields whose arguments
+  validate against the advertised tool schema. Repaired blocks become executable
+  `function_call` output items, natural-language preface text remains assistant
+  text, and ambiguous or invalid payloads still fail closed as malformed output.
 - `anthropic_grok_native_prior_function_call_replay_dropped_count` and
   `anthropic_grok_native_prior_function_call_replay_dropped_items`: Anthropic
   Grok-native adapter requests drop prior assistant `tool_use` replay before

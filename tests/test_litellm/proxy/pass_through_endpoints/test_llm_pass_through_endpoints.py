@@ -129,6 +129,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _is_oa_xai_responses_model,
     _is_codex_google_code_assist_empty_success_model_response,
     _is_codex_auto_agent_malformed_tool_call_text_output,
+    _response_body_has_grok_composer_literal_tool_label_blocks,
     _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body,
     _validate_codex_auto_agent_responses_payload,
     _normalize_codex_google_code_assist_reasoning_effort,
@@ -23366,7 +23367,10 @@ def _grok_composer_exec_command_tool_request_body() -> dict[str, Any]:
                 "name": "exec_command",
                 "parameters": {
                     "type": "object",
-                    "properties": {"cmd": {"type": "string"}},
+                    "properties": {
+                        "cmd": {"type": "string"},
+                        "workdir": {"type": "string"},
+                    },
                     "required": ["cmd"],
                     "additionalProperties": False,
                 },
@@ -23441,6 +23445,43 @@ def _d1_424_literal_exec_final_text() -> str:
         '"workdir": "/home/zepfu/projects/aawm-tap"}\n'
         "</think>"
     )
+
+
+def _d1_439_literal_exec_response_payload() -> dict[str, Any]:
+    payload_block_one = """{"cmd": "python3 - <<'PY'
+from aawm_tap.domains.agent_context.keys import build_candidate_keys, build_context_key
+PY", "description": "Probe helper outputs for testable expectations", "workdir": "/home/zepfu/projects/aawm-tap"}"""
+    payload_block_two = (
+        '{"cmd": "sed -n \\"400,480p\\" '
+        '/home/zepfu/projects/pytest-testable/src/pytest_testable/plugin/items.py", '
+        '"description": "Read expected_status assertion behavior"'
+        '}'
+    )
+    return {
+        "id": "time-22-21-38-038503_chatcmpl-29ab415f-92a3-458f-91e7-a24fadc4c69e",
+        "object": "response",
+        "status": "completed",
+        "model": "grok-composer-2.5-fast",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": (
+                    "Checking candidate key counts and how `expected_status` applies to dict rejections.\n\n"
+                    "[Context note - prior assistant step; not an executable tool invocation]\n"
+                    "Tool label: exec_command\n"
+                    "Correlation ref: call-8b0b0b0b-8b95-4154-b622-a2359c41b8b5-composer_call_n9P0Z\n"
+                    f"Input payload: {payload_block_one}\n"
+                    "[Context note - prior assistant step; not an executable tool invocation]\n"
+                    "Tool label: exec_command\n"
+                    "Correlation ref: call-8b0b0b0b-8b95-4154-b622-a2359c41b8b5-composer_call_3d1u4\n"
+                    f"Input payload: {payload_block_two}\n"
+                ),
+                "function_call": None,
+                "tool_calls": None,
+            }
+        ],
+    }
 
 
 def _d1_424_literal_exec_response_payload() -> dict:
@@ -23570,6 +23611,50 @@ def test_codex_auto_agent_grok_native_repairs_advertised_tool_from_mixed_literal
     assert json.loads(function_calls[0]["arguments"]) == {"cmd": "git status -sb"}
 
 
+def test_codex_auto_agent_grok_native_repairs_d1_439_fresh_tool_label_shape():
+    request_body = _grok_composer_exec_command_tool_request_body()
+    response_body = _d1_439_literal_exec_response_payload()
+
+    assert (
+        _response_body_has_grok_composer_literal_tool_label_blocks(response_body)
+        is True
+    )
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(response_body) is True
+
+    repaired = _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+        response_body,
+        request_body=request_body,
+    )
+
+    assert repaired is not None
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(repaired) is False
+    function_calls = [
+        item
+        for item in repaired["output"]
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+    assert len(function_calls) == 2
+    assert function_calls[0]["name"] == "exec_command"
+    assert function_calls[0]["call_id"] == (
+        "call-8b0b0b0b-8b95-4154-b622-a2359c41b8b5-composer_call_n9P0Z"
+    )
+    assert "from aawm_tap.domains.agent_context.keys import build_candidate_keys" in (
+        json.loads(function_calls[0]["arguments"])["cmd"]
+    )
+    assert "description" not in json.loads(function_calls[0]["arguments"])
+    assert function_calls[1]["call_id"] == (
+        "call-8b0b0b0b-8b95-4154-b622-a2359c41b8b5-composer_call_3d1u4"
+    )
+    assert "sed -n" in json.loads(function_calls[1]["arguments"])["cmd"]
+    assert "description" not in json.loads(function_calls[1]["arguments"])
+    assert (
+        "Checking candidate key counts and how `expected_status` applies to dict rejections."
+        in json.dumps(repaired)
+    )
+    assert "Tool label:" not in json.dumps(repaired)
+    assert "Input payload:" not in json.dumps(repaired)
+
+
 @pytest.mark.parametrize(
     "literal_text",
     [
@@ -23581,6 +23666,18 @@ def test_codex_auto_agent_grok_native_repairs_advertised_tool_from_mixed_literal
         (
             "Tool label: exec_command\n"
             'Input payload: {"cmd": 123}'
+        ),
+        (
+            "Tool label: exec_command\n"
+            'Input payload: {"cmd": "pwd", "not_advertised": true}'
+        ),
+        (
+            "Tool label: exec_command\n"
+            'Input payload: {"cmd": "pwd"} trailing junk'
+        ),
+        (
+            "Tool label: exec_command\n"
+            'Input payload: {"cmd": "pwd"}{"cmd": "ls"}'
         ),
     ],
 )
