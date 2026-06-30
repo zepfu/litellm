@@ -42,6 +42,14 @@ class LLMClientCache(InMemoryCache):
     def _retain_evicted_client_if_needed(self, value: Any) -> None:
         if not self._is_client_like(value):
             return
+        try:
+            from litellm.llms.custom_httpx.aiohttp_transport import (
+                mark_litellm_aiohttp_client_retained_for_cleanup,
+            )
+
+            mark_litellm_aiohttp_client_retained_for_cleanup(value)
+        except Exception:
+            pass
         self._evicted_clients_retained.append(value)
         overflow = (
             len(self._evicted_clients_retained) - MAX_EVICTED_LLM_CLIENT_RETENTION

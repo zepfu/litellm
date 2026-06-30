@@ -23677,7 +23677,16 @@ def test_codex_auto_agent_grok_native_repairs_d1_439_fresh_tool_label_shape():
         ),
         (
             "Tool label: exec_command\n"
+            'Input payload: {"cmd": "pwd"}\n'
+            'trailing junk'
+        ),
+        (
+            "Tool label: exec_command\n"
             'Input payload: {"cmd": "pwd"}{"cmd": "ls"}'
+        ),
+        (
+            "Tool label: exec_command\n"
+            'Input payload: {"cmd": "pwd"}\n{ "cmd": "ls" }'
         ),
     ],
 )

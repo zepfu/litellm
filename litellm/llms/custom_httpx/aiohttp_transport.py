@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import inspect
 import os
+import socket
 import ssl
 import typing
 import urllib.request
@@ -54,6 +55,139 @@ try:
     AIOHTTP_EXC_MAP[aiohttp.client_exceptions.ClientPayloadError] = httpx.ReadError
 except ImportError:
     pass
+
+
+_LITELLM_AIOHTTP_SESSION_ATTR_NAME = "_litellm_aiohttp_session_attribution"
+
+
+def _safe_event_loop_id() -> Optional[int]:
+    try:
+        return id(asyncio.get_running_loop())
+    except RuntimeError:
+        return None
+
+
+def _build_litellm_aiohttp_session_attribution(
+    *,
+    owner_kind: str,
+    creation_site: str,
+    litellm_owns_session: bool,
+    session: Optional[Any] = None,
+) -> Dict[str, Any]:
+    return {
+        "owner_kind": owner_kind,
+        "creation_site": creation_site,
+        "pid": os.getpid(),
+        "container_hostname": os.getenv("HOSTNAME", socket.gethostname()),
+        "event_loop_id": _safe_event_loop_id(),
+        "session_id": id(session) if session is not None else None,
+        "litellm_owns_session": litellm_owns_session,
+    }
+
+
+def _set_litellm_aiohttp_session_attribution(
+    session: Any,
+    *,
+    owner_kind: str,
+    creation_site: str,
+    litellm_owns_session: bool,
+    overwrite: bool = False,
+) -> None:
+    if session is None:
+        return
+    if (
+        not overwrite
+        and hasattr(session, _LITELLM_AIOHTTP_SESSION_ATTR_NAME)
+    ):
+        return
+    attribution = _build_litellm_aiohttp_session_attribution(
+        owner_kind=owner_kind,
+        creation_site=creation_site,
+        litellm_owns_session=litellm_owns_session,
+        session=session,
+    )
+    try:
+        setattr(
+            session,
+            _LITELLM_AIOHTTP_SESSION_ATTR_NAME,
+            attribution,
+        )
+    except (AttributeError, TypeError):
+        return
+
+    try:
+        connector = getattr(session, "connector", None) or getattr(
+            session, "_connector", None
+        )
+    except Exception:
+        connector = None
+    if connector is None or connector is session:
+        return
+    if (
+        not overwrite
+        and hasattr(connector, _LITELLM_AIOHTTP_SESSION_ATTR_NAME)
+    ):
+        return
+    connector_attribution = dict(attribution)
+    connector_attribution["connector_id"] = id(connector)
+    try:
+        setattr(
+            connector,
+            _LITELLM_AIOHTTP_SESSION_ATTR_NAME,
+            connector_attribution,
+        )
+    except (AttributeError, TypeError):
+        return
+
+
+def get_litellm_aiohttp_session_attribution(
+    session: Any,
+) -> Optional[Dict[str, Any]]:
+    attribution = getattr(session, _LITELLM_AIOHTTP_SESSION_ATTR_NAME, None)
+    if isinstance(attribution, dict):
+        return attribution.copy()
+    return None
+
+
+def _mark_litellm_aiohttp_session_cache_retained(session: Any) -> None:
+    if not isinstance(session, ClientSession) or getattr(session, "closed", False):
+        return
+    existing_attribution = get_litellm_aiohttp_session_attribution(session) or {}
+    litellm_owns_session = existing_attribution.get("litellm_owns_session")
+    _set_litellm_aiohttp_session_attribution(
+        session,
+        owner_kind="cache_retained_evicted",
+        creation_site="LLMClientCache._retain_evicted_client_if_needed",
+        litellm_owns_session=(
+            litellm_owns_session if isinstance(litellm_owns_session, bool) else True
+        ),
+        overwrite=True,
+    )
+
+
+def mark_litellm_aiohttp_client_retained_for_cleanup(value: Any) -> None:
+    """Mark already-created LiteLLM aiohttp sessions retained after cache eviction."""
+    if value is None:
+        return
+
+    _mark_litellm_aiohttp_session_cache_retained(value)
+
+    for attr_name in ("client_session", "client"):
+        _mark_litellm_aiohttp_session_cache_retained(getattr(value, attr_name, None))
+
+    transport = getattr(value, "transport", None)
+    if transport is None:
+        client = getattr(value, "client", None)
+        transport = getattr(client, "_transport", None)
+
+    if transport is None:
+        return
+
+    _mark_litellm_aiohttp_session_cache_retained(getattr(transport, "client", None))
+    retained_sessions = getattr(transport, "_retained_replaced_sessions", None)
+    if isinstance(retained_sessions, list):
+        for session in retained_sessions:
+            _mark_litellm_aiohttp_session_cache_retained(session)
 
 
 @contextlib.contextmanager
@@ -171,9 +305,25 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
 
     def _create_replacement_client_session(self) -> ClientSession:
         if hasattr(self, "_client_factory") and callable(self._client_factory):
-            return self._client_factory()
+            session = self._client_factory()
+            _set_litellm_aiohttp_session_attribution(
+                session,
+                owner_kind="custom_httpx_transport",
+                creation_site="LiteLLMAiohttpTransport._create_replacement_client_session",
+                litellm_owns_session=self._owns_session,
+                overwrite=True,
+            )
+            return session
         self._owns_session = True
-        return ClientSession()
+        session = ClientSession()
+        _set_litellm_aiohttp_session_attribution(
+            session,
+            owner_kind="custom_httpx_transport",
+            creation_site="LiteLLMAiohttpTransport._create_replacement_client_session",
+            litellm_owns_session=self._owns_session,
+            overwrite=True,
+        )
+        return session
 
     async def _close_owned_replaced_session(self, session: Any) -> None:
         if not self._owns_session or getattr(session, "closed", False):
@@ -182,6 +332,10 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         if not callable(close):
             return
         try:
+            verbose_logger.debug(
+                "Closing replaced owned session with attribution: %s",
+                get_litellm_aiohttp_session_attribution(session),
+            )
             result = close()
             if inspect.isawaitable(result):
                 await result
@@ -193,6 +347,13 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
             return
         if getattr(session, "closed", False):
             return
+        _set_litellm_aiohttp_session_attribution(
+            session,
+            owner_kind="custom_httpx_transport",
+            creation_site="LiteLLMAiohttpTransport._retain_replaced_owned_session",
+            litellm_owns_session=self._owns_session,
+            overwrite=True,
+        )
         self._retained_replaced_sessions.append(session)
 
     def _release_or_retain_replaced_owned_session(self, session: Any) -> None:
@@ -207,16 +368,42 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 or session_loop != current_loop
                 or session_loop.is_closed()
             ):
+                _set_litellm_aiohttp_session_attribution(
+                    session,
+                    owner_kind="custom_httpx_transport",
+                    creation_site="LiteLLMAiohttpTransport._release_or_retain_replaced_owned_session",
+                    litellm_owns_session=self._owns_session,
+                )
                 self._retain_replaced_owned_session(session)
                 return
             asyncio.create_task(session.close())
         except RuntimeError:
+            _set_litellm_aiohttp_session_attribution(
+                session,
+                owner_kind="custom_httpx_transport",
+                creation_site="LiteLLMAiohttpTransport._release_or_retain_replaced_owned_session",
+                litellm_owns_session=self._owns_session,
+            )
             self._retain_replaced_owned_session(session)
         except Exception as e:
             verbose_logger.debug(f"Error scheduling old session close: {e}")
+            _set_litellm_aiohttp_session_attribution(
+                session,
+                owner_kind="custom_httpx_transport",
+                creation_site="LiteLLMAiohttpTransport._release_or_retain_replaced_owned_session",
+                litellm_owns_session=self._owns_session,
+            )
             self._retain_replaced_owned_session(session)
 
     async def _close_retained_replaced_sessions(self) -> None:
+        if self._retained_replaced_sessions:
+            verbose_logger.debug(
+                "Closing retained replaced aiohttp sessions: %s",
+                [
+                    get_litellm_aiohttp_session_attribution(session)
+                    for session in self._retained_replaced_sessions
+                ],
+            )
         retained = self._retained_replaced_sessions
         self._retained_replaced_sessions = []
         for session in retained:
@@ -232,6 +419,12 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         if self.client.closed:
             verbose_logger.debug("Session is closed, creating new session")
             old_session = self.client
+            _set_litellm_aiohttp_session_attribution(
+                old_session,
+                owner_kind="custom_httpx_transport",
+                creation_site="LiteLLMAiohttpTransport._get_valid_client_session_for_request",
+                litellm_owns_session=self._owns_session,
+            )
             await self._close_owned_replaced_session(old_session)
             self.client = self._create_replacement_client_session()
             return self.client
@@ -246,11 +439,23 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 or session_loop.is_closed()
             ):
                 old_session = self.client
+                _set_litellm_aiohttp_session_attribution(
+                    old_session,
+                    owner_kind="custom_httpx_transport",
+                    creation_site="LiteLLMAiohttpTransport._get_valid_client_session_for_request",
+                    litellm_owns_session=self._owns_session,
+                )
                 await self._close_owned_replaced_session(old_session)
                 self.client = self._create_replacement_client_session()
 
         except (RuntimeError, AttributeError):
             old_session = self.client
+            _set_litellm_aiohttp_session_attribution(
+                old_session,
+                owner_kind="custom_httpx_transport",
+                creation_site="LiteLLMAiohttpTransport._get_valid_client_session_for_request",
+                litellm_owns_session=self._owns_session,
+            )
             await self._close_owned_replaced_session(old_session)
             self.client = self._create_replacement_client_session()
 
@@ -274,6 +479,12 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         if self.client.closed:
             verbose_logger.debug("Session is closed, creating new session")
             old_session = self.client
+            _set_litellm_aiohttp_session_attribution(
+                old_session,
+                owner_kind="custom_httpx_transport",
+                creation_site="LiteLLMAiohttpTransport._get_valid_client_session",
+                litellm_owns_session=self._owns_session,
+            )
             self._release_or_retain_replaced_owned_session(old_session)
             self.client = self._create_replacement_client_session()
             return self.client
@@ -290,12 +501,24 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 or session_loop.is_closed()
             ):
                 old_session = self.client
+                _set_litellm_aiohttp_session_attribution(
+                    old_session,
+                    owner_kind="custom_httpx_transport",
+                    creation_site="LiteLLMAiohttpTransport._get_valid_client_session",
+                    litellm_owns_session=self._owns_session,
+                )
                 self._release_or_retain_replaced_owned_session(old_session)
                 self.client = self._create_replacement_client_session()
 
         except (RuntimeError, AttributeError):
             old_session = self.client if isinstance(self.client, ClientSession) else None
             if old_session is not None:
+                _set_litellm_aiohttp_session_attribution(
+                    old_session,
+                    owner_kind="custom_httpx_transport",
+                    creation_site="LiteLLMAiohttpTransport._get_valid_client_session",
+                    litellm_owns_session=self._owns_session,
+                )
                 self._release_or_retain_replaced_owned_session(old_session)
             self.client = self._create_replacement_client_session()
 
@@ -391,6 +614,12 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                     f"Session closed during request, retrying with new session: {e}"
                 )
                 # Force creation of a new session
+                _set_litellm_aiohttp_session_attribution(
+                    self.client,
+                    owner_kind="custom_httpx_transport",
+                    creation_site="LiteLLMAiohttpTransport.handle_async_request",
+                    litellm_owns_session=self._owns_session,
+                )
                 await self._close_owned_replaced_session(self.client)
                 self.client = self._create_replacement_client_session()
                 client_session = self.client

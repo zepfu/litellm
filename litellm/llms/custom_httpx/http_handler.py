@@ -836,6 +836,9 @@ class AsyncHTTPHandler:
         - False: disable SSL verification
         """
         from litellm.llms.custom_httpx.aiohttp_transport import LiteLLMAiohttpTransport
+        from litellm.llms.custom_httpx.aiohttp_transport import (
+            _set_litellm_aiohttp_session_attribution,
+        )
         from litellm.secret_managers.main import str_to_bool
 
         connector_kwargs = AsyncHTTPHandler._get_ssl_connector_kwargs(
@@ -863,6 +866,12 @@ class AsyncHTTPHandler:
 
         # Use shared session if provided and valid
         if shared_session is not None and not shared_session.closed:
+            _set_litellm_aiohttp_session_attribution(
+                shared_session,
+                owner_kind="custom_httpx",
+                creation_site="AsyncHTTPHandler._create_aiohttp_transport:shared_session",
+                litellm_owns_session=False,
+            )
             verbose_logger.debug(
                 f"SHARED SESSION: Reusing existing ClientSession (ID: {id(shared_session)})"
             )
@@ -890,11 +899,21 @@ class AsyncHTTPHandler:
                 "limit_per_host"
             ] = AIOHTTP_CONNECTOR_LIMIT_PER_HOST
 
-        return LiteLLMAiohttpTransport(
-            client=lambda: ClientSession(
+        def _owned_session_factory() -> ClientSession:
+            session = ClientSession(
                 connector=TCPConnector(**transport_connector_kwargs),
                 trust_env=trust_env,
-            ),
+            )
+            _set_litellm_aiohttp_session_attribution(
+                session,
+                owner_kind="custom_httpx",
+                creation_site="AsyncHTTPHandler._create_aiohttp_transport:owned_session_factory",
+                litellm_owns_session=True,
+            )
+            return session
+
+        return LiteLLMAiohttpTransport(
+            client=_owned_session_factory,
             ssl_verify=ssl_for_transport,
         )
 

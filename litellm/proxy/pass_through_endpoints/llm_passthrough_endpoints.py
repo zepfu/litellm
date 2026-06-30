@@ -14831,6 +14831,7 @@ def _parse_grok_composer_literal_tool_label_blocks(
 
     for index, label_match in enumerate(label_matches):
         block_start = label_match.start()
+        has_following_tool_block = index + 1 < len(label_matches)
         block_end = (
             label_matches[index + 1].start()
             if index + 1 < len(label_matches)
@@ -14879,7 +14880,7 @@ def _parse_grok_composer_literal_tool_label_blocks(
                             has_newline = True
                         trailing_ws += 1
                     trailing_text = trailing[trailing_ws:]
-                    if has_newline and trailing_text:
+                    if has_newline and trailing_text and has_following_tool_block:
                         try:
                             json.JSONDecoder().raw_decode(trailing_text)
                         except json.JSONDecodeError:

@@ -364,6 +364,16 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "langfuse_call_type",
     "langfuse_event_fit_failed",
     "langfuse_enqueue_observed_at",
+    "aiohttp_owner_kind",
+    "aiohttp_creation_site",
+    "aiohttp_litellm_owns_session",
+    "aiohttp_session_id",
+    "aiohttp_connector_id",
+    "aiohttp_event_loop_id",
+    "aiohttp_pid",
+    "aiohttp_container_hostname",
+    "aiohttp_context_keys",
+    "aiohttp_context_resource",
 )
 
 
@@ -437,6 +447,46 @@ def _build_aawm_error_log_record(
     }
 
 
+def _extract_aiohttp_attribution_from_asyncio_context(
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+
+    resource_name = "client_session"
+    resource = context.get(resource_name)
+    if resource is None:
+        resource_name = "connector"
+        resource = context.get(resource_name)
+    if resource is None:
+        return {}
+
+    try:
+        from litellm.llms.custom_httpx.aiohttp_transport import (
+            get_litellm_aiohttp_session_attribution,
+        )
+    except Exception:
+        return {}
+
+    attribution = get_litellm_aiohttp_session_attribution(resource)
+    if not isinstance(attribution, dict):
+        return {}
+
+    fields = {
+        "aiohttp_owner_kind": attribution.get("owner_kind"),
+        "aiohttp_creation_site": attribution.get("creation_site"),
+        "aiohttp_litellm_owns_session": attribution.get("litellm_owns_session"),
+        "aiohttp_session_id": attribution.get("session_id"),
+        "aiohttp_connector_id": attribution.get("connector_id"),
+        "aiohttp_event_loop_id": attribution.get("event_loop_id"),
+        "aiohttp_pid": attribution.get("pid"),
+        "aiohttp_container_hostname": attribution.get("container_hostname"),
+        "aiohttp_context_keys": sorted({str(key) for key in context.keys()}),
+        "aiohttp_context_resource": resource_name,
+    }
+    return {key: value for key, value in fields.items() if value is not None}
+
+
 class AawmErrorLogFileHandler(logging.Handler):
     """Append sanitized LiteLLM ERROR records to the local .analysis intake log."""
 
@@ -456,6 +506,12 @@ class AawmErrorLogFileHandler(logging.Handler):
         if getattr(self._emit_state, "active", False):
             return
         if record.levelno < logging.ERROR and record.exc_info is None:
+            return
+        if (
+            record.exc_info is None
+            and record.levelno >= logging.CRITICAL
+            and record.getMessage() == "LITELLM_MASTER_KEY is not set"
+        ):
             return
 
         log_path = _get_aawm_error_log_path()
@@ -1043,8 +1099,29 @@ def _setup_json_exception_handlers(formatter):
                 )
                 error_handler.handle(record)
                 aawm_error_handler.handle(record)
-            else:
+                return
+
+            aiohttp_context = _extract_aiohttp_attribution_from_asyncio_context(context)
+            if not aiohttp_context:
                 loop.default_exception_handler(context)
+                return
+
+            record = logging.LogRecord(
+                name="asyncio",
+                level=logging.ERROR,
+                pathname="",
+                lineno=0,
+                msg=str(context.get("message", "Asyncio error")),
+                args=(),
+                exc_info=None,
+            )
+            setattr(record, "source", "asyncio_exception_handler")
+            setattr(record, "failure_kind", "aiohttp_lifecycle_warning")
+            for key, value in aiohttp_context.items():
+                setattr(record, key, value)
+
+            error_handler.handle(record)
+            aawm_error_handler.handle(record)
 
         asyncio.get_event_loop().set_exception_handler(async_json_exception_handler)
     except Exception:
