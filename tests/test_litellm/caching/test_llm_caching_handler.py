@@ -192,6 +192,55 @@ async def test_remove_key_retains_evicted_client_without_closing():
 
 
 @pytest.mark.asyncio
+async def test_remove_key_marks_litellm_aiohttp_session_cache_retained():
+    from litellm.llms.custom_httpx.aiohttp_transport import (
+        get_litellm_aiohttp_session_attribution,
+    )
+    from litellm.llms.custom_httpx.async_client_cleanup import (
+        close_litellm_async_clients,
+    )
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    import litellm
+
+    cache = LLMClientCache(max_size_in_memory=2)
+    handler = AsyncHTTPHandler()
+    transport = handler.client._transport
+    session = transport._get_valid_client_session()  # type: ignore
+
+    try:
+        cache.cache_dict["test-key"] = handler
+        cache.ttl_dict["test-key"] = 0
+
+        cache._remove_key("test-key")
+        await asyncio.sleep(0.1)
+
+        assert session.closed is False
+        assert cache._evicted_clients_retained == [handler]
+        attribution = get_litellm_aiohttp_session_attribution(session)
+        assert attribution is not None
+        assert attribution["owner_kind"] == "cache_retained_evicted"
+        assert (
+            attribution["creation_site"]
+            == "LLMClientCache._retain_evicted_client_if_needed"
+        )
+        assert attribution["litellm_owns_session"] is True
+
+        with patch.object(
+            litellm,
+            "in_memory_llm_clients_cache",
+            cache,
+        ), patch.object(litellm, "base_llm_aiohttp_handler", None):
+            await close_litellm_async_clients()
+
+        assert session.closed is True
+        assert cache._evicted_clients_retained == []
+    finally:
+        if not session.closed:
+            await handler.close()
+
+
+@pytest.mark.asyncio
 async def test_close_litellm_async_clients_closes_retained_evicted_clients():
     from litellm.llms.custom_httpx.async_client_cleanup import (
         close_litellm_async_clients,

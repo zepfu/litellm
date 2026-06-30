@@ -214,6 +214,10 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         2. If running in a background thread (e.g. logging hook), use a cached session for that loop.
         """
         current_loop = asyncio.get_running_loop()
+        from litellm.llms.custom_httpx.aiohttp_transport import (
+            _set_litellm_aiohttp_session_attribution,
+            get_litellm_aiohttp_session_attribution,
+        )
 
         # Check if we are in the stored main thread
         if threading.get_ident() == self._main_thread_id:
@@ -221,6 +225,22 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
             async with self._session_lock:
                 if self._http_session is None or self._http_session.closed:
                     self._http_session = aiohttp.ClientSession()
+                    _set_litellm_aiohttp_session_attribution(
+                        self._http_session,
+                        owner_kind="presidio",
+                        creation_site="presidio._get_session_iterator:main-thread",
+                        litellm_owns_session=True,
+                    )
+                elif (
+                    get_litellm_aiohttp_session_attribution(self._http_session)
+                    is None
+                ):
+                    _set_litellm_aiohttp_session_attribution(
+                        self._http_session,
+                        owner_kind="presidio",
+                        creation_site="presidio._get_session_iterator:main-thread",
+                        litellm_owns_session=True,
+                    )
                 yield self._http_session
         else:
             # Background thread/loop -> use loop-bound session cache
@@ -231,16 +251,48 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                 or self._loop_sessions[current_loop].closed
             ):
                 self._loop_sessions[current_loop] = aiohttp.ClientSession()
+                _set_litellm_aiohttp_session_attribution(
+                    self._loop_sessions[current_loop],
+                    owner_kind="presidio",
+                    creation_site="presidio._get_session_iterator:loop-session",
+                    litellm_owns_session=True,
+                )
+            elif (
+                get_litellm_aiohttp_session_attribution(
+                    self._loop_sessions[current_loop]
+                )
+                is None
+            ):
+                _set_litellm_aiohttp_session_attribution(
+                    self._loop_sessions[current_loop],
+                    owner_kind="presidio",
+                    creation_site="presidio._get_session_iterator:loop-session",
+                    litellm_owns_session=True,
+                )
             yield self._loop_sessions[current_loop]
 
     async def _close_http_session(self) -> None:
         """Close all cached HTTP sessions."""
+        from litellm.llms.custom_httpx.aiohttp_transport import (
+            get_litellm_aiohttp_session_attribution,
+        )
         if self._http_session is not None and not self._http_session.closed:
+            verbose_proxy_logger.debug(
+                "Presidio: closing main-thread session with attribution=%s",
+                get_litellm_aiohttp_session_attribution(self._http_session),
+            )
             await self._http_session.close()
             self._http_session = None
+            verbose_proxy_logger.debug(
+                "Presidio: closed main-thread session and cleared _http_session cache"
+            )
 
         for session in self._loop_sessions.values():
             if not session.closed:
+                verbose_proxy_logger.debug(
+                    "Presidio: closing loop session with attribution=%s",
+                    get_litellm_aiohttp_session_attribution(session),
+                )
                 await session.close()
         self._loop_sessions.clear()
 

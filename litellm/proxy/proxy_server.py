@@ -815,6 +815,10 @@ async def _initialize_shared_aiohttp_session():
     """Initialize shared aiohttp session for connection reuse with connection limits."""
     try:
         from aiohttp import ClientSession, TCPConnector
+        from litellm.llms.custom_httpx.aiohttp_transport import (
+            get_litellm_aiohttp_session_attribution,
+            _set_litellm_aiohttp_session_attribution,
+        )
 
         connector_kwargs: Dict[str, Any] = {
             "keepalive_timeout": AIOHTTP_KEEPALIVE_TIMEOUT,
@@ -829,10 +833,21 @@ async def _initialize_shared_aiohttp_session():
 
         connector = TCPConnector(**connector_kwargs)
         session = ClientSession(connector=connector)
+        _set_litellm_aiohttp_session_attribution(
+            session,
+            owner_kind="proxy",
+            creation_site="proxy_server._initialize_shared_aiohttp_session",
+            litellm_owns_session=True,
+        )
+        session_attribution = get_litellm_aiohttp_session_attribution(session)
 
         verbose_proxy_logger.info(
-            f"SESSION REUSE: Created shared aiohttp session for connection pooling (ID: {id(session)}, "
-            f"limit={AIOHTTP_CONNECTOR_LIMIT}, limit_per_host={AIOHTTP_CONNECTOR_LIMIT_PER_HOST})"
+            "SESSION REUSE: Created shared aiohttp session for connection pooling "
+            "(ID: %s, limit=%s, limit_per_host=%s, owner=%s)",
+            id(session),
+            AIOHTTP_CONNECTOR_LIMIT,
+            AIOHTTP_CONNECTOR_LIMIT_PER_HOST,
+            session_attribution.get("owner_kind"),
         )
         return session
     except Exception as e:
@@ -1033,8 +1048,15 @@ async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
     # Shutdown event - close shared aiohttp session
     if shared_aiohttp_session is not None:
         try:
+            from litellm.llms.custom_httpx.aiohttp_transport import (
+                get_litellm_aiohttp_session_attribution,
+            )
+
             await shared_aiohttp_session.close()
-            verbose_proxy_logger.info("SESSION REUSE: Closed shared aiohttp session")
+            verbose_proxy_logger.info(
+                "SESSION REUSE: Closed shared aiohttp session (attribution=%s)",
+                get_litellm_aiohttp_session_attribution(shared_aiohttp_session),
+            )
         except Exception as e:
             verbose_proxy_logger.error(f"Error closing shared aiohttp session: {e}")
 

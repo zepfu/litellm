@@ -17,6 +17,7 @@ from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.llms.custom_httpx.aiohttp_transport import (
     AiohttpResponseStream,
     LiteLLMAiohttpTransport,
+    get_litellm_aiohttp_session_attribution,
 )
 
 
@@ -63,6 +64,89 @@ async def test_aiohttp_transport_response_uses_stream_not_content():
     )
 
     assert isinstance(response.stream, AiohttpResponseStream)
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_transport_replaces_invalid_loop_session_and_retains_attribution():
+    """Replacement session path should retain old owned sessions with attribution metadata."""
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            self._loop = asyncio.get_running_loop()
+            self.close_calls = 0
+
+        async def close(self):
+            self.closed = True
+            self.close_calls += 1
+
+    created_sessions = []
+
+    def fake_session_factory() -> FakeClientSession:
+        session = FakeClientSession()
+        created_sessions.append(session)
+        return session
+
+    with patch(
+        "litellm.llms.custom_httpx.aiohttp_transport.ClientSession", FakeClientSession
+    ), patch("aiohttp.client.ClientSession", FakeClientSession):
+        transport = LiteLLMAiohttpTransport(client=fake_session_factory)
+        first_session = transport._get_valid_client_session()  # type: ignore
+        first_session._loop = None
+
+        second_session = transport._get_valid_client_session()  # type: ignore
+
+        assert first_session in transport._retained_replaced_sessions
+
+    first_attribution = get_litellm_aiohttp_session_attribution(first_session)
+    second_attribution = get_litellm_aiohttp_session_attribution(second_session)
+
+    assert first_attribution is not None
+    assert second_attribution is not None
+    assert first_attribution["owner_kind"] == "custom_httpx_transport"
+    assert (
+        first_attribution["creation_site"]
+        in {
+            "LiteLLMAiohttpTransport._release_or_retain_replaced_owned_session",
+            "LiteLLMAiohttpTransport._retain_replaced_owned_session",
+        }
+    )
+    assert first_attribution["litellm_owns_session"] is True
+    assert second_attribution["owner_kind"] == "custom_httpx_transport"
+    assert (
+        second_attribution["creation_site"]
+        == "LiteLLMAiohttpTransport._create_replacement_client_session"
+    )
+    assert second_attribution["litellm_owns_session"] is True
+    assert created_sessions[0] is first_session
+    assert created_sessions[1] is second_session
+    assert len(created_sessions) == 2
+
+    await transport.aclose()
+    assert first_session.closed
+    await second_session.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_aiohttp_session_initialization_records_attribution():
+    from litellm.proxy.proxy_server import _initialize_shared_aiohttp_session
+
+    shared_session = await _initialize_shared_aiohttp_session()
+    try:
+        assert shared_session is not None
+        attribution = get_litellm_aiohttp_session_attribution(shared_session)
+        assert attribution is not None
+        assert attribution["owner_kind"] == "proxy"
+        assert (
+            attribution["creation_site"]
+            == "proxy_server._initialize_shared_aiohttp_session"
+        )
+        assert attribution["litellm_owns_session"] is True
+        assert attribution["session_id"] == id(shared_session)
+        assert attribution["pid"] == os.getpid()
+    finally:
+        if shared_session is not None:
+            await shared_session.close()
 
 
 @pytest.mark.asyncio
