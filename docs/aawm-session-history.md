@@ -922,6 +922,15 @@ with `metadata.provider_name` and `metadata.raw=ERROR` as terminal candidate
 failures. Alias probes cool down only that OpenRouter candidate, record
 `OPENROUTER_PROVIDER_RAW_ERROR` in attempt metadata, and continue to the next
 declared candidate rather than surfacing an ASGI traceback to the client.
+OpenRouter alias-probe 404 responses whose provider message indicates no
+endpoint is available for the requested model (for example
+`No endpoints found for openrouter/owl-alpha`) are classified as
+candidate-unavailable during alias-probe dispatch. LiteLLM applies the normal
+per-candidate cooldown, records the skipped attempt in alias metadata, and
+continues to the next declared candidate instead of surfacing an ASGI traceback.
+Non-alias OpenRouter 404s and unrelated not-found failures are not remapped and
+still surface to the client normally.
+
 Successful non-streaming OpenRouter completion-adapter requests also contribute
 completed turns to the AAWM route rollup and suppress their matching native
 `/openai_passthrough/responses?adapted_to=openrouter.ai/api/v1/chat/completions`

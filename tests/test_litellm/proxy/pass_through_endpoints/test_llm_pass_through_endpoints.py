@@ -8012,6 +8012,75 @@ class TestOpenRouterAdapterRetry:
         set_cooldown.assert_awaited_once_with("google/gemma-4-31b-it:free", 2.0)
 
     @pytest.mark.asyncio
+    async def test_openrouter_completion_adapter_no_endpoints_maps_to_candidate_unavailable_when_alias_probe(
+        self,
+    ):
+        raw = "No endpoints found for owl-alpha"
+        no_endpoint_error = ProxyException(
+            message="Provider returned error",
+            type="None",
+            param="None",
+            code=404,
+        )
+        no_endpoint_error.detail = {
+            "error": {
+                "message": "No endpoints found for owl-alpha",
+                "code": 404,
+                "metadata": {"raw": raw},
+            }
+        }
+        operation = AsyncMock(side_effect=no_endpoint_error)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_openrouter_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await _perform_openrouter_completion_adapter_operation(
+                    adapter_model="owl-alpha",
+                    operation=operation,
+                    use_alias_candidate_probe=True,
+                )
+
+        assert exc_info.value.detail["error"]["code"] == (
+            "aawm_codex_auto_agent_candidate_unavailable"
+        )
+        assert "owl-alpha" in exc_info.value.detail["error"]["message"]
+        assert "no available endpoints" in exc_info.value.detail["error"]["message"].lower()
+        operation.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_openrouter_completion_adapter_no_endpoints_reraises_when_not_alias_probe(
+        self,
+    ):
+        no_endpoint_error = ProxyException(
+            message="No endpoints found for owl-alpha",
+            type="None",
+            param="None",
+            code=404,
+        )
+        no_endpoint_error.detail = {
+            "error": {
+                "message": "No endpoints found for owl-alpha",
+                "code": 404,
+            }
+        }
+        operation = AsyncMock(side_effect=no_endpoint_error)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._wait_for_openrouter_adapter_cooldown_if_needed",
+            new=AsyncMock(),
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await _perform_openrouter_completion_adapter_operation(
+                    adapter_model="owl-alpha",
+                    operation=operation,
+                    use_alias_candidate_probe=False,
+                )
+
+        assert exc_info.value is no_endpoint_error
+
+    @pytest.mark.asyncio
     async def test_openrouter_adapter_request_fails_fast_on_long_window_rate_limit(self, monkeypatch):
         monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_MAX_RETRIES", "3")
         monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS", "2,4,8,12")
@@ -25457,6 +25526,92 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_low_owl_alpha_no_endpoints_reaches_mini(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    mini_success = Response(content='{"ok": true}', media_type="application/json")
+    await _set_codex_auto_agent_cooldown(
+        "openrouter:openrouter/cohere/north-mini-code:free:openrouter",
+        60.0,
+    )
+
+    owl_no_endpoints = ProxyException(
+        message="No endpoints found for owl-alpha",
+        type="None",
+        param="None",
+        code=404,
+    )
+    owl_no_endpoints.detail = {
+        "error": {
+            "message": "No endpoints found for owl-alpha",
+            "code": 404,
+            "metadata": {"raw": "No endpoints found for owl-alpha"},
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_api_key",
+        return_value="or-test-key",
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
+        new=AsyncMock(side_effect=FileNotFoundError("missing opencode auth")),
+    ) as mock_load_opencode_key, patch(
+        "litellm.acompletion",
+        new=AsyncMock(side_effect=owl_no_endpoints),
+    ) as mock_acompletion, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress",
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(return_value=mini_success),
+    ) as mock_pass_through:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is mini_success
+    mock_acompletion.assert_awaited_once()
+    assert mock_load_opencode_key.await_count == 2
+    mock_pass_through.assert_awaited_once()
+    candidate_body = mock_pass_through.await_args.kwargs["custom_body"]
+    assert candidate_body["model"] == "gpt-5.4-mini"
+    metadata = candidate_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_last_resort"] is True
+    openrouter_attempts = [
+        attempt
+        for attempt in metadata["codex_auto_agent_attempts"]
+        if attempt["provider"] == "openrouter"
+    ]
+    assert [attempt["model"] for attempt in openrouter_attempts] == [
+        "openrouter/owl-alpha",
+    ]
+    assert openrouter_attempts[0]["status"] == "cooldown_set"
+    assert openrouter_attempts[0]["error_class"] == "candidate_unavailable"
+    assert "aawm_codex_auto_agent_candidate_unavailable" in openrouter_attempts[0][
+        "error_tokens"
+    ]
+    skipped_models = {
+        candidate["model"]
+        for candidate in metadata["codex_auto_agent_skipped_candidates"]
+    }
+    assert "openrouter/cohere/north-mini-code:free" in skipped_models
+    assert "openrouter/owl-alpha" in skipped_models
 
 
 def _build_opencode_zen_billing_error() -> ProxyException:
