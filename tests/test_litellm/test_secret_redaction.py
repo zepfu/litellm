@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import sys
@@ -17,6 +18,9 @@ from litellm._logging import (
     verbose_logger,
     verbose_proxy_logger,
     verbose_router_logger,
+)
+from litellm.llms.custom_httpx.aiohttp_transport import (
+    _set_litellm_aiohttp_session_attribution,
 )
 
 SECRET = "sk-proj-abc123def456ghi789jklmnopqrst"
@@ -395,7 +399,7 @@ def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
 
     payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
     assert payload["observed_at"].endswith("+00:00")
-    assert payload["context"] == {
+    expected_context = {
         "source": "pass_through_endpoint",
         "container": "litellm-dev",
         "endpoint": "/anthropic/v1/messages",
@@ -430,6 +434,22 @@ def test_aawm_error_log_handler_writes_context_fields(monkeypatch, tmp_path):
         "grok_side_channel_request_json_container_type": "array",
         "grok_side_channel_request_array_length": 2,
     }
+    for key, value in expected_context.items():
+        assert payload["context"][key] == value
+    for key in (
+        "aiohttp_owner_kind",
+        "aiohttp_creation_site",
+        "aiohttp_litellm_owns_session",
+        "aiohttp_session_id",
+        "aiohttp_connector_id",
+        "aiohttp_event_loop_id",
+        "aiohttp_pid",
+        "aiohttp_container_hostname",
+        "aiohttp_context_keys",
+        "aiohttp_context_resource",
+    ):
+        assert key in payload["context"]
+        assert payload["context"][key] is None
     assert SECRET not in json.dumps(payload)
 
 
@@ -531,3 +551,157 @@ def test_json_exception_hook_writes_aawm_error_log(monkeypatch, tmp_path):
     assert "Traceback (most recent call last)" in payload["traceback_text"]
     assert SECRET not in json.dumps(payload)
     assert "REDACTED" in payload["raw_text"]
+
+
+def test_asyncio_exception_handler_records_aiohttp_session_attribution(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("HOSTNAME", "aawm-test-host")
+
+    loop = asyncio.new_event_loop()
+
+    async def _build_session():
+        from aiohttp import ClientSession
+
+        session = ClientSession()
+        _set_litellm_aiohttp_session_attribution(
+            session,
+            owner_kind="aiohttp-test-owner",
+            creation_site="tests.test_secret_redaction:test_asyncio_exception_handler_records_aiohttp_session_attribution",
+            litellm_owns_session=True,
+        )
+        return session
+
+    session = loop.run_until_complete(_build_session())
+    original_excepthook = sys.excepthook
+    try:
+        monkeypatch.setattr(asyncio, "get_event_loop", lambda: loop)
+        _setup_json_exception_handlers(JsonFormatter())
+        handler = loop.get_exception_handler()
+        assert handler is not None
+
+        default_handler_called = False
+
+        def _default_exception_handler(_context):
+            nonlocal default_handler_called
+            default_handler_called = True
+
+        loop.default_exception_handler = _default_exception_handler  # type: ignore[method-assign]
+
+        handler(
+            loop,
+            {
+                "message": f"Unclosed client session: {SECRET}",
+                "client_session": session,
+                "source_traceback": [("pytest", 123, "session", "close")],
+            },
+        )
+
+        payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
+        assert payload["logger"] == "asyncio"
+        assert payload["context"]["source"] == "asyncio_exception_handler"
+        assert payload["context"]["failure_kind"] == "aiohttp_lifecycle_warning"
+        assert payload["context"]["aiohttp_owner_kind"] == "aiohttp-test-owner"
+        assert (
+            payload["context"]["aiohttp_creation_site"]
+            == "tests.test_secret_redaction:test_asyncio_exception_handler_records_aiohttp_session_attribution"
+        )
+        assert payload["context"]["aiohttp_litellm_owns_session"] is True
+        assert payload["context"]["aiohttp_session_id"] == id(session)
+        assert payload["context"]["aiohttp_connector_id"] is None
+        assert payload["context"]["aiohttp_event_loop_id"] == id(loop)
+        assert isinstance(payload["context"]["aiohttp_pid"], int)
+        assert payload["context"]["aiohttp_container_hostname"] == "aawm-test-host"
+        assert payload["context"]["aiohttp_context_keys"] == [
+            "client_session",
+            "message",
+            "source_traceback",
+        ]
+        assert payload["context"]["aiohttp_context_resource"] == "client_session"
+        assert default_handler_called is False
+        assert SECRET not in json.dumps(payload)
+        assert "REDACTED" in payload["message"]
+        assert "pytest" not in json.dumps(payload)
+    finally:
+        sys.excepthook = original_excepthook
+        loop.run_until_complete(session.close())
+        loop.close()
+
+
+def test_asyncio_exception_handler_records_aiohttp_connector_attribution(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("HOSTNAME", "aawm-test-host")
+
+    loop = asyncio.new_event_loop()
+
+    async def _build_session():
+        from aiohttp import ClientSession
+
+        session = ClientSession()
+        _set_litellm_aiohttp_session_attribution(
+            session,
+            owner_kind="aiohttp-test-owner",
+            creation_site="tests.test_secret_redaction:connector_attribution",
+            litellm_owns_session=True,
+        )
+        return session
+
+    session = loop.run_until_complete(_build_session())
+    connector = session.connector
+    original_excepthook = sys.excepthook
+    try:
+        monkeypatch.setattr(asyncio, "get_event_loop", lambda: loop)
+        _setup_json_exception_handlers(JsonFormatter())
+        handler = loop.get_exception_handler()
+        assert handler is not None
+
+        default_handler_called = False
+
+        def _default_exception_handler(_context):
+            nonlocal default_handler_called
+            default_handler_called = True
+
+        loop.default_exception_handler = _default_exception_handler  # type: ignore[method-assign]
+
+        handler(
+            loop,
+            {
+                "message": f"Unclosed connector: {SECRET}",
+                "connector": connector,
+                "connections": [f"connection detail {SECRET}"],
+            },
+        )
+
+        payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
+        assert payload["logger"] == "asyncio"
+        assert payload["context"]["source"] == "asyncio_exception_handler"
+        assert payload["context"]["failure_kind"] == "aiohttp_lifecycle_warning"
+        assert payload["context"]["aiohttp_owner_kind"] == "aiohttp-test-owner"
+        assert (
+            payload["context"]["aiohttp_creation_site"]
+            == "tests.test_secret_redaction:connector_attribution"
+        )
+        assert payload["context"]["aiohttp_litellm_owns_session"] is True
+        assert payload["context"]["aiohttp_session_id"] == id(session)
+        assert payload["context"]["aiohttp_connector_id"] == id(connector)
+        assert payload["context"]["aiohttp_event_loop_id"] == id(loop)
+        assert payload["context"]["aiohttp_container_hostname"] == "aawm-test-host"
+        assert payload["context"]["aiohttp_context_keys"] == [
+            "connections",
+            "connector",
+            "message",
+        ]
+        assert payload["context"]["aiohttp_context_resource"] == "connector"
+        assert default_handler_called is False
+        assert SECRET not in json.dumps(payload)
+        assert "REDACTED" in payload["message"]
+        assert "connection detail" not in json.dumps(payload)
+    finally:
+        sys.excepthook = original_excepthook
+        loop.run_until_complete(session.close())
+        loop.close()

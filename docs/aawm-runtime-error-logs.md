@@ -139,6 +139,16 @@ Practical `context` fields to inspect are:
 - `grok_side_channel_request_body_digest_source`
 - `grok_side_channel_request_json_container_type`
 - `grok_side_channel_request_array_length`
+- `aiohttp_owner_kind`
+- `aiohttp_creation_site`
+- `aiohttp_litellm_owns_session`
+- `aiohttp_session_id`
+- `aiohttp_connector_id`
+- `aiohttp_event_loop_id`
+- `aiohttp_pid`
+- `aiohttp_container_hostname`
+- `aiohttp_context_keys`
+- `aiohttp_context_resource`
 
 Sidecar anomaly intake lines use the same append-safe JSONL file convention but a
 different event shape. Each detected anomaly class is written as one line with
@@ -152,6 +162,28 @@ different event shape. Each detected anomaly class is written as one line with
 - `examples`
 - `recommended_todo`
 - `cleanup_requirement`
+
+## Asyncio aiohttp lifecycle attribution
+
+When the asyncio loop emits a non-exception context that includes a tagged
+aiohttp `client_session`, LiteLLM logs the row as an `ERROR` level runtime intake
+row with safe lifecycle-attribution fields in `context`.
+
+Observed session fields are pulled from internal session attribution metadata only:
+
+- `aiohttp_owner_kind`
+- `aiohttp_creation_site`
+- `aiohttp_litellm_owns_session`
+- `aiohttp_session_id`
+- `aiohttp_connector_id`
+- `aiohttp_event_loop_id`
+- `aiohttp_pid`
+- `aiohttp_container_hostname`
+- `aiohttp_context_keys` (the names of keys present in the loop context)
+- `aiohttp_context_resource` (`client_session` or `connector`)
+
+These lifecycle rows intentionally omit prompt text, headers, credentials,
+connector internals, and raw tracebacks when no exception object is present.
 
 
 
