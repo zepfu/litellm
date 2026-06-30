@@ -291,6 +291,10 @@ unavailable candidate until the cooldown expires. Bare transient upstream
 instability does not suppress a route longer than the current progression
 requires.
 
+`malformed_tool_call_text` is also a durable per-candidate cooldown path. For
+non-spark candidates it resolves to a 30-minute cooldown; Spark candidates keep
+their existing five-minute durable override for this failure class.
+
 Successful or exhausted hidden retries add bounded metadata under
 `litellm_params.metadata`, including
 `aawm_passthrough_hidden_retry_attempts`,
