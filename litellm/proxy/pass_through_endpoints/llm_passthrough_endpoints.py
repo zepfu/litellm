@@ -8132,6 +8132,56 @@ def _extract_openrouter_adapter_raw_message(exc: Any) -> Optional[str]:
     return None
 
 
+def _is_openrouter_adapter_no_endpoint_candidate_error(
+    exc: Any,
+    *,
+    status_code: Optional[int] = None,
+    raw_message: Optional[str] = None,
+) -> bool:
+    """True when OpenRouter reports no upstream endpoint for a model (alias probe only)."""
+    if status_code is None:
+        status_code = _extract_openrouter_adapter_exception_status_code(exc)
+    if status_code != 404:
+        return False
+    if raw_message is None:
+        raw_message = _extract_openrouter_adapter_raw_message(exc)
+    haystacks: list[str] = []
+    if isinstance(raw_message, str) and raw_message:
+        haystacks.append(raw_message)
+    haystacks.append(str(exc))
+    message_attr = getattr(exc, "message", None)
+    if isinstance(message_attr, str) and message_attr:
+        haystacks.append(message_attr)
+    combined = " ".join(haystacks).lower()
+    return "no endpoints found" in combined
+
+
+def _maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable(
+    exc: Any,
+    *,
+    adapter_model: Optional[str],
+    use_alias_candidate_probe: bool,
+    status_code: Optional[int] = None,
+    raw_message: Optional[str] = None,
+) -> None:
+    if not use_alias_candidate_probe:
+        return
+    if not _is_openrouter_adapter_no_endpoint_candidate_error(
+        exc,
+        status_code=status_code,
+        raw_message=raw_message,
+    ):
+        return
+    model_label = _get_openrouter_adapter_rate_limit_key(adapter_model)
+    detail_text = raw_message or str(exc)
+    _raise_openrouter_auto_agent_candidate_unavailable(
+        (
+            f"OpenRouter auto-agent candidate {model_label} has no available endpoints: "
+            f"{detail_text}"
+        )
+    )
+
+
 def _is_openrouter_adapter_provider_raw_error(exc: Any) -> bool:
     payload = _extract_openrouter_adapter_error_payload(exc)
     if not isinstance(payload, dict):
@@ -8485,6 +8535,13 @@ async def _perform_openrouter_completion_adapter_operation(
                 )
                 await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
                 raise
+            _maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable(
+                exc,
+                adapter_model=adapter_model,
+                use_alias_candidate_probe=use_alias_candidate_probe,
+                status_code=status_code,
+                raw_message=raw_message,
+            )
             if status_code != 429 or (attempt >= total_attempts and not within_hidden_budget):
                 if log_warnings:
                     verbose_proxy_logger.warning(
@@ -8594,6 +8651,13 @@ async def _perform_openrouter_adapter_pass_through_request(
                 )
                 await _openrouter_adapter_open_failure_circuit(adapter_model, exc=exc)
                 raise
+            _maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable(
+                exc,
+                adapter_model=adapter_model,
+                use_alias_candidate_probe=use_alias_candidate_probe,
+                status_code=status_code,
+                raw_message=raw_message,
+            )
             if status_code != 429 or (attempt >= total_attempts and not within_hidden_budget):
                 if log_warnings:
                     verbose_proxy_logger.warning(
