@@ -276,9 +276,11 @@ Operational notes:
   provider/model cooldown state. Explicit capacity/rate-limit/usage-limit
   failures still use candidate cooldowns.
 - For the `gpt-5.3-codex-spark` candidate only, durable capacity, rate-limit,
-  usage-limit, upstream-overloaded, and upstream-timeout cooldowns are capped at
-  five minutes. Other candidates keep the default durable cooldown behavior, and
-  request-local transient cooldowns remain separate.
+  usage-limit, malformed_tool_call_text, upstream-overloaded, and upstream-timeout
+  cooldowns are capped at five minutes. Other candidates keep the default durable
+  behavior: 3-hour caps for capacity/rate-limit/usage-limit and 30-minute
+  candidate-cached malformed tool-call cooldowns, with request-local transient
+  cooldowns remaining separate.
 
 ## Alias Routing Audit Metadata
 

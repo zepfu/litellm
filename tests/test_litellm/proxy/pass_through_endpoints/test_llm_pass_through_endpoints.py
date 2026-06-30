@@ -26987,15 +26987,22 @@ async def test_codex_auto_agent_alias_openrouter_malformed_composer_call_rolls_o
     assert response is mini_success
     mock_pass_through.assert_awaited_once()
     mini_body = mock_pass_through.await_args.kwargs["custom_body"]
-    attempts = mini_body["litellm_metadata"]["codex_auto_agent_attempts"]
+    metadata = mini_body["litellm_metadata"]
+    attempts = metadata["codex_auto_agent_attempts"]
     assert attempts[0]["provider"] == "openrouter"
     assert attempts[0]["status"] == "cooldown_set"
     assert attempts[0]["error_class"] == "malformed_tool_call_text"
+    assert attempts[0]["cooldown_seconds"] == 1800.0
     assert attempts[0]["cooldown_scope"] == "candidate"
     assert "aawm_auto_agent_malformed_tool_call_text" in attempts[0]["error_tokens"]
-    assert mini_body["litellm_metadata"]["codex_auto_agent_selected_model"] == (
-        "gpt-5.4-mini"
+    failure_event = next(
+        event
+        for event in metadata["aawm_alias_routing_audit_events"]
+        if event["event_type"] == "candidate_retryable_failure"
     )
+    assert failure_event["failure_class"] == "malformed_tool_call_text"
+    assert failure_event["cooldown_seconds"] == 1800.0
+    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.4-mini"
 
 
 @pytest.mark.asyncio
@@ -34353,18 +34360,58 @@ def test_codex_auto_agent_spark_durable_cooldown_seconds_are_five_minutes():
         "Selected model is at capacity. Please try a different model."
     )
     usage_exc = RuntimeError("usage_limit_reached for this account")
+    malformed_tool_call_text_error = ProxyException(
+        message="Malformed tool-call marker in response.",
+        type="rate_limit_error",
+        param="model",
+        code=400,
+    )
+    malformed_tool_call_text_error.detail = {
+        "error": {
+            "message": "Malformed tool-call marker in response.",
+            "code": "aawm_auto_agent_malformed_tool_call_text",
+            "status": "RESPONSES_MALFORMED_TOOL_CALL",
+            "type": "rate_limit_error",
+        }
+    }
     assert _get_codex_auto_agent_cooldown_seconds(capacity_exc, candidate=spark) == 300.0
     assert _get_codex_auto_agent_cooldown_seconds(usage_exc, candidate=spark) == 300.0
+    assert (
+        _get_codex_auto_agent_cooldown_seconds(
+            malformed_tool_call_text_error, candidate=spark
+        )
+        == 300.0
+    )
 
 
-def test_codex_auto_agent_non_spark_candidate_keeps_default_durable_cooldown():
+def test_codex_auto_agent_non_spark_candidate_uses_durable_cooldown_by_error_class():
     other = {"model": "oa_xai/grok-build", "provider": "xai"}
     capacity_exc = RuntimeError(
         "Selected model is at capacity. Please try a different model."
     )
+    malformed_tool_call_text_error = ProxyException(
+        message="Malformed tool-call marker in response.",
+        type="rate_limit_error",
+        param="model",
+        code=400,
+    )
+    malformed_tool_call_text_error.detail = {
+        "error": {
+            "message": "Malformed tool-call marker in response.",
+            "code": "aawm_auto_agent_malformed_tool_call_text",
+            "status": "RESPONSES_MALFORMED_TOOL_CALL",
+            "type": "rate_limit_error",
+        }
+    }
     assert (
         _get_codex_auto_agent_cooldown_seconds(capacity_exc, candidate=other)
         == 10800.0
+    )
+    assert (
+        _get_codex_auto_agent_cooldown_seconds(
+            malformed_tool_call_text_error, candidate=other
+        )
+        == 1800.0
     )
 
 
@@ -34377,6 +34424,18 @@ def test_codex_auto_agent_spark_transient_cooldown_unchanged_at_thirty_seconds()
         code=502,
     )
     assert _get_codex_auto_agent_cooldown_seconds(exc, candidate=spark) == 30.0
+
+
+def test_codex_auto_agent_non_spark_transient_cooldown_unchanged_at_thirty_seconds():
+    other = {"model": "oa_xai/grok-build", "provider": "xai"}
+    exc = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+
+    assert _get_codex_auto_agent_cooldown_seconds(exc, candidate=other) == 30.0
 
 
 @pytest.mark.parametrize("status_code", [500, 502, 503, 529])
