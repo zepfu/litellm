@@ -2581,9 +2581,16 @@ def test_collect_observability_anomalies_runs_read_only_queries(monkeypatch) -> 
         ),
         (
             loop.OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL,
-            (6.0, loop.OBSERVABILITY_ANOMALY_SAMPLE_LIMIT),
+            (6.0, 6.0, loop.OBSERVABILITY_ANOMALY_SAMPLE_LIMIT),
         ),
     ]
+
+
+def test_observability_rate_limit_anomaly_sql_filters_recent_unscoped_observations() -> None:
+    sql = loop.OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL
+    assert "observed_at >=" in sql
+    assert "account_hash IS NULL" in sql
+    assert sql.index("observed_at >=") < sql.index("recent_traffic AS")
 
 
 def test_refresh_antigravity_oauth_token_file_writes_direct_response(
