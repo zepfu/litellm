@@ -239,6 +239,15 @@ provider/model fields, alias metadata that was not promoted, token or git/tool
 activity counters that do not match persisted activity, or stale rate-limit
 reset timestamps that still have matching recent traffic.
 
+The `stale_rate_limit_reset_with_recent_traffic` class only considers rate-limit
+observations whose `observed_at` falls inside the same recent lookback window
+used for the scan (`AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS`). Older
+reset rows are ignored so historical `DISTINCT ON` snapshots cannot be matched
+against unrelated recent provider traffic. Rows with a non-null `account_hash`
+are also skipped for this anomaly because `session_history` does not carry a
+matching account identifier; joining only on provider/model would produce
+cross-account false positives until same-account traffic can be proven.
+
 Relevant environment variables:
 
 - `AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED`: enables the scheduled scan task.

@@ -680,6 +680,10 @@ WITH latest_observations AS (
         litellm_call_id
     FROM public.rate_limit_observations
     WHERE expected_reset_at IS NOT NULL
+      AND observed_at >= (
+          NOW() - (%s::double precision * INTERVAL '1 hour')
+      )
+      AND account_hash IS NULL
     ORDER BY
         provider,
         COALESCE(model, ''),
@@ -4032,7 +4036,7 @@ def _collect_observability_anomalies(
                     anomalies.extend(_rows_as_dicts(cur))
                     cur.execute(
                         OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL,
-                        (lookback_hours, sample_limit),
+                        (lookback_hours, lookback_hours, sample_limit),
                     )
                     anomalies.extend(_rows_as_dicts(cur))
             except (
