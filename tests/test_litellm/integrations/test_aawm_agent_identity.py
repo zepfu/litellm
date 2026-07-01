@@ -1233,6 +1233,31 @@ def test_normalize_repository_identity_accepts_repo_shapes(
     )
 
 
+def test_normalize_repository_identity_maps_instruction_file_paths_to_parent_repo() -> None:
+    assert (
+        aawm_agent_identity._normalize_repository_identity(
+            "/home/zepfu/projects/litellm/CLAUDE.md"
+        )
+        == "litellm"
+    )
+
+
+def test_normalize_repository_identity_maps_codex_memories_memory_md_to_codex_memories() -> None:
+    assert (
+        aawm_agent_identity._normalize_repository_identity(
+            "/home/zepfu/.codex/memories/MEMORY.md"
+        )
+        == "codex-memories"
+    )
+
+
+def test_normalize_repository_identity_rejects_bare_instruction_filenames() -> None:
+    assert aawm_agent_identity._normalize_repository_identity("CLAUDE.md") is None
+    assert aawm_agent_identity._normalize_repository_identity("AGENTS.md") is None
+    assert aawm_agent_identity._normalize_repository_identity("MEMORY.md") is None
+    assert aawm_agent_identity._normalize_repository_identity("/tmp/CLAUDE.md") is None
+
+
 @pytest.mark.parametrize(
     "raw_repository",
     [
@@ -13368,6 +13393,50 @@ def test_build_session_history_record_from_langfuse_trace_observation_marks_perm
     assert "claude-permission-check:no" in record["metadata"]["request_tags"]
 
 
+def test_build_session_history_record_from_langfuse_maps_harness_trace_user_and_instruction_path() -> None:
+    trace = {
+        "id": "trace-harness-claude-md",
+        "name": "litellm-pass_through_endpoint",
+        "sessionId": "eed52e5a-8938-4672-a437-33997ff48e70",
+        "userId": "adapter-harness-tenant",
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Contents of /home/zepfu/projects/litellm/CLAUDE.md\n"
+                        "# INSTRUCTIONS\n"
+                    ),
+                }
+            ]
+        },
+    }
+    observation = {
+        "id": "call-harness-claude-md",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gpt-5.4-mini",
+        "promptTokens": 10,
+        "completionTokens": 2,
+        "totalTokens": 12,
+        "metadata": {},
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-harness-claude-md",
+    )
+
+    assert record is not None
+    assert record["repository"] == "litellm"
+    assert record["tenant_id"] == "litellm"
+    assert record["metadata"]["tenant_id"] == "litellm"
+    assert record["metadata"]["tenant_id_source"] == "harness_tenant_repository"
+    assert record["metadata"]["aawm_original_tenant_id"] == "adapter-harness-tenant"
+    assert record["metadata"]["aawm_harness_tenant_alias"] is True
+
+
 def test_build_session_history_record_from_langfuse_trace_observation_prefers_metadata_tenant() -> None:
     trace = {
         "id": "trace-explicit-tenant",
@@ -13397,6 +13466,37 @@ def test_build_session_history_record_from_langfuse_trace_observation_prefers_me
         trace,
         observation,
         backfill_run_id="run-tenant",
+    )
+
+    assert record is not None
+    assert record["tenant_id"] == "org-aawm"
+    assert record["metadata"]["tenant_id"] == "org-aawm"
+    assert record["metadata"]["tenant_id_source"] == "observation.metadata.user_api_key_org_id"
+
+
+def test_build_session_history_record_from_langfuse_trace_observation_metadata_tenant_wins_over_trace_user_id() -> None:
+    trace = {
+        "id": "trace-metadata-vs-userid",
+        "name": "claude-code.orchestrator",
+        "sessionId": "session-metadata-vs-userid",
+        "userId": "trace-user-fallback-only",
+        "input": {},
+    }
+    observation = {
+        "id": "call-metadata-vs-userid",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gpt-5.5",
+        "promptTokens": 10,
+        "completionTokens": 2,
+        "totalTokens": 12,
+        "metadata": {"user_api_key_org_id": "org-aawm"},
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-metadata-vs-userid",
     )
 
     assert record is not None
