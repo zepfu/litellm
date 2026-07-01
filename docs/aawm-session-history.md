@@ -1149,3 +1149,26 @@ cache key; in-flight requests can still hold those clients. Evicted client-like
 values are retained on the cache until `close_litellm_async_clients()` runs, so
 they do not fall out of scope and emit unclosed aiohttp session warnings before
 the explicit shutdown cleanup path can close them.
+
+## Target Runtime Verifier
+
+`scripts/verify_target_runtime_release.py` is a narrow target-aware verifier
+for release and session-history correlation checks. It does not run sidecar,
+Langfuse callback, or dashboard lanes.
+
+- Choose `--target {dev,prod}` before any probe helpers run. Dev profiles
+  describe the local bind-mounted `litellm-dev` runtime; prod profiles describe
+  the released `aawm-litellm` image.
+- `--target prod` is fail-closed: without `--release-runbook`, `--image-tag`,
+  `--callback-wheel`, `--db-name`, and `source_mode=released_image`, the script
+  refuses with a nonzero exit before Docker, SQL, HTTP, Langfuse, or `psycopg`
+  import. Prod mutation is never allowed.
+- The `session-history` lane (`--lane session-history`) proves persistence in
+  `aawm_tristore.public.session_history`, not HTTP success alone. It requires
+  `--marker-id` and at least one of `--session-id`, `--trace-id`, or
+  `--litellm-call-id`, then fails if no matching row is found. Evidence reports
+  row ids and attribution fields with raw `metadata` omitted/redacted.
+- `--workspace-root` sets the active repository for provenance. Repeatable
+  `--referenced-artifact-path` values (for example paths under
+  `/home/zepfu/projects/<repo>/...`) are recorded as referenced artifact owners
+  and do not override the active workspace repository.
