@@ -466,22 +466,30 @@ def _extract_aiohttp_attribution_from_asyncio_context(
             get_litellm_aiohttp_session_attribution,
         )
     except Exception:
-        return {}
+        get_litellm_aiohttp_session_attribution = None
 
-    attribution = get_litellm_aiohttp_session_attribution(resource)
+    attribution = (
+        get_litellm_aiohttp_session_attribution(resource)
+        if callable(get_litellm_aiohttp_session_attribution)
+        else None
+    )
     if not isinstance(attribution, dict):
-        return {}
+        attribution = {}
+
+    context_keys = sorted({str(key) for key in context.keys()})
+    fallback_session_id = id(resource) if resource_name == "client_session" else None
+    fallback_connector_id = id(resource) if resource_name == "connector" else None
 
     fields = {
-        "aiohttp_owner_kind": attribution.get("owner_kind"),
+        "aiohttp_owner_kind": attribution.get("owner_kind", "unattributed"),
         "aiohttp_creation_site": attribution.get("creation_site"),
         "aiohttp_litellm_owns_session": attribution.get("litellm_owns_session"),
-        "aiohttp_session_id": attribution.get("session_id"),
-        "aiohttp_connector_id": attribution.get("connector_id"),
+        "aiohttp_session_id": attribution.get("session_id", fallback_session_id),
+        "aiohttp_connector_id": attribution.get("connector_id", fallback_connector_id),
         "aiohttp_event_loop_id": attribution.get("event_loop_id"),
-        "aiohttp_pid": attribution.get("pid"),
-        "aiohttp_container_hostname": attribution.get("container_hostname"),
-        "aiohttp_context_keys": sorted({str(key) for key in context.keys()}),
+        "aiohttp_pid": attribution.get("pid", os.getpid()),
+        "aiohttp_container_hostname": attribution.get("container_hostname", os.getenv("HOSTNAME")),
+        "aiohttp_context_keys": context_keys,
         "aiohttp_context_resource": resource_name,
     }
     return {key: value for key, value in fields.items() if value is not None}

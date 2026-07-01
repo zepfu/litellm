@@ -76,8 +76,10 @@ bounded previews; the file keeps appending by default. Operators can set
 runtime needs to stop appending after a known size. When these literal tool-call
 blocks are in the explicit grok pattern and arguments validate against the
 advertised tool schema, LiteLLM now repairs them into executable `function_call`
-items instead of immediately logging a malformed-tool-call failure, so repaired
-rows no longer emit `aawm_auto_agent_malformed_tool_call_text`.
+items instead of immediately logging a malformed-tool-call failure. The repair
+also strips provider tool-end markers such as `<|tool_call_end|>` and the
+fullwidth Grok marker variants before emitting the tool call, so repaired rows
+no longer emit `aawm_auto_agent_malformed_tool_call_text`.
 
 Each event should include at least:
 
@@ -165,11 +167,18 @@ different event shape. Each detected anomaly class is written as one line with
 
 ## Asyncio aiohttp lifecycle attribution
 
-When the asyncio loop emits a non-exception context that includes a tagged
-aiohttp `client_session`, LiteLLM logs the row as an `ERROR` level runtime intake
-row with safe lifecycle-attribution fields in `context`.
+When the asyncio loop emits a non-exception context that includes an aiohttp
+`client_session` or connector, LiteLLM logs the row as an `ERROR` level runtime
+intake row with safe lifecycle-attribution fields in `context`.
 
-Observed session fields are pulled from internal session attribution metadata only:
+LiteLLM-owned aiohttp sessions are tagged when they are created or provided to
+the custom aiohttp handler. If a warning arrives for an untagged resource, the
+row still records `aiohttp_owner_kind=unattributed` plus the resource id, pid,
+hostname, loop-context keys, and whether the loop context named a
+`client_session` or `connector`. This makes future leak attribution possible
+without guessing ownership for older or third-party sessions.
+
+Observed session fields are:
 
 - `aiohttp_owner_kind`
 - `aiohttp_creation_site`
@@ -393,6 +402,14 @@ as degraded side-channel telemetry. LiteLLM still returns the upstream `404` to
 the client, but logs a warning with
 `failure_kind=degraded_grok_replicas_update_not_owned` instead of emitting
 traceback-style active error intake.
+
+Grok/xAI CLI passthrough `403` responses whose upstream body contains
+`personal-team-blocked:spending-limit` are treated as upstream account quota
+exhaustion, not generic permission failures. LiteLLM preserves the upstream `403`
+response for callers, logs a warning with
+`failure_kind=upstream_grok_account_quota_exhaustion`, and avoids repeated full
+traceback logging for this known account-limit class. Unrelated Grok `403` bodies
+still use the normal failure logging path.
 
 Unexpected `/signals` `401` bodies, unexpected `/replicas/update` `404` bodies,
 other Grok side-channel `401`/`404` failures, and any data-bearing side-channel

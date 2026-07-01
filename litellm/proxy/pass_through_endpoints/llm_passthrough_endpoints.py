@@ -14879,6 +14879,9 @@ _GROK_COMPOSER_LITERAL_CORRELATION_REF_LINE_RE = re.compile(
 _GROK_COMPOSER_LITERAL_INPUT_PAYLOAD_LINE_RE = re.compile(
     r"(?im)^Input payload:\s*(?P<payload>.+?)\s*$"
 )
+_GROK_COMPOSER_LITERAL_TOOL_END_MARKER_RE = re.compile(
+    r"^\s*(?:<\|tool_call_end\|>|<\|tool_calls_end\|>|<｜tool▁call▁end｜>|<｜tool▁calls▁end｜>)+\s*$"
+)
 _GROK_COMPOSER_LITERAL_TOOL_ARGUMENT_METADATA_KEYS = frozenset({"description"})
 
 
@@ -14949,6 +14952,9 @@ def _parse_grok_composer_literal_tool_label_blocks(
                             json.JSONDecoder().raw_decode(trailing_text)
                         except json.JSONDecodeError:
                             raw_payload = payload_candidate[:payload_decode_end].strip()
+                    elif _GROK_COMPOSER_LITERAL_TOOL_END_MARKER_RE.match(trailing):
+                        raw_payload = payload_candidate[:payload_decode_end].strip()
+                        payload_end = block_end
                 break
             except json.JSONDecodeError:
                 continue

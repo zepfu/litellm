@@ -629,6 +629,68 @@ def test_asyncio_exception_handler_records_aiohttp_session_attribution(monkeypat
         loop.close()
 
 
+def test_asyncio_exception_handler_records_unattributed_aiohttp_context(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "dev")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("HOSTNAME", "aawm-test-host")
+
+    loop = asyncio.new_event_loop()
+
+    async def _build_session():
+        from aiohttp import ClientSession
+
+        return ClientSession()
+
+    session = loop.run_until_complete(_build_session())
+    original_excepthook = sys.excepthook
+    try:
+        monkeypatch.setattr(asyncio, "get_event_loop", lambda: loop)
+        _setup_json_exception_handlers(JsonFormatter())
+        handler = loop.get_exception_handler()
+        assert handler is not None
+
+        default_handler_called = False
+
+        def _default_exception_handler(_context):
+            nonlocal default_handler_called
+            default_handler_called = True
+
+        loop.default_exception_handler = _default_exception_handler  # type: ignore[method-assign]
+
+        handler(
+            loop,
+            {
+                "message": f"Unclosed client session: {SECRET}",
+                "client_session": session,
+            },
+        )
+
+        payload = _read_aawm_error_jsonl(tmp_path / "dev-error.jsonl")
+        assert payload["logger"] == "asyncio"
+        assert payload["context"]["source"] == "asyncio_exception_handler"
+        assert payload["context"]["failure_kind"] == "aiohttp_lifecycle_warning"
+        assert payload["context"]["aiohttp_owner_kind"] == "unattributed"
+        assert payload["context"]["aiohttp_session_id"] == id(session)
+        assert payload["context"]["aiohttp_connector_id"] is None
+        assert isinstance(payload["context"]["aiohttp_pid"], int)
+        assert payload["context"]["aiohttp_container_hostname"] == "aawm-test-host"
+        assert payload["context"]["aiohttp_context_keys"] == [
+            "client_session",
+            "message",
+        ]
+        assert payload["context"]["aiohttp_context_resource"] == "client_session"
+        assert default_handler_called is False
+        assert SECRET not in json.dumps(payload)
+        assert "REDACTED" in payload["message"]
+    finally:
+        sys.excepthook = original_excepthook
+        loop.run_until_complete(session.close())
+        loop.close()
+
+
 def test_asyncio_exception_handler_records_aiohttp_connector_attribution(
     monkeypatch, tmp_path
 ):

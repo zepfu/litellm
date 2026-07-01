@@ -90,6 +90,12 @@ headers. The request includes the OIDC bearer token plus `x-userid`,
 snapshot as a sanitized `rate_limit_observations` row using the same stored field
 shape and dedupe guard as the LiteLLM callback path.
 
+When the billing response includes `billingPeriodEnd` but no `monthlyLimit`,
+`used`, `creditUsagePercent`, or `productUsage`, the sidecar still persists a
+period-only snapshot for the Grok credits billing series. That row updates
+`expected_reset_at` and the billing-period boundary columns while leaving
+`remaining_pct` and absolute quota fields null.
+
 Relevant environment variables:
 
 - `AAWM_GROK_BILLING_POLL_ENABLED`: enables the scheduled billing poll.
@@ -238,6 +244,12 @@ rows and looks for persistence or mapping inconsistencies such as missing
 provider/model fields, alias metadata that was not promoted, token or git/tool
 activity counters that do not match persisted activity, or stale rate-limit
 reset timestamps that still have matching recent traffic.
+
+The `missing_repository_for_agent_context` class is limited to rows where a
+repository should be derivable from trusted agent or AAWM alias context. Generic
+native Grok shell/pager passthrough rows (`provider=xai`, `client_name=grok-build`,
+`passthrough_route_family=grok_cli_chat_proxy`) are excluded when they are not an
+AAWM alias and carry no trusted repository source.
 
 The `stale_rate_limit_reset_with_recent_traffic` class only considers rate-limit
 observations whose `observed_at` falls inside the same recent lookback window

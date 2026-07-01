@@ -95,10 +95,12 @@ def _set_litellm_aiohttp_session_attribution(
 ) -> None:
     if session is None:
         return
-    if (
-        not overwrite
-        and hasattr(session, _LITELLM_AIOHTTP_SESSION_ATTR_NAME)
-    ):
+    existing_session_attribution = getattr(
+        session,
+        _LITELLM_AIOHTTP_SESSION_ATTR_NAME,
+        None,
+    )
+    if not overwrite and isinstance(existing_session_attribution, dict):
         return
     attribution = _build_litellm_aiohttp_session_attribution(
         owner_kind=owner_kind,
@@ -123,10 +125,12 @@ def _set_litellm_aiohttp_session_attribution(
         connector = None
     if connector is None or connector is session:
         return
-    if (
-        not overwrite
-        and hasattr(connector, _LITELLM_AIOHTTP_SESSION_ATTR_NAME)
-    ):
+    existing_connector_attribution = getattr(
+        connector,
+        _LITELLM_AIOHTTP_SESSION_ATTR_NAME,
+        None,
+    )
+    if not overwrite and isinstance(existing_connector_attribution, dict):
         return
     connector_attribution = dict(attribution)
     connector_attribution["connector_id"] = id(connector)

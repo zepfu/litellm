@@ -18,7 +18,10 @@ from litellm.llms.custom_httpx.http_handler import (
     HTTPHandler,
     _get_httpx_client,
 )
-from litellm.llms.custom_httpx.aiohttp_transport import LiteLLMAiohttpTransport
+from litellm.llms.custom_httpx.aiohttp_transport import (
+    LiteLLMAiohttpTransport,
+    _set_litellm_aiohttp_session_attribution,
+)
 from litellm._logging import verbose_logger
 from litellm.types.llms.openai import FileTypes
 from litellm.types.utils import HttpHandlerRequestFields, ImageResponse, LlmProviders
@@ -45,6 +48,13 @@ class BaseLLMAIOHTTPHandler:
         self._owns_session = (
             client_session is None
         )  # Track if we own the session for cleanup
+        if client_session is not None:
+            _set_litellm_aiohttp_session_attribution(
+                client_session,
+                owner_kind="custom_httpx_handler",
+                creation_site="BaseLLMAIOHTTPHandler.__init__:provided_session",
+                litellm_owns_session=False,
+            )
 
         self.transport = transport
         self._owns_transport = (
@@ -95,16 +105,34 @@ class BaseLLMAIOHTTPHandler:
         elif connector:
             # Use provided connector
             session = aiohttp.ClientSession(connector=connector)
+            _set_litellm_aiohttp_session_attribution(
+                session,
+                owner_kind="custom_httpx_handler",
+                creation_site="BaseLLMAIOHTTPHandler._create_client_session_with_transport:connector",
+                litellm_owns_session=True,
+            )
             return session
         else:
             # Default session creation
             session = aiohttp.ClientSession()
+            _set_litellm_aiohttp_session_attribution(
+                session,
+                owner_kind="custom_httpx_handler",
+                creation_site="BaseLLMAIOHTTPHandler._create_client_session_with_transport:default",
+                litellm_owns_session=True,
+            )
             return session
 
     def _get_async_client_session(
         self, dynamic_client_session: Optional[ClientSession] = None
     ) -> ClientSession:
         if dynamic_client_session:
+            _set_litellm_aiohttp_session_attribution(
+                dynamic_client_session,
+                owner_kind="custom_httpx_handler",
+                creation_site="BaseLLMAIOHTTPHandler._get_async_client_session:dynamic_session",
+                litellm_owns_session=False,
+            )
             return dynamic_client_session
         elif self.client_session:
             return self.client_session
