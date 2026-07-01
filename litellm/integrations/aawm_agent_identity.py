@@ -2794,6 +2794,16 @@ _AAWM_REPOSITORY_UNTRUSTED_TEXT_ITEM_TYPES = {
     "tool_search_call",
     "tool_search_output",
 }
+_AAWM_REPO_INSTRUCTION_FILENAMES = frozenset(
+    {
+        "agents.md",
+        "claude.md",
+        "gemini.md",
+        "memory.md",
+    }
+)
+
+
 _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
     "...",
     "0",
@@ -4774,12 +4784,20 @@ def _extract_tenant_identity_from_langfuse_trace_observation(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
-    return _extract_tenant_identity_from_metadata_sources(
+    tenant_id, source = _extract_tenant_identity_from_metadata_sources(
         ("observation.metadata", metadata or observation.get("metadata")),
         ("trace.metadata", trace_metadata),
         ("observation", observation),
         ("trace", trace),
     )
+    if tenant_id:
+        return tenant_id, source
+    trace_user_id = _normalize_tenant_identity(
+        trace.get("userId") if isinstance(trace, dict) else None
+    )
+    if trace_user_id:
+        return trace_user_id, "trace.userId"
+    return None, None
 
 
 def _is_agent_id_like(value: str) -> bool:
@@ -5066,7 +5084,24 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
         if normalized_path == _CODEX_MEMORY_ROOT_PATH:
             cleaned = _CODEX_MEMORY_ROOT_REPOSITORY
         else:
-            cleaned = normalized_path.rsplit("/", 1)[-1]
+            path_parts = normalized_path.rsplit("/", 1)
+            basename = path_parts[-1]
+            if (
+                basename.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES
+                and len(path_parts) > 1
+            ):
+                parent_path = path_parts[0].rstrip("/")
+                if parent_path == _CODEX_MEMORY_ROOT_PATH:
+                    cleaned = _CODEX_MEMORY_ROOT_REPOSITORY
+                elif parent_path.startswith("/home/zepfu/projects/"):
+                    cleaned = parent_path.rsplit("/", 1)[-1]
+                else:
+                    return None
+            else:
+                cleaned = basename
+
+    if cleaned.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES:
+        return None
 
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
