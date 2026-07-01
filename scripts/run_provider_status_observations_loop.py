@@ -497,6 +497,18 @@ anomalies AS (
           OR LEFT(COALESCE(inbound_model_alias, ''), 5) = 'aawm-'
       )
       AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
+      AND NOT (
+          LOWER(COALESCE(provider, '')) = 'xai'
+          AND LOWER(COALESCE(client_name, '')) = 'grok-build'
+          AND LOWER(COALESCE(metadata->>'passthrough_route_family', '')) = 'grok_cli_chat_proxy'
+          AND LEFT(COALESCE(inbound_model_alias, ''), 5) <> 'aawm-'
+          AND NULLIF(BTRIM(COALESCE(agent_name, '')), '') IS NULL
+          AND (
+              LOWER(COALESCE(metadata->>'client_user_agent', '')) LIKE 'grok-pager/%%'
+              OR LOWER(COALESCE(metadata->>'client_user_agent', '')) LIKE 'grok-shell/%%'
+              OR LOWER(COALESCE(metadata->>'client_user_agent', '')) LIKE '%% grok-shell/%%'
+          )
+      )
 
     UNION ALL
 
@@ -3851,47 +3863,79 @@ def _build_grok_billing_rate_limit_payload(
         quota_limit = monthly_limit
         quota_used = used
         quota_remaining = max(0.0, monthly_limit - used)
+        remaining_pct_value: Optional[float] = float(remaining_pct)
     else:
         credit_usage_percent = _safe_float(billing_config.get("creditUsagePercent"))
-        if credit_usage_percent is None:
+        if credit_usage_percent is not None:
+            used_percentage = max(0.0, min(100.0, credit_usage_percent))
+            remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
+            raw_provider_fields = {
+                "creditUsagePercent": _json_safe_grok_billing_value(
+                    billing_config.get("creditUsagePercent")
+                ),
+                "productUsage": _json_safe_grok_billing_value(
+                    billing_config.get("productUsage")
+                ),
+                "billingPeriodStart": billing_config.get("billingPeriodStart"),
+                "billingPeriodEnd": billing_config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_credit_usage_percent",
+                "quota_unit_interpretation": "percent_of_credit_quota",
+            }
+            evidence = {
+                "signals": [
+                    "grok_billing_payload",
+                    "grok_billing_percentage_only",
+                ],
+                "provider_fields": [
+                    "config.creditUsagePercent",
+                    "config.productUsage",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "none",
+                "unit_note": (
+                    "Grok billing provided percentage-only credit usage; absolute "
+                    "quota counts are intentionally left null."
+                ),
+            }
+            quota_key = "xai_grok_build_monthly_credits:credits"
+            quota_type = "credits"
+            quota_limit = None
+            quota_used = None
+            quota_remaining = None
+            remaining_pct_value = float(remaining_pct)
+        elif billing_period_end_at is not None:
+            raw_provider_fields = {
+                "billingPeriodStart": billing_config.get("billingPeriodStart"),
+                "billingPeriodEnd": billing_config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_period_only",
+                "quota_unit_interpretation": "unknown_usage",
+            }
+            evidence = {
+                "signals": [
+                    "grok_billing_payload",
+                    "grok_billing_period_only",
+                ],
+                "provider_fields": [
+                    "config.billingPeriodStart",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "none",
+                "unit_note": (
+                    "Grok billing reported a billing-period boundary without "
+                    "absolute or percentage usage fields; remaining quota is "
+                    "unknown and left null."
+                ),
+            }
+            quota_key = "xai_grok_build_monthly_credits:credits"
+            quota_type = "credits"
+            quota_limit = None
+            quota_used = None
+            quota_remaining = None
+            remaining_pct_value = None
+        else:
             raise ValueError(
                 "Grok billing payload did not include absolute or percentage quota fields."
             )
-        used_percentage = max(0.0, min(100.0, credit_usage_percent))
-        remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
-        raw_provider_fields = {
-            "creditUsagePercent": _json_safe_grok_billing_value(
-                billing_config.get("creditUsagePercent")
-            ),
-            "productUsage": _json_safe_grok_billing_value(
-                billing_config.get("productUsage")
-            ),
-            "billingPeriodStart": billing_config.get("billingPeriodStart"),
-            "billingPeriodEnd": billing_config.get("billingPeriodEnd"),
-            "quota_unit": "grok_billing_credit_usage_percent",
-            "quota_unit_interpretation": "percent_of_credit_quota",
-        }
-        evidence = {
-            "signals": [
-                "grok_billing_payload",
-                "grok_billing_percentage_only",
-            ],
-            "provider_fields": [
-                "config.creditUsagePercent",
-                "config.productUsage",
-                "config.billingPeriodEnd",
-            ],
-            "rounding": "none",
-            "unit_note": (
-                "Grok billing provided percentage-only credit usage; absolute "
-                "quota counts are intentionally left null."
-            ),
-        }
-        quota_key = "xai_grok_build_monthly_credits:credits"
-        quota_type = "credits"
-        quota_limit = None
-        quota_used = None
-        quota_remaining = None
 
     evidence.update(
         _grok_billing_sidecar_request_contract_evidence(
@@ -3915,7 +3959,7 @@ def _build_grok_billing_rate_limit_payload(
         "monthly",
         quota_type,
         billing_period_end_at,
-        float(remaining_pct),
+        remaining_pct_value,
         quota_limit,
         quota_used,
         quota_remaining,

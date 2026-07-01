@@ -23724,6 +23724,61 @@ def test_codex_auto_agent_grok_native_repairs_d1_439_fresh_tool_label_shape():
     assert "Input payload:" not in json.dumps(repaired)
 
 
+def test_codex_auto_agent_grok_native_repairs_literal_exec_with_fullwidth_tool_markers():
+    request_body = _grok_composer_exec_command_tool_request_body()
+    response_body = {
+        "id": "resp_d1_447_literal_exec",
+        "object": "response",
+        "status": "completed",
+        "model": "grok-composer-2.5-fast",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": (
+                    "Rebasing onto `origin/develop` and running the focused CD-230 gates.\n\n"
+                    "[Context note - prior assistant step; not an executable tool invocation]\n"
+                    "Tool label: exec_command\n"
+                    "Correlation ref: call-cff12460-da48-4a4a-8a3c-8d639975400c-composer_call_3d1u4\n"
+                    'Input payload: {"cmd": "cd /tmp/aawm-tap-cd226-clean.Z7HrRj/repo && git fetch origin develop 2>&1 && git rev-parse origin/develop", "workdir": "/tmp/aawm-tap-cd226-clean.Z7HrRj/repo"}\n'
+                    "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+                ),
+            }
+        ],
+    }
+
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(response_body) is True
+
+    repaired = _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+        response_body,
+        request_body=request_body,
+    )
+
+    assert repaired is not None
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(repaired) is False
+    rendered_repaired = json.dumps(repaired)
+    assert "Tool label:" not in rendered_repaired
+    assert "Input payload:" not in rendered_repaired
+    assert "tool▁call" not in rendered_repaired
+    function_calls = [
+        item
+        for item in repaired["output"]
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+    assert len(function_calls) == 1
+    assert function_calls[0]["name"] == "exec_command"
+    assert function_calls[0]["call_id"] == (
+        "call-cff12460-da48-4a4a-8a3c-8d639975400c-composer_call_3d1u4"
+    )
+    assert json.loads(function_calls[0]["arguments"]) == {
+        "cmd": (
+            "cd /tmp/aawm-tap-cd226-clean.Z7HrRj/repo && "
+            "git fetch origin develop 2>&1 && git rev-parse origin/develop"
+        ),
+        "workdir": "/tmp/aawm-tap-cd226-clean.Z7HrRj/repo",
+    }
+
+
 @pytest.mark.parametrize(
     "literal_text",
     [

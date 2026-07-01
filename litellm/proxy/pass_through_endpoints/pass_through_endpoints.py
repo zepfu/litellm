@@ -228,6 +228,7 @@ _GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS = (
 _GROK_REPLICAS_UPDATE_NOT_OWNED_ERROR_MARKERS = (
     "session not found or not owned",
 )
+_GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER = "personal-team-blocked:spending-limit"
 _CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
     "unable to load site",
     "cdn-cgi/challenge-platform",
@@ -762,6 +763,46 @@ def _is_known_grok_replicas_update_not_owned_response(
 
 def _get_passthrough_grok_replicas_update_not_owned_failure_kind() -> str:
     return "degraded_grok_replicas_update_not_owned"
+
+
+def _is_known_grok_personal_team_spending_limit_response(
+    *,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_403_FORBIDDEN:
+        return False
+
+    if not _is_xai_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if not detail:
+        return False
+
+    normalized_detail = str(detail).strip().lower()
+    if _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER not in normalized_detail:
+        return False
+
+    payload = _coerce_upstream_error_payload(detail)
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, str) and _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in error.lower():
+            return True
+        code = payload.get("code")
+        if isinstance(code, str) and _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in code.lower():
+            return True
+
+    return _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in normalized_detail
+
+
+def _get_passthrough_grok_personal_team_spending_limit_failure_kind() -> str:
+    return "upstream_grok_account_quota_exhaustion"
 
 
 def _is_known_grok_signals_auth_context_response(
@@ -3965,6 +4006,14 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        suppress_grok_personal_team_spending_limit_traceback = (
+            _is_known_grok_personal_team_spending_limit_response(
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         suppress_grok_replicas_update_not_owned_traceback = (
             _is_known_grok_replicas_update_not_owned_response(
                 request=request,
@@ -4035,6 +4084,16 @@ async def pass_through_request(  # noqa: PLR0915
                 extra={
                     **error_log_context,
                     "failure_kind": _get_passthrough_grok_signals_auth_context_failure_kind(),
+                },
+            )
+        elif suppress_grok_personal_team_spending_limit_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced known Grok personal-team spending-limit status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": _get_passthrough_grok_personal_team_spending_limit_failure_kind(),
                 },
             )
         elif suppress_grok_replicas_update_not_owned_traceback:
@@ -4176,6 +4235,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_grok_billing_timeout_traceback
             and not suppress_grok_signals_auth_context_traceback
             and not suppress_grok_replicas_update_not_owned_traceback
+            and not suppress_grok_personal_team_spending_limit_traceback
             and not suppress_chatgpt_codex_block_page_traceback
             and not suppress_chatgpt_codex_invalid_encrypted_content_traceback
             and not suppress_google_code_assist_tos_traceback
@@ -4191,6 +4251,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_grok_billing_timeout_traceback
             and not suppress_grok_signals_auth_context_traceback
             and not suppress_grok_replicas_update_not_owned_traceback
+            and not suppress_grok_personal_team_spending_limit_traceback
         ):
             try:
                 await proxy_logging_obj.post_call_failure_hook(

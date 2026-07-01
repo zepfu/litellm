@@ -90,9 +90,13 @@ Grok monthly billing payloads with absolute counters populate `quota_limit`,
 copy of the sanitized `monthlyLimit`, `used`, `onDemandCap`, and period fields.
 Newer Grok credit billing payloads may provide only `creditUsagePercent` and
 `productUsage`; those snapshots populate `remaining_pct` and leave absolute
-quota fields null rather than inventing counts. xAI OAuth rate-limit headers
-populate absolute request/token amounts and carry billing period ends when the
-provider config or managed subscription context exposes one.
+quota fields null rather than inventing counts. When Grok billing returns only
+billing-period boundaries, the provider-status sidecar billing poll may persist a
+period-only snapshot in the same Grok credits series with null `remaining_pct`
+and quota amounts so stale `expected_reset_at` values can advance to the current
+reset boundary. xAI OAuth rate-limit headers populate absolute request/token
+amounts and carry billing period ends when the provider config or managed
+subscription context exposes one.
 
 ## Provider Credit Observations
 
