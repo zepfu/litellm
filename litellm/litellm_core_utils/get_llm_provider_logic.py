@@ -422,11 +422,13 @@ def get_llm_provider(  # noqa: PLR0915
         ## petals
         elif model in litellm.petals_models:
             custom_llm_provider = "petals"
+        ## bedrock converse
+        elif model in litellm.bedrock_converse_models:
+            custom_llm_provider = "bedrock_converse"
         ## bedrock
         elif (
             model in litellm.bedrock_models
             or model in litellm.bedrock_embedding_models
-            or model in litellm.bedrock_converse_models
         ):
             custom_llm_provider = "bedrock"
         elif model in litellm.watsonx_models:
