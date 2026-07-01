@@ -53,6 +53,32 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.109 — Harness session-history repository attribution repair
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.109`. Session-history
+repository normalization now treats absolute paths to known repo instruction
+files such as `/home/zepfu/projects/litellm/CLAUDE.md` as references to the
+parent repository instead of persisting the instruction filename as the
+repository. Bare instruction filenames are rejected as repository identities.
+Langfuse trace `userId` is available as a fallback tenant source for trace
+backfill, while explicit observation/request metadata tenant sources keep
+precedence.
+
+**Why:** The aawm.108 prod harness produced a successful `gpt-5.4` Claude
+adapter call, but the associated `session_history` row persisted
+`CLAUDE.md` as both `repository` and `tenant_id` for the harness tenant alias.
+That broke the release validation attribution check even though the provider
+call and Langfuse trace existed.
+
+**Why not upstream:** This is specific to AAWM's fork-local session-history
+schema, harness tenant aliasing, and Codex/Claude repo attribution conventions.
+
+**Validation status:** Focused unit coverage verifies instruction-file path
+normalization, bare instruction filename rejection, Codex memory-root handling,
+harness trace-user fallback, and tenant metadata precedence. Prod deployment
+must repair the one known bad row and rerun the focused prod harness case before
+D1-449/D1-450 closeout.
+
 ### aawm.108 — Runtime traceback shaping and provider-status release rollup
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.108`. This release
