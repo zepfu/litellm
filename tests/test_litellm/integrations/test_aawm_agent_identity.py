@@ -1258,6 +1258,63 @@ def test_normalize_repository_identity_rejects_bare_instruction_filenames() -> N
     assert aawm_agent_identity._normalize_repository_identity("/tmp/CLAUDE.md") is None
 
 
+def test_normalize_repository_identity_rejects_nested_project_file_paths_and_bare_filenames() -> None:
+    """Reject referenced files while preserving trusted workspace roots."""
+    assert (
+        aawm_agent_identity._normalize_repository_identity(
+            "/home/zepfu/projects/litellm"
+        )
+        == "litellm"
+    )
+    assert (
+        aawm_agent_identity._normalize_repository_identity(
+            "/home/zepfu/projects/aawm-tap"
+        )
+        == "aawm-tap"
+    )
+
+    assert (
+        aawm_agent_identity._normalize_repository_identity(
+            "/home/zepfu/projects/litellm/AGENTS.md"
+        )
+        == "litellm"
+    )
+    assert (
+        aawm_agent_identity._normalize_repository_identity(
+            "/home/zepfu/projects/litellm/CLAUDE.md"
+        )
+        == "litellm"
+    )
+
+    rejected_values = [
+        "/home/zepfu/projects/litellm/suggestion.md",
+        "/home/zepfu/projects/litellm/foo/bar.py",
+        "/home/zepfu/projects/litellm/suggestion.md.",
+        "/home/zepfu/projects/aegis/proposal-foo.md",
+        "suggestion.md",
+        "todo.md",
+        "run_provider_status_observations_loop.py",
+        "config.yaml",
+        "foo.json",
+        "notes.txt",
+        "output.log",
+        "suggestion.md.",
+        "run_foo.py.",
+        ".agents",
+        ".agents.",
+        ".codex",
+    ]
+    for value in rejected_values:
+        assert aawm_agent_identity._normalize_repository_identity(value) is None
+
+    assert aawm_agent_identity._normalize_repository_identity("litellm") == "litellm"
+    assert (
+        aawm_agent_identity._normalize_repository_identity("aegis-dashboard")
+        == "aegis-dashboard"
+    )
+    assert aawm_agent_identity._normalize_repository_identity("aawm-tap") == "aawm-tap"
+
+
 @pytest.mark.parametrize(
     "raw_repository",
     [

@@ -60,6 +60,22 @@ current source such as tenant headers, current `x-codex-turn-metadata`
 `metadata.tenant_id_source=trace_user_untrusted` and
 `metadata.trace_user_tenant_fallback_skipped=true`.
 
+Paths that appear only because prompt text, handoff notes, or completion output
+referenced an artifact file, such as
+`/home/zepfu/projects/<repo>/.analysis/suggestion.md`, proposal files, or other
+`.analysis/` paths, do not establish `session_history.repository` or
+`session_history.tenant_id` unless a trusted current-workspace source (headers,
+current cwd/workspace blocks, or explicit metadata keys above) proves that repo is
+the active workspace for the turn. Maintainers should treat those strings as
+cited artifact locations, not as ownership signals.
+
+Backfill or repair jobs may record the referenced artifact owner separately in
+metadata (for example which repo owned the cited file) while keeping
+`repository` and `tenant_id` null or setting them only from trusted
+tenant/header/trace signals. That split keeps historical drill-down honest:
+diagnostic artifact context without promoting stale prompt references into route
+grouping.
+
 ## Rate Limit And Billing Observations
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing
