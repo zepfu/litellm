@@ -1087,6 +1087,8 @@ BEDROCK_CONVERSE_MODELS = [
     "anthropic.claude-opus-4-6-v1:0",
     "anthropic.claude-opus-4-6-v1",
     "anthropic.claude-sonnet-4-6",
+    "anthropic.claude-fable-5",
+    "anthropic.claude-sonnet-5",
     "anthropic.claude-opus-4-1-20250805-v1:0",
     "anthropic.claude-opus-4-20250514-v1:0",
     "anthropic.claude-sonnet-4-20250514-v1:0",
