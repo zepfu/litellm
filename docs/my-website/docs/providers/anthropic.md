@@ -6,7 +6,9 @@ LiteLLM supports all anthropic models.
 
 - `claude-opus-4-6` (`claude-opus-4-6-20260205`)
 - `claude-sonnet-4-6`
+- `claude-sonnet-5` (modeled; standard Sonnet-4.6-equivalent pricing; official model IDs may differ)
 - `claude-sonnet-4-5-20250929`
+- `claude-fable-5` (audited + extended cloud provider coverage; modeled on existing Fable 5 rates)
 - `claude-opus-4-5-20251101`
 - `claude-opus-4-1-20250805`
 - `claude-4` (`claude-opus-4-20250514`, `claude-sonnet-4-20250514`)
@@ -27,6 +29,8 @@ LiteLLM supports all anthropic models.
 | Supported Endpoints | `/chat/completions`, `/v1/messages` (passthrough) |
 
 
+
+> **Note on Claude Sonnet 5 / Fable 5**: Metadata, cost, get_model_info, and routing entries added in D1-457 using offline tests only (no live Anthropic calls due to capacity). Sonnet 5 uses non-promotional Sonnet 4.6-equivalent rates. See `tests/test_litellm/test_anthropic_model_metadata.py`.
 ## Supported OpenAI Parameters
 
 Check this in code, [here](../completion/input.md#translated-openai-params)
