@@ -35272,6 +35272,102 @@ def test_malformed_tool_call_intake_appends_one_row_per_detected_tool_call(
     ]
 
 
+def test_malformed_tool_call_intake_records_string_message_content(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.aawm_runtime_error_logging import (
+        persist_malformed_tool_call_detection,
+    )
+
+    monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+
+    response_body = {
+        "id": "resp_string_content",
+        "status": "completed",
+        "model": "test-model",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "composer_call",
+            }
+        ],
+    }
+
+    assert persist_malformed_tool_call_detection(
+        response_body=response_body,
+        adapter_model="test-model",
+        adapter="codex_auto_agent_openrouter_responses",
+        adapter_label="OpenRouter",
+        intake_context={"repository": "litellm", "session_id": "sess-string"},
+    )
+
+    import json
+
+    record = json.loads(
+        (tmp_path / "malformed-error.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["malformed_tool_call_text"] == "composer_call"
+    assert record["malformed_tool_call_evidence"] == [
+        {
+            "detection_kind": "literal_text",
+            "malformed_tool_call_text": "composer_call",
+        }
+    ]
+
+
+def test_malformed_tool_call_intake_records_grok_tool_label_transcript_text(
+    tmp_path, monkeypatch
+):
+    from litellm.proxy.aawm_runtime_error_logging import (
+        persist_malformed_tool_call_detection,
+    )
+
+    monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+
+    malformed_text = (
+        "Tool label: exec_command\n"
+        'Input payload: {"cmd": "rg -n expected tests"}'
+    )
+    response_body = {
+        "id": "resp_grok_tool_label",
+        "status": "completed",
+        "model": "test-model",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": malformed_text}],
+            }
+        ],
+    }
+
+    assert persist_malformed_tool_call_detection(
+        response_body=response_body,
+        adapter_model="test-model",
+        adapter="codex_auto_agent_grok_native_responses",
+        adapter_label="Grok native",
+        intake_context={"repository": "litellm", "session_id": "sess-grok"},
+    )
+
+    import json
+
+    record = json.loads(
+        (tmp_path / "malformed-error.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["malformed_tool_call_text"] == malformed_text
+    assert record["malformed_tool_call_evidence"] == [
+        {
+            "detection_kind": "grok_literal_tool_label_transcript",
+            "malformed_tool_call_text": malformed_text,
+        }
+    ]
+
+
 def test_malformed_tool_call_intake_write_failure_does_not_break_raise(
     monkeypatch,
 ):
