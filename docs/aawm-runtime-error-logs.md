@@ -71,7 +71,9 @@ detection. The text detector treats literal tool-call transcript blocks, such
 as `composer_call` markers or `Tool label:` / `Input payload:` output, as
 malformed when they appear in an assistant final response instead of an
 executable tool call. Individual text and payload fields are truncated to
-bounded previews; the file keeps appending by default. Operators can set
+bounded previews, including string-style `message.content` and list-style
+`message.content[].text` Responses outputs; the file keeps appending by
+default. Operators can set
 `LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES` as an explicit safety ceiling if a
 runtime needs to stop appending after a known size. When these literal tool-call
 blocks are in the explicit grok pattern and arguments validate against the
