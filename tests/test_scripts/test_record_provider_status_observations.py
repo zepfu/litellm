@@ -1774,6 +1774,93 @@ def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
     assert payload[21] == "grok-billing-poll-20260616200400"
 
 
+def test_grok_billing_sidecar_payload_maps_period_only_snapshot() -> None:
+    config = _grok_billing_poll_config()
+    observed_at = datetime(2026, 6, 30, 12, 0, tzinfo=timezone.utc)
+    response_body = {
+        "config": {
+            "billingPeriodStart": "2026-06-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+        }
+    }
+
+    payload = loop._build_grok_billing_rate_limit_payload(
+        config,
+        observed_at=observed_at,
+        response_body=response_body,
+    )
+
+    assert payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert payload[8] == "credits"
+    assert payload[9] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert payload[10] is None
+    assert payload[11] is None
+    assert payload[12] is None
+    assert payload[13] is None
+    raw_provider_fields = json.loads(payload[16])
+    assert raw_provider_fields["quota_unit"] == "grok_billing_period_only"
+    assert "creditUsagePercent" not in raw_provider_fields
+    assert "productUsage" not in raw_provider_fields
+    evidence = json.loads(payload[17])
+    assert "grok_billing_period_only" in evidence["signals"]
+
+
+def test_grok_billing_sidecar_payload_raises_without_usage_or_period() -> None:
+    config = _grok_billing_poll_config()
+    observed_at = datetime(2026, 6, 30, 12, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="absolute or percentage quota fields"):
+        loop._build_grok_billing_rate_limit_payload(
+            config,
+            observed_at=observed_at,
+            response_body={"config": {}},
+        )
+
+
+def test_run_due_sidecar_tasks_persists_grok_billing_period_only_snapshot(
+    monkeypatch,
+) -> None:
+    config = _grok_billing_poll_config()
+    period_only_payload = {
+        "config": {
+            "billingPeriodStart": "2026-06-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-07-15T00:00:00+00:00",
+        }
+    }
+    captured = {}
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_grok_billing_payload",
+        lambda *_args, **_kwargs: {
+            "status_code": 200,
+            "payload": period_only_payload,
+        },
+    )
+    monkeypatch.setattr(
+        loop,
+        "_load_grok_billing_auth_context",
+        lambda _path: _grok_billing_auth_context(),
+    )
+
+    def fake_persist(cfg, *, observed_at, response_body, identity_headers=None):
+        captured["response_body"] = response_body
+        return 1, 1
+
+    monkeypatch.setattr(loop, "_persist_grok_billing_observations", fake_persist)
+
+    events = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    assert captured["response_body"] == period_only_payload
+    assert events[0]["event"] == "grok_billing_poll"
+    assert events[0]["persisted"] is True
+    assert events[0]["observation_count"] == 1
+
+
 def test_persist_grok_billing_observations_uses_sidecar_db_path(monkeypatch) -> None:
     config = _grok_billing_poll_config(
         dsn="postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore",
@@ -2565,6 +2652,23 @@ def test_collect_observability_anomalies_runs_read_only_queries(monkeypatch) -> 
         in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
     )
     assert "LIKE 'aawm-%'" not in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
+    assert (
+        "LOWER(COALESCE(provider, '')) = 'xai'"
+        in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
+    )
+    assert (
+        "LOWER(COALESCE(client_name, '')) = 'grok-build'"
+        in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
+    )
+    assert (
+        "LEFT(COALESCE(inbound_model_alias, ''), 5) <> 'aawm-'"
+        in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
+    )
+    assert (
+        "LOWER(COALESCE(metadata->>'client_user_agent', '')) LIKE 'grok-pager/%%'"
+        in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
+    )
+    assert "'% grok-shell/%'" not in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
     assert fake_conn.rollback_count == 0
     assert fake_conn.cursor_instance.execute_calls[:3] == [
         (

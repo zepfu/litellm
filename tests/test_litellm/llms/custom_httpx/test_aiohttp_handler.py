@@ -10,7 +10,10 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 from litellm.llms.custom_httpx.aiohttp_handler import BaseLLMAIOHTTPHandler
-from litellm.llms.custom_httpx.aiohttp_transport import LiteLLMAiohttpTransport
+from litellm.llms.custom_httpx.aiohttp_transport import (
+    LiteLLMAiohttpTransport,
+    get_litellm_aiohttp_session_attribution,
+)
 
 
 class TestBaseLLMAIOHTTPHandler:
@@ -32,6 +35,14 @@ class TestBaseLLMAIOHTTPHandler:
 
         assert handler.client_session is mock_session
         assert handler._owns_session is False
+        attribution = get_litellm_aiohttp_session_attribution(mock_session)
+        assert attribution is not None
+        assert attribution["owner_kind"] == "custom_httpx_handler"
+        assert (
+            attribution["creation_site"]
+            == "BaseLLMAIOHTTPHandler.__init__:provided_session"
+        )
+        assert attribution["litellm_owns_session"] is False
 
     def test_get_async_client_session_with_dynamic_session(self):
         """Test _get_async_client_session with dynamic session parameter"""
@@ -44,6 +55,14 @@ class TestBaseLLMAIOHTTPHandler:
         )
 
         assert result is dynamic_session
+        attribution = get_litellm_aiohttp_session_attribution(dynamic_session)
+        assert attribution is not None
+        assert attribution["owner_kind"] == "custom_httpx_handler"
+        assert (
+            attribution["creation_site"]
+            == "BaseLLMAIOHTTPHandler._get_async_client_session:dynamic_session"
+        )
+        assert attribution["litellm_owns_session"] is False
 
     def test_get_async_client_session_with_instance_session(self):
         """Test _get_async_client_session with instance session"""
@@ -68,6 +87,14 @@ class TestBaseLLMAIOHTTPHandler:
         assert handler.client_session is mock_session_instance
         assert handler._owns_session is True
         assert result is mock_session_instance
+        attribution = get_litellm_aiohttp_session_attribution(mock_session_instance)
+        assert attribution is not None
+        assert attribution["owner_kind"] == "custom_httpx_handler"
+        assert (
+            attribution["creation_site"]
+            == "BaseLLMAIOHTTPHandler._create_client_session_with_transport:default"
+        )
+        assert attribution["litellm_owns_session"] is True
 
     @pytest.mark.asyncio
     async def test_close_with_owned_session(self):
