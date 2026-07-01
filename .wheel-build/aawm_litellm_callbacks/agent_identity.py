@@ -2803,6 +2803,54 @@ _AAWM_REPO_INSTRUCTION_FILENAMES = frozenset(
     }
 )
 
+_AAWM_REJECT_BARE_FILENAME_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".py",
+        ".pyi",
+        ".pyx",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".swift",
+        ".scala",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".fish",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".json",
+        ".jsonc",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".md",
+        ".markdown",
+        ".txt",
+        ".rst",
+        ".adoc",
+        ".log",
+        ".jsonl",
+        ".out",
+        ".err",
+    }
+)
+
 
 _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
     "...",
@@ -5055,6 +5103,58 @@ def _normalize_tenant_identity(value: Any) -> Optional[str]:
     return cleaned
 
 
+def _is_bare_file_basename_with_reject_extension(value: str) -> bool:
+    if not value or "/" in value or "\\" in value:
+        return False
+    v = value.lower().rstrip(".")
+    for ext in _AAWM_REJECT_BARE_FILENAME_EXTENSIONS:
+        if v.endswith(ext):
+            return True
+    if value.endswith(".") and value.rstrip("."):
+        return True
+    return False
+
+
+def _is_bare_dot_directory(value: str) -> bool:
+    if not value or "/" in value or "\\" in value:
+        return False
+    if not value.startswith("."):
+        return False
+    return True
+
+
+def _normalize_repository_identity_from_absolute_path(
+    normalized_path: str,
+) -> Optional[str]:
+    if normalized_path == _CODEX_MEMORY_ROOT_PATH:
+        return _CODEX_MEMORY_ROOT_REPOSITORY
+
+    path_parts = normalized_path.rsplit("/", 1)
+    basename = path_parts[-1]
+    if basename.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES and len(path_parts) > 1:
+        parent_path = path_parts[0].rstrip("/")
+        if parent_path == _CODEX_MEMORY_ROOT_PATH:
+            return _CODEX_MEMORY_ROOT_REPOSITORY
+        if parent_path.startswith("/home/zepfu/projects/"):
+            return parent_path.rsplit("/", 1)[-1]
+        return None
+
+    # Trusted workspace roots map to repos; nested prompt-text file paths under
+    # a project are references, not session ownership.
+    if normalized_path.startswith("/home/zepfu/projects/"):
+        sub = normalized_path[len("/home/zepfu/projects/") :].strip("/")
+        if not sub:
+            return None
+        if "/" not in sub:
+            return sub
+        first, sep, rest = sub.partition("/")
+        if sep and rest and rest.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES:
+            return first
+        return None
+
+    return basename
+
+
 def _normalize_repository_identity(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -5080,25 +5180,11 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
         except Exception:
             pass
     elif cleaned.startswith("/"):
-        normalized_path = cleaned.rstrip("/")
-        if normalized_path == _CODEX_MEMORY_ROOT_PATH:
-            cleaned = _CODEX_MEMORY_ROOT_REPOSITORY
-        else:
-            path_parts = normalized_path.rsplit("/", 1)
-            basename = path_parts[-1]
-            if (
-                basename.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES
-                and len(path_parts) > 1
-            ):
-                parent_path = path_parts[0].rstrip("/")
-                if parent_path == _CODEX_MEMORY_ROOT_PATH:
-                    cleaned = _CODEX_MEMORY_ROOT_REPOSITORY
-                elif parent_path.startswith("/home/zepfu/projects/"):
-                    cleaned = parent_path.rsplit("/", 1)[-1]
-                else:
-                    return None
-            else:
-                cleaned = basename
+        cleaned = _normalize_repository_identity_from_absolute_path(
+            cleaned.rstrip("/")
+        )
+        if cleaned is None:
+            return None
 
     if cleaned.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES:
         return None
@@ -5106,6 +5192,10 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
     cleaned = cleaned.strip().strip("/")
+    if _is_bare_file_basename_with_reject_extension(cleaned):
+        return None
+    if _is_bare_dot_directory(cleaned):
+        return None
     if (
         not cleaned
         or not _is_valid_repository_identity(cleaned)
