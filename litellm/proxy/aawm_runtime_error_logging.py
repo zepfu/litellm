@@ -16,6 +16,7 @@ from litellm._logging import (
 )
 from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_composer_call_literal_text,
+    is_malformed_grok_literal_tool_label_transcript_text,
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 
@@ -90,6 +91,24 @@ def _truncate_payload(value: Any, *, max_chars: int) -> Any:
     }
 
 
+def _malformed_text_evidence(text: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(text, str):
+        return None
+    if is_malformed_composer_call_literal_text(text):
+        detection_kind = "literal_text"
+    elif is_malformed_grok_literal_tool_label_transcript_text(text):
+        detection_kind = "grok_literal_tool_label_transcript"
+    else:
+        return None
+    return {
+        "detection_kind": detection_kind,
+        "malformed_tool_call_text": _truncate_text(
+            text,
+            max_chars=_DEFAULT_MAX_TEXT_CHARS,
+        ),
+    }
+
+
 def extract_malformed_tool_call_evidence(
     response_body: dict[str, Any],
     *,
@@ -105,6 +124,13 @@ def extract_malformed_tool_call_evidence(
             continue
         if item.get("type") == "message":
             content = item.get("content")
+            if isinstance(content, str):
+                text_evidence = _malformed_text_evidence(content)
+                if text_evidence is not None:
+                    evidence.append(text_evidence)
+                if max_items is not None and len(evidence) >= max_items:
+                    break
+                continue
             if not isinstance(content, list):
                 continue
             for part in content:
@@ -112,17 +138,13 @@ def extract_malformed_tool_call_evidence(
                     continue
                 if part.get("type") not in {"text", "output_text"}:
                     continue
-                text = part.get("text") or ""
-                if is_malformed_composer_call_literal_text(text):
-                    evidence.append(
-                        {
-                            "detection_kind": "literal_text",
-                            "malformed_tool_call_text": _truncate_text(
-                                text,
-                                max_chars=_DEFAULT_MAX_TEXT_CHARS,
-                            ),
-                        }
-                    )
+                text_evidence = _malformed_text_evidence(part.get("text"))
+                if text_evidence is not None:
+                    evidence.append(text_evidence)
+                if max_items is not None and len(evidence) >= max_items:
+                    break
+            if max_items is not None and len(evidence) >= max_items:
+                break
             continue
 
         if item.get("type") in {"function_call", "mcp_call"}:
