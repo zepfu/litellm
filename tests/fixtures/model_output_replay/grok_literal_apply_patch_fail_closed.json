@@ -1,0 +1,50 @@
+{
+  "fixture_id": "grok_literal_apply_patch_fail_closed",
+  "adapter": "codex_auto_agent_grok_native_responses",
+  "adapter_label": "GrokNative",
+  "adapter_model": "grok-composer-2.5-fast",
+  "request_body": {
+    "model": "aawm-code",
+    "tools": [
+      {
+        "type": "function",
+        "name": "exec_command",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "cmd": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cmd"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ]
+  },
+  "response_body": {
+    "id": "resp_replay_patch_sanitized",
+    "object": "response",
+    "status": "completed",
+    "model": "grok-composer-2.5-fast",
+    "output": [
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "[Context note - prior assistant step; not an executable tool invocation]\nTool label: apply_patch\nCorrelation ref: call-replay-sanitized-patch\nInput payload: {\"file_path\": \"/tmp/x.py\", \"patch\": \"*** Begin Patch\"}"
+          }
+        ]
+      }
+    ]
+  },
+  "intake_context": {
+    "provider": "grok",
+    "model_alias": "aawm-codex-agent-auto",
+    "route_family": "codex_auto_agent_grok_native_responses"
+  }
+}
