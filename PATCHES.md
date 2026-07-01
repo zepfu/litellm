@@ -53,6 +53,45 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.108 — Runtime traceback shaping and provider-status release rollup
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.108`. This release
+rolls up develop work since aawm.107 across runtime error intake, aiohttp
+lifecycle, Codex auto-agent output validation, session-history attribution, and
+provider-status monitoring. Expected provider `429` responses and related
+capacity signals are handled without polluting traceback intake; runtime
+traceback intake resolution and stale reset-anomaly scoping reduce false-positive
+operator noise. Aiohttp guardrail sessions close on proxy shutdown, embedding
+paths preserve shared transport sessions, evicted async clients remain available
+for shutdown cleanup, and AAWM error logs gain aiohttp lifecycle attribution.
+Worker and auto-agent quality paths preserve context-exhaustion telemetry, flag
+Claude XML literal tool invocations, handle literal `Tool label:` final output,
+cover malformed worker context-note completions, cap malformed tool-call
+cooldowns, and apply bounded Grok Composer literal-tool repair. Responses
+request-shape `422`s are instrumented; Codex reset-credit lifecycle and sidecar
+observations improve credit-reset visibility. Session-history spool replay
+tolerates missing files; Codex tenant attribution and route rollups are hardened.
+OpenRouter no-endpoint alias probes are handled explicitly. Google and Antigravity
+provider-status monitoring are removed from the release rollup surface. AAWM
+identity test drift from prior changes is resolved.
+
+**Why:** Prod and develop intake showed traceback noise from expected rate limits,
+ambiguous aiohttp shutdown ownership, and hard-to-diagnose auto-agent failures
+(literal tool text, malformed context notes, and attribution gaps in session
+history and route rollups). Operator workflows need cleaner error signals,
+deterministic shutdown behavior, and aligned provider-status scope before
+promotion closes D1-449/D1-450.
+
+**Why not upstream:** These changes are specific to AAWM alias routing, local
+error-intake policy, Codex/session-history integrations, provider-status
+rollups, and fork release validation gates.
+
+**Validation status:** Focused dev/runtime validation was completed on `develop`
+for the individual items listed in this release. This image/metadata bump still
+requires the `PROD_RELEASE.md` publish/promotion flow and prod harness/log
+checks before D1-449/D1-450 can close; do not treat this patch entry alone as
+completed production validation.
+
 ### aawm.107 — Composer-call malformed tool text quarantine and bounded Grok literal-tool repair for auto-agent aliases
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.107`.
