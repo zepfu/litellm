@@ -46,10 +46,15 @@ intentionally ignore assistant history and tool-output items such as
 reasoning blocks, because those can contain stale worktree paths or fixture
 strings from earlier turns.
 
-Rows where repository was inferred from untrusted text keep the repository label
-for diagnosis but do not promote it to `tenant_id`. These records include
-`metadata.repository_tenant_fallback_skipped=true` so downstream reporting can
-distinguish "unknown tenant" from an omitted attribution field.
+Rows where repository was inferred from untrusted text may keep a diagnostic
+repository label, but file-like or cited-artifact candidates can remain
+`repository=NULL` rather than being promoted to a misleading workspace. These
+records include `metadata.repository_tenant_fallback_skipped=true` and
+`metadata.tenant_id_source=repository_untrusted` so downstream reporting can
+distinguish "untrusted/unresolved repository" from an omitted attribution field.
+Large groups of non-excluded null repositories are surfaced by the provider
+status sidecar as `large_null_repository_cluster` anomalies instead of being
+silently rendered only as `unknown` in reporting.
 
 Stale Codex `metadata.trace_user_id` values from compact/resume history are
 diagnostic only. They may remain in `metadata.trace_user_id` for Langfuse and

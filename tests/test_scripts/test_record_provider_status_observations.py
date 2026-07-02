@@ -2670,24 +2670,41 @@ def test_collect_observability_anomalies_runs_read_only_queries(monkeypatch) -> 
     )
     assert "'% grok-shell/%'" not in loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
     assert fake_conn.rollback_count == 0
-    assert fake_conn.cursor_instance.execute_calls[:3] == [
+    assert fake_conn.cursor_instance.execute_calls[:4] == [
         (
             "SELECT set_config('application_name', %s, false)",
             ("aawm-provider-status-observations-anomaly-scan",),
         ),
         ("SELECT set_config('lock_timeout', %s, true)", ("1000ms",)),
         ("SELECT set_config('statement_timeout', %s, true)", ("5000ms",)),
+        ("SELECT set_config('jit', 'off', true)", None),
     ]
-    assert fake_conn.cursor_instance.execute_calls[3:] == [
+    assert fake_conn.cursor_instance.execute_calls[4:] == [
         (
             loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL,
-            (6.0, 6.0, loop.OBSERVABILITY_ANOMALY_SAMPLE_LIMIT),
+            (
+                6.0,
+                6.0,
+                loop.OBSERVABILITY_NULL_REPOSITORY_CLUSTER_MIN_ROWS,
+                loop.OBSERVABILITY_ANOMALY_SAMPLE_LIMIT,
+            ),
         ),
         (
             loop.OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL,
             (6.0, 6.0, loop.OBSERVABILITY_ANOMALY_SAMPLE_LIMIT),
         ),
     ]
+
+
+def test_observability_session_history_anomaly_sql_classifies_null_repository_clusters() -> None:
+    sql = loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
+
+    assert "null_repository_clusters AS" in sql
+    assert "'large_null_repository_cluster' AS anomaly_class" in sql
+    assert "rendered_repository', 'unknown'" in sql
+    assert "HAVING COUNT(*) >= %s::int" in sql
+    assert "COALESCE(metadata->>'tenant_id_source', '') = 'repository_untrusted'" in sql
+    assert "metadata->>'repository_tenant_fallback_skipped'" in sql
 
 
 def test_observability_rate_limit_anomaly_sql_filters_recent_unscoped_observations() -> None:

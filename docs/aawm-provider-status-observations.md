@@ -251,6 +251,16 @@ native Grok shell/pager passthrough rows (`provider=xai`, `client_name=grok-buil
 `passthrough_route_family=grok_cli_chat_proxy`) are excluded when they are not an
 AAWM alias and carry no trusted repository source.
 
+Rows that have already been classified as Codex repository text with an
+untrusted source (`metadata.tenant_id_source=repository_untrusted` and
+`metadata.repository_tenant_fallback_skipped=true`) are not treated as
+`missing_repository_for_agent_context`; those rows are unresolved attribution,
+not proof that a trusted repository was dropped. The sidecar still surfaces
+large groups of non-excluded null repositories through
+`large_null_repository_cluster`, which lets operators investigate dashboard
+`unknown` repository spikes without backfilling prompt-derived or file-like
+repository guesses.
+
 The `stale_rate_limit_reset_with_recent_traffic` class only considers rate-limit
 observations whose `observed_at` falls inside the same recent lookback window
 used for the scan (`AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS`). Older
