@@ -259,7 +259,11 @@ not proof that a trusted repository was dropped. The sidecar still surfaces
 large groups of non-excluded null repositories through
 `large_null_repository_cluster`, which lets operators investigate dashboard
 `unknown` repository spikes without backfilling prompt-derived or file-like
-repository guesses.
+repository guesses. Once a repair pass stamps
+`metadata.session_history_repository_status=unresolved` and
+`metadata.session_history_repository_unresolved=true`, those rows are no longer
+treated as unclassified active anomaly intake; fresh unclassified null rows
+remain actionable.
 
 The `stale_rate_limit_reset_with_recent_traffic` class only considers rate-limit
 observations whose `observed_at` falls inside the same recent lookback window

@@ -2385,7 +2385,7 @@ def test_build_session_history_record_does_not_trust_inferred_metadata_repositor
     assert "tenant_id" not in record["metadata"]
 
 
-def test_build_session_history_record_does_not_promote_codex_metadata_repository_to_tenant() -> None:
+def test_build_session_history_record_promotes_known_codex_metadata_repository_to_tenant() -> None:
     kwargs = _base_kwargs(trace_name="orchestrator")
     kwargs["model"] = "gpt-5.4-mini"
     kwargs["custom_llm_provider"] = "openai"
@@ -2418,11 +2418,98 @@ def test_build_session_history_record_does_not_promote_codex_metadata_repository
 
     assert record is not None
     assert record["repository"] == "aawm-tap"
-    assert record["tenant_id"] is None
+    assert record["tenant_id"] == "aawm-tap"
     assert record["metadata"]["repository"] == "aawm-tap"
+    assert record["metadata"]["repository_source"] == "litellm_params.metadata.repository"
+    assert record["metadata"]["tenant_id"] == "aawm-tap"
+    assert record["metadata"]["tenant_id_source"] == "repository"
+    assert "repository_tenant_fallback_skipped" not in record["metadata"]
+    assert "session_history_repository_status" not in record["metadata"]
+    assert "session_history_repository_unresolved" not in record["metadata"]
+
+
+def test_build_session_history_record_does_not_promote_unknown_codex_metadata_repository_to_tenant() -> None:
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-unknown-metadata-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-unknown-metadata-repository",
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "client_user_agent": "codex-tui/0.142.4",
+            "repository": "zepfu",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-unknown-metadata-repository",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-29T21:19:00Z",
+        end_time="2026-06-29T21:19:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "zepfu"
+    assert record["tenant_id"] is None
+    assert record["metadata"]["repository"] == "zepfu"
     assert record["metadata"]["repository_source"] == "litellm_params.metadata.repository"
     assert record["metadata"]["repository_tenant_fallback_skipped"] is True
     assert record["metadata"]["tenant_id_source"] == "repository_untrusted"
+    assert record["metadata"]["session_history_repository_status"] == "unresolved"
+    assert record["metadata"]["session_history_repository_unresolved"] is True
+    assert (
+        record["metadata"]["session_history_repository_unresolved_reason"]
+        == "untrusted_metadata_repository_label"
+    )
+    assert "tenant_id" not in record["metadata"]
+
+
+def test_build_session_history_record_rejects_file_like_codex_metadata_repository() -> None:
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-file-metadata-repository"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-file-metadata-repository",
+            "passthrough_route_family": "codex_responses",
+            "client_name": "codex-tui",
+            "client_user_agent": "codex-tui/0.142.4",
+            "repository": "ci.yml",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-codex-file-metadata-repository",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-06-29T21:20:00Z",
+        end_time="2026-06-29T21:20:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert "repository" not in record["metadata"]
     assert "tenant_id" not in record["metadata"]
 
 

@@ -38,9 +38,12 @@ metadata or `litellm_metadata` keys, and current workspace context such as
 `<environment_context><cwd>...</cwd></environment_context>`,
 `AGENTS.md instructions for ...`, or workspace-directory blocks. Codex traffic
 uses a narrower tenant fallback rule: generic `metadata.repository` remains a
-diagnostic repository label, but it is not enough to set `tenant_id` unless the
-repository came from explicit headers, current `x-codex-turn-metadata`
-`project_path`, or current workspace/cwd text. Recursive text scans
+diagnostic repository label unless it names a known AAWM workspace repository.
+Known workspace labels such as `aawm-tap`, `litellm`, or `dashboard-shell` may
+be promoted to `tenant_id`; arbitrary labels, placeholder worktree names, owner
+names, and file-like values are not promoted. Other trusted Codex sources remain
+explicit headers, current `x-codex-turn-metadata` `project_path`, or current
+workspace/cwd text. Recursive text scans
 intentionally ignore assistant history and tool-output items such as
 `function_call_output`, `custom_tool_call_output`, `tool_search_output`, and
 reasoning blocks, because those can contain stale worktree paths or fixture
@@ -53,8 +56,9 @@ records include `metadata.repository_tenant_fallback_skipped=true` and
 `metadata.tenant_id_source=repository_untrusted` so downstream reporting can
 distinguish "untrusted/unresolved repository" from an omitted attribution field.
 Large groups of non-excluded null repositories are surfaced by the provider
-status sidecar as `large_null_repository_cluster` anomalies instead of being
-silently rendered only as `unknown` in reporting.
+status sidecar as `large_null_repository_cluster` anomalies until they are
+repaired or stamped with an explicit durable unresolved classification such as
+`metadata.session_history_repository_status=unresolved`.
 
 Stale Codex `metadata.trace_user_id` values from compact/resume history are
 diagnostic only. They may remain in `metadata.trace_user_id` for Langfuse and

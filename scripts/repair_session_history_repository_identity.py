@@ -92,10 +92,12 @@ _METADATA_IDENTITY_KEYS = (
     "cwd_uri",
     "cwdUri",
     "aawm_claude_project",
+    "aawm_d1_452_referenced_artifact_owner",
     "tenant_id",
     "aawm_tenant_id",
 )
 _ROW_METADATA_REPOSITORY_PRIORITY = (
+    "aawm_d1_452_referenced_artifact_owner",
     "aawm_claude_project",
     "aawm_repository",
     "repository",
@@ -125,6 +127,12 @@ _ROW_METADATA_TENANT_PRIORITY = (
 _NOISY_REPO_PREFIX_PATTERNS = (
     re.compile(r"^(?P<repo>[A-Za-z0-9_.-]+)\s+(?:all|commits|files)="),
     re.compile(r"^(?P<repo>[A-Za-z0-9_.-]+)(?:\\\\n|\\n|\n)+"),
+)
+_REPOSITORY_UNRESOLVED_KEYS = (
+    "session_history_repository_unresolved",
+    "session_history_repository_unresolved_reason",
+    "repository_identity_classified_at",
+    "repository_identity_classification_source",
 )
 
 
@@ -264,7 +272,7 @@ def _repair_noisy_identity(
     value: Any, known_repositories: set[str]
 ) -> Optional[str]:
     normalized = _normalize_repository_identity(value)
-    if normalized:
+    if normalized and _is_known_repository(normalized, known_repositories):
         return normalized
     if not isinstance(value, str):
         return None
@@ -424,13 +432,15 @@ def _build_repaired_row(  # noqa: PLR0915
     metadata_repository = _repair_noisy_identity(
         metadata.get("repository"), known_repositories
     )
+    referenced_artifact_owner = _repair_noisy_identity(
+        metadata.get("aawm_d1_452_referenced_artifact_owner"),
+        known_repositories,
+    )
     source_repository = _repair_noisy_identity(
         metadata.get("source_repository"), known_repositories
     )
-    tenant_id = _normalize_repository_identity(original_tenant_id)
-    repaired_tenant_id = _repair_noisy_identity(
-        original_tenant_id, known_repositories
-    )
+    tenant_id = _repair_noisy_identity(original_tenant_id, known_repositories)
+    repaired_tenant_id = tenant_id
     repair_source = "row_identity_normalization"
 
     if grok_repository and _is_grok_row(row):
@@ -461,7 +471,10 @@ def _build_repaired_row(  # noqa: PLR0915
         repository = rollout_repository
         repair_source = "rollout_memory_registry"
     elif repository is None:
-        if metadata_repository is not None:
+        if referenced_artifact_owner is not None:
+            repository = referenced_artifact_owner
+            repair_source = "row_metadata.aawm_d1_452_referenced_artifact_owner"
+        elif metadata_repository is not None:
             repository = metadata_repository
             repair_source = "row_metadata.repository"
         elif source_repository is not None:
@@ -518,6 +531,24 @@ def _build_repaired_row(  # noqa: PLR0915
     if not changed:
         return None
 
+    if repository is None and tenant_id is None:
+        metadata["session_history_repository_status"] = "unresolved"
+        metadata["session_history_repository_unresolved"] = True
+        metadata["session_history_repository_unresolved_reason"] = (
+            _unresolved_repository_reason(row, metadata, known_repositories)
+        )
+        metadata["repository_identity_classified_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        metadata["repository_identity_classification_source"] = (
+            "repair_session_history_repository_identity.identity_cleanup"
+        )
+        repair_source = "unresolved_identity_cleanup"
+    else:
+        metadata["session_history_repository_status"] = "repaired"
+        metadata["session_history_repository_status_source"] = repair_source
+        for key in _REPOSITORY_UNRESOLVED_KEYS:
+            metadata.pop(key, None)
     metadata["repository_identity_repaired_at"] = datetime.now(timezone.utc).isoformat()
     metadata["repository_identity_repair_source"] = repair_source
     if repository != original_repository:
@@ -535,6 +566,83 @@ def _build_repaired_row(  # noqa: PLR0915
         "previous_repository": original_repository,
         "previous_tenant_id": original_tenant_id,
         "repair_source": repair_source,
+    }
+
+
+def _metadata_flag_is_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
+def _unresolved_repository_reason(
+    row: Dict[str, Any],
+    metadata: Dict[str, Any],
+    known_repositories: set[str],
+) -> str:
+    original_candidate = metadata.get("aawm_d1_452_original_repository")
+    if original_candidate is not None:
+        if _is_bad_repository_fragment(original_candidate, known_repositories):
+            return "untrusted_file_like_repository_candidate"
+        return "untrusted_repository_candidate"
+
+    provider = str(row.get("provider") or "").lower()
+    client_name = str(metadata.get("client_name") or "").lower()
+    if provider == "anthropic" or "claude" in client_name:
+        return "no_trusted_claude_project_signal"
+    if _is_grok_row(row):
+        return "no_trusted_grok_project_signal"
+    return "no_trusted_repository_signal"
+
+
+def _build_unresolved_classification_row(
+    row: Dict[str, Any],
+    known_repositories: set[str],
+) -> Optional[Dict[str, Any]]:
+    metadata = _safe_json_metadata(row.get("metadata"))
+    if _metadata_flag_is_true(metadata.get("session_history_reporting_excluded")):
+        return None
+
+    original_metadata = dict(metadata)
+    original_repository = row.get("repository")
+    original_tenant_id = row.get("tenant_id")
+    reason = _unresolved_repository_reason(row, metadata, known_repositories)
+    if (
+        metadata.get("session_history_repository_status") == "unresolved"
+        and metadata.get("session_history_repository_unresolved") is True
+        and metadata.get("session_history_repository_unresolved_reason") == reason
+        and metadata.get("repository_identity_classification_source")
+    ):
+        return None
+
+    metadata["session_history_repository_status"] = "unresolved"
+    metadata["session_history_repository_unresolved"] = True
+    metadata["session_history_repository_unresolved_reason"] = reason
+    metadata["repository_identity_classified_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+    metadata["repository_identity_classification_source"] = (
+        "repair_session_history_repository_identity.null_repository_since"
+    )
+    if original_repository is not None:
+        metadata["repository_identity_previous_repository"] = original_repository
+    if original_tenant_id is not None:
+        metadata["repository_identity_previous_tenant_id"] = original_tenant_id
+
+    if metadata == original_metadata:
+        return None
+
+    return {
+        "id": row["id"],
+        "repository": original_repository,
+        "tenant_id": original_tenant_id,
+        "metadata": metadata,
+        "previous_repository": original_repository,
+        "previous_tenant_id": original_tenant_id,
+        "classification_reason": reason,
+        "classification_source": "unresolved_repository",
     }
 
 
@@ -639,6 +747,7 @@ def _fetch_candidate_rows(
                         )
                     )
                  OR (repository IS NULL AND metadata ? 'aawm_claude_project')
+                 OR (repository IS NULL AND metadata ? 'aawm_d1_452_referenced_artifact_owner')
                  OR (repository IS NULL AND (provider = 'xai' OR model ILIKE %s))
                  OR (
                         %s::timestamptz IS NOT NULL
@@ -756,10 +865,13 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
 
     total_seen = 0
     total_repaired = 0
+    total_classified_unresolved = 0
     repair_sources: Counter[str] = Counter()
+    classification_reasons: Counter[str] = Counter()
     repair_groups: Counter[str] = Counter()
     unresolved_groups: Counter[str] = Counter()
     preview: list[Dict[str, Any]] = []
+    classification_preview: list[Dict[str, Any]] = []
     cursor_id = args.cursor_id
 
     with psycopg.connect(dsn) as conn:
@@ -811,6 +923,7 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
                 is not None
             ]
             repaired_ids = {int(repair["id"]) for repair in repairs}
+            classifications: list[Dict[str, Any]] = []
             if args.null_repository_since:
                 for row in rows:
                     provider = str(row.get("provider") or "unknown")
@@ -818,15 +931,40 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
                     group_key = f"{provider}|{model}"
                     if int(row["id"]) in repaired_ids:
                         repair_groups[group_key] += 1
-                    else:
+                    elif not _metadata_flag_is_true(
+                        _safe_json_metadata(row.get("metadata")).get(
+                            "session_history_reporting_excluded"
+                        )
+                    ):
                         unresolved_groups[group_key] += 1
+                        if args.classify_unresolved:
+                            classification = _build_unresolved_classification_row(
+                                row,
+                                known_repositories,
+                            )
+                            if classification is not None:
+                                classifications.append(classification)
+                    else:
+                        unresolved_groups[f"{group_key}|reporting_excluded"] += 1
+            updates = repairs + classifications
             if repairs:
                 total_repaired += len(repairs)
                 repair_sources.update(str(repair["repair_source"]) for repair in repairs)
                 preview.extend(repairs[: max(0, args.preview_limit - len(preview))])
-                if args.apply:
-                    _apply_repairs(conn, repairs)
-                    conn.commit()
+            if classifications:
+                total_classified_unresolved += len(classifications)
+                classification_reasons.update(
+                    str(classification["classification_reason"])
+                    for classification in classifications
+                )
+                classification_preview.extend(
+                    classifications[
+                        : max(0, args.preview_limit - len(classification_preview))
+                    ]
+                )
+            if updates and args.apply:
+                _apply_repairs(conn, updates)
+                conn.commit()
             elif args.apply:
                 conn.commit()
 
@@ -836,9 +974,12 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
     print(f"database={database_name}")  # noqa: T201
     print(f"candidate_rows={total_seen}")  # noqa: T201
     print(f"repairable_rows={total_repaired}")  # noqa: T201
+    print(f"classified_unresolved_rows={total_classified_unresolved}")  # noqa: T201
     print(f"applied={str(bool(args.apply)).lower()}")  # noqa: T201
     for source, count in sorted(repair_sources.items()):
         print(f"repair_source {source}={count}")  # noqa: T201
+    for reason, count in sorted(classification_reasons.items()):
+        print(f"classification_reason {reason}={count}")  # noqa: T201
     for group, count in repair_groups.most_common(20):
         print(f"repair_group {group}={count}")  # noqa: T201
     for group, count in unresolved_groups.most_common(20):
@@ -849,6 +990,12 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
             f"id={repair['id']} "
             f"repository={repair['previous_repository']!r}->{repair['repository']!r} "
             f"tenant_id={repair['previous_tenant_id']!r}->{repair['tenant_id']!r}"
+        )
+    for classification in classification_preview:
+        print(  # noqa: T201
+            "preview_classification "
+            f"id={classification['id']} "
+            f"reason={classification['classification_reason']!r}"
         )
     return 0
 
@@ -884,6 +1031,15 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Explicit repository to stamp onto Grok/xAI rows. "
             "Use only when the Grok dataset is known to belong to one repository."
+        ),
+    )
+    parser.add_argument(
+        "--classify-unresolved",
+        action="store_true",
+        help=(
+            "For --null-repository-since runs: when a row cannot be repaired to a known repository, "
+            "stamp durable classification metadata instead of leaving it blank. "
+            "Requires --apply to persist. Does not set repository or tenant for unresolved rows."
         ),
     )
     return parser.parse_args()

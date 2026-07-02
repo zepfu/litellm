@@ -283,6 +283,143 @@ def test_should_not_repair_null_repository_from_mixed_session() -> None:
     assert repaired is None
 
 
+def test_should_repair_null_repository_from_referenced_artifact_owner() -> None:
+    repaired = repair._build_repaired_row(
+        {
+            "id": 23,
+            "session_id": "artifact-session",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "repository": None,
+            "tenant_id": None,
+            "metadata": {
+                "aawm_d1_452_original_repository": (
+                    "proposal-focused-verification-profile-registry.md"
+                ),
+                "aawm_d1_452_referenced_artifact_owner": "aawm-devtools",
+                "session_history_repository_status": "unresolved",
+                "session_history_repository_unresolved": True,
+            },
+        },
+        {"aawm-devtools", "litellm"},
+        {},
+    )
+
+    assert repaired is not None
+    assert repaired["repository"] == "aawm-devtools"
+    assert repaired["tenant_id"] == "aawm-devtools"
+    assert repaired["repair_source"] == "row_metadata.aawm_d1_452_referenced_artifact_owner"
+    assert repaired["metadata"]["session_history_repository_status"] == "repaired"
+    assert "session_history_repository_unresolved" not in repaired["metadata"]
+
+
+def test_should_classify_unrepairable_file_like_null_repository() -> None:
+    classified = repair._build_unresolved_classification_row(
+        {
+            "id": 24,
+            "session_id": "file-like-session",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "repository": None,
+            "tenant_id": None,
+            "metadata": {
+                "aawm_d1_452_original_repository": "ci.yml",
+                "tenant_id_source": "repository_untrusted",
+            },
+        },
+        {"litellm"},
+    )
+
+    assert classified is not None
+    assert classified["repository"] is None
+    assert classified["tenant_id"] is None
+    assert classified["classification_reason"] == (
+        "untrusted_file_like_repository_candidate"
+    )
+    metadata = classified["metadata"]
+    assert metadata["session_history_repository_status"] == "unresolved"
+    assert metadata["session_history_repository_unresolved"] is True
+    assert (
+        metadata["session_history_repository_unresolved_reason"]
+        == "untrusted_file_like_repository_candidate"
+    )
+
+
+def test_should_clear_untrusted_generic_repository_and_tenant_literals() -> None:
+    repaired = repair._build_repaired_row(
+        {
+            "id": 26,
+            "session_id": "generic-owner-session",
+            "provider": "xai",
+            "model": "grok-composer-2.5-fast",
+            "repository": "zepfu",
+            "tenant_id": "zepfu",
+            "metadata": {
+                "repository": "zepfu",
+                "tenant_id": "zepfu",
+                "tenant_id_source": "repository_untrusted",
+            },
+        },
+        {"litellm"},
+        {},
+    )
+
+    assert repaired is not None
+    assert repaired["repository"] is None
+    assert repaired["tenant_id"] is None
+    metadata = repaired["metadata"]
+    assert "repository" not in metadata
+    assert "tenant_id" not in metadata
+    assert "tenant_id_source" not in metadata
+    assert metadata["session_history_repository_status"] == "unresolved"
+    assert metadata["session_history_repository_unresolved"] is True
+    assert metadata["session_history_repository_unresolved_reason"] == (
+        "no_trusted_grok_project_signal"
+    )
+
+
+def test_should_repair_known_repository_untrusted_tenant_source() -> None:
+    repaired = repair._build_repaired_row(
+        {
+            "id": 27,
+            "session_id": "known-repo-session",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "repository": "aawm-tap",
+            "tenant_id": None,
+            "metadata": {
+                "repository": "aawm-tap",
+                "tenant_id_source": "repository_untrusted",
+            },
+        },
+        {"aawm-tap", "litellm"},
+        {},
+    )
+
+    assert repaired is not None
+    assert repaired["repository"] == "aawm-tap"
+    assert repaired["tenant_id"] == "aawm-tap"
+    assert repaired["metadata"]["tenant_id_source"] == "repository_repair"
+    assert repaired["metadata"]["session_history_repository_status"] == "repaired"
+
+
+def test_should_not_classify_reporting_excluded_null_repository() -> None:
+    classified = repair._build_unresolved_classification_row(
+        {
+            "id": 25,
+            "session_id": "excluded-grok-session",
+            "provider": "xai",
+            "model": "grok-build",
+            "repository": None,
+            "tenant_id": None,
+            "metadata": {"session_history_reporting_excluded": True},
+        },
+        {"litellm"},
+    )
+
+    assert classified is None
+
+
 def test_should_stamp_grok_rows_with_explicit_repository_override() -> None:
     repaired = repair._build_repaired_row(
         {
