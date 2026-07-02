@@ -390,6 +390,8 @@ def test_should_repair_known_repository_untrusted_tenant_source() -> None:
             "metadata": {
                 "repository": "aawm-tap",
                 "tenant_id_source": "repository_untrusted",
+                "repository_tenant_fallback_skipped": True,
+                "session_history_repository_unresolved": True,
             },
         },
         {"aawm-tap", "litellm"},
@@ -401,6 +403,8 @@ def test_should_repair_known_repository_untrusted_tenant_source() -> None:
     assert repaired["tenant_id"] == "aawm-tap"
     assert repaired["metadata"]["tenant_id_source"] == "repository_repair"
     assert repaired["metadata"]["session_history_repository_status"] == "repaired"
+    assert "repository_tenant_fallback_skipped" not in repaired["metadata"]
+    assert "session_history_repository_unresolved" not in repaired["metadata"]
 
 
 def test_should_not_classify_reporting_excluded_null_repository() -> None:
@@ -477,3 +481,91 @@ def test_should_preserve_good_repository_and_tenant() -> None:
     )
 
     assert repaired is None
+
+
+class _FakeRepairCursor:
+    def __init__(self) -> None:
+        self.execute_calls: list[tuple[str, tuple | None]] = []
+        self._rows: list[dict] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def execute(self, statement, params=None) -> None:
+        self.execute_calls.append((statement, params))
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeRepairConnection:
+    def __init__(self) -> None:
+        self.cursor_instance = _FakeRepairCursor()
+
+    def cursor(self, *, row_factory=None):
+        return self.cursor_instance
+
+
+def test_should_include_max_id_in_repository_value_candidate_fetch() -> None:
+    conn = _FakeRepairConnection()
+    repair._fetch_candidate_rows(
+        conn,
+        cursor_id=10,
+        batch_size=25,
+        repository_values=["litellm", "aawm-tap"],
+        max_id=500,
+    )
+    assert len(conn.cursor_instance.execute_calls) == 1
+    statement, params = conn.cursor_instance.execute_calls[0]
+    assert "id <= %s" in statement
+    assert "repository = ANY(%s::text[])" in statement
+    assert params == (10, 500, ["litellm", "aawm-tap"], ["litellm", "aawm-tap"], 25)
+
+
+def test_should_include_max_id_in_null_repository_since_candidate_fetch() -> None:
+    conn = _FakeRepairConnection()
+    repair._fetch_candidate_rows(
+        conn,
+        cursor_id=0,
+        batch_size=100,
+        null_repository_since="2026-01-01T00:00:00+00:00",
+        max_id=999,
+    )
+    statement, params = conn.cursor_instance.execute_calls[0]
+    assert "repository IS NULL" in statement
+    assert "created_at >= %s::timestamptz" in statement
+    assert "id <= %s" in statement
+    assert params == (0, 999, "2026-01-01T00:00:00+00:00", 100)
+
+
+def test_should_omit_max_id_predicate_when_not_provided() -> None:
+    conn = _FakeRepairConnection()
+    repair._fetch_candidate_rows(
+        conn,
+        cursor_id=5,
+        batch_size=10,
+        repository_values=["zepfu"],
+    )
+    statement, params = conn.cursor_instance.execute_calls[0]
+    assert "id <= %s" not in statement
+    assert params[0] == 5
+    assert params[-1] == 10
+    assert 999 not in params
+
+
+def test_should_include_max_id_in_default_candidate_fetch() -> None:
+    conn = _FakeRepairConnection()
+    repair._fetch_candidate_rows(
+        conn,
+        cursor_id=1,
+        batch_size=50,
+        max_id=42,
+    )
+    statement, params = conn.cursor_instance.execute_calls[0]
+    assert "id <= %s" in statement
+    assert params[0] == 1
+    assert 42 in params
+    assert params[-1] == 50
