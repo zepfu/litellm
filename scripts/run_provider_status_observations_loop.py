@@ -132,6 +132,7 @@ DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS = 3600.0
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS = 4.0
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR = "/app/.analysis"
 OBSERVABILITY_ANOMALY_SAMPLE_LIMIT = 5
+OBSERVABILITY_NULL_REPOSITORY_CLUSTER_MIN_ROWS = 10
 GROK_BILLING_IDENTITY_HEADER_FIELDS = (
     ("x-userid", "user_id"),
     ("x-grok-user-id", "user_id"),
@@ -443,6 +444,38 @@ base AS (
     LEFT JOIN tool_activity AS ta
       ON ta.litellm_call_id = sh.litellm_call_id
 ),
+null_repository_clusters AS (
+    SELECT
+        MAX(id) AS id,
+        MAX(observed_at) AS observed_at,
+        provider,
+        model,
+        inbound_model_alias,
+        client_name,
+        agent_name,
+        COALESCE(metadata->>'repository_source', '') AS repository_source,
+        COALESCE(metadata->>'tenant_id_source', '') AS tenant_id_source,
+        COALESCE(
+            metadata->>'repository_tenant_fallback_skipped',
+            'false'
+        ) AS repository_tenant_fallback_skipped,
+        COUNT(*)::int AS cluster_row_count,
+        MIN(observed_at) AS cluster_first_observed_at,
+        MAX(observed_at) AS cluster_last_observed_at
+    FROM base
+    WHERE NULLIF(BTRIM(COALESCE(repository, '')), '') IS NULL
+      AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
+    GROUP BY
+        provider,
+        model,
+        inbound_model_alias,
+        client_name,
+        agent_name,
+        COALESCE(metadata->>'repository_source', ''),
+        COALESCE(metadata->>'tenant_id_source', ''),
+        COALESCE(metadata->>'repository_tenant_fallback_skipped', 'false')
+    HAVING COUNT(*) >= %s::int
+),
 anomalies AS (
     SELECT
         id,
@@ -452,7 +485,8 @@ anomalies AS (
         sample_base || jsonb_build_object(
             'observed',
             jsonb_build_object('provider', provider)
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE NULLIF(BTRIM(COALESCE(provider, '')), '') IS NULL
       AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
@@ -467,7 +501,8 @@ anomalies AS (
         sample_base || jsonb_build_object(
             'observed',
             jsonb_build_object('model', model)
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE NULLIF(BTRIM(COALESCE(model, '')), '') IS NULL
 
@@ -487,7 +522,8 @@ anomalies AS (
                 'agent_id', agent_id,
                 'inbound_model_alias', inbound_model_alias
             )
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE NULLIF(BTRIM(COALESCE(repository, '')), '') IS NULL
       AND LOWER(COALESCE(client_name, '')) ~ '^(claude|codex|grok)'
@@ -497,6 +533,13 @@ anomalies AS (
           OR LEFT(COALESCE(inbound_model_alias, ''), 5) = 'aawm-'
       )
       AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
+      AND NOT (
+          COALESCE(metadata->>'tenant_id_source', '') = 'repository_untrusted'
+          AND COALESCE(
+              metadata->>'repository_tenant_fallback_skipped',
+              'false'
+          ) = 'true'
+      )
       AND NOT (
           LOWER(COALESCE(provider, '')) = 'xai'
           AND LOWER(COALESCE(client_name, '')) = 'grok-build'
@@ -513,6 +556,40 @@ anomalies AS (
     UNION ALL
 
     SELECT
+        clusters.id,
+        clusters.observed_at,
+        'large_null_repository_cluster' AS anomaly_class,
+        'large groups of non-excluded session_history rows rendered as unknown repository should be surfaced and classified' AS expected,
+        jsonb_strip_nulls(
+            jsonb_build_object(
+                'row_id', clusters.id,
+                'observed_at', clusters.observed_at,
+                'provider', clusters.provider,
+                'model', clusters.model,
+                'inbound_model_alias', clusters.inbound_model_alias,
+                'client_name', clusters.client_name,
+                'agent_name', clusters.agent_name,
+                'repository', NULL,
+                'observed',
+                jsonb_build_object(
+                    'repository', NULL,
+                    'rendered_repository', 'unknown',
+                    'cluster_row_count', clusters.cluster_row_count,
+                    'cluster_first_observed_at', clusters.cluster_first_observed_at,
+                    'cluster_last_observed_at', clusters.cluster_last_observed_at,
+                    'repository_source', NULLIF(clusters.repository_source, ''),
+                    'tenant_id_source', NULLIF(clusters.tenant_id_source, ''),
+                    'repository_tenant_fallback_skipped',
+                    clusters.repository_tenant_fallback_skipped
+                )
+            )
+        ) AS sample,
+        clusters.cluster_row_count AS row_weight
+    FROM null_repository_clusters AS clusters
+
+    UNION ALL
+
+    SELECT
         id,
         observed_at,
         'alias_metadata_not_promoted' AS anomaly_class,
@@ -523,7 +600,8 @@ anomalies AS (
                 'inbound_model_alias', inbound_model_alias,
                 'metadata_aliases', metadata_aliases
             )
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE NULLIF(BTRIM(COALESCE(inbound_model_alias, '')), '') IS NULL
       AND metadata ?| ARRAY[
@@ -551,7 +629,8 @@ anomalies AS (
                 'cache_creation_input_tokens', cache_creation_input_tokens,
                 'response_cost_usd', response_cost_usd
             )
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE input_tokens < 0
        OR output_tokens < 0
@@ -574,7 +653,8 @@ anomalies AS (
                 'output_tokens', output_tokens,
                 'total_tokens', total_tokens
             )
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE total_tokens > 0
       AND input_tokens >= 0
@@ -594,7 +674,8 @@ anomalies AS (
                 'tool_call_count', tool_call_count,
                 'tool_activity_count', tool_activity_count
             )
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE tool_activity_count > 0
       AND tool_call_count < tool_activity_count
@@ -613,7 +694,8 @@ anomalies AS (
                 'activity_git_commit_count', activity_git_commit_count,
                 'activity_git_commit_command', activity_git_commit_command
             )
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE git_commit_count = 0
       AND (
@@ -635,7 +717,8 @@ anomalies AS (
                 'activity_git_push_count', activity_git_push_count,
                 'activity_git_push_command', activity_git_push_command
             )
-        ) AS sample
+        ) AS sample,
+        1 AS row_weight
     FROM base
     WHERE git_push_count = 0
       AND (
@@ -655,7 +738,7 @@ ranked AS (
 SELECT
     anomaly_class,
     expected,
-    COUNT(*)::int AS row_count,
+    SUM(row_weight)::int AS row_count,
     COALESCE(
         jsonb_agg(sample ORDER BY observed_at DESC, id DESC)
         FILTER (WHERE sample_rank <= %s::int),
@@ -4045,6 +4128,7 @@ def _set_observability_anomaly_scan_database_timeouts(
         "SELECT set_config('statement_timeout', %s, true)",
         (f"{statement_timeout_ms}ms",),
     )
+    cur.execute("SELECT set_config('jit', 'off', true)")
 
 
 def _rows_as_dicts(cur: Any) -> list[Dict[str, Any]]:
@@ -4075,7 +4159,12 @@ def _collect_observability_anomalies(
                     )
                     cur.execute(
                         OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL,
-                        (lookback_hours, lookback_hours, sample_limit),
+                        (
+                            lookback_hours,
+                            lookback_hours,
+                            OBSERVABILITY_NULL_REPOSITORY_CLUSTER_MIN_ROWS,
+                            sample_limit,
+                        ),
                     )
                     anomalies.extend(_rows_as_dicts(cur))
                     cur.execute(
