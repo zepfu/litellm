@@ -2705,6 +2705,8 @@ def test_observability_session_history_anomaly_sql_classifies_null_repository_cl
     assert "HAVING COUNT(*) >= %s::int" in sql
     assert "COALESCE(metadata->>'tenant_id_source', '') = 'repository_untrusted'" in sql
     assert "metadata->>'repository_tenant_fallback_skipped'" in sql
+    assert "metadata->>'session_history_repository_status', '') <> 'unresolved'" in sql
+    assert "metadata->>'session_history_repository_unresolved', 'false') <> 'true'" in sql
 
 
 def test_observability_rate_limit_anomaly_sql_filters_recent_unscoped_observations() -> None:

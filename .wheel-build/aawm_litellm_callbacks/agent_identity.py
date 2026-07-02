@@ -2878,6 +2878,26 @@ _AAWM_REPOSITORY_PLACEHOLDER_VALUES = {
     "wt-ops-xyz",
     "x",
 }
+
+_KNOWN_AAWM_WORKSPACE_REPOS: frozenset[str] = frozenset(
+    {
+        "litellm",
+        "aawm",
+        "aawm-tap",
+        "aawm-devtools",
+        "aawm-infrastructure",
+        "dashboard-shell",
+        "aegis",
+        "pytest-testable",
+        "pytest-classifier",
+        "aawm-transcript",
+        "aawm-hook",
+        "aawm-tap-dashboard",
+        "aawm-observe",
+        "mcp-pg",
+        "sluice",
+    }
+)
 _AAWM_REPOSITORY_AGENT_ROLE_VALUES = {
     "agent",
     "analyst",
@@ -5088,6 +5108,32 @@ def _is_disallowed_repository_identity(value: str) -> bool:
     if _AAWM_REPOSITORY_AGENT_ID_RE.fullmatch(normalized):
         return True
     return bool(_AAWM_REPOSITORY_WAVE_AGENT_RE.fullmatch(normalized))
+
+
+def _is_known_aawm_workspace_repository(value: Any) -> bool:
+    """Return True only for conservative known AAWM workspace repo names.
+
+    Used to gate metadata.repository -> tenant_id fallback for Codex records.
+    Built-in list + optional AAWM_KNOWN_WORKSPACE_REPOS (comma list) env.
+    Never allows generic owners (e.g. zepfu), wt-ops-*, file-like, or arbitrary.
+    """
+    normalized = _normalize_repository_identity(value)
+    if not normalized:
+        return False
+    if normalized in _KNOWN_AAWM_WORKSPACE_REPOS:
+        return True
+    # env allowlist (comma-separated additional known repos)
+    try:
+        env_val = get_secret_str("AAWM_KNOWN_WORKSPACE_REPOS") or os.environ.get(
+            "AAWM_KNOWN_WORKSPACE_REPOS", ""
+        )
+    except Exception:
+        env_val = os.environ.get("AAWM_KNOWN_WORKSPACE_REPOS", "")
+    if env_val:
+        extras = {x.strip() for x in env_val.split(",") if x.strip()}
+        if normalized in extras:
+            return True
+    return False
 
 
 def _normalize_tenant_identity(value: Any) -> Optional[str]:
@@ -14177,6 +14223,30 @@ def _mark_codex_trace_user_tenant_skipped(
     record["metadata"] = metadata
 
 
+def _codex_untrusted_repository_reason(metadata: Dict[str, Any]) -> str:
+    repository_source = _clean_non_empty_string(metadata.get("repository_source")) or ""
+    if ".metadata.repository" in repository_source:
+        return "untrusted_metadata_repository_label"
+    if ".text." in repository_source or "project_path" in repository_source:
+        return "untrusted_prompt_text_repository_candidate"
+    return "untrusted_repository_tenant_source"
+
+
+def _mark_repository_unresolved_metadata(metadata: Dict[str, Any]) -> None:
+    metadata["session_history_repository_status"] = "unresolved"
+    metadata["session_history_repository_unresolved"] = True
+    metadata["session_history_repository_unresolved_reason"] = (
+        _codex_untrusted_repository_reason(metadata)
+    )
+
+
+def _clear_repository_unresolved_metadata(metadata: Dict[str, Any]) -> None:
+    metadata.pop("session_history_repository_unresolved", None)
+    metadata.pop("session_history_repository_unresolved_reason", None)
+    if metadata.get("session_history_repository_status") == "unresolved":
+        metadata.pop("session_history_repository_status", None)
+
+
 def _mark_codex_repository_tenant_skipped(
     record: Dict[str, Any],
     original_tenant_id: Optional[str] = None,
@@ -14190,6 +14260,7 @@ def _mark_codex_repository_tenant_skipped(
     metadata.pop("tenant_id", None)
     metadata["tenant_id_source"] = "repository_untrusted"
     metadata["repository_tenant_fallback_skipped"] = True
+    _mark_repository_unresolved_metadata(metadata)
     record["tenant_id"] = None
     record["metadata"] = metadata
 
@@ -14292,6 +14363,7 @@ def _clear_untrusted_codex_repository_tenant_on_record(
     metadata.pop("tenant_id", None)
     metadata["tenant_id_source"] = "repository_untrusted"
     metadata["repository_tenant_fallback_skipped"] = True
+    _mark_repository_unresolved_metadata(metadata)
     record["tenant_id"] = None
     record["metadata"] = metadata
     return True
@@ -14369,13 +14441,35 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
     if not isinstance(metadata, dict):
         metadata = {}
     if not _codex_repository_source_trusted_for_record(record):
-        _mark_codex_repository_tenant_skipped(record)
-        return
+        # Bounded relaxation for Codex: generic metadata.repository (or
+        # litellm_metadata.repository) may promote to tenant ONLY when the
+        # normalized repository label is a known AAWM workspace repo from the
+        # conservative built-in allowlist (or AAWM_KNOWN_WORKSPACE_REPOS env).
+        # Headers, x-codex-turn-metadata project_path, cwd/workspace text, and
+        # other previously trusted sources remain trusted without the name check.
+        repo_source = None
+        if isinstance(metadata, dict):
+            repo_source = metadata.get("repository_source")
+        allow_via_known = False
+        if (
+            isinstance(repo_source, str)
+            and (
+                ".metadata.repository" in repo_source
+                or "litellm_metadata.repository" in repo_source
+            )
+            and _is_known_aawm_workspace_repository(repository)
+        ):
+            allow_via_known = True
+        if not allow_via_known:
+            _mark_codex_repository_tenant_skipped(record)
+            return
 
     record["tenant_id"] = repository
     metadata = dict(metadata)
     metadata["tenant_id"] = repository
     metadata["tenant_id_source"] = "repository"
+    metadata.pop("repository_tenant_fallback_skipped", None)
+    _clear_repository_unresolved_metadata(metadata)
     record["metadata"] = metadata
 
 
