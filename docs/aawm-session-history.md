@@ -55,6 +55,22 @@ repository label, but file-like or cited-artifact candidates can remain
 records include `metadata.repository_tenant_fallback_skipped=true` and
 `metadata.tenant_id_source=repository_untrusted` so downstream reporting can
 distinguish "untrusted/unresolved repository" from an omitted attribution field.
+Claude CLI rows that arrive without a trusted `aawm_claude_project`, repository
+header, or current workspace signal are also stamped as unresolved, with
+`metadata.session_history_repository_unresolved_reason=no_trusted_claude_project_signal`,
+rather than promoted from client name alone. `aawm_claude_project` must normalize
+to a known AAWM workspace repository such as `dashboard-shell`; owner names such
+as `zepfu`, placeholders, and file-like labels are retained only as diagnostic
+metadata and are not used as `repository` or `tenant_id`.
+The current missing-repository reason codes are:
+
+- `no_trusted_repository_signal`: no trusted repository, tenant, workspace, or
+  header signal was available for the row.
+- `no_trusted_claude_project_signal`: Claude/Anthropic traffic had no trusted
+  `aawm_claude_project` or equivalent current workspace signal.
+- `no_trusted_grok_project_signal`: Grok/XAI traffic had no trusted project or
+  current workspace signal.
+
 Large groups of non-excluded null repositories are surfaced by the provider
 status sidecar as `large_null_repository_cluster` anomalies until they are
 repaired or stamped with an explicit durable unresolved classification such as
@@ -620,10 +636,12 @@ display tokens derived from normalized metadata or explicit headers such as
 `x-aawm-agent-name`, and `x-aawm-repository`. Repository display can also come
 from the same structured identity aliases used by `session_history`, including
 `repo`, `workspace_root`, `project_root`, `working_directory`, `cwd_path`,
-`cwd_uri`, and `aawm_claude_project`. LiteLLM omits prompt-like, sentence-like,
-or punctuation-heavy identity values instead of printing raw request text.
-LiteLLM intentionally does not inspect prompt text or raw tool arguments for the
-route log.
+`cwd_uri`, and `aawm_claude_project`. For Claude CLI traffic,
+`aawm_claude_project` is the preferred trusted project source; client product
+strings such as `claude-cli` alone do not establish repository ownership.
+LiteLLM omits prompt-like, sentence-like, or punctuation-heavy identity values
+instead of printing raw request text. LiteLLM intentionally does not inspect
+prompt text or raw tool arguments for the route log.
 
 Route logs must not include API keys, authorization headers, full request or
 response bodies, prompt content, tool arguments, or arbitrary query strings.
