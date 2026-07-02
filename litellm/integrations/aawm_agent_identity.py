@@ -14166,6 +14166,50 @@ def _is_codex_session_history_record(record: Dict[str, Any]) -> bool:
     )
 
 
+def _is_claude_session_history_record(record: Dict[str, Any]) -> bool:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    provider = str(record.get("provider") or "").strip().lower()
+    if provider == "anthropic":
+        return True
+    client_name = _clean_non_empty_string(
+        _first_non_none(record.get("client_name"), metadata.get("client_name"))
+    )
+    if client_name and "claude" in client_name.lower():
+        return True
+    trace_name = _clean_non_empty_string(metadata.get("trace_name"))
+    return bool(trace_name and "claude" in trace_name.lower())
+
+
+def _is_claude_project_repository_source(value: Any) -> bool:
+    source = _clean_non_empty_string(value)
+    return bool(source and source.endswith(".aawm_claude_project"))
+
+
+def _is_claude_metadata_tenant_source(value: Any) -> bool:
+    source = _clean_non_empty_string(value)
+    if not source:
+        return False
+    return source.endswith(".metadata.tenant_id") or source.endswith(
+        ".metadata.aawm_tenant_id"
+    )
+
+
+def _claude_project_identity_is_trusted(
+    record: Dict[str, Any],
+    repository: Optional[str],
+    source: Any,
+) -> bool:
+    if not (
+        repository
+        and _is_claude_session_history_record(record)
+        and _is_claude_project_repository_source(source)
+    ):
+        return True
+    return _is_known_aawm_workspace_repository(repository)
+
+
 def _codex_repository_source_trusted_for_record(record: Dict[str, Any]) -> bool:
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
@@ -14238,6 +14282,89 @@ def _mark_repository_unresolved_metadata(metadata: Dict[str, Any]) -> None:
     metadata["session_history_repository_unresolved_reason"] = (
         _codex_untrusted_repository_reason(metadata)
     )
+
+
+def _session_history_missing_repository_reason(record: Dict[str, Any]) -> str:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    provider = str(record.get("provider") or "").strip().lower()
+    client_name = str(metadata.get("client_name") or "").strip().lower()
+    if provider == "anthropic" or "claude" in client_name:
+        return "no_trusted_claude_project_signal"
+    if provider in {"xai", "grok"} or "grok" in str(record.get("model") or "").lower():
+        return "no_trusted_grok_project_signal"
+    return "no_trusted_repository_signal"
+
+
+def _mark_missing_repository_unresolved(
+    record: Dict[str, Any],
+) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    if _metadata_bool(metadata.get("session_history_reporting_excluded")):
+        record["metadata"] = metadata
+        return
+    if metadata.get("session_history_repository_status") == "unresolved":
+        record["metadata"] = metadata
+        return
+    metadata["session_history_repository_status"] = "unresolved"
+    metadata["session_history_repository_unresolved"] = True
+    metadata["session_history_repository_unresolved_reason"] = (
+        _session_history_missing_repository_reason(record)
+    )
+    record["metadata"] = metadata
+
+
+def _clear_untrusted_claude_project_repository_on_record(
+    record: Dict[str, Any],
+    repository: Optional[str],
+    repository_source: Any,
+) -> Optional[str]:
+    if _claude_project_identity_is_trusted(record, repository, repository_source):
+        return repository
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    if repository:
+        metadata["aawm_original_repository"] = repository
+    source = _clean_non_empty_string(repository_source)
+    if source:
+        metadata["repository_source_untrusted"] = source
+    metadata.pop("repository", None)
+    record["metadata"] = metadata
+    return None
+
+
+def _clear_untrusted_claude_metadata_tenant_on_record(
+    record: Dict[str, Any],
+    tenant_id: str,
+) -> bool:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if not (
+        _is_claude_session_history_record(record)
+        and not _is_known_aawm_workspace_repository(tenant_id)
+        and _is_claude_metadata_tenant_source(metadata.get("tenant_id_source"))
+    ):
+        return False
+    metadata = dict(metadata)
+    metadata["aawm_original_tenant_id"] = tenant_id
+    tenant_source = _clean_non_empty_string(metadata.get("tenant_id_source"))
+    if tenant_source:
+        metadata["tenant_id_source_untrusted"] = tenant_source
+    metadata.pop("tenant_id", None)
+    record["tenant_id"] = None
+    record["metadata"] = metadata
+    if _normalize_repository_identity(record.get("repository")) is None:
+        _mark_missing_repository_unresolved(record)
+    return True
 
 
 def _clear_repository_unresolved_metadata(metadata: Dict[str, Any]) -> None:
@@ -14374,6 +14501,7 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
+    repository_source = metadata.get("repository_source")
     if repository is None:
         repository, repository_source = _extract_repository_identity_from_metadata_sources_with_source(
             ("record.metadata", metadata)
@@ -14391,6 +14519,12 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
             metadata = dict(metadata)
             metadata.setdefault("repository_source", "tenant_id.request_headers")
             record["metadata"] = metadata
+            repository_source = metadata.get("repository_source")
+    repository = _clear_untrusted_claude_project_repository_on_record(
+        record,
+        repository,
+        repository_source,
+    )
     record["repository"] = repository
 
 
@@ -14427,6 +14561,8 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
 
     tenant_id = _normalize_tenant_identity(record.get("tenant_id"))
     if tenant_id:
+        if _clear_untrusted_claude_metadata_tenant_on_record(record, tenant_id):
+            return
         if _clear_untrusted_codex_tenant_on_record(record, tenant_id):
             return
         record["tenant_id"] = tenant_id
@@ -14435,6 +14571,7 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
     repository = _normalize_repository_identity(record.get("repository"))
     if repository is None:
         record["tenant_id"] = None
+        _mark_missing_repository_unresolved(record)
         return
 
     metadata = record.get("metadata")

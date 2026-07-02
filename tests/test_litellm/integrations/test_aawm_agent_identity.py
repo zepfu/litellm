@@ -2511,6 +2511,103 @@ def test_build_session_history_record_rejects_file_like_codex_metadata_repositor
     assert record["tenant_id"] is None
     assert "repository" not in record["metadata"]
     assert "tenant_id" not in record["metadata"]
+    assert record["metadata"]["session_history_repository_status"] == "unresolved"
+    assert record["metadata"]["session_history_repository_unresolved"] is True
+    assert (
+        record["metadata"]["session_history_repository_unresolved_reason"]
+        == "no_trusted_repository_signal"
+    )
+
+
+def test_build_session_history_record_classifies_claude_cli_without_project() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code")
+    kwargs["model"] = "claude-opus-4-8"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-cli-no-project"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-claude-cli-no-project",
+            "trace_environment": "dev",
+            "client_name": "claude-cli",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-claude-cli-no-project",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-07-02T04:12:51Z",
+        end_time="2026-07-02T04:12:52Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert record["metadata"]["client_name"] == "claude-cli"
+    assert record["metadata"]["session_history_repository_status"] == "unresolved"
+    assert record["metadata"]["session_history_repository_unresolved"] is True
+    assert (
+        record["metadata"]["session_history_repository_unresolved_reason"]
+        == "no_trusted_claude_project_signal"
+    )
+    assert "tenant_id_source" not in record["metadata"]
+
+
+def test_build_session_history_record_rejects_unknown_claude_project_owner() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code")
+    kwargs["model"] = "claude-opus-4-8"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-claude-project-owner"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-claude-project-owner",
+            "trace_environment": "dev",
+            "client_name": "claude-cli",
+            "tenant_id": "zepfu",
+            "aawm_tenant_id": "zepfu",
+            "aawm_claude_project": "zepfu",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-claude-project-owner",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-07-02T14:20:17Z",
+        end_time="2026-07-02T14:20:18Z",
+    )
+
+    assert record is not None
+    assert record["repository"] is None
+    assert record["tenant_id"] is None
+    assert "repository" not in record["metadata"]
+    assert "tenant_id" not in record["metadata"]
+    assert record["metadata"]["aawm_original_repository"] == "zepfu"
+    assert record["metadata"]["aawm_original_tenant_id"] == "zepfu"
+    assert (
+        record["metadata"]["repository_source_untrusted"]
+        == "litellm_params.metadata.aawm_claude_project"
+    )
+    assert (
+        record["metadata"]["tenant_id_source_untrusted"]
+        == "litellm_params.metadata.tenant_id"
+    )
+    assert record["metadata"]["session_history_repository_status"] == "unresolved"
+    assert record["metadata"]["session_history_repository_unresolved"] is True
+    assert (
+        record["metadata"]["session_history_repository_unresolved_reason"]
+        == "no_trusted_claude_project_signal"
+    )
 
 
 def test_build_session_history_record_rejects_stale_codex_trace_user_tenant() -> None:

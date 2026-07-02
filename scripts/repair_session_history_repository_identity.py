@@ -133,6 +133,8 @@ _REPOSITORY_UNRESOLVED_KEYS = (
     "session_history_repository_unresolved_reason",
     "repository_identity_classified_at",
     "repository_identity_classification_source",
+    "repository_tenant_fallback_skipped",
+    "trace_user_tenant_fallback_skipped",
 )
 
 
@@ -646,6 +648,75 @@ def _build_unresolved_classification_row(
     }
 
 
+def _fetch_repository_value_params(
+    cursor_id: int,
+    repository_values: list[str],
+    batch_size: int,
+    max_id: Optional[int],
+) -> Tuple[Any, ...]:
+    params: list[Any] = [cursor_id]
+    if max_id is not None:
+        params.append(max_id)
+    params.extend([repository_values, repository_values, batch_size])
+    return tuple(params)
+
+
+def _fetch_null_repository_since_params(
+    cursor_id: int,
+    null_repository_since: str,
+    batch_size: int,
+    max_id: Optional[int],
+) -> Tuple[Any, ...]:
+    params: list[Any] = [cursor_id]
+    if max_id is not None:
+        params.append(max_id)
+    params.extend([null_repository_since, batch_size])
+    return tuple(params)
+
+
+def _fetch_default_candidate_params(
+    *,
+    cursor_id: int,
+    batch_size: int,
+    include_all_grok: bool,
+    null_repository_since: Optional[str],
+    max_id: Optional[int],
+) -> Tuple[Any, ...]:
+    params: list[Any] = [cursor_id]
+    if max_id is not None:
+        params.append(max_id)
+    params.extend(
+        [
+            include_all_grok,
+            "%grok%",
+            _VALID_IDENTITY_SQL,
+            list(_DISALLOWED_IDENTITY_VALUES),
+            list(_DISALLOWED_IDENTITY_VALUES),
+            _AGENT_IDENTITY_SQL,
+            _WAVE_AGENT_IDENTITY_SQL,
+            _TRANSCRIPT_ARTIFACT_SQL,
+            _VALID_IDENTITY_SQL,
+            list(_DISALLOWED_IDENTITY_VALUES),
+            list(_DISALLOWED_IDENTITY_VALUES),
+            _AGENT_IDENTITY_SQL,
+            _WAVE_AGENT_IDENTITY_SQL,
+            _TRANSCRIPT_ARTIFACT_SQL,
+            list(_METADATA_IDENTITY_KEYS),
+            _VALID_IDENTITY_SQL,
+            list(_DISALLOWED_IDENTITY_VALUES),
+            list(_DISALLOWED_IDENTITY_VALUES),
+            _AGENT_IDENTITY_SQL,
+            _WAVE_AGENT_IDENTITY_SQL,
+            _TRANSCRIPT_ARTIFACT_SQL,
+            "%grok%",
+            null_repository_since,
+            null_repository_since,
+            batch_size,
+        ]
+    )
+    return tuple(params)
+
+
 def _fetch_candidate_rows(
     conn: psycopg.Connection,
     *,
@@ -654,14 +725,17 @@ def _fetch_candidate_rows(
     include_all_grok: bool = False,
     null_repository_since: Optional[str] = None,
     repository_values: Optional[list[str]] = None,
+    max_id: Optional[int] = None,
 ) -> list[Dict[str, Any]]:
+    max_id_clause = "AND id <= %s" if max_id is not None else ""
     with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         if repository_values:
             cur.execute(
-                """
+                f"""
                 SELECT id, session_id, provider, model, repository, tenant_id, metadata, created_at
                 FROM public.session_history
                 WHERE id > %s
+                  {max_id_clause}
                   AND (
                         repository = ANY(%s::text[])
                      OR tenant_id = ANY(%s::text[])
@@ -669,39 +743,36 @@ def _fetch_candidate_rows(
                 ORDER BY id ASC
                 LIMIT %s
                 """,
-                (
-                    cursor_id,
-                    repository_values,
-                    repository_values,
-                    batch_size,
+                _fetch_repository_value_params(
+                    cursor_id, repository_values, batch_size, max_id
                 ),
             )
             return [dict(row) for row in cur.fetchall()]
 
         if null_repository_since and not include_all_grok:
             cur.execute(
-                """
+                f"""
                 SELECT id, session_id, provider, model, repository, tenant_id, metadata, created_at
                 FROM public.session_history
                 WHERE id > %s
+                  {max_id_clause}
                   AND repository IS NULL
                   AND created_at >= %s::timestamptz
                 ORDER BY id ASC
                 LIMIT %s
                 """,
-                (
-                    cursor_id,
-                    null_repository_since,
-                    batch_size,
+                _fetch_null_repository_since_params(
+                    cursor_id, null_repository_since, batch_size, max_id
                 ),
             )
             return [dict(row) for row in cur.fetchall()]
 
         cur.execute(
-            """
+            f"""
             SELECT id, session_id, provider, model, repository, tenant_id, metadata, created_at
             FROM public.session_history
             WHERE id > %s
+              {max_id_clause}
               AND (
                     (
                         %s
@@ -758,33 +829,12 @@ def _fetch_candidate_rows(
             ORDER BY id ASC
             LIMIT %s
             """,
-            (
-                cursor_id,
-                include_all_grok,
-                "%grok%",
-                _VALID_IDENTITY_SQL,
-                list(_DISALLOWED_IDENTITY_VALUES),
-                list(_DISALLOWED_IDENTITY_VALUES),
-                _AGENT_IDENTITY_SQL,
-                _WAVE_AGENT_IDENTITY_SQL,
-                _TRANSCRIPT_ARTIFACT_SQL,
-                _VALID_IDENTITY_SQL,
-                list(_DISALLOWED_IDENTITY_VALUES),
-                list(_DISALLOWED_IDENTITY_VALUES),
-                _AGENT_IDENTITY_SQL,
-                _WAVE_AGENT_IDENTITY_SQL,
-                _TRANSCRIPT_ARTIFACT_SQL,
-                list(_METADATA_IDENTITY_KEYS),
-                _VALID_IDENTITY_SQL,
-                list(_DISALLOWED_IDENTITY_VALUES),
-                list(_DISALLOWED_IDENTITY_VALUES),
-                _AGENT_IDENTITY_SQL,
-                _WAVE_AGENT_IDENTITY_SQL,
-                _TRANSCRIPT_ARTIFACT_SQL,
-                "%grok%",
-                null_repository_since,
-                null_repository_since,
-                batch_size,
+            _fetch_default_candidate_params(
+                cursor_id=cursor_id,
+                batch_size=batch_size,
+                include_all_grok=include_all_grok,
+                null_repository_since=null_repository_since,
+                max_id=max_id,
             ),
         )
         return [dict(row) for row in cur.fetchall()]
@@ -887,6 +937,7 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
                 include_all_grok=grok_repository is not None,
                 null_repository_since=args.null_repository_since,
                 repository_values=args.repository_value,
+                max_id=args.max_id,
             )
             if not rows:
                 break
@@ -897,7 +948,11 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
                 for row in rows
                 if row.get("session_id")
             }
-            session_identity_rows = _fetch_session_identity_rows(conn, session_ids)
+            session_identity_rows = (
+                []
+                if args.skip_session_evidence
+                else _fetch_session_identity_rows(conn, session_ids)
+            )
             if args.null_repository_since:
                 session_repositories = _build_unique_session_repository_map(
                     session_identity_rows,
@@ -1008,6 +1063,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="Apply repairs.")
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--cursor-id", type=int, default=0)
+    parser.add_argument(
+        "--max-id",
+        type=int,
+        default=None,
+        help=(
+            "Optional upper bound on session_history.id. When set, candidate fetches "
+            "only include rows with id <= this value."
+        ),
+    )
     parser.add_argument("--preview-limit", type=int, default=20)
     parser.add_argument("--projects-dir", default="/home/zepfu/projects")
     parser.add_argument("--memories-dir", default="/home/zepfu/.codex/memories")
@@ -1040,6 +1104,14 @@ def _parse_args() -> argparse.Namespace:
             "For --null-repository-since runs: when a row cannot be repaired to a known repository, "
             "stamp durable classification metadata instead of leaving it blank. "
             "Requires --apply to persist. Does not set repository or tenant for unresolved rows."
+        ),
+    )
+    parser.add_argument(
+        "--skip-session-evidence",
+        action="store_true",
+        help=(
+            "Skip same-session identity expansion. Use for exact known repository "
+            "repair passes where each candidate row already contains enough evidence."
         ),
     )
     return parser.parse_args()
