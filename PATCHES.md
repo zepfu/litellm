@@ -53,6 +53,35 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.111 — Session-history repository attribution and release-verifier rollup
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.111`. This release
+rolls up develop work since aawm.110, including stricter unresolved repository
+classification for `session_history`, rejection of untrusted owner labels as
+repository/tenant identities, bounded repair support with `--max-id` and
+`--skip-session-evidence`, the target-aware runtime release verifier, model
+output replay tooling, refreshed Anthropic model metadata for Claude Sonnet 5
+and Fable 5, and provider-status observation handling for reset-credit and
+telemetry anomaly data.
+
+**Why:** Production was still able to write rows such as `repository_untrusted`
+from stale/untrusted repo signals after the dev-side attribution fix had been
+verified. Operators need the production callback wheel and released image to
+apply the same durable repository classification rules as `litellm-dev`, plus a
+release verifier that can prove prod uses a released image and writes the
+expected `session_history` attribution.
+
+**Why not upstream:** These behaviors are specific to AAWM's fork-local
+session-history schema, local repo/tenant attribution conventions, provider
+observation sidecars, and AAWM release validation workflow.
+
+**Validation status:** Dev validation for the attribution fix wrote marker row
+`1921480` with `repository=litellm` and `tenant_id=litellm`, then repaired
+known bad rows through `session_history.id <= 1921498`. Production promotion
+must follow `PROD_RELEASE.md`, publish the new fork image and callback overlay,
+rebuild `aawm-litellm`, verify `:4000`, and repair any prod drift written after
+that cutoff.
+
 ### aawm.110 — Harness session-history repository attribution repair
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.110`. Session-history
