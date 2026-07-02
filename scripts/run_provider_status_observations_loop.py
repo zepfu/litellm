@@ -465,6 +465,8 @@ null_repository_clusters AS (
     FROM base
     WHERE NULLIF(BTRIM(COALESCE(repository, '')), '') IS NULL
       AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
+      AND COALESCE(metadata->>'session_history_repository_status', '') <> 'unresolved'
+      AND COALESCE(metadata->>'session_history_repository_unresolved', 'false') <> 'true'
     GROUP BY
         provider,
         model,
@@ -533,6 +535,8 @@ anomalies AS (
           OR LEFT(COALESCE(inbound_model_alias, ''), 5) = 'aawm-'
       )
       AND COALESCE(metadata->>'session_history_reporting_excluded', 'false') <> 'true'
+      AND COALESCE(metadata->>'session_history_repository_status', '') <> 'unresolved'
+      AND COALESCE(metadata->>'session_history_repository_unresolved', 'false') <> 'true'
       AND NOT (
           COALESCE(metadata->>'tenant_id_source', '') = 'repository_untrusted'
           AND COALESCE(
