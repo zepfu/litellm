@@ -838,6 +838,14 @@ fields when present, but the durable table is populated only by runtime
 session-history ingestion or by older Langfuse rows that still carried the
 inline `aawm_tool_definition_snapshot` value.
 
+`scripts/backfill_session_history.py` in `--source-mode langfuse_clickhouse` reads
+Langfuse ClickHouse `observations` in batches. By default it does **not** select
+`o.input` or `o.output` (the query uses `NULL AS observation_input` /
+`observation_output`) to avoid scanning large payload blobs across broad time
+windows. Reconstruction still uses trace fields, observation metadata, usage/cost
+columns, and `tool_calls` / `tool_call_names`. Pass `--clickhouse-include-payloads`
+when you explicitly need full input/output hydration from ClickHouse.
+
 ## Langfuse Metadata Compaction
 
 Langfuse generation metadata is intentionally more compact than
