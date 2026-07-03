@@ -36,12 +36,13 @@ def test_should_repair_rollout_memory_filename_from_memory_registry(tmp_path) ->
     )
 
     assert repaired is not None
-    assert repaired["repository"] == "litellm (memory)"
-    assert repaired["tenant_id"] == "litellm (memory)"
+    assert repaired["repository"] == "litellm"
+    assert repaired["tenant_id"] == "litellm"
+    assert repaired["metadata"]["memory_workload_label"] == "litellm (memory)"
     assert repaired["repair_source"] == "rollout_memory_registry"
-    assert repaired["metadata"]["repository"] == "litellm (memory)"
+    assert repaired["metadata"]["repository"] == "litellm"
     assert repaired["metadata"]["source_repository"] == "litellm"
-    assert repaired["metadata"]["trace_user_id"] == "litellm (memory)"
+    assert repaired["metadata"].get("trace_user_id") in (None, "litellm")
 
 
 def test_should_null_placeholder_repository_without_guessing() -> None:
@@ -138,8 +139,8 @@ def test_should_not_override_valid_memory_repository_from_rollout_metadata(
     )
 
     assert repaired is not None
-    assert repaired["repository"] == "aawm-tap (memory)"
-    assert repaired["tenant_id"] == "aawm-tap (memory)"
+    assert repaired["repository"] == "aawm-tap"
+    assert repaired["tenant_id"] == "aawm-tap"
     assert repaired["metadata"]["source_repository"] == "aawm-tap"
 
 
@@ -407,6 +408,33 @@ def test_should_repair_known_repository_untrusted_tenant_source() -> None:
     assert "session_history_repository_unresolved" not in repaired["metadata"]
 
 
+def test_should_repair_trace_user_untrusted_known_repository() -> None:
+    repaired = repair._build_repaired_row(
+        {
+            "id": 28,
+            "session_id": "trace-untrusted-session",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "repository": "litellm",
+            "tenant_id": None,
+            "metadata": {
+                "repository": "litellm",
+                "tenant_id_source": "trace_user_untrusted",
+                "trace_user_tenant_fallback_skipped": True,
+            },
+        },
+        {"litellm"},
+        {},
+    )
+
+    assert repaired is not None
+    assert repaired["repository"] == "litellm"
+    assert repaired["tenant_id"] == "litellm"
+    assert repaired["repair_source"] == "known_repository_untrusted_tenant_repair"
+    assert repaired["metadata"]["tenant_id_source"] == "repository_repair"
+    assert repaired["metadata"]["session_history_repository_status"] == "repaired"
+
+
 def test_should_not_classify_reporting_excluded_null_repository() -> None:
     classified = repair._build_unresolved_classification_row(
         {
@@ -569,3 +597,8 @@ def test_should_include_max_id_in_default_candidate_fetch() -> None:
     assert params[0] == 1
     assert 42 in params
     assert params[-1] == 50
+    assert "metadata->>'tenant_id_source'" in statement
+    assert "repository_untrusted" in statement
+    assert "trace_user_untrusted" in statement
+    assert "repository LIKE '%% (memory)'" in statement
+    assert "tenant_id LIKE '%% (memory)'" in statement

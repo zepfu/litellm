@@ -417,9 +417,10 @@ def test_aawm_agent_identity_promotes_codex_memory_repository_trace_user_id() ->
     assert result == {"choices": []}
     metadata = updated_kwargs["litellm_params"]["metadata"]
     headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
-    assert metadata["trace_user_id"] == "pytest-classifier (memory)"
-    assert headers["langfuse_trace_user_id"] == "pytest-classifier (memory)"
-    assert metadata["repository"] == "pytest-classifier (memory)"
+    assert metadata["trace_user_id"] == "pytest-classifier"
+    assert headers["langfuse_trace_user_id"] == "pytest-classifier"
+    assert metadata["repository"] == "pytest-classifier"
+    assert metadata["memory_workload_label"] == "pytest-classifier (memory)"
     assert metadata["source_repository"] == "pytest-classifier"
     assert metadata["workload_type"] == "agent_memory"
     assert metadata["workload_subtype"] == "codex_memory_writer"
@@ -1326,6 +1327,7 @@ def test_normalize_repository_identity_rejects_nested_project_file_paths_and_bar
         ),
         "aegis commits=3a131aa skip_tests=true",
         "aawm-tap-dashboard all=true",
+        "aawm-tap...pper",
         "aawm-tap\\n\\n\\ (memory)",
         "...",
         "0",
@@ -2026,10 +2028,11 @@ def test_build_session_history_record_labels_codex_memory_repository() -> None:
     )
 
     assert record is not None
-    assert record["repository"] == "mcp-pg (memory)"
-    assert record["tenant_id"] == "mcp-pg (memory)"
-    assert record["metadata"]["repository"] == "mcp-pg (memory)"
-    assert record["metadata"]["tenant_id"] == "mcp-pg (memory)"
+    assert record["repository"] == "mcp-pg"
+    assert record["tenant_id"] == "mcp-pg"
+    assert record["metadata"]["repository"] == "mcp-pg"
+    assert record["metadata"]["tenant_id"] == "mcp-pg"
+    assert record["metadata"]["memory_workload_label"] == "mcp-pg (memory)"
     assert record["metadata"]["tenant_id_source"] == "repository"
     assert record["metadata"]["source_repository"] == "mcp-pg"
     assert record["metadata"]["workload_type"] == "agent_memory"
@@ -2088,8 +2091,9 @@ def test_build_session_history_record_labels_root_codex_memory_workspace() -> No
     )
 
     assert record is not None
-    assert record["repository"] == "codex-memories (memory)"
-    assert record["tenant_id"] == "codex-memories (memory)"
+    assert record["repository"] == "codex-memories"
+    assert record["tenant_id"] == "codex-memories"
+    assert record["metadata"]["memory_workload_label"] == "codex-memories (memory)"
     assert record["metadata"]["source_repository"] == "codex-memories"
     assert record["metadata"]["workload_type"] == "agent_memory"
     assert record["metadata"]["workload_subtype"] == "codex_memory_writer"
@@ -2608,6 +2612,45 @@ def test_build_session_history_record_rejects_unknown_claude_project_owner() -> 
         record["metadata"]["session_history_repository_unresolved_reason"]
         == "no_trusted_claude_project_signal"
     )
+
+
+def test_build_session_history_record_promotes_known_repo_after_stale_trace_user() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-codex-known-after-stale-trace"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-codex-known-after-stale-trace",
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "trace_user_id": "aegis",
+            "tenant_id": "aegis",
+            "tenant_id_source": "litellm_params.metadata.trace_user_id",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.5",
+        "input": [],
+        "litellm_metadata": {"repository": "litellm"},
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-known-after-stale",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-07-02T12:00:00Z",
+        end_time="2026-07-02T12:00:01Z",
+    )
+
+    assert record is not None
+    assert record["repository"] == "litellm"
+    assert record["tenant_id"] == "litellm"
+    assert record["metadata"]["tenant_id_source"] == "repository"
 
 
 def test_build_session_history_record_rejects_stale_codex_trace_user_tenant() -> None:
