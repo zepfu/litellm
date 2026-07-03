@@ -241,9 +241,14 @@ telemetry anomaly scan. This is separate from the five-minute provider
 front-door probes and the hourly credential or billing tasks. When enabled, the
 scan reads recent `public.session_history` and `public.rate_limit_observations`
 rows and looks for persistence or mapping inconsistencies such as missing
-provider/model fields, alias metadata that was not promoted, token or git/tool
-activity counters that do not match persisted activity, or stale rate-limit
-reset timestamps that still have matching recent traffic.
+provider/model fields, alias metadata that was not promoted, token or tool
+activity counters that do not match persisted activity, parsed git commit/push
+activity counters that were not rolled up to `session_history`, or stale
+rate-limit reset timestamps that still have matching recent traffic. Git
+commit/push anomaly triggers use the parsed `session_history_tool_activity`
+counter fields; broad command-text regex matches are retained only as bounded
+example context because shell heredocs and generated notes can mention
+`git commit` without executing it.
 
 The `missing_repository_for_agent_context` class is limited to rows where a
 repository should be derivable from trusted agent or AAWM alias context. Generic
