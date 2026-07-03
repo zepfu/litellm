@@ -2709,6 +2709,23 @@ def test_observability_session_history_anomaly_sql_classifies_null_repository_cl
     assert "metadata->>'session_history_repository_unresolved', 'false') <> 'true'" in sql
 
 
+def test_observability_git_anomalies_use_parsed_tool_activity_counts() -> None:
+    sql = loop.OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL
+    commit_branch = sql.split(
+        "'git_commit_activity_not_reflected' AS anomaly_class", 1
+    )[1].split("UNION ALL", 1)[0]
+    push_branch = sql.split(
+        "'git_push_activity_not_reflected' AS anomaly_class", 1
+    )[1].split("),\nranked AS", 1)[0]
+
+    assert "'activity_git_commit_command', activity_git_commit_command" in commit_branch
+    assert "'activity_git_push_command', activity_git_push_command" in push_branch
+    assert "AND activity_git_commit_count > 0" in commit_branch
+    assert "AND activity_git_push_count > 0" in push_branch
+    assert "OR activity_git_commit_command" not in commit_branch
+    assert "OR activity_git_push_command" not in push_branch
+
+
 def test_observability_rate_limit_anomaly_sql_filters_recent_unscoped_observations() -> None:
     sql = loop.OBSERVABILITY_RATE_LIMIT_ANOMALY_SQL
     assert "observed_at >=" in sql

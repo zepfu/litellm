@@ -702,10 +702,7 @@ anomalies AS (
         1 AS row_weight
     FROM base
     WHERE git_commit_count = 0
-      AND (
-          activity_git_commit_count > 0
-          OR activity_git_commit_command
-      )
+      AND activity_git_commit_count > 0
 
     UNION ALL
 
@@ -725,10 +722,7 @@ anomalies AS (
         1 AS row_weight
     FROM base
     WHERE git_push_count = 0
-      AND (
-          activity_git_push_count > 0
-          OR activity_git_push_command
-      )
+      AND activity_git_push_count > 0
 ),
 ranked AS (
     SELECT
