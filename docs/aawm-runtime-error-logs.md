@@ -55,6 +55,25 @@ metadata repair:
 Ownership or mode repair failures are swallowed after the JSONL line is written.
 Error-intake logging must never fail a client request or the sidecar scan loop.
 
+### Repo-local `.analysis` mounts for non-root sidecars
+
+Some non-root third-party containers (for example Langfuse `web` and `worker`)
+append runtime JSONL through the AAWM container wrapper with
+`AAWM_ERROR_JSONL_DIR=/aawm-analysis`, bind-mounting this repo's `.analysis`
+directory at `/aawm-analysis`. The mount must be writable by the container's
+effective user or one of its groups, not only by the host checkout owner.
+Root-owned LiteLLM metadata repair does not apply to these wrapper paths.
+
+On hosts where the container user has supplemental group id `1000` (common when
+the process runs as a fixed non-root uid with gid `1000` in the image), the
+host `.analysis` directory typically needs group-write permission (for example
+mode `2775` or `775` with group matching that supplemental gid) so append and
+create of `<container-name>-error.jsonl` succeed.
+
+Verify with an in-container probe: a non-destructive write test under
+`/aawm-analysis`, or confirming the wrapper can open the intended `*-error.jsonl`
+without `permission denied` in container logs.
+
 ## JSONL intake shape
 
 The sink writes append-safe newline-delimited JSON. Each line is one complete
