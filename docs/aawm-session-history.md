@@ -76,6 +76,26 @@ status sidecar as `large_null_repository_cluster` anomalies until they are
 repaired or stamped with an explicit durable unresolved classification such as
 `metadata.session_history_repository_status=unresolved`.
 
+
+Codex memory-writing workloads still record `metadata.source_repository`,
+`metadata.workload_type`, and `metadata.workload_subtype` (and optional
+`metadata.memory_workload_label` such as `litellm (memory)`) for diagnostics,
+but `session_history.repository` and `session_history.tenant_id` group on the
+base workspace repository (for example `litellm`) so dashboards do not split
+memory traffic into a separate pseudo-repo.
+
+Truncated or placeholder repository labels containing `...` are never accepted
+as repository identities; repair jobs classify or resolve them instead of
+preserving them on `repository` or `tenant_id`.
+
+When a row already has a known workspace `repository` but
+`metadata.tenant_id_source` is `repository_untrusted` or `trace_user_untrusted`
+from an earlier stale `trace_user_id` or untrusted metadata pass, normalization
+and `repair_session_history_repository_identity.py` may repair the row to
+`repository=tenant_id=<known repo>` with `metadata.session_history_repository_status=repaired`
+and `metadata.tenant_id_source=repository_repair`. Stale `trace_user_id` rejection
+does not block that promotion when a valid current repository label is present.
+
 Stale Codex `metadata.trace_user_id` values from compact/resume history are
 diagnostic only. They may remain in `metadata.trace_user_id` for Langfuse and
 session-history inspection, but LiteLLM does not promote them to
