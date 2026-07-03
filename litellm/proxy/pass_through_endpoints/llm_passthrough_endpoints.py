@@ -14883,6 +14883,27 @@ _GROK_COMPOSER_LITERAL_TOOL_END_MARKER_RE = re.compile(
     r"^\s*(?:<\|tool_call_end\|>|<\|tool_calls_end\|>|<｜tool▁call▁end｜>|<｜tool▁calls▁end｜>)+\s*$"
 )
 _GROK_COMPOSER_LITERAL_TOOL_ARGUMENT_METADATA_KEYS = frozenset({"description"})
+_GROK_COMPOSER_LITERAL_CONTEXT_NOTE_LINE_RE = re.compile(
+    r"(?im)^\s*\[Context note - prior assistant step; not an executable tool invocation\]\s*$"
+)
+
+
+def _grok_composer_literal_tool_block_strip_start(text: str, label_start: int) -> int:
+    if not isinstance(text, str) or label_start <= 0:
+        return label_start
+
+    prefix = text[:label_start]
+    context_note_matches = list(
+        _GROK_COMPOSER_LITERAL_CONTEXT_NOTE_LINE_RE.finditer(prefix)
+    )
+    if not context_note_matches:
+        return label_start
+
+    context_note_match = context_note_matches[-1]
+    between = prefix[context_note_match.end() : label_start]
+    if between.strip():
+        return label_start
+    return context_note_match.start()
 
 
 def _parse_grok_composer_literal_tool_label_blocks(
@@ -14897,7 +14918,10 @@ def _parse_grok_composer_literal_tool_label_blocks(
         return []
 
     for index, label_match in enumerate(label_matches):
-        block_start = label_match.start()
+        block_start = _grok_composer_literal_tool_block_strip_start(
+            text,
+            label_match.start(),
+        )
         has_following_tool_block = index + 1 < len(label_matches)
         block_end = (
             label_matches[index + 1].start()
@@ -15051,11 +15075,19 @@ def _strip_text_spans(text: str, spans: list[tuple[int, int]]) -> str:
     ]
     if not normalized_spans:
         return text
+    merged_spans: list[tuple[int, int]] = []
+    for start, end in sorted(normalized_spans, key=lambda span: span[0]):
+        if not merged_spans:
+            merged_spans.append((start, end))
+            continue
+        previous_start, previous_end = merged_spans[-1]
+        if start <= previous_end:
+            merged_spans[-1] = (previous_start, max(previous_end, end))
+            continue
+        merged_spans.append((start, end))
     segments: list[str] = []
     cursor = 0
-    for start, end in sorted(normalized_spans, key=lambda span: span[0]):
-        if start < cursor:
-            continue
+    for start, end in merged_spans:
         if start > cursor:
             segments.append(text[cursor:start])
         cursor = max(cursor, end)
@@ -15184,6 +15216,27 @@ def _build_repaired_grok_composer_function_call_output_item(
     }
 
 
+def _dedupe_repaired_grok_composer_call_id(
+    call_id: Optional[str],
+    *,
+    block_index: int,
+    used_call_ids: set[str],
+) -> Optional[str]:
+    if not isinstance(call_id, str) or not call_id.strip():
+        return call_id
+    normalized_call_id = call_id.strip()
+    if normalized_call_id not in used_call_ids:
+        used_call_ids.add(normalized_call_id)
+        return normalized_call_id
+    deduped_call_id = f"{normalized_call_id}_repaired_{block_index}"
+    suffix = 2
+    while deduped_call_id in used_call_ids:
+        deduped_call_id = f"{normalized_call_id}_repaired_{block_index}_{suffix}"
+        suffix += 1
+    used_call_ids.add(deduped_call_id)
+    return deduped_call_id
+
+
 def _repair_grok_composer_literal_tool_calls_in_text(
     text: str,
     *,
@@ -15195,6 +15248,7 @@ def _repair_grok_composer_literal_tool_calls_in_text(
 
     repaired_items: list[dict[str, Any]] = []
     strip_spans: list[tuple[int, int]] = []
+    used_call_ids: set[str] = set()
     for block_index, block in enumerate(blocks):
         tool_name = str(block.get("name") or "").strip()
         try:
@@ -15219,12 +15273,15 @@ def _repair_grok_composer_literal_tool_calls_in_text(
             return None, []
         if not isinstance(parsed_arguments, dict):
             return None, []
+        repaired_call_id = _dedupe_repaired_grok_composer_call_id(
+            block.get("call_id") if isinstance(block.get("call_id"), str) else None,
+            block_index=block_index,
+            used_call_ids=used_call_ids,
+        )
         repaired_items.append(
             _build_repaired_grok_composer_function_call_output_item(
                 tool_name=tool_name,
-                call_id=block.get("call_id")
-                if isinstance(block.get("call_id"), str)
-                else None,
+                call_id=repaired_call_id,
                 arguments=parsed_arguments,
                 block_index=block_index,
             )

@@ -23574,6 +23574,52 @@ def _d1_424_literal_exec_response_payload() -> dict:
     }
 
 
+def _d1_472_repeated_context_note_exec_command_literal_text() -> str:
+    call_id = (
+        "call-f0c7a3d1-a991-47f5-9b64-7c8acfc0e274-composer_call_0w5Q6"
+    )
+    workdir = "/home/zepfu/projects/aegis"
+    commands = [
+        "sed -n '220,320p' /home/zepfu/projects/aegis/scripts/criu/checkpointer.sh",
+        (
+            'rg -n "NetworkMode|host" /home/zepfu/projects/aegis/scripts/criu '
+            "/home/zepfu/projects/aegis/tests/test_criu_scripts.py"
+        ),
+        "sed -n '120,220p' /home/zepfu/projects/aegis/scripts/criu/README.md",
+    ]
+    blocks: list[str] = []
+    for cmd in commands:
+        payload = json.dumps({"cmd": cmd, "workdir": workdir}, ensure_ascii=False)
+        blocks.append(
+            "[Context note - prior assistant step; not an executable tool invocation]\n"
+            "Tool label: exec_command\n"
+            f"Correlation ref: {call_id}\n"
+            f"Input payload: {payload}"
+        )
+    return "\n".join(blocks)
+
+
+def _d1_472_repeated_context_note_exec_command_response_payload() -> dict[str, Any]:
+    return {
+        "id": "resp_d1_472_repeated_context_note_exec_command",
+        "object": "response",
+        "status": "completed",
+        "model": "grok-composer-2.5-fast",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": _d1_472_repeated_context_note_exec_command_literal_text(),
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def test_codex_auto_agent_malformed_detector_flags_d1_419_literal_apply_patch_transcript():
     from litellm.integrations.aawm_agent_quality_rules import (
         is_malformed_composer_call_literal_text,
@@ -23720,8 +23766,52 @@ def test_codex_auto_agent_grok_native_repairs_d1_439_fresh_tool_label_shape():
         "Checking candidate key counts and how `expected_status` applies to dict rejections."
         in json.dumps(repaired)
     )
+    assert "Context note" not in json.dumps(repaired)
     assert "Tool label:" not in json.dumps(repaired)
     assert "Input payload:" not in json.dumps(repaired)
+
+
+
+def test_codex_auto_agent_grok_native_repairs_d1_472_repeated_context_note_exec_command_blocks():
+    request_body = _grok_composer_exec_command_tool_request_body()
+    response_body = _d1_472_repeated_context_note_exec_command_response_payload()
+
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(response_body) is True
+
+    repaired = _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+        response_body,
+        request_body=request_body,
+    )
+
+    assert repaired is not None
+    assert _is_codex_auto_agent_malformed_tool_call_text_output(repaired) is False
+    rendered_repaired = json.dumps(repaired)
+    assert "Context note" not in rendered_repaired
+    assert "Tool label:" not in rendered_repaired
+    assert "Input payload:" not in rendered_repaired
+    assert "Correlation ref:" not in rendered_repaired
+
+    function_calls = [
+        item
+        for item in repaired["output"]
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+    assert len(function_calls) == 3
+    assert all(item["name"] == "exec_command" for item in function_calls)
+    call_ids = [item["call_id"] for item in function_calls]
+    assert len(set(call_ids)) == len(call_ids)
+    assert call_ids[0] == (
+        "call-f0c7a3d1-a991-47f5-9b64-7c8acfc0e274-composer_call_0w5Q6"
+    )
+    assert call_ids[1].endswith("_repaired_1")
+    assert call_ids[2].endswith("_repaired_2")
+    for item in function_calls:
+        args = json.loads(item["arguments"])
+        assert args["workdir"] == "/home/zepfu/projects/aegis"
+        assert isinstance(args["cmd"], str) and args["cmd"]
+    assert json.loads(function_calls[0]["arguments"])["cmd"] == (
+        "sed -n '220,320p' /home/zepfu/projects/aegis/scripts/criu/checkpointer.sh"
+    )
 
 
 def test_codex_auto_agent_grok_native_repairs_literal_exec_with_fullwidth_tool_markers():
