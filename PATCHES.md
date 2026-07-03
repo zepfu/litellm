@@ -53,6 +53,25 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.113 — Session-history attribution prod release head
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.113` on top of the
+`aawm.112` session-history repository/tenant attribution fix and the callback
+artifact autobump that moved the production callback overlay to `cb-v0.0.60`.
+
+**Why:** The initial `v1.82.3-aawm.112` tag was cut before the callback artifact
+autobump moved `main`. The production release runbook requires preserving that
+tag and cutting a new image tag from the new `main` head rather than
+force-moving an already-published release tag.
+
+**Why not upstream:** This is AAWM release-line bookkeeping for fork image and
+overlay artifact coherence.
+
+**Validation status:** Same focused D1-465 validation as `aawm.112`: identity
+tests, repair-script tests, dev refresh proof, and live session-history repair
+verification. Production deployment should pin the `aawm.113` image and consume
+callback overlay `cb-v0.0.60`.
+
 ### aawm.112 — Session-history repository tenant repair hardening
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.112`. Session-history
