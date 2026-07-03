@@ -71,6 +71,7 @@ from litellm.integrations.aawm_agent_identity import (
     _derive_langfuse_trace_tags_from_spend_log_row,
     _ensure_session_history_schema,
     _extract_repository_identity_from_metadata_sources,
+    _extract_repository_identity_from_metadata_sources_with_source,
     _extract_tenant_identity_from_metadata_sources,
     _persist_session_history_records,
     _safe_float,
@@ -2012,11 +2013,11 @@ def _derive_session_history_tenant_identity(
     if str(row.get("tenant_id") or "").strip():
         return None, None
 
-    repository = _extract_repository_identity_from_metadata_sources(
+    repository, repository_source = _extract_repository_identity_from_metadata_sources_with_source(
         ("session_history.metadata", metadata),
     )
     if repository:
-        return repository, "session_history.metadata.repository"
+        return repository, repository_source or "session_history.metadata.repository"
 
     repository = _extract_repository_identity_from_metadata_sources(
         ("session_history", {"repository": row.get("repository")}),

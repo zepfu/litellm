@@ -33,6 +33,19 @@ route grouping and drill-down. `session_history.tenant_id` is stricter: LiteLLM
 only falls back from repository to tenant when metadata records a trusted
 `repository_source`.
 
+When request-time metadata includes a bounded route-rollup group header such as
+`metadata.aawm_route_rollup_context.group_header_label='aegis@Claude[2.1.199]'`,
+LiteLLM may recover the normalized repository prefix (`aegis`) for
+`session_history.repository` and, when no stronger explicit tenant signal is
+present, for `session_history.tenant_id`, but only when the prefix is a known
+AAWM workspace repository. This fallback runs only after explicit tenant headers
+and explicit repository metadata keys; it does not promote
+`langfuse_trace_user_id`, `trace_user_id`, owner labels such as `zepfu`, or
+other stale Codex trace-user values. Historical rows that never stored rollup
+context in
+`session_history.metadata` may require Langfuse observation metadata during
+backfill or `repair_session_history_repository_identity.py` repair passes.
+
 Trusted repository sources include explicit repository headers, explicit
 metadata or `litellm_metadata` keys, and current workspace context such as
 `<environment_context><cwd>...</cwd></environment_context>`,
