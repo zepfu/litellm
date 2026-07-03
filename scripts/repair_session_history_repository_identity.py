@@ -228,6 +228,53 @@ def _repo_base(identity: str) -> str:
     return identity
 
 
+def _is_truncated_repository_label(value: Any) -> bool:
+    return isinstance(value, str) and "..." in value.strip()
+
+
+def _apply_dashboard_repository_grouping(
+    repository: Optional[str],
+    tenant_id: Optional[str],
+    metadata: Dict[str, Any],
+    *,
+    original_repository: Any,
+    original_tenant_id: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    if _is_truncated_repository_label(repository) or _is_truncated_repository_label(
+        tenant_id
+    ):
+        metadata.pop("repository", None)
+        metadata.pop("tenant_id", None)
+        metadata.pop("tenant_id_source", None)
+        return None, None
+
+    memory_context = (
+        _has_memory_suffix(original_repository)
+        or _has_memory_suffix(original_tenant_id)
+        or _has_memory_suffix(metadata.get("repository"))
+        or metadata.get("workload_type") == "agent_memory"
+        or (
+            isinstance(repository, str)
+            and repository.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX)
+        )
+    )
+    if not repository:
+        return repository, tenant_id
+
+    if memory_context or repository.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
+        base = _repo_base(repository)
+        metadata["source_repository"] = base
+        metadata["workload_type"] = metadata.get("workload_type") or "agent_memory"
+        metadata.setdefault("workload_subtype", "codex_memory_writer")
+        metadata["memory_workload_label"] = f"{base}{_CODEX_MEMORY_REPOSITORY_SUFFIX}"
+        repository = base
+        if tenant_id is None or _has_memory_suffix(tenant_id) or tenant_id in (
+            original_repository,
+            original_tenant_id,
+        ):
+            tenant_id = base
+    return repository, tenant_id
+
 def _has_memory_suffix(value: Any) -> bool:
     return isinstance(value, str) and value.strip().endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX)
 
@@ -255,8 +302,6 @@ def _rollout_repository_candidate(
     for name in names:
         repository = rollout_repository_map.get(name)
         if repository:
-            if _has_memory_suffix(value):
-                return f"{repository}{_CODEX_MEMORY_REPOSITORY_SUFFIX}"
             return repository
     return None
 
@@ -431,6 +476,8 @@ def _build_repaired_row(  # noqa: PLR0915
     original_tenant_id = row.get("tenant_id")
 
     repository = _repair_noisy_identity(original_repository, known_repositories)
+    if _is_truncated_repository_label(original_repository):
+        repository = None
     metadata_repository = _repair_noisy_identity(
         metadata.get("repository"), known_repositories
     )
@@ -497,10 +544,16 @@ def _build_repaired_row(  # noqa: PLR0915
     if tenant_id is None:
         tenant_id = repaired_tenant_id or repository
 
+    repository, tenant_id = _apply_dashboard_repository_grouping(
+        repository,
+        tenant_id,
+        metadata,
+        original_repository=original_repository,
+        original_tenant_id=original_tenant_id,
+    )
+
     if repository is not None:
         metadata["repository"] = repository
-        if repository.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
-            metadata["source_repository"] = _repo_base(repository)
     else:
         metadata.pop("repository", None)
         if _is_bad_repository_fragment(
@@ -547,6 +600,14 @@ def _build_repaired_row(  # noqa: PLR0915
         )
         repair_source = "unresolved_identity_cleanup"
     else:
+        if (
+            repository is not None
+            and tenant_id == repository
+            and _is_known_repository(repository, known_repositories)
+            and original_metadata.get("tenant_id_source")
+            in {"repository_untrusted", "trace_user_untrusted"}
+        ):
+            repair_source = "known_repository_untrusted_tenant_repair"
         metadata["session_history_repository_status"] = "repaired"
         metadata["session_history_repository_status_source"] = repair_source
         for key in _REPOSITORY_UNRESOLVED_KEYS:
@@ -824,6 +885,14 @@ def _fetch_candidate_rows(
                         %s::timestamptz IS NOT NULL
                     AND repository IS NULL
                     AND created_at >= %s::timestamptz
+                    )
+                 OR repository LIKE '%%...%%'
+                 OR tenant_id LIKE '%%...%%'
+                 OR repository LIKE '%% (memory)'
+                 OR tenant_id LIKE '%% (memory)'
+                 OR COALESCE(metadata->>'tenant_id_source', '') IN (
+                        'repository_untrusted',
+                        'trace_user_untrusted'
                     )
               )
             ORDER BY id ASC

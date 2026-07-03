@@ -2301,6 +2301,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "workload_type",
     "workload_subtype",
     "source_repository",
+    "memory_workload_label",
     "trace_name",
     "trace_user_id",
     "trace_environment",
@@ -5210,6 +5211,9 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
         return None
     cleaned = cleaned.strip("`'\"")
 
+    if "..." in cleaned:
+        return None
+
     if cleaned.startswith("git@") and ":" in cleaned:
         cleaned = cleaned.split(":", 1)[1]
     elif "://" in cleaned:
@@ -5590,13 +5594,15 @@ def _apply_codex_memory_workflow_repository(
     if source_repository.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
         source_repository = source_repository[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
 
-    display_repository = _format_memory_repository_identity(source_repository)
     metadata["workload_type"] = "agent_memory"
     metadata["workload_subtype"] = "codex_memory_writer"
     metadata["source_repository"] = source_repository
-    metadata["repository"] = display_repository
+    metadata["repository"] = source_repository
+    metadata["memory_workload_label"] = _format_memory_repository_identity(
+        source_repository
+    )
     _merge_tags(metadata, ["codex-memory-workflow", "agent-memory-workload"])
-    return display_repository
+    return source_repository
 
 
 @lru_cache(maxsize=1)
@@ -14529,8 +14535,7 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
 
 
 def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
-    if _clear_codex_trace_user_tenant_source_on_record(record):
-        return
+    _clear_codex_trace_user_tenant_source_on_record(record)
 
     raw_tenant_id = record.get("tenant_id")
     if _is_harness_tenant_identity(raw_tenant_id):
@@ -14563,10 +14568,15 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
     if tenant_id:
         if _clear_untrusted_claude_metadata_tenant_on_record(record, tenant_id):
             return
-        if _clear_untrusted_codex_tenant_on_record(record, tenant_id):
+        _clear_untrusted_codex_tenant_on_record(record, tenant_id)
+        tenant_id = _normalize_tenant_identity(record.get("tenant_id"))
+        if not tenant_id:
+            # Continue into repository fallback. A stale Codex tenant can be
+            # rejected while the same row still has a trusted current repo.
+            pass
+        else:
+            record["tenant_id"] = tenant_id
             return
-        record["tenant_id"] = tenant_id
-        return
 
     repository = _normalize_repository_identity(record.get("repository"))
     if repository is None:
@@ -14588,13 +14598,18 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
         if isinstance(metadata, dict):
             repo_source = metadata.get("repository_source")
         allow_via_known = False
-        if (
-            isinstance(repo_source, str)
-            and (
-                ".metadata.repository" in repo_source
-                or "litellm_metadata.repository" in repo_source
+        if _is_known_aawm_workspace_repository(repository) and (
+            metadata.get("tenant_id_source")
+            in {"repository_untrusted", "trace_user_untrusted"}
+            or metadata.get("trace_user_tenant_fallback_skipped") is True
+            or metadata.get("repository_tenant_fallback_skipped") is True
+            or (
+                isinstance(repo_source, str)
+                and (
+                    ".metadata.repository" in repo_source
+                    or "litellm_metadata.repository" in repo_source
+                )
             )
-            and _is_known_aawm_workspace_repository(repository)
         ):
             allow_via_known = True
         if not allow_via_known:

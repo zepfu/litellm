@@ -53,6 +53,37 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.112 — Session-history repository tenant repair hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.112`. Session-history
+normalization now continues into trusted repository fallback after rejecting a
+stale Codex trace-user tenant, so rows with a valid current known workspace
+repository are written with matching `repository` and `tenant_id` instead of
+remaining `tenant_id=NULL` with `tenant_id_source=trace_user_untrusted`.
+Codex memory workloads now keep dashboard-facing `repository` / `tenant_id`
+grouped on the base workspace repository while preserving the memory-specific
+label in `metadata.memory_workload_label`. Truncated placeholder labels
+containing `...` are rejected, and the repository repair script now catches
+trace-user/repository-untrusted rows, memory suffix rows, and truncated labels.
+
+**Why:** Production was still emitting new rows for known repos such as `aegis`
+with `tenant_id=NULL` after stale Codex trace-user rejection. The dev fix proved
+the current workspace repository was available, but the tenant normalization
+returned too early and the historical repair job did not target all affected
+dashboard-facing classes.
+
+**Why not upstream:** This is specific to AAWM's fork-local
+`session_history` schema, known workspace repository list, Codex trace metadata,
+memory-workload reporting, and live dataset repair process.
+
+**Validation status:** Focused identity and repair-script tests cover stale
+trace-user fallback, untrusted repository tenant repair, memory workload base
+grouping, and truncated label rejection. Dev was refreshed before promotion and
+wrote no new bad rows for these classes. Production promotion must publish this
+fork image, rebuild `aawm-litellm`, repair rows written after the last dev-side
+cleanup cursor, and verify `:4000` stops emitting the known-repo/null-tenant
+class.
+
 ### aawm.111 — Session-history repository attribution and release-verifier rollup
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.111`. This release
