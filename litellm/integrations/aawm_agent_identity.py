@@ -4731,6 +4731,24 @@ def _extract_tenant_identity_from_metadata_sources(
                 if tenant_id:
                     return tenant_id, f"{source_name}.{nested_key}.{key}"
 
+        repository, source_detail = _extract_route_rollup_repository_identity_from_mapping(
+            source,
+            source_name=source_name,
+        )
+        if repository:
+            return repository, source_detail
+
+        for nested_key in ("metadata", "request_metadata", "user_api_key_metadata"):
+            nested_source = _coerce_mapping(source.get(nested_key))
+            if not nested_source:
+                continue
+            repository, source_detail = _extract_route_rollup_repository_identity_from_mapping(
+                nested_source,
+                source_name=f"{source_name}.{nested_key}",
+            )
+            if repository:
+                return repository, source_detail
+
     return None, None
 
 
@@ -5280,6 +5298,52 @@ def _extract_repository_identity_from_text(value: str) -> Optional[str]:
     return repository
 
 
+_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
+_AAWM_ROUTE_ROLLUP_GROUP_HEADER_LABEL_KEY = "group_header_label"
+_AAWM_ROUTE_ROLLUP_GROUP_HEADER_LABEL_MAX_CHARS = 96
+
+
+def _extract_repository_identity_from_route_rollup_group_header_label(
+    value: Any,
+) -> Optional[str]:
+    """Bounded recovery of repository prefix from route-rollup group headers.
+
+    Accepts labels such as ``aegis@Claude[2.1.199]`` and returns the normalized
+    repository prefix (``aegis``). Does not accept arbitrary trace-user ids.
+    """
+    cleaned = _clean_non_empty_string(value)
+    if not cleaned or len(cleaned) > _AAWM_ROUTE_ROLLUP_GROUP_HEADER_LABEL_MAX_CHARS:
+        return None
+    if "@" not in cleaned:
+        return None
+    repository_part = cleaned.split("@", 1)[0].strip()
+    if not repository_part:
+        return None
+    repository = _normalize_repository_identity(repository_part)
+    if not _is_known_aawm_workspace_repository(repository):
+        return None
+    return repository
+
+
+def _extract_route_rollup_repository_identity_from_mapping(
+    source: Dict[str, Any],
+    *,
+    source_name: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    rollup_context = _coerce_mapping(source.get(_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY))
+    if not rollup_context:
+        return None, None
+    repository = _extract_repository_identity_from_route_rollup_group_header_label(
+        rollup_context.get(_AAWM_ROUTE_ROLLUP_GROUP_HEADER_LABEL_KEY)
+    )
+    if not repository:
+        return None, None
+    return (
+        repository,
+        f"{source_name}.{_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY}.{_AAWM_ROUTE_ROLLUP_GROUP_HEADER_LABEL_KEY}",
+    )
+
+
 def _repository_text_scan_blocked_by_mapping(value: Dict[str, Any]) -> bool:
     item_type = _clean_non_empty_string(value.get("type"))
     if item_type and item_type.lower() in _AAWM_REPOSITORY_UNTRUSTED_TEXT_ITEM_TYPES:
@@ -5391,6 +5455,29 @@ def _extract_repository_identity_from_metadata_sources_with_source(
                         repository,
                         source_detail or f"{source_name}.{nested_key}.{key}",
                     )
+
+        repository, source_detail = _extract_route_rollup_repository_identity_from_mapping(
+            source,
+            source_name=source_name,
+        )
+        if repository:
+            return repository, source_detail
+
+        for nested_key in (
+            "metadata",
+            "litellm_metadata",
+            "request_metadata",
+            "user_api_key_metadata",
+        ):
+            nested_source = _coerce_mapping(source.get(nested_key))
+            if not nested_source:
+                continue
+            repository, source_detail = _extract_route_rollup_repository_identity_from_mapping(
+                nested_source,
+                source_name=f"{source_name}.{nested_key}",
+            )
+            if repository:
+                return repository, source_detail
 
         repository, source_detail = _extract_repository_identity_from_value_with_source(
             source,
@@ -14063,6 +14150,9 @@ def _is_repository_source_trusted_for_tenant(value: Any) -> bool:
         )
     ):
         return True
+    if source.endswith(".aawm_route_rollup_context.group_header_label"):
+        return True
+
     if (
         "x-codex-turn-metadata" in source
         and source.endswith(".text.project_path")
@@ -14534,6 +14624,32 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
     record["repository"] = repository
 
 
+def _can_promote_known_codex_repository_to_tenant(
+    repository: str,
+    metadata: Dict[str, Any],
+) -> bool:
+    # Bounded relaxation for Codex: generic metadata.repository (or
+    # litellm_metadata.repository) may promote to tenant ONLY when the
+    # normalized repository label is a known AAWM workspace repo from the
+    # conservative built-in allowlist (or AAWM_KNOWN_WORKSPACE_REPOS env).
+    # Headers, x-codex-turn-metadata project_path, cwd/workspace text, and
+    # other previously trusted sources remain trusted without the name check.
+    repo_source = metadata.get("repository_source")
+    return _is_known_aawm_workspace_repository(repository) and (
+        metadata.get("tenant_id_source")
+        in {"repository_untrusted", "trace_user_untrusted"}
+        or metadata.get("trace_user_tenant_fallback_skipped") is True
+        or metadata.get("repository_tenant_fallback_skipped") is True
+        or (
+            isinstance(repo_source, str)
+            and (
+                ".metadata.repository" in repo_source
+                or "litellm_metadata.repository" in repo_source
+            )
+        )
+    )
+
+
 def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
     _clear_codex_trace_user_tenant_source_on_record(record)
 
@@ -14588,31 +14704,7 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
     if not isinstance(metadata, dict):
         metadata = {}
     if not _codex_repository_source_trusted_for_record(record):
-        # Bounded relaxation for Codex: generic metadata.repository (or
-        # litellm_metadata.repository) may promote to tenant ONLY when the
-        # normalized repository label is a known AAWM workspace repo from the
-        # conservative built-in allowlist (or AAWM_KNOWN_WORKSPACE_REPOS env).
-        # Headers, x-codex-turn-metadata project_path, cwd/workspace text, and
-        # other previously trusted sources remain trusted without the name check.
-        repo_source = None
-        if isinstance(metadata, dict):
-            repo_source = metadata.get("repository_source")
-        allow_via_known = False
-        if _is_known_aawm_workspace_repository(repository) and (
-            metadata.get("tenant_id_source")
-            in {"repository_untrusted", "trace_user_untrusted"}
-            or metadata.get("trace_user_tenant_fallback_skipped") is True
-            or metadata.get("repository_tenant_fallback_skipped") is True
-            or (
-                isinstance(repo_source, str)
-                and (
-                    ".metadata.repository" in repo_source
-                    or "litellm_metadata.repository" in repo_source
-                )
-            )
-        ):
-            allow_via_known = True
-        if not allow_via_known:
+        if not _can_promote_known_codex_repository_to_tenant(repository, metadata):
             _mark_codex_repository_tenant_skipped(record)
             return
 

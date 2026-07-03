@@ -99,6 +99,7 @@ _METADATA_IDENTITY_KEYS = (
 _ROW_METADATA_REPOSITORY_PRIORITY = (
     "aawm_d1_452_referenced_artifact_owner",
     "aawm_claude_project",
+    "aawm_route_rollup_context",
     "aawm_repository",
     "repository",
     "source_repository",
