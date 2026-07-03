@@ -374,6 +374,56 @@ def test_aawm_agent_identity_promotes_grok_repository_without_custom_headers() -
     assert langfuse_metadata["trace_user_id"] == "litellm"
 
 
+def test_build_session_history_record_extracts_agent_from_responses_instructions() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_call_id"] = "call-codex-worker-instructions"
+    kwargs["model"] = "openai/gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "session_id": "session-codex-worker-instructions",
+            "trace_user_id": "codex",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "langfuse_trace_user_id": "codex",
+            "user-agent": "codex-tui/0.142.5",
+        }
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "instructions": "You are a 'worker' agent. Always follow repository instructions.",
+        "input": [
+            {
+                "role": "user",
+                "content": "Implement the scoped change.",
+            }
+        ],
+    }
+    result = {
+        "id": "resp-codex-worker-instructions",
+        "usage": {"input_tokens": 12, "output_tokens": 4, "total_tokens": 16},
+        "output": [],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["agent_name"] == "worker"
+    assert record["session_id"] == "session-codex-worker-instructions"
+    assert record["repository"] == "litellm"
+
+
 def test_aawm_agent_identity_promotes_codex_memory_repository_trace_user_id() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="codex")

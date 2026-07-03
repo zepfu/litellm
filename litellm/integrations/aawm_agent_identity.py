@@ -5,6 +5,7 @@ request prompts, then enriches the langfuse_trace_name request header so
 each agent's API calls can be distinguished in Langfuse.
 
 The hook injects: "You are '<agent-name>' and you are working..."
+Role profiles can also declare: "You are a '<agent-name>' agent."
 When no agent designation is found, defaults to "orchestrator".
 
 Enriches langfuse_trace_name from "claude-code" to "claude-code.<agent>"
@@ -81,6 +82,7 @@ _AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
 _AGENT_TENANT_RE = re.compile(
     r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project"
 )
+_AGENT_ROLE_RE = re.compile(r"You are (?:an?\s+)?'(?P<agent>[^']+)'\s+agent\b")
 _DEFAULT_AGENT = "orchestrator"
 _CLAUDE_EXPERIMENT_ID_RE = re.compile(
     rb"(?<![A-Za-z0-9._-])([A-Za-z][A-Za-z0-9._-]{11,})(?![A-Za-z0-9._-])"
@@ -5885,6 +5887,10 @@ def _extract_agent_context_from_text(text: str) -> Tuple[Optional[str], Optional
     if agent_match:
         return agent_match.group(1), None
 
+    role_match = _AGENT_ROLE_RE.search(text)
+    if role_match:
+        return role_match.group("agent"), None
+
     return None, None
 
 
@@ -5960,6 +5966,13 @@ def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optio
     if isinstance(payload, dict):
         request_body = payload.get("request_body")
         if isinstance(request_body, dict):
+            instructions = request_body.get("instructions")
+            if instructions:
+                text = _content_to_text(instructions)
+                agent_name, tenant_id = _extract_agent_context_from_text(text)
+                if agent_name:
+                    return agent_name, explicit_tenant_id or tenant_id
+
             system = request_body.get("system")
             if system:
                 text = _content_to_text(system)
