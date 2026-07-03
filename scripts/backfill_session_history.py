@@ -785,6 +785,135 @@ def _build_langfuse_observation_from_db_row(row: asyncpg.Record) -> Dict[str, An
         "internalModelId": row["observation_internal_model_id"],
     }
 
+def _clickhouse_observation_payload_select_sql(*, include_payloads: bool) -> str:
+    if include_payloads:
+        return (
+            "o.input AS observation_input,\n"
+            "                o.output AS observation_output,"
+        )
+    return (
+        "NULL AS observation_input,\n"
+        "                NULL AS observation_output,"
+    )
+
+
+def build_langfuse_clickhouse_generation_batch_query(
+    *,
+    limit: int,
+    include_payloads: bool = False,
+    cursor_start_time: Optional[datetime] = None,
+    cursor_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    from_start_time: Optional[str] = None,
+    to_start_time: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
+    """Build the ClickHouse observation batch query used by session-history backfill."""
+
+    predicates = ["o.type = 'GENERATION'", "o.is_deleted = 0"]
+
+    def q(value: str) -> str:
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    if trace_id:
+        predicates.append(f"o.trace_id = {q(trace_id)}")
+    if session_id:
+        predicates.append(
+            "o.trace_id IN ("
+            "SELECT id FROM traces "
+            f"WHERE is_deleted = 0 AND session_id = {q(session_id)}"
+            ")"
+        )
+
+    from_dt = _parse_optional_datetime(from_start_time)
+    to_dt = _parse_optional_datetime(to_start_time)
+    if from_dt is not None:
+        predicates.append(
+            f"o.start_time >= toDateTime64({q(_clickhouse_datetime64_literal_value(from_dt))}, 3)"
+        )
+    if to_dt is not None:
+        predicates.append(
+            f"o.start_time <= toDateTime64({q(_clickhouse_datetime64_literal_value(to_dt))}, 3)"
+        )
+
+    if model and model.strip():
+        model_literal = q(model.strip())
+        predicates.append(
+            "("
+            f"o.provided_model_name = {model_literal}"
+            f" OR o.metadata['model'] = {model_literal}"
+            f" OR o.metadata['anthropic_adapter_original_model'] = {model_literal}"
+            f" OR o.metadata['codex_adapter_original_model'] = {model_literal}"
+            f" OR o.metadata['codex_auto_agent_selected_model'] = {model_literal}"
+            ")"
+        )
+
+    if provider and provider.strip().lower() == "openrouter":
+        predicates.append(
+            "("
+            "positionCaseInsensitive(coalesce(o.provided_model_name, ''), 'openrouter') > 0"
+            " OR o.metadata['aawm_stream_logging_custom_llm_provider'] = 'openrouter'"
+            " OR positionCaseInsensitive(o.metadata['passthrough_route_family'], 'openrouter') > 0"
+            " OR positionCaseInsensitive(o.metadata['api_base'], 'openrouter') > 0"
+            " OR positionCaseInsensitive(o.metadata['anthropic_adapter_original_model'], 'openrouter/') = 1"
+            " OR positionCaseInsensitive(o.metadata['codex_adapter_original_model'], 'openrouter/') = 1"
+            ")"
+        )
+
+    if cursor_start_time is not None and cursor_id is not None:
+        cursor_literal = _clickhouse_datetime64_literal_value(cursor_start_time)
+        predicates.append(
+            "("
+            f"o.start_time < toDateTime64({q(cursor_literal)}, 3)"
+            f" OR (o.start_time = toDateTime64({q(cursor_literal)}, 3)"
+            f" AND o.id < {q(cursor_id)}))"
+        )
+
+    payload_select = _clickhouse_observation_payload_select_sql(
+        include_payloads=include_payloads
+    )
+
+    return f"""
+            SELECT
+                o.id AS observation_id,
+                o.trace_id AS observation_trace_id,
+                o.start_time AS observation_start_time,
+                o.end_time AS observation_end_time,
+                o.parent_observation_id AS observation_parent_observation_id,
+                o.type AS observation_type,
+                o.name AS observation_name,
+                o.metadata AS observation_metadata,
+                o.level AS observation_level,
+                o.status_message AS observation_status_message,
+                o.version AS observation_version,
+                {payload_select}
+                o.provided_model_name AS observation_model,
+                o.internal_model_id AS observation_internal_model_id,
+                o.model_parameters AS observation_model_parameters,
+                o.provided_usage_details AS observation_provided_usage_details,
+                o.usage_details AS observation_usage_details,
+                o.provided_cost_details AS observation_provided_cost_details,
+                o.cost_details AS observation_cost_details,
+                o.total_cost AS observation_total_cost,
+                o.completion_start_time AS observation_completion_start_time,
+                o.prompt_id AS observation_prompt_id,
+                o.prompt_name AS observation_prompt_name,
+                o.prompt_version AS observation_prompt_version,
+                o.created_at AS observation_created_at,
+                o.updated_at AS observation_updated_at,
+                o.project_id AS observation_project_id,
+                o.environment AS observation_environment,
+                o.tool_calls AS observation_tool_calls,
+                o.tool_call_names AS observation_tool_call_names
+            FROM observations AS o
+            WHERE {' AND '.join(predicates)}
+            ORDER BY o.start_time DESC, o.id DESC
+            LIMIT {int(limit)}
+            FORMAT JSONEachRow
+        """
+
 
 class LangfuseClickHouseSource:
     def __init__(self, *, url: str, user: str, password: str) -> None:
@@ -829,96 +958,20 @@ class LangfuseClickHouseSource:
         to_start_time: Optional[str] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        include_payloads: bool = False,
     ) -> List[Dict[str, Any]]:
-        predicates = ["o.type = 'GENERATION'", "o.is_deleted = 0"]
-
-        def q(value: str) -> str:
-            return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-        if trace_id:
-            predicates.append(f"o.trace_id = {q(trace_id)}")
-        if session_id:
-            predicates.append(f"t.session_id = {q(session_id)}")
-
-        from_dt = _parse_optional_datetime(from_start_time)
-        to_dt = _parse_optional_datetime(to_start_time)
-        if from_dt is not None:
-            predicates.append(f"o.start_time >= toDateTime64({q(_clickhouse_datetime64_literal_value(from_dt))}, 3)")
-        if to_dt is not None:
-            predicates.append(f"o.start_time <= toDateTime64({q(_clickhouse_datetime64_literal_value(to_dt))}, 3)")
-
-        if model and model.strip():
-            model_literal = q(model.strip())
-            predicates.append(
-                "("
-                f"o.provided_model_name = {model_literal}"
-                f" OR o.metadata['model'] = {model_literal}"
-                f" OR o.metadata['anthropic_adapter_original_model'] = {model_literal}"
-                f" OR o.metadata['codex_adapter_original_model'] = {model_literal}"
-                f" OR o.metadata['codex_auto_agent_selected_model'] = {model_literal}"
-                ")"
-            )
-
-        if provider and provider.strip().lower() == "openrouter":
-            predicates.append(
-                "("
-                "positionCaseInsensitive(coalesce(o.provided_model_name, ''), 'openrouter') > 0"
-                " OR o.metadata['aawm_stream_logging_custom_llm_provider'] = 'openrouter'"
-                " OR positionCaseInsensitive(o.metadata['passthrough_route_family'], 'openrouter') > 0"
-                " OR positionCaseInsensitive(o.metadata['api_base'], 'openrouter') > 0"
-                " OR positionCaseInsensitive(o.metadata['anthropic_adapter_original_model'], 'openrouter/') = 1"
-                " OR positionCaseInsensitive(o.metadata['codex_adapter_original_model'], 'openrouter/') = 1"
-                ")"
-            )
-
-        if cursor_start_time is not None and cursor_id is not None:
-            cursor_literal = _clickhouse_datetime64_literal_value(cursor_start_time)
-            predicates.append(
-                "("
-                f"o.start_time < toDateTime64({q(cursor_literal)}, 3)"
-                f" OR (o.start_time = toDateTime64({q(cursor_literal)}, 3)"
-                f" AND o.id < {q(cursor_id)}))"
-            )
-
-        observation_query = f"""
-            SELECT
-                o.id AS observation_id,
-                o.trace_id AS observation_trace_id,
-                o.start_time AS observation_start_time,
-                o.end_time AS observation_end_time,
-                o.parent_observation_id AS observation_parent_observation_id,
-                o.type AS observation_type,
-                o.name AS observation_name,
-                o.metadata AS observation_metadata,
-                o.level AS observation_level,
-                o.status_message AS observation_status_message,
-                o.version AS observation_version,
-                o.input AS observation_input,
-                o.output AS observation_output,
-                o.provided_model_name AS observation_model,
-                o.internal_model_id AS observation_internal_model_id,
-                o.model_parameters AS observation_model_parameters,
-                o.provided_usage_details AS observation_provided_usage_details,
-                o.usage_details AS observation_usage_details,
-                o.provided_cost_details AS observation_provided_cost_details,
-                o.cost_details AS observation_cost_details,
-                o.total_cost AS observation_total_cost,
-                o.completion_start_time AS observation_completion_start_time,
-                o.prompt_id AS observation_prompt_id,
-                o.prompt_name AS observation_prompt_name,
-                o.prompt_version AS observation_prompt_version,
-                o.created_at AS observation_created_at,
-                o.updated_at AS observation_updated_at,
-                o.project_id AS observation_project_id,
-                o.environment AS observation_environment,
-                o.tool_calls AS observation_tool_calls,
-                o.tool_call_names AS observation_tool_call_names
-            FROM observations AS o
-            WHERE {' AND '.join(predicates)}
-            ORDER BY o.start_time DESC, o.id DESC
-            LIMIT {int(limit)}
-            FORMAT JSONEachRow
-        """
+        observation_query = build_langfuse_clickhouse_generation_batch_query(
+            limit=limit,
+            include_payloads=include_payloads,
+            cursor_start_time=cursor_start_time,
+            cursor_id=cursor_id,
+            trace_id=trace_id,
+            session_id=session_id,
+            from_start_time=from_start_time,
+            to_start_time=to_start_time,
+            provider=provider,
+            model=model,
+        )
         observation_rows = await asyncio.to_thread(self._request_rows, observation_query)
         if not observation_rows:
             return []
@@ -933,6 +986,9 @@ class LangfuseClickHouseSource:
         )
         if not trace_ids:
             return observation_rows
+
+        def q(value: str) -> str:
+            return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
         trace_query = f"""
             SELECT
@@ -1700,6 +1756,7 @@ async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
             to_start_time=args.to_start_time,
             provider=args.provider,
             model=args.model,
+            include_payloads=bool(getattr(args, "clickhouse_include_payloads", False)),
         )
         if not rows:
             break
@@ -2653,6 +2710,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clickhouse-url", help="Override CLICKHOUSE_URL.")
     parser.add_argument("--clickhouse-user", help="Override CLICKHOUSE_USER.")
     parser.add_argument("--clickhouse-password", help="Override CLICKHOUSE_PASSWORD.")
+    parser.add_argument(
+        "--clickhouse-include-payloads",
+        action="store_true",
+        help=(
+            "When using --source-mode langfuse_clickhouse, select observation input/output "
+            "payload columns from ClickHouse. Default is off to avoid reading large blobs."
+        ),
+    )
     parser.add_argument(
         "--langfuse-database-url",
         help="Override the Langfuse Postgres DATABASE_URL used for direct historical reads.",
