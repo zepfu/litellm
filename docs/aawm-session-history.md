@@ -931,6 +931,16 @@ content. Benign prose that merely discusses those strings inline is not flagged.
 Request-side `<tool_use_error>` content and normal structured `tool_use` blocks
 remain distinct from this assistant-side literal-text failure class.
 
+When spawned-agent output is reduced to a pseudo function wrapper such as
+`<function=explorer>["/home/zepfu/projects/litellm"]</function>`, LiteLLM
+classifies the generation with
+`output_contract_failure_class=malformed_final_payload`,
+`output_contract_compliance_score=0.0`, and
+`agent_score_reasons.output_contract_compliance=["malformed_final_payload"]`.
+This captures malformed final payloads that are not structured findings or a
+normal final answer, while avoiding benign prose that quotes the wrapper while
+explaining the incident.
+
 Langfuse-only historical backfills cannot reconstruct a full snapshot once
 generation metadata has been compacted. They preserve the compact hash/reference
 fields when present, but the durable table is populated only by runtime
