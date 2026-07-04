@@ -401,8 +401,52 @@ def _grok_billing_payload() -> dict:
                 {"name": "GrokBuild", "usagePercent": 12.507334},
                 {"name": "Api", "usagePercent": 2.032},
             ],
-            "billingPeriodStart": "2026-06-01T00:00:00+00:00",
-            "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-07-03T19:54:47.584112+00:00",
+                "end": "2026-07-10T19:54:47.584112+00:00",
+            },
+            "billingPeriodStart": "2026-07-03T19:54:47.584112+00:00",
+            "billingPeriodEnd": "2026-07-10T19:54:47.584112+00:00",
+        }
+    }
+
+
+def _grok_billing_weekly_fresh_payload() -> dict:
+    return {
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-07-03T19:54:47.584112+00:00",
+                "end": "2026-07-10T19:54:47.584112+00:00",
+            },
+            "billingPeriodStart": "2026-07-03T19:54:47.584112+00:00",
+            "billingPeriodEnd": "2026-07-10T19:54:47.584112+00:00",
+        }
+    }
+
+
+def _grok_billing_monthly_counter_payload() -> dict:
+    return {
+        "config": {
+            "monthlyLimit": {"val": 150000},
+            "used": {"val": 42910},
+            "billingPeriodStart": "2026-07-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-08-01T00:00:00+00:00",
+        }
+    }
+
+
+def _grok_billing_legacy_monthly_credit_payload() -> dict:
+    return {
+        "config": {
+            "creditUsagePercent": 27.0,
+            "productUsage": [
+                {"product": "GrokBuild", "usagePercent": 26.0},
+                {"product": "Api", "usagePercent": 1.0},
+            ],
+            "billingPeriodStart": "2026-07-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-08-01T00:00:00+00:00",
         }
     }
 
@@ -1733,16 +1777,17 @@ def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
     assert payload[3] is None
     assert payload[4] == "xai"
     assert payload[5] == "grok-composer-2.5-fast"
-    assert payload[6] == "xai_grok_build_monthly_credits:credits"
-    assert payload[7] == "monthly"
+    assert payload[6] == "xai_grok_build_weekly_credits:credits"
+    assert payload[7] == "weekly"
     assert payload[8] == "credits"
-    assert payload[9] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert payload[9] == datetime(2026, 7, 10, 19, 54, 47, 584112, tzinfo=timezone.utc)
     assert payload[10] == pytest.approx(85.460667)
+    assert payload[6] != "xai_grok_build_monthly_credits:credits"
     assert payload[11] is None
     assert payload[12] is None
     assert payload[13] is None
-    assert payload[14] == datetime(2026, 6, 1, tzinfo=timezone.utc)
-    assert payload[15] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert payload[14] == datetime(2026, 7, 3, 19, 54, 47, 584112, tzinfo=timezone.utc)
+    assert payload[15] == datetime(2026, 7, 10, 19, 54, 47, 584112, tzinfo=timezone.utc)
     raw_provider_fields = json.loads(payload[16])
     assert raw_provider_fields["creditUsagePercent"] == pytest.approx(14.539333)
     assert raw_provider_fields["productUsage"][0]["name"] == "GrokBuild"
@@ -1750,6 +1795,7 @@ def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
     evidence = json.loads(payload[17])
     assert evidence["signals"] == [
         "grok_billing_payload",
+        "grok_billing_weekly_credit",
         "grok_billing_percentage_only",
         "grok_billing_sidecar_request_contract",
     ]
@@ -1774,15 +1820,10 @@ def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
     assert payload[21] == "grok-billing-poll-20260616200400"
 
 
-def test_grok_billing_sidecar_payload_maps_period_only_snapshot() -> None:
+def test_grok_billing_sidecar_payload_maps_weekly_fresh_period_snapshot() -> None:
     config = _grok_billing_poll_config()
-    observed_at = datetime(2026, 6, 30, 12, 0, tzinfo=timezone.utc)
-    response_body = {
-        "config": {
-            "billingPeriodStart": "2026-06-01T00:00:00+00:00",
-            "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
-        }
-    }
+    observed_at = datetime(2026, 7, 3, 20, 0, tzinfo=timezone.utc)
+    response_body = _grok_billing_weekly_fresh_payload()
 
     payload = loop._build_grok_billing_rate_limit_payload(
         config,
@@ -1790,19 +1831,66 @@ def test_grok_billing_sidecar_payload_maps_period_only_snapshot() -> None:
         response_body=response_body,
     )
 
-    assert payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert payload[6] == "xai_grok_build_weekly_credits:credits"
+    assert payload[7] == "weekly"
     assert payload[8] == "credits"
-    assert payload[9] == datetime(2026, 7, 1, tzinfo=timezone.utc)
-    assert payload[10] is None
+    assert payload[9] == datetime(2026, 7, 10, 19, 54, 47, 584112, tzinfo=timezone.utc)
+    assert payload[10] == 100.0
+    assert payload[6] != "xai_grok_build_monthly_credits:credits"
     assert payload[11] is None
     assert payload[12] is None
     assert payload[13] is None
     raw_provider_fields = json.loads(payload[16])
-    assert raw_provider_fields["quota_unit"] == "grok_billing_period_only"
+    assert (
+        raw_provider_fields["quota_unit"] == "grok_billing_weekly_credit_fresh_period"
+    )
     assert "creditUsagePercent" not in raw_provider_fields
-    assert "productUsage" not in raw_provider_fields
     evidence = json.loads(payload[17])
-    assert "grok_billing_period_only" in evidence["signals"]
+    assert "grok_billing_weekly_fresh_period" in evidence["signals"]
+    assert evidence["unit_note"].startswith("Fresh weekly Grok Build credit periods")
+
+
+def test_grok_billing_sidecar_payload_maps_monthly_counter_snapshot() -> None:
+    config = _grok_billing_poll_config()
+    observed_at = datetime(2026, 7, 3, 12, 0, tzinfo=timezone.utc)
+    response_body = _grok_billing_monthly_counter_payload()
+
+    payload = loop._build_grok_billing_rate_limit_payload(
+        config,
+        observed_at=observed_at,
+        response_body=response_body,
+    )
+
+    assert payload[6] == "xai_grok_build_monthly_requests:requests"
+    assert payload[7] == "monthly"
+    assert payload[8] == "requests"
+    assert payload[10] == 71.0
+    assert payload[11] == pytest.approx(150000.0)
+    assert payload[12] == pytest.approx(42910.0)
+    evidence = json.loads(payload[17])
+    assert "grok_billing_monthly_counter" in evidence["signals"]
+
+
+def test_grok_billing_sidecar_payload_keeps_legacy_credit_snapshot_monthly() -> None:
+    config = _grok_billing_poll_config()
+    observed_at = datetime(2026, 7, 3, 16, 45, tzinfo=timezone.utc)
+
+    payload = loop._build_grok_billing_rate_limit_payload(
+        config,
+        observed_at=observed_at,
+        response_body=_grok_billing_legacy_monthly_credit_payload(),
+    )
+
+    assert payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert payload[7] == "monthly"
+    assert payload[8] == "credits"
+    assert payload[9] == datetime(2026, 8, 1, tzinfo=timezone.utc)
+    assert payload[10] == pytest.approx(73.0)
+    assert payload[11] is None
+    assert payload[12] is None
+    assert payload[13] is None
+    evidence = json.loads(payload[17])
+    assert "grok_billing_legacy_monthly_credit" in evidence["signals"]
 
 
 def test_grok_billing_sidecar_payload_raises_without_usage_or_period() -> None:
@@ -1891,7 +1979,7 @@ def test_persist_grok_billing_observations_uses_sidecar_db_path(monkeypatch) -> 
     assert insert_sql == loop.GROK_BILLING_RATE_LIMIT_INSERT_SQL
     assert "latest.evidence" in insert_sql
     assert "candidate.evidence" in insert_sql
-    assert insert_payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert insert_payload[6] == "xai_grok_build_weekly_credits:credits"
     assert insert_payload[11] is None
     assert insert_payload[12] is None
     assert insert_payload[13] is None

@@ -29,7 +29,13 @@ WITH rate_limit_points AS (
     FROM public.rate_limit_observations
     WHERE provider = ANY (ARRAY['openai', 'anthropic', 'google', 'xai', 'openrouter'])
       AND remaining_pct >= 0
-      AND remaining_pct < 100
+      AND (
+          remaining_pct < 100
+          OR (
+              provider = 'xai'
+              AND quota_key = 'xai_grok_build_weekly_credits:credits'
+          )
+      )
       AND (
           quota_key = ANY (ARRAY[
               'codex:secondary',
@@ -38,7 +44,8 @@ WITH rate_limit_points AS (
               'codex_bengalfox:primary',
               'anthropic_unified_7d:7d',
               'anthropic_unified_7d_sonnet:7d_sonnet',
-              'anthropic_unified_5h:5h'
+              'anthropic_unified_5h:5h',
+              'xai_grok_build_weekly_credits:credits'
           ])
           OR quota_type = 'requests'
       )
@@ -88,7 +95,7 @@ SELECT DISTINCT
     fromdate,
     COALESCE(next_fromdate, '9999-12-31 00:00:00+00'::timestamptz) AS todate,
     CASE
-        WHEN quota_key = ANY (ARRAY['anthropic_unified_7d:7d', 'codex:secondary']) THEN 'weekly'
+        WHEN quota_key = ANY (ARRAY['anthropic_unified_7d:7d', 'codex:secondary', 'xai_grok_build_weekly_credits:credits']) THEN 'weekly'
         WHEN quota_key = ANY (ARRAY['anthropic_unified_5h:5h', 'codex:primary']) THEN 'short'
         WHEN quota_key = ANY (ARRAY['codex_bengalfox:primary']) THEN 'short_special'
         WHEN quota_key = ANY (ARRAY['anthropic_unified_7d_sonnet:7d_sonnet', 'codex_bengalfox:secondary']) THEN 'weekly_special'

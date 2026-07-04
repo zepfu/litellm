@@ -159,18 +159,19 @@ signals, source fields, and interpretation notes that explain how the snapshot
 was classified. These JSONB fields must not contain credentials, account ids,
 authorization headers, prompt bodies, response text, or raw tool arguments.
 
-Grok monthly billing payloads with absolute counters populate `quota_limit`,
-`quota_used`, `quota_remaining`, both billing-period boundary columns, and a raw
-copy of the sanitized `monthlyLimit`, `used`, `onDemandCap`, and period fields.
-Newer Grok credit billing payloads may provide only `creditUsagePercent` and
-`productUsage`; those snapshots populate `remaining_pct` and leave absolute
-quota fields null rather than inventing counts. When Grok billing returns only
-billing-period boundaries, the provider-status sidecar billing poll may persist a
-period-only snapshot in the same Grok credits series with null `remaining_pct`
-and quota amounts so stale `expected_reset_at` values can advance to the current
-reset boundary. xAI OAuth rate-limit headers populate absolute request/token
-amounts and carry billing period ends when the provider config or managed
-subscription context exposes one.
+Grok no-format `/v1/billing` monthly counter payloads (`monthlyLimit`, `used`)
+populate `quota_limit`, `quota_used`, `quota_remaining`, billing-period columns,
+and quota key `xai_grok_build_monthly_requests:requests` with
+`quota_period=monthly`. They are separate from weekly credit telemetry.
+
+Grok `/v1/billing?format=credits` weekly payloads use quota key
+`xai_grok_build_weekly_credits:credits` with `quota_period=weekly` when
+`currentPeriod.type` is `USAGE_PERIOD_TYPE_WEEKLY`. `creditUsagePercent` is used
+percent; `remaining_pct` stores remaining percent. Fresh weekly periods without
+`creditUsagePercent` persist `remaining_pct=100` and `used_percentage=0` with
+explicit fresh-period evidence, not null/unknown. xAI OAuth rate-limit headers
+populate absolute request/token amounts and carry billing period ends when the
+provider config or managed subscription context exposes one.
 
 ## Provider Credit Observations
 

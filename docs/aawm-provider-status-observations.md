@@ -90,11 +90,38 @@ headers. The request includes the OIDC bearer token plus `x-userid`,
 snapshot as a sanitized `rate_limit_observations` row using the same stored field
 shape and dedupe guard as the LiteLLM callback path.
 
-When the billing response includes `billingPeriodEnd` but no `monthlyLimit`,
-`used`, `creditUsagePercent`, or `productUsage`, the sidecar still persists a
-period-only snapshot for the Grok credits billing series. That row updates
-`expected_reset_at` and the billing-period boundary columns while leaving
-`remaining_pct` and absolute quota fields null.
+Grok billing has two distinct payload shapes and must not be conflated:
+
+- `GET /v1/billing?format=credits` (credit-format): weekly Grok Build credit
+  usage. When `config.currentPeriod.type` is `USAGE_PERIOD_TYPE_WEEKLY`, the
+  snapshot uses quota key `xai_grok_build_weekly_credits:credits`,
+  `quota_period=weekly`, and billing boundaries from `billingPeriodStart` /
+  `billingPeriodEnd` or `currentPeriod.start` / `currentPeriod.end`.
+  `creditUsagePercent` is **used** percent; `remaining_pct` stores
+  `100 - creditUsagePercent`. When a fresh weekly period omits
+  `creditUsagePercent` but includes weekly period bounds, the sidecar persists
+  `0%` used / `100%` remaining with explicit `grok_billing_weekly_fresh_period`
+  evidence (matching the TUI `Weekly limit: 0%` display).
+
+- `GET /v1/billing` (no format): monthly request counters via `monthlyLimit.val`
+  and `used.val`. These persist as `xai_grok_build_monthly_requests:requests`
+  with `quota_period=monthly` and are **not** used as a fallback for weekly
+  credit percent.
+
+The `public.rate_limit_intervals` materialized view (rebuilt by
+`scripts/apply_rate_limit_intervals_mview_2026_06_03_antigravity.sql`, or the
+legacy `scripts/apply_rate_limit_intervals_mview_2026_05_23.sql` without
+Antigravity pool rows) explicitly allows quota key
+`xai_grok_build_weekly_credits:credits` and maps it to `quota_type = 'weekly'`
+in the final projection CASE. That mapping is deliberate: weekly Grok Build
+credit intervals must roll up under the same `weekly` bucket as other weekly
+quota keys, not under raw observation `quota_type` alone. Unlike most quota
+keys, weekly Grok Build credits also materialize observations with
+`remaining_pct = 100` (fresh weekly period / `grok_billing_weekly_fresh_period`)
+so a new interval closes out the prior depleted window instead of leaving an
+old 0% row open past reset. Monthly Grok request rows
+(`xai_grok_build_monthly_requests:requests`) continue to enter via
+`quota_type = 'requests'` when `remaining_pct < 100`.
 
 Relevant environment variables:
 
