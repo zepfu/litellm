@@ -26,6 +26,65 @@ for reporting and grouping by requested alias.
 Historical rows written before this field existed may be `NULL` unless they were
 explicitly backfilled from prior metadata.
 
+
+## Anthropic / Claude Context Window Selection
+
+LiteLLM records **requested** Claude/Anthropic context-window mode in
+`session_history.metadata`. This is evidence from request headers, retained
+beta metadata, or model suffix labels—not an inference from observed input
+token volume.
+
+Persisted keys (allowlisted in `metadata`):
+
+- `anthropic_context_window_mode`: `extended_1m`, `default_200k`, or `unknown`
+- `anthropic_context_window_requested_tokens`: `1000000`, `200000`, or `null`
+  when unavailable
+- `anthropic_context_window_source`: how the mode was determined, for example
+  `anthropic_beta_header`, `model_suffix_1m`, `no_extended_context_evidence`,
+  or `unavailable`
+- `anthropic_context_window_beta`: safe retained beta token when present (for
+  example `context-1m-2025-08-07`); omitted when not captured
+- `anthropic_context_window_classification`: `classified` or `unavailable`
+
+Header evidence is read from direct `anthropic-beta` / `x-pass-anthropic-beta`
+values and retained shapes such as `llm_provider-anthropic-beta` on forwarded
+metadata. Model suffix evidence uses retained labels such as `claude-opus-4-7[1m]`
+on `inbound_model_alias`, `requested_model_alias`, or related metadata before
+normalization.
+
+Live session-history writes may stamp `default_200k` when traffic is clearly
+Anthropic but no extended-context evidence exists. Historical backfill only
+classifies rows when retained header or suffix evidence exists; otherwise it
+sets `unknown` / `unavailable` markers.
+
+### Repairing existing rows (`--repair-session-history`)
+
+To stamp or refresh Anthropic context-window metadata on rows already stored in
+`public.session_history`, use the backfill script in repair mode. Repairs call
+`_enrich_backfill_anthropic_context_window_metadata`, which classifies from
+retained beta headers and model suffix labels only—not from input token volume.
+
+```bash
+./.venv/bin/python scripts/backfill_session_history.py \
+  --repair-session-history \
+  --repair-anthropic-context-window \
+  [--provider anthropic] [--model claude-opus-4-7] \
+  [--request-id <litellm_call_id>] [--trace-id <id>] [--session-id <id>] \
+  [--from-start-time <iso>] [--to-start-time <iso>] \
+  [--limit N] [--batch-size N]
+```
+
+Omit `--apply` for a dry run. JSON output includes `scanned_rows`,
+`rows_with_updates`, and `anthropic_context_window_updates`. With `--apply`, only
+`metadata` JSONB is updated for context-window changes when
+`--repair-anthropic-context-window` is used without `--repair-costs` or
+`--repair-tenant-ids`. Combine flags to run multiple repair passes in one scan.
+
+`unknown` / `unavailable` on repaired historical rows means retained evidence in
+stored metadata (and `inbound_model_alias` when present) was insufficient to
+classify extended context; it does not mean LiteLLM inferred a window from
+observed token counts.
+
 ## Repository And Tenant Attribution
 
 `session_history.repository` identifies the workspace or project label used for
