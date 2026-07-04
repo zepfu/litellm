@@ -70,6 +70,8 @@ from litellm.integrations.aawm_agent_identity import (
     _derive_request_tags_from_langfuse_metadata,
     _derive_langfuse_trace_tags_from_spend_log_row,
     _ensure_session_history_schema,
+    _enrich_backfill_anthropic_context_window_metadata,
+    _is_anthropic_session_history_context,
     _extract_repository_identity_from_metadata_sources,
     _extract_repository_identity_from_metadata_sources_with_source,
     _extract_tenant_identity_from_metadata_sources,
@@ -2344,6 +2346,84 @@ async def _run_gemini_control_plane_session_history_repair(  # noqa: PLR0915
     }
 
 
+
+_ANTHROPIC_CONTEXT_WINDOW_METADATA_KEYS_FOR_REPAIR = (
+    "anthropic_context_window_mode",
+    "anthropic_context_window_requested_tokens",
+    "anthropic_context_window_source",
+    "anthropic_context_window_beta",
+    "anthropic_context_window_classification",
+)
+
+
+def _resolve_session_history_repair_modes(
+    args: argparse.Namespace,
+) -> Dict[str, bool]:
+    """Resolve which in-place repair operations run for --repair-session-history."""
+    repair_anthropic_context_window = bool(
+        getattr(args, "repair_anthropic_context_window", False)
+    )
+    repair_costs = bool(args.repair_costs)
+    repair_tenant_ids = bool(args.repair_tenant_ids)
+    if repair_costs or repair_tenant_ids:
+        return {
+            "repair_costs": repair_costs,
+            "repair_tenant_ids": repair_tenant_ids,
+            "repair_anthropic_context_window": repair_anthropic_context_window,
+        }
+    if repair_anthropic_context_window:
+        return {
+            "repair_costs": False,
+            "repair_tenant_ids": False,
+            "repair_anthropic_context_window": True,
+        }
+    return {
+        "repair_costs": True,
+        "repair_tenant_ids": True,
+        "repair_anthropic_context_window": False,
+    }
+
+
+def _anthropic_context_window_metadata_slice(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: metadata.get(key)
+        for key in _ANTHROPIC_CONTEXT_WINDOW_METADATA_KEYS_FOR_REPAIR
+        if key in metadata
+    }
+
+
+def _session_history_row_is_anthropic_context_window_candidate(
+    row_dict: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> bool:
+    provider = row_dict.get("provider")
+    model = str(row_dict.get("model") or metadata.get("model") or "unknown")
+    return _is_anthropic_session_history_context(
+        provider=str(provider) if provider is not None else None,
+        resolved_model=model,
+        metadata=metadata,
+    )
+
+
+def _session_history_row_needs_anthropic_context_window_metadata_repair(
+    row_dict: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> bool:
+    if not _session_history_row_is_anthropic_context_window_candidate(row_dict, metadata):
+        return False
+    before = _anthropic_context_window_metadata_slice(metadata)
+    record = {
+        **row_dict,
+        "metadata": dict(metadata),
+    }
+    _enrich_backfill_anthropic_context_window_metadata(record)
+    repaired_meta = record.get("metadata")
+    if not isinstance(repaired_meta, dict):
+        return False
+    after = _anthropic_context_window_metadata_slice(repaired_meta)
+    return before != after
+
+
 async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any]:  # noqa: PLR0915
     if args.repair_gemini_control_plane:
         return await _run_gemini_control_plane_session_history_repair(args)
@@ -2351,8 +2431,10 @@ async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any
     pool = await _get_session_history_pool()
     await _ensure_session_history_schema_with_pool(pool)
 
-    repair_costs = args.repair_costs or not args.repair_tenant_ids
-    repair_tenant_ids = args.repair_tenant_ids or not args.repair_costs
+    repair_modes = _resolve_session_history_repair_modes(args)
+    repair_costs = repair_modes["repair_costs"]
+    repair_tenant_ids = repair_modes["repair_tenant_ids"]
+    repair_anthropic_context_window = repair_modes["repair_anthropic_context_window"]
 
     where_clauses = ["litellm_call_id IS NOT NULL"]
     params: List[Any] = []
@@ -2384,6 +2466,7 @@ async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any
     batch_size = max(1, args.batch_size)
     scanned_rows = 0
     rows_with_updates = 0
+    anthropic_context_window_updates = 0
     tenant_updates = 0
     cost_candidates = 0
     cost_updates = 0
@@ -2398,6 +2481,7 @@ async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any
                 tenant_id,
                 provider,
                 model,
+                inbound_model_alias,
                 input_tokens,
                 output_tokens,
                 cache_read_input_tokens,
@@ -2467,6 +2551,18 @@ async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any
                         cost_updates += 1
                         should_update = True
 
+            if repair_anthropic_context_window:
+                if _session_history_row_needs_anthropic_context_window_metadata_repair(
+                    row_dict, metadata
+                ):
+                    repair_record = {**row_dict, "metadata": metadata}
+                    _enrich_backfill_anthropic_context_window_metadata(repair_record)
+                    repaired_meta = repair_record.get("metadata")
+                    if isinstance(repaired_meta, dict):
+                        metadata = repaired_meta
+                        anthropic_context_window_updates += 1
+                        should_update = True
+
             if should_update:
                 rows_with_updates += 1
                 if args.apply:
@@ -2506,6 +2602,7 @@ async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any
         "stats": {
             "scanned_rows": scanned_rows,
             "rows_with_updates": rows_with_updates,
+            "anthropic_context_window_updates": anthropic_context_window_updates,
             "tenant_updates": tenant_updates,
             "cost_candidates": cost_candidates,
             "cost_updates": cost_updates,
@@ -2643,7 +2740,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repair-session-history",
         action="store_true",
-        help="Repair existing session_history rows in place. By default repairs both tenant ids and response costs.",
+        help="Repair existing session_history rows in place. By default repairs tenant ids and response costs; use --repair-anthropic-context-window, --repair-costs, or --repair-tenant-ids to narrow scope.",
     )
     parser.add_argument(
         "--repair-costs",
@@ -2654,6 +2751,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--repair-tenant-ids",
         action="store_true",
         help="With --repair-session-history, only fill tenant_id from stored session metadata.",
+    )
+    parser.add_argument(
+        "--repair-anthropic-context-window",
+        action="store_true",
+        help=(
+            "With --repair-session-history, repair Anthropic context-window metadata "
+            "on existing rows from retained header/suffix evidence only (not token volume)."
+        ),
     )
     parser.add_argument(
         "--repair-gemini-control-plane",
