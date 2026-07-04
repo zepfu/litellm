@@ -520,6 +520,42 @@ Do not mark an error-intake-driven item complete until the underlying error is
 fixed, verification evidence is recorded, and the corresponding active JSONL or
 legacy text intake file has been deleted or archived out of active intake.
 
+## ClickHouse runtime auth intake (aawm-clickhouse)
+
+Active errors in `.analysis/aawm-clickhouse-error.jsonl` that show `UNKNOWN_USER`
+for user `default`, `Authentication failed: password is incorrect, or there is no
+user with such name` for `default`, or similar default-user auth failures mean a
+caller is probing or connecting with ClickHouse user `default` while
+`aawm-clickhouse` exposes only configured users (for example `clickhouse`).
+
+Resolve by identifying the caller (manual probe, script, Langfuse web/worker, or
+other tooling) and pointing it at explicit credentials instead of implicit
+`default`:
+
+- `CLICKHOUSE_URL`, `CLICKHOUSE_USER`, and `CLICKHOUSE_PASSWORD`, or
+- `LANGFUSE_CLICKHOUSE_URL`, `LANGFUSE_CLICKHOUSE_USER`, and
+  `LANGFUSE_CLICKHOUSE_PASSWORD` for Langfuse-owned paths.
+
+Do not enable or add a `default` ClickHouse user as the fix. Align client env
+with the server's configured users.
+
+Repo scripts that query Langfuse ClickHouse
+(`scripts/backfill_session_history.py`,
+`scripts/backfill_rate_limit_observations.py`,
+`scripts/backfill_session_history_runtime_identity.py`,
+`scripts/score_agent_trace_quality.py`) now:
+
+- resolve auth from CLI flags or the env vars above (with bounded local defaults
+  only when no env is set);
+- run a `SELECT 1` preflight before ClickHouse-backed source modes such as
+  `langfuse_clickhouse`;
+- emit redacted `clickhouse_auth` diagnostics (normalized URL, redacted raw URL
+  userinfo, user, and `*_source` fields) without passwords.
+
+Archive active `aawm-clickhouse-error.jsonl` intake only after verification shows
+no new default-user auth error signatures for the resolved caller class.
+
+
 ## Redaction and local-only handling
 
 Managed prod deployments must mount a writable repo-local analysis directory
