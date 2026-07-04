@@ -97,6 +97,10 @@ DEFAULT_GROK_BILLING_MODEL = "grok-build"
 DEFAULT_GROK_BILLING_HTTP_METHOD = "GET"
 DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS = 3
 DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS = 0.5
+USAGE_PERIOD_TYPE_WEEKLY = "USAGE_PERIOD_TYPE_WEEKLY"
+GROK_BILLING_WEEKLY_CREDITS_QUOTA_KEY = "xai_grok_build_weekly_credits:credits"
+GROK_BILLING_MONTHLY_REQUESTS_QUOTA_KEY = "xai_grok_build_monthly_requests:requests"
+GROK_BILLING_MONTHLY_CREDITS_QUOTA_KEY = "xai_grok_build_monthly_credits:credits"
 DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED = False
 DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -3852,6 +3856,233 @@ def _grok_billing_config(response_body: Dict[str, Any]) -> Dict[str, Any]:
     return response_body
 
 
+def _grok_billing_current_period(config: Dict[str, Any]) -> Dict[str, Any]:
+    current_period = config.get("currentPeriod")
+    return current_period if isinstance(current_period, dict) else {}
+
+
+def _grok_billing_is_weekly_period(config: Dict[str, Any]) -> bool:
+    current_period = _grok_billing_current_period(config)
+    period_type = str(current_period.get("type") or "").strip()
+    return period_type == USAGE_PERIOD_TYPE_WEEKLY
+
+
+def _grok_billing_period_bounds(
+    config: Dict[str, Any],
+) -> tuple[Optional[datetime], Optional[datetime]]:
+    current_period = _grok_billing_current_period(config)
+    billing_period_start_at = _parse_grok_billing_timestamp(
+        config.get("billingPeriodStart") or current_period.get("start")
+    )
+    billing_period_end_at = _parse_grok_billing_timestamp(
+        config.get("billingPeriodEnd") or current_period.get("end")
+    )
+    return billing_period_start_at, billing_period_end_at
+
+
+def _grok_billing_snapshot_parts(
+    config: Dict[str, Any],
+    *,
+    base_evidence: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(config, dict):
+        return None
+
+    billing_period_start_at, billing_period_end_at = _grok_billing_period_bounds(config)
+    is_weekly = _grok_billing_is_weekly_period(config)
+    monthly_limit = _grok_billing_quota_value(config.get("monthlyLimit"))
+    used = _grok_billing_quota_value(config.get("used"))
+    credit_usage_percent = _safe_float(config.get("creditUsagePercent"))
+
+    evidence: Dict[str, Any] = dict(base_evidence or {})
+    signals = list(evidence.get("signals") or [])
+    if "grok_billing_payload" not in signals:
+        signals.append("grok_billing_payload")
+    evidence["signals"] = signals
+
+    if monthly_limit is not None and monthly_limit > 0 and used is not None and used >= 0:
+        used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
+        remaining_pct = float(
+            int(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)
+        )
+        quota_remaining = max(0.0, monthly_limit - used)
+        if "grok_billing_monthly_counter" not in signals:
+            signals.append("grok_billing_monthly_counter")
+        return {
+            "quota_key": GROK_BILLING_MONTHLY_REQUESTS_QUOTA_KEY,
+            "quota_period": "monthly",
+            "quota_type": "requests",
+            "remaining_pct": remaining_pct,
+            "quota_limit": monthly_limit,
+            "quota_used": used,
+            "quota_remaining": quota_remaining,
+            "billing_period_start_at": billing_period_start_at,
+            "billing_period_end_at": billing_period_end_at,
+            "raw_provider_fields": {
+                "monthlyLimit": _json_safe_grok_billing_value(
+                    config.get("monthlyLimit")
+                ),
+                "used": _json_safe_grok_billing_value(config.get("used")),
+                "onDemandCap": _json_safe_grok_billing_value(
+                    config.get("onDemandCap")
+                ),
+                "billingPeriodStart": config.get("billingPeriodStart"),
+                "billingPeriodEnd": config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_used",
+                "quota_unit_interpretation": "requests",
+            },
+            "evidence": {
+                **evidence,
+                "provider_fields": [
+                    "config.monthlyLimit.val",
+                    "config.used.val",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "whole_remaining_percentage",
+                "unit_note": (
+                    "Grok billing does not label used.val; observed tool traffic "
+                    "behaves request-like."
+                ),
+            },
+        }
+
+    if is_weekly and credit_usage_percent is not None:
+        used_percentage = max(0.0, min(100.0, credit_usage_percent))
+        remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
+        for signal in (
+            "grok_billing_weekly_credit",
+            "grok_billing_percentage_only",
+        ):
+            if signal not in signals:
+                signals.append(signal)
+        return {
+            "quota_key": GROK_BILLING_WEEKLY_CREDITS_QUOTA_KEY,
+            "quota_period": "weekly",
+            "quota_type": "credits",
+            "remaining_pct": remaining_pct,
+            "quota_limit": None,
+            "quota_used": None,
+            "quota_remaining": None,
+            "billing_period_start_at": billing_period_start_at,
+            "billing_period_end_at": billing_period_end_at,
+            "raw_provider_fields": {
+                "creditUsagePercent": _json_safe_grok_billing_value(
+                    config.get("creditUsagePercent")
+                ),
+                "productUsage": _json_safe_grok_billing_value(
+                    config.get("productUsage")
+                ),
+                "currentPeriod": _json_safe_grok_billing_value(
+                    config.get("currentPeriod")
+                ),
+                "billingPeriodStart": config.get("billingPeriodStart"),
+                "billingPeriodEnd": config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_credit_usage_percent",
+                "quota_unit_interpretation": "percent_of_credit_quota",
+            },
+            "evidence": {
+                **evidence,
+                "provider_fields": [
+                    "config.creditUsagePercent",
+                    "config.productUsage",
+                    "config.currentPeriod.type",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "none",
+                "unit_note": (
+                    "Grok billing provided percentage-only weekly credit usage; "
+                    "absolute quota counts are intentionally left null."
+                ),
+            },
+        }
+
+    if is_weekly and (
+        billing_period_start_at is not None or billing_period_end_at is not None
+    ):
+        if "grok_billing_weekly_fresh_period" not in signals:
+            signals.append("grok_billing_weekly_fresh_period")
+        return {
+            "quota_key": GROK_BILLING_WEEKLY_CREDITS_QUOTA_KEY,
+            "quota_period": "weekly",
+            "quota_type": "credits",
+            "remaining_pct": 100.0,
+            "quota_limit": None,
+            "quota_used": None,
+            "quota_remaining": None,
+            "billing_period_start_at": billing_period_start_at,
+            "billing_period_end_at": billing_period_end_at,
+            "raw_provider_fields": {
+                "currentPeriod": _json_safe_grok_billing_value(
+                    config.get("currentPeriod")
+                ),
+                "billingPeriodStart": config.get("billingPeriodStart"),
+                "billingPeriodEnd": config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_weekly_credit_fresh_period",
+                "quota_unit_interpretation": "percent_of_credit_quota",
+            },
+            "evidence": {
+                **evidence,
+                "provider_fields": [
+                    "config.currentPeriod.type",
+                    "config.currentPeriod.start",
+                    "config.currentPeriod.end",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "none",
+                "unit_note": (
+                    "Fresh weekly Grok Build credit periods omit creditUsagePercent; "
+                    "remaining percent is inferred as 100% used / 0% consumed."
+                ),
+            },
+        }
+
+    if credit_usage_percent is not None:
+        used_percentage = max(0.0, min(100.0, credit_usage_percent))
+        remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
+        if "grok_billing_percentage_only" not in signals:
+            signals.append("grok_billing_percentage_only")
+        if "grok_billing_legacy_monthly_credit" not in signals:
+            signals.append("grok_billing_legacy_monthly_credit")
+        return {
+            "quota_key": GROK_BILLING_MONTHLY_CREDITS_QUOTA_KEY,
+            "quota_period": "monthly",
+            "quota_type": "credits",
+            "remaining_pct": remaining_pct,
+            "quota_limit": None,
+            "quota_used": None,
+            "quota_remaining": None,
+            "billing_period_start_at": billing_period_start_at,
+            "billing_period_end_at": billing_period_end_at,
+            "raw_provider_fields": {
+                "creditUsagePercent": _json_safe_grok_billing_value(
+                    config.get("creditUsagePercent")
+                ),
+                "productUsage": _json_safe_grok_billing_value(
+                    config.get("productUsage")
+                ),
+                "billingPeriodStart": config.get("billingPeriodStart"),
+                "billingPeriodEnd": config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_credit_usage_percent",
+                "quota_unit_interpretation": "percent_of_credit_quota",
+            },
+            "evidence": {
+                **evidence,
+                "provider_fields": [
+                    "config.creditUsagePercent",
+                    "config.productUsage",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "none",
+                "unit_note": (
+                    "Grok billing provided percentage-only credit usage; "
+                    "absolute quota counts are intentionally left null."
+                ),
+            },
+        }
+
+    return None
+
+
 def _grok_billing_sidecar_request_contract_evidence(
     config: ProviderStatusLoopConfig,
     *,
@@ -3901,133 +4132,25 @@ def _build_grok_billing_rate_limit_payload(
     identity_headers: Optional[Mapping[str, str]] = None,
 ) -> tuple[Any, ...]:
     billing_config = _grok_billing_config(response_body)
-    billing_period_start_at = _parse_grok_billing_timestamp(
-        billing_config.get("billingPeriodStart")
-    )
-    billing_period_end_at = _parse_grok_billing_timestamp(
-        billing_config.get("billingPeriodEnd")
-    )
-
-    monthly_limit = _grok_billing_quota_value(billing_config.get("monthlyLimit"))
-    used = _grok_billing_quota_value(billing_config.get("used"))
-    if monthly_limit is not None and monthly_limit > 0 and used is not None and used >= 0:
-        used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
-        remaining_pct = int(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)
-        raw_provider_fields = {
-            "monthlyLimit": _json_safe_grok_billing_value(
-                billing_config.get("monthlyLimit")
-            ),
-            "used": _json_safe_grok_billing_value(billing_config.get("used")),
-            "onDemandCap": _json_safe_grok_billing_value(
-                billing_config.get("onDemandCap")
-            ),
-            "billingPeriodStart": billing_config.get("billingPeriodStart"),
-            "billingPeriodEnd": billing_config.get("billingPeriodEnd"),
-            "quota_unit": "grok_billing_used",
-            "quota_unit_interpretation": "requests",
-        }
-        evidence = {
-            "signals": ["grok_billing_payload"],
-            "provider_fields": [
-                "config.monthlyLimit.val",
-                "config.used.val",
-                "config.billingPeriodEnd",
-            ],
-            "rounding": "whole_remaining_percentage",
-            "unit_note": (
-                "Grok billing does not label used.val; observed tool traffic "
-                "behaves request-like."
-            ),
-        }
-        quota_key = "xai_grok_build_monthly_requests:requests"
-        quota_type = "requests"
-        quota_limit = monthly_limit
-        quota_used = used
-        quota_remaining = max(0.0, monthly_limit - used)
-        remaining_pct_value: Optional[float] = float(remaining_pct)
-    else:
-        credit_usage_percent = _safe_float(billing_config.get("creditUsagePercent"))
-        if credit_usage_percent is not None:
-            used_percentage = max(0.0, min(100.0, credit_usage_percent))
-            remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
-            raw_provider_fields = {
-                "creditUsagePercent": _json_safe_grok_billing_value(
-                    billing_config.get("creditUsagePercent")
-                ),
-                "productUsage": _json_safe_grok_billing_value(
-                    billing_config.get("productUsage")
-                ),
-                "billingPeriodStart": billing_config.get("billingPeriodStart"),
-                "billingPeriodEnd": billing_config.get("billingPeriodEnd"),
-                "quota_unit": "grok_billing_credit_usage_percent",
-                "quota_unit_interpretation": "percent_of_credit_quota",
-            }
-            evidence = {
-                "signals": [
-                    "grok_billing_payload",
-                    "grok_billing_percentage_only",
-                ],
-                "provider_fields": [
-                    "config.creditUsagePercent",
-                    "config.productUsage",
-                    "config.billingPeriodEnd",
-                ],
-                "rounding": "none",
-                "unit_note": (
-                    "Grok billing provided percentage-only credit usage; absolute "
-                    "quota counts are intentionally left null."
-                ),
-            }
-            quota_key = "xai_grok_build_monthly_credits:credits"
-            quota_type = "credits"
-            quota_limit = None
-            quota_used = None
-            quota_remaining = None
-            remaining_pct_value = float(remaining_pct)
-        elif billing_period_end_at is not None:
-            raw_provider_fields = {
-                "billingPeriodStart": billing_config.get("billingPeriodStart"),
-                "billingPeriodEnd": billing_config.get("billingPeriodEnd"),
-                "quota_unit": "grok_billing_period_only",
-                "quota_unit_interpretation": "unknown_usage",
-            }
-            evidence = {
-                "signals": [
-                    "grok_billing_payload",
-                    "grok_billing_period_only",
-                ],
-                "provider_fields": [
-                    "config.billingPeriodStart",
-                    "config.billingPeriodEnd",
-                ],
-                "rounding": "none",
-                "unit_note": (
-                    "Grok billing reported a billing-period boundary without "
-                    "absolute or percentage usage fields; remaining quota is "
-                    "unknown and left null."
-                ),
-            }
-            quota_key = "xai_grok_build_monthly_credits:credits"
-            quota_type = "credits"
-            quota_limit = None
-            quota_used = None
-            quota_remaining = None
-            remaining_pct_value = None
-        else:
-            raise ValueError(
-                "Grok billing payload did not include absolute or percentage quota fields."
-            )
-
-    evidence.update(
-        _grok_billing_sidecar_request_contract_evidence(
+    snapshot = _grok_billing_snapshot_parts(
+        billing_config,
+        base_evidence=_grok_billing_sidecar_request_contract_evidence(
             config,
             identity_headers=identity_headers,
-        )
+        ),
     )
+    if snapshot is None:
+        raise ValueError(
+            "Grok billing payload did not include absolute or percentage quota fields."
+        )
 
+    evidence = dict(snapshot["evidence"])
     signals = evidence.setdefault("signals", [])
     if "grok_billing_sidecar_request_contract" not in signals:
         signals.append("grok_billing_sidecar_request_contract")
+
+    billing_period_start_at = snapshot["billing_period_start_at"]
+    billing_period_end_at = snapshot["billing_period_end_at"]
 
     return (
         observed_at,
@@ -4036,17 +4159,17 @@ def _build_grok_billing_rate_limit_payload(
         None,
         "xai",
         config.grok_billing_model,
-        quota_key,
-        "monthly",
-        quota_type,
+        snapshot["quota_key"],
+        snapshot["quota_period"],
+        snapshot["quota_type"],
         billing_period_end_at,
-        remaining_pct_value,
-        quota_limit,
-        quota_used,
-        quota_remaining,
+        snapshot["remaining_pct"],
+        snapshot["quota_limit"],
+        snapshot["quota_used"],
+        snapshot["quota_remaining"],
         billing_period_start_at,
         billing_period_end_at,
-        json.dumps(raw_provider_fields, sort_keys=True),
+        json.dumps(snapshot["raw_provider_fields"], sort_keys=True),
         json.dumps(evidence, sort_keys=True),
         "grok_billing",
         None,

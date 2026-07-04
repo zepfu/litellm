@@ -40,6 +40,10 @@ WITH rate_limit_points AS (
                   'antigravity_code_assist:vertex_pool'
               ])
           )
+          OR (
+              provider = 'xai'
+              AND quota_key = 'xai_grok_build_weekly_credits:credits'
+          )
       )
       AND (
           quota_key = ANY (ARRAY[
@@ -51,7 +55,8 @@ WITH rate_limit_points AS (
               'anthropic_unified_7d_sonnet:7d_sonnet',
               'anthropic_unified_5h:5h',
               'antigravity_code_assist:gemini_pool',
-              'antigravity_code_assist:vertex_pool'
+              'antigravity_code_assist:vertex_pool',
+              'xai_grok_build_weekly_credits:credits'
           ])
           OR (
               provider <> 'antigravity'
@@ -104,7 +109,7 @@ SELECT DISTINCT
     fromdate,
     COALESCE(next_fromdate, '9999-12-31 00:00:00+00'::timestamptz) AS todate,
     CASE
-        WHEN quota_key = ANY (ARRAY['anthropic_unified_7d:7d', 'codex:secondary']) THEN 'weekly'
+        WHEN quota_key = ANY (ARRAY['anthropic_unified_7d:7d', 'codex:secondary', 'xai_grok_build_weekly_credits:credits']) THEN 'weekly'
         WHEN quota_key = ANY (ARRAY['anthropic_unified_5h:5h', 'codex:primary']) THEN 'short'
         WHEN quota_key = ANY (ARRAY['codex_bengalfox:primary']) THEN 'short_special'
         WHEN quota_key = ANY (ARRAY['anthropic_unified_7d_sonnet:7d_sonnet', 'codex_bengalfox:secondary']) THEN 'weekly_special'

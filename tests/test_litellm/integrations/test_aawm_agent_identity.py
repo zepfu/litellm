@@ -9003,10 +9003,15 @@ def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
     assert payload[14] == datetime(2026, 5, 1, tzinfo=timezone.utc)
     assert payload[15] == datetime(2026, 6, 1, tzinfo=timezone.utc)
     assert json.loads(payload[16])["monthlyLimit"] == {"val": 60000}
-    assert json.loads(payload[17])["signals"] == ["grok_billing_payload"]
+    assert json.loads(payload[17])["signals"] == [
+        "grok_billing_payload",
+        "grok_billing_monthly_counter",
+    ]
 
 
-def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> None:  # noqa: PLR0915
+def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> (  # noqa: PLR0915
+    None
+):
     kwargs = _base_kwargs(trace_name="grok-build")
     kwargs["model"] = "grok-composer-2.5-fast"
     kwargs["custom_llm_provider"] = "xai"
@@ -9051,8 +9056,13 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> Non
                     {"name": "GrokBuild", "usagePercent": 12.507334},
                     {"name": "Api", "usagePercent": 2.032},
                 ],
-                "billingPeriodStart": "2026-06-01T00:00:00+00:00",
-                "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-03T19:54:47.584112+00:00",
+                    "end": "2026-07-10T19:54:47.584112+00:00",
+                },
+                "billingPeriodStart": "2026-07-03T19:54:47.584112+00:00",
+                "billingPeriodEnd": "2026-07-10T19:54:47.584112+00:00",
             }
         },
     }
@@ -9072,7 +9082,7 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> Non
     assert observation["client_family"] == "grok-build"
     assert observation["model"] == "grok-composer-2.5-fast"
     assert observation["quota_type"] == "credits"
-    assert observation["quota_period"] == "monthly"
+    assert observation["quota_period"] == "weekly"
     assert observation["limit_scope"] == "credits"
     assert observation["raw_provider_fields"]["quota_unit"] == (
         "grok_billing_credit_usage_percent"
@@ -9087,24 +9097,37 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> Non
     assert observation["quota_remaining"] is None
     assert observation["billing_period_start_at"] == datetime(
         2026,
-        6,
-        1,
+        7,
+        3,
+        19,
+        54,
+        47,
+        584112,
         tzinfo=timezone.utc,
     )
     assert observation["billing_period_end_at"] == datetime(
         2026,
         7,
-        1,
+        10,
+        19,
+        54,
+        47,
+        584112,
         tzinfo=timezone.utc,
     )
     assert observation["provider_resets_at"] == datetime(
         2026,
         7,
-        1,
+        10,
+        19,
+        54,
+        47,
+        584112,
         tzinfo=timezone.utc,
     )
     assert observation["evidence"]["signals"] == [
         "grok_billing_payload",
+        "grok_billing_weekly_credit",
         "grok_billing_percentage_only",
     ]
     assert observation["evidence"]["request_contract_fingerprint"] == "abcd" * 16
@@ -9115,32 +9138,122 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> Non
     )
     assert observation["evidence"]["request_contract_target_path"] == "/v1/billing"
     assert observation["evidence"]["request_contract_query_keys"] == ["format"]
-    assert "authorization" in observation["evidence"][
-        "request_contract_header_names"
-    ]
-    assert observation["evidence"][
-        "request_contract_x_xai_token_auth_configured"
-    ] is True
-
-    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
-        observation
+    assert "authorization" in observation["evidence"]["request_contract_header_names"]
+    assert (
+        observation["evidence"]["request_contract_x_xai_token_auth_configured"] is True
     )
+
+    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(observation)
     assert payload[4] == "xai"
-    assert payload[6] == "xai_grok_build_monthly_credits:credits"
+    assert payload[6] == "xai_grok_build_weekly_credits:credits"
     assert payload[8] == "credits"
     assert payload[10] == pytest.approx(85.460667)
     assert payload[11] is None
     assert payload[12] is None
     assert payload[13] is None
-    assert payload[14] == datetime(2026, 6, 1, tzinfo=timezone.utc)
-    assert payload[15] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert payload[14] == datetime(2026, 7, 3, 19, 54, 47, 584112, tzinfo=timezone.utc)
+    assert payload[15] == datetime(2026, 7, 10, 19, 54, 47, 584112, tzinfo=timezone.utc)
     raw_provider_fields = json.loads(payload[16])
     assert raw_provider_fields["creditUsagePercent"] == pytest.approx(14.539333)
     assert raw_provider_fields["productUsage"][0]["name"] == "GrokBuild"
     assert json.loads(payload[17])["signals"] == [
         "grok_billing_payload",
+        "grok_billing_weekly_credit",
         "grok_billing_percentage_only",
     ]
+
+
+def test_build_rate_limit_observations_extracts_grok_weekly_fresh_credit_billing() -> (
+    None
+):
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-weekly-fresh-billing"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "grok_model_override": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        }
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        "response_body": {
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-07-03T19:54:47.584112+00:00",
+                    "end": "2026-07-10T19:54:47.584112+00:00",
+                },
+                "billingPeriodStart": "2026-07-03T19:54:47.584112+00:00",
+                "billingPeriodEnd": "2026-07-10T19:54:47.584112+00:00",
+            }
+        },
+    }
+    observed_at = datetime(2026, 7, 3, 20, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=kwargs["standard_pass_through_logging_payload"]["response_body"],
+        start_time=observed_at,
+        end_time=observed_at,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["limit_id"] == "xai_grok_build_weekly_credits"
+    assert observation["quota_period"] == "weekly"
+    assert observation["remaining_pct"] == 100.0
+    assert observation["used_percentage"] == 0.0
+    assert "grok_billing_weekly_fresh_period" in observation["evidence"]["signals"]
+
+
+def test_build_rate_limit_observations_keeps_legacy_grok_credit_payload_monthly() -> (
+    None
+):
+    kwargs = _base_kwargs(trace_name="grok-build")
+    kwargs["model"] = "grok-build"
+    kwargs["custom_llm_provider"] = "xai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-grok-legacy-credit-billing"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "grok-build",
+            "grok_model_override": "grok-build",
+            "passthrough_route_family": "grok_cli_chat_proxy",
+        }
+    )
+    kwargs["standard_pass_through_logging_payload"] = {
+        "url": "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        "response_body": {
+            "config": {
+                "creditUsagePercent": 27.0,
+                "productUsage": [
+                    {"name": "GrokBuild", "usagePercent": 26.0},
+                    {"name": "Api", "usagePercent": 1.0},
+                ],
+                "billingPeriodStart": "2026-07-01T00:00:00+00:00",
+                "billingPeriodEnd": "2026-08-01T00:00:00+00:00",
+            }
+        },
+    }
+    observed_at = datetime(2026, 7, 3, 16, 45, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=kwargs["standard_pass_through_logging_payload"]["response_body"],
+        start_time=observed_at,
+        end_time=observed_at,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["limit_id"] == "xai_grok_build_monthly_credits"
+    assert observation["quota_period"] == "monthly"
+    assert observation["remaining_pct"] == pytest.approx(73.0)
+    assert "grok_billing_legacy_monthly_credit" in observation["evidence"]["signals"]
 
 
 def test_build_rate_limit_observations_prefers_absolute_grok_billing_counts() -> None:
