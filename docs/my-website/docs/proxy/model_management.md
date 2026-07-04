@@ -41,6 +41,11 @@ curl -X GET "http://0.0.0.0:4000/model/info" \
 
 Add a new model to the proxy via the `/model/new` API, to add models without restarting the proxy.
 
+
+:::info Database required
+`/model/new` persists deployments to the LiteLLM proxy database. The proxy must start with `DATABASE_URL` set so Prisma initializes successfully, and `store_model_in_db` must be enabled. Config-file-only or DB-less proxy deployments should not use dynamic model-management writes; use `model_list` in your config instead.
+:::
+
 <Tabs>
 <TabItem value="API">
 
