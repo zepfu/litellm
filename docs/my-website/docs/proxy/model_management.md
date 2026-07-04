@@ -19,6 +19,25 @@ model_list:
 
 Retrieve detailed information about each model listed in the `/model/info` endpoint, including descriptions from the `config.yaml` file, and additional model info (e.g. max tokens, cost per input token, etc.) pulled from the model_info you set and the [litellm model cost map](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json). Sensitive details like API keys are excluded for security purposes.
 
+
+## AAWM OpenAI gpt-5.6 catalog (D1-478)
+
+LiteLLM's canonical cost map includes `gpt-5.6-sol`, `gpt-5.6-terra`, and
+`gpt-5.6-luna` in both `model_prices_and_context_window.json` and
+`litellm/bundled_model_prices_and_context_window_fallback.json`. Pricing and
+cache billing fields are sourced from
+[Previewing GPT-5.6 Sol](https://openai.com/index/previewing-gpt-5-6-sol/)
+(per 1M tokens: Sol $5/$30, Terra $2.50/$15, Luna $1/$6; cache write 1.25× input;
+cache read 10% of input). These entries intentionally include only verified
+pricing/cache billing plus minimal structure (`litellm_provider`, `mode`,
+`supported_endpoints`); they do not copy `gpt-5.5` context-window or capability
+flags until those fields are verified for the gpt-5.6 family. Codex alias routing uses:
+
+- `aawm-sota`: `gpt-5.6-sol` → `gpt-5.5`
+- `aawm-code`: `gpt-5.3-codex-spark` → Grok adapters → `gpt-5.6-terra` → `gpt-5.5`
+- `aawm-low`: OpenRouter/OpenCode lanes → `gpt-5.6-luna` → `gpt-5.4-mini`
+- `aawm-orchestration`: `gpt-5.6-terra` → `gpt-5.5`
+
 :::tip Sync Model Data
 Keep your model pricing data up to date by [syncing models from GitHub](sync_models_github.md).
 :::
@@ -185,3 +204,27 @@ Returned `model_info = Your custom model_info + (if exists) LITELLM MODEL INFO`
     ]
 }
 ```
+
+## Direct Anthropic routes and provider credentials
+
+For **direct Anthropic** model routes (for example `anthropic/claude-sonnet-4-6` or
+`/anthropic/v1/messages`), LiteLLM must send a **real Anthropic provider credential**
+to the upstream API. Acceptable sources include:
+
+- the deployment `api_key` in `model_list` / stored model params
+- `litellm.anthropic_key` (or equivalent library setting)
+- the `ANTHROPIC_API_KEY` environment variable
+- a valid Anthropic OAuth bearer token (when configured for that route)
+
+**LiteLLM proxy authentication is not a provider credential.** Headers such as
+`Authorization: Bearer <litellm-proxy-key>` or `x-litellm-api-key` authenticate
+the client to the LiteLLM gateway only. They must not be promoted or reused as
+Anthropic `api_key` / `x-api-key` for upstream calls.
+
+**BYOK `x-api-key` promotion** applies only on **direct Anthropic** routes when
+provider-header forwarding is enabled. Use `forward_llm_provider_auth_headers: true`
+in general settings, or model-group forwarding via `forward_client_headers_to_llm_api`
+for `anthropic/*` in model group settings. In that case, a
+client-supplied Anthropic `x-api-key` that was **not** used for LiteLLM proxy auth
+may be promoted to `api_key` for the upstream request. Proxy-only keys and
+non-Anthropic routes do not use this path.

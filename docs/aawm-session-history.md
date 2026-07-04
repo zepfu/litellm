@@ -218,9 +218,9 @@ signals, source fields, and interpretation notes that explain how the snapshot
 was classified. These JSONB fields must not contain credentials, account ids,
 authorization headers, prompt bodies, response text, or raw tool arguments.
 
-Grok no-format `/v1/billing` monthly counter payloads (`monthlyLimit`, `used`)
-populate `quota_limit`, `quota_used`, `quota_remaining`, billing-period columns,
-and quota key `xai_grok_build_monthly_requests:requests` with
+Grok no-format `/v1/billing` monthly counter payloads (`monthlyLimit`,
+`used`) populate `quota_limit`, `quota_used`, `quota_remaining`, billing-period
+columns, and quota key `xai_grok_build_monthly_requests:requests` with
 `quota_period=monthly`. They are separate from weekly credit telemetry.
 
 Grok `/v1/billing?format=credits` weekly payloads use quota key
@@ -228,11 +228,18 @@ Grok `/v1/billing?format=credits` weekly payloads use quota key
 `currentPeriod.type` is `USAGE_PERIOD_TYPE_WEEKLY`. `creditUsagePercent` is used
 percent; `remaining_pct` stores remaining percent. Fresh weekly periods without
 `creditUsagePercent` persist `remaining_pct=100` and `used_percentage=0` with
-explicit fresh-period evidence, not null/unknown. xAI OAuth rate-limit headers
-populate absolute request/token amounts and carry billing period ends when the
-provider config or managed subscription context exposes one.
+explicit fresh-period evidence, not null/unknown. xAI OAuth rate-limit headers populate absolute request/token
+amounts and carry billing period ends when the provider config or managed
+subscription context exposes one.
 
 ## Provider Credit Observations
+
+
+Anthropic Fable weekly overage-included headers (`anthropic-ratelimit-unified-7d_oi-*`)
+persist as quota key `anthropic_unified_7d_oi:7d_oi` with `quota_period=seven_day`
+and `window_minutes=10080`. This is distinct from the baseline `anthropic_unified_7d:7d`
+bucket and from the retired `anthropic_unified_7d_sonnet:7d_sonnet` series. Prompt-side
+token cache breakdowns remain sub-buckets of input tokens, not additional quota keys.
 
 `public.provider_credit_observations` stores provider banked reset-credit
 snapshots from scheduled sidecar polls (for example Codex usage-limit reset
@@ -508,28 +515,60 @@ selection. These aliases follow their declared non-Antigravity failover order
 below. Direct explicit Antigravity routes remain available separately and are
 documented in the Antigravity OAuth Credentials section.
 
+`aawm-sota` uses this order:
+
+1. `gpt-5.6-sol`
+2. `gpt-5.5` as the OpenAI last-resort candidate
+
 `aawm-low` and `aawm-low-anthropic` use this order:
 
 1. OpenRouter North Mini (`openrouter/cohere/north-mini-code:free`)
 2. OpenRouter Owl Alpha (`openrouter/owl-alpha`)
 3. OpenCode Zen `deepseek-v4-flash`
 4. OpenCode Zen `big-pickle`
-5. `gpt-5.4-mini` as the OpenAI last-resort candidate for `aawm-low`
-6. native Anthropic Haiku as the last-resort candidate for `aawm-low-anthropic`
+5. `gpt-5.6-luna`
+6. `gpt-5.4-mini` as the OpenAI last-resort candidate for `aawm-low`
+7. native Anthropic Haiku as the last-resort candidate for `aawm-low-anthropic`
 
 `aawm-code` uses this order:
 
 1. `gpt-5.3-codex-spark`
 2. `grok-composer-2.5-fast`
 3. `oa_xai/grok-build`
-4. `gpt-5.5` as the OpenAI last-resort candidate with medium reasoning
+4. `gpt-5.6-terra`
+5. `gpt-5.5` as the OpenAI last-resort candidate with medium reasoning
+
+`aawm-orchestration` uses this order:
+
+1. `gpt-5.6-terra`
+2. `gpt-5.5` as the OpenAI last-resort candidate
+
+`aawm-sota-anthropic` uses this order:
+
+1. native Anthropic `claude-fable-5`
+2. native Anthropic `claude-opus-4-8` as the last-resort candidate
 
 `aawm-code-anthropic` uses this order:
 
 1. `gpt-5.3-codex-spark`
 2. `grok-composer-2.5-fast`
 3. `oa_xai/grok-build`
-4. native Anthropic `claude-sonnet-4-6` as the last-resort candidate
+4. native Anthropic `claude-sonnet-5[1m]` (1m context window)
+5. native Anthropic `claude-sonnet-5`
+6. native Anthropic `claude-sonnet-4-6` as the last-resort candidate
+
+`aawm-orchestration-anthropic` uses this order:
+
+1. native Anthropic `claude-opus-4-8` as the sole last-resort candidate
+
+OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` pricing in
+`model_prices_and_context_window.json` follows the official GPT-5.6 preview page
+(`https://openai.com/index/previewing-gpt-5-6-sol/`): per-token input/output
+costs, cache write at 1.25× uncached input, and cache read at 10% of uncached
+input. That preview source documents pricing and cache billing only; catalog
+entries therefore keep verified cost fields plus minimal structural fields
+(`litellm_provider`, `mode`, `supported_endpoints`) and do not assert
+unsupported context-window or capability metadata.
 
 This is default alias behavior; no staging environment variable is required for
 dev or production routing.
@@ -541,7 +580,7 @@ completion adapter must continue to send the provider-stripped model slug
 upstream (`cohere/north-mini-code:free`, `owl-alpha`) to match OpenRouter
 ingress expectations.
 
-The Codex `aawm-code` alias uses `gpt-5.5` as the OpenAI last-resort candidate,
+The Codex `aawm-code` alias uses `gpt-5.5` as the OpenAI last-resort candidate after `gpt-5.3-codex-spark`, Grok adapter lanes, and `gpt-5.6-terra`,
 not plain `gpt-5.3-codex`, because ChatGPT-account Codex passthrough rejects the
 plain `gpt-5.3-codex` model. When that last-resort candidate is selected,
 LiteLLM applies medium reasoning by default if the request did not already set a
