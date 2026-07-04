@@ -24,11 +24,13 @@ from litellm.types.llms.openai import AllMessageValues
 
 ANTHROPIC_MISSING_DIRECT_CREDENTIAL_MESSAGE = (
     "Missing Anthropic API Key - A direct Anthropic route requires a "
-    "server-side credential: set deployment `api_key`, "
+    "server-side credential: configure deployment `api_key`, "
     "`litellm.anthropic_key`, or the `ANTHROPIC_API_KEY` environment "
-    "variable, or supply a valid Anthropic OAuth token (sk-ant-oat*). "
-    "LiteLLM proxy `Authorization` headers are not Anthropic provider "
-    "credentials and are not forwarded as the Anthropic API key."
+    "variable (or an Anthropic credential supplied via server-side "
+    "`api_key` / deployment config, not from the proxy request). "
+    "LiteLLM proxy or client `Authorization` and `x-api-key` headers "
+    "are not Anthropic provider credentials and do not satisfy this "
+    "requirement."
 )
 
 

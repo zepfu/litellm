@@ -889,144 +889,6 @@ class LiteLLMProxyRequestSetup:
         return tags
 
 
-def _get_authenticated_with_header_from_request(request: Request) -> str:
-    if "x-litellm-api-key" in request.headers:
-        return "x-litellm-api-key"
-    if "authorization" in request.headers:
-        return "authorization"
-    return "x-api-key"
-
-
-def _get_client_anthropic_oauth_api_key_from_request(
-    request: Request,
-) -> Optional[str]:
-    """Return Anthropic OAuth api_key from client Authorization when present."""
-    from litellm.llms.anthropic.common_utils import is_anthropic_oauth_key
-
-    for header_name, header_value in request.headers.items():
-        if header_name.lower() != "authorization":
-            continue
-        if not is_anthropic_oauth_key(header_value):
-            continue
-        if header_value.startswith("Bearer "):
-            return header_value[7:]
-        return header_value
-    return None
-
-
-def _get_client_x_api_key_from_request(
-    request: Request, authenticated_with_header: Optional[str]
-) -> Optional[str]:
-    """Return client x-api-key when it was not used for LiteLLM proxy authentication."""
-    if (
-        authenticated_with_header is not None
-        and authenticated_with_header.lower() == "x-api-key"
-    ):
-        return None
-    for header_name, header_value in request.headers.items():
-        if header_name.lower() == "x-api-key":
-            return header_value
-    return None
-
-
-def _is_anthropic_direct_model(model: Optional[str]) -> bool:
-    if not model:
-        return False
-    try:
-        from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
-
-        _, custom_llm_provider, _, _ = get_llm_provider(model=model)
-    except Exception:
-        return False
-    return custom_llm_provider == LlmProviders.ANTHROPIC.value
-
-
-def _model_group_forwards_client_headers(
-    data: dict, user_api_key_dict: UserAPIKeyAuth
-) -> bool:
-    from litellm.proxy.auth.auth_checks import _check_model_access_helper
-    from litellm.proxy.proxy_server import llm_router
-
-    data_model = data.get("model")
-    if data_model is None or litellm.model_group_settings is None:
-        return False
-    forward_models = litellm.model_group_settings.forward_client_headers_to_llm_api
-    if forward_models is None:
-        return False
-    return _check_model_access_helper(
-        model=data_model,
-        llm_router=llm_router,
-        models=forward_models,
-        team_model_aliases=user_api_key_dict.team_model_aliases,
-        team_id=user_api_key_dict.team_id,
-    )
-
-
-def _maybe_promote_anthropic_byok_api_key(
-    *,
-    data: dict,
-    request: Request,
-    cleaned_headers: dict,
-    authenticated_with_header: Optional[str],
-    forward_llm_provider_auth_headers: bool,
-    forward_client_headers_to_llm_api: bool,
-    user_api_key_dict: UserAPIKeyAuth,
-) -> None:
-    """
-    For direct Anthropic routes, promote a client provider credential to
-    data["api_key"] when header forwarding is explicitly enabled. Never promote
-    proxy auth headers.
-    """
-    if not _is_anthropic_direct_model(data.get("model")):
-        return
-
-    credential_source: Optional[str] = None
-    client_x_api_key = _get_client_x_api_key_from_request(
-        request, authenticated_with_header
-    )
-    if client_x_api_key is not None:
-        credential_source = "x-api-key"
-    if client_x_api_key is None and forward_llm_provider_auth_headers:
-        for header_name, header_value in cleaned_headers.items():
-            if header_name.lower() == "x-api-key":
-                client_x_api_key = header_value
-                credential_source = "x-api-key"
-                break
-
-    client_api_key = client_x_api_key
-    if client_api_key is None:
-        client_api_key = _get_client_anthropic_oauth_api_key_from_request(request)
-        if client_api_key is not None:
-            credential_source = "authorization"
-
-    if not client_api_key:
-        return
-
-    model_group_forwards = _model_group_forwards_client_headers(
-        data, user_api_key_dict
-    )
-    if (
-        not forward_llm_provider_auth_headers
-        and not model_group_forwards
-        and not forward_client_headers_to_llm_api
-    ):
-        return
-
-    data["api_key"] = client_api_key
-    verbose_proxy_logger.debug(
-        "Setting client-provided %s as api_key parameter for Anthropic route "
-        "(will override deployment key)",
-        credential_source or "credential",
-    )
-
-    if model_group_forwards and credential_source == "x-api-key":
-        existing_headers = data.get("headers")
-        if not isinstance(existing_headers, dict):
-            existing_headers = {}
-        if "x-api-key" not in existing_headers and "X-Api-Key" not in existing_headers:
-            existing_headers["x-api-key"] = client_api_key
-            data["headers"] = existing_headers
-
 
 async def add_litellm_data_to_request(  # noqa: PLR0915
     data: dict,
@@ -1065,7 +927,16 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
         forward_llm_auth = getattr(litellm, "forward_llm_provider_auth_headers", False)
     # Determine which header was used for authentication
     # This enables forwarding provider keys (e.g., x-api-key) when they weren't used for LiteLLM auth
-    authenticated_with_header = _get_authenticated_with_header_from_request(request)
+    authenticated_with_header = None
+    if "x-litellm-api-key" in request.headers:
+        # If x-litellm-api-key is present, it was used for auth
+        authenticated_with_header = "x-litellm-api-key"
+    elif "authorization" in request.headers:
+        # Authorization header was used for auth
+        authenticated_with_header = "authorization"
+    else:
+        # x-api-key or another header was used for auth
+        authenticated_with_header = "x-api-key"
 
     _headers: Dict[str, str] = clean_headers(
         request.headers,
@@ -1079,6 +950,12 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
     )
     verbose_proxy_logger.debug(f"Request Headers: {_headers}")
     verbose_proxy_logger.debug(f"Raw Headers: {_raw_headers}")
+
+    if forward_llm_auth and "x-api-key" in _headers:
+        data["api_key"] = _headers["x-api-key"]
+        verbose_proxy_logger.debug(
+            "Setting client-provided x-api-key as api_key parameter (will override deployment key)"
+        )
 
     ##########################################################
     # Init - Proxy Server Request
@@ -1123,22 +1000,6 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
     # check for forwardable headers
     data = LiteLLMProxyRequestSetup.add_headers_to_llm_call_by_model_group(
         data=data, headers=_headers, user_api_key_dict=user_api_key_dict
-    )
-
-    forward_client_headers_to_llm_api = False
-    if general_settings:
-        forward_client_headers_to_llm_api = (
-            general_settings.get("forward_client_headers_to_llm_api") is True
-        )
-
-    _maybe_promote_anthropic_byok_api_key(
-        data=data,
-        request=request,
-        cleaned_headers=_headers,
-        authenticated_with_header=authenticated_with_header,
-        forward_llm_provider_auth_headers=forward_llm_auth,
-        forward_client_headers_to_llm_api=forward_client_headers_to_llm_api,
-        user_api_key_dict=user_api_key_dict,
     )
 
     user_api_key_dict = LiteLLMProxyRequestSetup.add_internal_user_from_user_mapping(

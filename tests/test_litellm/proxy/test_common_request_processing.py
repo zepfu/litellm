@@ -240,6 +240,52 @@ class TestProxyBaseLLMRequestProcessing:
         assert not error_log_path.exists()
 
     @pytest.mark.asyncio
+    async def test_handle_llm_api_exception_anthropic_missing_key_skips_error_intake_jsonl(
+        self, monkeypatch, tmp_path
+    ):
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_verbose_proxy_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+        error_log_path = tmp_path / "dev-error.jsonl"
+
+        processing_obj = ProxyBaseLLMRequestProcessing(
+            data={"model": "anthropic/claude-sonnet-4-6"}
+        )
+        mock_user_api_key_dict = self._build_user_api_key_auth_for_exception_tests()
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value=None
+        )
+
+        anthropic_missing_key_exc = litellm.AuthenticationError(
+            message=(
+                "Missing Anthropic API Key - A direct Anthropic route requires "
+                "a server-side credential: configure deployment `api_key`, "
+                "`litellm.anthropic_key`, or the `ANTHROPIC_API_KEY` "
+                "environment variable."
+            ),
+            llm_provider="anthropic",
+            model="anthropic/claude-sonnet-4-6",
+        )
+
+        try:
+            with pytest.raises(ProxyException) as raised:
+                await processing_obj._handle_llm_api_exception(
+                    e=anthropic_missing_key_exc,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers, saved_level, saved_propagate
+            )
+
+        assert raised.value.code == "401"
+        assert "server-side credential" in raised.value.message
+        assert not error_log_path.exists()
+
+    @pytest.mark.asyncio
     async def test_handle_llm_api_exception_generic_error_writes_error_intake_jsonl(
         self, monkeypatch, tmp_path
     ):
