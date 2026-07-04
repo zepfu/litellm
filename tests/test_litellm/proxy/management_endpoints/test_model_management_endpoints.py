@@ -5,6 +5,7 @@ from typing import Dict, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from litellm._uuid import uuid
@@ -17,14 +18,27 @@ from litellm.proxy._types import (
     LiteLLM_TeamTable,
     LitellmUserRoles,
     Member,
+    ModelInfoDelete,
+    ProxyException,
     UserAPIKeyAuth,
 )
 from litellm.proxy.management_endpoints.model_management_endpoints import (
     ModelManagementAuthChecks,
+    _MODEL_MANAGEMENT_DB_REQUIRED_ERROR,
+    add_new_model,
     clear_cache,
+    delete_model,
+    patch_model,
+    update_model,
 )
 from litellm.proxy.utils import PrismaClient
-from litellm.types.router import Deployment, LiteLLM_Params, updateDeployment
+from litellm.types.router import (
+    Deployment,
+    LiteLLM_Params,
+    ModelInfo,
+    updateDeployment,
+    updateLiteLLMParams,
+)
 
 
 class MockPrismaClient:
@@ -612,6 +626,127 @@ class TestUpdatePublicModelGroups:
         finally:
             litellm.public_model_groups_links = original_value
 
+
+def _proxy_exception_message_text(exc: ProxyException) -> str:
+    message = exc.message
+    if isinstance(message, dict):
+        return str(message.get("error", ""))
+    return str(message)
+
+
+def _assert_model_management_db_required_proxy_exception(exc_info) -> None:
+    assert int(exc_info.value.code) == 503
+    message_text = _proxy_exception_message_text(exc_info.value)
+    assert _MODEL_MANAGEMENT_DB_REQUIRED_ERROR in message_text
+    assert "DATABASE_URL" in message_text
+    assert "not sufficient" in message_text.lower()
+    assert "virtual_keys" in message_text
+
+
+class TestModelManagementWriteRoutesDbGuard:
+    @pytest.mark.asyncio
+    async def test_patch_model_without_prisma_returns_503(self):
+        patch_data = updateDeployment(
+            model_name="patched-model",
+            litellm_params=updateLiteLLMParams(model="gpt-4o-mini"),
+        )
+        user_api_key_dict = UserAPIKeyAuth(
+            user_id="admin_user",
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+        )
+
+        with patch("litellm.proxy.proxy_server.prisma_client", None), patch(
+            "litellm.proxy.proxy_server.store_model_in_db",
+            True,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await patch_model(
+                    model_id="model-123",
+                    patch_data=patch_data,
+                    user_api_key_dict=user_api_key_dict,
+                )
+
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        if isinstance(detail, dict):
+            message_text = str(detail.get("error", ""))
+        else:
+            message_text = str(detail)
+        assert _MODEL_MANAGEMENT_DB_REQUIRED_ERROR in message_text
+        assert "DATABASE_URL" in message_text
+        assert "virtual_keys" in message_text
+
+    @pytest.mark.asyncio
+    async def test_delete_model_without_prisma_returns_503(self):
+        model_info = ModelInfoDelete(id="model-123")
+        user_api_key_dict = UserAPIKeyAuth(
+            user_id="admin_user",
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+        )
+
+        with patch("litellm.proxy.proxy_server.prisma_client", None), patch(
+            "litellm.proxy.proxy_server.store_model_in_db",
+            True,
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await delete_model(
+                    model_info=model_info,
+                    user_api_key_dict=user_api_key_dict,
+                )
+
+        _assert_model_management_db_required_proxy_exception(exc_info)
+
+    @pytest.mark.asyncio
+    async def test_update_model_without_prisma_returns_503(self):
+        model_params = updateDeployment(
+            model_info=ModelInfo(id="model-123"),
+            litellm_params=updateLiteLLMParams(model="gpt-4o-mini"),
+        )
+        user_api_key_dict = UserAPIKeyAuth(
+            user_id="admin_user",
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+        )
+
+        with patch("litellm.proxy.proxy_server.prisma_client", None), patch(
+            "litellm.proxy.proxy_server.store_model_in_db",
+            True,
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await update_model(
+                    model_params=model_params,
+                    user_api_key_dict=user_api_key_dict,
+                )
+
+        _assert_model_management_db_required_proxy_exception(exc_info)
+
+
+class TestAddNewModelDbGuard:
+    @pytest.mark.asyncio
+    async def test_add_new_model_without_prisma_returns_503(self):
+        """DB-less /model/new must not attempt writes and must return a guarded 503."""
+        model_params = Deployment(
+            model_name="test-model",
+            litellm_params=LiteLLM_Params(model="gpt-4o-mini"),
+        )
+        user_api_key_dict = UserAPIKeyAuth(
+            user_id="admin_user",
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+        )
+
+        with patch(
+            "litellm.proxy.proxy_server.prisma_client",
+            None,
+        ), patch(
+            "litellm.proxy.proxy_server.store_model_in_db",
+            True,
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await add_new_model(
+                    model_params=model_params,
+                    user_api_key_dict=user_api_key_dict,
+                )
+
+        _assert_model_management_db_required_proxy_exception(exc_info)
 
 class TestTeamModelSiblingRouting:
     """
