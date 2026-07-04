@@ -127,7 +127,47 @@ def _normalize_clickhouse_url(value: Optional[str]) -> str:
     normalized = cleaned.rstrip("/")
     if not normalized.startswith(("http://", "https://")):
         normalized = f"http://{normalized}"
-    return normalized.replace("clickhouse", "127.0.0.1")
+    parsed = urlsplit(normalized)
+    hostname = (parsed.hostname or "127.0.0.1").replace("clickhouse", "127.0.0.1")
+    port = f":{parsed.port}" if parsed.port else ""
+    netloc = f"{hostname}{port}"
+    return urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
+
+def _redact_clickhouse_url_userinfo(url: Optional[str]) -> Optional[str]:
+    if url is None:
+        return None
+    parsed = urlsplit(url)
+    if not parsed.scheme and not parsed.netloc:
+        return url
+    hostname = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    userinfo = ""
+    if parsed.username is not None:
+        userinfo = parsed.username
+        if parsed.password is not None:
+            userinfo = f"{userinfo}:***"
+        userinfo = f"{userinfo}@"
+    redacted_netloc = f"{userinfo}{hostname}{port}"
+    return urlunsplit((parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _build_clickhouse_auth_diagnostics(auth: Dict[str, Any]) -> Dict[str, Any]:
+    url_input = auth.get("url_input")
+    return {
+        "clickhouse_url_normalized": auth["url"],
+        "clickhouse_url_raw": _redact_clickhouse_url_userinfo(url_input),
+        "clickhouse_url_source_input": _redact_clickhouse_url_userinfo(url_input),
+        "clickhouse_user": auth["user"],
+        "url_source": auth["url_source"],
+        "user_source": auth["user_source"],
+        "password_source": auth["password_source"],
+        "using_builtin_local_url_default": auth["url_source"] == "default:local_http_8123",
+        "using_builtin_clickhouse_credentials": (
+            auth["user_source"] == "default:clickhouse_builtin"
+            and auth["password_source"] == "default:clickhouse_builtin"
+        ),
+    }
+
 
 
 def _parse_optional_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -881,18 +921,87 @@ async def _run_minio_backfill(
     return stats
 
 
-def _resolve_clickhouse_config(args: argparse.Namespace) -> Dict[str, Any]:
+def _first_env_var_with_secret(names: Sequence[str]) -> Optional[str]:
+    for name in names:
+        if _clean_secret(get_secret_str(name)):
+            return name
+    return None
+
+
+def _resolve_clickhouse_auth_sources(args: argparse.Namespace) -> Dict[str, Any]:
+    url_arg = _clean_secret(args.clickhouse_url)
+    user_arg = _clean_secret(args.clickhouse_user)
+    password_arg = _clean_secret(args.clickhouse_password)
+
+    if url_arg:
+        url_source = "cli:clickhouse-url"
+        url_input: Optional[str] = url_arg
+    else:
+        url_env = _first_env_var_with_secret(_CLICKHOUSE_URL_ENV_VARS)
+        url_source = f"env:{url_env}" if url_env else "default:local_http_8123"
+        url_input = _get_first_secret(_CLICKHOUSE_URL_ENV_VARS) if url_env else None
+
+    if user_arg:
+        user_source = "cli:clickhouse-user"
+        user = user_arg
+    else:
+        user_env = _first_env_var_with_secret(_CLICKHOUSE_USER_ENV_VARS)
+        if user_env:
+            user_source = f"env:{user_env}"
+            user = _get_first_secret(_CLICKHOUSE_USER_ENV_VARS) or "clickhouse"
+        else:
+            user_source = "default:clickhouse_builtin"
+            user = "clickhouse"
+
+    if password_arg:
+        password_source = "cli:clickhouse-password"
+        password = password_arg
+    else:
+        password_env = _first_env_var_with_secret(_CLICKHOUSE_PASSWORD_ENV_VARS)
+        if password_env:
+            password_source = f"env:{password_env}"
+            password = _get_first_secret(_CLICKHOUSE_PASSWORD_ENV_VARS) or "clickhouse"
+        else:
+            password_source = "default:clickhouse_builtin"
+            password = "clickhouse"
+
     return {
-        "url": _normalize_clickhouse_url(
-            args.clickhouse_url or _get_first_secret(_CLICKHOUSE_URL_ENV_VARS)
-        ),
-        "user": _clean_secret(args.clickhouse_user)
-        or _get_first_secret(_CLICKHOUSE_USER_ENV_VARS)
-        or "clickhouse",
-        "password": _clean_secret(args.clickhouse_password)
-        or _get_first_secret(_CLICKHOUSE_PASSWORD_ENV_VARS)
-        or "clickhouse",
+        "url": _normalize_clickhouse_url(url_input),
+        "url_input": url_input,
+        "user": user,
+        "password": password,
+        "url_source": url_source,
+        "user_source": user_source,
+        "password_source": password_source,
         "timeout_seconds": args.clickhouse_timeout_seconds,
+    }
+
+
+def _clickhouse_auth_diagnostics(auth: Dict[str, Any]) -> Dict[str, Any]:
+    return _build_clickhouse_auth_diagnostics(auth)
+
+
+def _should_preflight_clickhouse_for_source_mode(source_mode: str) -> bool:
+    return source_mode in {"clickhouse", "minio"}
+
+
+def _preflight_clickhouse_connection(auth: Dict[str, Any]) -> None:
+    client = ClickHouseClient(
+        url=auth["url"],
+        user=auth["user"],
+        password=auth["password"],
+        timeout_seconds=int(auth.get("timeout_seconds") or 15),
+    )
+    client.request_rows("SELECT 1 AS ok FORMAT JSONEachRow")
+
+
+def _resolve_clickhouse_config(args: argparse.Namespace) -> Dict[str, Any]:
+    auth = _resolve_clickhouse_auth_sources(args)
+    return {
+        "url": auth["url"],
+        "user": auth["user"],
+        "password": auth["password"],
+        "timeout_seconds": auth["timeout_seconds"],
     }
 
 
@@ -914,7 +1023,11 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
     _configure_target_database_env(args)
     if args.apply:
         await _verify_target_database(args.require_target_database)
+    clickhouse_auth = _resolve_clickhouse_auth_sources(args)
     clickhouse_config = _resolve_clickhouse_config(args)
+    preflight_ran = _should_preflight_clickhouse_for_source_mode(args.source_mode)
+    if preflight_ran:
+        await asyncio.to_thread(_preflight_clickhouse_connection, clickhouse_auth)
     client = ClickHouseClient(**clickhouse_config)
     if args.source_mode == "clickhouse":
         stats = await _run_clickhouse_backfill(args, client)
@@ -927,6 +1040,8 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         "source_mode": args.source_mode,
         "applied": bool(args.apply),
         "clickhouse_url": clickhouse_config["url"],
+        "clickhouse_auth": _clickhouse_auth_diagnostics(clickhouse_auth),
+        "clickhouse_preflight": {"ran": preflight_ran, "reason": args.source_mode},
         "target_dsn_redacted": (
             (_build_aawm_admin_dsn() or "unresolved").split("@", 1)[-1]
         ),
