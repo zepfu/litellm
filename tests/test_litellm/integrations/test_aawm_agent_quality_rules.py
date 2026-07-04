@@ -121,6 +121,31 @@ def test_score_agent_quality_context_flags_literal_claude_xml_invoke_text() -> N
     ]
 
 
+def test_score_agent_quality_context_flags_malformed_function_tag_final_payload() -> None:
+    result = score_agent_quality_context(
+        assistant_texts=['<function=explorer>["/home/zepfu/projects/litellm"]</function>'],
+    )
+
+    assert result.fields["output_contract_compliance_score"] == 0.0
+    assert result.fields["output_contract_failure_class"] == "malformed_final_payload"
+    assert result.reasons["output_contract_compliance"] == [
+        "malformed_final_payload"
+    ]
+
+
+def test_score_agent_quality_context_ignores_benign_function_tag_prose() -> None:
+    result = score_agent_quality_context(
+        user_texts=["Explain the failure mode."],
+        assistant_texts=[
+            'The model printed the string <function=explorer>["/path"]</function> '
+            "in prose but did not emit structured findings."
+        ],
+    )
+
+    assert result.fields.get("output_contract_failure_class") is None
+    assert result.reasons.get("output_contract_compliance") == []
+
+
 def test_score_agent_quality_context_ignores_benign_claude_xml_prose() -> None:
     result = score_agent_quality_context(
         user_texts=["Explain the failure mode."],

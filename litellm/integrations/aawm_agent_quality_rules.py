@@ -151,6 +151,49 @@ _CLAUDE_XML_INVOKE_BLOCK_RE = re.compile(
     r"(?is)<invoke\b[^>]*>.*?<\s*parameter\b[^>]*>.*?</\s*invoke\s*>",
 )
 _CLAUDE_XML_INVOKE_CLOSE_RE = re.compile(r"</\s*invoke\s*>", re.IGNORECASE)
+_MALFORMED_FUNCTION_TAG_BLOCK_RE = re.compile(
+    r"(?is)<\s*function\s*=\s*[a-zA-Z0-9_.-]+\s*>.*?</\s*function\s*>",
+)
+_MALFORMED_FUNCTION_TAG_ONLY_RE = re.compile(
+    r"(?is)^\s*(?:<\s*function\s*=\s*[a-zA-Z0-9_.-]+\s*>.*?</\s*function\s*>\s*)+$",
+)
+
+
+def is_malformed_function_tag_literal_text(value: str) -> bool:
+    """Detect assistant text that emits pseudo <function=name>...</function> payloads."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    lowered = value.lower()
+    if "<function" not in lowered or "function=" not in lowered:
+        return False
+    if not _MALFORMED_FUNCTION_TAG_BLOCK_RE.search(value):
+        return False
+    stripped = value.strip()
+    if _MALFORMED_FUNCTION_TAG_ONLY_RE.match(stripped):
+        return True
+
+    remainder = _MALFORMED_FUNCTION_TAG_BLOCK_RE.sub("", stripped).strip()
+    remainder_norm = _normalize_contract_text(remainder)
+    if not remainder_norm:
+        return True
+    if any(marker in remainder_norm for marker in _OUTPUT_CONTRACT_COMPLETION_MARKERS):
+        return False
+    if any(
+        token in remainder_norm
+        for token in (
+            "quoted",
+            "mentioned",
+            "discussed",
+            "described",
+            "printed the string",
+            "in prose",
+            "did not emit",
+        )
+    ):
+        return False
+    if len(remainder_norm) <= 120:
+        return True
+    return False
 
 
 def is_malformed_claude_xml_literal_invocation_text(value: str) -> bool:
@@ -606,6 +649,8 @@ def _score_output_contract(
             failure_class = failure_class or "literal_tool_call_text"
         elif is_malformed_claude_xml_literal_invocation_text(final_text):
             failure_class = failure_class or "literal_tool_call_text"
+        elif is_malformed_function_tag_literal_text(final_text):
+            failure_class = failure_class or "malformed_final_payload"
     elif composer_call_markers:
         failure_class = failure_class or "malformed_tool_call_text"
 

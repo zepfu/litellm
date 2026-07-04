@@ -2170,6 +2170,65 @@ def test_should_not_flag_benign_claude_xml_prose_as_contract_failure() -> None:
     assert "output_contract_literal_tool_call_text" not in evidence.reasons
 
 
+def test_should_score_malformed_function_tag_final_payload_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Inspect D1-474 live path."}],
+        {
+            "role": "assistant",
+            "content": '<function=explorer>["/home/zepfu/projects/litellm"]</function>',
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(
+            agent_name="explorer",
+            agent_id="019f2b4c-f395-7582-bd6b-e80afe419ab8",
+            output_tokens=24,
+        ),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.trace_quality_score == 0.0
+    assert evidence.agent_name == "explorer"
+    assert evidence.agent_id == "019f2b4c-f395-7582-bd6b-e80afe419ab8"
+    assert evidence.output_contract_compliance_score == 0.0
+    assert evidence.output_contract_failure_class == "malformed_final_payload"
+    assert evidence.output_contract_failure_count == 1
+    assert evidence.agent_score_reasons["output_contract_compliance"] == [
+        "malformed_final_payload"
+    ]
+    assert "output_contract_malformed_final_payload" in evidence.reasons
+
+
+def test_should_not_flag_benign_function_tag_prose_as_contract_failure() -> None:
+    payload = _payload(
+        [{"role": "user", "content": "Summarize the incident."}],
+        {
+            "role": "assistant",
+            "content": (
+                'The transcript quoted <function=explorer>["/home/zepfu/projects/litellm"]'
+                "</function> in prose without treating it as the final answer."
+            ),
+            "tool_calls": None,
+        },
+    )
+
+    evidence = scorer.score_candidate(
+        _candidate(output_tokens=20),
+        payload,
+        provider_error_present=False,
+        max_output_tokens=5,
+        large_base64_threshold=100_000,
+    )
+
+    assert evidence.output_contract_failure_class is None
+    assert "output_contract_malformed_final_payload" not in evidence.reasons
+
+
 def test_should_not_flag_real_tool_calls_for_output_contract_when_solved() -> None:
     payload = _payload(
         [
