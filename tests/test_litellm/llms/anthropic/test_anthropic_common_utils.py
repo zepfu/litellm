@@ -8,6 +8,8 @@ instead of x-api-key, per Anthropic's OAuth specification.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.."))
 )
@@ -697,3 +699,48 @@ class TestProxyOAuthHeaderForwarding:
         assert cleaned["authorization"] == oauth_token
         # Proxy key must be stripped
         assert "x-litellm-api-key" not in cleaned
+
+
+class TestValidateEnvironmentMissingApiKey:
+    """Missing-key error text for direct Anthropic routes."""
+
+    def test_missing_api_key_message_mentions_server_side_credential_sources(self):
+        import litellm
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+        config = AnthropicModelInfo()
+        with pytest.raises(litellm.AuthenticationError) as exc_info:
+            config.validate_environment(
+                headers={},
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "Hello"}],
+                optional_params={},
+                litellm_params={},
+                api_key=None,
+            )
+
+        message = exc_info.value.message
+        assert "ANTHROPIC_API_KEY" in message
+        assert "litellm.anthropic_key" in message
+        assert "deployment `api_key`" in message
+        assert "sk-ant-oat" in message
+        assert "LiteLLM proxy `Authorization`" in message
+        assert "not Anthropic provider credentials" in message
+
+    def test_proxy_authorization_header_without_oauth_still_missing_key(self):
+        import litellm
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+        config = AnthropicModelInfo()
+        headers = {"authorization": "Bearer sk-litellm-proxy-key-not-anthropic"}
+        with pytest.raises(litellm.AuthenticationError) as exc_info:
+            config.validate_environment(
+                headers=headers,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "Hello"}],
+                optional_params={},
+                litellm_params={},
+                api_key=None,
+            )
+
+        assert "LiteLLM proxy `Authorization`" in exc_info.value.message
