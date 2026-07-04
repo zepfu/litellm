@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import psycopg
@@ -558,9 +558,50 @@ class MinioEventBlobClient:
 
 def _normalize_clickhouse_url(value: Optional[str]) -> str:
     cleaned = _clean(value) or "http://127.0.0.1:8123"
-    if not cleaned.startswith(("http://", "https://")):
-        cleaned = f"http://{cleaned}"
-    return cleaned.rstrip("/").replace("clickhouse", "127.0.0.1")
+    normalized = cleaned.rstrip("/")
+    if not normalized.startswith(("http://", "https://")):
+        normalized = f"http://{normalized}"
+    parsed = urlsplit(normalized)
+    hostname = (parsed.hostname or "127.0.0.1").replace("clickhouse", "127.0.0.1")
+    port = f":{parsed.port}" if parsed.port else ""
+    netloc = f"{hostname}{port}"
+    return urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
+
+def _redact_clickhouse_url_userinfo(url: Optional[str]) -> Optional[str]:
+    if url is None:
+        return None
+    parsed = urlsplit(url)
+    if not parsed.scheme and not parsed.netloc:
+        return url
+    hostname = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    userinfo = ""
+    if parsed.username is not None:
+        userinfo = parsed.username
+        if parsed.password is not None:
+            userinfo = f"{userinfo}:***"
+        userinfo = f"{userinfo}@"
+    redacted_netloc = f"{userinfo}{hostname}{port}"
+    return urlunsplit((parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _build_clickhouse_auth_diagnostics(auth: Dict[str, Any]) -> Dict[str, Any]:
+    url_input = auth.get("url_input")
+    return {
+        "clickhouse_url_normalized": auth["url"],
+        "clickhouse_url_raw": _redact_clickhouse_url_userinfo(url_input),
+        "clickhouse_url_source_input": _redact_clickhouse_url_userinfo(url_input),
+        "clickhouse_user": auth["user"],
+        "url_source": auth["url_source"],
+        "user_source": auth["user_source"],
+        "password_source": auth["password_source"],
+        "using_builtin_local_url_default": auth["url_source"] == "default:local_http_8123",
+        "using_builtin_clickhouse_credentials": (
+            auth["user_source"] == "default:clickhouse_builtin"
+            and auth["password_source"] == "default:clickhouse_builtin"
+        ),
+    }
+
 
 
 def _postgres_dsn_from_args(args: argparse.Namespace) -> str:
@@ -583,26 +624,88 @@ def _postgres_dsn_from_args(args: argparse.Namespace) -> str:
     )
 
 
+_CLICKHOUSE_URL_ENV_VARS = ("CLICKHOUSE_URL", "LANGFUSE_CLICKHOUSE_URL")
+_CLICKHOUSE_USER_ENV_VARS = ("CLICKHOUSE_USER", "LANGFUSE_CLICKHOUSE_USER")
+_CLICKHOUSE_PASSWORD_ENV_VARS = ("CLICKHOUSE_PASSWORD", "LANGFUSE_CLICKHOUSE_PASSWORD")
+
+
+def _first_env_var(names: Sequence[str]) -> Optional[str]:
+    for name in names:
+        if _clean(os.getenv(name)):
+            return name
+    return None
+
+
+def _resolve_clickhouse_auth_sources(args: argparse.Namespace) -> Dict[str, Any]:
+    url_arg = _clean(args.clickhouse_url)
+    user_arg = _clean(args.clickhouse_user)
+    password_arg = _clean(args.clickhouse_password)
+
+    if url_arg:
+        url_source = "cli:clickhouse-url"
+        url_input: Optional[str] = url_arg
+    else:
+        url_env = _first_env_var(_CLICKHOUSE_URL_ENV_VARS)
+        url_source = f"env:{url_env}" if url_env else "default:local_http_8123"
+        url_input = _clean(os.getenv(url_env)) if url_env else None
+
+    if user_arg:
+        user_source = "cli:clickhouse-user"
+        user = user_arg
+    else:
+        user_env = _first_env_var(_CLICKHOUSE_USER_ENV_VARS)
+        if user_env:
+            user_source = f"env:{user_env}"
+            user = _clean(os.getenv(user_env)) or "clickhouse"
+        else:
+            user_source = "default:clickhouse_builtin"
+            user = "clickhouse"
+
+    if password_arg:
+        password_source = "cli:clickhouse-password"
+        password = password_arg
+    else:
+        password_env = _first_env_var(_CLICKHOUSE_PASSWORD_ENV_VARS)
+        if password_env:
+            password_source = f"env:{password_env}"
+            password = _clean(os.getenv(password_env)) or "clickhouse"
+        else:
+            password_source = "default:clickhouse_builtin"
+            password = "clickhouse"
+
+    return {
+        "url": _normalize_clickhouse_url(url_input),
+        "url_input": url_input,
+        "user": user,
+        "password": password,
+        "url_source": url_source,
+        "user_source": user_source,
+        "password_source": password_source,
+        "timeout_seconds": args.clickhouse_timeout_seconds,
+    }
+
+
+def _clickhouse_auth_diagnostics(auth: Dict[str, Any]) -> Dict[str, Any]:
+    return _build_clickhouse_auth_diagnostics(auth)
+
+
+def _preflight_clickhouse_connection(auth: Dict[str, Any]) -> None:
+    client = ClickHouseClient(
+        url=auth["url"],
+        user=auth["user"],
+        password=auth["password"],
+        timeout_seconds=int(auth.get("timeout_seconds") or 15),
+    )
+    client.request_rows("SELECT 1 AS ok FORMAT JSONEachRow")
+
+
 def _resolve_clickhouse_client(args: argparse.Namespace) -> ClickHouseClient:
+    auth = _resolve_clickhouse_auth_sources(args)
     return ClickHouseClient(
-        url=_normalize_clickhouse_url(
-            args.clickhouse_url
-            or os.getenv("CLICKHOUSE_URL")
-            or os.getenv("LANGFUSE_CLICKHOUSE_URL")
-        ),
-        user=(
-            args.clickhouse_user
-            or os.getenv("CLICKHOUSE_USER")
-            or os.getenv("LANGFUSE_CLICKHOUSE_USER")
-            or "clickhouse"
-        ),
-        password=(
-            args.clickhouse_password
-            or os.getenv("CLICKHOUSE_PASSWORD")
-            or os.getenv("LANGFUSE_CLICKHOUSE_PASSWORD")
-            or "clickhouse"
-        ),
-        timeout_seconds=args.clickhouse_timeout_seconds,
+        url=auth["url"],
+        user=auth["user"],
+        password=auth["password"],
+        timeout_seconds=auth["timeout_seconds"],
     )
 
 
@@ -4276,6 +4379,18 @@ def _should_fetch_session_history_candidates(args: argparse.Namespace) -> bool:
 
 
 def _run(args: argparse.Namespace) -> Dict[str, Any]:
+    clickhouse_auth: Optional[Dict[str, Any]] = None
+    clickhouse_preflight: Optional[Dict[str, Any]] = None
+    needs_clickhouse = (
+        _should_fetch_session_history_candidates(args)
+        and args.source_mode in {"clickhouse", "auto", "minio"}
+    )
+    if needs_clickhouse:
+        clickhouse_auth = _resolve_clickhouse_auth_sources(args)
+        _preflight_clickhouse_connection(clickhouse_auth)
+        clickhouse_preflight = {"ran": True, "reason": "session_history_candidates"}
+    elif args.codex_transcript:
+        clickhouse_preflight = {"ran": False, "reason": "codex_transcript_only"}
     candidates = (
         _fetch_session_candidates(args)
         if _should_fetch_session_history_candidates(args)
@@ -4350,7 +4465,7 @@ def _run(args: argparse.Namespace) -> Dict[str, Any]:
                 transcript_pairs,
             )
 
-    return {
+    result: Dict[str, Any] = {
         "applied": bool(args.apply),
         "session_history_scores_updated": bool(args.update_session_history_scores),
         "codex_transcript_session_history_upserted": bool(
@@ -4364,6 +4479,11 @@ def _run(args: argparse.Namespace) -> Dict[str, Any]:
         if getattr(args, "summary_only", False)
         else [score.to_json() for score in evidences],
     }
+    if clickhouse_auth is not None:
+        result["clickhouse_auth"] = _clickhouse_auth_diagnostics(clickhouse_auth)
+    if clickhouse_preflight is not None:
+        result["clickhouse_preflight"] = clickhouse_preflight
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:

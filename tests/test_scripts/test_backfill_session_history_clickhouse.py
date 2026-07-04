@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from scripts import backfill_session_history as backfill
 
@@ -71,3 +73,79 @@ async def test_should_pass_include_payloads_flag_through_fetch_generation_batch(
     assert len(source.queries) == 2
     assert "NULL AS observation_input" in source.queries[0]
     assert "o.input AS observation_input" in source.queries[1]
+
+
+def test_should_report_builtin_clickhouse_auth_sources_when_unconfigured() -> None:
+    args = argparse.Namespace(clickhouse_url=None, clickhouse_user=None, clickhouse_password=None)
+    with patch.object(backfill, "get_secret_str", return_value=None):
+        auth = backfill._resolve_clickhouse_auth_sources(args)
+
+    assert auth["url"] == "http://127.0.0.1:8123"
+    assert auth["user"] == "clickhouse"
+    assert auth["url_source"] == "default:local_http_8123"
+    assert auth["user_source"] == "default:clickhouse_builtin"
+    assert auth["password_source"] == "default:clickhouse_builtin"
+
+    diagnostics = backfill._clickhouse_auth_diagnostics(auth)
+    assert diagnostics["clickhouse_url_normalized"] == "http://127.0.0.1:8123"
+    assert diagnostics["using_builtin_local_url_default"] is True
+    assert diagnostics["using_builtin_clickhouse_credentials"] is True
+    assert "password" not in diagnostics
+
+
+def test_should_report_env_clickhouse_auth_sources() -> None:
+    args = argparse.Namespace(clickhouse_url=None, clickhouse_user=None, clickhouse_password=None)
+
+    def fake_secret(name: str):
+        return {
+            "LANGFUSE_CLICKHOUSE_URL": "http://clickhouse:8123",
+            "LANGFUSE_CLICKHOUSE_USER": "lf_user",
+            "LANGFUSE_CLICKHOUSE_PASSWORD": "lf_secret",
+        }.get(name)
+
+    with patch.object(backfill, "get_secret_str", side_effect=fake_secret):
+        auth = backfill._resolve_clickhouse_auth_sources(args)
+
+    assert auth["url"] == "http://127.0.0.1:8123"
+    assert auth["user"] == "lf_user"
+    assert auth["url_source"] == "env:LANGFUSE_CLICKHOUSE_URL"
+    assert auth["user_source"] == "env:LANGFUSE_CLICKHOUSE_USER"
+    assert auth["password_source"] == "env:LANGFUSE_CLICKHOUSE_PASSWORD"
+
+    diagnostics = backfill._clickhouse_auth_diagnostics(auth)
+    assert diagnostics["clickhouse_url_normalized"] == "http://127.0.0.1:8123"
+    assert diagnostics["clickhouse_url_raw"] == "http://clickhouse:8123"
+    assert "lf_secret" not in str(diagnostics)
+
+
+def test_should_redact_userinfo_in_clickhouse_auth_diagnostics() -> None:
+    args = argparse.Namespace(
+        clickhouse_url="http://chuser:supersecret@clickhouse:8123/path",
+        clickhouse_user=None,
+        clickhouse_password=None,
+    )
+    with patch.object(backfill, "get_secret_str", return_value=None):
+        auth = backfill._resolve_clickhouse_auth_sources(args)
+
+    diagnostics = backfill._clickhouse_auth_diagnostics(auth)
+    assert diagnostics["clickhouse_url_normalized"] == "http://127.0.0.1:8123/path"
+    assert diagnostics["clickhouse_url_raw"] == "http://chuser:***@clickhouse:8123/path"
+    assert "supersecret" not in str(diagnostics)
+    assert "password" not in diagnostics
+
+
+def test_should_preflight_clickhouse_before_query() -> None:
+    args = argparse.Namespace(clickhouse_url=None, clickhouse_user=None, clickhouse_password=None)
+    with patch.object(backfill, "get_secret_str", return_value=None):
+        auth = backfill._resolve_clickhouse_auth_sources(args)
+    with patch.object(backfill.LangfuseClickHouseSource, "_request_rows") as mock_rows:
+        backfill._preflight_clickhouse_connection(auth)
+        mock_rows.assert_called_once()
+        assert "SELECT 1" in mock_rows.call_args[0][0]
+
+
+def test_should_skip_preflight_for_non_clickhouse_source_modes() -> None:
+    assert backfill._should_preflight_clickhouse_for_source_mode("langfuse_clickhouse") is True
+    assert backfill._should_preflight_clickhouse_for_source_mode("langfuse") is False
+    assert backfill._should_preflight_clickhouse_for_source_mode("spendlogs") is False
+    assert backfill._should_preflight_clickhouse_for_source_mode("langfuse_db") is False
