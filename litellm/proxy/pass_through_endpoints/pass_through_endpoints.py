@@ -229,6 +229,7 @@ _GROK_REPLICAS_UPDATE_NOT_OWNED_ERROR_MARKERS = (
     "session not found or not owned",
 )
 _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER = "personal-team-blocked:spending-limit"
+_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_ERROR_MARKER = "grok build usage balance exhausted"
 _CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
     "unable to load site",
     "cdn-cgi/challenge-platform",
@@ -802,6 +803,44 @@ def _is_known_grok_personal_team_spending_limit_response(
 
 
 def _get_passthrough_grok_personal_team_spending_limit_failure_kind() -> str:
+    return "upstream_grok_account_quota_exhaustion"
+
+
+def _is_known_grok_build_usage_balance_exhausted_response(
+    *,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_402_PAYMENT_REQUIRED:
+        return False
+
+    if not _is_xai_passthrough_target(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+    ):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if not detail:
+        return False
+
+    normalized_detail = str(detail).strip().lower()
+    payload = _coerce_upstream_error_payload(detail)
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if (
+            isinstance(error, str)
+            and error.strip().lower()
+            == _GROK_BUILD_USAGE_BALANCE_EXHAUSTED_ERROR_MARKER
+        ):
+            return True
+
+    return normalized_detail == _GROK_BUILD_USAGE_BALANCE_EXHAUSTED_ERROR_MARKER
+
+
+def _get_passthrough_grok_build_usage_balance_exhausted_failure_kind() -> str:
     return "upstream_grok_account_quota_exhaustion"
 
 
@@ -4014,6 +4053,14 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        suppress_grok_build_usage_balance_exhausted_traceback = (
+            _is_known_grok_build_usage_balance_exhausted_response(
+                url=url,
+                custom_llm_provider=custom_llm_provider,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         suppress_grok_replicas_update_not_owned_traceback = (
             _is_known_grok_replicas_update_not_owned_response(
                 request=request,
@@ -4094,6 +4141,16 @@ async def pass_through_request(  # noqa: PLR0915
                 extra={
                     **error_log_context,
                     "failure_kind": _get_passthrough_grok_personal_team_spending_limit_failure_kind(),
+                },
+            )
+        elif suppress_grok_build_usage_balance_exhausted_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced known Grok Build usage balance exhaustion status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": _get_passthrough_grok_build_usage_balance_exhausted_failure_kind(),
                 },
             )
         elif suppress_grok_replicas_update_not_owned_traceback:
@@ -4236,6 +4293,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_grok_signals_auth_context_traceback
             and not suppress_grok_replicas_update_not_owned_traceback
             and not suppress_grok_personal_team_spending_limit_traceback
+            and not suppress_grok_build_usage_balance_exhausted_traceback
             and not suppress_chatgpt_codex_block_page_traceback
             and not suppress_chatgpt_codex_invalid_encrypted_content_traceback
             and not suppress_google_code_assist_tos_traceback
@@ -4252,6 +4310,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_grok_signals_auth_context_traceback
             and not suppress_grok_replicas_update_not_owned_traceback
             and not suppress_grok_personal_team_spending_limit_traceback
+            and not suppress_grok_build_usage_balance_exhausted_traceback
         ):
             try:
                 await proxy_logging_obj.post_call_failure_hook(
