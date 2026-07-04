@@ -94,9 +94,7 @@ PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (
     60,
     120,
 )
-PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset(
-    {500, 502, 503, 504, 529}
-)
+PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504, 529})
 _ANTHROPIC_INVALID_AUTHENTICATION_MARKER = "invalid authentication credentials"
 _ANTHROPIC_MODEL_NOT_FOUND_PREFIX = "model:"
 _ANTHROPIC_CONTEXT_OVERFLOW_MARKERS = (
@@ -195,7 +193,7 @@ _AAWM_PASSTHROUGH_REQUEST_SHAPE_FAILURE_LOGGING_PAYLOAD_ALLOWLIST = (
 )
 _AAWM_PASSTHROUGH_REQUEST_SHAPE_ERROR_PREVIEW_TRUNCATE_PATTERNS = (
     re.compile(r'(?i)(?:[;,\s{]|^)\s*"?prompt"?\s*[:=]'),
-    re.compile(r'(?i)(?:[;]|^)\s*input\s*='),
+    re.compile(r"(?i)(?:[;]|^)\s*input\s*="),
     re.compile(r'(?i)"input"\s*:'),
     re.compile(r'(?i)(?:[;,\s{]|^)\s*"?messages"?\s*[:=]'),
     re.compile(r'(?i)(?:[;,\s{]|^)\s*"?content"?\s*[:=]'),
@@ -206,7 +204,7 @@ _AAWM_PASSTHROUGH_REQUEST_SHAPE_ERROR_PREVIEW_TRUNCATE_PATTERNS = (
     re.compile(r'(?i)(?:[;,\s{]|^)\s*"?api[_-]?key"?\s*[:=]'),
     re.compile(r'(?i)(?:[;,\s{]|^)\s*"?token"?\s*[:=]'),
     re.compile(r'(?i)(?:[;,\s{]|^)\s*"?bearer"?\s*[:=]'),
-    re.compile(r'(?i)\bsk-[a-z0-9_-]+\b'),
+    re.compile(r"(?i)\bsk-[a-z0-9_-]+\b"),
 )
 _AAWM_PASSTHROUGH_ERROR_LOG_GROK_SIDE_CHANNEL_FIELDS = (
     "grok_side_channel",
@@ -225,9 +223,7 @@ _GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS = (
     "x_xai_token_auth=xai-grok-cli",
     "no auth context",
 )
-_GROK_REPLICAS_UPDATE_NOT_OWNED_ERROR_MARKERS = (
-    "session not found or not owned",
-)
+_GROK_REPLICAS_UPDATE_NOT_OWNED_ERROR_MARKERS = ("session not found or not owned",)
 _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER = "personal-team-blocked:spending-limit"
 _GROK_BUILD_USAGE_BALANCE_EXHAUSTED_ERROR_MARKER = "grok build usage balance exhausted"
 _CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
@@ -235,6 +231,10 @@ _CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
     "cdn-cgi/challenge-platform",
 )
 _CHATGPT_CODEX_INVALID_ENCRYPTED_CONTENT_ERROR_CODE = "invalid_encrypted_content"
+_CHATGPT_CODEX_MODEL_NOT_SUPPORTED_FOR_ACCOUNT_MARKERS = (
+    "not supported when using codex with a chatgpt account",
+    "model is not supported",
+)
 _GOOGLE_CODE_ASSIST_HOST_SUFFIX = "cloudcode-pa.googleapis.com"
 _GOOGLE_CODE_ASSIST_TOS_REASON = "TOS_VIOLATION"
 _GOOGLE_CODE_ASSIST_PERMISSION_DENIED_STATUS = "PERMISSION_DENIED"
@@ -458,9 +458,7 @@ def _build_chatgpt_codex_usage_limit_detail(
     if upstream_error.get("type") != "usage_limit_reached":
         return None
 
-    retry_after_seconds = _chatgpt_codex_usage_limit_retry_after_seconds(
-        upstream_error
-    )
+    retry_after_seconds = _chatgpt_codex_usage_limit_retry_after_seconds(upstream_error)
     structured_detail = {
         "error": {
             "message": (
@@ -532,8 +530,6 @@ def _extract_exception_status_code(exc: Exception) -> Optional[int]:
         except Exception:
             continue
     return None
-
-
 
 
 @dataclass(frozen=True)
@@ -793,10 +789,16 @@ def _is_known_grok_personal_team_spending_limit_response(
     payload = _coerce_upstream_error_payload(detail)
     if isinstance(payload, dict):
         error = payload.get("error")
-        if isinstance(error, str) and _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in error.lower():
+        if (
+            isinstance(error, str)
+            and _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in error.lower()
+        ):
             return True
         code = payload.get("code")
-        if isinstance(code, str) and _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in code.lower():
+        if (
+            isinstance(code, str)
+            and _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in code.lower()
+        ):
             return True
 
     return _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in normalized_detail
@@ -865,7 +867,9 @@ def _is_known_grok_signals_auth_context_response(
         request
     )
     upstream_path = urlparse(str(url or "")).path
-    if not (_is_grok_signals_path(request_path) or _is_grok_signals_path(upstream_path)):
+    if not (
+        _is_grok_signals_path(request_path) or _is_grok_signals_path(upstream_path)
+    ):
         return False
 
     detail = _extract_passthrough_exception_detail(exc)
@@ -939,6 +943,45 @@ def _is_known_chatgpt_codex_invalid_encrypted_content_response(
     )
 
 
+def _is_known_chatgpt_codex_model_not_supported_for_account_response(
+    *,
+    url: Optional[httpx.URL],
+    status_code: Optional[int],
+    exc: Exception,
+) -> bool:
+    if status_code != status.HTTP_400_BAD_REQUEST:
+        return False
+
+    parsed_url = urlparse(str(url or ""))
+    if (
+        str(parsed_url.hostname or "").lower() != "chatgpt.com"
+        or "/backend-api/codex/" not in str(parsed_url.path or "").lower()
+    ):
+        return False
+
+    detail = _extract_passthrough_exception_detail(exc)
+    if detail is None:
+        return False
+
+    payload = _coerce_upstream_error_payload(detail)
+    if isinstance(payload, dict):
+        detail_text = str(payload.get("detail") or "")
+    else:
+        detail_text = str(detail)
+
+    normalized_detail = detail_text.lower()
+    if _CHATGPT_CODEX_MODEL_NOT_SUPPORTED_FOR_ACCOUNT_MARKERS[0] not in normalized_detail:
+        return False
+    return (
+        _CHATGPT_CODEX_MODEL_NOT_SUPPORTED_FOR_ACCOUNT_MARKERS[1] in normalized_detail
+        or "is not supported" in normalized_detail
+    )
+
+
+def _get_passthrough_chatgpt_codex_model_not_supported_failure_kind() -> str:
+    return "openai_chatgpt_codex_model_not_supported_for_account"
+
+
 def _is_google_code_assist_passthrough_target(
     *,
     url: Optional[httpx.URL],
@@ -946,9 +989,8 @@ def _is_google_code_assist_passthrough_target(
 ) -> bool:
     provider = str(custom_llm_provider or "").strip().lower()
     hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
-    return (
-        provider in {"google_code_assist", "antigravity"}
-        or hostname.endswith(_GOOGLE_CODE_ASSIST_HOST_SUFFIX)
+    return provider in {"google_code_assist", "antigravity"} or hostname.endswith(
+        _GOOGLE_CODE_ASSIST_HOST_SUFFIX
     )
 
 
@@ -1113,7 +1155,8 @@ def _is_xai_passthrough_target(
     hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
     return (
         provider == "xai"
-        or hostname in {
+        or hostname
+        in {
             "api.x.ai",
             "cli-chat-proxy.grok.com",
         }
@@ -1359,11 +1402,9 @@ def _get_passthrough_hidden_retry_wait_seconds(attempt_index: int) -> float:
     return float(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS[-1])
 
 
-def _classify_passthrough_hidden_retry_failure(exc: Exception) -> Tuple[
-    Optional[int],
-    str,
-    Optional[str],
-]:
+def _classify_passthrough_hidden_retry_failure(
+    exc: Exception,
+) -> Tuple[Optional[int], str, Optional[str],]:
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
         return status_code, f"http_status_{status_code}", None
@@ -1545,9 +1586,9 @@ def _record_passthrough_hidden_retry_metadata(
     if final_outcome is not None:
         metadata["aawm_passthrough_hidden_retry_final_outcome"] = final_outcome
     if failure_classification is not None:
-        metadata["aawm_passthrough_hidden_retry_failure_classification"] = (
-            failure_classification
-        )
+        metadata[
+            "aawm_passthrough_hidden_retry_failure_classification"
+        ] = failure_classification
 
 
 async def _execute_passthrough_pre_first_byte_with_hidden_retries(
@@ -1578,9 +1619,11 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 )
             return result
         except Exception as exc:
-            status_code, failure_class, failure_classification = (
-                _classify_passthrough_hidden_retry_failure(exc)
-            )
+            (
+                status_code,
+                failure_class,
+                failure_classification,
+            ) = _classify_passthrough_hidden_retry_failure(exc)
             should_retry = _is_passthrough_pre_first_byte_hidden_retryable(
                 exc,
                 status_code=status_code,
@@ -1645,9 +1688,7 @@ def _clean_passthrough_error_context_value(value: Any) -> Optional[str]:
         return None
 
     if len(cleaned) > _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS:
-        cleaned = (
-            cleaned[: _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS - 3] + "..."
-        )
+        cleaned = cleaned[: _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS - 3] + "..."
     return cleaned
 
 
@@ -1683,8 +1724,6 @@ def _passthrough_error_context_metadata_value(value: Any) -> Any:
                 cleaned_dict[cleaned_key] = cleaned_value
         return cleaned_dict
     return _clean_passthrough_error_context_value(value)
-
-
 
 
 def _is_openai_passthrough_responses_error_context(
@@ -1757,7 +1796,6 @@ def _extract_passthrough_upstream_error_text(exc: Exception) -> str:
         if error_value is not None:
             return str(error_value)
     return detail_text
-
 
 
 def _sanitize_passthrough_request_shape_error_preview(error_text: str) -> Optional[str]:
@@ -1878,7 +1916,9 @@ def _build_passthrough_request_shape_failure_request_payload(
     if passthrough_logging_payload is not None:
         safe_logging_payload: Dict[str, Any] = {}
         if isinstance(passthrough_logging_payload, dict):
-            for key in _AAWM_PASSTHROUGH_REQUEST_SHAPE_FAILURE_LOGGING_PAYLOAD_ALLOWLIST:
+            for (
+                key
+            ) in _AAWM_PASSTHROUGH_REQUEST_SHAPE_FAILURE_LOGGING_PAYLOAD_ALLOWLIST:
                 if key not in passthrough_logging_payload:
                     continue
                 value = passthrough_logging_payload[key]
@@ -1917,7 +1957,10 @@ def _classify_passthrough_request_shape_deserialization_422(
 
     if "modelinput" in normalized_error_text:
         message_class = "model_input_deserialization_failed"
-    elif "unknown variant" in normalized_error_text or "expected one of" in normalized_error_text:
+    elif (
+        "unknown variant" in normalized_error_text
+        or "expected one of" in normalized_error_text
+    ):
         message_class = "unsupported_variant_deserialization_failed"
     else:
         message_class = "generic_deserialization_failed"
@@ -2024,26 +2067,23 @@ def _enrich_passthrough_error_log_context_for_request_shape_422(
     summary = _build_passthrough_request_shape_summary(enriched_context)
     if summary:
         enriched_context["aawm_passthrough_request_shape_summary"] = summary
-    enriched_context["aawm_passthrough_request_shape_fingerprint"] = (
-        _build_passthrough_request_shape_fingerprint(enriched_context)
-    )
-    enriched_context["aawm_passthrough_request_shape_error_fingerprint"] = (
-        _build_passthrough_request_shape_error_fingerprint(
-            message_class=str(
-                classification.get(
-                    "aawm_passthrough_request_shape_error_message_class"
-                )
-                or ""
-            ),
-            preview=classification.get(
-                "aawm_passthrough_request_shape_error_body_preview"
-            ),
-            endpoint=_clean_passthrough_error_context_value(
-                enriched_context.get("endpoint")
-            ),
-        )
+    enriched_context[
+        "aawm_passthrough_request_shape_fingerprint"
+    ] = _build_passthrough_request_shape_fingerprint(enriched_context)
+    enriched_context[
+        "aawm_passthrough_request_shape_error_fingerprint"
+    ] = _build_passthrough_request_shape_error_fingerprint(
+        message_class=str(
+            classification.get("aawm_passthrough_request_shape_error_message_class")
+            or ""
+        ),
+        preview=classification.get("aawm_passthrough_request_shape_error_body_preview"),
+        endpoint=_clean_passthrough_error_context_value(
+            enriched_context.get("endpoint")
+        ),
     )
     return enriched_context
+
 
 def _build_passthrough_error_log_request_shape_context(
     metadata: Dict[str, Any],
@@ -2163,9 +2203,9 @@ def _merge_passthrough_request_shape_metadata(
 
     if json_egress_content_type_removed:
         metadata["aawm_passthrough_json_egress_content_type_removed"] = True
-        metadata["aawm_passthrough_json_egress_content_type_removed_value"] = (
-            _clean_passthrough_error_context_value(json_egress_content_type_removed)
-        )
+        metadata[
+            "aawm_passthrough_json_egress_content_type_removed_value"
+        ] = _clean_passthrough_error_context_value(json_egress_content_type_removed)
     else:
         metadata.pop("aawm_passthrough_json_egress_content_type_removed", None)
         metadata.pop("aawm_passthrough_json_egress_content_type_removed_value", None)
@@ -2191,15 +2231,15 @@ def _merge_passthrough_request_shape_metadata(
     )
     if isinstance(input_value, list):
         metadata["aawm_passthrough_input_item_count"] = len(input_value)
-        metadata["aawm_passthrough_input_item_type_counts"] = (
-            _count_passthrough_item_types(input_value)
-        )
+        metadata[
+            "aawm_passthrough_input_item_type_counts"
+        ] = _count_passthrough_item_types(input_value)
 
     tools = body.get("tools")
     if isinstance(tools, list):
         metadata["aawm_passthrough_tool_count"] = len(tools)
-        metadata["aawm_passthrough_tool_type_counts"] = (
-            _count_passthrough_item_types(tools)
+        metadata["aawm_passthrough_tool_type_counts"] = _count_passthrough_item_types(
+            tools
         )
 
 
@@ -2344,8 +2384,10 @@ def _build_passthrough_error_log_context(
 
     grok_side_channel_context: Dict[str, Any] = {}
     if isinstance(passthrough_logging_metadata, dict):
-        grok_side_channel_context = _build_passthrough_error_log_grok_side_channel_context(
-            passthrough_logging_metadata
+        grok_side_channel_context = (
+            _build_passthrough_error_log_grok_side_channel_context(
+                passthrough_logging_metadata
+            )
         )
     grok_side_channel_endpoint_path_template = _clean_passthrough_error_context_value(
         grok_side_channel_context.get("grok_side_channel_endpoint_path_template")
@@ -2377,9 +2419,7 @@ def _build_passthrough_error_log_context(
             metadata,
             _AAWM_PASSTHROUGH_ERROR_LOG_TRACE_METADATA_KEYS,
         ),
-        "litellm_call_id": _clean_passthrough_error_context_value(
-            litellm_call_id
-        ),
+        "litellm_call_id": _clean_passthrough_error_context_value(litellm_call_id),
     }
     context.update(_build_passthrough_error_log_request_shape_context(metadata))
     context.update(grok_side_channel_context)
@@ -2723,10 +2763,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             or hostname.endswith(".chatgpt.com")
         ):
             return "openai"
-        if (
-            hostname == "openrouter.ai"
-            or hostname.endswith(".openrouter.ai")
-        ):
+        if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
             return "openrouter"
         if hostname == "opencode.ai" or hostname.endswith(".opencode.ai"):
             return "opencode"
@@ -2895,7 +2932,10 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         request_path = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
             request
         )
-        if "/openai_passthrough/" not in request_path and "/openai/" not in request_path:
+        if (
+            "/openai_passthrough/" not in request_path
+            and "/openai/" not in request_path
+        ):
             return False
 
         target_url = passthrough_logging_payload.get("url") or ""
@@ -2937,15 +2977,15 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         user_api_key_dict: UserAPIKeyAuth,
         passthrough_logging_payload: PassthroughStandardLoggingPayload,
     ) -> Optional[str]:
-        if (
-            HttpPassThroughEndpointHelpers._is_openai_responses_client_auth_passthrough_request(
-                request=request,
-                passthrough_logging_payload=passthrough_logging_payload,
-            )
+        if HttpPassThroughEndpointHelpers._is_openai_responses_client_auth_passthrough_request(
+            request=request,
+            passthrough_logging_payload=passthrough_logging_payload,
         ):
             headers = _safe_get_request_headers(request)
             auth_header = headers.get("authorization") or headers.get("Authorization")
-            if isinstance(auth_header, str) and auth_header.lower().startswith("bearer "):
+            if isinstance(auth_header, str) and auth_header.lower().startswith(
+                "bearer "
+            ):
                 return hash_token(auth_header[len("Bearer ") :])
 
             api_key_header = headers.get("api-key") or headers.get("Api-Key")
@@ -2979,9 +3019,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         parsed_url = urlparse(url)
         hostname = parsed_url.hostname or ""
         path = parsed_url.path or ""
-        if (
-            (hostname == "opencode.ai" or hostname.endswith(".opencode.ai"))
-            and (path.endswith("/messages") or "/messages/" in path)
+        if (hostname == "opencode.ai" or hostname.endswith(".opencode.ai")) and (
+            path.endswith("/messages") or "/messages/" in path
         ):
             return EndpointType.ANTHROPIC
         if (
@@ -3261,7 +3300,9 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
 
         updated_body = dict(parsed_body)
         existing_metadata = updated_body.get("litellm_metadata")
-        metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+        metadata = (
+            dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+        )
 
         existing_tags = metadata.get("tags")
         merged_tags = list(existing_tags) if isinstance(existing_tags, list) else []
@@ -3464,9 +3505,11 @@ async def pass_through_request(  # noqa: PLR0915
             }
         else:
             _parsed_body = await _read_request_body(request)
-        _parsed_body = HttpPassThroughEndpointHelpers._merge_passthrough_logging_metadata(
-            parsed_body=_parsed_body,
-            passthrough_logging_metadata=passthrough_logging_metadata,
+        _parsed_body = (
+            HttpPassThroughEndpointHelpers._merge_passthrough_logging_metadata(
+                parsed_body=_parsed_body,
+                passthrough_logging_metadata=passthrough_logging_metadata,
+            )
         )
         normalized_tool_schema_count = _normalize_openai_function_tool_schemas_in_body(
             _parsed_body
@@ -3694,12 +3737,15 @@ async def pass_through_request(  # noqa: PLR0915
         if stream:
             upstream_wait_started_at = datetime.now()
 
-            async def _send_stream_pre_first_byte() -> Tuple[httpx.Response, httpx.Request]:
+            async def _send_stream_pre_first_byte() -> Tuple[
+                httpx.Response, httpx.Request
+            ]:
                 stream_headers = headers
                 if use_json_egress:
-                    stream_headers, removed_content_type = (
-                        _headers_for_json_passthrough_egress(headers)
-                    )
+                    (
+                        stream_headers,
+                        removed_content_type,
+                    ) = _headers_for_json_passthrough_egress(headers)
                     if removed_content_type:
                         _merge_passthrough_request_shape_metadata(
                             metadata,
@@ -3744,7 +3790,10 @@ async def pass_through_request(  # noqa: PLR0915
                     ) from e
                 return response, req
 
-            response, req = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            (
+                response,
+                req,
+            ) = await _execute_passthrough_pre_first_byte_with_hidden_retries(
                 kwargs=kwargs,
                 operation_name="stream_pre_first_byte",
                 operation=_send_stream_pre_first_byte,
@@ -3789,9 +3838,10 @@ async def pass_through_request(  # noqa: PLR0915
         async def _send_non_stream_pre_first_byte() -> httpx.Response:
             non_stream_headers = headers
             if use_json_egress:
-                non_stream_headers, removed_content_type = (
-                    _headers_for_json_passthrough_egress(headers)
-                )
+                (
+                    non_stream_headers,
+                    removed_content_type,
+                ) = _headers_for_json_passthrough_egress(headers)
                 if removed_content_type:
                     _merge_passthrough_request_shape_metadata(
                         metadata,
@@ -3802,9 +3852,7 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     if error_log_context is not None:
                         error_log_context.update(
-                            _build_passthrough_error_log_request_shape_context(
-                                metadata
-                            )
+                            _build_passthrough_error_log_request_shape_context(metadata)
                         )
             response = (
                 await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
@@ -4084,6 +4132,13 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
+        suppress_chatgpt_codex_model_not_supported_traceback = (
+            _is_known_chatgpt_codex_model_not_supported_for_account_response(
+                url=url,
+                status_code=status_code,
+                exc=e,
+            )
+        )
         suppress_google_code_assist_tos_traceback = (
             _is_known_google_code_assist_tos_violation_response(
                 url=url,
@@ -4183,6 +4238,16 @@ async def pass_through_request(  # noqa: PLR0915
                     "failure_kind": "openai_chatgpt_codex_invalid_encrypted_content",
                 },
             )
+        elif suppress_chatgpt_codex_model_not_supported_traceback:
+            verbose_proxy_logger.warning(
+                "Pass through endpoint surfaced ChatGPT Codex unsupported model for account status=%s error=%s",
+                status_code,
+                str(e),
+                extra={
+                    **error_log_context,
+                    "failure_kind": _get_passthrough_chatgpt_codex_model_not_supported_failure_kind(),
+                },
+            )
         elif suppress_google_code_assist_tos_traceback:
             verbose_proxy_logger.warning(
                 "Pass through endpoint surfaced Google Code Assist account TOS violation status=%s error=%s",
@@ -4237,7 +4302,9 @@ async def pass_through_request(  # noqa: PLR0915
                 ),
                 status_code,
                 str(e),
-                hidden_retry_metadata.get("aawm_passthrough_hidden_retry_final_outcome"),
+                hidden_retry_metadata.get(
+                    "aawm_passthrough_hidden_retry_final_outcome"
+                ),
                 hidden_retry_metadata.get("aawm_passthrough_hidden_retry_count"),
                 extra=terminal_failure_context,
                 exc_info=False,
@@ -4296,6 +4363,7 @@ async def pass_through_request(  # noqa: PLR0915
             and not suppress_grok_build_usage_balance_exhausted_traceback
             and not suppress_chatgpt_codex_block_page_traceback
             and not suppress_chatgpt_codex_invalid_encrypted_content_traceback
+            and not suppress_chatgpt_codex_model_not_supported_traceback
             and not suppress_google_code_assist_tos_traceback
             and known_anthropic_failure_kind is None
             and error_log_context.get("failure_kind")
@@ -4638,7 +4706,9 @@ def create_pass_through_route(
                 egress_credential_family=cast(
                     Optional[str], param_egress_credential_family
                 ),
-                expected_target_family=cast(Optional[str], param_expected_target_family),
+                expected_target_family=cast(
+                    Optional[str], param_expected_target_family
+                ),
                 allowed_forward_headers=cast(
                     Optional[list[str]], param_allowed_forward_headers
                 ),

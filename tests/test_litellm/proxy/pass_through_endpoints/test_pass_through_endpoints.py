@@ -55,6 +55,8 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _get_passthrough_grok_personal_team_spending_limit_failure_kind,
     _is_known_grok_build_usage_balance_exhausted_response,
     _get_passthrough_grok_build_usage_balance_exhausted_failure_kind,
+    _is_known_chatgpt_codex_model_not_supported_for_account_response,
+    _get_passthrough_chatgpt_codex_model_not_supported_failure_kind,
     _record_grok_billing_passthrough_request_contract,
     _record_passthrough_hidden_retry_metadata,
     _should_log_passthrough_terminal_failure_without_traceback,
@@ -92,8 +94,6 @@ def _build_aawm_route_log_request(
         "http_version": http_version,
     }
     return request
-
-
 
 
 def test_request_shape_422_modelinput_enrichment_is_sanitized_and_fingerprinted():
@@ -200,7 +200,9 @@ def test_request_shape_422_classification_skips_unrelated_responses_422():
         "upstream_url": "https://chatgpt.com/backend-api/codex/responses",
         "status_code": 422,
     }
-    exc = HTTPException(status_code=422, detail='{"error":"validation failed for stream"}')
+    exc = HTTPException(
+        status_code=422, detail='{"error":"validation failed for stream"}'
+    )
 
     assert (
         _classify_passthrough_request_shape_deserialization_422(
@@ -241,13 +243,12 @@ def test_aawm_error_log_context_allowlist_preserves_request_shape_fields():
         assert context[field_name] == field_name
 
 
-
 def test_sanitize_passthrough_request_shape_error_preview_redacts_secrets():
     raw = (
         "Failed to deserialize the JSON body into the target type: "
         "data did not match any variant of untagged enum ModelInput; "
-        'prompt=SUPER_SECRET_PROMPT; token=sk-leaked-token-abc; '
-        'authorization=Bearer secret; api_key=mykey123; '
+        "prompt=SUPER_SECRET_PROMPT; token=sk-leaked-token-abc; "
+        "authorization=Bearer secret; api_key=mykey123; "
         '"input": "JSON_INPUT_LEAK", "content": "JSON_CONTENT_LEAK", '
         '"arguments": {"tool": "TOOL_ARG_LEAK"}, "output": "OUTPUT_LEAK"'
     )
@@ -437,6 +438,7 @@ async def test_pass_through_request_shape_422_failure_hook_payload_is_sanitized(
         .get("aawm_passthrough_request_shape_error_body_preview")
     )
 
+
 def test_headers_for_json_passthrough_egress_preserves_json_content_type():
     headers, removed_content_type = _headers_for_json_passthrough_egress(
         {
@@ -596,9 +598,7 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -
                 "general-purpose@mypy fails, fix and retry. "
                 "This is prompt-like prose"
             ),
-            "repository": (
-                "litellm; reuse_rule=safe for similar queue-shaping work"
-            ),
+            "repository": ("litellm; reuse_rule=safe for similar queue-shaping work"),
             "requested_model_alias": "aawm-code",
         },
     }
@@ -661,9 +661,7 @@ def test_build_aawm_route_access_log_line_normalizes_repository_paths() -> None:
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith(
-        "20260614 19:31:05 [ROUTE] - W4 engineer@dashboard-shell."
-    )
+    assert line.startswith("20260614 19:31:05 [ROUTE] - W4 engineer@dashboard-shell.")
     assert "/home/zepfu/projects" not in line
 
 
@@ -684,9 +682,7 @@ def test_build_aawm_route_access_log_line_preserves_owner_repository_slug() -> N
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith(
-        "20260614 19:31:05 [ROUTE] - W4 engineer@zepfu/litellm."
-    )
+    assert line.startswith("20260614 19:31:05 [ROUTE] - W4 engineer@zepfu/litellm.")
 
 
 def test_build_aawm_route_access_log_line_uses_session_history_repo_aliases() -> None:
@@ -708,13 +704,13 @@ def test_build_aawm_route_access_log_line_uses_session_history_repo_aliases() ->
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith(
-        "20260614 19:31:05 [ROUTE] - orchestrator@dashboard-shell."
-    )
+    assert line.startswith("20260614 19:31:05 [ROUTE] - orchestrator@dashboard-shell.")
     assert "should-not-win" not in line
 
 
-def test_build_aawm_route_access_log_line_uses_trace_user_repo_when_structured_repo_missing() -> None:
+def test_build_aawm_route_access_log_line_uses_trace_user_repo_when_structured_repo_missing() -> (
+    None
+):
     request = _build_aawm_route_log_request(
         headers={
             "langfuse_trace_name": "claude-code.orchestrator",
@@ -747,9 +743,7 @@ def test_build_aawm_route_access_log_line_uses_split_client_identity() -> None:
         now=datetime(2026, 6, 14, 19, 31, 5),
     )
 
-    assert line.startswith(
-        "20260614 19:31:05 [ROUTE] Codex/0.119.0-alpha.29 - "
-    )
+    assert line.startswith("20260614 19:31:05 [ROUTE] Codex/0.119.0-alpha.29 - ")
 
 
 def test_build_aawm_route_access_log_line_rejects_freeform_client_identity() -> None:
@@ -872,9 +866,9 @@ def test_emit_aawm_route_access_log_refreshes_suppression_for_same_scope(
             target="https://chatgpt.com/backend-api/codex/responses",
             request_body=request_body,
         )
-        request.scope["query_string"] = (
-            b"beta=true -> cli-chat-proxy.grok.com/v1/responses"
-        )
+        request.scope[
+            "query_string"
+        ] = b"beta=true -> cli-chat-proxy.grok.com/v1/responses"
         emit_aawm_route_access_log(
             request=request,
             target="https://cli-chat-proxy.grok.com/v1/responses",
@@ -1015,11 +1009,15 @@ def test_aawm_route_access_log_filter_preserves_non_access_records() -> None:
 def test_aawm_route_logger_emits_info_level_access_lines() -> None:
     assert verbose_aawm_route_logger.getEffectiveLevel() <= logging.INFO
     assert verbose_aawm_route_logger.handlers
-    assert all(handler.level <= logging.INFO for handler in verbose_aawm_route_logger.handlers)
+    assert all(
+        handler.level <= logging.INFO for handler in verbose_aawm_route_logger.handlers
+    )
 
 
 @pytest.mark.asyncio
-async def test_pass_through_request_emits_aawm_route_access_log(caplog, monkeypatch) -> None:
+async def test_pass_through_request_emits_aawm_route_access_log(
+    caplog, monkeypatch
+) -> None:
     clear_aawm_route_access_log_replacements()
     clear_aawm_route_rollups()
     monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
@@ -1077,7 +1075,9 @@ async def test_pass_through_request_emits_aawm_route_access_log(caplog, monkeypa
         ), patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_response_body",
             return_value={"success": True},
-        ), _capture_aawm_route_logs(caplog):
+        ), _capture_aawm_route_logs(
+            caplog
+        ):
             await pass_through_request(
                 request=request,
                 target="https://api.openai.com/v1/responses?api_key=secret",
@@ -1152,7 +1152,9 @@ async def test_pass_through_async_success_handler_records_completed_route_rollup
     mock_response.status_code = 200
     mock_response.text = '{"success": true}'
     mock_response.headers = {}
-    mock_response.request = MagicMock(method="POST", url="https://api.openai.com/v1/responses")
+    mock_response.request = MagicMock(
+        method="POST", url="https://api.openai.com/v1/responses"
+    )
 
     with patch.object(
         handler,
@@ -1178,14 +1180,13 @@ async def test_pass_through_async_success_handler_records_completed_route_rollup
     rendered = "\n".join(flushed)
 
     assert len(flushed) == 2
+    assert ("litellm@Codex[0.119.0-alpha.29] /openai_passthrough/responses") in rendered
     assert (
-        "litellm@Codex[0.119.0-alpha.29] /openai_passthrough/responses"
+        " - gpt-5.3-codex-spark(aawm-code) - Turns: 1 -> " "api.openai.com/v1/responses"
     ) in rendered
     assert (
-        " - gpt-5.3-codex-spark(aawm-code) - Turns: 1 -> "
-        "api.openai.com/v1/responses"
-    ) in rendered
-    assert kwargs["litellm_params"]["metadata"]["aawm_route_rollup_turn_recorded"] is True
+        kwargs["litellm_params"]["metadata"]["aawm_route_rollup_turn_recorded"] is True
+    )
     clear_aawm_route_rollups()
 
 
@@ -1722,18 +1723,29 @@ async def test_pass_through_request_failure_handler():
                 # Verify the arguments to post_call_failure_hook
                 call_args = mock_proxy_logging.post_call_failure_hook.call_args[1]
                 assert call_args["user_api_key_dict"] == mock_user_api_key_dict
-                assert isinstance(
-                    call_args["original_exception"], httpx.HTTPError
-                )
+                assert isinstance(call_args["original_exception"], httpx.HTTPError)
                 assert "traceback_str" in call_args
 
 
 def test_is_anthropic_route_excludes_count_tokens():
     handler = PassThroughEndpointLogging()
 
-    assert handler.is_anthropic_route("http://localhost:4000/anthropic/v1/messages") is True
-    assert handler.is_anthropic_route("http://localhost:4000/anthropic/v1/messages/batches") is True
-    assert handler.is_anthropic_route("http://localhost:4000/anthropic/v1/messages/count_tokens?beta=true") is False
+    assert (
+        handler.is_anthropic_route("http://localhost:4000/anthropic/v1/messages")
+        is True
+    )
+    assert (
+        handler.is_anthropic_route(
+            "http://localhost:4000/anthropic/v1/messages/batches"
+        )
+        is True
+    )
+    assert (
+        handler.is_anthropic_route(
+            "http://localhost:4000/anthropic/v1/messages/count_tokens?beta=true"
+        )
+        is False
+    )
 
 
 def test_is_langfuse_route():
@@ -2113,6 +2125,7 @@ async def test_handle_logging_skips_plain_function_callbacks():
 
     mock_submit.assert_not_called()
 
+
 @pytest.mark.asyncio
 async def test_handle_logging_uses_standard_callback_contracts():
     handler = PassThroughEndpointLogging()
@@ -2129,7 +2142,9 @@ async def test_handle_logging_uses_standard_callback_contracts():
             next_kwargs["mutated"] = True
             return next_kwargs, {"mutated_result": True}
 
-        async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        async def async_log_success_event(
+            self, kwargs, response_obj, start_time, end_time
+        ):
             self.calls.append((kwargs, response_obj, start_time, end_time))
 
     class DummySyncCallback:
@@ -2164,15 +2179,26 @@ async def test_handle_logging_uses_standard_callback_contracts():
     assert mock_submit.call_count == 1
     success_call = mock_submit.call_args_list[0].args
     assert success_call[0] == sync_callback.log_success_event
-    assert success_call[1:] == ({"example": "value", "standard_callback_dynamic_params": {}}, {"ok": True}, start_time, end_time)
+    assert success_call[1:] == (
+        {"example": "value", "standard_callback_dynamic_params": {}},
+        {"ok": True},
+        start_time,
+        end_time,
+    )
 
-    assert async_callback.calls[0] == ({"example": "value", "standard_callback_dynamic_params": {}}, {"ok": True}, "acompletion")
-    assert async_callback.calls[1][0] == {"example": "value", "standard_callback_dynamic_params": {}, "mutated": True}
+    assert async_callback.calls[0] == (
+        {"example": "value", "standard_callback_dynamic_params": {}},
+        {"ok": True},
+        "acompletion",
+    )
+    assert async_callback.calls[1][0] == {
+        "example": "value",
+        "standard_callback_dynamic_params": {},
+        "mutated": True,
+    }
     assert async_callback.calls[1][1] == {"mutated_result": True}
     assert async_callback.calls[1][2] == start_time
     assert async_callback.calls[1][3] == end_time
-
-
 
 
 def test_normalize_llm_passthrough_logging_payload_uses_openai_handler_for_adapted_openrouter_chat():
@@ -2207,7 +2233,10 @@ def test_normalize_llm_passthrough_logging_payload_uses_openai_handler_for_adapt
 
     assert result["standard_logging_response_object"] == "openai-ok"
     assert result["kwargs"] == {"marker": "openai"}
-    assert mock_openai_handler.call_args.kwargs["url_route"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert (
+        mock_openai_handler.call_args.kwargs["url_route"]
+        == "https://openrouter.ai/api/v1/chat/completions"
+    )
     mock_anthropic_handler.assert_not_called()
 
 
@@ -3494,8 +3523,6 @@ async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallba
     )
 
 
-
-
 class TestGrokPersonalTeamSpendingLimitLogging:
     def test_classifier_matches_known_spending_limit_403_body(self):
         detail = (
@@ -3552,7 +3579,9 @@ class TestGrokPersonalTeamSpendingLimitLogging:
         mock_request.url = "http://localhost:4001/grok/v1/responses"
         mock_request.headers = {"content-type": "application/json"}
         mock_request.query_params = {}
-        mock_request.body = AsyncMock(return_value=b'{"model":"grok-composer-2.5-fast"}')
+        mock_request.body = AsyncMock(
+            return_value=b'{"model":"grok-composer-2.5-fast"}'
+        )
 
         target_url = "https://cli-chat-proxy.grok.com/v1/responses"
         upstream_body = (
@@ -3566,11 +3595,13 @@ class TestGrokPersonalTeamSpendingLimitLogging:
         )
         handler = AsyncMock(return_value=upstream_response)
 
-        saved_handlers, saved_level, saved_propagate = (
-            TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
-                tmp_path,
-                monkeypatch,
-            )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
+            tmp_path,
+            monkeypatch,
         )
 
         try:
@@ -3621,6 +3652,7 @@ class TestGrokPersonalTeamSpendingLimitLogging:
             )
 
         assert not (tmp_path / "dev-error.jsonl").exists()
+
 
 class TestGrokBuildUsageBalanceExhaustedLogging:
     def test_classifier_matches_known_402_body(self):
@@ -3759,9 +3791,7 @@ class TestGrokBillingPassthroughTimeoutLogging:
         request.url = "http://localhost:4001/grok/v1/billing?format=credits"
         assert _is_known_grok_billing_passthrough_timeout_cancel_response(
             request=request,
-            url=httpx.URL(
-                "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
-            ),
+            url=httpx.URL("https://cli-chat-proxy.grok.com/v1/billing?format=credits"),
             custom_llm_provider="xai",
             status_code=400,
             exc=HTTPException(
@@ -3775,9 +3805,7 @@ class TestGrokBillingPassthroughTimeoutLogging:
         request.url = "http://localhost:4001/grok/v1/billing?format=credits"
         assert not _is_known_grok_billing_passthrough_timeout_cancel_response(
             request=request,
-            url=httpx.URL(
-                "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
-            ),
+            url=httpx.URL("https://cli-chat-proxy.grok.com/v1/billing?format=credits"),
             custom_llm_provider="xai",
             status_code=400,
             exc=HTTPException(
@@ -3803,18 +3831,19 @@ class TestGrokBillingPassthroughTimeoutLogging:
         upstream_response = httpx.Response(
             status_code=400,
             content=(
-                b'{"code":"The operation was cancelled",'
-                b'"error":"Timeout expired"}'
+                b'{"code":"The operation was cancelled",' b'"error":"Timeout expired"}'
             ),
             request=httpx.Request("GET", target_url),
         )
         handler = AsyncMock(return_value=upstream_response)
 
-        saved_handlers, saved_level, saved_propagate = (
-            TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
-                tmp_path,
-                monkeypatch,
-            )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
+            tmp_path,
+            monkeypatch,
         )
 
         try:
@@ -3883,11 +3912,13 @@ class TestGrokBillingPassthroughTimeoutLogging:
         )
         handler = AsyncMock(return_value=upstream_response)
 
-        saved_handlers, saved_level, saved_propagate = (
-            TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
-                tmp_path,
-                monkeypatch,
-            )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = TestPassThroughTerminalFailureLogging._install_aawm_error_log_handler(
+            tmp_path,
+            monkeypatch,
         )
 
         try:
@@ -3936,9 +3967,7 @@ class TestGrokBillingPassthroughTimeoutLogging:
             for line in error_log_path.read_text(encoding="utf-8").splitlines()
         ]
         payload = next(
-            item
-            for item in payloads
-            if "pass_through_endpoint" in item["message"]
+            item for item in payloads if "pass_through_endpoint" in item["message"]
         )
         assert payload["context"]["endpoint"] == "/grok/v1/billing"
         assert payload["context"]["status_code"] == 400
@@ -3982,7 +4011,9 @@ class TestPassThroughTerminalFailureLogging:
     ):
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
-        mock_request.url = "http://localhost:4001/openai_passthrough/responses?stream=true"
+        mock_request.url = (
+            "http://localhost:4001/openai_passthrough/responses?stream=true"
+        )
         mock_request.headers = {
             "content-type": "application/json",
             "authorization": f"Bearer {secret_token}",
@@ -4031,7 +4062,9 @@ class TestPassThroughTerminalFailureLogging:
     @staticmethod
     def _assert_codex_unsupported_content_type_error_context(context):
         assert context["endpoint"] == "/openai_passthrough/responses"
-        assert context["upstream_url"] == "https://chatgpt.com/backend-api/codex/responses"
+        assert (
+            context["upstream_url"] == "https://chatgpt.com/backend-api/codex/responses"
+        )
         assert context["provider"] == "openai"
         assert context["model"] == "gpt-5.5"
         assert context["route_family"] == "codex_responses"
@@ -4156,9 +4189,11 @@ class TestPassThroughTerminalFailureLogging:
         )
         handler = AsyncMock(return_value=upstream_response)
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -4249,9 +4284,11 @@ class TestPassThroughTerminalFailureLogging:
         )
         handler = AsyncMock(return_value=upstream_response)
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -4325,7 +4362,9 @@ class TestPassThroughTerminalFailureLogging:
         mock_request.query_params = {}
 
         target_url = "https://chatgpt.com/backend-api/codex/responses"
-        upstream_detail = "507: b'exceeded request buffer limit while retrying upstream'"
+        upstream_detail = (
+            "507: b'exceeded request buffer limit while retrying upstream'"
+        )
         upstream_response = httpx.Response(
             status_code=507,
             content=upstream_detail.encode("utf-8"),
@@ -4338,9 +4377,11 @@ class TestPassThroughTerminalFailureLogging:
             "aawm_passthrough_hidden_retry_count": 1,
         }
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -4424,9 +4465,11 @@ class TestPassThroughTerminalFailureLogging:
             secret_token,
         )
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -4480,9 +4523,7 @@ class TestPassThroughTerminalFailureLogging:
             for line in error_log_path.read_text(encoding="utf-8").splitlines()
         ]
         payload = next(
-            item
-            for item in payloads
-            if "Unsupported content type" in item["message"]
+            item for item in payloads if "Unsupported content type" in item["message"]
         )
         context = payload["context"]
 
@@ -4507,7 +4548,7 @@ class TestPassThroughTerminalFailureLogging:
             b'    "type": "invalid_request_error",\n'
             b'    "param": null,\n'
             b'    "code": "invalid_encrypted_content"\n'
-            b'  }\n}'
+            b"  }\n}"
         )
         fixture = self._build_codex_unsupported_content_type_fixture(
             "redacted prompt",
@@ -4516,9 +4557,11 @@ class TestPassThroughTerminalFailureLogging:
             upstream_detail=upstream_detail,
         )
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -4627,7 +4670,9 @@ class TestPassThroughTerminalFailureLogging:
             mock_client_obj = MagicMock()
             mock_client_obj.client = MagicMock()
             mock_get_client.return_value = mock_client_obj
-            mock_logging_obj.pre_call_hook = AsyncMock(return_value={"model": "gpt-5.5"})
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "gpt-5.5"}
+            )
             mock_logging_obj.post_call_failure_hook = AsyncMock()
 
             with pytest.raises(ProxyException) as exc_info:
@@ -4675,7 +4720,7 @@ class TestPassThroughTerminalFailureLogging:
             b'    "type": "invalid_request_error",\n'
             b'    "param": null,\n'
             b'    "code": "invalid_encrypted_content"\n'
-            b'  }\n}'
+            b"  }\n}"
         )
         upstream_response = httpx.Response(
             status_code=400,
@@ -4739,6 +4784,113 @@ class TestPassThroughTerminalFailureLogging:
             is None
         )
 
+    def test_classifier_matches_chatgpt_codex_unsupported_model_for_account_body(self):
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        exc = HTTPException(
+            status_code=400,
+            detail=(
+                b'{"detail":"The \'gpt-5.6-terra\' model is not supported when using Codex '
+                b'with a ChatGPT account."}'
+            ),
+        )
+        assert _is_known_chatgpt_codex_model_not_supported_for_account_response(
+            url=httpx.URL(target_url),
+            status_code=400,
+            exc=exc,
+        )
+        assert (
+            _get_passthrough_chatgpt_codex_model_not_supported_failure_kind()
+            == "openai_chatgpt_codex_model_not_supported_for_account"
+        )
+
+    def test_classifier_rejects_unrelated_chatgpt_codex_400_body(self):
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        exc = HTTPException(
+            status_code=400,
+            detail=b'{"detail":"Unsupported content type"}',
+        )
+        assert not _is_known_chatgpt_codex_model_not_supported_for_account_response(
+            url=httpx.URL(target_url),
+            status_code=400,
+            exc=exc,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_chatgpt_codex_unsupported_model_warns_with_failure_kind(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        upstream_detail = (
+            b'{"detail":"The \'gpt-5.6-terra\' model is not supported when using Codex '
+            b'with a ChatGPT account."}'
+        )
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=upstream_detail,
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "gpt-5.6-terra"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch.object(
+            verbose_proxy_logger,
+            "warning",
+        ) as mock_warning, patch.object(
+            verbose_proxy_logger,
+            "exception",
+        ) as mock_exception:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "gpt-5.6-terra"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+
+        assert exc_info.value.code == "400"
+        assert "gpt-5.6-terra" in str(exc_info.value.detail)
+        mock_exception.assert_not_called()
+        unsupported_warning = next(
+            call
+            for call in mock_warning.call_args_list
+            if "unsupported model for account" in str(call.args[0])
+        )
+        assert (
+            unsupported_warning.kwargs["extra"]["failure_kind"]
+            == "openai_chatgpt_codex_model_not_supported_for_account"
+        )
+        assert unsupported_warning.kwargs["extra"]["upstream_url"] == target_url
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert (
+            mock_logging_obj.post_call_failure_hook.await_args.kwargs["traceback_str"]
+            is None
+        )
+
     @pytest.mark.asyncio
     async def test_pass_through_request_chatgpt_codex_unrelated_400_keeps_exception_logging(
         self,
@@ -4775,7 +4927,9 @@ class TestPassThroughTerminalFailureLogging:
             mock_client_obj = MagicMock()
             mock_client_obj.client = MagicMock()
             mock_get_client.return_value = mock_client_obj
-            mock_logging_obj.pre_call_hook = AsyncMock(return_value={"model": "gpt-5.5"})
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "gpt-5.5"}
+            )
             mock_logging_obj.post_call_failure_hook = AsyncMock()
 
             with pytest.raises(ProxyException) as exc_info:
@@ -4807,9 +4961,7 @@ class TestPassThroughTerminalFailureLogging:
     ):
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
-        mock_request.url = (
-            "http://localhost:4001/openai_passthrough/codex/responses"
-        )
+        mock_request.url = "http://localhost:4001/openai_passthrough/codex/responses"
         mock_request.headers = {"content-type": "application/json"}
         mock_request.query_params = {}
 
@@ -4829,9 +4981,11 @@ class TestPassThroughTerminalFailureLogging:
         async def fake_sleep(seconds: float) -> None:
             sleep_calls.append(seconds)
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -4936,9 +5090,11 @@ class TestPassThroughTerminalFailureLogging:
         async def fake_sleep(seconds: float) -> None:
             sleep_calls.append(seconds)
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -5034,9 +5190,11 @@ class TestPassThroughTerminalFailureLogging:
         async def fake_sleep(seconds: float) -> None:
             sleep_calls.append(seconds)
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -5189,9 +5347,11 @@ class TestPassThroughTerminalFailureLogging:
         target_url = "https://api.anthropic.com/v1/messages"
         handler = AsyncMock(side_effect=RuntimeError("unexpected passthrough failure"))
 
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -5265,9 +5425,7 @@ class TestPassThroughTerminalFailureLogging:
         mock_request.query_params = {}
         mock_request.body = AsyncMock(return_value=raw_body)
 
-        target_url = (
-            f"https://cli-chat-proxy.grok.com/v1/sessions/{session_id}/signals"
-        )
+        target_url = f"https://cli-chat-proxy.grok.com/v1/sessions/{session_id}/signals"
         upstream_response = httpx.Response(
             status_code=401,
             content=upstream_detail.encode("utf-8"),
@@ -5309,14 +5467,16 @@ class TestPassThroughTerminalFailureLogging:
     ):
         upstream_detail = (
             '{"error":"Invalid or expired credentials '
-            '(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, '
+            "(auth_kind=bearer, x_xai_token_auth=xai-grok-cli, "
             'upstream=PermissionDenied, reason=no auth context)"}'
         )
         fixture = self._build_grok_signals_401_fixture(upstream_detail)
         handler = AsyncMock(return_value=fixture["upstream_response"])
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -5464,9 +5624,11 @@ class TestPassThroughTerminalFailureLogging:
             model=model,
         )
         handler = AsyncMock(return_value=fixture["upstream_response"])
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -5541,9 +5703,11 @@ class TestPassThroughTerminalFailureLogging:
             model="claude-opus-4-8",
         )
         handler = AsyncMock(return_value=fixture["upstream_response"])
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -5615,9 +5779,11 @@ class TestPassThroughTerminalFailureLogging:
         upstream_detail = '{"error":"grok signals authorization failed"}'
         fixture = self._build_grok_signals_401_fixture(upstream_detail)
         handler = AsyncMock(return_value=fixture["upstream_response"])
-        saved_handlers, saved_level, saved_propagate = (
-            self._install_aawm_error_log_handler(tmp_path, monkeypatch)
-        )
+        (
+            saved_handlers,
+            saved_level,
+            saved_propagate,
+        ) = self._install_aawm_error_log_handler(tmp_path, monkeypatch)
 
         try:
             with patch(
@@ -5682,9 +5848,7 @@ class TestPassThroughTerminalFailureLogging:
             for line in error_log_path.read_text(encoding="utf-8").splitlines()
         ]
         payload = next(
-            item
-            for item in payloads
-            if "Exception occured - 401:" in item["message"]
+            item for item in payloads if "Exception occured - 401:" in item["message"]
         )
         context = payload["context"]
 
@@ -5700,10 +5864,7 @@ class TestPassThroughTerminalFailureLogging:
             context["grok_side_channel_endpoint_path_template"]
             == "/sessions/{session_id}/signals"
         )
-        assert (
-            context["grok_side_channel_request_content_type"]
-            == "application/json"
-        )
+        assert context["grok_side_channel_request_content_type"] == "application/json"
         assert (
             context["grok_side_channel_request_body_byte_length"]
             == fixture["raw_body_length"]
@@ -5842,18 +6003,18 @@ class TestPassThroughHiddenRetry:
         assert response.status_code == 200
         assert handler.await_count == 2
         assert sleep_calls == [5.0]
-        metadata = mock_success_handler.call_args.kwargs["litellm_params"][
-            "metadata"
-        ]
+        metadata = mock_success_handler.call_args.kwargs["litellm_params"]["metadata"]
         assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
             "success_after_retry"
         )
-        assert metadata["aawm_passthrough_hidden_retry_attempts"][0][
-            "status_code"
-        ] == status_code
-        assert metadata["aawm_passthrough_hidden_retry_attempts"][-1][
-            "failure_class"
-        ] == "success"
+        assert (
+            metadata["aawm_passthrough_hidden_retry_attempts"][0]["status_code"]
+            == status_code
+        )
+        assert (
+            metadata["aawm_passthrough_hidden_retry_attempts"][-1]["failure_class"]
+            == "success"
+        )
 
     @pytest.mark.asyncio
     async def test_pass_through_request_retries_transport_dns_failure(self):
@@ -6238,7 +6399,9 @@ async def test_pass_through_request_forwards_raw_body_without_json_parse():
     call_kwargs = mock_http_handler.await_args.kwargs
     assert call_kwargs["raw_body"] == b"\x08\x01native"
     assert call_kwargs["_parsed_body"]["raw_body_passthrough"] is True
-    assert call_kwargs["_parsed_body"]["raw_body_content_type"] == "application/x-protobuf"
+    assert (
+        call_kwargs["_parsed_body"]["raw_body_content_type"] == "application/x-protobuf"
+    )
     assert call_kwargs["_parsed_body"]["raw_body_bytes"] == len(b"\x08\x01native")
 
 
@@ -7025,11 +7188,15 @@ def test_build_full_path_with_root_default():
         InitPassThroughEndpointHelpers,
     )
 
-    with patch("litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path") as mock_get_root:
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path"
+    ) as mock_get_root:
         # Test with default root path
         mock_get_root.return_value = "/"
 
-        result = InitPassThroughEndpointHelpers._build_full_path_with_root("/api/v1/endpoint")
+        result = InitPassThroughEndpointHelpers._build_full_path_with_root(
+            "/api/v1/endpoint"
+        )
         assert result == "/api/v1/endpoint"
 
 
@@ -7041,11 +7208,15 @@ def test_build_full_path_with_root_custom():
         InitPassThroughEndpointHelpers,
     )
 
-    with patch("litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path") as mock_get_root:
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path"
+    ) as mock_get_root:
         # Test with custom root path /proxy
         mock_get_root.return_value = "/proxy"
 
-        result = InitPassThroughEndpointHelpers._build_full_path_with_root("/api/v1/endpoint")
+        result = InitPassThroughEndpointHelpers._build_full_path_with_root(
+            "/api/v1/endpoint"
+        )
         assert result == "/proxy/api/v1/endpoint"
 
 
@@ -7057,7 +7228,9 @@ def test_build_full_path_with_root_nested():
         InitPassThroughEndpointHelpers,
     )
 
-    with patch("litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path") as mock_get_root:
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path"
+    ) as mock_get_root:
         # Test with nested root path /api/v2
         mock_get_root.return_value = "/api/v2"
 
@@ -7089,24 +7262,46 @@ def test_is_registered_pass_through_route_with_custom_root():
         "headers": {},
     }
 
-    with patch("litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path") as mock_get_root:
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path"
+    ) as mock_get_root:
         # Test with custom root path /proxy
         mock_get_root.return_value = "/proxy"
 
         # Should match when request route includes the root path
-        assert InitPassThroughEndpointHelpers.is_registered_pass_through_route("/proxy/api/endpoint") is True
+        assert (
+            InitPassThroughEndpointHelpers.is_registered_pass_through_route(
+                "/proxy/api/endpoint"
+            )
+            is True
+        )
 
         # Should not match when request route doesn't include root path
-        assert InitPassThroughEndpointHelpers.is_registered_pass_through_route("/api/endpoint") is False
+        assert (
+            InitPassThroughEndpointHelpers.is_registered_pass_through_route(
+                "/api/endpoint"
+            )
+            is False
+        )
 
         # Test with default root path
         mock_get_root.return_value = "/"
 
         # Should match with default root
-        assert InitPassThroughEndpointHelpers.is_registered_pass_through_route("/api/endpoint") is True
+        assert (
+            InitPassThroughEndpointHelpers.is_registered_pass_through_route(
+                "/api/endpoint"
+            )
+            is True
+        )
 
         # Should not match with root prepended when root is /
-        assert InitPassThroughEndpointHelpers.is_registered_pass_through_route("/proxy/api/endpoint") is False
+        assert (
+            InitPassThroughEndpointHelpers.is_registered_pass_through_route(
+                "/proxy/api/endpoint"
+            )
+            is False
+        )
 
     # Clean up
     _registered_pass_through_routes.clear()
@@ -7138,25 +7333,33 @@ def test_get_registered_pass_through_route_with_custom_root():
     route_key = f"{endpoint_id}:exact:{path}"
     _registered_pass_through_routes[route_key] = target_config
 
-    with patch("litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path") as mock_get_root:
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_server_root_path"
+    ) as mock_get_root:
         # Test with custom root path /litellm
         mock_get_root.return_value = "/litellm"
 
         # Should return config when request route includes root path
-        result = InitPassThroughEndpointHelpers.get_registered_pass_through_route("/litellm/chat/completions")
+        result = InitPassThroughEndpointHelpers.get_registered_pass_through_route(
+            "/litellm/chat/completions"
+        )
         assert result is not None
         assert result["target"] == "http://api.example.com/v1/chat/completions"
         assert result["headers"]["Authorization"] == "Bearer token123"
 
         # Should return None when route doesn't match
-        result = InitPassThroughEndpointHelpers.get_registered_pass_through_route("/chat/completions")
+        result = InitPassThroughEndpointHelpers.get_registered_pass_through_route(
+            "/chat/completions"
+        )
         assert result is None
 
         # Test with default root path
         mock_get_root.return_value = "/"
 
         # Should return config with default root
-        result = InitPassThroughEndpointHelpers.get_registered_pass_through_route("/chat/completions")
+        result = InitPassThroughEndpointHelpers.get_registered_pass_through_route(
+            "/chat/completions"
+        )
         assert result is not None
         assert result["target"] == "http://api.example.com/v1/chat/completions"
 
@@ -7175,9 +7378,7 @@ def test_mapped_pass_through_routes_with_server_root_path():
         InitPassThroughEndpointHelpers,
     )
 
-    with patch(
-        "litellm.proxy.utils.get_server_root_path"
-    ) as mock_get_root:
+    with patch("litellm.proxy.utils.get_server_root_path") as mock_get_root:
         mock_get_root.return_value = "/litellm"
 
         # prefixed route should match mapped routes like /vertex_ai
@@ -7203,7 +7404,6 @@ def test_mapped_pass_through_routes_with_server_root_path():
         )
 
 
-
 @pytest.mark.asyncio
 async def test_multipart_passthrough_preserves_boundary():
     """
@@ -7218,7 +7418,9 @@ async def test_multipart_passthrough_preserves_boundary():
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.headers = httpx.Headers({"content-type": "application/json"})
-    mock_response.aread = AsyncMock(return_value=b'{"filename": "test.txt", "size": 17}')
+    mock_response.aread = AsyncMock(
+        return_value=b'{"filename": "test.txt", "size": 17}'
+    )
     mock_response.text = '{"filename": "test.txt", "size": 17}'
 
     async def mock_httpx_request(method, url, **kwargs):
@@ -7228,7 +7430,9 @@ async def test_multipart_passthrough_preserves_boundary():
 
         # Verify content-type is NOT in headers (httpx will set it with correct boundary)
         headers = kwargs.get("headers", {})
-        assert "content-type" not in headers, "content-type should be removed for multipart"
+        assert (
+            "content-type" not in headers
+        ), "content-type should be removed for multipart"
 
         filename, content, content_type = kwargs["files"]["file"]
         assert filename == "test.txt"
@@ -7281,7 +7485,7 @@ class _FakeStreamingResponse:
 
 @pytest.mark.asyncio
 async def test_chunk_processor_records_segmented_streaming_metrics():
-    response = _FakeStreamingResponse([b"data: {\"delta\":1}\n\n", b"data: [DONE]\n\n"])
+    response = _FakeStreamingResponse([b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"])
     logging_obj = MagicMock()
     success_handler_kwargs = {
         "litellm_params": {"metadata": {}},
@@ -7307,7 +7511,7 @@ async def test_chunk_processor_records_segmented_streaming_metrics():
 
     await asyncio.sleep(0)
 
-    assert chunks == [b"data: {\"delta\":1}\n\n", b"data: [DONE]\n\n"]
+    assert chunks == [b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"]
     metadata = success_handler_kwargs["litellm_params"]["metadata"]
     assert metadata["aawm_stream_chunk_count"] == 2
     assert metadata["aawm_stream_total_bytes"] > 0
@@ -7363,9 +7567,7 @@ async def test_route_streaming_logging_records_finalize_metrics():
     assert metadata["aawm_local_stream_finalize_ms"] >= 0
     assert metadata["aawm_total_proxy_overhead_ms"] >= 5.5
     span_names = [
-        span["name"]
-        for span in metadata["langfuse_spans"]
-        if isinstance(span, dict)
+        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
     ]
     assert "proxy.post_response_finalize" in span_names
 
@@ -7457,16 +7659,9 @@ async def test_route_streaming_logging_captures_code_assist_quota_observation(
         if custom_llm_provider == "antigravity"
         else "google_retrieve_user_quota"
     )
+    assert metadata["google_retrieve_user_quota"]["source"] == expected_source
+    assert metadata["google_retrieve_user_quota"]["remainingRequests"] == 1499
     assert (
-        metadata["google_retrieve_user_quota"]["source"]
-        == expected_source
-    )
-    assert (
-        metadata["google_retrieve_user_quota"]["remainingRequests"] == 1499
-    )
-    assert (
-        metadata["google_retrieve_user_quota"]["buckets"]["items"][0][
-            "resetTime"
-        ]
+        metadata["google_retrieve_user_quota"]["buckets"]["items"][0]["resetTime"]
         == "2026-06-04T00:00:00Z"
     )

@@ -461,12 +461,19 @@ _CODEX_AAWM_READ_ALIAS = "aawm-read"
 _CODEX_AAWM_SOTA_ALIAS = "aawm-sota"
 _CODEX_AAWM_CODE_ALIAS = "aawm-code"
 _CODEX_AAWM_LOW_ALIAS = "aawm-low"
+_CODEX_AAWM_ORCHESTRATION_ALIAS = "aawm-orchestration"
 _CODEX_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.6-sol",
+        "route_family": "codex_responses",
+        "last_resort": False,
+    },
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
         "model": "gpt-5.5",
         "route_family": "codex_responses",
-        "last_resort": False,
+        "last_resort": True,
     },
 )
 _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
@@ -486,6 +493,12 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
         "model": "oa_xai/grok-build",
         "route_family": "codex_xai_oauth_responses_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.6-terra",
+        "route_family": "codex_responses",
         "last_resort": False,
     },
     {
@@ -523,7 +536,27 @@ _CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.6-luna",
+        "route_family": "codex_responses",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
         "model": "gpt-5.4-mini",
+        "route_family": "codex_responses",
+        "last_resort": True,
+    },
+)
+_CODEX_AAWM_ORCHESTRATION_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.6-terra",
+        "route_family": "codex_responses",
+        "last_resort": False,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "gpt-5.5",
         "route_family": "codex_responses",
         "last_resort": True,
     },
@@ -534,6 +567,7 @@ _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {
     _CODEX_AAWM_SOTA_ALIAS: _CODEX_AAWM_SOTA_CANDIDATES,
     _CODEX_AAWM_CODE_ALIAS: _CODEX_AAWM_CODE_CANDIDATES,
     _CODEX_AAWM_LOW_ALIAS: _CODEX_AAWM_LOW_CANDIDATES,
+    _CODEX_AAWM_ORCHESTRATION_ALIAS: _CODEX_AAWM_ORCHESTRATION_CANDIDATES,
 }
 _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = "aawm-anthropic-agent-auto"
 _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER = "anthropic"
@@ -562,12 +596,19 @@ _ANTHROPIC_AAWM_READ_ALIAS = "aawm-read-anthropic"
 _ANTHROPIC_AAWM_SOTA_ALIAS = "aawm-sota-anthropic"
 _ANTHROPIC_AAWM_CODE_ALIAS = "aawm-code-anthropic"
 _ANTHROPIC_AAWM_LOW_ALIAS = "aawm-low-anthropic"
+_ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = "aawm-orchestration-anthropic"
 _ANTHROPIC_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "claude-fable-5",
+        "route_family": "anthropic_messages",
+        "last_resort": False,
+    },
     {
         "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
         "model": "claude-opus-4-8",
         "route_family": "anthropic_messages",
-        "last_resort": False,
+        "last_resort": True,
     },
 )
 _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
@@ -591,7 +632,27 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
     {
         "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "claude-sonnet-5[1m]",
+        "route_family": "anthropic_messages",
+        "last_resort": False,
+    },
+    {
+        "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "claude-sonnet-5",
+        "route_family": "anthropic_messages",
+        "last_resort": False,
+    },
+    {
+        "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
         "model": "claude-sonnet-4-6",
+        "route_family": "anthropic_messages",
+        "last_resort": True,
+    },
+)
+_ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": "claude-opus-4-8",
         "route_family": "anthropic_messages",
         "last_resort": True,
     },
@@ -636,6 +697,7 @@ _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[
     _ANTHROPIC_AAWM_SOTA_ALIAS: _ANTHROPIC_AAWM_SOTA_CANDIDATES,
     _ANTHROPIC_AAWM_CODE_ALIAS: _ANTHROPIC_AAWM_CODE_CANDIDATES,
     _ANTHROPIC_AAWM_LOW_ALIAS: _ANTHROPIC_AAWM_LOW_CANDIDATES,
+    _ANTHROPIC_AAWM_ORCHESTRATION_ALIAS: _ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES,
 }
 
 
@@ -4337,6 +4399,14 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("429")
         tokens.add("RATE_LIMIT_EXCEEDED")
     if "aawm_codex_auto_agent_candidate_unavailable" in text_lower:
+        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
+    if (
+        "not supported when using codex with a chatgpt account" in text_lower
+        and (
+            "model is not supported" in text_lower
+            or " is not supported" in text_lower
+        )
+    ):
         tokens.add("aawm_codex_auto_agent_candidate_unavailable")
     if "aawm_auto_agent_failed_responses_payload" in text_lower:
         tokens.add("aawm_auto_agent_failed_responses_payload")
@@ -12887,6 +12957,51 @@ def _is_grok_unsupported_reasoning_parameter_detail(normalized_detail: str) -> b
             "invalid argument",
         )
     )
+
+
+def _codex_native_openai_candidate_unavailable_detail(exc: Any) -> Optional[str]:
+    status_code = _extract_google_adapter_exception_status_code(exc)
+    if status_code != 400:
+        return None
+    detail = _extract_google_adapter_exception_detail(exc)
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="ignore")
+    elif isinstance(detail, (dict, list)):
+        detail_text = json.dumps(detail, sort_keys=True, default=str)
+    elif detail is not None:
+        detail_text = str(detail)
+    else:
+        detail_text = str(exc)
+    normalized = detail_text.lower()
+    if "not supported when using codex with a chatgpt account" not in normalized:
+        return None
+    if "model is not supported" not in normalized and "is not supported" not in normalized:
+        return None
+    return detail_text
+
+
+def _raise_codex_native_openai_auto_agent_candidate_unavailable(exc: Exception) -> None:
+    detail = _codex_native_openai_candidate_unavailable_detail(exc) or str(exc)
+    proxy_exc = ProxyException(
+        message=(
+            "ChatGPT/Codex native OpenAI auto-agent candidate is unavailable for "
+            f"this account: {detail}"
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": proxy_exc.message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
+    raise proxy_exc from exc
 
 
 def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
@@ -25350,14 +25465,35 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
     else:
-        _safe_set_request_parsed_body(request, candidate_body)
+        native_candidate_body = candidate_body
+        native_custom_headers = custom_headers
+        blocked_pass_through_prefixed_headers: Optional[list[str]] = None
+        (
+            native_candidate_body,
+            normalized_native_model_alias,
+        ) = _normalize_anthropic_native_passthrough_model_alias(
+            native_candidate_body
+        )
+        (
+            native_candidate_body,
+            native_custom_headers,
+            normalized_context_1m_model,
+        ) = _prepare_anthropic_context_1m_native_passthrough(
+            request=request,
+            request_body=native_candidate_body,
+            custom_headers=native_custom_headers,
+        )
+        if normalized_context_1m_model:
+            blocked_pass_through_prefixed_headers = [_ANTHROPIC_BETA_HEADER_NAME]
+        _safe_set_request_parsed_body(request, native_candidate_body)
         response = await _perform_anthropic_native_passthrough_request(
             endpoint=endpoint,
             request=request,
             fastapi_response=fastapi_response,
             user_api_key_dict=user_api_key_dict,
             target_url=target_url,
-            custom_headers=custom_headers,
+            custom_headers=native_custom_headers,
+            blocked_pass_through_prefixed_headers=blocked_pass_through_prefixed_headers,
         )
     return response
 
@@ -25569,9 +25705,13 @@ _ANTHROPIC_NATIVE_PASSTHROUGH_MODEL_ALIASES = {
     "opus": "claude-opus-4-6",
     "opus-4-6": "claude-opus-4-6",
     "opus-4-8": "claude-opus-4-8",
+    "fable-5": "claude-fable-5",
+    "claude-fable-5": "claude-fable-5",
     "sonnet": "claude-sonnet-4-20250514",
     "sonnet-4-6": "claude-sonnet-4-6",
     "sonnet-4-20250514": "claude-sonnet-4-20250514",
+    "sonnet-5": "claude-sonnet-5",
+    "claude-sonnet-5": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5",
     "haiku-4-5": "claude-haiku-4-5",
     "haiku-4-5-20251001": "claude-haiku-4-5-20251001",
@@ -25718,6 +25858,18 @@ def _prepare_anthropic_context_1m_native_passthrough(
 
     updated_body = dict(request_body)
     updated_body["model"] = base_model
+
+    metadata = updated_body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    metadata.setdefault("inbound_model_alias", stripped_model)
+    metadata.setdefault("requested_model_alias", stripped_model)
+    metadata.setdefault("model_alias_label", stripped_model)
+    metadata.setdefault("anthropic_native_passthrough_model_alias", stripped_model)
+    metadata["anthropic_native_passthrough_normalized_model"] = base_model
+    updated_body["litellm_metadata"] = metadata
 
     updated_headers = dict(custom_headers)
     for beta_header_name in (
@@ -27393,23 +27545,28 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
 ) -> Response:
     is_streaming_request = "stream" in str(target_url)
-    return await pass_through_request(
-        request=request,
-        target=target_url,
-        custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
-            api_key=api_key,
+    try:
+        return await pass_through_request(
             request=request,
-        ),
-        user_api_key_dict=user_api_key_dict,
-        forward_headers=forward_headers,
-        stream=is_streaming_request,
-        custom_body=request_body,
-        custom_llm_provider=litellm.LlmProviders.OPENAI.value,
-        egress_credential_family="openai" if forward_headers else None,
-        expected_target_family="openai",
-        retryable_upstream_status_codes=[429],
-        caller_managed_hidden_retry=False,
-    )
+            target=target_url,
+            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
+                api_key=api_key,
+                request=request,
+            ),
+            user_api_key_dict=user_api_key_dict,
+            forward_headers=forward_headers,
+            stream=is_streaming_request,
+            custom_body=request_body,
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+            egress_credential_family="openai" if forward_headers else None,
+            expected_target_family="openai",
+            retryable_upstream_status_codes=[429],
+            caller_managed_hidden_retry=False,
+        )
+    except Exception as exc:
+        if _codex_native_openai_candidate_unavailable_detail(exc) is not None:
+            _raise_codex_native_openai_auto_agent_candidate_unavailable(exc)
+        raise
 
 
 async def _perform_codex_auto_agent_grok_native_responses_request(
