@@ -57,6 +57,20 @@ from litellm.utils import get_utc_datetime
 
 router = APIRouter()
 
+_MODEL_MANAGEMENT_DB_REQUIRED_ERROR = (
+    "Dynamic model management requires a LiteLLM proxy database. "
+    "Start the proxy with DATABASE_URL set so Prisma initializes the LiteLLM schema. "
+    "Config-file-only or DB-less proxies cannot use /model/new for persistent writes. "
+    "Other application database environment variables are not sufficient. "
+    "Setup guide: https://docs.litellm.ai/docs/proxy/virtual_keys"
+)
+
+def _raise_model_management_db_required_error() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"error": _MODEL_MANAGEMENT_DB_REQUIRED_ERROR},
+    )
+
 
 class UpdatePublicModelGroupsRequest(BaseModel):
     """Request model for updating public model groups"""
@@ -179,10 +193,7 @@ async def patch_model(
 
     try:
         if prisma_client is None:
-            raise HTTPException(
-                status_code=500,
-                detail={"error": CommonProxyErrors.db_not_connected_error.value},
-            )
+            _raise_model_management_db_required_error()
 
         # Verify model exists and is stored in DB
         if not store_model_in_db:
@@ -706,12 +717,7 @@ async def delete_model(
         )
 
         if prisma_client is None:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": "No DB Connected. Here's how to do it - https://docs.litellm.ai/docs/proxy/virtual_keys"
-                },
-            )
+            _raise_model_management_db_required_error()
 
         model_in_db = await prisma_client.db.litellm_proxymodeltable.find_unique(
             where={"model_id": model_info.id}
@@ -918,12 +924,7 @@ async def add_new_model(
 
     try:
         if prisma_client is None:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": "No DB Connected. Here's how to do it - https://docs.litellm.ai/docs/proxy/virtual_keys"
-                },
-            )
+            _raise_model_management_db_required_error()
 
         ## Auth check
         await ModelManagementAuthChecks.can_user_make_model_call(
@@ -1055,12 +1056,7 @@ async def update_model(
 
     try:
         if prisma_client is None:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": "No DB Connected. Here's how to do it - https://docs.litellm.ai/docs/proxy/virtual_keys"
-                },
-            )
+            _raise_model_management_db_required_error()
 
         _model_id = None
         _model_info = getattr(model_params, "model_info", None)
