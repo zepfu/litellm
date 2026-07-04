@@ -22,6 +22,25 @@ from litellm.types.llms.anthropic import (
 from litellm.types.llms.openai import AllMessageValues
 
 
+ANTHROPIC_MISSING_DIRECT_CREDENTIAL_MESSAGE = (
+    "Missing Anthropic API Key - A direct Anthropic route requires a "
+    "server-side credential: set deployment `api_key`, "
+    "`litellm.anthropic_key`, or the `ANTHROPIC_API_KEY` environment "
+    "variable, or supply a valid Anthropic OAuth token (sk-ant-oat*). "
+    "LiteLLM proxy `Authorization` headers are not Anthropic provider "
+    "credentials and are not forwarded as the Anthropic API key."
+)
+
+
+def raise_anthropic_missing_api_key_error(*, model: str) -> None:
+    """Raise the standard missing-credential error for direct Anthropic routes."""
+    raise litellm.AuthenticationError(
+        message=ANTHROPIC_MISSING_DIRECT_CREDENTIAL_MESSAGE,
+        llm_provider="anthropic",
+        model=model,
+    )
+
+
 def is_anthropic_oauth_key(value: Optional[str]) -> bool:
     """Check if a value contains an Anthropic OAuth token (sk-ant-oat*)."""
     if value is None:
@@ -497,11 +516,7 @@ class AnthropicModelInfo(BaseLLMModelInfo):
             headers=headers, api_key=api_key
         )
         if api_key is None:
-            raise litellm.AuthenticationError(
-                message="Missing Anthropic API Key - A call is being made to anthropic but no key is set either in the environment variables or via params. Please set `ANTHROPIC_API_KEY` in your environment vars",
-                llm_provider="anthropic",
-                model=model,
-            )
+            raise_anthropic_missing_api_key_error(model=model)
 
         tools = optional_params.get("tools")
         prompt_caching_set = self.is_cache_control_set(messages=messages)
