@@ -90,6 +90,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     websocket_passthrough_request,
     _classify_passthrough_hidden_retry_failure,
     _get_passthrough_hidden_retry_wait_seconds,
+    _is_known_grok_build_usage_balance_exhausted_response,
     _record_passthrough_hidden_retry_metadata,
 )
 from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
@@ -381,6 +382,13 @@ _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = (
 _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS = 30.0 * 60.0
 _CODEX_AUTO_AGENT_SPARK_MODEL = "gpt-5.3-codex-spark"
 _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = 300.0
+_CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = 300.0
+_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = (
+    "GROK_BUILD_USAGE_BALANCE_EXHAUSTED"
+)
+_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL = (
+    "https://cli-chat-proxy.grok.com/v1/responses"
+)
 _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 30.0
 _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset({500, 502, 503, 529})
 _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
@@ -4294,6 +4302,10 @@ def _add_codex_auto_agent_text_error_tokens(
     tokens: set[str],
     text_lower: str,
 ) -> None:
+    if "grok build usage balance exhausted" in text_lower:
+        tokens.add(
+            _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN
+        )
     if "usage_limit_reached" in text_lower:
         tokens.add("usage_limit_reached")
     if "resource_exhausted" in text_lower or "resource exhausted" in text_lower:
@@ -4566,11 +4578,51 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
     return cooldown_scope
 
 
+def _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc: Any) -> bool:
+    status_code = _extract_google_adapter_exception_status_code(exc)
+    return _is_known_grok_build_usage_balance_exhausted_response(
+        url=httpx.URL(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL),
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        status_code=status_code,
+        exc=exc,
+    )
+
+
+def _is_codex_auto_agent_grok_account_quota_candidate(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_XAI_PROVIDER:
+        return False
+    route_family = str(candidate.get("route_family") or "")
+    return route_family in {
+        "codex_grok_native_responses_adapter",
+        "codex_xai_oauth_responses_adapter",
+        "anthropic_grok_native_responses_adapter",
+        "anthropic_xai_oauth_responses_adapter",
+    }
+
+
+def _is_codex_auto_agent_grok_account_quota_exhaustion(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+) -> bool:
+    if not _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc):
+        return False
+    if candidate is None:
+        return True
+    return _is_codex_auto_agent_grok_account_quota_candidate(candidate)
+
+
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
 ) -> Optional[str]:
     status_code = _extract_google_adapter_exception_status_code(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
+    if _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc):
+        return "capacity_exhausted"
     if "aawm_codex_auto_agent_candidate_unavailable" in tokens:
         return "candidate_unavailable"
     if "usage_limit_reached" in tokens:
@@ -4667,6 +4719,15 @@ def _get_codex_auto_agent_cooldown_seconds(
         and _is_codex_auto_agent_durable_cooldown_error_class(error_class)
     ):
         return _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS
+    if (
+        _is_codex_auto_agent_grok_account_quota_candidate(candidate)
+        and (
+            _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN in tokens
+            or _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc)
+        )
+        and _is_codex_auto_agent_durable_cooldown_error_class(error_class)
+    ):
+        return _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS
     return resolved
 
 

@@ -432,6 +432,20 @@ response for callers, logs a warning with
 traceback logging for this known account-limit class. Unrelated Grok `403` bodies
 still use the normal failure logging path.
 
+Grok/xAI CLI passthrough `402` responses whose upstream body is exactly
+`{"error":"Grok Build usage balance exhausted"}` (or equivalent JSON with that
+error string) are treated the same way: upstream account/provider quota exhaustion
+for xAI passthrough targets only. LiteLLM preserves the upstream `402` for callers,
+logs a warning with `failure_kind=upstream_grok_account_quota_exhaustion` without a
+traceback, and does not emit active `.analysis/*-error.jsonl` intake for this known
+quota shape. Unrelated Grok `402` bodies still use the normal failure logging path.
+For `aawm-code` and `aawm-code-anthropic` alias routes, the same known Grok Build
+`402` body is also classified as retryable provider/account quota exhaustion: the
+exhausted Grok candidate gets a durable cooldown, non-in-flight requests fall through
+to the next alias candidate when one is available, and in-flight sessions return
+`redispatch_required` with attempt metadata including `error_status_code`,
+`failure_class`, and `error_tokens`.
+
 Unexpected `/signals` `401` bodies, unexpected `/replicas/update` `404` bodies,
 other Grok side-channel `401`/`404` failures, and any data-bearing side-channel
 error that does not match a known degraded shape still use the normal failure
