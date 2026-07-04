@@ -357,3 +357,38 @@ data, and then delete or archive the source `<environment>-error.jsonl` file onc
 the anomaly is resolved and recorded in completed notes. Scan failures are logged
 as `status=scan_failed` on the sidecar event and do not raise out of the sidecar
 loop.
+
+## Langfuse ClickHouse `default.observations` metadata (Map)
+
+Langfuse stores observation metadata in ClickHouse as a **Map**, not a JSON
+string column. On `aawm-clickhouse`, `default.observations.metadata` is
+`Map(LowCardinality(String), String)` (values are strings). Related columns
+used in provider audits include `provided_model_name` (`Nullable(String)`) and
+`start_time` (`DateTime64(3)`).
+
+**Do not** filter provider identity with `JSONExtractString(metadata, 'custom_llm_provider')`
+or similar JSON extractors on `metadata`; ClickHouse returns Code 43
+`ILLEGAL_TYPE_OF_ARGUMENT` because the first argument is not JSON text.
+
+**Use Map key access instead**, for example:
+
+```sql
+metadata['custom_llm_provider'] = 'anthropic'
+```
+
+Example Anthropic/Claude observation count (July 2026 window), verified after
+replacing the bad predicate:
+
+```sql
+SELECT count()
+FROM default.observations
+WHERE start_time >= toDateTime64('2026-07-01 00:00:00', 3)
+  AND (
+    provided_model_name ILIKE '%claude%'
+    OR provided_model_name ILIKE '%anthropic%'
+    OR metadata['custom_llm_provider'] = 'anthropic'
+  );
+```
+
+This repo's backfill scripts already use `metadata[...]` patterns; ad-hoc probes
+and sibling dashboards should follow the same shape.
