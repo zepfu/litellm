@@ -269,14 +269,44 @@ def _is_expected_provider_rate_limit_exception(exc: Exception) -> bool:
     return status_code == status.HTTP_429_TOO_MANY_REQUESTS
 
 
+_DIRECT_ANTHROPIC_MISSING_SERVER_CREDENTIAL_MARKER = (
+    "A direct Anthropic route requires a server-side credential"
+)
+
+
+def _iter_exceptions_in_chain(exc: BaseException) -> Any:
+    """Yield exceptions reachable via cause/context/original_exception links."""
+    stack: list[BaseException] = [exc]
+    seen: set[int] = set()
+    depth = 0
+    while stack and depth < DEFAULT_MAX_RECURSE_DEPTH:
+        current = stack.pop()
+        exc_id = id(current)
+        if exc_id in seen:
+            continue
+        seen.add(exc_id)
+        yield current
+        for attr in ("__cause__", "__context__", "original_exception"):
+            inner = getattr(current, attr, None)
+            if inner is not None and isinstance(inner, BaseException):
+                stack.append(inner)
+        depth += 1
+
+
+def _is_direct_anthropic_missing_server_credential_message(message: str) -> bool:
+    """Match only the operator-actionable direct Anthropic missing-key message."""
+    return _DIRECT_ANTHROPIC_MISSING_SERVER_CREDENTIAL_MARKER in message
+
+
 def _is_expected_provider_auth_configuration_exception(exc: Exception) -> bool:
     """Known operator-actionable provider auth/config failures should not emit tracebacks."""
-    if not isinstance(exc, litellm.AuthenticationError):
-        return False
-    if getattr(exc, "llm_provider", None) != "anthropic":
-        return False
-    message = getattr(exc, "message", str(exc))
-    return "A direct Anthropic route requires a server-side credential" in message
+    for chained_exc in _iter_exceptions_in_chain(exc):
+        if not isinstance(chained_exc, litellm.AuthenticationError):
+            continue
+        message = getattr(chained_exc, "message", str(chained_exc))
+        if _is_direct_anthropic_missing_server_credential_message(message):
+            return True
+    return False
 
 
 def _is_azure_model_router_request(model: str) -> bool:

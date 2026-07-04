@@ -31,6 +31,7 @@ from litellm.proxy.common_request_processing import (
     _get_cost_breakdown_from_logging_obj,
     _has_attribute_error_in_chain,
     _is_azure_model_router_request,
+    _is_expected_provider_auth_configuration_exception,
     _override_openai_response_model,
     _parse_event_data_for_error,
     create_response,
@@ -284,6 +285,144 @@ class TestProxyBaseLLMRequestProcessing:
         assert raised.value.code == "401"
         assert "server-side credential" in raised.value.message
         assert not error_log_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_handle_llm_api_exception_anthropic_missing_key_without_llm_provider_skips_error_intake_jsonl(
+        self, monkeypatch, tmp_path
+    ):
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_verbose_proxy_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+        error_log_path = tmp_path / "dev-error.jsonl"
+
+        processing_obj = ProxyBaseLLMRequestProcessing(
+            data={"model": "anthropic/claude-sonnet-4-6"}
+        )
+        mock_user_api_key_dict = self._build_user_api_key_auth_for_exception_tests()
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value=None
+        )
+
+        anthropic_missing_key_exc = litellm.AuthenticationError(
+            message=(
+                "Missing Anthropic API Key - A direct Anthropic route requires "
+                "a server-side credential: configure deployment `api_key`, "
+                "`litellm.anthropic_key`, or the `ANTHROPIC_API_KEY` "
+                "environment variable."
+            ),
+            llm_provider="",
+            model="anthropic/claude-sonnet-4-6",
+        )
+
+        try:
+            with pytest.raises(ProxyException) as raised:
+                await processing_obj._handle_llm_api_exception(
+                    e=anthropic_missing_key_exc,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers, saved_level, saved_propagate
+            )
+
+        assert raised.value.code == "401"
+        assert not error_log_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_handle_llm_api_exception_wrapped_anthropic_missing_key_skips_error_intake_jsonl(
+        self, monkeypatch, tmp_path
+    ):
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_verbose_proxy_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+        error_log_path = tmp_path / "dev-error.jsonl"
+
+        processing_obj = ProxyBaseLLMRequestProcessing(
+            data={"model": "anthropic/claude-sonnet-4-6"}
+        )
+        mock_user_api_key_dict = self._build_user_api_key_auth_for_exception_tests()
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value=None
+        )
+
+        anthropic_missing_key_exc = litellm.AuthenticationError(
+            message=(
+                "Missing Anthropic API Key - A direct Anthropic route requires "
+                "a server-side credential: configure deployment `api_key`, "
+                "`litellm.anthropic_key`, or the `ANTHROPIC_API_KEY` "
+                "environment variable."
+            ),
+            llm_provider=None,
+            model="anthropic/claude-sonnet-4-6",
+        )
+        wrapped_exc = RuntimeError("upstream wrapper")
+        wrapped_exc.__cause__ = anthropic_missing_key_exc
+
+        try:
+            with pytest.raises(ProxyException) as raised:
+                await processing_obj._handle_llm_api_exception(
+                    e=wrapped_exc,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers, saved_level, saved_propagate
+            )
+
+        assert raised.value.code == "500"
+        assert not error_log_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_handle_llm_api_exception_generic_authentication_error_writes_error_intake_jsonl(
+        self, monkeypatch, tmp_path
+    ):
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_verbose_proxy_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+        error_log_path = tmp_path / "dev-error.jsonl"
+
+        processing_obj = ProxyBaseLLMRequestProcessing(data={"model": "gpt-4"})
+        mock_user_api_key_dict = self._build_user_api_key_auth_for_exception_tests()
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value=None
+        )
+
+        generic_auth_exc = litellm.AuthenticationError(
+            message="Invalid API key provided",
+            llm_provider="openai",
+            model="gpt-4",
+        )
+
+        try:
+            with pytest.raises(ProxyException):
+                await processing_obj._handle_llm_api_exception(
+                    e=generic_auth_exc,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers, saved_level, saved_propagate
+            )
+
+        assert error_log_path.exists()
+        payloads = [
+            json.loads(line)
+            for line in error_log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(payloads) == 1
+        assert "Invalid API key provided" in payloads[0]["message"]
+        assert payloads[0]["traceback"]
+        assert "AuthenticationError" in payloads[0]["traceback"]
 
     @pytest.mark.asyncio
     async def test_handle_llm_api_exception_generic_error_writes_error_intake_jsonl(
@@ -2615,6 +2754,48 @@ class TestDDSpanTaggerTagRequest:
             )
 
         mock_set_tag.assert_called_once_with("litellm.requested_model", "claude-3-5-sonnet")
+
+
+class TestExpectedProviderAuthConfigurationException:
+    def test_matches_direct_anthropic_missing_key_without_llm_provider(self):
+        exc = litellm.AuthenticationError(
+            message=(
+                "Missing Anthropic API Key - A direct Anthropic route requires "
+                "a server-side credential: configure deployment `api_key`."
+            ),
+            llm_provider="",
+            model="anthropic/claude-sonnet-4-6",
+        )
+        assert _is_expected_provider_auth_configuration_exception(exc) is True
+
+    def test_matches_wrapped_anthropic_missing_key(self):
+        inner = litellm.AuthenticationError(
+            message=(
+                "Missing Anthropic API Key - A direct Anthropic route requires "
+                "a server-side credential: configure deployment `api_key`."
+            ),
+            llm_provider=None,
+            model="anthropic/claude-sonnet-4-6",
+        )
+        outer = RuntimeError("wrapper")
+        outer.__cause__ = inner
+        assert _is_expected_provider_auth_configuration_exception(outer) is True
+
+    def test_rejects_generic_authentication_error(self):
+        exc = litellm.AuthenticationError(
+            message="Invalid API key provided",
+            llm_provider="openai",
+            model="gpt-4",
+        )
+        assert _is_expected_provider_auth_configuration_exception(exc) is False
+
+    def test_rejects_non_anthropic_missing_credential_message(self):
+        exc = litellm.AuthenticationError(
+            message="Missing OpenAI API Key",
+            llm_provider="anthropic",
+            model="anthropic/claude-sonnet-4-6",
+        )
+        assert _is_expected_provider_auth_configuration_exception(exc) is False
 
 
 class TestHasAttributeErrorInChain:
