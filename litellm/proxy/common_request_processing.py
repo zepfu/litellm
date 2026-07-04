@@ -269,6 +269,16 @@ def _is_expected_provider_rate_limit_exception(exc: Exception) -> bool:
     return status_code == status.HTTP_429_TOO_MANY_REQUESTS
 
 
+def _is_expected_provider_auth_configuration_exception(exc: Exception) -> bool:
+    """Known operator-actionable provider auth/config failures should not emit tracebacks."""
+    if not isinstance(exc, litellm.AuthenticationError):
+        return False
+    if getattr(exc, "llm_provider", None) != "anthropic":
+        return False
+    message = getattr(exc, "message", str(exc))
+    return "A direct Anthropic route requires a server-side credential" in message
+
+
 def _is_azure_model_router_request(model: str) -> bool:
     """
     Check if the requested model is an Azure Model Router.
@@ -1300,7 +1310,9 @@ class ProxyBaseLLMRequestProcessing:
         version: Optional[str] = None,
     ):
         """Raises ProxyException (OpenAI API compatible) if an exception is raised"""
-        if _is_expected_provider_rate_limit_exception(e):
+        if _is_expected_provider_rate_limit_exception(
+            e
+        ) or _is_expected_provider_auth_configuration_exception(e):
             verbose_proxy_logger.warning(
                 "litellm.proxy.proxy_server._handle_llm_api_exception(): Exception occured - %s",
                 str(e),

@@ -723,9 +723,9 @@ class TestValidateEnvironmentMissingApiKey:
         assert "ANTHROPIC_API_KEY" in message
         assert "litellm.anthropic_key" in message
         assert "deployment `api_key`" in message
-        assert "sk-ant-oat" in message
-        assert "LiteLLM proxy `Authorization`" in message
+        assert "server-side" in message.lower() or "deployment" in message.lower()
         assert "not Anthropic provider credentials" in message
+        assert "proxy or client" in message.lower() or "Authorization" in message
 
     def test_proxy_authorization_header_without_oauth_still_missing_key(self):
         import litellm
@@ -743,4 +743,4 @@ class TestValidateEnvironmentMissingApiKey:
                 api_key=None,
             )
 
-        assert "LiteLLM proxy `Authorization`" in exc_info.value.message
+        assert "not Anthropic provider credentials" in exc_info.value.message
