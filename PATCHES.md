@@ -53,6 +53,42 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.114 — Anthropic credential diagnostics and quota/context metadata release head
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.114`. Direct
+Anthropic routes now surface a clean, actionable server-side credential error
+when no Anthropic provider key is configured, without promoting LiteLLM
+proxy/client `Authorization` or `x-api-key` headers into provider credentials
+and without writing expected missing-key noise to runtime error intake. The
+release also carries the recovered Anthropic observability work from the
+integration branch: Claude context-window evidence is persisted in
+`session_history.metadata`, Anthropic `context-1m` beta evidence is backfillable
+where retained, and the Fable/overage-included `7d_oi` rate-limit bucket is
+captured and materialized separately from the retired Sonnet-specific
+`7d_sonnet` bucket.
+
+**Why:** Prod `aawm-litellm` still ran `1.82.3+aawm.113`, whose Anthropic
+missing-key path produced the old generic credential message and traceback
+intake. Separately, completed D1-474/D1-477 observability work had remained in a
+dirty local tree; shipping it in this release keeps prod callback/source parity
+and prevents Claude context-window and Fable weekly-overage quota details from
+being lost.
+
+**Why not upstream:** These behaviors are specific to AAWM's fork-local direct
+Anthropic routing policy, runtime error-intake suppression, callback
+`session_history` metadata schema, and provider status/rate-limit reporting
+semantics.
+
+**Validation status:** Dev validation for D1-482 proved `litellm-dev` returns a
+401 with the actionable server-side Anthropic credential message and warning
+logs without traceback intake. Focused unit tests cover the Anthropic
+missing-key message, wrapped error classification, callback overlay parity,
+Claude context-window metadata classification/backfill, Anthropic `7d_oi`
+header extraction, SQL interval mapping, and backfill extraction. Production
+promotion must publish `v1.82.3-aawm.114`, rebuild the prod LiteLLM image from
+that exact base, and validate the missing-key response on `:4000` before
+closing D1-482.
+
 ### aawm.113 — Session-history attribution prod release head
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.113` on top of the
