@@ -8258,6 +8258,123 @@ def test_build_rate_limit_observations_extracts_anthropic_unified_headers() -> N
     assert by_scope["7d_sonnet"]["client_family"] == "claude"
 
 
+def test_build_rate_limit_observations_extracts_anthropic_7d_oi_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-fable-5"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-7d-oi-rate-headers"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-7d-oi-rate-headers",
+            "client_name": "claude-cli",
+            "anthropic_response_headers": {
+                "source": "anthropic_response_headers",
+                "anthropic-ratelimit-unified-7d_oi-reset": "1783036800",
+                "anthropic-ratelimit-unified-7d_oi-status": "allowed_warning",
+                "anthropic-ratelimit-unified-7d_oi-utilization": "0.67",
+                "anthropic-ratelimit-unified-representative-claim": "seven_day_overage_included",
+                "anthropic-ratelimit-unified-overage-status": "within_included",
+            },
+        }
+    )
+    end_time = datetime(2026, 7, 2, 15, 30, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    oi_rows = [o for o in observations if o.get("limit_scope") == "7d_oi"]
+    assert len(oi_rows) == 1
+    oi = oi_rows[0]
+    assert oi["limit_id"] == "anthropic_unified_7d_oi"
+    assert oi["used_percentage"] == 67.0
+    assert oi["quota_period"] == "seven_day"
+    assert oi["window_minutes"] == 10080
+    assert oi["raw_provider_fields"][
+        "anthropic-ratelimit-unified-representative-claim"
+    ] == "seven_day_overage_included"
+    assert (
+        oi["raw_provider_fields"]["anthropic-ratelimit-unified-overage-status"]
+        == "within_included"
+    )
+    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(oi)
+    assert "anthropic_unified_7d_oi:7d_oi" in payload
+    sonnet_rows = [o for o in observations if o.get("limit_scope") == "7d_sonnet"]
+    assert sonnet_rows == []
+
+
+def test_build_rate_limit_observations_extracts_anthropic_7d_oi_hidden_headers() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-fable-5"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-hidden-7d-oi"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-hidden-7d-oi",
+            "client_name": "claude-cli",
+        }
+    )
+    result = SimpleNamespace(
+        _hidden_params={
+            "additional_headers": {
+                "llm_provider-anthropic-ratelimit-unified-7d_oi-reset": "1783036800",
+                "llm_provider-anthropic-ratelimit-unified-7d_oi-status": "allowed",
+                "llm_provider-anthropic-ratelimit-unified-7d_oi-utilization": "0.12",
+                "llm_provider-anthropic-ratelimit-unified-representative-claim": (
+                    "seven_day_overage_included"
+                ),
+            }
+        }
+    )
+    end_time = datetime(2026, 7, 2, 16, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result=result,
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    assert observations[0]["limit_scope"] == "7d_oi"
+    assert observations[0]["limit_id"] == "anthropic_unified_7d_oi"
+    assert observations[0]["used_percentage"] == 12.0
+
+
+def test_build_rate_limit_observations_7d_oi_does_not_alias_to_7d_sonnet() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "anthropic/claude-fable-5"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_call_id"] = "call-anthropic-7d-oi-only"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-anthropic-7d-oi-only",
+            "client_name": "claude-cli",
+            "anthropic_response_headers": {
+                "source": "anthropic_response_headers",
+                "anthropic-ratelimit-unified-7d_oi-reset": "1783036800",
+                "anthropic-ratelimit-unified-7d_oi-status": "allowed",
+                "anthropic-ratelimit-unified-7d_oi-utilization": "0.05",
+            },
+        }
+    )
+    end_time = datetime(2026, 7, 2, 15, 0, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={"choices": []},
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    scopes = {o["limit_scope"] for o in observations}
+    assert scopes == {"7d_oi"}
+    assert "7d_sonnet" not in scopes
+
+
 def test_build_rate_limit_observations_skips_anthropic_stale_reset_headers() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "anthropic/claude-sonnet-4-6"
@@ -16223,3 +16340,77 @@ def test_rate_limit_meaningful_change_ignores_reset_hint_when_reset_time_exists(
         )
         is True
     )
+
+
+def test_extract_context_1m_beta_from_headers_and_llm_provider_metadata() -> None:
+    headers = {"anthropic-beta": "context-1m-2025-08-07, other-beta"}
+    metadata = {"llm_provider-anthropic-beta": "context-1m-2025-08-07"}
+    beta_values = aawm_agent_identity._extract_context_1m_beta_values(headers, metadata)
+    assert beta_values == ["context-1m-2025-08-07"]
+
+
+def test_classify_anthropic_context_window_from_model_suffix_1m() -> None:
+    metadata = {"custom_llm_provider": "anthropic"}
+    result = aawm_agent_identity._classify_anthropic_context_window_from_retained_evidence(
+        metadata,
+        resolved_model="claude-opus-4-7",
+        inbound_model_alias="claude-opus-4-7[1m]",
+        headers=None,
+        allow_implicit_default=False,
+    )
+    assert result is not None
+    assert result["mode"] == "extended_1m"
+    assert result["requested_tokens"] == 1_000_000
+    assert result["source"] == "model_suffix_1m"
+    assert result["classification"] == "classified"
+
+
+def test_build_session_history_record_persists_anthropic_context_window_metadata() -> None:
+    kwargs = _base_kwargs(trace_name="claude-code.ops")
+    kwargs["litellm_call_id"] = "call-context-window-header"
+    kwargs["model"] = "claude-sonnet-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-context-window",
+            "passthrough_route_family": "anthropic_messages",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"anthropic-beta": "context-1m-2025-08-07"}
+    }
+    result = {
+        "id": "msg-context-window",
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    meta = record["metadata"]
+    assert meta["anthropic_context_window_mode"] == "extended_1m"
+    assert meta["anthropic_context_window_requested_tokens"] == 1_000_000
+    assert meta["anthropic_context_window_source"] == "anthropic_beta_header"
+    assert meta["anthropic_context_window_beta"] == "context-1m-2025-08-07"
+    assert meta["anthropic_context_window_classification"] == "classified"
+
+
+def test_backfill_anthropic_context_window_unavailable_without_evidence() -> None:
+    record = {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "inbound_model_alias": "claude-sonnet-4-6",
+        "metadata": {"custom_llm_provider": "anthropic"},
+    }
+    aawm_agent_identity._enrich_backfill_anthropic_context_window_metadata(record)
+    meta = record["metadata"]
+    assert meta["anthropic_context_window_mode"] == "unknown"
+    assert meta["anthropic_context_window_requested_tokens"] is None
+    assert meta["anthropic_context_window_source"] == "unavailable"
+    assert meta["anthropic_context_window_classification"] == "unavailable"
+    assert "anthropic_context_window_beta" not in meta

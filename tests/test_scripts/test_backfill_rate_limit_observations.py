@@ -238,6 +238,85 @@ def test_should_extract_anthropic_quota_from_structured_metadata() -> None:
     assert observation["used_percentage"] == 42.0
 
 
+
+
+def test_should_extract_anthropic_7d_oi_from_structured_metadata() -> None:
+    row = {
+        "observation_id": "obs-anthropic-7d-oi",
+        "observation_trace_id": "trace-anthropic-7d-oi",
+        "observation_start_time": "2026-07-02T14:30:00Z",
+        "observation_end_time": "2026-07-02T14:30:01Z",
+        "observation_name": "litellm-pass_through_endpoint",
+        "observation_metadata": {
+            "client_name": "claude-cli",
+            "passthrough_route_family": "anthropic_messages",
+            "anthropic_response_headers": {
+                "source": "anthropic_response_headers",
+                "anthropic-ratelimit-unified-7d_oi-reset": "1783036800",
+                "anthropic-ratelimit-unified-7d_oi-status": "allowed_warning",
+                "anthropic-ratelimit-unified-7d_oi-utilization": "0.88",
+                "anthropic-ratelimit-unified-representative-claim": "seven_day_overage_included",
+                "anthropic-ratelimit-unified-overage-status": "approaching_limit",
+            },
+        },
+        "observation_input": None,
+        "observation_output": None,
+        "observation_model": "claude-fable-5",
+        "observation_environment": "dev",
+    }
+
+    record = quota_backfill.build_record_from_clickhouse_row(row)
+
+    assert record is not None
+    oi_rows = [
+        o
+        for o in record["rate_limit_observations"]
+        if o.get("limit_scope") == "7d_oi"
+    ]
+    assert len(oi_rows) == 1
+    observation = oi_rows[0]
+    assert observation["provider"] == "anthropic"
+    assert observation["limit_id"] == "anthropic_unified_7d_oi"
+    assert observation["quota_period"] == "seven_day"
+    assert observation["used_percentage"] == 88.0
+    assert observation["raw_provider_fields"][
+        "anthropic-ratelimit-unified-representative-claim"
+    ] == "seven_day_overage_included"
+
+
+def test_should_skip_anthropic_7d_oi_when_reset_header_stale() -> None:
+    row = {
+        "observation_id": "obs-anthropic-7d-oi-stale",
+        "observation_trace_id": "trace-anthropic-7d-oi-stale",
+        "observation_start_time": "2026-07-03T12:00:00Z",
+        "observation_end_time": "2026-07-03T12:00:01Z",
+        "observation_name": "litellm-pass_through_endpoint",
+        "observation_metadata": {
+            "client_name": "claude-cli",
+            "anthropic_response_headers": {
+                "source": "anthropic_response_headers",
+                "anthropic-ratelimit-unified-7d_oi-reset": "2026-05-14T02:40:00Z",
+                "anthropic-ratelimit-unified-7d_oi-status": "allowed",
+                "anthropic-ratelimit-unified-7d_oi-utilization": "0.42",
+            },
+        },
+        "observation_input": None,
+        "observation_output": None,
+        "observation_model": "claude-fable-5",
+        "observation_environment": "dev",
+    }
+
+    record = quota_backfill.build_record_from_clickhouse_row(row)
+
+    if record is None:
+        assert True
+    else:
+        assert not any(
+            o.get("limit_scope") == "7d_oi"
+            for o in record.get("rate_limit_observations", [])
+        )
+
+
 def test_should_extract_xai_oauth_quota_from_structured_metadata() -> None:
     row = {
         "observation_id": "obs-xai-oauth",

@@ -60,3 +60,35 @@ def test_xai_grok_weekly_credits_allows_hundred_pct_remaining_legacy_script() ->
 
     assert XAI_WEEKLY_100_PCT_EXCEPTION in sql
     assert "remaining_pct < 100" in sql
+
+
+def test_anthropic_7d_oi_quota_key_allowed_in_antigravity_script() -> None:
+    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
+    assert "'anthropic_unified_7d_oi:7d_oi'" in sql
+
+
+def test_anthropic_7d_oi_quota_key_mapped_weekly_overage_included_antigravity() -> None:
+    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
+    assert (
+        "WHEN quota_key = ANY (ARRAY['anthropic_unified_7d_oi:7d_oi']) THEN 'weekly_overage_included'"
+        in sql
+    )
+
+
+def test_anthropic_7d_oi_quota_key_allowed_in_legacy_script() -> None:
+    sql = LEGACY_SCRIPT.read_text(encoding="utf-8")
+    assert "'anthropic_unified_7d_oi:7d_oi'" in sql
+
+
+def test_anthropic_7d_oi_quota_key_mapped_weekly_overage_included_legacy() -> None:
+    sql = LEGACY_SCRIPT.read_text(encoding="utf-8")
+    assert (
+        "WHEN quota_key = ANY (ARRAY['anthropic_unified_7d_oi:7d_oi']) THEN 'weekly_overage_included'"
+        in sql
+    )
+
+
+def test_anthropic_7d_sonnet_weekly_special_mapping_preserved() -> None:
+    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
+    assert "'anthropic_unified_7d_sonnet:7d_sonnet'" in sql
+    assert "THEN 'weekly_special'" in sql

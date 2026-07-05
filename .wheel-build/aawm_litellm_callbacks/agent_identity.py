@@ -2295,6 +2295,19 @@ ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO UPDATE SET
     redispatch_threshold_crossed = aawm_alias_routing_audit.redispatch_threshold_crossed OR EXCLUDED.redispatch_threshold_crossed,
     metadata = COALESCE(aawm_alias_routing_audit.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
+_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX = "[1m]"
+_ANTHROPIC_CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07"
+_ANTHROPIC_CONTEXT_1M_BETA_PREFIX = "context-1m"
+_ANTHROPIC_CONTEXT_WINDOW_DEFAULT_TOKEN_COUNT = 200_000
+_ANTHROPIC_CONTEXT_WINDOW_1M_TOKEN_COUNT = 1_000_000
+_ANTHROPIC_CONTEXT_WINDOW_METADATA_KEYS = (
+    "anthropic_context_window_mode",
+    "anthropic_context_window_requested_tokens",
+    "anthropic_context_window_source",
+    "anthropic_context_window_beta",
+    "anthropic_context_window_classification",
+)
+
 _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "agent_id",
     "agent_id_source",
@@ -2518,6 +2531,11 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "codex_google_code_assist_tool_contract_policy",
     "codex_google_code_assist_tool_contract_policy_version",
     "codex_google_code_assist_tool_contract_policy_applied",
+    "anthropic_context_window_mode",
+    "anthropic_context_window_requested_tokens",
+    "anthropic_context_window_source",
+    "anthropic_context_window_beta",
+    "anthropic_context_window_classification",
     "codex_google_code_assist_tool_contract_prompt_chars",
     "usage_search_units",
     "usage_openrouter_cost",
@@ -8512,6 +8530,7 @@ def _extract_anthropic_header_rate_limit_observations(
         for limit_scope, display_name, window_minutes in (
             ("5h", "Anthropic unified 5h", 300),
             ("7d", "Anthropic unified 7d", 10080),
+            ("7d_oi", "Anthropic unified 7d overage included", 10080),
             ("7d_sonnet", "Anthropic unified 7d Sonnet", 10080),
         ):
             reset_key = f"anthropic-ratelimit-unified-{limit_scope}-reset"
@@ -8959,10 +8978,40 @@ def _extract_xai_oauth_header_rate_limit_observations(
     return _dedupe_rate_limit_observations(observations)
 
 
+USAGE_PERIOD_TYPE_WEEKLY = "USAGE_PERIOD_TYPE_WEEKLY"
+GROK_BILLING_WEEKLY_CREDITS_QUOTA_KEY = "xai_grok_build_weekly_credits:credits"
+GROK_BILLING_MONTHLY_REQUESTS_QUOTA_KEY = "xai_grok_build_monthly_requests:requests"
+GROK_BILLING_MONTHLY_CREDITS_QUOTA_KEY = "xai_grok_build_monthly_credits:credits"
+
+
 def _grok_billing_quota_value(value: Any) -> Optional[float]:
     if isinstance(value, dict):
         value = value.get("val")
     return _safe_float(value)
+
+
+def _grok_billing_current_period(config: Dict[str, Any]) -> Dict[str, Any]:
+    current_period = config.get("currentPeriod")
+    return current_period if isinstance(current_period, dict) else {}
+
+
+def _grok_billing_is_weekly_period(config: Dict[str, Any]) -> bool:
+    current_period = _grok_billing_current_period(config)
+    period_type = str(current_period.get("type") or "").strip()
+    return period_type == USAGE_PERIOD_TYPE_WEEKLY
+
+
+def _grok_billing_period_bounds(
+    config: Dict[str, Any],
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    current_period = _grok_billing_current_period(config)
+    billing_period_start_at = _parse_provider_timestamp(
+        config.get("billingPeriodStart") or current_period.get("start")
+    )
+    billing_period_end_at = _parse_provider_timestamp(
+        config.get("billingPeriodEnd") or current_period.get("end")
+    )
+    return billing_period_start_at, billing_period_end_at
 
 
 def _is_grok_billing_context(
@@ -9007,7 +9056,16 @@ def _extract_grok_billing_config(candidate: Dict[str, Any]) -> Optional[Dict[str
         dict,
     )
     has_percentage_quota = _safe_float(config.get("creditUsagePercent")) is not None
-    if not has_absolute_quota and not has_percentage_quota:
+    has_weekly_period = _grok_billing_is_weekly_period(config)
+    billing_period_start_at, billing_period_end_at = _grok_billing_period_bounds(config)
+    has_period_bounds = (
+        billing_period_start_at is not None or billing_period_end_at is not None
+    )
+    if (
+        not has_absolute_quota
+        and not has_percentage_quota
+        and not (has_weekly_period and has_period_bounds)
+    ):
         return None
     return config
 
@@ -9067,6 +9125,213 @@ def _grok_billing_request_contract_evidence(
     return evidence
 
 
+def _grok_billing_snapshot_parts(
+    config: Dict[str, Any],
+    *,
+    base_evidence: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(config, dict):
+        return None
+
+    billing_period_start_at, billing_period_end_at = _grok_billing_period_bounds(config)
+    is_weekly = _grok_billing_is_weekly_period(config)
+    monthly_limit = _grok_billing_quota_value(config.get("monthlyLimit"))
+    used = _grok_billing_quota_value(config.get("used"))
+    credit_usage_percent = _safe_float(config.get("creditUsagePercent"))
+
+    evidence: Dict[str, Any] = dict(base_evidence or {})
+    signals = list(evidence.get("signals") or [])
+    if "grok_billing_payload" not in signals:
+        signals.append("grok_billing_payload")
+    evidence["signals"] = signals
+
+    if monthly_limit is not None and monthly_limit > 0 and used is not None and used >= 0:
+        used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
+        remaining_pct = float(
+            int(math.floor(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5))
+        )
+        quota_remaining = max(0.0, monthly_limit - used)
+        if "grok_billing_monthly_counter" not in signals:
+            signals.append("grok_billing_monthly_counter")
+        return {
+            "quota_key": GROK_BILLING_MONTHLY_REQUESTS_QUOTA_KEY,
+            "quota_period": "monthly",
+            "quota_type": "requests",
+            "limit_id": "xai_grok_build_monthly_requests",
+            "limit_name": "Grok Build monthly requests",
+            "limit_scope": "requests",
+            "remaining_pct": remaining_pct,
+            "used_percentage": float(100.0 - remaining_pct),
+            "quota_limit": monthly_limit,
+            "quota_used": used,
+            "quota_remaining": quota_remaining,
+            "billing_period_start_at": billing_period_start_at,
+            "billing_period_end_at": billing_period_end_at,
+            "raw_provider_fields": {
+                "monthlyLimit": _json_safe_rate_limit_value(config.get("monthlyLimit")),
+                "used": _json_safe_rate_limit_value(config.get("used")),
+                "onDemandCap": _json_safe_rate_limit_value(config.get("onDemandCap")),
+                "billingPeriodStart": config.get("billingPeriodStart"),
+                "billingPeriodEnd": config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_used",
+                "quota_unit_interpretation": "requests",
+            },
+            "evidence": {
+                **evidence,
+                "provider_fields": [
+                    "config.monthlyLimit.val",
+                    "config.used.val",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "whole_remaining_percentage",
+                "unit_note": (
+                    "Grok billing does not label used.val; observed tool "
+                    "traffic behaves request-like."
+                ),
+            },
+        }
+
+    if is_weekly and credit_usage_percent is not None:
+        used_percentage = max(0.0, min(100.0, credit_usage_percent))
+        remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
+        for signal in (
+            "grok_billing_weekly_credit",
+            "grok_billing_percentage_only",
+        ):
+            if signal not in signals:
+                signals.append(signal)
+        return {
+            "quota_key": GROK_BILLING_WEEKLY_CREDITS_QUOTA_KEY,
+            "quota_period": "weekly",
+            "quota_type": "credits",
+            "limit_id": "xai_grok_build_weekly_credits",
+            "limit_name": "Grok Build weekly credits",
+            "limit_scope": "credits",
+            "remaining_pct": remaining_pct,
+            "used_percentage": used_percentage,
+            "quota_limit": None,
+            "quota_used": None,
+            "quota_remaining": None,
+            "billing_period_start_at": billing_period_start_at,
+            "billing_period_end_at": billing_period_end_at,
+            "raw_provider_fields": {
+                "creditUsagePercent": _json_safe_rate_limit_value(
+                    config.get("creditUsagePercent")
+                ),
+                "productUsage": _json_safe_rate_limit_value(config.get("productUsage")),
+                "currentPeriod": _json_safe_rate_limit_value(config.get("currentPeriod")),
+                "billingPeriodStart": config.get("billingPeriodStart"),
+                "billingPeriodEnd": config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_credit_usage_percent",
+                "quota_unit_interpretation": "percent_of_credit_quota",
+            },
+            "evidence": {
+                **evidence,
+                "provider_fields": [
+                    "config.creditUsagePercent",
+                    "config.productUsage",
+                    "config.currentPeriod.type",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "none",
+                "unit_note": (
+                    "Grok billing provided percentage-only weekly credit usage; "
+                    "absolute quota counts are intentionally left null."
+                ),
+            },
+        }
+
+    if is_weekly and (
+        billing_period_start_at is not None or billing_period_end_at is not None
+    ):
+        if "grok_billing_weekly_fresh_period" not in signals:
+            signals.append("grok_billing_weekly_fresh_period")
+        return {
+            "quota_key": GROK_BILLING_WEEKLY_CREDITS_QUOTA_KEY,
+            "quota_period": "weekly",
+            "quota_type": "credits",
+            "limit_id": "xai_grok_build_weekly_credits",
+            "limit_name": "Grok Build weekly credits",
+            "limit_scope": "credits",
+            "remaining_pct": 100.0,
+            "used_percentage": 0.0,
+            "quota_limit": None,
+            "quota_used": None,
+            "quota_remaining": None,
+            "billing_period_start_at": billing_period_start_at,
+            "billing_period_end_at": billing_period_end_at,
+            "raw_provider_fields": {
+                "currentPeriod": _json_safe_rate_limit_value(config.get("currentPeriod")),
+                "billingPeriodStart": config.get("billingPeriodStart"),
+                "billingPeriodEnd": config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_weekly_credit_fresh_period",
+                "quota_unit_interpretation": "percent_of_credit_quota",
+            },
+            "evidence": {
+                **evidence,
+                "provider_fields": [
+                    "config.currentPeriod.type",
+                    "config.currentPeriod.start",
+                    "config.currentPeriod.end",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "none",
+                "unit_note": (
+                    "Fresh weekly Grok Build credit periods omit creditUsagePercent; "
+                    "remaining percent is inferred as 100% used / 0% consumed."
+                ),
+            },
+        }
+
+    if credit_usage_percent is not None:
+        used_percentage = max(0.0, min(100.0, credit_usage_percent))
+        remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
+        if "grok_billing_percentage_only" not in signals:
+            signals.append("grok_billing_percentage_only")
+        if "grok_billing_legacy_monthly_credit" not in signals:
+            signals.append("grok_billing_legacy_monthly_credit")
+        return {
+            "quota_key": GROK_BILLING_MONTHLY_CREDITS_QUOTA_KEY,
+            "quota_period": "monthly",
+            "quota_type": "credits",
+            "limit_id": "xai_grok_build_monthly_credits",
+            "limit_name": "Grok Build monthly credits",
+            "limit_scope": "credits",
+            "remaining_pct": remaining_pct,
+            "used_percentage": used_percentage,
+            "quota_limit": None,
+            "quota_used": None,
+            "quota_remaining": None,
+            "billing_period_start_at": billing_period_start_at,
+            "billing_period_end_at": billing_period_end_at,
+            "raw_provider_fields": {
+                "creditUsagePercent": _json_safe_rate_limit_value(
+                    config.get("creditUsagePercent")
+                ),
+                "productUsage": _json_safe_rate_limit_value(config.get("productUsage")),
+                "billingPeriodStart": config.get("billingPeriodStart"),
+                "billingPeriodEnd": config.get("billingPeriodEnd"),
+                "quota_unit": "grok_billing_credit_usage_percent",
+                "quota_unit_interpretation": "percent_of_credit_quota",
+            },
+            "evidence": {
+                **evidence,
+                "provider_fields": [
+                    "config.creditUsagePercent",
+                    "config.productUsage",
+                    "config.billingPeriodEnd",
+                ],
+                "rounding": "none",
+                "unit_note": (
+                    "Grok billing provided percentage-only credit usage; "
+                    "absolute quota counts are intentionally left null."
+                ),
+            },
+        }
+
+    return None
+
+
 def _extract_grok_billing_observations(
     kwargs: Dict[str, Any],
     result: Any,
@@ -9089,77 +9354,15 @@ def _extract_grok_billing_observations(
         if config is None:
             continue
 
-        monthly_limit = _grok_billing_quota_value(config.get("monthlyLimit"))
-        used = _grok_billing_quota_value(config.get("used"))
-        billing_period_start_at = _parse_provider_timestamp(config.get("billingPeriodStart"))
-        provider_resets_at = _parse_provider_timestamp(config.get("billingPeriodEnd"))
-        model = _grok_billing_model(context, metadata)
-        if monthly_limit is not None and monthly_limit > 0 and used is not None and used >= 0:
-            used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
-            remaining_pct = int(
-                math.floor(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)
-            )
-            quota_remaining = max(0.0, monthly_limit - used)
-            observations.append(
-                _finalize_rate_limit_observation(
-                    {
-                        "observed_at": context["observed_at"],
-                        "source": "grok_billing",
-                        "provider": "xai",
-                        "client_family": "grok-build",
-                        "limit_id": "xai_grok_build_monthly_requests",
-                        "limit_name": "Grok Build monthly requests",
-                        "limit_scope": "requests",
-                        "quota_period": "monthly",
-                        "quota_type": "requests",
-                        "provider_resets_at": provider_resets_at,
-                        "remaining_pct": float(remaining_pct),
-                        "quota_limit": monthly_limit,
-                        "quota_used": used,
-                        "quota_remaining": quota_remaining,
-                        "billing_period_start_at": billing_period_start_at,
-                        "billing_period_end_at": provider_resets_at,
-                        "used_percentage": float(100 - remaining_pct),
-                        "model": model,
-                        "model_family": "grok",
-                        "raw_provider_fields": {
-                            "monthlyLimit": _json_safe_rate_limit_value(
-                                config.get("monthlyLimit")
-                            ),
-                            "used": _json_safe_rate_limit_value(config.get("used")),
-                            "onDemandCap": _json_safe_rate_limit_value(
-                                config.get("onDemandCap")
-                            ),
-                            "billingPeriodStart": config.get("billingPeriodStart"),
-                            "billingPeriodEnd": config.get("billingPeriodEnd"),
-                            "quota_unit": "grok_billing_used",
-                            "quota_unit_interpretation": "requests",
-                        },
-                        "evidence": {
-                            "signals": ["grok_billing_payload"],
-                            "provider_fields": [
-                                "config.monthlyLimit.val",
-                                "config.used.val",
-                                "config.billingPeriodEnd",
-                            ],
-                            "rounding": "whole_remaining_percentage",
-                            "unit_note": (
-                                "Grok billing does not label used.val; observed tool "
-                                "traffic behaves request-like."
-                            ),
-                            **request_contract_evidence,
-                        },
-                    },
-                    context,
-                )
-            )
+        snapshot = _grok_billing_snapshot_parts(
+            config,
+            base_evidence=request_contract_evidence,
+        )
+        if snapshot is None:
             continue
 
-        credit_usage_percent = _safe_float(config.get("creditUsagePercent"))
-        if credit_usage_percent is None:
-            continue
-        used_percentage = max(0.0, min(100.0, credit_usage_percent))
-        remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
+        model = _grok_billing_model(context, metadata)
+        provider_resets_at = snapshot.get("billing_period_end_at")
         observations.append(
             _finalize_rate_limit_observation(
                 {
@@ -9167,50 +9370,23 @@ def _extract_grok_billing_observations(
                     "source": "grok_billing",
                     "provider": "xai",
                     "client_family": "grok-build",
-                    "limit_id": "xai_grok_build_monthly_credits",
-                    "limit_name": "Grok Build monthly credits",
-                    "limit_scope": "credits",
-                    "quota_period": "monthly",
-                    "quota_type": "credits",
+                    "limit_id": snapshot["limit_id"],
+                    "limit_name": snapshot["limit_name"],
+                    "limit_scope": snapshot["limit_scope"],
+                    "quota_period": snapshot["quota_period"],
+                    "quota_type": snapshot["quota_type"],
                     "provider_resets_at": provider_resets_at,
-                    "remaining_pct": remaining_pct,
-                    "quota_limit": None,
-                    "quota_used": None,
-                    "quota_remaining": None,
-                    "billing_period_start_at": billing_period_start_at,
-                    "billing_period_end_at": provider_resets_at,
-                    "used_percentage": used_percentage,
+                    "remaining_pct": snapshot["remaining_pct"],
+                    "quota_limit": snapshot["quota_limit"],
+                    "quota_used": snapshot["quota_used"],
+                    "quota_remaining": snapshot["quota_remaining"],
+                    "billing_period_start_at": snapshot["billing_period_start_at"],
+                    "billing_period_end_at": snapshot["billing_period_end_at"],
+                    "used_percentage": snapshot["used_percentage"],
                     "model": model,
                     "model_family": "grok",
-                    "raw_provider_fields": {
-                        "creditUsagePercent": _json_safe_rate_limit_value(
-                            config.get("creditUsagePercent")
-                        ),
-                        "productUsage": _json_safe_rate_limit_value(
-                            config.get("productUsage")
-                        ),
-                        "billingPeriodStart": config.get("billingPeriodStart"),
-                        "billingPeriodEnd": config.get("billingPeriodEnd"),
-                        "quota_unit": "grok_billing_credit_usage_percent",
-                        "quota_unit_interpretation": "percent_of_credit_quota",
-                    },
-                    "evidence": {
-                        "signals": [
-                            "grok_billing_payload",
-                            "grok_billing_percentage_only",
-                        ],
-                        "provider_fields": [
-                            "config.creditUsagePercent",
-                            "config.productUsage",
-                            "config.billingPeriodEnd",
-                        ],
-                        "rounding": "none",
-                        "unit_note": (
-                            "Grok billing provided percentage-only credit usage; "
-                            "absolute quota counts are intentionally left null."
-                        ),
-                        **request_contract_evidence,
-                    },
+                    "raw_provider_fields": snapshot["raw_provider_fields"],
+                    "evidence": snapshot["evidence"],
                 },
                 context,
             )
@@ -16950,6 +17126,7 @@ def _build_session_history_record_from_spend_log_row(
                 metadata["agent_id"] = agent_id
                 metadata["agent_id_source"] = "spend_log.agent_id"
     record["metadata"] = metadata
+    _enrich_backfill_anthropic_context_window_metadata(record)
     record["trace_id"] = kwargs.get("litellm_trace_id") or record.get("trace_id")
     return _normalize_session_history_record(record)
 
@@ -17391,6 +17568,14 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
         output_model=output_model,
         resolved_model=resolved_model,
     )
+    _enrich_anthropic_context_window_metadata(
+        dict(),
+        metadata,
+        resolved_model=resolved_model,
+        inbound_model_alias=inbound_model_alias,
+        provider=provider,
+        allow_implicit_default=False,
+    )
     permission_decision = _extract_claude_permission_check_decision_from_value(
         output_payload
     )
@@ -17805,6 +17990,294 @@ def _sanitize_worker_context_exhaustion_metadata(metadata: Dict[str, Any]) -> No
         metadata["worker_context_exhaustion_success"] = False
         metadata["worker_context_exhaustion_completed"] = False
 
+
+
+
+def _is_anthropic_session_history_context(
+    *,
+    provider: Optional[str],
+    resolved_model: str,
+    metadata: Dict[str, Any],
+) -> bool:
+    provider_lower = str(provider or "").strip().lower()
+    if provider_lower in {"anthropic", "azure_ai", "bedrock"}:
+        return True
+    route_family = str(
+        metadata.get("passthrough_route_family")
+        or metadata.get("route_family")
+        or metadata.get("openai_passthrough_route_family")
+        or ""
+    ).strip().lower()
+    if "anthropic" in route_family:
+        return True
+    model_lower = str(resolved_model or "").strip().lower()
+    if model_lower.startswith("claude") or "claude" in model_lower:
+        return True
+    for key in (
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_auto_agent_selected_model",
+    ):
+        candidate = str(metadata.get(key) or "").strip().lower()
+        if candidate.startswith("claude") or "anthropic" in candidate:
+            return True
+    return False
+
+
+def _iter_anthropic_beta_header_candidates(
+    headers: Optional[Dict[str, Any]],
+    metadata: Dict[str, Any],
+) -> List[str]:
+    candidates: List[str] = []
+    header_names = (
+        "anthropic-beta",
+        "x-pass-anthropic-beta",
+        "llm_provider-anthropic-beta",
+    )
+    if headers:
+        for header_name in header_names:
+            value = _get_header_value(headers, header_name)
+            if value:
+                candidates.append(value)
+        for key, value in headers.items():
+            key_lower = str(key).lower()
+            if key_lower in {"anthropic-beta", "x-pass-anthropic-beta"}:
+                cleaned = _clean_non_empty_string(value)
+                if cleaned:
+                    candidates.append(cleaned)
+            elif key_lower.startswith("llm_provider-") and "anthropic-beta" in key_lower:
+                cleaned = _clean_non_empty_string(value)
+                if cleaned:
+                    candidates.append(cleaned)
+
+    for meta_key in (
+        "anthropic-beta",
+        "anthropic_beta",
+        "llm_provider-anthropic-beta",
+        "x-pass-anthropic-beta",
+    ):
+        cleaned = _clean_non_empty_string(metadata.get(meta_key))
+        if cleaned:
+            candidates.append(cleaned)
+
+    for nested_key in ("hidden_params", "_hidden_params", "additional_headers"):
+        nested = metadata.get(nested_key)
+        if not isinstance(nested, dict):
+            continue
+        for key, value in nested.items():
+            key_lower = str(key).lower()
+            if key_lower in {"anthropic-beta", "x-pass-anthropic-beta"}:
+                cleaned = _clean_non_empty_string(value)
+                if cleaned:
+                    candidates.append(cleaned)
+            elif key_lower.startswith("llm_provider-") and "anthropic-beta" in key_lower:
+                cleaned = _clean_non_empty_string(value)
+                if cleaned:
+                    candidates.append(cleaned)
+    return candidates
+
+
+def _split_anthropic_beta_values(raw_value: str) -> List[str]:
+    return [
+        token.strip()
+        for token in str(raw_value).replace(";", ",").split(",")
+        if token.strip()
+    ]
+
+
+def _extract_context_1m_beta_values(
+    headers: Optional[Dict[str, Any]],
+    metadata: Dict[str, Any],
+) -> List[str]:
+    matched: List[str] = []
+    seen: Set[str] = set()
+    for raw in _iter_anthropic_beta_header_candidates(headers, metadata):
+        for beta_value in _split_anthropic_beta_values(raw):
+            beta_lower = beta_value.lower()
+            if (
+                beta_lower == _ANTHROPIC_CONTEXT_1M_BETA_HEADER.lower()
+                or beta_lower.startswith(_ANTHROPIC_CONTEXT_1M_BETA_PREFIX)
+            ):
+                if beta_value not in seen:
+                    seen.add(beta_value)
+                    matched.append(beta_value)
+    return matched
+
+
+def _model_strings_indicate_context_1m_suffix(*model_values: Any) -> bool:
+    suffix_lower = _ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX.lower()
+    for value in model_values:
+        cleaned = _clean_non_empty_string(value)
+        if cleaned and cleaned.lower().endswith(suffix_lower):
+            return True
+    return False
+
+
+def _select_safe_anthropic_context_window_beta(beta_values: List[str]) -> Optional[str]:
+    if not beta_values:
+        return None
+    for beta_value in beta_values:
+        if beta_value.lower() == _ANTHROPIC_CONTEXT_1M_BETA_HEADER.lower():
+            return beta_value
+    for beta_value in beta_values:
+        if beta_value.lower().startswith(_ANTHROPIC_CONTEXT_1M_BETA_PREFIX):
+            return beta_value
+    return beta_values[0]
+
+
+def _apply_anthropic_context_window_metadata_fields(
+    metadata: Dict[str, Any],
+    *,
+    mode: str,
+    requested_tokens: Optional[int],
+    source: str,
+    beta: Optional[str] = None,
+    classification: Optional[str] = None,
+) -> None:
+    metadata["anthropic_context_window_mode"] = mode
+    metadata["anthropic_context_window_requested_tokens"] = requested_tokens
+    metadata["anthropic_context_window_source"] = source
+    if beta is not None:
+        metadata["anthropic_context_window_beta"] = beta
+    else:
+        metadata.pop("anthropic_context_window_beta", None)
+    if classification is not None:
+        metadata["anthropic_context_window_classification"] = classification
+    else:
+        metadata.pop("anthropic_context_window_classification", None)
+
+
+def _classify_anthropic_context_window_from_retained_evidence(
+    metadata: Dict[str, Any],
+    *,
+    resolved_model: str,
+    inbound_model_alias: Optional[str] = None,
+    headers: Optional[Dict[str, Any]] = None,
+    allow_implicit_default: bool = False,
+) -> Optional[Dict[str, Any]]:
+    beta_values = _extract_context_1m_beta_values(headers, metadata)
+    if beta_values:
+        return {
+            "mode": "extended_1m",
+            "requested_tokens": _ANTHROPIC_CONTEXT_WINDOW_1M_TOKEN_COUNT,
+            "source": "anthropic_beta_header",
+            "beta": _select_safe_anthropic_context_window_beta(beta_values),
+            "classification": "classified",
+        }
+
+    if _model_strings_indicate_context_1m_suffix(
+        inbound_model_alias,
+        metadata.get("inbound_model_alias"),
+        metadata.get("requested_model_alias"),
+        metadata.get("model_alias_label"),
+        metadata.get("anthropic_native_passthrough_model_alias"),
+        metadata.get("source_model"),
+        metadata.get("model"),
+        resolved_model,
+    ):
+        return {
+            "mode": "extended_1m",
+            "requested_tokens": _ANTHROPIC_CONTEXT_WINDOW_1M_TOKEN_COUNT,
+            "source": "model_suffix_1m",
+            "beta": None,
+            "classification": "classified",
+        }
+
+    if not _is_anthropic_session_history_context(
+        provider=str(metadata.get("custom_llm_provider") or metadata.get("provider") or ""),
+        resolved_model=resolved_model,
+        metadata=metadata,
+    ):
+        return None
+
+    if allow_implicit_default:
+        return {
+            "mode": "default_200k",
+            "requested_tokens": _ANTHROPIC_CONTEXT_WINDOW_DEFAULT_TOKEN_COUNT,
+            "source": "no_extended_context_evidence",
+            "beta": None,
+            "classification": "classified",
+        }
+
+    return {
+        "mode": "unknown",
+        "requested_tokens": None,
+        "source": "unavailable",
+        "beta": None,
+        "classification": "unavailable",
+    }
+
+
+def _enrich_anthropic_context_window_metadata(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+    *,
+    resolved_model: Optional[str] = None,
+    inbound_model_alias: Optional[str] = None,
+    provider: Optional[str] = None,
+    allow_implicit_default: bool = True,
+) -> None:
+    model_value = _clean_non_empty_string(
+        resolved_model
+        or metadata.get("model")
+        or kwargs.get("model")
+    ) or "unknown"
+    provider_value = _clean_non_empty_string(
+        provider or kwargs.get("custom_llm_provider") or metadata.get("custom_llm_provider")
+    )
+    if provider_value:
+        metadata.setdefault("custom_llm_provider", provider_value)
+
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    classification = _classify_anthropic_context_window_from_retained_evidence(
+        metadata,
+        resolved_model=model_value,
+        inbound_model_alias=inbound_model_alias,
+        headers=headers,
+        allow_implicit_default=allow_implicit_default,
+    )
+    if classification is None:
+        for key in _ANTHROPIC_CONTEXT_WINDOW_METADATA_KEYS:
+            metadata.pop(key, None)
+        return
+
+    _apply_anthropic_context_window_metadata_fields(
+        metadata,
+        mode=classification["mode"],
+        requested_tokens=classification["requested_tokens"],
+        source=classification["source"],
+        beta=classification.get("beta"),
+        classification=classification.get("classification"),
+    )
+
+
+def _enrich_backfill_anthropic_context_window_metadata(
+    record: Dict[str, Any],
+) -> None:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        return
+    provider = _clean_non_empty_string(record.get("provider"))
+    if provider:
+        metadata.setdefault("custom_llm_provider", provider)
+    classification = _classify_anthropic_context_window_from_retained_evidence(
+        metadata,
+        resolved_model=str(record.get("model") or metadata.get("model") or "unknown"),
+        inbound_model_alias=record.get("inbound_model_alias"),
+        headers=None,
+        allow_implicit_default=False,
+    )
+    if classification is None:
+        return
+    _apply_anthropic_context_window_metadata_fields(
+        metadata,
+        mode=classification["mode"],
+        requested_tokens=classification["requested_tokens"],
+        source=classification["source"],
+        beta=classification.get("beta"),
+        classification=classification.get("classification"),
+    )
+    record["metadata"] = metadata
 
 def _promote_worker_context_exhaustion_metadata(
     kwargs: Dict[str, Any],
@@ -18488,6 +18961,14 @@ def _build_session_history_record(  # noqa: PLR0915
         standard_logging_object=standard_logging_object,
         metadata=metadata,
         resolved_model=resolved_model,
+    )
+    _enrich_anthropic_context_window_metadata(
+        kwargs,
+        metadata,
+        resolved_model=resolved_model,
+        inbound_model_alias=inbound_model_alias,
+        provider=resolved_provider,
+        allow_implicit_default=True,
     )
 
     message = _extract_first_response_message(result)
