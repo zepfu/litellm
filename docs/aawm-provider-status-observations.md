@@ -108,6 +108,18 @@ Grok billing has two distinct payload shapes and must not be conflated:
   with `quota_period=monthly` and are **not** used as a fallback for weekly
   credit percent.
 
+Anthropic unified response headers persist separate weekly buckets:
+
+- `anthropic_unified_7d:7d` — baseline unified seven-day quota (`quota_period=seven_day`, `window_minutes=10080`).
+- `anthropic_unified_7d_oi:7d_oi` — Fable / overage-included weekly bucket from
+  `anthropic-ratelimit-unified-7d_oi-*` (and `llm_provider-anthropic-ratelimit-unified-7d_oi-*`)
+  headers. Representative claim and overage status fields are stored in
+  `raw_provider_fields` (for example `seven_day_overage_included`). Interval
+  materialization maps this key to `quota_type = weekly_overage_included`, not
+  `weekly_special`.
+- `anthropic_unified_7d_sonnet:7d_sonnet` — retired Sonnet-specific weekly-special
+  series kept for historical rows; new Fable traffic must not be labeled as Sonnet.
+
 The `public.rate_limit_intervals` materialized view (rebuilt by
 `scripts/apply_rate_limit_intervals_mview_2026_06_03_antigravity.sql`, or the
 legacy `scripts/apply_rate_limit_intervals_mview_2026_05_23.sql` without
@@ -119,9 +131,13 @@ quota keys, not under raw observation `quota_type` alone. Unlike most quota
 keys, weekly Grok Build credits also materialize observations with
 `remaining_pct = 100` (fresh weekly period / `grok_billing_weekly_fresh_period`)
 so a new interval closes out the prior depleted window instead of leaving an
-old 0% row open past reset. Monthly Grok request rows
-(`xai_grok_build_monthly_requests:requests`) continue to enter via
+old 0% row open past reset. Monthly Grok request
+rows (`xai_grok_build_monthly_requests:requests`) continue to enter via
 `quota_type = 'requests'` when `remaining_pct < 100`.
+
+When a non-weekly credit payload includes only billing-period boundaries with
+no usage fields, the sidecar may still persist a period-only monthly credits
+snapshot with null `remaining_pct`.
 
 Relevant environment variables:
 
