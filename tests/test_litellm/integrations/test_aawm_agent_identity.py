@@ -11479,6 +11479,91 @@ def test_session_history_failed_flush_max_retries_defaults_and_parses(
     assert aawm_agent_identity._get_session_history_failed_flush_max_retries() == 0
 
 
+def test_spool_session_history_records_tolerates_file_exists_when_spool_dir_is_directory(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    records = [{"litellm_call_id": "call-spool-file-exists-dir"}]
+    spool_dir = str(tmp_path / "session_history")
+    Path(spool_dir).mkdir(parents=True, exist_ok=True)
+
+    def fake_makedirs(path, exist_ok=False):
+        if path == spool_dir:
+            raise FileExistsError(path)
+        raise AssertionError(f"unexpected makedirs path: {path}")
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: spool_dir
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(aawm_agent_identity.os, "makedirs", fake_makedirs)
+    monkeypatch.setattr(
+        aawm_agent_identity.os.path,
+        "isdir",
+        lambda path: True if path == spool_dir else Path(path).is_dir(),
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_ensure_session_history_spool_drainer_started",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_session_history_spool_summary",
+        lambda: "spool_pending=0",
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_session_history_queue_depth_values",
+        lambda: (0, 1024),
+    )
+
+    spool_path = aawm_agent_identity._spool_session_history_records(
+        records,
+        reason="file exists directory tolerance",
+    )
+
+    assert spool_path.startswith(spool_dir)
+    assert Path(spool_path).exists()
+
+
+def test_spool_session_history_records_raises_when_spool_path_exists_but_not_directory(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    records = [{"litellm_call_id": "call-spool-file-exists-file"}]
+    spool_dir = str(tmp_path / "session_history")
+    Path(spool_dir).write_text("not a directory", encoding="utf-8")
+
+    def fake_makedirs(path, exist_ok=False):
+        if path == spool_dir:
+            raise FileExistsError(path)
+        raise AssertionError(f"unexpected makedirs path: {path}")
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: spool_dir
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(aawm_agent_identity.os, "makedirs", fake_makedirs)
+    monkeypatch.setattr(
+        aawm_agent_identity.os.path,
+        "isdir",
+        lambda path: False if path == spool_dir else Path(path).is_dir(),
+    )
+
+    with pytest.raises(NotADirectoryError, match="not a directory"):
+        aawm_agent_identity._spool_session_history_records(
+            records,
+            reason="file exists non-directory",
+        )
+
+
 def test_session_history_spool_dir_defaults_to_local_fallback(monkeypatch) -> None:
     monkeypatch.setattr(aawm_agent_identity, "get_secret_str", lambda key: None)
 
