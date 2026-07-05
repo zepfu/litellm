@@ -3148,6 +3148,17 @@ def _get_session_history_spool_dir() -> str:
     return _AAWM_SESSION_HISTORY_SPOOL_DIR_DEFAULT
 
 
+def _ensure_session_history_spool_dir(spool_dir: str) -> None:
+    try:
+        os.makedirs(spool_dir, exist_ok=True)
+    except FileExistsError:
+        if os.path.isdir(spool_dir):
+            return
+        raise NotADirectoryError(
+            f"session_history spool path exists but is not a directory: {spool_dir}"
+        ) from None
+
+
 def _session_history_queue_depth_summary() -> str:
     queue_size: Union[int, str]
     try:
@@ -3652,7 +3663,7 @@ def _spool_session_history_records(
     if not records:
         raise ValueError("session_history spool requires at least one record")
     spool_dir = _get_session_history_spool_dir()
-    os.makedirs(spool_dir, exist_ok=True)
+    _ensure_session_history_spool_dir(spool_dir)
     filename = _session_history_spool_filename(records)
     final_path = os.path.join(spool_dir, filename)
     tmp_path = f"{final_path}.{time.time_ns()}.{threading.get_ident()}.tmp"
