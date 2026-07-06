@@ -159,3 +159,176 @@ def test_attach_aawm_route_rollup_context_copies_host_metadata(monkeypatch):
     assert metadata["host_name"] == "thoth"
     assert metadata["host_name_source"] == "reverse_dns"
     assert metadata["aawm_route_rollup_context"]["host_name"] == "thoth"
+
+def test_is_tailscale_cgnat_client_ip_detects_100_64_range():
+    from litellm.proxy.aawm_route_logging import _is_tailscale_cgnat_client_ip
+
+    assert _is_tailscale_cgnat_client_ip("100.99.166.16") is True
+    assert _is_tailscale_cgnat_client_ip("100.64.0.1") is True
+    assert _is_tailscale_cgnat_client_ip("100.63.255.255") is False
+    assert _is_tailscale_cgnat_client_ip("192.168.1.1") is False
+
+
+def test_resolve_aawm_route_host_name_magicdns_fallback_on_cgnat_miss(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        Mock(side_effect=OSError("no reverse dns")),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="seshat"),
+    )
+
+    host_name, source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.166.16",
+        monotonic_now=1000.0,
+    )
+    assert host_name == "seshat"
+    assert source == "magicdns_reverse"
+
+
+def test_resolve_aawm_route_host_name_prefers_reverse_dns_over_magicdns(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        lambda ip: ("thoth.tailnet.ts.net", [], ["100.99.1.5"]),
+    )
+    magic = Mock(return_value="should-not-be-used")
+    monkeypatch.setattr(route_logging, "_resolve_hostname_via_magicdns", magic)
+
+    host_name, source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.1.5",
+        monotonic_now=2000.0,
+    )
+    assert host_name == "thoth"
+    assert source == "reverse_dns"
+    magic.assert_not_called()
+
+
+def test_resolve_aawm_route_host_name_cgnat_full_ip_fallback(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        Mock(side_effect=OSError("no reverse dns")),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value=None),
+    )
+
+    host_name, source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.166.16",
+        monotonic_now=3000.0,
+    )
+    assert host_name == "100.99.166.16"
+    assert source == "ip_literal"
+
+
+def test_resolve_aawm_route_host_name_cache_preserves_source_and_ttl(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        Mock(side_effect=OSError("no reverse dns")),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="seshat"),
+    )
+
+    first_host, first_source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.166.16",
+        monotonic_now=4000.0,
+    )
+    second_host, second_source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.166.16",
+        monotonic_now=4001.0,
+    )
+    assert first_host == second_host == "seshat"
+    assert first_source == "magicdns_reverse"
+    assert second_source == "magicdns_reverse_cache"
+
+    cached = route_logging._aawm_route_host_reverse_dns_cache["100.99.166.16"]
+    host_name, cached_source, expires_at = cached
+    assert cached_source == "magicdns_reverse"
+    assert expires_at == 4000.0 + route_logging._AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_TTL_SECONDS
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value=None),
+    )
+    _, ip_source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.166.17",
+        monotonic_now=5000.0,
+    )
+    ip_cached = route_logging._aawm_route_host_reverse_dns_cache["100.99.166.17"]
+    _, ip_cached_source, ip_expires = ip_cached
+    assert ip_source == "ip_literal"
+    assert ip_cached_source == "ip_literal"
+    assert ip_expires == 5000.0 + route_logging._AAWM_ROUTE_HOST_IP_LITERAL_CACHE_TTL_SECONDS
+
+
+def test_resolve_hostname_via_magicdns_parses_ptr_response(monkeypatch):
+    import struct
+
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    qname = "16.166.99.100.in-addr.arpa"
+    question = route_logging._encode_dns_name(qname) + struct.pack("!HH", 12, 1)
+    ptr_name = route_logging._encode_dns_name("seshat.tailf1878c.ts.net")
+    response = (
+        struct.pack("!HHHHHH", 0x1357, 0x8180, 1, 1, 0, 0)
+        + question
+        + b"\xc0\x0c"
+        + struct.pack("!HHIH", 12, 1, 30, len(ptr_name))
+        + ptr_name
+    )
+
+    class FakeSocket:
+        def __init__(self):
+            self.timeout = None
+            self.sent_to = None
+            self.closed = False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendto(self, payload, target):
+            self.sent_to = target
+            assert payload == route_logging._build_dns_ptr_query(qname)
+            assert target == ("100.100.100.100", 53)
+
+        def recvfrom(self, size):
+            assert size == 4096
+            return response, ("100.100.100.100", 53)
+
+        def close(self):
+            self.closed = True
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(
+        route_logging.socket,
+        "socket",
+        lambda family, sock_type: fake_socket,
+    )
+
+    assert route_logging._resolve_hostname_via_magicdns("100.99.166.16") == "seshat"
+    assert fake_socket.timeout == route_logging._AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS
+    assert fake_socket.closed is True
