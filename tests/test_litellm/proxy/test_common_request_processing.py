@@ -2873,7 +2873,7 @@ class TestAawmRouteRollup:
         assert len(flushed) == 2
         assert (
             flushed[0]
-            == "20260623 01:06:52 litellm@Codex[0.141.0] /openai_passthrough/responses"
+            == "20260623 01:06:52 litellm#Codex[0.141.0] /openai_passthrough/responses"
         )
         assert flushed[1] == " - gemini-3.5-flash-low(aawm-low) - Turns: 3"
 
@@ -2884,7 +2884,7 @@ class TestAawmRouteRollup:
 
         now = datetime(2026, 6, 23, 2, 51, 23)
         accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
-        header = "aawm@Codex[0.141.0]"
+        header = "aawm#Codex[0.141.0]"
         endpoint = "/openai_passthrough/responses"
 
         accumulator.record(
@@ -2906,7 +2906,7 @@ class TestAawmRouteRollup:
 
         flushed = accumulator.flush(force=True, now=now)
         assert flushed == [
-            "20260623 02:51:23 aawm@Codex[0.141.0] /openai_passthrough/responses",
+            "20260623 02:51:23 aawm#Codex[0.141.0] /openai_passthrough/responses",
             (
                 " - gemini-3.5-flash-low(aawm-low) - Turns: 7 -> "
                 "daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
