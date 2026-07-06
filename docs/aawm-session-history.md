@@ -85,6 +85,25 @@ stored metadata (and `inbound_model_alias` when present) was insufficient to
 classify extended context; it does not mean LiteLLM inferred a window from
 observed token counts.
 
+## Host Attribution
+
+`public.session_history` includes nullable `client_ip` and `host_name` text
+columns. They capture the incoming LiteLLM client address and the resolved
+display host used by AAWM route logging.
+
+- `client_ip` stores the canonical requester IP literal when one is available.
+- `host_name` stores the resolved host label shown in route rollup headers, for
+  example `thoth` from Tailscale/MagicDNS reverse lookup, `localhost` for
+  loopback or Docker gateway-adjacent traffic, or the IP literal when DNS has no
+  better label.
+- Metadata may also retain `client_ip_source` and `host_name_source` for debugging
+  (`request_client`, `x_forwarded_for`, `loopback`, `docker_bridge_gateway`,
+  `reverse_dns`, `ip_literal`).
+
+Route rollup headers use the exact display form
+`repo#Client[version]@host`, for example
+`aawm-infrastructure#Codex[0.142.5]@thoth /openai_passthrough/responses`.
+
 ## Repository And Tenant Attribution
 
 `session_history.repository` identifies the workspace or project label used for

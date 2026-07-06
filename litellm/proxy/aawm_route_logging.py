@@ -1,7 +1,9 @@
 import atexit
+import ipaddress
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from collections import deque
@@ -29,6 +31,227 @@ _AAWM_ROUTE_ROLLUP_DEFAULT_INTERVAL_SECONDS = 60
 _AAWM_ROUTE_ROLLUP_MAX_GROUPS = 256
 _AAWM_ROUTE_ROLLUP_MAX_SUBLINES = 16
 _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
+
+_AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS = 0.35
+_AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_TTL_SECONDS = 300.0
+_AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES = 1024
+_AAWM_ROUTE_HOST_LOOPBACK_LABEL = "localhost"
+_AAWM_ROUTE_HOST_DOCKER_BRIDGE_NETWORKS = (
+    ipaddress.ip_network("172.16.0.0/12"),
+)
+_aawm_route_host_reverse_dns_cache_lock = threading.Lock()
+_aawm_route_host_reverse_dns_cache: dict[str, tuple[str, float]] = {}
+
+
+def _clean_aawm_route_client_ip(value: Any) -> Optional[str]:
+    cleaned = _clean_aawm_route_log_field(value)
+    if not cleaned:
+        return None
+    if "," in cleaned:
+        cleaned = cleaned.split(",", 1)[0].strip()
+    try:
+        return str(ipaddress.ip_address(cleaned))
+    except ValueError:
+        return cleaned
+
+
+def _normalize_aawm_route_client_ip(value: Any) -> Optional[str]:
+    cleaned = _clean_aawm_route_client_ip(value)
+    if not cleaned:
+        return None
+    try:
+        parsed = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return cleaned
+    return str(parsed)
+
+
+def _is_aawm_route_local_display_ip(client_ip: Optional[str]) -> tuple[bool, str]:
+    if not client_ip:
+        return False, "unknown"
+    if client_ip.lower() == _AAWM_ROUTE_HOST_LOOPBACK_LABEL:
+        return True, "loopback"
+    try:
+        parsed = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False, "ip_literal"
+    if parsed.is_loopback:
+        return True, "loopback"
+    if parsed.is_unspecified:
+        return True, "unspecified"
+    if parsed.is_link_local:
+        return True, "link_local"
+    if parsed.version == 4:
+        octets = str(parsed).split(".")
+        if (
+            len(octets) == 4
+            and octets[-1] == "1"
+            and any(
+                parsed in network
+                for network in _AAWM_ROUTE_HOST_DOCKER_BRIDGE_NETWORKS
+            )
+        ):
+            return True, "docker_bridge_gateway"
+    return False, "remote"
+
+
+def _hostname_label_from_reverse_lookup(hostname: str) -> Optional[str]:
+    cleaned = _clean_aawm_route_log_field(hostname)
+    if not cleaned:
+        return None
+    cleaned = cleaned.rstrip(".")
+    if not cleaned:
+        return None
+    first_label = cleaned.split(".", 1)[0].strip()
+    if not first_label:
+        return cleaned
+    if _is_aawm_route_log_slug(first_label):
+        return first_label
+    return cleaned
+
+
+def _resolve_aawm_route_host_name_from_ip(
+    client_ip: Optional[str],
+    *,
+    monotonic_now: Optional[float] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    normalized_ip = _normalize_aawm_route_client_ip(client_ip)
+    if not normalized_ip:
+        return None, None
+    is_local, local_source = _is_aawm_route_local_display_ip(normalized_ip)
+    if is_local:
+        return _AAWM_ROUTE_HOST_LOOPBACK_LABEL, local_source
+    try:
+        ipaddress.ip_address(normalized_ip)
+    except ValueError:
+        return normalized_ip, "ip_literal"
+
+    now = time.monotonic() if monotonic_now is None else monotonic_now
+    with _aawm_route_host_reverse_dns_cache_lock:
+        cached = _aawm_route_host_reverse_dns_cache.get(normalized_ip)
+        if cached is not None:
+            host_name, expires_at = cached
+            if expires_at > now:
+                return host_name, "reverse_dns_cache"
+            _aawm_route_host_reverse_dns_cache.pop(normalized_ip, None)
+
+    host_name = normalized_ip
+    source = "ip_literal"
+    previous_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(_AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS)
+        hostname, _, _ = socket.gethostbyaddr(normalized_ip)
+        resolved = _hostname_label_from_reverse_lookup(hostname)
+        if resolved:
+            host_name = resolved
+            source = "reverse_dns"
+    except Exception:
+        pass
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+
+    with _aawm_route_host_reverse_dns_cache_lock:
+        if (
+            len(_aawm_route_host_reverse_dns_cache)
+            >= _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES
+        ):
+            _aawm_route_host_reverse_dns_cache.clear()
+        _aawm_route_host_reverse_dns_cache[normalized_ip] = (
+            host_name,
+            now + _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_TTL_SECONDS,
+        )
+    return host_name, source
+
+
+def _extract_aawm_route_request_client_ip(
+    request: Request,
+    *,
+    general_settings: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    from litellm.proxy.auth.ip_address_utils import IPAddressUtils
+
+    raw_ip = IPAddressUtils.get_mcp_client_ip(request, general_settings)
+    if not raw_ip:
+        scope = getattr(request, "scope", None)
+        client = scope.get("client") if isinstance(scope, dict) else None
+        if isinstance(client, (list, tuple)) and client:
+            raw_ip = str(client[0])
+        elif getattr(request, "client", None) is not None:
+            raw_ip = getattr(request.client, "host", None)
+    normalized_ip = _normalize_aawm_route_client_ip(raw_ip)
+    if not raw_ip:
+        return normalized_ip, None
+    headers = dict(getattr(request, "headers", {}) or {})
+    x_forwarded_for = _get_case_insensitive_header_value(
+        headers,
+        ("x-forwarded-for",),
+    )
+    if x_forwarded_for and _clean_aawm_route_client_ip(x_forwarded_for) == normalized_ip:
+        return normalized_ip, "x_forwarded_for"
+    return normalized_ip, "request_client"
+
+
+def resolve_aawm_route_host_attribution(
+    request: Request,
+    *,
+    general_settings: Optional[dict[str, Any]] = None,
+    client_ip: Optional[str] = None,
+    client_ip_source: Optional[str] = None,
+) -> dict[str, Optional[str]]:
+    if client_ip is None:
+        client_ip, client_ip_source = _extract_aawm_route_request_client_ip(
+            request,
+            general_settings=general_settings,
+        )
+    else:
+        client_ip = _normalize_aawm_route_client_ip(client_ip)
+    host_name, host_name_source = _resolve_aawm_route_host_name_from_ip(client_ip)
+    return {
+        "client_ip": client_ip,
+        "client_ip_source": client_ip_source,
+        "host_name": host_name,
+        "host_name_source": host_name_source,
+    }
+
+
+def _format_aawm_route_client_version_label(
+    client_product_label: Optional[str],
+) -> Optional[str]:
+    if not client_product_label:
+        return None
+    if "/" in client_product_label:
+        client_name, client_version = client_product_label.split("/", 1)
+        return (
+            f"{_normalize_aawm_route_log_known_client_name(client_name)}"
+            f"[{client_version}]"
+        )
+    return _normalize_aawm_route_log_known_client_name(client_product_label)
+
+
+def build_aawm_route_repo_client_host_label(
+    *,
+    repository: Optional[str],
+    client_product_label: Optional[str],
+    host_name: Optional[str],
+) -> Optional[str]:
+    repository_label = _normalize_aawm_route_log_repository_label(repository)
+    client_label = _format_aawm_route_client_version_label(client_product_label)
+    host_label = _clean_aawm_route_log_field(host_name)
+    segments: list[str] = []
+    if repository_label and client_label:
+        segments.append(f"{repository_label}#{client_label}")
+    elif repository_label:
+        segments.append(repository_label)
+    elif client_label:
+        segments.append(client_label)
+    if not segments:
+        return host_label
+    base = segments[0]
+    if host_label:
+        return f"{base}@{host_label}"
+    return base
+
+
 _AAWM_ROUTE_ROLLUP_STATUS_VALUES = (
     "Degraded",
     "Cooling Down",
@@ -243,32 +466,29 @@ def _format_aawm_route_rollup_client_context_label(
     *,
     group_header_label: str,
     client_product_label: Optional[str],
+    host_name: Optional[str] = None,
 ) -> Optional[str]:
-    repository = _normalize_aawm_route_log_repository_label(group_header_label)
-    client_label = None
-    if client_product_label and "/" in client_product_label:
-        client_name, client_version = client_product_label.split("/", 1)
-        client_label = (
-            f"{_normalize_aawm_route_log_known_client_name(client_name)}"
-            f"[{client_version}]"
-        )
-    elif client_product_label:
-        client_label = _normalize_aawm_route_log_known_client_name(
-            client_product_label
-        )
-    if repository and client_label:
-        return f"{repository}@{client_label}"
-    return repository or client_label
+    if "@" in group_header_label or "#" in group_header_label:
+        cleaned = _clean_aawm_route_log_field(group_header_label)
+        if cleaned:
+            return cleaned
+    return build_aawm_route_repo_client_host_label(
+        repository=group_header_label,
+        client_product_label=client_product_label,
+        host_name=host_name,
+    )
 
 
 def build_aawm_route_rollup_group_header_label(
     *,
     repository: Optional[str],
     client_product_label: Optional[str],
+    host_name: Optional[str] = None,
 ) -> Optional[str]:
-    return _format_aawm_route_rollup_client_context_label(
-        group_header_label=repository or "",
+    return build_aawm_route_repo_client_host_label(
+        repository=repository,
         client_product_label=client_product_label,
+        host_name=host_name,
     )
 
 
@@ -717,7 +937,7 @@ def build_aawm_route_rollup_context(
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
     route_type: Optional[str] = None,
-) -> Optional[dict[str, str]]:
+) -> Optional[dict[str, Optional[str]]]:
     metadata = _extract_aawm_route_log_metadata(request_body, kwargs)
     headers = dict(getattr(request, "headers", {}) or {})
     client_product_label = _get_aawm_route_log_client_product_label(metadata, headers)
@@ -739,9 +959,16 @@ def build_aawm_route_rollup_context(
         _AAWM_ROUTE_LOG_REPOSITORY_TENANT_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_tenant_repository_label,
     )
+    host_attribution = resolve_aawm_route_host_attribution(
+        request,
+        client_ip=_clean_aawm_route_client_ip(metadata.get("client_ip"))
+        or _clean_aawm_route_client_ip(metadata.get("requester_ip_address")),
+        client_ip_source=_clean_aawm_route_log_field(metadata.get("client_ip_source")),
+    )
     group_header_label = build_aawm_route_rollup_group_header_label(
         repository=repository,
         client_product_label=client_product_label,
+        host_name=host_attribution.get("host_name"),
     )
     model_label = _get_aawm_route_rollup_model_label(
         model_label=_get_aawm_route_log_model_label(request_body, metadata),
@@ -757,6 +984,10 @@ def build_aawm_route_rollup_context(
         "outgoing_target": outgoing_target,
         "model_label": model_label,
         "route_type": log_type,
+        "client_ip": host_attribution.get("client_ip"),
+        "client_ip_source": host_attribution.get("client_ip_source"),
+        "host_name": host_attribution.get("host_name"),
+        "host_name_source": host_attribution.get("host_name_source"),
     }
 
 
@@ -767,7 +998,7 @@ def attach_aawm_route_rollup_context(
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
     route_type: Optional[str] = None,
-) -> Optional[dict[str, str]]:
+) -> Optional[dict[str, Optional[str]]]:
     context = build_aawm_route_rollup_context(
         request=request,
         target=target,
@@ -780,6 +1011,10 @@ def attach_aawm_route_rollup_context(
     metadata = _set_aawm_route_rollup_metadata(kwargs)
     if metadata is not None:
         metadata[_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY] = context
+        for key in ("client_ip", "client_ip_source", "host_name", "host_name_source"):
+            value = context.get(key)
+            if value:
+                metadata[key] = value
     return context
 
 
