@@ -99,18 +99,28 @@ display host used by AAWM route logging.
   local lookup fails, or the IP literal when DNS has no better label.
 - Metadata may also retain `client_ip_source` and `host_name_source` for debugging
   (`request_client`, `x_forwarded_for`, `loopback`, `docker_bridge_gateway`,
-  `reverse_dns`, `magicdns_reverse`, `magicdns_local`, `magicdns_local_cache`,
-  `reverse_dns_cache`, `magicdns_reverse_cache`, `ip_literal`, `ip_literal_cache`).
+  `tailscale_self`, `tailscale_self_cache`, `reverse_dns`, `magicdns_reverse`,
+  `magicdns_local`, `magicdns_local_cache`, `reverse_dns_cache`,
+  `magicdns_reverse_cache`, `ip_literal`, `ip_literal_cache`).
 - For local display sources (loopback, unspecified, link-local, Docker bridge
-  gateway), LiteLLM attempts lookup-based resolution of the host machine's own
-  Tailscale MagicDNS short hostname before falling back to `localhost`. The
-  resolver looks for process-visible `100.64.0.0/10` addresses, hostnames/FQDNs
-  from the process and optional read-only host hostname files such as
-  `/host/etc/hostname`, and tailnet search domains from resolver config. Tailnet
-  hostname candidates are resolved with direct MagicDNS A lookups and the final
-  display label still comes from MagicDNS PTR. Results are cached under a
-  dedicated local-host cache key so repeated local requests do not rescan
-  discovery surfaces.
+  gateway), LiteLLM resolves the host label in this order:
+  1. A sanitized Tailscale self identity snapshot (for example
+     `Self.DNSName`, `Self.TailscaleIPs`, and `MagicDNSSuffix` only) from a
+     read-only directory mounted at `/host/aawm` in `litellm-dev`, with the
+     snapshot file at `/host/aawm/tailscale-self.json`.
+  2. The existing hostname/MagicDNS discovery path: process-visible
+     `100.64.0.0/10` addresses, hostnames/FQDNs from the process and optional
+     read-only host hostname files such as `/host/etc/hostname`, tailnet search
+     domains from resolver config, direct MagicDNS A lookups, and MagicDNS PTR
+     for the final short hostname.
+  3. `localhost` when neither path yields a label.
+  The snapshot path is configurable with
+  `AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH`; host operators can refresh it
+  with `scripts/write_tailscale_self_snapshot.py` without mounting the Tailscale
+  socket into the container. The dev compose mount uses
+  `AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_HOST_DIR` for the host-side snapshot
+  directory. Results are cached under dedicated local-host cache keys so
+  repeated local requests do not rescan discovery surfaces.
 - For Tailscale CGNAT client IPs in `100.64.0.0/10`, LiteLLM tries normal reverse
   DNS first. If that misses, it queries the MagicDNS resolver at `100.100.100.100`
   directly for PTR and uses the returned short hostname when available.

@@ -633,3 +633,195 @@ def test_aawm_route_rollup_accumulator_cooldown_line_omits_host_when_unresolved(
     assert flushed[0].startswith(
         "20260706 16:04:06 litellm#Codex[0.142.5] /openai_passthrough/responses"
     )
+
+
+def test_parse_tailscale_self_snapshot_payload_accepts_sanitized_schema():
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    parsed = route_logging._parse_tailscale_self_snapshot_payload(
+        {
+            "schema_version": 1,
+            "self_dns_name": "desktop-qjhrj1m-wsl.tailf1878c.ts.net",
+            "self_tailscale_ips": ["100.100.7.5", "fd7a:115c:a1e0::c133:706"],
+            "magic_dns_suffix": "tailf1878c.ts.net",
+        }
+    )
+    assert parsed == {
+        "dns_name": "desktop-qjhrj1m-wsl.tailf1878c.ts.net",
+        "tailscale_ips": ["100.100.7.5"],
+        "magic_dns_suffix": "tailf1878c.ts.net",
+    }
+
+
+def test_resolve_local_display_host_prefers_tailscale_self_over_stale_hostname(
+    monkeypatch, tmp_path,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    snapshot = tmp_path / "tailscale-self.json"
+    snapshot.write_text(
+        """{
+  "self_dns_name": "desktop-qjhrj1m-wsl.tailf1878c.ts.net",
+  "self_tailscale_ips": ["100.100.7.5"],
+  "magic_dns_suffix": "tailf1878c.ts.net"
+}
+""",
+        encoding="utf-8",
+    )
+
+    discover = Mock(return_value=["100.100.7.5"])
+    magic = Mock(return_value="DESKTOP-QJHRJ1M")
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        discover,
+    )
+    monkeypatch.setattr(route_logging, "_resolve_hostname_via_magicdns", magic)
+    monkeypatch.setattr(
+        route_logging,
+        "_hostname_lookup_file_candidates",
+        Mock(return_value=["DESKTOP-QJHRJ1M"]),
+    )
+
+    host_name, source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="loopback",
+        monotonic_now=12000.0,
+        snapshot_paths=(str(snapshot),),
+    )
+    assert host_name == "desktop-qjhrj1m-wsl"
+    assert source == "tailscale_self"
+    discover.assert_not_called()
+    magic.assert_not_called()
+
+
+def test_resolve_local_display_host_tailscale_self_cache_label(monkeypatch, tmp_path):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    snapshot = tmp_path / "tailscale-self.json"
+    snapshot.write_text(
+        '{"self_dns_name": "desktop-qjhrj1m-wsl.tailf1878c.ts.net"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=[]),
+    )
+
+    first_host, first_source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="docker_bridge_gateway",
+        monotonic_now=13000.0,
+        snapshot_paths=(str(snapshot),),
+    )
+    second_host, second_source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="docker_bridge_gateway",
+        monotonic_now=13001.0,
+        snapshot_paths=(str(snapshot),),
+    )
+    assert first_host == second_host == "desktop-qjhrj1m-wsl"
+    assert first_source == "tailscale_self"
+    assert second_source == "tailscale_self_cache"
+
+
+def test_resolve_local_display_host_ignores_non_tailnet_self_dns_name(
+    monkeypatch, tmp_path,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    snapshot = tmp_path / "tailscale-self.json"
+    snapshot.write_text(
+        '{"self_dns_name": "desktop-qjhrj1m.localdomain"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=["100.99.166.16"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="seshat"),
+    )
+
+    host_name, source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="loopback",
+        monotonic_now=13500.0,
+        snapshot_paths=(str(snapshot),),
+    )
+    assert host_name == "seshat"
+    assert source == "magicdns_local"
+
+
+def test_resolve_aawm_route_host_attribution_loopback_uses_tailscale_self_snapshot(
+    monkeypatch, tmp_path,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    snapshot = tmp_path / "tailscale-self.json"
+    snapshot.write_text(
+        '{"self_dns_name": "desktop-qjhrj1m-wsl.tailf1878c.ts.net"}',
+        encoding="utf-8",
+    )
+
+    request = Mock(spec=Request)
+    request.headers = {}
+    request.client = SimpleNamespace(host="127.0.0.1", port=54321)
+    request.scope = {"client": ("127.0.0.1", 54321)}
+
+    monkeypatch.setattr(
+        "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
+        lambda request, general_settings=None: "127.0.0.1",
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_aawm_route_host_tailscale_self_snapshot_paths",
+        lambda: (str(snapshot),),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=["100.100.7.5"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="wrong-host"),
+    )
+
+    attribution = resolve_aawm_route_host_attribution(request)
+    assert attribution["host_name"] == "desktop-qjhrj1m-wsl"
+    assert attribution["host_name_source"] == "tailscale_self"
+
+
+def test_resolve_local_display_host_falls_back_when_tailscale_self_snapshot_invalid(
+    monkeypatch, tmp_path,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    snapshot = tmp_path / "tailscale-self.json"
+    snapshot.write_text("not-json", encoding="utf-8")
+
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=["100.99.166.16"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="seshat"),
+    )
+
+    host_name, source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="loopback",
+        monotonic_now=14000.0,
+        snapshot_paths=(str(snapshot),),
+    )
+    assert host_name == "seshat"
+    assert source == "magicdns_local"
