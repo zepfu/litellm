@@ -37,7 +37,12 @@ def test_build_aawm_route_rollup_group_header_label_includes_host():
     assert label == "litellm#Codex[0.141.0]@localhost"
 
 
-def test_resolve_aawm_route_host_attribution_uses_loopback_without_dns(monkeypatch):
+def test_resolve_aawm_route_host_attribution_loopback_resolves_local_magicdns(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
     request = Mock(spec=Request)
     request.headers = {}
     request.client = SimpleNamespace(host="127.0.0.1", port=54321)
@@ -47,16 +52,29 @@ def test_resolve_aawm_route_host_attribution_uses_loopback_without_dns(monkeypat
         "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
         lambda request, general_settings=None: "127.0.0.1",
     )
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=["100.99.166.16"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="seshat"),
+    )
 
     attribution = resolve_aawm_route_host_attribution(request)
     assert attribution["client_ip"] == "127.0.0.1"
-    assert attribution["host_name"] == "localhost"
-    assert attribution["host_name_source"] == "loopback"
+    assert attribution["host_name"] == "seshat"
+    assert attribution["host_name_source"] == "magicdns_local"
 
 
-def test_resolve_aawm_route_host_attribution_uses_docker_gateway_as_localhost(
+def test_resolve_aawm_route_host_attribution_docker_gateway_resolves_local_magicdns(
     monkeypatch,
 ):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
     request = Mock(spec=Request)
     request.headers = {}
     request.client = SimpleNamespace(host="172.19.0.1", port=54321)
@@ -66,11 +84,21 @@ def test_resolve_aawm_route_host_attribution_uses_docker_gateway_as_localhost(
         "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
         lambda request, general_settings=None: "172.19.0.1",
     )
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=["100.99.1.5"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="thoth"),
+    )
 
     attribution = resolve_aawm_route_host_attribution(request)
     assert attribution["client_ip"] == "172.19.0.1"
-    assert attribution["host_name"] == "localhost"
-    assert attribution["host_name_source"] == "docker_bridge_gateway"
+    assert attribution["host_name"] == "thoth"
+    assert attribution["host_name_source"] == "magicdns_local"
 
 
 def test_resolve_aawm_route_host_attribution_keeps_lan_ip_fallback(monkeypatch):
@@ -159,6 +187,7 @@ def test_attach_aawm_route_rollup_context_copies_host_metadata(monkeypatch):
     assert metadata["host_name"] == "thoth"
     assert metadata["host_name_source"] == "reverse_dns"
     assert metadata["aawm_route_rollup_context"]["host_name"] == "thoth"
+
 
 def test_is_tailscale_cgnat_client_ip_detects_100_64_range():
     from litellm.proxy.aawm_route_logging import _is_tailscale_cgnat_client_ip
@@ -332,3 +361,218 @@ def test_resolve_hostname_via_magicdns_parses_ptr_response(monkeypatch):
     assert route_logging._resolve_hostname_via_magicdns("100.99.166.16") == "seshat"
     assert fake_socket.timeout == route_logging._AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS
     assert fake_socket.closed is True
+
+
+def test_resolve_ipv4_via_magicdns_parses_a_response(monkeypatch):
+    import struct
+
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    qname = "desktop-qjhrj1m.tailf1878c.ts.net"
+    question = route_logging._encode_dns_name(qname) + struct.pack("!HH", 1, 1)
+    response = (
+        struct.pack("!HHHHHH", 0x2468, 0x8580, 1, 1, 0, 0)
+        + question
+        + b"\xc0\x0c"
+        + struct.pack("!HHIH", 1, 1, 600, 4)
+        + bytes([100, 100, 7, 5])
+    )
+
+    class FakeSocket:
+        def __init__(self):
+            self.timeout = None
+            self.sent_to = None
+            self.closed = False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendto(self, payload, target):
+            self.sent_to = target
+            assert payload == route_logging._build_dns_a_query(qname)
+            assert target == ("100.100.100.100", 53)
+
+        def recvfrom(self, size):
+            assert size == 4096
+            return response, ("100.100.100.100", 53)
+
+        def close(self):
+            self.closed = True
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(
+        route_logging.socket,
+        "socket",
+        lambda family, sock_type: fake_socket,
+    )
+
+    assert route_logging._resolve_ipv4_via_magicdns(qname) == ["100.100.7.5"]
+    assert fake_socket.timeout == route_logging._AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS
+    assert fake_socket.closed is True
+
+
+def test_resolve_aawm_route_local_display_host_falls_back_to_localhost(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "getfqdn",
+        Mock(return_value="localhost"),
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostname",
+        Mock(return_value="localhost"),
+    )
+
+    host_name, source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="loopback",
+        monotonic_now=9000.0,
+    )
+    assert host_name == "localhost"
+    assert source == "loopback"
+
+
+def test_resolve_aawm_route_local_display_host_fallback_cache_is_source_specific(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "getfqdn",
+        Mock(return_value="localhost"),
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostname",
+        Mock(return_value="localhost"),
+    )
+
+    loopback_host, loopback_source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="loopback",
+        monotonic_now=9500.0,
+    )
+    docker_host, docker_source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="docker_bridge_gateway",
+        monotonic_now=9501.0,
+    )
+
+    assert loopback_host == docker_host == "localhost"
+    assert loopback_source == "loopback"
+    assert docker_source == "docker_bridge_gateway"
+
+
+def test_resolve_aawm_route_local_display_host_uses_magicdns_local_cache(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    discover = Mock(return_value=["100.99.166.16"])
+    magic = Mock(return_value="seshat")
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        discover,
+    )
+    monkeypatch.setattr(route_logging, "_resolve_hostname_via_magicdns", magic)
+
+    first_host, first_source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="docker_bridge_gateway",
+        monotonic_now=10000.0,
+    )
+    second_host, second_source = route_logging._resolve_aawm_route_local_display_host(
+        local_source="docker_bridge_gateway",
+        monotonic_now=10001.0,
+    )
+    assert first_host == second_host == "seshat"
+    assert first_source == "magicdns_local"
+    assert second_source == "magicdns_local_cache"
+    discover.assert_called_once()
+    magic.assert_called_once()
+
+
+def test_discover_hostname_tailscale_ipv4_candidates_uses_tailnet_search_domain(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    monkeypatch.setattr(
+        route_logging.socket,
+        "getfqdn",
+        Mock(return_value="desktop-qjhrj1m.localdomain"),
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostname",
+        Mock(return_value="desktop-qjhrj1m"),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_tailnet_search_domains_from_resolv_conf",
+        Mock(return_value=["tailf1878c.ts.net"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_hostname_lookup_file_candidates",
+        Mock(return_value=[]),
+    )
+
+    monkeypatch.setattr(
+        route_logging.socket,
+        "getaddrinfo",
+        Mock(side_effect=OSError("not found")),
+    )
+    magicdns_a = Mock(return_value=["100.100.7.5"])
+    monkeypatch.setattr(route_logging, "_resolve_ipv4_via_magicdns", magicdns_a)
+
+    assert route_logging._discover_hostname_tailscale_ipv4_candidates() == [
+        "100.100.7.5"
+    ]
+    magicdns_a.assert_called_once_with("desktop-qjhrj1m.tailf1878c.ts.net")
+
+
+def test_hostname_lookup_file_candidates_reads_host_hostname(tmp_path):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    host_hostname = tmp_path / "hostname"
+    host_hostname.write_text("DESKTOP-QJHRJ1M\n", encoding="utf-8")
+
+    assert route_logging._hostname_lookup_file_candidates(
+        lookup_paths=(str(host_hostname),),
+    ) == ["DESKTOP-QJHRJ1M"]
+
+
+def test_discover_local_tailscale_ipv4_candidates_merges_fib_trie_and_hostname(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    monkeypatch.setattr(
+        route_logging,
+        "_parse_proc_net_fib_trie_tailscale_local_ips",
+        Mock(return_value=["100.99.166.16"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_hostname_tailscale_ipv4_candidates",
+        Mock(return_value=["100.99.1.5"]),
+    )
+
+    assert route_logging._discover_local_tailscale_ipv4_candidates() == [
+        "100.99.166.16",
+        "100.99.1.5",
+    ]

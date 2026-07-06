@@ -16247,14 +16247,63 @@ def test_extract_session_host_attribution_reads_nested_route_rollup_context() ->
     assert attribution["host_name_source"] == "reverse_dns"
 
 
-def test_extract_session_host_attribution_uses_localhost_display_for_loopback_ip() -> None:
+def test_extract_session_host_attribution_uses_localhost_display_for_loopback_ip(
+    monkeypatch,
+) -> None:
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "getfqdn",
+        lambda: "localhost",
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostname",
+        lambda: "localhost",
+    )
+
     attribution = aawm_agent_identity._extract_session_host_attribution(
         {"requester_ip_address": "127.0.0.1"}
     )
 
     assert attribution["client_ip"] == "127.0.0.1"
     assert attribution["host_name"] == "localhost"
-    assert attribution["host_name_source"] in {"loopback", "reverse_dns"}
+    assert attribution["host_name_source"] == "loopback"
+
+
+def test_extract_session_host_attribution_resolves_local_magicdns_for_loopback_ip(
+    monkeypatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=["100.99.166.16"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="seshat"),
+    )
+
+    attribution = aawm_agent_identity._extract_session_host_attribution(
+        {"requester_ip_address": "127.0.0.1"}
+    )
+
+    assert attribution["client_ip"] == "127.0.0.1"
+    assert attribution["host_name"] == "seshat"
+    assert attribution["host_name_source"] == "magicdns_local"
 
 
 def test_session_history_payload_preserves_unknown_sensitive_config_flags() -> None:
