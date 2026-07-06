@@ -54,6 +54,165 @@ _AAWM_ROUTE_HOST_HOSTNAME_LOOKUP_PATHS = (
     "/host/etc/hostname",
     "/host/proc/sys/kernel/hostname",
 )
+_AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_DEFAULT_PATHS = (
+    "/host/aawm/tailscale-self.json",
+    "/app/.analysis/tailscale-self.json",
+)
+_AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_ENV = (
+    "AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH"
+)
+_AAWM_ROUTE_HOST_TAILSCALE_SELF_CACHE_KEY = (
+    "__aawm_tailscale_self_display_host__"
+)
+
+
+def _aawm_route_host_tailscale_self_snapshot_paths() -> tuple[str, ...]:
+    override = _clean_aawm_route_log_field(
+        os.environ.get(_AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_ENV)
+    )
+    if override:
+        return (override,)
+    return _AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_DEFAULT_PATHS
+
+
+def _parse_tailscale_self_snapshot_payload(
+    payload: Any,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+
+    self_section = payload.get("Self")
+    if not isinstance(self_section, dict):
+        self_section = {}
+
+    dns_name = (
+        payload.get("self_dns_name")
+        or payload.get("SelfDNSName")
+        or self_section.get("DNSName")
+    )
+    dns_name = _clean_aawm_route_log_field(dns_name)
+    if dns_name:
+        dns_name = dns_name.rstrip(".")
+
+    tailscale_ips_raw = (
+        payload.get("self_tailscale_ips")
+        or payload.get("SelfTailscaleIPs")
+        or self_section.get("TailscaleIPs")
+    )
+    tailscale_ips: list[str] = []
+    if isinstance(tailscale_ips_raw, (list, tuple)):
+        for raw_ip in tailscale_ips_raw:
+            normalized_ip = _normalize_aawm_route_client_ip(raw_ip)
+            if normalized_ip and _is_tailscale_cgnat_client_ip(normalized_ip):
+                if normalized_ip not in tailscale_ips:
+                    tailscale_ips.append(normalized_ip)
+
+    magic_dns_suffix = payload.get("magic_dns_suffix") or payload.get(
+        "MagicDNSSuffix"
+    )
+    current_tailnet = payload.get("CurrentTailnet")
+    if not magic_dns_suffix and isinstance(current_tailnet, dict):
+        magic_dns_suffix = current_tailnet.get("MagicDNSSuffix")
+    magic_dns_suffix = _clean_aawm_route_log_field(magic_dns_suffix)
+    if magic_dns_suffix:
+        magic_dns_suffix = magic_dns_suffix.rstrip(".")
+
+    if not dns_name and not tailscale_ips:
+        return None
+
+    return {
+        "dns_name": dns_name,
+        "tailscale_ips": tailscale_ips,
+        "magic_dns_suffix": magic_dns_suffix,
+    }
+
+
+def _hostname_label_from_tailscale_self_dns_name(dns_name: str) -> Optional[str]:
+    cleaned = _clean_aawm_route_log_field(dns_name)
+    if not cleaned:
+        return None
+    cleaned = cleaned.rstrip(".")
+    if not _is_aawm_route_tailnet_domain(cleaned):
+        return None
+    return _hostname_label_from_reverse_lookup(cleaned)
+
+
+def _load_tailscale_self_identity_snapshot(
+    *,
+    snapshot_paths: Optional[tuple[str, ...]] = None,
+) -> Optional[dict[str, Any]]:
+    paths = (
+        snapshot_paths
+        if snapshot_paths is not None
+        else _aawm_route_host_tailscale_self_snapshot_paths()
+    )
+    for snapshot_path in paths:
+        try:
+            with open(snapshot_path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+        parsed = _parse_tailscale_self_snapshot_payload(payload)
+        if parsed is not None:
+            parsed["snapshot_path"] = snapshot_path
+            return parsed
+    return None
+
+
+def _resolve_aawm_route_host_name_from_tailscale_self_identity(
+    *,
+    snapshot_paths: Optional[tuple[str, ...]] = None,
+    monotonic_now: Optional[float] = None,
+) -> Optional[tuple[str, str]]:
+    now = time.monotonic() if monotonic_now is None else monotonic_now
+    with _aawm_route_host_reverse_dns_cache_lock:
+        cached = _aawm_route_host_reverse_dns_cache.get(
+            _AAWM_ROUTE_HOST_TAILSCALE_SELF_CACHE_KEY
+        )
+        if cached is not None:
+            host_name, cached_source, expires_at = cached
+            if expires_at > now:
+                return host_name, _aawm_route_host_local_cache_source_label(
+                    cached_source
+                )
+            _aawm_route_host_reverse_dns_cache.pop(
+                _AAWM_ROUTE_HOST_TAILSCALE_SELF_CACHE_KEY, None
+            )
+
+    snapshot = _load_tailscale_self_identity_snapshot(snapshot_paths=snapshot_paths)
+    if snapshot is None:
+        return None
+
+    resolved_host: Optional[str] = None
+    dns_name = snapshot.get("dns_name")
+    if isinstance(dns_name, str) and dns_name:
+        resolved_host = _hostname_label_from_tailscale_self_dns_name(dns_name)
+
+    if not resolved_host:
+        for candidate_ip in snapshot.get("tailscale_ips") or []:
+            resolved_host = _resolve_hostname_via_magicdns(candidate_ip)
+            if resolved_host:
+                break
+
+    if not resolved_host:
+        return None
+
+    with _aawm_route_host_reverse_dns_cache_lock:
+        if (
+            len(_aawm_route_host_reverse_dns_cache)
+            >= _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES
+        ):
+            _aawm_route_host_reverse_dns_cache.clear()
+        _aawm_route_host_reverse_dns_cache[
+            _AAWM_ROUTE_HOST_TAILSCALE_SELF_CACHE_KEY
+        ] = (
+            resolved_host,
+            "tailscale_self",
+            now + _aawm_route_host_local_cache_ttl_for_source("tailscale_self"),
+        )
+    return resolved_host, "tailscale_self"
+
+
 _AAWM_ROUTE_HOST_LOCAL_FALLBACK_SOURCES = {
     "loopback",
     "unspecified",
@@ -369,6 +528,7 @@ def _resolve_aawm_route_local_display_host(
     *,
     local_source: str,
     monotonic_now: Optional[float] = None,
+    snapshot_paths: Optional[tuple[str, ...]] = None,
 ) -> tuple[str, str]:
     now = time.monotonic() if monotonic_now is None else monotonic_now
     fallback_cache_key = _aawm_route_host_local_cache_key(local_source)
@@ -393,6 +553,13 @@ def _resolve_aawm_route_local_display_host(
                     cached_source
                 )
             _aawm_route_host_reverse_dns_cache.pop(fallback_cache_key, None)
+
+    tailscale_self = _resolve_aawm_route_host_name_from_tailscale_self_identity(
+        monotonic_now=now,
+        snapshot_paths=snapshot_paths,
+    )
+    if tailscale_self is not None:
+        return tailscale_self
 
     resolved_host: Optional[str] = None
     resolved_source = "magicdns_local"
