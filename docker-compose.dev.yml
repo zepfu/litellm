@@ -105,6 +105,8 @@ services:
       - ./captures:/tmp/captures
       # Durable session_history outage spool for replay after DB outages.
       - /mnt/e/litellm/session_history:/mnt/e/litellm/session_history
+      # Read-only host identity lookup surface for local Tailscale MagicDNS attribution.
+      - /etc/hostname:/host/etc/hostname:ro
     environment:
       # Langfuse — read from host env or set defaults
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}

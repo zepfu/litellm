@@ -43,6 +43,23 @@ _AAWM_ROUTE_HOST_DOCKER_BRIDGE_NETWORKS = (
 _AAWM_ROUTE_HOST_TAILSCALE_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 _AAWM_ROUTE_HOST_MAGICDNS_RESOLVER = "100.100.100.100"
 _AAWM_ROUTE_HOST_MAGICDNS_PORT = 53
+_AAWM_ROUTE_HOST_LOCAL_LOOKUP_CACHE_KEY = "__aawm_local_display_host__"
+_AAWM_ROUTE_HOST_LOCAL_DISCOVERY_MAX_CANDIDATES = 4
+_AAWM_ROUTE_HOST_LOCAL_DISCOVERY_TIMEOUT_SECONDS = 0.2
+_AAWM_ROUTE_HOST_RESOLV_CONF_PATH = "/etc/resolv.conf"
+_AAWM_ROUTE_HOST_FIB_TRIE_PATH = "/proc/net/fib_trie"
+_AAWM_ROUTE_HOST_HOSTNAME_LOOKUP_PATHS = (
+    "/etc/hostname",
+    "/proc/sys/kernel/hostname",
+    "/host/etc/hostname",
+    "/host/proc/sys/kernel/hostname",
+)
+_AAWM_ROUTE_HOST_LOCAL_FALLBACK_SOURCES = {
+    "loopback",
+    "unspecified",
+    "link_local",
+    "docker_bridge_gateway",
+}
 _aawm_route_host_reverse_dns_cache_lock = threading.Lock()
 _aawm_route_host_reverse_dns_cache: dict[str, tuple[str, str, float]] = {}
 
@@ -122,6 +139,298 @@ def _is_tailscale_cgnat_client_ip(client_ip: str) -> bool:
     return parsed.version == 4 and parsed in _AAWM_ROUTE_HOST_TAILSCALE_CGNAT_NETWORK
 
 
+def _aawm_route_host_local_cache_ttl_for_source(source: str) -> float:
+    if source in _AAWM_ROUTE_HOST_LOCAL_FALLBACK_SOURCES:
+        return _AAWM_ROUTE_HOST_IP_LITERAL_CACHE_TTL_SECONDS
+    return _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_TTL_SECONDS
+
+
+def _aawm_route_host_local_cache_key(local_source: str) -> str:
+    return f"{_AAWM_ROUTE_HOST_LOCAL_LOOKUP_CACHE_KEY}:{local_source}"
+
+
+def _aawm_route_host_local_cache_source_label(source: str) -> str:
+    if source in _AAWM_ROUTE_HOST_LOCAL_FALLBACK_SOURCES:
+        return source
+    return _aawm_route_host_cache_source_label(source)
+
+
+def _is_aawm_route_tailnet_domain(value: str) -> bool:
+    lowered = value.rstrip(".").lower()
+    return (
+        lowered == "ts.net"
+        or lowered.endswith(".ts.net")
+        or lowered == "tailscale.net"
+        or lowered.endswith(".tailscale.net")
+    )
+
+
+def _tailnet_search_domains_from_resolv_conf(
+    *,
+    resolv_conf_path: str = _AAWM_ROUTE_HOST_RESOLV_CONF_PATH,
+    max_domains: int = 8,
+) -> list[str]:
+    domains: list[str] = []
+    try:
+        with open(resolv_conf_path, encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+                    continue
+                lower = stripped.lower()
+                if lower.startswith("search "):
+                    tokens = stripped.split()[1:]
+                elif lower.startswith("domain "):
+                    tokens = stripped.split()[1:2]
+                else:
+                    continue
+                for token in tokens:
+                    cleaned = token.strip().rstrip(".")
+                    if not cleaned or cleaned in domains:
+                        continue
+                    if _is_aawm_route_tailnet_domain(cleaned):
+                        domains.append(cleaned)
+                    if len(domains) >= max_domains:
+                        return domains
+    except OSError:
+        return domains
+    return domains
+
+
+def _parse_proc_net_fib_trie_tailscale_local_ips(
+    *,
+    fib_trie_path: str = _AAWM_ROUTE_HOST_FIB_TRIE_PATH,
+    max_candidates: int = _AAWM_ROUTE_HOST_LOCAL_DISCOVERY_MAX_CANDIDATES,
+) -> list[str]:
+    import re
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    current_ip: Optional[str] = None
+    try:
+        with open(fib_trie_path, encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                match = re.match(r"\s*\|--\s+(\d+\.\d+\.\d+\.\d+)", line)
+                if match:
+                    current_ip = match.group(1)
+                    continue
+                if current_ip is None or "host LOCAL" not in line:
+                    continue
+                try:
+                    parsed = ipaddress.ip_address(current_ip)
+                except ValueError:
+                    current_ip = None
+                    continue
+                if (
+                    parsed.version == 4
+                    and parsed in _AAWM_ROUTE_HOST_TAILSCALE_CGNAT_NETWORK
+                    and current_ip not in seen
+                ):
+                    candidates.append(current_ip)
+                    seen.add(current_ip)
+                    if len(candidates) >= max_candidates:
+                        break
+                current_ip = None
+    except OSError:
+        return candidates
+    return candidates
+
+
+def _hostname_lookup_file_candidates(
+    *,
+    lookup_paths: tuple[str, ...] = _AAWM_ROUTE_HOST_HOSTNAME_LOOKUP_PATHS,
+    max_candidates: int = _AAWM_ROUTE_HOST_LOCAL_DISCOVERY_MAX_CANDIDATES,
+) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for path in lookup_paths:
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as handle:
+                raw_value = handle.readline()
+        except OSError:
+            continue
+        cleaned = _clean_aawm_route_log_field(raw_value)
+        normalized = cleaned.rstrip(".") if cleaned else None
+        if (
+            not normalized
+            or normalized.lower() in {"localhost", "localhost.localdomain"}
+            or normalized in seen
+        ):
+            continue
+        candidates.append(normalized)
+        seen.add(normalized)
+        if len(candidates) >= max_candidates:
+            break
+    return candidates
+
+
+def _local_tailscale_hostname_lookup_names() -> list[str]:
+    try:
+        host_name = _clean_aawm_route_log_field(socket.gethostname())
+    except OSError:
+        host_name = None
+    candidate_names: list[str] = []
+    seen_names: set[str] = set()
+    try:
+        fqdn = socket.getfqdn()
+    except OSError:
+        fqdn = None
+    for raw_name in (fqdn, host_name):
+        cleaned = _clean_aawm_route_log_field(raw_name)
+        normalized_name = cleaned.rstrip(".") if cleaned else None
+        if normalized_name and normalized_name not in seen_names:
+            candidate_names.append(normalized_name)
+            seen_names.add(normalized_name)
+    for file_host_name in _hostname_lookup_file_candidates():
+        if file_host_name not in seen_names:
+            candidate_names.append(file_host_name)
+            seen_names.add(file_host_name)
+    for domain in _tailnet_search_domains_from_resolv_conf():
+        for base_name in list(candidate_names):
+            if "." in base_name:
+                continue
+            fqdn = f"{base_name}.{domain}".rstrip(".")
+            if fqdn not in seen_names:
+                candidate_names.append(fqdn)
+                seen_names.add(fqdn)
+    return candidate_names
+
+
+def _discover_hostname_tailscale_ipv4_candidates(
+    *,
+    max_candidates: int = _AAWM_ROUTE_HOST_LOCAL_DISCOVERY_MAX_CANDIDATES,
+    timeout_seconds: float = _AAWM_ROUTE_HOST_LOCAL_DISCOVERY_TIMEOUT_SECONDS,
+) -> list[str]:
+    candidate_names = _local_tailscale_hostname_lookup_names()
+    candidates: list[str] = []
+    seen_ips: set[str] = set()
+    previous_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(timeout_seconds)
+        for name in candidate_names:
+            try:
+                infos = socket.getaddrinfo(
+                    name,
+                    None,
+                    family=socket.AF_INET,
+                    type=socket.SOCK_DGRAM,
+                )
+            except OSError:
+                infos = []
+            for info in infos:
+                sockaddr = info[4]
+                if not isinstance(sockaddr, tuple) or not sockaddr:
+                    continue
+                ip = str(sockaddr[0])
+                if not _is_tailscale_cgnat_client_ip(ip) or ip in seen_ips:
+                    continue
+                candidates.append(ip)
+                seen_ips.add(ip)
+                if len(candidates) >= max_candidates:
+                    return candidates
+            if _is_aawm_route_tailnet_domain(name):
+                for ip in _resolve_ipv4_via_magicdns(name):
+                    if ip in seen_ips:
+                        continue
+                    candidates.append(ip)
+                    seen_ips.add(ip)
+                    if len(candidates) >= max_candidates:
+                        return candidates
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+    return candidates
+
+
+def _discover_local_tailscale_ipv4_candidates(
+    *,
+    max_candidates: int = _AAWM_ROUTE_HOST_LOCAL_DISCOVERY_MAX_CANDIDATES,
+) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for ip in _parse_proc_net_fib_trie_tailscale_local_ips(
+        max_candidates=max_candidates,
+    ):
+        if ip not in seen:
+            candidates.append(ip)
+            seen.add(ip)
+    if len(candidates) < max_candidates:
+        for ip in _discover_hostname_tailscale_ipv4_candidates(
+            max_candidates=max_candidates - len(candidates),
+        ):
+            if ip not in seen:
+                candidates.append(ip)
+                seen.add(ip)
+            if len(candidates) >= max_candidates:
+                break
+    return candidates
+
+
+def _resolve_aawm_route_local_display_host(
+    *,
+    local_source: str,
+    monotonic_now: Optional[float] = None,
+) -> tuple[str, str]:
+    now = time.monotonic() if monotonic_now is None else monotonic_now
+    fallback_cache_key = _aawm_route_host_local_cache_key(local_source)
+    with _aawm_route_host_reverse_dns_cache_lock:
+        cached = _aawm_route_host_reverse_dns_cache.get(
+            _AAWM_ROUTE_HOST_LOCAL_LOOKUP_CACHE_KEY
+        )
+        if cached is not None:
+            host_name, cached_source, expires_at = cached
+            if expires_at > now:
+                return host_name, _aawm_route_host_local_cache_source_label(
+                    cached_source
+                )
+            _aawm_route_host_reverse_dns_cache.pop(
+                _AAWM_ROUTE_HOST_LOCAL_LOOKUP_CACHE_KEY, None
+            )
+        cached = _aawm_route_host_reverse_dns_cache.get(fallback_cache_key)
+        if cached is not None:
+            host_name, cached_source, expires_at = cached
+            if expires_at > now:
+                return host_name, _aawm_route_host_local_cache_source_label(
+                    cached_source
+                )
+            _aawm_route_host_reverse_dns_cache.pop(fallback_cache_key, None)
+
+    resolved_host: Optional[str] = None
+    resolved_source = "magicdns_local"
+    for candidate_ip in _discover_local_tailscale_ipv4_candidates():
+        resolved_host = _resolve_hostname_via_magicdns(candidate_ip)
+        if resolved_host:
+            break
+
+    if resolved_host:
+        with _aawm_route_host_reverse_dns_cache_lock:
+            if (
+                len(_aawm_route_host_reverse_dns_cache)
+                >= _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES
+            ):
+                _aawm_route_host_reverse_dns_cache.clear()
+            _aawm_route_host_reverse_dns_cache[
+                _AAWM_ROUTE_HOST_LOCAL_LOOKUP_CACHE_KEY
+            ] = (
+                resolved_host,
+                resolved_source,
+                now + _aawm_route_host_local_cache_ttl_for_source(resolved_source),
+            )
+        return resolved_host, resolved_source
+
+    with _aawm_route_host_reverse_dns_cache_lock:
+        if (
+            len(_aawm_route_host_reverse_dns_cache)
+            >= _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES
+        ):
+            _aawm_route_host_reverse_dns_cache.clear()
+        _aawm_route_host_reverse_dns_cache[fallback_cache_key] = (
+            _AAWM_ROUTE_HOST_LOOPBACK_LABEL,
+            local_source,
+            now + _aawm_route_host_local_cache_ttl_for_source(local_source),
+        )
+    return _AAWM_ROUTE_HOST_LOOPBACK_LABEL, local_source
+
+
 def _aawm_route_host_cache_ttl_for_source(source: str) -> float:
     if source == "ip_literal":
         return _AAWM_ROUTE_HOST_IP_LITERAL_CACHE_TTL_SECONDS
@@ -191,14 +500,35 @@ def _decode_dns_name(data: bytes, offset: int) -> tuple[str, int]:
     return ".".join(label for label in labels if label), next_offset
 
 
-def _build_dns_ptr_query(qname: str, *, transaction_id: int = 0x1357) -> bytes:
+def _build_dns_query(
+    qname: str,
+    *,
+    query_type: int,
+    transaction_id: int = 0x1357,
+) -> bytes:
     import random
     import struct
 
     tid = transaction_id if transaction_id is not None else random.randint(0, 65535)
     header = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
-    query = _encode_dns_name(qname) + struct.pack("!HH", 12, 1)
+    query = _encode_dns_name(qname) + struct.pack("!HH", query_type, 1)
     return header + query
+
+
+def _build_dns_ptr_query(qname: str, *, transaction_id: int = 0x1357) -> bytes:
+    return _build_dns_query(
+        qname,
+        query_type=12,
+        transaction_id=transaction_id,
+    )
+
+
+def _build_dns_a_query(qname: str, *, transaction_id: int = 0x2468) -> bytes:
+    return _build_dns_query(
+        qname,
+        query_type=1,
+        transaction_id=transaction_id,
+    )
 
 
 def _extract_ptr_hostnames_from_dns_response(data: bytes) -> list[str]:
@@ -229,6 +559,65 @@ def _extract_ptr_hostnames_from_dns_response(data: bytes) -> list[str]:
                 hostnames.append(hostname.rstrip("."))
         offset = rdata_end
     return hostnames
+
+
+def _extract_ipv4_addresses_from_dns_response(data: bytes) -> list[str]:
+    import struct
+
+    if len(data) < 12:
+        return []
+    _, _, qdcount, ancount, _, _ = struct.unpack("!HHHHHH", data[:12])
+    offset = 12
+    for _ in range(qdcount):
+        _, offset = _decode_dns_name(data, offset)
+        if offset + 4 > len(data):
+            return []
+        offset += 4
+    addresses: list[str] = []
+    for _ in range(ancount):
+        _, offset = _decode_dns_name(data, offset)
+        if offset + 10 > len(data):
+            break
+        rtype, _, _, rdlength = struct.unpack("!HHIH", data[offset : offset + 10])
+        offset += 10
+        rdata_end = offset + rdlength
+        if rdata_end > len(data):
+            break
+        if rtype == 1 and rdlength == 4:
+            try:
+                addresses.append(str(ipaddress.ip_address(data[offset:rdata_end])))
+            except ValueError:
+                pass
+        offset = rdata_end
+    return addresses
+
+
+def _resolve_ipv4_via_magicdns(
+    hostname: str,
+    *,
+    resolver: str = _AAWM_ROUTE_HOST_MAGICDNS_RESOLVER,
+    port: int = _AAWM_ROUTE_HOST_MAGICDNS_PORT,
+    timeout_seconds: float = _AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS,
+) -> list[str]:
+    cleaned = _clean_aawm_route_log_field(hostname)
+    if not cleaned or not _is_aawm_route_tailnet_domain(cleaned):
+        return []
+    query = _build_dns_a_query(cleaned.rstrip("."))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout_seconds)
+        sock.sendto(query, (resolver, port))
+        data, _ = sock.recvfrom(4096)
+    except Exception:
+        return []
+    finally:
+        sock.close()
+
+    addresses: list[str] = []
+    for address in _extract_ipv4_addresses_from_dns_response(data):
+        if _is_tailscale_cgnat_client_ip(address):
+            addresses.append(address)
+    return addresses
 
 
 def _resolve_hostname_via_magicdns(
@@ -269,7 +658,10 @@ def _resolve_aawm_route_host_name_from_ip(
         return None, None
     is_local, local_source = _is_aawm_route_local_display_ip(normalized_ip)
     if is_local:
-        return _AAWM_ROUTE_HOST_LOOPBACK_LABEL, local_source
+        return _resolve_aawm_route_local_display_host(
+            local_source=local_source,
+            monotonic_now=monotonic_now,
+        )
     try:
         ipaddress.ip_address(normalized_ip)
     except ValueError:

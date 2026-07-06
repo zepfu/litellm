@@ -93,13 +93,24 @@ display host used by AAWM route logging.
 
 - `client_ip` stores the canonical requester IP literal when one is available.
 - `host_name` stores the resolved host label shown in route rollup headers, for
-  example `thoth` from Tailscale/MagicDNS reverse lookup, `localhost` for
-  loopback or Docker gateway-adjacent traffic, or the IP literal when DNS has no
-  better label.
+  example `thoth` from Tailscale/MagicDNS reverse lookup, the local machine's
+  Tailscale MagicDNS short hostname when loopback or Docker gateway-adjacent
+  traffic is attributed via lookup (`magicdns_local`), `localhost` when that
+  local lookup fails, or the IP literal when DNS has no better label.
 - Metadata may also retain `client_ip_source` and `host_name_source` for debugging
   (`request_client`, `x_forwarded_for`, `loopback`, `docker_bridge_gateway`,
-  `reverse_dns`, `magicdns_reverse`, `reverse_dns_cache`, `magicdns_reverse_cache`, `ip_literal`,
-  `ip_literal_cache`).
+  `reverse_dns`, `magicdns_reverse`, `magicdns_local`, `magicdns_local_cache`,
+  `reverse_dns_cache`, `magicdns_reverse_cache`, `ip_literal`, `ip_literal_cache`).
+- For local display sources (loopback, unspecified, link-local, Docker bridge
+  gateway), LiteLLM attempts lookup-based resolution of the host machine's own
+  Tailscale MagicDNS short hostname before falling back to `localhost`. The
+  resolver looks for process-visible `100.64.0.0/10` addresses, hostnames/FQDNs
+  from the process and optional read-only host hostname files such as
+  `/host/etc/hostname`, and tailnet search domains from resolver config. Tailnet
+  hostname candidates are resolved with direct MagicDNS A lookups and the final
+  display label still comes from MagicDNS PTR. Results are cached under a
+  dedicated local-host cache key so repeated local requests do not rescan
+  discovery surfaces.
 - For Tailscale CGNAT client IPs in `100.64.0.0/10`, LiteLLM tries normal reverse
   DNS first. If that misses, it queries the MagicDNS resolver at `100.100.100.100`
   directly for PTR and uses the returned short hostname when available.
