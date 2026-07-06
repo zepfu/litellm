@@ -36,7 +36,6 @@ import math
 import os
 import queue
 import re
-import socket
 import shlex
 import threading
 import time
@@ -73,6 +72,7 @@ except ModuleNotFoundError as exc:
         score_agent_quality_context,
     )
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.proxy.aawm_route_logging import _resolve_aawm_route_host_name_from_ip
 from litellm.secret_managers.main import get_secret_str
 
 _CLAUDE_PERMISSION_CHECK_OUTPUT_RE = re.compile(
@@ -5828,10 +5828,6 @@ def _extract_claude_code_version_from_metadata(
     )
 
 _SESSION_HISTORY_LOOPBACK_HOST_LABEL = "localhost"
-_SESSION_HISTORY_HOST_REVERSE_DNS_TIMEOUT_SECONDS = 0.35
-_SESSION_HISTORY_HOST_DOCKER_BRIDGE_NETWORKS = (
-    ipaddress.ip_network("172.16.0.0/12"),
-)
 
 
 def _clean_session_history_client_ip_candidate(value: Any) -> Optional[str]:
@@ -5855,80 +5851,10 @@ def _canonical_session_history_client_ip(value: Any) -> Optional[str]:
         return None
 
 
-def _is_local_session_history_display_ip(
-    client_ip: Optional[str],
-) -> Tuple[bool, Optional[str]]:
-    if not client_ip:
-        return False, None
-    if client_ip.lower() == _SESSION_HISTORY_LOOPBACK_HOST_LABEL:
-        return True, "loopback"
-    try:
-        parsed = ipaddress.ip_address(client_ip)
-    except ValueError:
-        return False, "ip_literal"
-    if parsed.is_loopback:
-        return True, "loopback"
-    if parsed.is_unspecified:
-        return True, "unspecified"
-    if parsed.is_link_local:
-        return True, "link_local"
-    if parsed.version == 4:
-        octets = str(parsed).split(".")
-        if (
-            len(octets) == 4
-            and octets[-1] == "1"
-            and any(
-                parsed in network
-                for network in _SESSION_HISTORY_HOST_DOCKER_BRIDGE_NETWORKS
-            )
-        ):
-            return True, "docker_bridge_gateway"
-    return False, "remote"
-
-
-def _session_history_hostname_label_from_reverse_lookup(
-    hostname: str,
-) -> Optional[str]:
-    cleaned = _clean_non_empty_string(hostname)
-    if not cleaned:
-        return None
-    cleaned = cleaned.rstrip(".")
-    if not cleaned:
-        return None
-    first_label = cleaned.split(".", 1)[0].strip()
-    if not first_label:
-        return cleaned
-    return first_label
-
-
 def _resolve_session_history_host_name_from_ip(
     client_ip: Optional[str],
 ) -> Tuple[Optional[str], Optional[str]]:
-    if not client_ip:
-        return None, None
-    is_local, local_source = _is_local_session_history_display_ip(client_ip)
-    if is_local:
-        return _SESSION_HISTORY_LOOPBACK_HOST_LABEL, local_source
-    try:
-        ipaddress.ip_address(client_ip)
-    except ValueError:
-        return client_ip, "ip_literal"
-
-    host_name = client_ip
-    source = "ip_literal"
-    previous_timeout = socket.getdefaulttimeout()
-    try:
-        socket.setdefaulttimeout(_SESSION_HISTORY_HOST_REVERSE_DNS_TIMEOUT_SECONDS)
-        hostname, _, _ = socket.gethostbyaddr(client_ip)
-        resolved = _session_history_hostname_label_from_reverse_lookup(hostname)
-        if resolved:
-            host_name = resolved
-            source = "reverse_dns"
-    except Exception:
-        pass
-    finally:
-        socket.setdefaulttimeout(previous_timeout)
-    return host_name, source
+    return _resolve_aawm_route_host_name_from_ip(client_ip)
 
 
 def _extract_session_host_attribution(

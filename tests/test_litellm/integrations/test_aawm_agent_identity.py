@@ -16210,6 +16210,25 @@ def test_extract_session_host_attribution_resolves_display_host_from_ip() -> Non
     assert attribution["client_ip_source"] == "request_client"
 
 
+def test_extract_session_host_attribution_uses_shared_magicdns_resolver(monkeypatch) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_resolve_aawm_route_host_name_from_ip",
+        lambda client_ip: ("seshat", "magicdns_reverse"),
+    )
+
+    attribution = aawm_agent_identity._extract_session_host_attribution(
+        {
+            "requester_ip_address": "100.99.166.16",
+            "client_ip_source": "request_client",
+        }
+    )
+
+    assert attribution["client_ip"] == "100.99.166.16"
+    assert attribution["host_name"] == "seshat"
+    assert attribution["host_name_source"] == "magicdns_reverse"
+
+
 def test_extract_session_host_attribution_reads_nested_route_rollup_context() -> None:
     attribution = aawm_agent_identity._extract_session_host_attribution(
         {

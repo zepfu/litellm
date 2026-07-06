@@ -98,7 +98,14 @@ display host used by AAWM route logging.
   better label.
 - Metadata may also retain `client_ip_source` and `host_name_source` for debugging
   (`request_client`, `x_forwarded_for`, `loopback`, `docker_bridge_gateway`,
-  `reverse_dns`, `ip_literal`).
+  `reverse_dns`, `magicdns_reverse`, `reverse_dns_cache`, `magicdns_reverse_cache`, `ip_literal`,
+  `ip_literal_cache`).
+- For Tailscale CGNAT client IPs in `100.64.0.0/10`, LiteLLM tries normal reverse
+  DNS first. If that misses, it queries the MagicDNS resolver at `100.100.100.100`
+  directly for PTR and uses the returned short hostname when available.
+- Successful hostname resolutions (including MagicDNS) use a longer cache TTL;
+  IP-literal fallbacks use a shorter TTL so a later MagicDNS success can replace
+  them without waiting for the full hostname cache window.
 
 Route rollup headers use the exact display form
 `repo#Client[version]@host`, for example

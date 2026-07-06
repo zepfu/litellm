@@ -34,13 +34,17 @@ _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
 
 _AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS = 0.35
 _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_TTL_SECONDS = 300.0
+_AAWM_ROUTE_HOST_IP_LITERAL_CACHE_TTL_SECONDS = 60.0
 _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES = 1024
 _AAWM_ROUTE_HOST_LOOPBACK_LABEL = "localhost"
 _AAWM_ROUTE_HOST_DOCKER_BRIDGE_NETWORKS = (
     ipaddress.ip_network("172.16.0.0/12"),
 )
+_AAWM_ROUTE_HOST_TAILSCALE_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+_AAWM_ROUTE_HOST_MAGICDNS_RESOLVER = "100.100.100.100"
+_AAWM_ROUTE_HOST_MAGICDNS_PORT = 53
 _aawm_route_host_reverse_dns_cache_lock = threading.Lock()
-_aawm_route_host_reverse_dns_cache: dict[str, tuple[str, float]] = {}
+_aawm_route_host_reverse_dns_cache: dict[str, tuple[str, str, float]] = {}
 
 
 def _clean_aawm_route_client_ip(value: Any) -> Optional[str]:
@@ -110,6 +114,151 @@ def _hostname_label_from_reverse_lookup(hostname: str) -> Optional[str]:
     return cleaned
 
 
+def _is_tailscale_cgnat_client_ip(client_ip: str) -> bool:
+    try:
+        parsed = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    return parsed.version == 4 and parsed in _AAWM_ROUTE_HOST_TAILSCALE_CGNAT_NETWORK
+
+
+def _aawm_route_host_cache_ttl_for_source(source: str) -> float:
+    if source == "ip_literal":
+        return _AAWM_ROUTE_HOST_IP_LITERAL_CACHE_TTL_SECONDS
+    return _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_TTL_SECONDS
+
+
+def _aawm_route_host_cache_source_label(source: str) -> str:
+    if source.endswith("_cache"):
+        return source
+    return f"{source}_cache"
+
+
+def _aawm_route_host_ptr_qname(client_ip: str) -> Optional[str]:
+    try:
+        parsed = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return None
+    if parsed.version != 4:
+        return None
+    return ".".join(reversed(str(parsed).split("."))) + ".in-addr.arpa"
+
+
+def _encode_dns_name(name: str) -> bytes:
+    encoded = bytearray()
+    for label in name.split("."):
+        if not label:
+            continue
+        label_bytes = label.encode("idna")
+        if len(label_bytes) > 63:
+            raise ValueError("dns label too long")
+        encoded.append(len(label_bytes))
+        encoded.extend(label_bytes)
+    encoded.append(0)
+    return bytes(encoded)
+
+
+def _decode_dns_name(data: bytes, offset: int) -> tuple[str, int]:
+    labels: list[str] = []
+    next_offset = offset
+    jumped = False
+    jumps = 0
+    while offset < len(data):
+        length = data[offset]
+        if length == 0:
+            offset += 1
+            if not jumped:
+                next_offset = offset
+            break
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(data):
+                break
+            pointer = ((length & 0x3F) << 8) | data[offset + 1]
+            jumps += 1
+            if jumps > 16:
+                break
+            if not jumped:
+                next_offset = offset + 2
+                jumped = True
+            offset = pointer
+            continue
+        offset += 1
+        end = offset + length
+        labels.append(data[offset:end].decode("ascii", errors="ignore"))
+        offset = end
+        if not jumped:
+            next_offset = offset
+    return ".".join(label for label in labels if label), next_offset
+
+
+def _build_dns_ptr_query(qname: str, *, transaction_id: int = 0x1357) -> bytes:
+    import random
+    import struct
+
+    tid = transaction_id if transaction_id is not None else random.randint(0, 65535)
+    header = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    query = _encode_dns_name(qname) + struct.pack("!HH", 12, 1)
+    return header + query
+
+
+def _extract_ptr_hostnames_from_dns_response(data: bytes) -> list[str]:
+    import struct
+
+    if len(data) < 12:
+        return []
+    _, _, qdcount, ancount, _, _ = struct.unpack("!HHHHHH", data[:12])
+    offset = 12
+    for _ in range(qdcount):
+        _, offset = _decode_dns_name(data, offset)
+        if offset + 4 > len(data):
+            return []
+        offset += 4
+    hostnames: list[str] = []
+    for _ in range(ancount):
+        _, offset = _decode_dns_name(data, offset)
+        if offset + 10 > len(data):
+            break
+        rtype, _, _, rdlength = struct.unpack("!HHIH", data[offset : offset + 10])
+        offset += 10
+        rdata_end = offset + rdlength
+        if rdata_end > len(data):
+            break
+        if rtype in {5, 12}:
+            hostname, _ = _decode_dns_name(data, offset)
+            if hostname:
+                hostnames.append(hostname.rstrip("."))
+        offset = rdata_end
+    return hostnames
+
+
+def _resolve_hostname_via_magicdns(
+    client_ip: str,
+    *,
+    resolver: str = _AAWM_ROUTE_HOST_MAGICDNS_RESOLVER,
+    port: int = _AAWM_ROUTE_HOST_MAGICDNS_PORT,
+    timeout_seconds: float = _AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS,
+) -> Optional[str]:
+    qname = _aawm_route_host_ptr_qname(client_ip)
+    if not qname:
+        return None
+    query = _build_dns_ptr_query(qname)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout_seconds)
+        sock.sendto(query, (resolver, port))
+        data, _ = sock.recvfrom(4096)
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+    for hostname in _extract_ptr_hostnames_from_dns_response(data):
+        resolved = _hostname_label_from_reverse_lookup(hostname)
+        if resolved:
+            return resolved
+    return None
+
+
 def _resolve_aawm_route_host_name_from_ip(
     client_ip: Optional[str],
     *,
@@ -130,9 +279,9 @@ def _resolve_aawm_route_host_name_from_ip(
     with _aawm_route_host_reverse_dns_cache_lock:
         cached = _aawm_route_host_reverse_dns_cache.get(normalized_ip)
         if cached is not None:
-            host_name, expires_at = cached
+            host_name, cached_source, expires_at = cached
             if expires_at > now:
-                return host_name, "reverse_dns_cache"
+                return host_name, _aawm_route_host_cache_source_label(cached_source)
             _aawm_route_host_reverse_dns_cache.pop(normalized_ip, None)
 
     host_name = normalized_ip
@@ -146,7 +295,11 @@ def _resolve_aawm_route_host_name_from_ip(
             host_name = resolved
             source = "reverse_dns"
     except Exception:
-        pass
+        if _is_tailscale_cgnat_client_ip(normalized_ip):
+            resolved = _resolve_hostname_via_magicdns(normalized_ip)
+            if resolved:
+                host_name = resolved
+                source = "magicdns_reverse"
     finally:
         socket.setdefaulttimeout(previous_timeout)
 
@@ -158,7 +311,8 @@ def _resolve_aawm_route_host_name_from_ip(
             _aawm_route_host_reverse_dns_cache.clear()
         _aawm_route_host_reverse_dns_cache[normalized_ip] = (
             host_name,
-            now + _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_TTL_SECONDS,
+            source,
+            now + _aawm_route_host_cache_ttl_for_source(source),
         )
     return host_name, source
 
