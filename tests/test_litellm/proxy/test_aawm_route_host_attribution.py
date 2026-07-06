@@ -576,3 +576,60 @@ def test_discover_local_tailscale_ipv4_candidates_merges_fib_trie_and_hostname(
         "100.99.166.16",
         "100.99.1.5",
     ]
+
+
+def test_aawm_route_rollup_accumulator_cooldown_line_includes_host():
+    from datetime import datetime
+
+    from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+    now = datetime(2026, 7, 6, 16, 4, 6)
+    accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+    header = "litellm#Codex[0.142.5]@thoth"
+    endpoint = "/openai_passthrough/responses"
+    target = "openrouter.ai/api/v1/chat/completions"
+    model = "openrouter/cohere/north-mini-code:free(aawm-low)"
+
+    accumulator.record(
+        group_header_label=header,
+        incoming_endpoint=endpoint,
+        outgoing_target=target,
+        model_label=model,
+        turns=0,
+        status="Cooling Down",
+        now=now,
+    )
+    flushed = accumulator.flush(force=True, now=now)
+    assert flushed[0].startswith(
+        "20260706 16:04:06 litellm#Codex[0.142.5]@thoth /openai_passthrough/responses"
+    )
+    assert " [Cooling Down]" in flushed[1]
+    assert " -> openrouter.ai/api/v1/chat/completions" in flushed[1]
+
+
+def test_aawm_route_rollup_accumulator_cooldown_line_omits_host_when_unresolved():
+    from datetime import datetime
+
+    from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+    now = datetime(2026, 7, 6, 16, 4, 6)
+    accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+    header = "litellm#Codex[0.142.5]"
+    endpoint = "/openai_passthrough/responses"
+    target = "openrouter.ai/api/v1/chat/completions"
+    model = "openrouter/cohere/north-mini-code:free(aawm-low)"
+
+    accumulator.record(
+        group_header_label=header,
+        incoming_endpoint=endpoint,
+        outgoing_target=target,
+        model_label=model,
+        turns=0,
+        status="Cooling Down",
+        now=now,
+    )
+    flushed = accumulator.flush(force=True, now=now)
+    assert "@thoth" not in flushed[0]
+    assert flushed[0].startswith(
+        "20260706 16:04:06 litellm#Codex[0.142.5] /openai_passthrough/responses"
+    )
