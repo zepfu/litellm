@@ -593,7 +593,7 @@ documented in the Antigravity OAuth Credentials section.
 `aawm-sota-anthropic` uses this order:
 
 1. native Anthropic `claude-fable-5`
-2. native Anthropic `claude-opus-4-8` as the last-resort candidate
+2. native Anthropic `claude-opus-4-8[1m]` as the last-resort candidate
 
 `aawm-code-anthropic` uses this order:
 
@@ -606,7 +606,7 @@ documented in the Antigravity OAuth Credentials section.
 
 `aawm-orchestration-anthropic` uses this order:
 
-1. native Anthropic `claude-opus-4-8` as the sole last-resort candidate
+1. native Anthropic `claude-opus-4-8[1m]` as the sole last-resort candidate
 
 OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` pricing in
 `model_prices_and_context_window.json` follows the official GPT-5.6 preview page

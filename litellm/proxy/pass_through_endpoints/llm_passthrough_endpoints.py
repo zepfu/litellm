@@ -607,7 +607,7 @@ _ANTHROPIC_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
     {
         "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-4-8[1m]",
         "route_family": "anthropic_messages",
         "last_resort": True,
     },
@@ -653,7 +653,7 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
 _ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-4-8[1m]",
         "route_family": "anthropic_messages",
         "last_resort": True,
     },

@@ -19537,7 +19537,7 @@ async def test_anthropic_auto_agent_alias_sota_falls_through_fable_to_opus():
         )
 
     assert selection2["candidate"]["provider"] == "anthropic"
-    assert selection2["candidate"]["model"] == "claude-opus-4-8"
+    assert selection2["candidate"]["model"] == "claude-opus-4-8[1m]"
     assert selection2["selection_reason"] == "last_resort"
     mock_antigravity_lane.assert_not_called()
 
@@ -19552,7 +19552,7 @@ async def test_anthropic_auto_agent_alias_sota_all_candidates_cooling_down():
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
         new=AsyncMock(return_value="google-lane"),
     ):
-        for model in ("claude-fable-5", "claude-opus-4-8"):
+        for model in ("claude-fable-5", "claude-opus-4-8[1m]"):
             await _set_anthropic_auto_agent_cooldown(
                 f"anthropic:{model}:__default__",
                 60.0,
@@ -19569,7 +19569,7 @@ async def test_anthropic_auto_agent_alias_sota_all_candidates_cooling_down():
     )
     assert [c["model"] for c in exc_info.value.detail["candidates"]] == [
         "claude-fable-5",
-        "claude-opus-4-8",
+        "claude-opus-4-8[1m]",
     ]
 
 
@@ -19589,7 +19589,7 @@ async def test_anthropic_auto_agent_alias_orchestration_selects_opus_4_8():
         )
 
     assert selection["candidate"]["provider"] == "anthropic"
-    assert selection["candidate"]["model"] == "claude-opus-4-8"
+    assert selection["candidate"]["model"] == "claude-opus-4-8[1m]"
     assert selection["candidate"]["route_family"] == "anthropic_messages"
     assert selection["candidate"]["last_resort"] is True
     assert selection["selection_reason"] == "last_resort"
@@ -19607,7 +19607,7 @@ async def test_anthropic_auto_agent_alias_orchestration_all_candidates_cooling_d
         new=AsyncMock(return_value="google-lane"),
     ):
         await _set_anthropic_auto_agent_cooldown(
-            "anthropic:claude-opus-4-8:__default__",
+            "anthropic:claude-opus-4-8[1m]:__default__",
             60.0,
         )
         with pytest.raises(HTTPException) as exc_info:
@@ -19621,7 +19621,7 @@ async def test_anthropic_auto_agent_alias_orchestration_all_candidates_cooling_d
         "aawm_anthropic_auto_agent_all_candidates_cooling_down"
     )
     assert [c["model"] for c in exc_info.value.detail["candidates"]] == [
-        "claude-opus-4-8",
+        "claude-opus-4-8[1m]",
     ]
 
 
@@ -22093,7 +22093,7 @@ async def test_anthropic_auto_agent_alias_in_flight_redispatch_uses_requested_al
         "aawm-sota-anthropic:claude-session:session:claude-session"
     ] = {
         "provider": "anthropic",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-4-8[1m]",
         "route_family": "anthropic_messages",
         "last_resort": False,
         "expires_at_monotonic": time.monotonic() + 3600,
@@ -22129,7 +22129,7 @@ async def test_anthropic_auto_agent_alias_in_flight_redispatch_uses_requested_al
     )
     assert exc_info.value.detail["redispatch_model"] == "aawm-sota-anthropic"
     assert exc_info.value.detail["selected_provider"] == "anthropic"
-    assert exc_info.value.detail["selected_model"] == "claude-opus-4-8"
+    assert exc_info.value.detail["selected_model"] == "claude-opus-4-8[1m]"
     assert "MODEL_AT_CAPACITY" in exc_info.value.detail["error_tokens"]
     mock_antigravity.assert_not_called()
 
