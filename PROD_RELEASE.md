@@ -335,19 +335,19 @@ coverage.
     --write-artifact /tmp/litellm-prod-focused.json
 ```
 
-Then run the default prod adapter harness.
+Do not run the default Anthropic adapter harness
+(`run_anthropic_adapter_acceptance.py --target prod`) as part of routine
+prod validation. Use one of the following instead based on the changed lane:
 
-```bash
-./.venv/bin/python -m dotenv run -- \
-  ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
-    --target prod \
-    --write-artifact /tmp/litellm-prod-harness-<version>.json
-```
+- For Anthropic-adjacent changes, run scoped adapter cases via `--cases` that
+  specifically target the modified code path(s).
+- For lanes not covered by the adapter suite, run small direct smokes that validate
+  the changed path.
 
 Acceptance requires:
 
-- zero default-suite failures
-- zero default-suite warnings unless a documented warning-only case was
+- zero failures for all executed focused cases/smokes
+- zero warnings unless a documented warning-only case was
   intentionally selected
 - Langfuse traces under `environment=prod`
 - session tags tied to the initiating parent session
