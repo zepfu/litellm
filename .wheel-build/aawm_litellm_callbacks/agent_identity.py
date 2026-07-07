@@ -72,6 +72,7 @@ except ModuleNotFoundError as exc:
         score_agent_quality_context,
     )
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.proxy.aawm_route_logging import _resolve_aawm_route_host_name_from_ip
 from litellm.secret_managers.main import get_secret_str
 
 _CLAUDE_PERMISSION_CHECK_OUTPUT_RE = re.compile(
@@ -262,6 +263,8 @@ CREATE TABLE IF NOT EXISTS public.session_history (
     client_name TEXT,
     client_version TEXT,
     client_user_agent TEXT,
+    client_ip TEXT,
+    host_name TEXT,
     token_permission_input INTEGER NOT NULL DEFAULT 0,
     token_permission_output INTEGER NOT NULL DEFAULT 0,
     permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -368,6 +371,8 @@ _AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_name TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_version TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_user_agent TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_ip TEXT",
+    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS host_name TEXT",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_input INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_output INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0",
@@ -1012,6 +1017,8 @@ INSERT INTO public.session_history (
     client_name,
     client_version,
     client_user_agent,
+    client_ip,
+    host_name,
     token_permission_input,
     token_permission_output,
     permission_usd_cost,
@@ -1096,16 +1103,16 @@ INSERT INTO public.session_history (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
     $11, COALESCE($11, $12, NOW()), $12, $13, $14, $15, $16, $17, $18, $19, $20,
     $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb,
-    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44::jsonb, $45, $46, $47, $48, $49, $50, $51::jsonb, $52,
-    $53, $54, $55, $56, $57, $58, $59, $60, $61,
-    $62, $63, $64, $65, $66, $67, $68, $69, $70, $71,
-    $72, $73, $74, $75, $76,
-    $77, $78, $79, $80, $81, $82, $83, $84, $85, $86,
-    $87, $88, $89, $90, $91, $92, $93, $94, $95, $96,
-    $97, $98, $99, $100,
-    $101, $102, $103, $104, $105, $106, $107, $108, $109, $110,
-    $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121::jsonb,
-    $122, $123, $124, $125, $126, $127
+    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44::jsonb, $45, $46, $47, $48, $49, $50, $51, $52, $53::jsonb, $54,
+    $55, $56, $57, $58, $59, $60, $61, $62, $63,
+    $64, $65, $66, $67, $68, $69, $70, $71, $72, $73,
+    $74, $75, $76, $77, $78,
+    $79, $80, $81, $82, $83, $84, $85, $86, $87, $88,
+    $89, $90, $91, $92, $93, $94, $95, $96, $97, $98,
+    $99, $100, $101, $102,
+    $103, $104, $105, $106, $107, $108, $109, $110, $111, $112,
+    $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123::jsonb,
+    $124, $125, $126, $127, $128, $129
 )
 ON CONFLICT (litellm_call_id) DO UPDATE SET
     session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
@@ -1493,6 +1500,8 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
         NULLIF(EXCLUDED.client_user_agent, ''),
         session_history.client_user_agent
     ),
+    client_ip = COALESCE(NULLIF(EXCLUDED.client_ip, ''), session_history.client_ip),
+    host_name = COALESCE(NULLIF(EXCLUDED.host_name, ''), session_history.host_name),
     repository = COALESCE(NULLIF(EXCLUDED.repository, ''), session_history.repository),
     input_system_tokens_estimated = CASE
         WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_system_tokens_estimated
@@ -2338,6 +2347,10 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "client_name",
     "client_version",
     "client_user_agent",
+    "client_ip",
+    "client_ip_source",
+    "host_name",
+    "host_name_source",
     "repository",
     "route_tag",
     "openai_passthrough_route_family",
@@ -5814,6 +5827,79 @@ def _extract_claude_code_version_from_metadata(
         _first_non_empty_string(metadata.get("cc_entrypoint"), billing_header_fields.get("cc_entrypoint")),
     )
 
+_SESSION_HISTORY_LOOPBACK_HOST_LABEL = "localhost"
+
+
+def _clean_session_history_client_ip_candidate(value: Any) -> Optional[str]:
+    cleaned = _clean_non_empty_string(value)
+    if not cleaned:
+        return None
+    if "," in cleaned:
+        cleaned = cleaned.split(",", 1)[0].strip()
+    return cleaned or None
+
+
+def _canonical_session_history_client_ip(value: Any) -> Optional[str]:
+    cleaned = _clean_session_history_client_ip_candidate(value)
+    if not cleaned:
+        return None
+    try:
+        return str(ipaddress.ip_address(cleaned))
+    except ValueError:
+        if cleaned.lower() == _SESSION_HISTORY_LOOPBACK_HOST_LABEL:
+            return _SESSION_HISTORY_LOOPBACK_HOST_LABEL
+        return None
+
+
+def _resolve_session_history_host_name_from_ip(
+    client_ip: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    return _resolve_aawm_route_host_name_from_ip(client_ip)
+
+
+def _extract_session_host_attribution(
+    metadata: Dict[str, Any],
+) -> Dict[str, Optional[str]]:
+    route_rollup_context = metadata.get("aawm_route_rollup_context")
+    if not isinstance(route_rollup_context, dict):
+        route_rollup_context = {}
+
+    client_ip = None
+    for candidate in (
+        metadata.get("requester_ip_address"),
+        metadata.get("client_ip"),
+        route_rollup_context.get("client_ip"),
+    ):
+        client_ip = _canonical_session_history_client_ip(candidate)
+        if client_ip:
+            break
+
+    host_name = _first_non_empty_string(
+        metadata.get("host_name"),
+        route_rollup_context.get("host_name"),
+    )
+    host_name_source = _first_non_empty_string(
+        metadata.get("host_name_source"),
+        route_rollup_context.get("host_name_source"),
+    )
+    if host_name is None and client_ip is not None:
+        host_name, resolved_source = _resolve_session_history_host_name_from_ip(
+            client_ip
+        )
+        if host_name_source is None:
+            host_name_source = resolved_source
+
+    client_ip_source = _first_non_empty_string(
+        metadata.get("client_ip_source"),
+        route_rollup_context.get("client_ip_source"),
+    )
+    return {
+        "client_ip": client_ip,
+        "host_name": host_name,
+        "client_ip_source": client_ip_source,
+        "host_name_source": host_name_source,
+    }
+
 
 def _build_session_runtime_identity(
     *,
@@ -5903,6 +5989,10 @@ def _enrich_session_runtime_identity_metadata(kwargs: Dict[str, Any]) -> None:
             if isinstance(value, dict) and value:
                 metadata[key] = value
             continue
+        if value is not None:
+            metadata[key] = value
+    host_attribution = _extract_session_host_attribution(metadata)
+    for key, value in host_attribution.items():
         if value is not None:
             metadata[key] = value
 
@@ -14278,6 +14368,8 @@ def _normalize_session_runtime_identity_on_record(record: Dict[str, Any]) -> Non
         "client_name",
         "client_version",
         "client_user_agent",
+        "client_ip",
+        "host_name",
     ):
         if not _clean_non_empty_string(record.get(key)):
             record[key] = identity.get(key)
@@ -14288,6 +14380,10 @@ def _normalize_session_runtime_identity_on_record(record: Dict[str, Any]) -> Non
         **metadata_wheel_versions,
         **record_wheel_versions,
     }
+    host_attribution = _extract_session_host_attribution(metadata)
+    for key in ("client_ip", "host_name"):
+        if not _clean_non_empty_string(record.get(key)):
+            record[key] = host_attribution.get(key)
 
 
 _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS = (
@@ -15073,6 +15169,8 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:  # no
         "client_name",
         "client_version",
         "client_user_agent",
+        "client_ip",
+        "host_name",
     ):
         value = _clean_non_empty_string(record.get(key))
         if value is not None:
@@ -19272,6 +19370,7 @@ def _build_session_history_record(  # noqa: PLR0915
         "client_name": runtime_identity["client_name"],
         "client_version": runtime_identity["client_version"],
         "client_user_agent": runtime_identity["client_user_agent"],
+        **_extract_session_host_attribution(metadata),
         **prompt_overhead_breakdown,
         "metadata": _build_session_history_metadata(
             metadata=metadata,
@@ -19421,6 +19520,8 @@ def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]
         record.get("client_name"),
         record.get("client_version"),
         record.get("client_user_agent"),
+        record.get("client_ip"),
+        record.get("host_name"),
         record.get("token_permission_input", 0),
         record.get("token_permission_output", 0),
         record.get("permission_usd_cost", 0),

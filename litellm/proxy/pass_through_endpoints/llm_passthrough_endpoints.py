@@ -102,6 +102,7 @@ from litellm.proxy.aawm_route_logging import (
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
     record_aawm_route_rollup_turn,
+    resolve_aawm_route_host_attribution,
 )
 try:
     from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
@@ -3060,6 +3061,45 @@ def _auto_agent_alias_route_status_message(event: dict[str, Any]) -> str:
     return "; ".join(parts) or "route status changed"
 
 
+def _resolve_auto_agent_alias_route_host_attribution(
+    request: Request,
+) -> dict[str, Optional[str]]:
+    try:
+        return resolve_aawm_route_host_attribution(request)
+    except Exception:
+        return {
+            "client_ip": None,
+            "client_ip_source": None,
+            "host_name": None,
+            "host_name_source": None,
+        }
+
+
+def _build_auto_agent_alias_rollup_group_header_label(
+    *,
+    repository: Optional[str],
+    client_product_label: Optional[str],
+    host_name: Optional[str],
+) -> Optional[str]:
+    return build_aawm_route_rollup_group_header_label(
+        repository=repository,
+        client_product_label=client_product_label,
+        host_name=host_name,
+    )
+
+
+def _resolve_auto_agent_alias_route_rollup_group_header_label(
+    event: dict[str, Any],
+) -> Optional[str]:
+    group_header_label = _clean_codex_auth_value(event.get("rollup_group_header_label"))
+    if not group_header_label:
+        return None
+    host_name = _clean_codex_auth_value(event.get("host_name"))
+    if "@" in group_header_label or not host_name:
+        return group_header_label
+    return f"{group_header_label}@{host_name}"
+
+
 def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
     status = _auto_agent_alias_route_rollup_status(event)
     if status is None:
@@ -3091,7 +3131,7 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
             message=message,
         )
 
-    group_header_label = _clean_codex_auth_value(event.get("rollup_group_header_label"))
+    group_header_label = _resolve_auto_agent_alias_route_rollup_group_header_label(event)
     incoming_endpoint = _clean_codex_auth_value(event.get("incoming_endpoint"))
     outgoing_target = (
         _clean_codex_auth_value(event.get("outgoing_target"))
@@ -3185,6 +3225,7 @@ def _emit_auto_agent_alias_no_candidate_event(
         request,
         request_body,
     )
+    host_attribution = _resolve_auto_agent_alias_route_host_attribution(request)
     _emit_auto_agent_alias_route_event(
         {
             "observed_at": _format_auto_agent_alias_timestamp(
@@ -3204,9 +3245,14 @@ def _emit_auto_agent_alias_no_candidate_event(
             ),
             "repository": repository,
             "client_product_label": client_product_label,
-            "rollup_group_header_label": build_aawm_route_rollup_group_header_label(
+            "client_ip": host_attribution.get("client_ip"),
+            "client_ip_source": host_attribution.get("client_ip_source"),
+            "host_name": host_attribution.get("host_name"),
+            "host_name_source": host_attribution.get("host_name_source"),
+            "rollup_group_header_label": _build_auto_agent_alias_rollup_group_header_label(
                 repository=repository,
                 client_product_label=client_product_label,
+                host_name=host_attribution.get("host_name"),
             ),
             "incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint(request),
             "outgoing_target": "candidate_selection",
@@ -3266,6 +3312,7 @@ def _build_auto_agent_alias_audit_event(
         request,
         request_body,
     )
+    host_attribution = _resolve_auto_agent_alias_route_host_attribution(request)
     event: dict[str, Any] = {
         "observed_at": _format_auto_agent_alias_timestamp(datetime.now(timezone.utc)),
         "alias_family": alias_family,
@@ -3280,9 +3327,14 @@ def _build_auto_agent_alias_audit_event(
         ),
         "repository": repository,
         "client_product_label": client_product_label,
-        "rollup_group_header_label": build_aawm_route_rollup_group_header_label(
+        "client_ip": host_attribution.get("client_ip"),
+        "client_ip_source": host_attribution.get("client_ip_source"),
+        "host_name": host_attribution.get("host_name"),
+        "host_name_source": host_attribution.get("host_name_source"),
+        "rollup_group_header_label": _build_auto_agent_alias_rollup_group_header_label(
             repository=repository,
             client_product_label=client_product_label,
+            host_name=host_attribution.get("host_name"),
         ),
         "incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint(request),
         "outgoing_target": _resolve_auto_agent_alias_route_rollup_outgoing_target(

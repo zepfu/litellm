@@ -85,6 +85,53 @@ stored metadata (and `inbound_model_alias` when present) was insufficient to
 classify extended context; it does not mean LiteLLM inferred a window from
 observed token counts.
 
+## Host Attribution
+
+`public.session_history` includes nullable `client_ip` and `host_name` text
+columns. They capture the incoming LiteLLM client address and the resolved
+display host used by AAWM route logging.
+
+- `client_ip` stores the canonical requester IP literal when one is available.
+- `host_name` stores the resolved host label shown in route rollup headers, for
+  example `thoth` from Tailscale/MagicDNS reverse lookup, the local machine's
+  Tailscale MagicDNS short hostname when loopback or Docker gateway-adjacent
+  traffic is attributed via lookup (`magicdns_local`), `localhost` when that
+  local lookup fails, or the IP literal when DNS has no better label.
+- Metadata may also retain `client_ip_source` and `host_name_source` for debugging
+  (`request_client`, `x_forwarded_for`, `loopback`, `docker_bridge_gateway`,
+  `tailscale_self`, `tailscale_self_cache`, `reverse_dns`, `magicdns_reverse`,
+  `magicdns_local`, `magicdns_local_cache`, `reverse_dns_cache`,
+  `magicdns_reverse_cache`, `ip_literal`, `ip_literal_cache`).
+- For local display sources (loopback, unspecified, link-local, Docker bridge
+  gateway), LiteLLM resolves the host label in this order:
+  1. A sanitized Tailscale self identity snapshot (for example
+     `Self.DNSName`, `Self.TailscaleIPs`, and `MagicDNSSuffix` only) from a
+     read-only directory mounted at `/host/aawm` in `litellm-dev`, with the
+     snapshot file at `/host/aawm/tailscale-self.json`.
+  2. The existing hostname/MagicDNS discovery path: process-visible
+     `100.64.0.0/10` addresses, hostnames/FQDNs from the process and optional
+     read-only host hostname files such as `/host/etc/hostname`, tailnet search
+     domains from resolver config, direct MagicDNS A lookups, and MagicDNS PTR
+     for the final short hostname.
+  3. `localhost` when neither path yields a label.
+  The snapshot path is configurable with
+  `AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH`; host operators can refresh it
+  with `scripts/write_tailscale_self_snapshot.py` without mounting the Tailscale
+  socket into the container. The dev compose mount uses
+  `AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_HOST_DIR` for the host-side snapshot
+  directory. Results are cached under dedicated local-host cache keys so
+  repeated local requests do not rescan discovery surfaces.
+- For Tailscale CGNAT client IPs in `100.64.0.0/10`, LiteLLM tries normal reverse
+  DNS first. If that misses, it queries the MagicDNS resolver at `100.100.100.100`
+  directly for PTR and uses the returned short hostname when available.
+- Successful hostname resolutions (including MagicDNS) use a longer cache TTL;
+  IP-literal fallbacks use a shorter TTL so a later MagicDNS success can replace
+  them without waiting for the full hostname cache window.
+
+Route rollup headers use the exact display form
+`repo#Client[version]@host`, for example
+`aawm-infrastructure#Codex[0.142.5]@thoth /openai_passthrough/responses`.
+
 ## Repository And Tenant Attribution
 
 `session_history.repository` identifies the workspace or project label used for
