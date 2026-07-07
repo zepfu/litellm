@@ -53,6 +53,31 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.115 — Anthropic SOTA/orchestration alias model selector normalization
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.115`. The
+`aawm-sota-anthropic` last-resort candidate and the
+`aawm-orchestration-anthropic` candidate now select `claude-opus-4-8[1m]`
+instead of the base `claude-opus-4-8` label. The native Anthropic route still
+normalizes the request to the base upstream model with the 1m context beta
+header while preserving the requested alias label in routing/session metadata.
+This release also carries forward the full `aawm.114` release head.
+
+**Why:** Anthropic-style SOTA and orchestration aliases should exercise the
+1m-window Opus lane when they fall through to Opus, without changing direct
+`claude-opus-4-8` routes or relying on callers to remember the beta-specific
+label.
+
+**Why not upstream:** These aliases and the bracketed 1m selector convention are
+AAWM fork-local routing policy layered on top of LiteLLM passthrough behavior.
+
+**Validation status:** Focused proxy passthrough tests cover the SOTA,
+orchestration, cooldown/redispatch, and 1m-context routes. Dev container
+readiness plus in-container alias inspection proved `aawm-sota-anthropic`
+resolves to `['claude-fable-5', 'claude-opus-4-8[1m]']` and
+`aawm-orchestration-anthropic` resolves to `['claude-opus-4-8[1m]']` before prod
+promotion.
+
 ### aawm.114 — Anthropic credential diagnostics and quota/context metadata release head
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.114`. Direct
