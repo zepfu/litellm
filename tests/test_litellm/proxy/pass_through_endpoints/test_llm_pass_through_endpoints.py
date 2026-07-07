@@ -25458,6 +25458,164 @@ def test_auto_agent_alias_route_event_records_zero_turn_rollup(monkeypatch):
     ]
 
 
+def test_auto_agent_alias_route_event_records_cooldown_rollup_with_host(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    rollups = []
+    monkeypatch.setattr(endpoints, "emit_aawm_route_status_event", lambda **kwargs: None)
+    monkeypatch.setattr(
+        endpoints,
+        "record_aawm_route_rollup",
+        lambda **kwargs: rollups.append(kwargs),
+    )
+    monkeypatch.setattr(endpoints.verbose_proxy_logger, "warning", lambda message: None)
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "rate_limited",
+            "alias_model": "aawm-low",
+            "model": "openrouter/cohere/north-mini-code:free",
+            "repository": "litellm",
+            "client_product_label": "codex-cli/0.142.5",
+            "host_name": "thoth",
+            "rollup_group_header_label": "litellm#Codex[0.142.5]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "openrouter.ai/api/v1/chat/completions",
+        },
+        level="warning",
+    )
+
+    assert rollups == [
+        {
+            "group_header_label": "litellm#Codex[0.142.5]@thoth",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "openrouter.ai/api/v1/chat/completions",
+            "model_label": "openrouter/cohere/north-mini-code:free(aawm-low)",
+            "turns": 0,
+            "status": "Cooling Down",
+        }
+    ]
+
+
+def test_auto_agent_alias_audit_event_builds_cooldown_rollup_with_request_host(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    request = _build_codex_auto_agent_request()
+    request.headers = {
+        **request.headers,
+        "user-agent": "codex-cli/0.142.5",
+    }
+    request_body = {
+        "litellm_metadata": {
+            "repository": "litellm",
+            "session_id": "codex-session",
+        }
+    }
+    monkeypatch.setattr(
+        endpoints,
+        "resolve_aawm_route_host_attribution",
+        lambda request: {
+            "client_ip": "100.99.166.16",
+            "client_ip_source": "request_client",
+            "host_name": "thoth",
+            "host_name_source": "magicdns_reverse",
+        },
+    )
+
+    event = endpoints._build_auto_agent_alias_audit_event(
+        alias_family="codex",
+        alias_model="aawm-low",
+        request=request,
+        request_body=request_body,
+        selection={
+            "lane_key": "openrouter",
+            "session_key": "codex-session",
+        },
+        candidate={
+            "provider": "openrouter",
+            "model": "openrouter/cohere/north-mini-code:free",
+            "route_family": "codex_openrouter_completion_adapter",
+        },
+        event_type="candidate_retryable_failure",
+        candidate_status="cooldown_set",
+        failure_class="rate_limited",
+    )
+
+    assert event["rollup_group_header_label"] == (
+        "litellm#Codex[0.142.5]@thoth"
+    )
+    assert event["client_ip"] == "100.99.166.16"
+    assert event["host_name_source"] == "magicdns_reverse"
+
+
+def test_auto_agent_alias_route_event_cooldown_rollup_keeps_no_host_without_context(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    rollups = []
+    monkeypatch.setattr(endpoints, "emit_aawm_route_status_event", lambda **kwargs: None)
+    monkeypatch.setattr(
+        endpoints,
+        "record_aawm_route_rollup",
+        lambda **kwargs: rollups.append(kwargs),
+    )
+    monkeypatch.setattr(endpoints.verbose_proxy_logger, "warning", lambda message: None)
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "rate_limited",
+            "alias_model": "aawm-low",
+            "model": "openrouter/cohere/north-mini-code:free",
+            "rollup_group_header_label": "litellm#Codex[0.142.5]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "openrouter.ai/api/v1/chat/completions",
+        },
+        level="warning",
+    )
+
+    assert rollups[0]["group_header_label"] == "litellm#Codex[0.142.5]"
+    assert "@" not in rollups[0]["group_header_label"]
+
+
+def test_auto_agent_alias_route_event_cooldown_rollup_preserves_existing_host_label(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    rollups = []
+    monkeypatch.setattr(endpoints, "emit_aawm_route_status_event", lambda **kwargs: None)
+    monkeypatch.setattr(
+        endpoints,
+        "record_aawm_route_rollup",
+        lambda **kwargs: rollups.append(kwargs),
+    )
+    monkeypatch.setattr(endpoints.verbose_proxy_logger, "warning", lambda message: None)
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "rate_limited",
+            "alias_model": "aawm-low",
+            "model": "openrouter/cohere/north-mini-code:free",
+            "host_name": "other-host",
+            "rollup_group_header_label": "litellm#Codex[0.142.5]@thoth",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "openrouter.ai/api/v1/chat/completions",
+        },
+        level="warning",
+    )
+
+    assert rollups[0]["group_header_label"] == "litellm#Codex[0.142.5]@thoth"
+
+
 def test_auto_agent_alias_route_event_prefers_real_opencode_zen_target(monkeypatch):
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
 

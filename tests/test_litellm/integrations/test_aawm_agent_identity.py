@@ -1574,8 +1574,46 @@ def test_build_session_history_record_uses_repository_header_and_metadata() -> N
     assert record["metadata"]["repository"] == "zepfu/litellm"
 
     payload = _build_session_history_db_payload(record)
-    assert payload[51] == "zepfu/litellm"
+    assert payload[53] == "zepfu/litellm"
 
+
+
+
+def test_build_session_history_record_persists_client_ip_and_host_name() -> None:
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-host-attribution"
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-host-attribution"
+    kwargs["litellm_params"]["metadata"]["client_ip"] = "100.99.1.5"
+    kwargs["litellm_params"]["metadata"]["client_ip_source"] = "request_client"
+    kwargs["litellm_params"]["metadata"]["host_name"] = "thoth"
+    kwargs["litellm_params"]["metadata"]["host_name_source"] = "reverse_dns"
+
+    result = {
+        "id": "resp-host-attribution",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time="2026-04-19T21:00:00Z",
+        end_time="2026-04-19T21:00:01Z",
+    )
+
+    assert record is not None
+    assert record["client_ip"] == "100.99.1.5"
+    assert record["host_name"] == "thoth"
+    assert record["metadata"]["client_ip"] == "100.99.1.5"
+    assert record["metadata"]["host_name"] == "thoth"
+    assert record["metadata"]["host_name_source"] == "reverse_dns"
+
+    payload = _build_session_history_db_payload(record)
+    assert payload[47] == "100.99.1.5"
+    assert payload[48] == "thoth"
 
 def test_build_session_history_record_prefers_repository_header_over_request_context() -> None:
     kwargs = _base_kwargs()
@@ -3382,15 +3420,15 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
 
     payload = _build_session_history_db_payload(record)
     assert len(payload) == _session_history_insert_placeholder_count()
-    assert payload[71] is True
-    assert payload[72] is False
-    assert payload[73] == "json_schema"
-    assert payload[74] == record["structured_output_schema_hash"]
-    assert payload[75] is None
-    assert payload[76:98] == (None,) * 22
-    assert payload[98] == pytest.approx(1.0)
-    assert payload[99] == 0
-    assert payload[100:117] == (
+    assert payload[73] is True
+    assert payload[74] is False
+    assert payload[75] == "json_schema"
+    assert payload[76] == record["structured_output_schema_hash"]
+    assert payload[77] is None
+    assert payload[78:100] == (None,) * 22
+    assert payload[100] == pytest.approx(1.0)
+    assert payload[101] == 0
+    assert payload[102:119] == (
         0.0,
         0.0,
         0,
@@ -3409,11 +3447,11 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
         0,
         0,
     )
-    assert payload[117:120] == (None, None, None)
-    assert json.loads(payload[120]) == {
+    assert payload[119:122] == (None, None, None)
+    assert json.loads(payload[122]) == {
         "agent_quality_rule_catalog_version": "2026-05-31.v1"
     }
-    assert payload[121:125] == (False, None, None, None)
+    assert payload[123:127] == (False, None, None, None)
 
 
 def test_build_session_history_record_persists_agent_score_metadata() -> None:  # noqa: PLR0915
@@ -3487,40 +3525,40 @@ def test_build_session_history_record_persists_agent_score_metadata() -> None:  
 
     payload = _build_session_history_db_payload(record)
     assert len(payload) == _session_history_insert_placeholder_count()
-    assert payload[76] == pytest.approx(0.0)
-    assert payload[77] is True
-    assert payload[80] is False
-    assert payload[81] == pytest.approx(0.0)
-    assert payload[82] == 2
+    assert payload[78] == pytest.approx(0.0)
+    assert payload[79] is True
+    assert payload[82] is False
     assert payload[83] == pytest.approx(0.0)
-    assert payload[84] == pytest.approx(0.0)
-    assert payload[85] == pytest.approx(1.0)
-    assert payload[86] == pytest.approx(0.5)
+    assert payload[84] == 2
+    assert payload[85] == pytest.approx(0.0)
+    assert payload[86] == pytest.approx(0.0)
     assert payload[87] == pytest.approx(1.0)
-    assert payload[88] == pytest.approx(1.0)
-    assert payload[89] == pytest.approx(0.0)
-    assert payload[90] == pytest.approx(0.0)
-    assert payload[91] == pytest.approx(1.0)
-    assert payload[92] == pytest.approx(1.0)
-    assert payload[93] == pytest.approx(0.0)
-    assert payload[94] == pytest.approx(0.0)
+    assert payload[88] == pytest.approx(0.5)
+    assert payload[89] == pytest.approx(1.0)
+    assert payload[90] == pytest.approx(1.0)
+    assert payload[91] == pytest.approx(0.0)
+    assert payload[92] == pytest.approx(0.0)
+    assert payload[93] == pytest.approx(1.0)
+    assert payload[94] == pytest.approx(1.0)
     assert payload[95] == pytest.approx(0.0)
-    assert payload[96] is None
-    assert payload[97] == pytest.approx(1.0)
-    assert payload[98] == pytest.approx(1.0)
-    assert payload[99] == 0
-    assert payload[100] == pytest.approx(0.0)
-    assert payload[101] == pytest.approx(0.0)
-    assert payload[109] == pytest.approx(0.0)
-    assert payload[110] == pytest.approx(0.0)
-    assert payload[117:120] == (None, None, None)
-    assert json.loads(payload[120]) == {
+    assert payload[96] == pytest.approx(0.0)
+    assert payload[97] == pytest.approx(0.0)
+    assert payload[98] is None
+    assert payload[99] == pytest.approx(1.0)
+    assert payload[100] == pytest.approx(1.0)
+    assert payload[101] == 0
+    assert payload[102] == pytest.approx(0.0)
+    assert payload[103] == pytest.approx(0.0)
+    assert payload[111] == pytest.approx(0.0)
+    assert payload[112] == pytest.approx(0.0)
+    assert payload[119:122] == (None, None, None)
+    assert json.loads(payload[122]) == {
         "response_meaningfulness": ["no_meaningful_output"],
         "read_only_policy_compliance": ["mutating_tool:Bash"],
         "agent_quality_rule_catalog_version": "2026-05-31.v1",
     }
-    assert payload[121:125] == (False, None, None, None)
-    payload_metadata = json.loads(payload[50])
+    assert payload[123:127] == (False, None, None, None)
+    payload_metadata = json.loads(payload[52])
     assert payload_metadata["usage_trace_quality_score"] == pytest.approx(0.0)
     assert payload_metadata["usage_empty_completion_failure"] is True
     assert payload_metadata["usage_answer_completeness_score"] == pytest.approx(1.0)
@@ -4155,16 +4193,16 @@ def test_build_session_history_record_derives_passthrough_latency_breakdown() ->
     assert record["latency_unclassified_ms"] == pytest.approx(5.0)
     payload = _build_session_history_db_payload(record)
     assert len(payload) == _session_history_insert_placeholder_count()
-    assert payload[61] == pytest.approx(25.0)
-    assert payload[62] == pytest.approx(100.0)
-    assert payload[63] == pytest.approx(130.0)
-    assert payload[64] == pytest.approx(50.0)
-    assert payload[65] == pytest.approx(10.0)
-    assert payload[66] == pytest.approx(15.0)
-    assert payload[70] is None
-    assert payload[67] == pytest.approx(40.0)
-    assert payload[68] == pytest.approx(60.0)
-    assert payload[69] == pytest.approx(5.0)
+    assert payload[63] == pytest.approx(25.0)
+    assert payload[64] == pytest.approx(100.0)
+    assert payload[65] == pytest.approx(130.0)
+    assert payload[66] == pytest.approx(50.0)
+    assert payload[67] == pytest.approx(10.0)
+    assert payload[68] == pytest.approx(15.0)
+    assert payload[72] is None
+    assert payload[69] == pytest.approx(40.0)
+    assert payload[70] == pytest.approx(60.0)
+    assert payload[71] == pytest.approx(5.0)
 
 
 def test_build_session_history_record_preserves_explicit_openrouter_model() -> None:
@@ -5561,7 +5599,7 @@ def test_build_session_history_record_routes_auto_agent_alias_to_selected_provid
     assert record["model_group"] == "deepseek/deepseek-v4-flash:free"
     payload = _build_session_history_db_payload(record)
     assert payload[5] == "deepseek/deepseek-v4-flash:free"
-    assert payload[125] == "aawm-codex-agent-auto"
+    assert payload[127] == "aawm-codex-agent-auto"
 
 
 def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selected_provider() -> None:
@@ -5607,7 +5645,7 @@ def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selec
     assert record["model_group"] == "claude-sonnet-4-6"
     payload = _build_session_history_db_payload(record)
     assert payload[5] == "claude-sonnet-4-6"
-    assert payload[125] == "aawm-code-anthropic"
+    assert payload[127] == "aawm-code-anthropic"
 
 
 def test_build_session_history_record_sets_inbound_model_alias_for_direct_request() -> None:
@@ -5645,7 +5683,7 @@ def test_build_session_history_record_sets_inbound_model_alias_for_direct_reques
     assert record["model"] == record["inbound_model_alias"]
     payload = _build_session_history_db_payload(record)
     assert payload[5] == "gpt-5.4-mini"
-    assert payload[125] == "gpt-5.4-mini"
+    assert payload[127] == "gpt-5.4-mini"
 
 
 def test_build_session_history_record_routes_openai_compatible_openrouter_model() -> None:
@@ -6316,7 +6354,7 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
     assert payload[29] == 0
     assert payload[40] == "dev"
     assert payload[41] == "1.82.3+aawm.25"
-    assert payload[61:71] == (
+    assert payload[63:73] == (
         None,
         None,
         None,
@@ -6328,19 +6366,19 @@ def test_session_history_db_payload_sanitizes_zero_reported_reasoning() -> None:
         None,
         None,
     )
-    assert payload[71:76] == (False, False, None, None, None)
-    assert payload[76:120] == (None,) * 44
-    assert json.loads(payload[120]) == {}
-    assert payload[121:125] == (False, None, None, None)
+    assert payload[73:78] == (False, False, None, None, None)
+    assert payload[78:122] == (None,) * 44
+    assert json.loads(payload[122]) == {}
+    assert payload[123:127] == (False, None, None, None)
     assert payload[42] == "aawm.25"
     assert "aawm-litellm-callbacks" in payload[43]
     assert payload[44] == "codex-tui"
     assert payload[45] == "0.124.0"
     assert payload[46] == "codex-tui/0.124.0"
-    assert payload[47] == 100
-    assert payload[48] == 7
-    assert payload[49] == pytest.approx(0.016138)
-    payload_metadata = json.loads(payload[50])
+    assert payload[49] == 100
+    assert payload[50] == 7
+    assert payload[51] == pytest.approx(0.016138)
+    payload_metadata = json.loads(payload[52])
     assert payload_metadata["litellm_environment"] == "dev"
     assert payload_metadata["client_name"] == "codex-tui"
     assert payload_metadata["usage_invalid_tool_call_count"] == 0
@@ -6730,10 +6768,10 @@ def test_d1_169_build_session_history_db_payload_appends_compact_summary_fields(
     assert record is not None
     payload = _build_session_history_db_payload(record)
     assert len(payload) == _session_history_insert_placeholder_count()
-    assert payload[121] == record["is_compact_summary"]
-    assert payload[122] == record["compact_summary_source"]
-    assert payload[123] == record["compact_summary_id"]
-    assert payload[124] == record["compact_summary_role"]
+    assert payload[123] == record["is_compact_summary"]
+    assert payload[124] == record["compact_summary_source"]
+    assert payload[125] == record["compact_summary_id"]
+    assert payload[126] == record["compact_summary_role"]
 
 
 def test_build_session_history_record_marks_anthropic_provider_cache_write_only() -> None:
@@ -10278,9 +10316,9 @@ def test_failure_record_persists_structured_output_failure_in_session_history() 
     ] is True
 
     payload = _build_session_history_db_payload(record)
-    assert payload[71] is True
-    assert payload[72] is True
-    assert payload[75] == "schema_validation_error"
+    assert payload[73] is True
+    assert payload[74] is True
+    assert payload[77] == "schema_validation_error"
 
 
 def test_failure_record_persists_structured_output_attempt_for_unrelated_error() -> None:
@@ -12683,8 +12721,8 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert executed_args[1] == "call-123"
     assert executed_args[2] == "session-123"
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
-    assert executed_args[126] == "anthropic/claude-sonnet-4-6"
-    assert executed_args[127] is None
+    assert executed_args[128] == "anthropic/claude-sonnet-4-6"
+    assert executed_args[129] is None
     gap_args = mock_conn.execute.await_args_list[2].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-123"]
@@ -12775,7 +12813,7 @@ async def test_persist_session_history_record_strips_postgres_nul_bytes(
     assert "INSERT INTO public.session_history" in executed_args[0]
     _assert_no_postgres_nul_bytes(executed_args[1:])
     assert json.loads(executed_args[31]) == ["Read"]
-    metadata_payload = json.loads(executed_args[51])
+    metadata_payload = json.loads(executed_args[53])
     assert metadata_payload["requested_model_alias"] == "aawm-sota-anthropic"
     assert metadata_payload["raw_response"] == {"text": "containsnul"}
 
@@ -14639,7 +14677,7 @@ def test_build_session_history_record_from_langfuse_preserves_inbound_model_alia
     assert record["inbound_model_alias"] == "aawm-read"
     payload = _build_session_history_db_payload(record)
     assert payload[5] == "gpt-5.3-codex-spark"
-    assert payload[125] == "aawm-read"
+    assert payload[127] == "aawm-read"
 
 
 def test_build_session_history_record_from_langfuse_recovers_claude_model_from_exp_tag() -> None:
@@ -15512,7 +15550,7 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
     assert "    start_time,\n    created_at,\n    end_time," in history_args[0]
     assert "$11, COALESCE($11, $12, NOW()), $12" in history_args[0]
     assert len(history_args[1][0]) == _session_history_insert_placeholder_count()
-    assert history_args[1][0][125] == "anthropic/claude-sonnet-4-6"
+    assert history_args[1][0][127] == "anthropic/claude-sonnet-4-6"
     assert history_args[1][0][0] == "call-1"
     assert history_args[1][0][10] == start_time
     assert history_args[1][0][11] == end_time
@@ -15793,11 +15831,11 @@ async def test_persist_session_history_records_inherits_auto_review_parent_ident
     permission_payload = next(
         payload for payload in payloads if payload[0] == "call-auto-review-child"
     )
-    metadata = json.loads(permission_payload[50])
+    metadata = json.loads(permission_payload[52])
     assert permission_payload[5] == "claude-auto-review"
     assert permission_payload[7] == "auto-reviewer"
     assert permission_payload[8] == "dashboard-shell"
-    assert permission_payload[51] == "dashboard-shell"
+    assert permission_payload[53] == "dashboard-shell"
     assert metadata["repository"] == "dashboard-shell"
     assert metadata["tenant_id"] == "dashboard-shell"
     assert metadata["trace_user_id"] == "dashboard-shell"
@@ -16131,6 +16169,143 @@ def test_session_history_insert_sql_uses_start_time_as_created_at() -> None:
     )
 
 
+def test_session_history_insert_sql_includes_client_ip_and_host_name_placeholders() -> None:
+    sql = aawm_agent_identity._AAWM_SESSION_HISTORY_INSERT_SQL
+    values_clause = sql.split("VALUES", 1)[1].split("ON CONFLICT", 1)[0]
+
+    assert "client_ip" in sql
+    assert "host_name" in sql
+    assert "$50" in values_clause
+    assert "$51" in values_clause
+    assert "client_ip = COALESCE(NULLIF(EXCLUDED.client_ip, ''), session_history.client_ip)" in sql
+    assert "host_name = COALESCE(NULLIF(EXCLUDED.host_name, ''), session_history.host_name)" in sql
+    assert _session_history_insert_placeholder_count() == 129
+
+
+def test_extract_session_host_attribution_stores_canonical_ip_not_localhost_label() -> None:
+    attribution = aawm_agent_identity._extract_session_host_attribution(
+        {
+            "client_ip": "localhost",
+            "requester_ip_address": "172.17.0.1",
+            "host_name": "thoth",
+            "host_name_source": "reverse_dns",
+        }
+    )
+
+    assert attribution["client_ip"] == "172.17.0.1"
+    assert attribution["host_name"] == "thoth"
+    assert attribution["host_name_source"] == "reverse_dns"
+
+
+def test_extract_session_host_attribution_resolves_display_host_from_ip() -> None:
+    attribution = aawm_agent_identity._extract_session_host_attribution(
+        {
+            "requester_ip_address": "100.99.1.5",
+            "client_ip_source": "request_client",
+        }
+    )
+
+    assert attribution["client_ip"] == "100.99.1.5"
+    assert attribution["host_name"] in {"100.99.1.5", "thoth"}
+    assert attribution["client_ip_source"] == "request_client"
+
+
+def test_extract_session_host_attribution_uses_shared_magicdns_resolver(monkeypatch) -> None:
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_resolve_aawm_route_host_name_from_ip",
+        lambda client_ip: ("seshat", "magicdns_reverse"),
+    )
+
+    attribution = aawm_agent_identity._extract_session_host_attribution(
+        {
+            "requester_ip_address": "100.99.166.16",
+            "client_ip_source": "request_client",
+        }
+    )
+
+    assert attribution["client_ip"] == "100.99.166.16"
+    assert attribution["host_name"] == "seshat"
+    assert attribution["host_name_source"] == "magicdns_reverse"
+
+
+def test_extract_session_host_attribution_reads_nested_route_rollup_context() -> None:
+    attribution = aawm_agent_identity._extract_session_host_attribution(
+        {
+            "aawm_route_rollup_context": {
+                "client_ip": "100.99.1.5",
+                "client_ip_source": "request_client",
+                "host_name": "thoth",
+                "host_name_source": "reverse_dns",
+            }
+        }
+    )
+
+    assert attribution["client_ip"] == "100.99.1.5"
+    assert attribution["client_ip_source"] == "request_client"
+    assert attribution["host_name"] == "thoth"
+    assert attribution["host_name_source"] == "reverse_dns"
+
+
+def test_extract_session_host_attribution_uses_localhost_display_for_loopback_ip(
+    monkeypatch,
+) -> None:
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "getfqdn",
+        lambda: "localhost",
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostname",
+        lambda: "localhost",
+    )
+
+    attribution = aawm_agent_identity._extract_session_host_attribution(
+        {"requester_ip_address": "127.0.0.1"}
+    )
+
+    assert attribution["client_ip"] == "127.0.0.1"
+    assert attribution["host_name"] == "localhost"
+    assert attribution["host_name_source"] == "loopback"
+
+
+def test_extract_session_host_attribution_resolves_local_magicdns_for_loopback_ip(
+    monkeypatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=["100.99.166.16"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="seshat"),
+    )
+
+    attribution = aawm_agent_identity._extract_session_host_attribution(
+        {"requester_ip_address": "127.0.0.1"}
+    )
+
+    assert attribution["client_ip"] == "127.0.0.1"
+    assert attribution["host_name"] == "seshat"
+    assert attribution["host_name_source"] == "magicdns_local"
+
+
 def test_session_history_payload_preserves_unknown_sensitive_config_flags() -> None:
     payload = _build_session_history_db_payload(
         {
@@ -16221,12 +16396,12 @@ def test_session_history_db_payload_strips_postgres_nul_bytes() -> None:
     assert all("\x00" not in value for value in string_values)
     assert json.loads(payload[30]) == ["Read"]
     assert json.loads(payload[43]) == {"wheelname": "1.0"}
-    metadata_payload = json.loads(payload[50])
+    metadata_payload = json.loads(payload[52])
     assert metadata_payload["nulkey"] == {"nested": "valuewith-nul"}
     assert metadata_payload["items"] == ["one", {"two": "three"}]
     assert "\\u0000" not in payload[30]
     assert "\\u0000" not in payload[43]
-    assert "\\u0000" not in payload[50]
+    assert "\\u0000" not in payload[52]
 
 
 def test_tool_activity_db_payload_strips_postgres_nul_bytes() -> None:

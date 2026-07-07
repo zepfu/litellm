@@ -20,6 +20,7 @@ from litellm.proxy._types import (
     TeamCallbackMetadata,
     UserAPIKeyAuth,
 )
+from litellm.proxy.aawm_route_logging import resolve_aawm_route_host_attribution
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
 
 # Cache special headers as a frozenset for O(1) lookup performance
@@ -1213,6 +1214,25 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
         ):
             requester_ip_address = request.client.host
     data[_metadata_variable_name]["requester_ip_address"] = requester_ip_address
+    host_attribution = resolve_aawm_route_host_attribution(
+        request,
+        general_settings=general_settings,
+    )
+    if host_attribution.get("client_ip"):
+        data[_metadata_variable_name]["client_ip"] = host_attribution["client_ip"]
+        data[_metadata_variable_name]["requester_ip_address"] = host_attribution[
+            "client_ip"
+        ]
+    if host_attribution.get("client_ip_source"):
+        data[_metadata_variable_name]["client_ip_source"] = host_attribution[
+            "client_ip_source"
+        ]
+    if host_attribution.get("host_name"):
+        data[_metadata_variable_name]["host_name"] = host_attribution["host_name"]
+    if host_attribution.get("host_name_source"):
+        data[_metadata_variable_name]["host_name_source"] = host_attribution[
+            "host_name_source"
+        ]
 
     # Add User-Agent
     user_agent = ""

@@ -105,6 +105,10 @@ services:
       - ./captures:/tmp/captures
       # Durable session_history outage spool for replay after DB outages.
       - /mnt/e/litellm/session_history:/mnt/e/litellm/session_history
+      # Read-only host identity lookup surface for local Tailscale MagicDNS attribution.
+      - /etc/hostname:/host/etc/hostname:ro
+      # Sanitized Tailscale self identity for local host attribution (host-maintained).
+      - ${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_HOST_DIR:-/home/zepfu/.analysis/aawm-host-identity}:/host/aawm:ro
     environment:
       # Langfuse — read from host env or set defaults
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
@@ -114,6 +118,7 @@ services:
       - LITELLM_AAWM_ERROR_LOG_ENABLED=${LITELLM_AAWM_ERROR_LOG_ENABLED:-1}
       - LITELLM_AAWM_ERROR_LOG_ENV=${LITELLM_AAWM_ERROR_LOG_ENV:-dev}
       - LITELLM_AAWM_ERROR_LOG_DIR=${LITELLM_AAWM_ERROR_LOG_DIR:-/app/.analysis}
+      - AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH=${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH:-/host/aawm/tailscale-self.json}
       - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
       - AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR=${AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR:-/home/zepfu/.analysis/full-payload-captures/runtime}
       # AAWM runtime database access goes through shared PgBouncer. Keep
