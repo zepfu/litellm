@@ -72,6 +72,31 @@ fork-local operational policy for the AAWM LiteLLM deployment.
 429/5xx preservation. Dev `litellm-dev` was rebuilt/recreated and verified with
 in-container checks showing arrow-form 200 suppression and 429 preservation.
 
+### Unreleased — Spark cooldown reuse for Anthropic auto-agent aliases
+
+**What changed:** Anthropic auto-agent OpenAI/Codex candidates now honor
+Codex-family cooldowns for the same candidate key, so `aawm-code-anthropic`
+skips `gpt-5.3-codex-spark` when Spark has already been cooled down through
+the Codex family. Spark transient 5xx failures also set a short
+candidate-scoped cooldown so later Anthropic alias requests skip Spark during
+that transient window. Non-Spark transient failures remain request-local.
+
+**Why:** The `aawm.115` prod rollout exposed `aawm-code-anthropic` retrying
+Codex Spark when it should have advanced to the next eligible candidate. The
+root causes were split Codex/Anthropic cooldown family reads for OpenAI-backed
+Anthropic candidates and Spark transient failures being request-local only.
+
+**Why not upstream:** The AAWM auto-agent aliases and their cross-family
+cooldown policy are fork-local routing behavior layered on top of LiteLLM
+passthrough.
+
+**Validation status:** Focused tests cover Codex-family Spark cooldown reuse by
+`aawm-code-anthropic`, Spark-only transient candidate cooldown, non-Spark
+transient request-local behavior, and unchanged malformed/tool-call durable
+cooldown behavior. Dev `litellm-dev` was rebuilt/recreated and verified with an
+in-container check showing Spark transient scope `candidate` and subsequent
+selection of `grok-composer-2.5-fast`.
+
 ### aawm.115 — Anthropic SOTA/orchestration alias model selector normalization
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.115`. The

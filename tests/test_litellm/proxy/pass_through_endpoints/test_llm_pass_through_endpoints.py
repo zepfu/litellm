@@ -180,6 +180,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _extract_codex_auto_agent_error_tokens,
     _get_codex_auto_agent_cooldown_seconds,
     _get_codex_auto_agent_cooldown_scope,
+    _get_codex_auto_agent_candidate_cooldown_scope,
     _apply_codex_auto_agent_alias_cooldown,
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
@@ -19643,6 +19644,48 @@ async def test_anthropic_auto_agent_alias_code_selects_spark_first():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_code_anthropic_skips_spark_when_codex_family_cooldown_active():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    await _set_codex_auto_agent_cooldown(spark_cooldown_key, 120.0)
+
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+
+    assert selection["candidate"]["provider"] == "xai"
+    assert selection["candidate"]["model"] == "grok-composer-2.5-fast"
+    assert selection["selection_reason"] == "first_available"
+    assert selection["skipped"][0]["provider"] == "openai"
+    assert selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
+    assert selection["skipped"][0]["reason"] == "cooldown"
+    assert "codex_family:" in selection["skipped"][0]["cooldown_state_source"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_code_anthropic_merged_spark_cooldown_prefers_longer_family():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    await _set_anthropic_auto_agent_cooldown(spark_cooldown_key, 30.0)
+    await _set_codex_auto_agent_cooldown(spark_cooldown_key, 90.0)
+
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+
+    assert selection["candidate"]["model"] == "grok-composer-2.5-fast"
+    assert selection["skipped"][0]["cooldown_seconds"] >= 89.0
+    assert "codex_family:" in selection["skipped"][0]["cooldown_state_source"]
+    assert "anthropic_family:" in selection["skipped"][0]["cooldown_state_source"]
+
+
+@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
@@ -25178,6 +25221,35 @@ def test_codex_auto_agent_cooldown_scope_promotes_reusable_failures_to_candidate
     )
     assert (
         _get_codex_auto_agent_cooldown_scope("provider_format_rejected")
+        == "request_local"
+    )
+
+
+def test_codex_auto_agent_candidate_cooldown_scope_spark_transient_is_candidate():
+    spark = {"model": "gpt-5.3-codex-spark", "provider": "openai"}
+    assert (
+        _get_codex_auto_agent_candidate_cooldown_scope(
+            "upstream_transient_internal",
+            candidate=spark,
+        )
+        == "candidate"
+    )
+    assert (
+        _get_codex_auto_agent_candidate_cooldown_scope(
+            "upstream_transient",
+            candidate=spark,
+        )
+        == "candidate"
+    )
+
+
+def test_codex_auto_agent_candidate_cooldown_scope_non_spark_transient_stays_request_local():
+    grok = {"model": "grok-composer-2.5-fast", "provider": "xai"}
+    assert (
+        _get_codex_auto_agent_candidate_cooldown_scope(
+            "upstream_transient_internal",
+            candidate=grok,
+        )
         == "request_local"
     )
 
@@ -35904,7 +35976,7 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_bare_transient_status_
 
 
 @pytest.mark.asyncio
-async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(monkeypatch):
+async def test_anthropic_spark_bare_502_sets_candidate_transient_cooldown(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
@@ -35915,8 +35987,15 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
         code=502,
     )
     fallback_success = Response(content='{"ok": true}', media_type="application/json")
+    spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    dual_cache = _FakeAawmAliasRoutingDualCache()
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
         new=AsyncMock(side_effect=transient_error),
     ) as mock_spark, patch(
@@ -35941,7 +36020,126 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
     mock_grok_native.assert_awaited_once()
     mock_xai_oauth.assert_awaited_once()
     metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    spark_attempt = metadata["anthropic_auto_agent_attempts"][0]
+    assert spark_attempt["model"] == "gpt-5.3-codex-spark"
+    assert spark_attempt["status"] == "cooldown_set"
+    assert spark_attempt["error_class"] == "upstream_transient_internal"
+    assert spark_attempt["cooldown_scope"] == "candidate"
+    assert spark_attempt["cooldown_seconds"] == 30.0
     grok_attempt = metadata["anthropic_auto_agent_attempts"][1]
+    assert grok_attempt["model"] == "grok-composer-2.5-fast"
+    assert grok_attempt["cooldown_scope"] == "request_local"
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        spark_cooldown_key
+    )
+    assert durable_seconds > 0.0
+    assert durable_source in {"durable_cache", "memory"}
+    grok_durable_seconds, grok_durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:grok-composer-2.5-fast:xai_grok_native"
+    )
+    assert grok_durable_seconds == 0.0
+    assert grok_durable_source == "local_fallback"
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_code_anthropic_second_request_skips_spark_after_transient_502():
+    request_first = _build_anthropic_auto_agent_request()
+    body_first = _build_anthropic_auto_agent_body()
+    body_first["model"] = "aawm-code-anthropic"
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    fallback_success = Response(content='{"ok": true}', media_type="application/json")
+    spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=transient_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=transient_error),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(return_value=fallback_success),
+    ):
+        await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request_first,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body_first,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    request_second = _build_anthropic_auto_agent_request()
+    body_second = _build_anthropic_auto_agent_body()
+    body_second["model"] = "aawm-code-anthropic"
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request_second,
+        request_body=body_second,
+    )
+
+    assert selection["candidate"]["model"] == "grok-composer-2.5-fast"
+    assert selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
+    assert selection["skipped"][0]["reason"] == "cooldown"
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(monkeypatch):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    fallback_success = Response(content='{"ok": true}', media_type="application/json")
+    spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    await _set_anthropic_auto_agent_cooldown(spark_cooldown_key, 120.0)
+    await _set_codex_auto_agent_cooldown(spark_cooldown_key, 120.0)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=AssertionError("Spark must be skipped")),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=transient_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(return_value=fallback_success),
+    ) as mock_xai_oauth:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is fallback_success
+    mock_spark.assert_not_called()
+    mock_grok_native.assert_awaited_once()
+    mock_xai_oauth.assert_awaited_once()
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    grok_attempt = metadata["anthropic_auto_agent_attempts"][0]
     assert grok_attempt["model"] == "grok-composer-2.5-fast"
     assert grok_attempt["status"] == "cooldown_set"
     assert grok_attempt["error_class"] == "upstream_transient_internal"
@@ -35952,6 +36150,8 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
     )
     assert durable_seconds == 0.0
     assert durable_source == "local_fallback"
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
 
 
 @pytest.mark.asyncio
@@ -35999,7 +36199,7 @@ async def test_anthropic_alias_non_inflight_bare_502_selects_next_candidate_with
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
-    assert attempts[0]["cooldown_scope"] == "request_local"
+    assert attempts[0]["cooldown_scope"] == "candidate"
     assert attempts[1]["cooldown_scope"] == "request_local"
     assert attempts[0]["error_class"] == "upstream_transient_internal"
     assert attempts[1]["error_class"] == "upstream_transient_internal"
@@ -36007,6 +36207,11 @@ async def test_anthropic_alias_non_inflight_bare_502_selects_next_candidate_with
         "xai:grok-composer-2.5-fast:xai_grok_native"
     )
     assert durable_seconds == 0.0
+    spark_durable_seconds, spark_durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "openai:gpt-5.3-codex-spark:__default__"
+    )
+    assert spark_durable_seconds > 0.0
+    assert spark_durable_source in {"durable_cache", "memory"}
 
 
 @pytest.mark.asyncio

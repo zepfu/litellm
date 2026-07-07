@@ -4054,6 +4054,19 @@ async def _build_codex_auto_agent_candidate_state(
     return state
 
 
+async def _get_anthropic_auto_agent_candidate_cooldown_state(
+    *,
+    provider: str,
+    cooldown_key: str,
+) -> tuple[float, str]:
+    """OpenAI/Codex candidates merge Anthropic + Codex cooldown; others use Anthropic-only."""
+    if provider == _CODEX_AUTO_AGENT_NATIVE_PROVIDER:
+        return await _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
+            cooldown_key
+        )
+    return await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+
+
 async def _build_anthropic_auto_agent_candidate_state(
     request: Request,
     *,
@@ -4109,7 +4122,10 @@ async def _build_anthropic_auto_agent_candidate_state(
         lane_key = openai_lane_key
     cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
     cooldown_seconds, cooldown_state_source = (
-        await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+        await _get_anthropic_auto_agent_candidate_cooldown_state(
+            provider=candidate["provider"],
+            cooldown_key=cooldown_key,
+        )
     )
     cooldown_seconds, cooldown_state_source, skip_reason = (
         _apply_codex_auto_agent_request_local_candidate_state(
@@ -4540,6 +4556,19 @@ def _get_codex_auto_agent_cooldown_scope(error_class: Optional[str]) -> str:
     return "request_local"
 
 
+def _get_codex_auto_agent_candidate_cooldown_scope(
+    error_class: Optional[str],
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+) -> str:
+    if (
+        _is_codex_auto_agent_spark_candidate(candidate)
+        and _is_codex_auto_agent_transient_internal_error_class(error_class)
+    ):
+        return "candidate"
+    return _get_codex_auto_agent_cooldown_scope(error_class)
+
+
 def _aawm_alias_route_verbose_json_enabled() -> bool:
     return os.getenv(_AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV, "").strip().lower() in {
         "1",
@@ -4643,7 +4672,10 @@ async def _apply_codex_auto_agent_alias_cooldown(
     cooldown_seconds: float,
     error_class: Optional[str],
 ) -> str:
-    cooldown_scope = _get_codex_auto_agent_cooldown_scope(error_class)
+    cooldown_scope = _get_codex_auto_agent_candidate_cooldown_scope(
+        error_class,
+        candidate=candidate,
+    )
     if cooldown_scope == "candidate":
         await _set_codex_auto_agent_cooldown(
             selected_cooldown_key,
@@ -4676,7 +4708,10 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
     cooldown_seconds: float,
     error_class: Optional[str],
 ) -> str:
-    cooldown_scope = _get_codex_auto_agent_cooldown_scope(error_class)
+    cooldown_scope = _get_codex_auto_agent_candidate_cooldown_scope(
+        error_class,
+        candidate=candidate,
+    )
     if cooldown_scope == "candidate":
         await _set_anthropic_auto_agent_cooldown(
             selected_cooldown_key,
@@ -5192,6 +5227,48 @@ def _resolve_anthropic_auto_agent_session_key(
     return (
         f"{alias_model}:{session_id}:"
         f"{_resolve_anthropic_auto_agent_native_lane_key(request)}"
+    )
+
+
+def _format_merged_alias_family_cooldown_state_source(
+    *,
+    anthropic_seconds: float,
+    anthropic_source: str,
+    codex_seconds: float,
+    codex_source: str,
+) -> tuple[float, str]:
+    family_states: list[tuple[float, str]] = []
+    if anthropic_seconds > 0:
+        family_states.append(
+            (
+                anthropic_seconds,
+                f"anthropic_family:{anthropic_source}",
+            )
+        )
+    if codex_seconds > 0:
+        family_states.append((codex_seconds, f"codex_family:{codex_source}"))
+    if not family_states:
+        return 0.0, "local_fallback"
+    family_states.sort(key=lambda item: item[0], reverse=True)
+    merged_seconds = family_states[0][0]
+    merged_source = "+".join(source for _, source in family_states)
+    return merged_seconds, merged_source
+
+
+async def _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
+    cooldown_key: str,
+) -> tuple[float, str]:
+    anthropic_seconds, anthropic_source = (
+        await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+    )
+    codex_seconds, codex_source = await _get_codex_auto_agent_active_cooldown_state(
+        cooldown_key
+    )
+    return _format_merged_alias_family_cooldown_state_source(
+        anthropic_seconds=anthropic_seconds,
+        anthropic_source=anthropic_source,
+        codex_seconds=codex_seconds,
+        codex_source=codex_source,
     )
 
 
