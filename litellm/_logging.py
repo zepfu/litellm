@@ -711,11 +711,77 @@ def _consume_aawm_route_access_log_replacement(
         return True
 
 
+_AAWM_ARROW_ACCESS_LOG_SEPARATOR = " -> "
+_AAWM_PASSTHROUGH_ACCESS_INBOUND_PATH_PREFIXES = (
+    "/anthropic",
+    "/openai_passthrough",
+)
+
+
+def _is_aawm_passthrough_inbound_access_path(path_only: str) -> bool:
+    for prefix in _AAWM_PASSTHROUGH_ACCESS_INBOUND_PATH_PREFIXES:
+        if path_only == prefix or path_only.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
+def _is_successful_access_status_code(status_code: int) -> bool:
+    return 200 <= status_code < 400
+
+
+def _status_code_from_access_log_record(record: logging.LogRecord) -> Optional[int]:
+    args = record.args
+    if not isinstance(args, (list, tuple)) or len(args) < 5:
+        return None
+    try:
+        return int(args[4])
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_access_full_path_from_record(
+    record: logging.LogRecord,
+) -> Optional[str]:
+    args = record.args
+    if not isinstance(args, (list, tuple)) or len(args) < 3:
+        return None
+    full_path = args[2]
+    if full_path is None:
+        return None
+    return _normalize_aawm_route_access_log_replacement_path(full_path)
+
+
+def _should_suppress_successful_aawm_passthrough_arrow_access_log(
+    record: logging.LogRecord,
+) -> bool:
+    normalized_full_path = _normalized_access_full_path_from_record(record)
+    if (
+        normalized_full_path is None
+        or _AAWM_ARROW_ACCESS_LOG_SEPARATOR not in normalized_full_path
+    ):
+        return False
+
+    inbound_path = normalized_full_path.split(_AAWM_ARROW_ACCESS_LOG_SEPARATOR, 1)[0]
+    path_only = inbound_path.split("?", 1)[0]
+    if not _is_aawm_passthrough_inbound_access_path(path_only):
+        return False
+
+    status_code = _status_code_from_access_log_record(record)
+    if status_code is None or not _is_successful_access_status_code(status_code):
+        return False
+
+    return True
+
+
 class AawmRouteAccessLogReplacementFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if record.name not in {"uvicorn.access", "gunicorn.access"}:
             return True
-        return not _consume_aawm_route_access_log_replacement(record)
+        if _consume_aawm_route_access_log_replacement(record):
+            return False
+        if _should_suppress_successful_aawm_passthrough_arrow_access_log(record):
+            return False
+        return True
 
 
 _aawm_route_access_log_replacement_filter = AawmRouteAccessLogReplacementFilter()

@@ -940,6 +940,89 @@ class TestProxyBaseLLMRequestProcessing:
         )
         assert access_filter.filter(_build_uvicorn_access_record()) is True
 
+    def test_aawm_route_access_log_filter_suppresses_successful_arrow_passthrough_without_registration(
+        self,
+    ):
+        clear_aawm_route_access_log_replacements()
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        arrow_path = (
+            "/anthropic/v1/messages?beta=true -> "
+            "chatgpt.com/backend-api/codex/responses"
+        )
+
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    full_path=arrow_path,
+                    status_code=200,
+                )
+            )
+            is False
+        )
+
+    def test_aawm_route_access_log_filter_preserves_arrow_passthrough_non_success(
+        self,
+    ):
+        clear_aawm_route_access_log_replacements()
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        arrow_path = (
+            "/anthropic/v1/messages?beta=true -> "
+            "chatgpt.com/backend-api/codex/responses"
+        )
+
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    full_path=arrow_path,
+                    status_code=429,
+                )
+            )
+            is True
+        )
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    full_path=arrow_path,
+                    status_code=500,
+                )
+            )
+            is True
+        )
+
+    def test_aawm_route_access_log_filter_preserves_non_arrow_or_non_passthrough_success(
+        self,
+    ):
+        clear_aawm_route_access_log_replacements()
+        access_filter = AawmRouteAccessLogReplacementFilter()
+
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    full_path="/v1/embeddings",
+                    status_code=200,
+                )
+            )
+            is True
+        )
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    full_path="/anthropic/v1/messages?beta=true",
+                    status_code=200,
+                )
+            )
+            is True
+        )
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    full_path="/openai_passthrough/responses",
+                    status_code=200,
+                )
+            )
+            is True
+        )
+
     def test_aawm_route_log_deduplicates_repeated_route_context(
         self,
         caplog,

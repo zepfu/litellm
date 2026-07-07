@@ -53,6 +53,25 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### Unreleased — Passthrough access-log suppression
+
+**What changed:** Successful arrow-form AAWM passthrough access logs for
+Anthropic/OpenAI passthrough routes are suppressed by the access-log filter
+after the route rollup has recorded the useful request summary. Non-success
+arrow-form access logs, including 429/5xx diagnostics, remain visible.
+
+**Why:** The `aawm.115` prod rollout exposed two regressions: successful
+passthrough requests emitted raw Uvicorn `POST ... -> ... 200 OK` lines in
+addition to AAWM route rollups. The fix keeps warning/error visibility while
+removing routine duplicate success noise.
+
+**Why not upstream:** These route-log rollups and access-log shaping rules are
+fork-local operational policy for the AAWM LiteLLM deployment.
+
+**Validation status:** Focused tests cover 2xx arrow-form suppression with
+429/5xx preservation. Dev `litellm-dev` was rebuilt/recreated and verified with
+in-container checks showing arrow-form 200 suppression and 429 preservation.
+
 ### aawm.115 — Anthropic SOTA/orchestration alias model selector normalization
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.115`. The
