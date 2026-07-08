@@ -562,6 +562,22 @@ selection. These aliases follow their declared non-Antigravity failover order
 below. Direct explicit Antigravity routes remain available separately and are
 documented in the Antigravity OAuth Credentials section.
 
+`aawm-sota-openai` mirrors `aawm-sota` and uses this order:
+
+1. `gpt-5.6-sol`
+2. `gpt-5.5` as the OpenAI last-resort candidate
+
+`aawm-sota-xai` uses this order:
+
+1. `oa_xai/grok-4.5` via the managed xAI OAuth Responses adapter
+2. `grok-4.5` via the native Grok OIDC Responses adapter
+3. `grok-build` as the xAI last-resort candidate
+
+Grok 4.5 is not generally available yet. When either Grok 4.5 candidate returns
+`aawm_codex_auto_agent_candidate_unavailable`, LiteLLM applies a durable
+~3600 second cooldown for that candidate so pre-release misses do not churn the
+alias on every request while still allowing pickup after release or cooldown expiry.
+
 `aawm-sota` uses this order:
 
 1. `gpt-5.6-sol`

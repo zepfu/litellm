@@ -7897,6 +7897,26 @@ class TestOpenRouterAdapterRetry:
         ] == ["gpt-5.6-terra", "gpt-5.5"]
         assert [
             candidate["model"]
+            for candidate in _get_codex_auto_agent_candidates_for_alias(
+                "aawm-sota-openai"
+            )
+        ] == ["gpt-5.6-sol", "gpt-5.5"]
+        assert [
+            candidate["model"]
+            for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-sota-xai")
+        ] == ["oa_xai/grok-4.5", "grok-4.5", "grok-build"]
+        sota_xai = _get_codex_auto_agent_candidates_for_alias("aawm-sota-xai")
+        assert sota_xai[0]["route_family"] == "codex_xai_oauth_responses_adapter"
+        assert sota_xai[1]["route_family"] == "codex_grok_native_responses_adapter"
+        assert sota_xai[2]["last_resort"] is True
+        assert sota_xai[0][
+            "expected_pre_release_candidate_unavailable_cooldown_seconds"
+        ] == 3600.0
+        assert sota_xai[1][
+            "expected_pre_release_candidate_unavailable_cooldown_seconds"
+        ] == 3600.0
+        assert [
+            candidate["model"]
             for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-code")
         ] == [
             "gpt-5.3-codex-spark",
@@ -35399,6 +35419,77 @@ async def test_aawm_alias_routing_durable_write_failure_keeps_in_memory_cooldown
 
     assert seconds > 0
     assert source == "memory"
+
+
+def test_codex_aawm_sota_openai_and_sota_xai_alias_normalization():
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as mod
+
+    assert mod._normalize_codex_auto_agent_alias_model("aawm-sota-openai") == (
+        "aawm-sota-openai"
+    )
+    assert mod._normalize_codex_auto_agent_alias_model("AAWM-SOTA-XAI") == (
+        "aawm-sota-xai"
+    )
+    assert mod._is_codex_auto_agent_alias_model("aawm-sota-openai") is True
+    assert mod._resolve_codex_auto_agent_alias_model(
+        {"model": "aawm-sota-xai"}, "/v1/responses"
+    ) == "aawm-sota-xai"
+    assert mod._resolve_codex_auto_agent_alias_model(
+        {"model": "aawm-sota-xai"}, "/v1/chat/completions"
+    ) is None
+
+
+def test_codex_auto_agent_grok_4_5_pre_release_candidate_unavailable_cooldown_is_one_hour():
+    grok45_oauth = {
+        "provider": "xai",
+        "model": "oa_xai/grok-4.5",
+        "route_family": "codex_xai_oauth_responses_adapter",
+        "expected_pre_release_candidate_unavailable_cooldown_seconds": 3600.0,
+    }
+    grok45_native = {
+        "provider": "xai",
+        "model": "grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "expected_pre_release_candidate_unavailable_cooldown_seconds": 3600.0,
+    }
+    unavailable_exc = ProxyException(
+        message="xAI OAuth auto-agent candidate requires a valid managed xAI OAuth credential",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    unavailable_exc.detail = {
+        "error": {
+            "message": unavailable_exc.message,
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    assert _get_codex_auto_agent_cooldown_seconds(
+        unavailable_exc, candidate=grok45_oauth
+    ) == 3600.0
+    assert _get_codex_auto_agent_cooldown_seconds(
+        unavailable_exc, candidate=grok45_native
+    ) == 3600.0
+
+
+def test_codex_auto_agent_grok_4_5_model_not_found_is_candidate_unavailable():
+    grok45_native = {
+        "provider": "xai",
+        "model": "grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "expected_pre_release_candidate_unavailable_cooldown_seconds": 3600.0,
+    }
+    not_found_exc = HTTPException(
+        status_code=404,
+        detail=b'{"error":{"message":"model not found: grok-4.5","code":"not_found"}}',
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(not_found_exc) == (
+        "candidate_unavailable"
+    )
+    assert _get_codex_auto_agent_cooldown_seconds(
+        not_found_exc, candidate=grok45_native
+    ) == 3600.0
 
 
 def test_codex_auto_agent_spark_durable_cooldown_seconds_are_five_minutes():

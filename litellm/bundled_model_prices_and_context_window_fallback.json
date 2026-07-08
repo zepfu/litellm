@@ -39276,5 +39276,61 @@
         "supports_tool_choice": true,
         "supports_vision": true,
         "tool_use_system_prompt_tokens": 346
+    },
+    "xai/grok-4.5": {
+        "litellm_provider": "xai",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 1000000,
+        "max_tokens": 1000000,
+        "mode": "responses",
+        "source": "https://docs.x.ai/developers/models/grok-4.5",
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search"
+        ],
+        "unsupported_request_params": [
+            "external_web_access",
+            "reasoning",
+            "reasoning_effort",
+            "reasoningEffort"
+        ],
+        "unsupported_input_item_types": [
+            "reasoning"
+        ],
+        "supports_vision": true,
+        "supports_web_search": true
+    },
+    "oa_xai/grok-4.5": {
+        "litellm_provider": "xai",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 1000000,
+        "max_tokens": 1000000,
+        "mode": "responses",
+        "source": "https://docs.x.ai/developers/models/grok-4.5",
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search"
+        ],
+        "unsupported_request_params": [
+            "external_web_access",
+            "reasoning",
+            "reasoning_effort",
+            "reasoningEffort"
+        ],
+        "unsupported_input_item_types": [
+            "reasoning"
+        ],
+        "supports_vision": true,
+        "supports_web_search": true
     }
 }

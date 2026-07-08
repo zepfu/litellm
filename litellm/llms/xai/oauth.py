@@ -34,11 +34,13 @@ _GROK_NATIVE_OAUTH_MODELS = frozenset(
         "grok-build",
         "grok-build-0.1",
         "grok-composer-2.5-fast",
+        "grok-4.5",
     }
 )
 
 _XAI_OAUTH_MODEL_MAP = {
     "oa_xai/grok-4.3": "xai/grok-4.3",
+    "oa_xai/grok-4.5": "xai/grok-4.5",
     "oa_xai/grok-4.20-0309-reasoning": "xai/grok-4.20-0309-reasoning",
     "oa_xai/grok-4.20-0309-non-reasoning": "xai/grok-4.20-0309-non-reasoning",
     "oa_xai/grok-4.20-multi-agent-0309": "xai/grok-4.20-multi-agent-0309",

@@ -384,6 +384,7 @@ _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS = 30.0 * 60.0
 _CODEX_AUTO_AGENT_SPARK_MODEL = "gpt-5.3-codex-spark"
 _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = 300.0
 _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = 300.0
+_CODEX_AUTO_AGENT_GROK_4_5_PRE_RELEASE_CANDIDATE_UNAVAILABLE_COOLDOWN_SECONDS = 3600.0
 _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = (
     "GROK_BUILD_USAGE_BALANCE_EXHAUSTED"
 )
@@ -477,6 +478,31 @@ _CODEX_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
+_CODEX_AAWM_SOTA_OPENAI_ALIAS = "aawm-sota-openai"
+_CODEX_AAWM_SOTA_XAI_ALIAS = "aawm-sota-xai"
+_CODEX_AAWM_SOTA_OPENAI_CANDIDATES: tuple[dict[str, Any], ...] = _CODEX_AAWM_SOTA_CANDIDATES
+_CODEX_AAWM_SOTA_XAI_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "oa_xai/grok-4.5",
+        "route_family": "codex_xai_oauth_responses_adapter",
+        "last_resort": False,
+        "expected_pre_release_candidate_unavailable_cooldown_seconds": _CODEX_AUTO_AGENT_GROK_4_5_PRE_RELEASE_CANDIDATE_UNAVAILABLE_COOLDOWN_SECONDS,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+        "expected_pre_release_candidate_unavailable_cooldown_seconds": _CODEX_AUTO_AGENT_GROK_4_5_PRE_RELEASE_CANDIDATE_UNAVAILABLE_COOLDOWN_SECONDS,
+    },
+    {
+        "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "grok-build",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": True,
+    },
+)
 _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -566,6 +592,8 @@ _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {
     _CODEX_AUTO_AGENT_MODEL_ALIAS: _CODEX_AUTO_AGENT_CANDIDATES,
     _CODEX_AAWM_READ_ALIAS: _CODEX_AUTO_AGENT_CANDIDATES,
     _CODEX_AAWM_SOTA_ALIAS: _CODEX_AAWM_SOTA_CANDIDATES,
+    _CODEX_AAWM_SOTA_OPENAI_ALIAS: _CODEX_AAWM_SOTA_OPENAI_CANDIDATES,
+    _CODEX_AAWM_SOTA_XAI_ALIAS: _CODEX_AAWM_SOTA_XAI_CANDIDATES,
     _CODEX_AAWM_CODE_ALIAS: _CODEX_AAWM_CODE_CANDIDATES,
     _CODEX_AAWM_LOW_ALIAS: _CODEX_AAWM_LOW_CANDIDATES,
     _CODEX_AAWM_ORCHESTRATION_ALIAS: _CODEX_AAWM_ORCHESTRATION_CANDIDATES,
@@ -4476,6 +4504,17 @@ def _add_codex_auto_agent_text_error_tokens(
         )
     ):
         tokens.add("aawm_codex_auto_agent_candidate_unavailable")
+    if "grok-4.5" in text_lower and any(
+        marker in text_lower
+        for marker in (
+            "model not found",
+            "model does not exist",
+            "model is not available",
+            "unknown model",
+            "unsupported model",
+        )
+    ):
+        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
     if "aawm_auto_agent_failed_responses_payload" in text_lower:
         tokens.add("aawm_auto_agent_failed_responses_payload")
     if "aawm_auto_agent_malformed_tool_call_text" in text_lower:
@@ -4544,6 +4583,40 @@ def _is_codex_auto_agent_spark_candidate(candidate: Optional[dict[str, Any]]) ->
     if not isinstance(candidate, dict):
         return False
     return str(candidate.get("model") or "") == _CODEX_AUTO_AGENT_SPARK_MODEL
+
+
+def _is_codex_auto_agent_grok_4_5_pre_release_candidate(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_XAI_PROVIDER:
+        return False
+    model = str(candidate.get("model") or "")
+    if model in {"oa_xai/grok-4.5", "grok-4.5", "xai/grok-4.5"}:
+        return True
+    route_family = str(candidate.get("route_family") or "")
+    return route_family in {
+        "codex_xai_oauth_responses_adapter",
+        "codex_grok_native_responses_adapter",
+    } and model.endswith("grok-4.5")
+
+
+def _get_codex_auto_agent_expected_pre_release_candidate_unavailable_cooldown_seconds(
+    candidate: Optional[dict[str, Any]],
+) -> Optional[float]:
+    if not isinstance(candidate, dict):
+        return None
+    raw = candidate.get("expected_pre_release_candidate_unavailable_cooldown_seconds")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return seconds
 
 
 def _is_codex_auto_agent_transient_internal_error_class(error_class: Optional[str]) -> bool:
@@ -4885,6 +4958,17 @@ def _get_codex_auto_agent_cooldown_seconds(
         and _is_codex_auto_agent_durable_cooldown_error_class(error_class)
     ):
         return _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS
+    pre_release_cooldown = (
+        _get_codex_auto_agent_expected_pre_release_candidate_unavailable_cooldown_seconds(
+            candidate
+        )
+    )
+    if (
+        pre_release_cooldown is not None
+        and error_class == "candidate_unavailable"
+        and _is_codex_auto_agent_grok_4_5_pre_release_candidate(candidate)
+    ):
+        return pre_release_cooldown
     return resolved
 
 

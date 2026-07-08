@@ -34,6 +34,8 @@ pricing/cache billing plus minimal structure (`litellm_provider`, `mode`,
 flags until those fields are verified for the gpt-5.6 family. Codex alias routing uses:
 
 - `aawm-sota`: `gpt-5.6-sol` → `gpt-5.5`
+- `aawm-sota-openai`: same order as `aawm-sota` (`gpt-5.6-sol` → `gpt-5.5`)
+- `aawm-sota-xai`: `oa_xai/grok-4.5` → `grok-4.5` → `grok-build` (last resort); pre-release Grok 4.5 misses use a ~1 hour candidate-unavailable cooldown
 - `aawm-code`: `gpt-5.3-codex-spark` → Grok adapters → `gpt-5.6-terra` → `gpt-5.5`
 - `aawm-low`: OpenRouter/OpenCode lanes → `gpt-5.6-luna` → `gpt-5.4-mini`
 - `aawm-orchestration`: `gpt-5.6-terra` → `gpt-5.5`

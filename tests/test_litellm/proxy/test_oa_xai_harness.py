@@ -24,6 +24,7 @@ from litellm.responses.utils import ResponsesAPIRequestUtils
 class OaXaiHarness:
     public_to_upstream = {
         "oa_xai/grok-4.3": "xai/grok-4.3",
+        "oa_xai/grok-4.5": "xai/grok-4.5",
         "oa_xai/grok-4.20-0309-reasoning": "xai/grok-4.20-0309-reasoning",
         "oa_xai/grok-4.20-0309-non-reasoning": "xai/grok-4.20-0309-non-reasoning",
         "oa_xai/grok-4.20-multi-agent-0309": "xai/grok-4.20-multi-agent-0309",
@@ -157,6 +158,8 @@ def test_oa_xai_harness_maps_all_public_models(public_model, upstream_model):
         ("grok-build-0.1", "grok-build-0.1"),
         ("xai/grok-build-0.1", "grok-build-0.1"),
         ("grok-composer-2.5-fast", "grok-composer-2.5-fast"),
+        ("grok-4.5", "grok-4.5"),
+        ("xai/grok-4.5", "grok-4.5"),
     ],
 )
 def test_grok_native_oauth_model_selection_includes_build_0_1(
