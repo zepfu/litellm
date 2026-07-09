@@ -35,9 +35,9 @@ flags until those fields are verified for the gpt-5.6 family. Codex alias routin
 
 - `aawm-sota`: `gpt-5.6-sol` → `gpt-5.5`
 - `aawm-sota-openai`: same order as `aawm-sota` (`gpt-5.6-sol` → `gpt-5.5`)
-- `aawm-sota-xai`: `oa_xai/grok-4.5` → `grok-4.5` → `grok-build` (last resort); Grok 4.5 candidate-unavailable errors use a ~1 hour cooldown
+- `aawm-sota-xai`: `oa_xai/grok-4.5` → `grok-4.5` → `grok-build` (last resort); generic Grok 4.5 candidate-unavailable probe failures do not apply a durable cooldown, while explicit usage/quota/rate/capacity signals still use normal cooldown handling
 - Grok 4.5 (`xai/grok-4.5`, `oa_xai/grok-4.5`): 500k context; input $2/M, output $6/M, cached input $0.50/M (`input_cost_per_token` 0.000002, `output_cost_per_token` 0.000006, `cache_read_input_token_cost` 5e-07); tiered pricing above 200k context is not modeled in the map
-- `aawm-code`: `gpt-5.3-codex-spark` → `xai/grok-4.5` → `grok-composer-2.5-fast` → `oa_xai/grok-build` → `gpt-5.6-terra` → `gpt-5.5` (Grok 4.5 candidate-unavailable errors use a ~1 hour cooldown)
+- `aawm-code`: `gpt-5.3-codex-spark` → `xai/grok-4.5` → `grok-composer-2.5-fast` → `oa_xai/grok-build` → `gpt-5.6-terra` → `gpt-5.5`
 - `aawm-low`: OpenRouter/OpenCode lanes → `gpt-5.6-luna` → `gpt-5.4-mini`
 - `aawm-orchestration`: `gpt-5.6-terra` → `gpt-5.5`
 

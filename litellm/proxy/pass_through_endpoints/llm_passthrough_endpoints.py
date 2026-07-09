@@ -384,7 +384,6 @@ _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS = 30.0 * 60.0
 _CODEX_AUTO_AGENT_SPARK_MODEL = "gpt-5.3-codex-spark"
 _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = 300.0
 _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = 300.0
-_CODEX_AUTO_AGENT_GROK_4_5_CANDIDATE_UNAVAILABLE_COOLDOWN_SECONDS = 3600.0
 _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = (
     "GROK_BUILD_USAGE_BALANCE_EXHAUSTED"
 )
@@ -487,14 +486,12 @@ _CODEX_AAWM_SOTA_XAI_CANDIDATES: tuple[dict[str, Any], ...] = (
         "model": "oa_xai/grok-4.5",
         "route_family": "codex_xai_oauth_responses_adapter",
         "last_resort": False,
-        "expected_candidate_unavailable_cooldown_seconds": _CODEX_AUTO_AGENT_GROK_4_5_CANDIDATE_UNAVAILABLE_COOLDOWN_SECONDS,
     },
     {
         "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
         "last_resort": False,
-        "expected_candidate_unavailable_cooldown_seconds": _CODEX_AUTO_AGENT_GROK_4_5_CANDIDATE_UNAVAILABLE_COOLDOWN_SECONDS,
     },
     {
         "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
@@ -515,7 +512,6 @@ _CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "model": "xai/grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
         "last_resort": False,
-        "expected_candidate_unavailable_cooldown_seconds": _CODEX_AUTO_AGENT_GROK_4_5_CANDIDATE_UNAVAILABLE_COOLDOWN_SECONDS,
     },
     {
         "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
@@ -659,7 +655,6 @@ _ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
         "model": "xai/grok-4.5",
         "route_family": "anthropic_grok_native_responses_adapter",
         "last_resort": False,
-        "expected_candidate_unavailable_cooldown_seconds": _CODEX_AUTO_AGENT_GROK_4_5_CANDIDATE_UNAVAILABLE_COOLDOWN_SECONDS,
     },
     {
         "provider": _CODEX_AUTO_AGENT_XAI_PROVIDER,
@@ -4509,7 +4504,14 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add(
             _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN
         )
-    if "usage_limit_reached" in text_lower:
+    if (
+        "usage_limit_reached" in text_lower
+        or "usage limit" in text_lower
+        or "weekly limit" in text_lower
+        or "quota exceeded" in text_lower
+        or "quota exhausted" in text_lower
+        or "quota limit" in text_lower
+    ):
         tokens.add("usage_limit_reached")
     if "resource_exhausted" in text_lower or "resource exhausted" in text_lower:
         tokens.add("RESOURCE_EXHAUSTED")
@@ -4644,24 +4646,20 @@ def _is_codex_auto_agent_grok_4_5_candidate(
     return route_family in {
         "codex_xai_oauth_responses_adapter",
         "codex_grok_native_responses_adapter",
+        "anthropic_grok_native_responses_adapter",
     } and model.endswith("grok-4.5")
 
 
-def _get_codex_auto_agent_expected_candidate_unavailable_cooldown_seconds(
+def _is_codex_auto_agent_native_grok_4_5_candidate(
     candidate: Optional[dict[str, Any]],
-) -> Optional[float]:
-    if not isinstance(candidate, dict):
-        return None
-    raw = candidate.get("expected_candidate_unavailable_cooldown_seconds")
-    if raw is None:
-        return None
-    try:
-        seconds = float(raw)
-    except (TypeError, ValueError):
-        return None
-    if seconds <= 0:
-        return None
-    return seconds
+) -> bool:
+    if not _is_codex_auto_agent_grok_4_5_candidate(candidate):
+        return False
+    route_family = str((candidate or {}).get("route_family") or "")
+    return route_family in {
+        "codex_grok_native_responses_adapter",
+        "anthropic_grok_native_responses_adapter",
+    }
 
 
 def _is_codex_auto_agent_transient_internal_error_class(error_class: Optional[str]) -> bool:
@@ -4679,6 +4677,19 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     *,
     candidate: Optional[dict[str, Any]] = None,
 ) -> str:
+    # Native Grok 4.5 is live. Broad candidate-unavailable probes can still
+    # happen on transient/request-shape blips, so do not evict the native
+    # candidate from routing. OAuth-route credential failures still fall through
+    # request-locally to the native Grok candidate.
+    if (
+        error_class == "candidate_unavailable"
+        and _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
+    ):
+        return "none"
+    if error_class == "candidate_unavailable" and _is_codex_auto_agent_grok_4_5_candidate(
+        candidate
+    ):
+        return "request_local"
     if (
         _is_codex_auto_agent_spark_candidate(candidate)
         and _is_codex_auto_agent_transient_internal_error_class(error_class)
@@ -4781,6 +4792,21 @@ def _exclude_codex_auto_agent_request_local_candidate(
     _get_codex_auto_agent_request_local_excluded_keys(request).add(cooldown_key)
 
 
+def _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+    request: Request,
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+) -> None:
+    _exclude_codex_auto_agent_request_local_candidate(
+        request,
+        cooldown_key=_get_codex_auto_agent_request_local_cooldown_key(
+            candidate=candidate,
+            lane_key=lane_key,
+        ),
+    )
+
+
 async def _apply_codex_auto_agent_alias_cooldown(
     *,
     request: Request,
@@ -4794,6 +4820,8 @@ async def _apply_codex_auto_agent_alias_cooldown(
         error_class,
         candidate=candidate,
     )
+    if cooldown_scope == "none":
+        return cooldown_scope
     if cooldown_scope == "candidate":
         await _set_codex_auto_agent_cooldown(
             selected_cooldown_key,
@@ -4830,6 +4858,8 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
         error_class,
         candidate=candidate,
     )
+    if cooldown_scope == "none":
+        return cooldown_scope
     if cooldown_scope == "candidate":
         await _set_anthropic_auto_agent_cooldown(
             selected_cooldown_key,
@@ -4898,12 +4928,14 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc):
         return "capacity_exhausted"
-    if "aawm_codex_auto_agent_candidate_unavailable" in tokens:
-        return "candidate_unavailable"
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
     if tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
         return "capacity_exhausted"
+    if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
+        return "rate_limited"
+    if "aawm_codex_auto_agent_candidate_unavailable" in tokens:
+        return "candidate_unavailable"
     if "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in tokens:
         return "provider_format_rejected"
     if "OPENROUTER_INVALID_CHAT_MESSAGE" in tokens:
@@ -4914,8 +4946,6 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "provider_terminal_error"
     if "aawm_auto_agent_malformed_tool_call_text" in tokens:
         return "malformed_tool_call_text"
-    if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
-        return "rate_limited"
     if status_code == 429:
         return "rate_limited"
     if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
@@ -5003,17 +5033,6 @@ def _get_codex_auto_agent_cooldown_seconds(
         and _is_codex_auto_agent_durable_cooldown_error_class(error_class)
     ):
         return _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS
-    candidate_unavailable_cooldown = (
-        _get_codex_auto_agent_expected_candidate_unavailable_cooldown_seconds(
-            candidate
-        )
-    )
-    if (
-        candidate_unavailable_cooldown is not None
-        and error_class == "candidate_unavailable"
-        and _is_codex_auto_agent_grok_4_5_candidate(candidate)
-    ):
-        return candidate_unavailable_cooldown
     return resolved
 
 
@@ -5090,13 +5109,18 @@ def _update_codex_auto_agent_retryable_attempt_record(
     error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
     retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
     update: dict[str, Any] = {
-        "status": "cooldown_set",
-        "cooldown_seconds": round(float(cooldown_seconds), 3),
+        "status": (
+            "retryable_no_cooldown"
+            if cooldown_scope == "none"
+            else "cooldown_set"
+        ),
         "error_class": error_class,
         "error_tokens": sorted(error_tokens),
         "failure_phase": "provider_attempt",
         "attempted_provider_call": True,
     }
+    if cooldown_scope != "none":
+        update["cooldown_seconds"] = round(float(cooldown_seconds), 3)
     if cooldown_scope is not None:
         update["cooldown_scope"] = cooldown_scope
     if error_status_code is not None:
@@ -25863,7 +25887,13 @@ async def _handle_anthropic_auto_agent_alias_route(
                 cooldown_seconds=cooldown_seconds,
                 cooldown_scope=cooldown_scope,
             )
-            if has_continuation_state:
+            if cooldown_scope == "none" and not has_continuation_state:
+                _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+                    request,
+                    candidate=candidate,
+                    lane_key=selection.get("lane_key"),
+                )
+            if has_continuation_state and cooldown_scope != "none":
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
                 failure_body = _record_auto_agent_alias_attempt_failure(
                     alias_family="anthropic_auto_agent",
@@ -28733,7 +28763,13 @@ async def _handle_codex_auto_agent_alias_route(
                 cooldown_seconds=cooldown_seconds,
                 cooldown_scope=cooldown_scope,
             )
-            if has_continuation_state:
+            if cooldown_scope == "none" and not has_continuation_state:
+                _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+                    request,
+                    candidate=candidate,
+                    lane_key=selection.get("lane_key"),
+                )
+            if has_continuation_state and cooldown_scope != "none":
                 attempt_record["status"] = "terminal_in_flight_cooldown_set"
                 failure_body = _record_auto_agent_alias_attempt_failure(
                     alias_family="codex_auto_agent",

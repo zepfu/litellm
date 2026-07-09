@@ -7909,12 +7909,8 @@ class TestOpenRouterAdapterRetry:
         assert sota_xai[0]["route_family"] == "codex_xai_oauth_responses_adapter"
         assert sota_xai[1]["route_family"] == "codex_grok_native_responses_adapter"
         assert sota_xai[2]["last_resort"] is True
-        assert sota_xai[0][
-            "expected_candidate_unavailable_cooldown_seconds"
-        ] == 3600.0
-        assert sota_xai[1][
-            "expected_candidate_unavailable_cooldown_seconds"
-        ] == 3600.0
+        assert "expected_candidate_unavailable_cooldown_seconds" not in sota_xai[0]
+        assert "expected_candidate_unavailable_cooldown_seconds" not in sota_xai[1]
         assert [
             candidate["model"]
             for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-code")
@@ -7930,9 +7926,7 @@ class TestOpenRouterAdapterRetry:
         grok45 = code[1]
         assert grok45["model"] == "xai/grok-4.5"
         assert grok45["route_family"] == "codex_grok_native_responses_adapter"
-        assert grok45[
-            "expected_candidate_unavailable_cooldown_seconds"
-        ] == 3600.0
+        assert "expected_candidate_unavailable_cooldown_seconds" not in grok45
 
     def test_opencode_zen_model_registries_expose_only_maintained_models(self):
         from pathlib import Path
@@ -20291,9 +20285,7 @@ async def test_anthropic_auto_agent_alias_code_order_omits_antigravity(
     ]
     grok45 = candidates[1]
     assert grok45["route_family"] == "anthropic_grok_native_responses_adapter"
-    assert grok45[
-        "expected_candidate_unavailable_cooldown_seconds"
-    ] == 3600.0
+    assert "expected_candidate_unavailable_cooldown_seconds" not in grok45
 
 
 @pytest.mark.asyncio
@@ -21423,8 +21415,10 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permi
         "error_tokens"
     ]
     grok45_attempt = metadata["anthropic_auto_agent_attempts"][0]
-    assert grok45_attempt["status"] == "cooldown_set"
+    assert grok45_attempt["status"] == "retryable_no_cooldown"
     assert grok45_attempt["error_class"] == "candidate_unavailable"
+    assert grok45_attempt["cooldown_scope"] == "none"
+    assert "cooldown_seconds" not in grok45_attempt
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["model"] == (
         "gpt-5.3-codex-spark"
     )
@@ -22070,6 +22064,88 @@ async def test_anthropic_auto_agent_alias_in_flight_bare_502_redispatches_withou
     mock_composer.assert_awaited_once()
     mock_spark.assert_not_called()
     mock_xai_oauth.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_in_flight_grok_4_5_candidate_unavailable_retries_without_redispatch():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "xai",
+        "model": "xai/grok-4.5",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    grok_unavailable = ProxyException(
+        message="grok 4.5 probe unavailable",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    grok_unavailable.detail = {
+        "error": {
+            "message": "generic Grok 4.5 availability probe failed",
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=[grok_unavailable, success]),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is success
+    assert mock_grok_native.await_count == 2
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert [attempt["model"] for attempt in attempts] == [
+        "xai/grok-4.5",
+        "xai/grok-4.5",
+    ]
+    assert attempts[0]["status"] == "retryable_no_cooldown"
+    assert attempts[0]["error_class"] == "candidate_unavailable"
+    assert attempts[0]["cooldown_scope"] == "none"
+    assert "cooldown_seconds" not in attempts[0]
+    assert metadata["anthropic_auto_agent_selected_model"] == "xai/grok-4.5"
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:xai/grok-4.5:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
 
 
 @pytest.mark.asyncio
@@ -24853,9 +24929,7 @@ async def test_codex_auto_agent_alias_code_order_omits_antigravity(
     ]
     grok45 = candidates[1]
     assert grok45["route_family"] == "codex_grok_native_responses_adapter"
-    assert grok45[
-        "expected_candidate_unavailable_cooldown_seconds"
-    ] == 3600.0
+    assert "expected_candidate_unavailable_cooldown_seconds" not in grok45
 
 
 def test_codex_auto_agent_alias_metadata_uses_requested_alias():
@@ -25136,8 +25210,10 @@ async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permissio
         "error_tokens"
     ]
     grok45_attempt = metadata["codex_auto_agent_attempts"][0]
-    assert grok45_attempt["status"] == "cooldown_set"
+    assert grok45_attempt["status"] == "retryable_no_cooldown"
     assert grok45_attempt["error_class"] == "candidate_unavailable"
+    assert grok45_attempt["cooldown_scope"] == "none"
+    assert "cooldown_seconds" not in grok45_attempt
     assert metadata["codex_auto_agent_skipped_candidates"][0]["model"] == (
         "gpt-5.3-codex-spark"
     )
@@ -25434,6 +25510,21 @@ def test_codex_auto_agent_candidate_cooldown_scope_non_spark_transient_stays_req
             candidate=grok,
         )
         == "request_local"
+    )
+
+
+def test_codex_auto_agent_candidate_cooldown_scope_live_grok_4_5_unavailable_has_no_cooldown():
+    grok45 = {
+        "model": "xai/grok-4.5",
+        "provider": "xai",
+        "route_family": "codex_grok_native_responses_adapter",
+    }
+    assert (
+        _get_codex_auto_agent_candidate_cooldown_scope(
+            "candidate_unavailable",
+            candidate=grok45,
+        )
+        == "none"
     )
 
 
@@ -35604,18 +35695,16 @@ def test_codex_aawm_sota_openai_and_sota_xai_alias_normalization():
     ) is None
 
 
-def test_codex_auto_agent_grok_4_5_candidate_unavailable_cooldown_is_one_hour():
+def test_codex_auto_agent_grok_4_5_candidate_unavailable_does_not_durable_cooldown():
     grok45_oauth = {
         "provider": "xai",
         "model": "oa_xai/grok-4.5",
         "route_family": "codex_xai_oauth_responses_adapter",
-        "expected_candidate_unavailable_cooldown_seconds": 3600.0,
     }
     grok45_native = {
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
-        "expected_candidate_unavailable_cooldown_seconds": 3600.0,
     }
     unavailable_exc = ProxyException(
         message="xAI OAuth auto-agent candidate requires a valid managed xAI OAuth credential",
@@ -35629,12 +35718,29 @@ def test_codex_auto_agent_grok_4_5_candidate_unavailable_cooldown_is_one_hour():
             "code": "aawm_codex_auto_agent_candidate_unavailable",
         }
     }
+    assert _classify_codex_auto_agent_retryable_exhaustion(unavailable_exc) == (
+        "candidate_unavailable"
+    )
     assert _get_codex_auto_agent_cooldown_seconds(
         unavailable_exc, candidate=grok45_oauth
-    ) == 3600.0
+    ) == 3 * 60 * 60.0
     assert _get_codex_auto_agent_cooldown_seconds(
         unavailable_exc, candidate=grok45_native
-    ) == 3600.0
+    ) == 3 * 60 * 60.0
+    assert (
+        _get_codex_auto_agent_candidate_cooldown_scope(
+            "candidate_unavailable",
+            candidate=grok45_oauth,
+        )
+        == "request_local"
+    )
+    assert (
+        _get_codex_auto_agent_candidate_cooldown_scope(
+            "candidate_unavailable",
+            candidate=grok45_native,
+        )
+        == "none"
+    )
 
 
 def test_codex_auto_agent_grok_4_5_model_not_found_is_candidate_unavailable():
@@ -35642,7 +35748,6 @@ def test_codex_auto_agent_grok_4_5_model_not_found_is_candidate_unavailable():
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
-        "expected_candidate_unavailable_cooldown_seconds": 3600.0,
     }
     not_found_exc = HTTPException(
         status_code=404,
@@ -35654,7 +35759,45 @@ def test_codex_auto_agent_grok_4_5_model_not_found_is_candidate_unavailable():
     )
     assert _get_codex_auto_agent_cooldown_seconds(
         not_found_exc, candidate=grok45_native
-    ) == 3600.0
+    ) == 3 * 60 * 60.0
+    assert (
+        _get_codex_auto_agent_candidate_cooldown_scope(
+            "candidate_unavailable",
+            candidate=grok45_native,
+        )
+        == "none"
+    )
+
+
+def test_codex_auto_agent_grok_4_5_usage_limit_wins_over_candidate_unavailable():
+    grok45_native = {
+        "provider": "xai",
+        "model": "grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+    }
+    usage_exc = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": (
+                    "aawm_codex_auto_agent_candidate_unavailable: "
+                    "Weekly limit reached for Grok 4.5"
+                ),
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(usage_exc) == (
+        "usage_limit_reached"
+    )
+    assert (
+        _get_codex_auto_agent_candidate_cooldown_scope(
+            "usage_limit_reached",
+            candidate=grok45_native,
+        )
+        == "candidate"
+    )
 
 
 def test_codex_auto_agent_spark_durable_cooldown_seconds_are_five_minutes():

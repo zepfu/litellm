@@ -573,11 +573,10 @@ documented in the Antigravity OAuth Credentials section.
 2. `grok-4.5` via the native Grok OIDC Responses adapter
 3. `grok-build` as the xAI last-resort candidate
 
-When a Grok 4.5 candidate returns
-`aawm_codex_auto_agent_candidate_unavailable`, LiteLLM applies a durable
-~3600 second cooldown for that candidate so unavailable-candidate responses do
-not churn the alias on every request while still allowing pickup after cooldown
-expiry.
+Grok 4.5 is treated as a live candidate. Generic
+`aawm_codex_auto_agent_candidate_unavailable` probe failures do not apply a
+durable Grok 4.5 cooldown; explicit usage, quota, rate-limit, or capacity
+signals still use the normal cooldown/fallback path.
 
 `aawm-sota` uses this order:
 
@@ -597,7 +596,7 @@ expiry.
 `aawm-code` uses this order:
 
 1. `gpt-5.3-codex-spark`
-2. `xai/grok-4.5` via the native Grok OIDC Responses adapter (candidate-unavailable errors use a ~1 hour cooldown)
+2. `xai/grok-4.5` via the native Grok OIDC Responses adapter
 3. `grok-composer-2.5-fast`
 4. `oa_xai/grok-build`
 5. `gpt-5.6-terra`
@@ -616,7 +615,7 @@ expiry.
 `aawm-code-anthropic` uses this order:
 
 1. `gpt-5.3-codex-spark`
-2. `xai/grok-4.5` via the native Grok OIDC Responses adapter (candidate-unavailable errors use a ~1 hour cooldown)
+2. `xai/grok-4.5` via the native Grok OIDC Responses adapter
 3. `grok-composer-2.5-fast`
 4. `oa_xai/grok-build`
 5. native Anthropic `claude-sonnet-5[1m]` (1m context window)

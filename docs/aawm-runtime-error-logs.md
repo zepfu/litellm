@@ -357,6 +357,11 @@ unavailable candidate until the cooldown expires. Bare transient upstream
 instability does not suppress a route longer than the current progression
 requires.
 
+Native Grok 4.5 is the exception for generic candidate-availability probe
+failures: `aawm_codex_auto_agent_candidate_unavailable` does not create a timed
+cooldown for that live route. Explicit usage, quota, rate-limit, or capacity
+signals still use the normal cooldown and fallback path.
+
 `malformed_tool_call_text` is also a durable per-candidate cooldown path. For
 non-spark candidates it resolves to a 30-minute cooldown; Spark candidates keep
 their existing five-minute durable override for this failure class.
