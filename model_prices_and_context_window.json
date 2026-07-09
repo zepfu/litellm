@@ -39517,9 +39517,9 @@
     },
     "xai/grok-4.5": {
         "litellm_provider": "xai",
-        "max_input_tokens": 1000000,
-        "max_output_tokens": 1000000,
-        "max_tokens": 1000000,
+        "max_input_tokens": 500000,
+        "max_output_tokens": 500000,
+        "max_tokens": 500000,
         "mode": "responses",
         "source": "https://docs.x.ai/developers/models/grok-4.5",
         "supports_function_calling": true,
@@ -39541,13 +39541,16 @@
             "reasoning"
         ],
         "supports_vision": true,
-        "supports_web_search": true
+        "supports_web_search": true,
+        "input_cost_per_token": 2e-06,
+        "output_cost_per_token": 6e-06,
+        "cache_read_input_token_cost": 5e-07
     },
     "oa_xai/grok-4.5": {
         "litellm_provider": "xai",
-        "max_input_tokens": 1000000,
-        "max_output_tokens": 1000000,
-        "max_tokens": 1000000,
+        "max_input_tokens": 500000,
+        "max_output_tokens": 500000,
+        "max_tokens": 500000,
         "mode": "responses",
         "source": "https://docs.x.ai/developers/models/grok-4.5",
         "supports_function_calling": true,
@@ -39569,6 +39572,9 @@
             "reasoning"
         ],
         "supports_vision": true,
-        "supports_web_search": true
+        "supports_web_search": true,
+        "input_cost_per_token": 2e-06,
+        "output_cost_per_token": 6e-06,
+        "cache_read_input_token_cost": 5e-07
     }
 }

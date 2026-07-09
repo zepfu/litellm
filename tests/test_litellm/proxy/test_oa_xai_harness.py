@@ -141,6 +141,11 @@ def test_oa_xai_harness_maps_all_public_models(public_model, upstream_model):
 
     assert oauth.resolve_oa_xai_upstream_model(public_model) == upstream_model
     assert catalog[public_model]["mode"] == "responses"
+    if public_model == "oa_xai/grok-4.5":
+        assert catalog[public_model]["input_cost_per_token"] == 0.000002
+        assert catalog[public_model]["output_cost_per_token"] == 0.000006
+        assert catalog["xai/grok-4.5"]["input_cost_per_token"] == 0.000002
+        assert catalog["xai/grok-4.5"]["output_cost_per_token"] == 0.000006
     assert metadata["xai_oauth_public_model"] == public_model
     assert metadata["xai_oauth_upstream_model"] == upstream_model
     assert metadata["auth_mode"] == "oauth"

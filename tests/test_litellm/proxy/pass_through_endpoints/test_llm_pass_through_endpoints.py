@@ -7910,21 +7910,29 @@ class TestOpenRouterAdapterRetry:
         assert sota_xai[1]["route_family"] == "codex_grok_native_responses_adapter"
         assert sota_xai[2]["last_resort"] is True
         assert sota_xai[0][
-            "expected_pre_release_candidate_unavailable_cooldown_seconds"
+            "expected_candidate_unavailable_cooldown_seconds"
         ] == 3600.0
         assert sota_xai[1][
-            "expected_pre_release_candidate_unavailable_cooldown_seconds"
+            "expected_candidate_unavailable_cooldown_seconds"
         ] == 3600.0
         assert [
             candidate["model"]
             for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-code")
         ] == [
             "gpt-5.3-codex-spark",
+            "xai/grok-4.5",
             "grok-composer-2.5-fast",
             "oa_xai/grok-build",
             "gpt-5.6-terra",
             "gpt-5.5",
         ]
+        code = _get_codex_auto_agent_candidates_for_alias("aawm-code")
+        grok45 = code[1]
+        assert grok45["model"] == "xai/grok-4.5"
+        assert grok45["route_family"] == "codex_grok_native_responses_adapter"
+        assert grok45[
+            "expected_candidate_unavailable_cooldown_seconds"
+        ] == 3600.0
 
     def test_opencode_zen_model_registries_expose_only_maintained_models(self):
         from pathlib import Path
@@ -19677,7 +19685,7 @@ async def test_anthropic_code_anthropic_skips_spark_when_codex_family_cooldown_a
     )
 
     assert selection["candidate"]["provider"] == "xai"
-    assert selection["candidate"]["model"] == "grok-composer-2.5-fast"
+    assert selection["candidate"]["model"] == "xai/grok-4.5"
     assert selection["selection_reason"] == "first_available"
     assert selection["skipped"][0]["provider"] == "openai"
     assert selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
@@ -19699,7 +19707,7 @@ async def test_anthropic_code_anthropic_merged_spark_cooldown_prefers_longer_fam
         request_body=body,
     )
 
-    assert selection["candidate"]["model"] == "grok-composer-2.5-fast"
+    assert selection["candidate"]["model"] == "xai/grok-4.5"
     assert selection["skipped"][0]["cooldown_seconds"] >= 89.0
     assert "codex_family:" in selection["skipped"][0]["cooldown_state_source"]
     assert "anthropic_family:" in selection["skipped"][0]["cooldown_state_source"]
@@ -19715,6 +19723,12 @@ async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates(
             "openai",
             "gpt-5.3-codex-spark",
             "anthropic_openai_responses_adapter",
+            False,
+        ),
+        (
+            "xai",
+            "xai/grok-4.5",
+            "anthropic_grok_native_responses_adapter",
             False,
         ),
         (
@@ -20268,12 +20282,44 @@ async def test_anthropic_auto_agent_alias_code_order_omits_antigravity(
     )
     assert [candidate["model"] for candidate in candidates] == [
         "gpt-5.3-codex-spark",
+        "xai/grok-4.5",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
         "claude-sonnet-5[1m]",
         "claude-sonnet-5",
         "claude-sonnet-4-6",
     ]
+    grok45 = candidates[1]
+    assert grok45["route_family"] == "anthropic_grok_native_responses_adapter"
+    assert grok45[
+        "expected_candidate_unavailable_cooldown_seconds"
+    ] == 3600.0
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_alias_code_selects_live_grok_4_5_after_spark_cooldown(
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    await _set_anthropic_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:__default__",
+        60.0,
+    )
+
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+
+    assert selection["candidate"]["model"] == "xai/grok-4.5"
+    assert selection["candidate"]["route_family"] == (
+        "anthropic_grok_native_responses_adapter"
+    )
+    assert selection["selection_reason"] == "first_available"
+    assert [
+        candidate["model"] for candidate in selection["skipped"]
+    ] == ["gpt-5.3-codex-spark"]
 
 
 @pytest.mark.asyncio
@@ -20284,6 +20330,7 @@ async def test_anthropic_auto_agent_alias_code_selects_sonnet_5_1m_before_plain_
 
     for cooldown_key in (
         "openai:gpt-5.3-codex-spark:__default__",
+        "xai:xai/grok-4.5:xai_grok_native",
         "xai:grok-composer-2.5-fast:xai_grok_native",
         "xai:oa_xai/grok-build:xai_grok_native",
     ):
@@ -20317,6 +20364,7 @@ async def test_anthropic_auto_agent_alias_code_native_sonnet_5_1m_normalizes_mod
     body["model"] = "aawm-code-anthropic"
     for cooldown_key in (
         "openai:gpt-5.3-codex-spark:__default__",
+        "xai:xai/grok-4.5:xai_grok_native",
         "xai:grok-composer-2.5-fast:xai_grok_native",
         "xai:oa_xai/grok-build:xai_grok_native",
     ):
@@ -20856,7 +20904,7 @@ async def test_anthropic_antigravity_completion_adapter_probe_preserves_request_
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_falls_back_to_composer_after_spark_429(
+async def test_anthropic_auto_agent_alias_code_falls_back_to_live_grok_4_5_after_spark_429(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
@@ -20875,7 +20923,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_composer_after_spar
             "status": "RESOURCE_EXHAUSTED",
         }
     }
-    composer_success = Response(content='{"ok": true}', media_type="application/json")
+    grok45_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
@@ -20883,8 +20931,8 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_composer_after_spar
     ) as mock_spark:
         with patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
-            new=AsyncMock(return_value=composer_success),
-        ) as mock_composer:
+            new=AsyncMock(return_value=grok45_success),
+        ) as mock_grok_native:
             response = await _handle_anthropic_auto_agent_alias_route(
                 endpoint="/v1/messages",
                 request=request,
@@ -20895,18 +20943,19 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_composer_after_spar
                 custom_headers={"x-api-key": "anthropic-key"},
             )
 
-    assert response is composer_success
+    assert response is grok45_success
     mock_spark.assert_awaited_once()
     assert mock_spark.await_args.kwargs["adapter_model"] == "gpt-5.3-codex-spark"
     assert mock_spark.await_args.kwargs["use_alias_candidate_probe"] is True
-    mock_composer.assert_awaited_once()
-    assert mock_composer.await_args.kwargs["adapter_model"] == "grok-composer-2.5-fast"
-    assert mock_composer.await_args.kwargs["use_alias_candidate_probe"] is True
-    composer_body = mock_composer.await_args.kwargs["prepared_request_body"]
-    metadata = composer_body["litellm_metadata"]
+    mock_grok_native.assert_awaited_once()
+    assert mock_grok_native.await_args.kwargs["adapter_model"] == "xai/grok-4.5"
+    assert mock_grok_native.await_args.kwargs["use_alias_candidate_probe"] is True
+    grok_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
+    metadata = grok_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code-anthropic"
     assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
+    assert metadata["anthropic_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["anthropic_auto_agent_selected_route_family"] == (
         "anthropic_grok_native_responses_adapter"
     )
@@ -20916,7 +20965,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_composer_after_spar
     )
     assert [attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]] == [
         "gpt-5.3-codex-spark",
-        "grok-composer-2.5-fast",
+        "xai/grok-4.5",
     ]
     audit_events = metadata["aawm_alias_routing_audit_events"]
     retryable_index = next(
@@ -20936,11 +20985,11 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_composer_after_spar
     assert retryable_event["failure_class"]
     selected_event = audit_events[selected_index]
     assert selected_event["provider"] == "xai"
-    assert selected_event["model"] == "grok-composer-2.5-fast"
+    assert selected_event["model"] == "xai/grok-4.5"
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_composer_after_spark_429(
+async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_live_grok_4_5_after_spark_429(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
@@ -20975,15 +21024,15 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_compos
             "status": "RESOURCE_EXHAUSTED",
         }
     }
-    composer_success = Response(content='{"ok": true}', media_type="application/json")
+    grok45_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
         new=AsyncMock(side_effect=spark_error),
     ) as mock_spark, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
-        new=AsyncMock(return_value=composer_success),
-    ) as mock_composer, patch(
+        new=AsyncMock(return_value=grok45_success),
+    ) as mock_grok_native, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
         new=AsyncMock(),
     ) as mock_native, patch(
@@ -20999,15 +21048,15 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_compos
             custom_headers={"x-api-key": "anthropic-key"},
         )
 
-    assert response is composer_success
+    assert response is grok45_success
     mock_spark.assert_awaited_once()
-    mock_composer.assert_awaited_once()
+    mock_grok_native.assert_awaited_once()
     mock_native.assert_not_called()
-    composer_body = mock_composer.await_args.kwargs["prepared_request_body"]
-    metadata = composer_body["litellm_metadata"]
+    grok_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
+    metadata = grok_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code-anthropic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert metadata["anthropic_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["anthropic_auto_agent_selected_route_family"] == (
         "anthropic_grok_native_responses_adapter"
     )
@@ -21021,7 +21070,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_compos
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_next_declared_candidate(
+async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_live_grok_4_5(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
@@ -21047,7 +21096,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_nex
         "openai:gpt-5.3-codex-spark:__default__",
         10691.0,
     )
-    composer_success = Response(content='{"ok": true}', media_type="application/json")
+    grok45_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
@@ -21057,7 +21106,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_nex
         new=AsyncMock(),
     ) as mock_spark, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
-        new=AsyncMock(return_value=composer_success),
+        new=AsyncMock(return_value=grok45_success),
     ) as mock_grok_native, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
         new=AsyncMock(),
@@ -21075,16 +21124,16 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_nex
             custom_headers={"x-api-key": "anthropic-key"},
         )
 
-    assert response is composer_success
+    assert response is grok45_success
     mock_antigravity_lane.assert_not_called()
     mock_spark.assert_not_called()
     mock_grok_native.assert_awaited_once()
     mock_xai_oauth.assert_not_called()
     mock_native.assert_not_called()
-    composer_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
-    metadata = composer_body["litellm_metadata"]
+    grok_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
+    metadata = grok_body["litellm_metadata"]
     assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert metadata["anthropic_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
         "openai"
     )
@@ -21095,7 +21144,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_nex
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_next_declared_candidate(
+async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_live_grok_4_5(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
@@ -21117,7 +21166,7 @@ async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_next_de
         "openai:gpt-5.3-codex-spark:__default__",
         10691.0,
     )
-    composer_success = Response(content='{"ok": true}', media_type="application/json")
+    grok45_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
@@ -21127,7 +21176,7 @@ async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_next_de
         new=AsyncMock(),
     ) as mock_spark, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
-        new=AsyncMock(return_value=composer_success),
+        new=AsyncMock(return_value=grok45_success),
     ) as mock_grok_native, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
         new=AsyncMock(),
@@ -21145,7 +21194,7 @@ async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_next_de
             custom_headers={"x-api-key": "anthropic-key"},
         )
 
-    assert response is composer_success
+    assert response is grok45_success
     mock_antigravity_lane.assert_not_called()
     mock_spark.assert_not_called()
     mock_grok_native.assert_awaited_once()
@@ -21154,7 +21203,7 @@ async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_next_de
     composer_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
     metadata = composer_body["litellm_metadata"]
     assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
-    assert metadata["anthropic_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert metadata["anthropic_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["aawm_alias_routing_audit_events"][-1]["in_flight_session"] is True
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["provider"] == (
         "openai"
@@ -21187,6 +21236,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_reaches_native_last_
     body["tool_choice"] = {"type": "function", "name": "Bash"}
     for cooldown_key in (
         "openai:gpt-5.3-codex-spark:__default__",
+        "xai:xai/grok-4.5:xai_grok_native",
         "xai:grok-composer-2.5-fast:xai_grok_native",
         "xai:oa_xai/grok-build:xai_grok_native",
     ):
@@ -21205,6 +21255,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_reaches_native_last_
         for candidate in selection["skipped"]
     ] == [
         ("openai", "gpt-5.3-codex-spark", "cooldown"),
+        ("xai", "xai/grok-4.5", "cooldown"),
         ("xai", "grok-composer-2.5-fast", "cooldown"),
         ("xai", "oa_xai/grok-build", "cooldown"),
     ]
@@ -21267,7 +21318,7 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
         )
 
     assert response is managed_xai_success
-    mock_grok_native.assert_awaited_once()
+    assert mock_grok_native.await_count == 2
     mock_xai_oauth.assert_awaited_once()
     assert mock_xai_oauth.await_args.kwargs["adapter_model"] == "oa_xai/grok-build"
     assert mock_xai_oauth.await_args.kwargs["use_alias_candidate_probe"] is True
@@ -21284,10 +21335,12 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
         attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]
     ] == [
         "gpt-5.3-codex-spark",
+        "xai/grok-4.5",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
     assert metadata["anthropic_auto_agent_attempts"][1]["status"] == "cooldown_set"
+    assert metadata["anthropic_auto_agent_attempts"][2]["status"] == "cooldown_set"
 
 
 @pytest.mark.asyncio
@@ -21345,7 +21398,7 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permi
         )
 
     assert response is managed_xai_success
-    mock_pass_through.assert_awaited_once()
+    assert mock_pass_through.await_count == 2
     mock_xai_oauth.assert_awaited_once()
     assert mock_xai_oauth.await_args.kwargs["adapter_model"] == "oa_xai/grok-build"
     xai_body = mock_xai_oauth.await_args.kwargs["prepared_request_body"]
@@ -21359,15 +21412,19 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permi
     assert [
         attempt["model"] for attempt in metadata["anthropic_auto_agent_attempts"]
     ] == [
+        "xai/grok-4.5",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
-    composer_attempt = metadata["anthropic_auto_agent_attempts"][0]
+    composer_attempt = metadata["anthropic_auto_agent_attempts"][1]
     assert composer_attempt["status"] == "cooldown_set"
     assert composer_attempt["error_class"] == "candidate_unavailable"
     assert "aawm_codex_auto_agent_candidate_unavailable" in composer_attempt[
         "error_tokens"
     ]
+    grok45_attempt = metadata["anthropic_auto_agent_attempts"][0]
+    assert grok45_attempt["status"] == "cooldown_set"
+    assert grok45_attempt["error_class"] == "candidate_unavailable"
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["model"] == (
         "gpt-5.3-codex-spark"
     )
@@ -23592,7 +23649,67 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_composer():
+async def test_anthropic_auto_agent_in_flight_cooldown_does_not_log_no_candidate_exhaustion():
+    request = _build_anthropic_auto_agent_request()
+    route_status = []
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "anthropic_openai_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    for cooldown_key in (
+        "openai:gpt-5.3-codex-spark:__default__",
+        "openai:gpt-5.3-codex-spark:session:claude-session",
+    ):
+        await _set_anthropic_auto_agent_cooldown(cooldown_key, 60.0)
+        await _set_codex_auto_agent_cooldown(cooldown_key, 60.0)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.emit_aawm_route_status_event",
+        side_effect=lambda **kwargs: route_status.append(kwargs),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_in_flight_provider_cooling_down"
+    )
+    assert route_status == []
+    mock_spark.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_live_grok_4_5():
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-code",
@@ -23611,7 +23728,7 @@ async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_composer(
         request_body=body,
     )
     assert fallback_selection["candidate"]["provider"] == "xai"
-    assert fallback_selection["candidate"]["model"] == "grok-composer-2.5-fast"
+    assert fallback_selection["candidate"]["model"] == "xai/grok-4.5"
     assert fallback_selection["selection_reason"] == "first_available"
     assert fallback_selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
 
@@ -23625,6 +23742,12 @@ async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
     }
     expected_candidates = [
         ("openai", "gpt-5.3-codex-spark", "codex_responses", False),
+        (
+            "xai",
+            "xai/grok-4.5",
+            "codex_grok_native_responses_adapter",
+            False,
+        ),
         (
             "xai",
             "grok-composer-2.5-fast",
@@ -24722,11 +24845,17 @@ async def test_codex_auto_agent_alias_code_order_omits_antigravity(
     candidates = _get_codex_auto_agent_candidates_for_alias("aawm-code")
     assert [candidate["model"] for candidate in candidates] == [
         "gpt-5.3-codex-spark",
+        "xai/grok-4.5",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
         "gpt-5.6-terra",
         "gpt-5.5",
     ]
+    grok45 = candidates[1]
+    assert grok45["route_family"] == "codex_grok_native_responses_adapter"
+    assert grok45[
+        "expected_candidate_unavailable_cooldown_seconds"
+    ] == 3600.0
 
 
 def test_codex_auto_agent_alias_metadata_uses_requested_alias():
@@ -24805,7 +24934,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_back_to_composer_after_spark_429(
+async def test_codex_auto_agent_alias_code_falls_back_to_live_grok_4_5_after_spark_429(
     monkeypatch,
 ):
     request = _build_codex_auto_agent_request()
@@ -24828,7 +24957,7 @@ async def test_codex_auto_agent_alias_code_falls_back_to_composer_after_spark_42
             "status": "RESOURCE_EXHAUSTED",
         }
     }
-    composer_success = Response(content='{"ok": true}', media_type="application/json")
+    grok45_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
@@ -24836,8 +24965,8 @@ async def test_codex_auto_agent_alias_code_falls_back_to_composer_after_spark_42
     ) as mock_pass_through:
         with patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
-            new=AsyncMock(return_value=composer_success),
-        ) as mock_composer:
+            new=AsyncMock(return_value=grok45_success),
+        ) as mock_grok_native:
             response = await _handle_codex_auto_agent_alias_route(
                 endpoint="/v1/responses",
                 request=request,
@@ -24849,18 +24978,18 @@ async def test_codex_auto_agent_alias_code_falls_back_to_composer_after_spark_42
                 forward_headers=True,
             )
 
-    assert response is composer_success
+    assert response is grok45_success
     mock_pass_through.assert_awaited_once()
-    mock_composer.assert_awaited_once()
-    assert mock_composer.await_args.kwargs["request_body"]["model"] == (
-        "grok-composer-2.5-fast"
+    mock_grok_native.assert_awaited_once()
+    assert mock_grok_native.await_args.kwargs["request_body"]["model"] == (
+        "xai/grok-4.5"
     )
-    composer_body = mock_composer.await_args.kwargs["request_body"]
-    metadata = composer_body["litellm_metadata"]
+    grok_body = mock_grok_native.await_args.kwargs["request_body"]
+    metadata = grok_body["litellm_metadata"]
     assert metadata["requested_model_alias"] == "aawm-code"
     assert metadata["codex_auto_agent_alias"] == "aawm-code"
     assert metadata["codex_auto_agent_selected_provider"] == "xai"
-    assert metadata["codex_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert metadata["codex_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["codex_auto_agent_selected_route_family"] == (
         "codex_grok_native_responses_adapter"
     )
@@ -24868,7 +24997,7 @@ async def test_codex_auto_agent_alias_code_falls_back_to_composer_after_spark_42
     assert metadata["codex_auto_agent_skipped_candidates"][0]["provider"] == "openai"
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "gpt-5.3-codex-spark",
-        "grok-composer-2.5-fast",
+        "xai/grok-4.5",
     ]
     audit_events = metadata["aawm_alias_routing_audit_events"]
     retryable_index = next(
@@ -24888,7 +25017,37 @@ async def test_codex_auto_agent_alias_code_falls_back_to_composer_after_spark_42
     assert retryable_event["failure_class"]
     selected_event = audit_events[selected_index]
     assert selected_event["provider"] == "xai"
-    assert selected_event["model"] == "grok-composer-2.5-fast"
+    assert selected_event["model"] == "xai/grok-4.5"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_code_selects_live_grok_4_5_after_spark_cooldown(
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    await _set_codex_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:__default__",
+        60.0,
+    )
+
+    selection = await _select_codex_auto_agent_candidate(
+        request=request,
+        request_body=body,
+    )
+
+    assert selection["candidate"]["model"] == "xai/grok-4.5"
+    assert selection["candidate"]["route_family"] == (
+        "codex_grok_native_responses_adapter"
+    )
+    assert selection["selection_reason"] == "first_available"
+    assert [
+        candidate["model"] for candidate in selection["skipped"]
+    ] == ["gpt-5.3-codex-spark"]
 
 
 @pytest.mark.asyncio
@@ -24952,7 +25111,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permissio
         )
 
     assert response is managed_xai_success
-    mock_pass_through.assert_awaited_once()
+    assert mock_pass_through.await_count == 2
     mock_xai_oauth.assert_awaited_once()
     xai_body = mock_xai_oauth.await_args.kwargs["request_body"]
     assert xai_body["model"] == "oa_xai/grok-build"
@@ -24966,15 +25125,19 @@ async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permissio
     assert [
         attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]
     ] == [
+        "xai/grok-4.5",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
-    composer_attempt = metadata["codex_auto_agent_attempts"][0]
+    composer_attempt = metadata["codex_auto_agent_attempts"][1]
     assert composer_attempt["status"] == "cooldown_set"
     assert composer_attempt["error_class"] == "candidate_unavailable"
     assert "aawm_codex_auto_agent_candidate_unavailable" in composer_attempt[
         "error_tokens"
     ]
+    grok45_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert grok45_attempt["status"] == "cooldown_set"
+    assert grok45_attempt["error_class"] == "candidate_unavailable"
     assert metadata["codex_auto_agent_skipped_candidates"][0]["model"] == (
         "gpt-5.3-codex-spark"
     )
@@ -25968,12 +26131,12 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
     assert grok_call["custom_headers"]["authorization"] == "Bearer grok-oidc-token"
     assert grok_call["custom_llm_provider"] == litellm.LlmProviders.XAI.value
     grok_body = grok_call["custom_body"]
-    assert grok_body["model"] == "grok-composer-2.5-fast"
+    assert grok_body["model"] == "grok-4.5"
     assert grok_body["tools"] == [body["tools"][1]]
     assert "tool_choice" not in grok_body
     metadata = grok_body["litellm_metadata"]
     assert metadata["codex_auto_agent_selected_provider"] == "xai"
-    assert metadata["codex_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    assert metadata["codex_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["codex_unsupported_hosted_tool_removed_count"] == 1
     assert metadata["codex_unsupported_hosted_tool_types_removed"] == ["custom"]
     assert metadata["codex_unsupported_hosted_tools_removed"] == [
@@ -25985,7 +26148,7 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
     }
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "gpt-5.3-codex-spark",
-        "grok-composer-2.5-fast",
+        "xai/grok-4.5",
     ]
     spark_attempt = metadata["codex_auto_agent_attempts"][0]
     assert spark_attempt["status"] == "cooldown_set"
@@ -26006,7 +26169,7 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
     ]
     assert [event["model"] for event in progression_events] == [
         "gpt-5.3-codex-spark",
-        "grok-composer-2.5-fast",
+        "xai/grok-4.5",
     ]
     assert [event["event_type"] for event in progression_events] == [
         "candidate_retryable_failure",
@@ -26157,7 +26320,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
     assert mock_pass_through.await_count == 2
     mock_antigravity.assert_not_awaited()
     mock_antigravity_lane.assert_not_called()
-    mock_grok_token.assert_awaited_once()
+    assert mock_grok_token.await_count == 2
     mock_xai_token.assert_awaited_once()
     managed_call = mock_pass_through.await_args_list[1].kwargs
     assert managed_call["target"] == "https://api.x.ai/v1/responses"
@@ -26191,11 +26354,13 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
     }
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "gpt-5.3-codex-spark",
+        "xai/grok-4.5",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
     assert [attempt["provider"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "openai",
+        "xai",
         "xai",
         "xai",
     ]
@@ -35439,18 +35604,18 @@ def test_codex_aawm_sota_openai_and_sota_xai_alias_normalization():
     ) is None
 
 
-def test_codex_auto_agent_grok_4_5_pre_release_candidate_unavailable_cooldown_is_one_hour():
+def test_codex_auto_agent_grok_4_5_candidate_unavailable_cooldown_is_one_hour():
     grok45_oauth = {
         "provider": "xai",
         "model": "oa_xai/grok-4.5",
         "route_family": "codex_xai_oauth_responses_adapter",
-        "expected_pre_release_candidate_unavailable_cooldown_seconds": 3600.0,
+        "expected_candidate_unavailable_cooldown_seconds": 3600.0,
     }
     grok45_native = {
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
-        "expected_pre_release_candidate_unavailable_cooldown_seconds": 3600.0,
+        "expected_candidate_unavailable_cooldown_seconds": 3600.0,
     }
     unavailable_exc = ProxyException(
         message="xAI OAuth auto-agent candidate requires a valid managed xAI OAuth credential",
@@ -35477,7 +35642,7 @@ def test_codex_auto_agent_grok_4_5_model_not_found_is_candidate_unavailable():
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
-        "expected_pre_release_candidate_unavailable_cooldown_seconds": 3600.0,
+        "expected_candidate_unavailable_cooldown_seconds": 3600.0,
     }
     not_found_exc = HTTPException(
         status_code=404,
@@ -35734,6 +35899,7 @@ async def test_codex_auto_agent_alias_code_cools_terra_when_unsupported_after_pr
     ]
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "gpt-5.3-codex-spark",
+        "xai/grok-4.5",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
         "gpt-5.6-terra",
@@ -35856,11 +36022,14 @@ async def test_codex_auto_agent_alias_code_falls_back_after_grok_build_usage_bal
     )
     dual_cache = _FakeAawmAliasRoutingDualCache()
     cooldown_key = "xai:grok-composer-2.5-fast:xai_grok_native"
+    grok45_cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(grok45_cooldown_key, None)
     await _set_codex_auto_agent_cooldown(
         "openai:gpt-5.3-codex-spark:__default__",
         60.0,
     )
+    await _set_codex_auto_agent_cooldown(grok45_cooldown_key, 60.0)
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
@@ -35908,11 +36077,16 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage
     managed_success = Response(content='{"ok": true}', media_type="application/json")
     dual_cache = _FakeAawmAliasRoutingDualCache()
     cooldown_key = "xai:grok-composer-2.5-fast:xai_grok_native"
+    grok45_cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(
+        grok45_cooldown_key, None
+    )
     await _set_anthropic_auto_agent_cooldown(
         "openai:gpt-5.3-codex-spark:__default__",
         60.0,
     )
+    await _set_anthropic_auto_agent_cooldown(grok45_cooldown_key, 60.0)
 
     spark_success = Response(content='{"ok": true}', media_type="application/json")
 
@@ -36108,7 +36282,7 @@ async def test_anthropic_spark_bare_502_sets_candidate_transient_cooldown(monkey
 
     assert response is fallback_success
     mock_spark.assert_awaited_once()
-    mock_grok_native.assert_awaited_once()
+    assert mock_grok_native.await_count == 2
     mock_xai_oauth.assert_awaited_once()
     metadata = request.scope["parsed_body"][1]["litellm_metadata"]
     spark_attempt = metadata["anthropic_auto_agent_attempts"][0]
@@ -36118,18 +36292,25 @@ async def test_anthropic_spark_bare_502_sets_candidate_transient_cooldown(monkey
     assert spark_attempt["cooldown_scope"] == "candidate"
     assert spark_attempt["cooldown_seconds"] == 30.0
     grok_attempt = metadata["anthropic_auto_agent_attempts"][1]
-    assert grok_attempt["model"] == "grok-composer-2.5-fast"
+    assert grok_attempt["model"] == "xai/grok-4.5"
     assert grok_attempt["cooldown_scope"] == "request_local"
+    composer_attempt = metadata["anthropic_auto_agent_attempts"][2]
+    assert composer_attempt["model"] == "grok-composer-2.5-fast"
+    assert composer_attempt["cooldown_scope"] == "request_local"
     durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
         spark_cooldown_key
     )
     assert durable_seconds > 0.0
     assert durable_source in {"durable_cache", "memory"}
-    grok_durable_seconds, grok_durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
-        "xai:grok-composer-2.5-fast:xai_grok_native"
-    )
-    assert grok_durable_seconds == 0.0
-    assert grok_durable_source == "local_fallback"
+    for cooldown_key in (
+        "xai:xai/grok-4.5:xai_grok_native",
+        "xai:grok-composer-2.5-fast:xai_grok_native",
+    ):
+        grok_durable_seconds, grok_durable_source = (
+            await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+        )
+        assert grok_durable_seconds == 0.0
+        assert grok_durable_source == "local_fallback"
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
 
@@ -36182,7 +36363,7 @@ async def test_anthropic_code_anthropic_second_request_skips_spark_after_transie
         request_body=body_second,
     )
 
-    assert selection["candidate"]["model"] == "grok-composer-2.5-fast"
+    assert selection["candidate"]["model"] == "xai/grok-4.5"
     assert selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
     assert selection["skipped"][0]["reason"] == "cooldown"
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
@@ -36202,8 +36383,10 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
     )
     fallback_success = Response(content='{"ok": true}', media_type="application/json")
     spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    grok45_cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
     await _set_anthropic_auto_agent_cooldown(spark_cooldown_key, 120.0)
     await _set_codex_auto_agent_cooldown(spark_cooldown_key, 120.0)
+    await _set_anthropic_auto_agent_cooldown(grok45_cooldown_key, 120.0)
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
@@ -36242,6 +36425,9 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
     assert durable_seconds == 0.0
     assert durable_source == "local_fallback"
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(
+        grok45_cooldown_key, None
+    )
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
 
 
@@ -36280,24 +36466,31 @@ async def test_anthropic_alias_non_inflight_bare_502_selects_next_candidate_with
 
     assert response is managed_success
     assert mock_spark.await_count == 1
-    assert mock_grok_native.await_count == 1
+    assert mock_grok_native.await_count == 2
     mock_xai_oauth.assert_awaited_once()
     metadata = request.scope["parsed_body"][1]["litellm_metadata"]
     assert metadata["anthropic_auto_agent_selected_model"] == "oa_xai/grok-build"
     attempts = metadata["anthropic_auto_agent_attempts"]
     assert [attempt["model"] for attempt in attempts] == [
         "gpt-5.3-codex-spark",
+        "xai/grok-4.5",
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
     assert attempts[0]["cooldown_scope"] == "candidate"
     assert attempts[1]["cooldown_scope"] == "request_local"
+    assert attempts[2]["cooldown_scope"] == "request_local"
     assert attempts[0]["error_class"] == "upstream_transient_internal"
     assert attempts[1]["error_class"] == "upstream_transient_internal"
-    durable_seconds, _ = await _get_anthropic_auto_agent_active_cooldown_state(
-        "xai:grok-composer-2.5-fast:xai_grok_native"
-    )
-    assert durable_seconds == 0.0
+    assert attempts[2]["error_class"] == "upstream_transient_internal"
+    for cooldown_key in (
+        "xai:xai/grok-4.5:xai_grok_native",
+        "xai:grok-composer-2.5-fast:xai_grok_native",
+    ):
+        durable_seconds, _ = await _get_anthropic_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+        assert durable_seconds == 0.0
     spark_durable_seconds, spark_durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
         "openai:gpt-5.3-codex-spark:__default__"
     )
