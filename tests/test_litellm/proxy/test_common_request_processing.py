@@ -1126,7 +1126,7 @@ class TestProxyBaseLLMRequestProcessing:
         rendered = "\n".join(flushed)
         assert len(flushed) == 2
         assert (
-            "litellm@Codex[0.141.0] /openai_passthrough/responses"
+            "litellm#Codex[0.141.0] /openai_passthrough/responses"
         ) in rendered
         assert " - gpt-5.5 - Turns: 1" in rendered
         assert "chatgpt.com/backend-api/codex/responses" not in rendered
@@ -1175,8 +1175,8 @@ class TestProxyBaseLLMRequestProcessing:
             clear_aawm_route_rollups()
 
         rendered = "\n".join(flushed)
-        assert "litellm@Codex[0.142.4] /openai_passthrough/responses" in rendered
-        assert "wt-ops-xyz@Codex" not in rendered
+        assert "litellm#Codex[0.142.4] /openai_passthrough/responses" in rendered
+        assert "wt-ops-xyz#Codex" not in rendered
 
     def test_aawm_route_log_rollup_drops_codex_placeholder_repository_without_turn_metadata(
         self,
@@ -1217,7 +1217,7 @@ class TestProxyBaseLLMRequestProcessing:
 
         rendered = "\n".join(flushed)
         assert "Codex[0.142.4] /openai_passthrough/responses" in rendered
-        assert "x@Codex" not in rendered
+        assert "x#Codex" not in rendered
 
     def test_aawm_route_rollup_groups_by_model_alias_without_agent_breakouts(
         self,
@@ -1278,7 +1278,7 @@ class TestProxyBaseLLMRequestProcessing:
         rendered = "\n".join(flushed)
         assert len(flushed) == 2
         assert (
-            "aegis@Claude[2.1.178] /anthropic/v1/messages?beta=true"
+            "aegis#Claude[2.1.178] /anthropic/v1/messages?beta=true"
         ) in rendered
         assert " - claude-opus-4-8 - Turns: 2" in rendered
         assert "api.anthropic.com/v1/messages" not in rendered

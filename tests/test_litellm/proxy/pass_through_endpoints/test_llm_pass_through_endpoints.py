@@ -10350,7 +10350,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             exc_info=None,
         )
         assert access_filter.filter(access_record) is False
-        assert access_filter.filter(access_record) is True
+        assert access_filter.filter(access_record) is False
 
         flushed = flush_aawm_route_rollups(force=True)
         rendered = "\n".join(flushed)
@@ -10473,7 +10473,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             exc_info=None,
         )
         assert access_filter.filter(access_record) is False
-        assert access_filter.filter(access_record) is True
+        assert access_filter.filter(access_record) is False
 
         flushed = flush_aawm_route_rollups(force=True)
         rendered = "\n".join(flushed)
@@ -10592,7 +10592,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             exc_info=None,
         )
         assert access_filter.filter(access_record) is False
-        assert access_filter.filter(access_record) is True
+        assert access_filter.filter(access_record) is False
 
         flushed = flush_aawm_route_rollups(force=True)
         rendered = "\n".join(flushed)
@@ -10753,7 +10753,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             exc_info=None,
         )
         assert access_filter.filter(access_record) is False
-        assert access_filter.filter(access_record) is True
+        assert access_filter.filter(access_record) is False
 
         flushed = flush_aawm_route_rollups(force=True)
         rendered = "\n".join(flushed)

@@ -53,49 +53,50 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
-### Unreleased — Passthrough access-log suppression
+### aawm.116 — Grok 4.5 live-route cooldown and alias routing rollout
 
-**What changed:** Successful arrow-form AAWM passthrough access logs for
-Anthropic/OpenAI passthrough routes are suppressed by the access-log filter
-after the route rollup has recorded the useful request summary. Non-success
-arrow-form access logs, including 429/5xx diagnostics, remain visible.
+**What changed:** The fork metadata advances to `1.82.3+aawm.116`. This release
+rolls up the post-`aawm.115` AAWM alias routing and logging fixes:
 
-**Why:** The `aawm.115` prod rollout exposed two regressions: successful
-passthrough requests emitted raw Uvicorn `POST ... -> ... 200 OK` lines in
-addition to AAWM route rollups. The fix keeps warning/error visibility while
-removing routine duplicate success noise.
+- Successful arrow-form AAWM passthrough access logs for Anthropic/OpenAI
+  passthrough routes are suppressed after route rollup capture, while non-2xx
+  diagnostics remain visible.
+- Anthropic auto-agent OpenAI/Codex candidates now honor Codex-family cooldowns
+  for the same candidate key, so `aawm-code-anthropic` skips
+  `gpt-5.3-codex-spark` when Spark has already cooled down through the Codex
+  family. Spark transient 5xx failures now set a short candidate-scoped
+  cooldown; non-Spark transient failures remain request-local.
+- The AAWM SOTA OpenAI/xAI aliases and Grok 4.5 pricing/context metadata are
+  included in the promoted line.
+- Native Grok 4.5 is treated as a live route. Generic
+  `aawm_codex_auto_agent_candidate_unavailable` probe failures no longer create
+  a durable one-hour Grok 4.5 cooldown or force in-flight child-agent
+  redispatch. OAuth Grok 4.5 generic availability failures remain
+  request-local, and explicit usage, weekly-limit, quota, rate-limit, or
+  capacity signals still use the normal candidate cooldown/fallback path.
 
-**Why not upstream:** These route-log rollups and access-log shaping rules are
-fork-local operational policy for the AAWM LiteLLM deployment.
+**Why:** The `aawm.115` prod rollout exposed duplicate successful passthrough
+access logs and `aawm-code-anthropic` Spark retry behavior. After Grok 4.5 went
+live, the old pre-release one-hour `candidate_unavailable` cooldown also caused
+transient Grok 4.5 availability blips to kill active agents and exclude a
+working route. The release keeps real usage/quota exhaustion protective while
+avoiding durable route poisoning for generic live-route probe failures.
+
+**Why not upstream:** These access-log rollups, AAWM auto-agent aliases,
+cross-family cooldown policy, and Grok 4.5 routing exceptions are fork-local
+operational behavior layered on top of LiteLLM passthrough.
 
 **Validation status:** Focused tests cover 2xx arrow-form suppression with
-429/5xx preservation. Dev `litellm-dev` was rebuilt/recreated and verified with
-in-container checks showing arrow-form 200 suppression and 429 preservation.
-
-### Unreleased — Spark cooldown reuse for Anthropic auto-agent aliases
-
-**What changed:** Anthropic auto-agent OpenAI/Codex candidates now honor
-Codex-family cooldowns for the same candidate key, so `aawm-code-anthropic`
-skips `gpt-5.3-codex-spark` when Spark has already been cooled down through
-the Codex family. Spark transient 5xx failures also set a short
-candidate-scoped cooldown so later Anthropic alias requests skip Spark during
-that transient window. Non-Spark transient failures remain request-local.
-
-**Why:** The `aawm.115` prod rollout exposed `aawm-code-anthropic` retrying
-Codex Spark when it should have advanced to the next eligible candidate. The
-root causes were split Codex/Anthropic cooldown family reads for OpenAI-backed
-Anthropic candidates and Spark transient failures being request-local only.
-
-**Why not upstream:** The AAWM auto-agent aliases and their cross-family
-cooldown policy are fork-local routing behavior layered on top of LiteLLM
-passthrough.
-
-**Validation status:** Focused tests cover Codex-family Spark cooldown reuse by
-`aawm-code-anthropic`, Spark-only transient candidate cooldown, non-Spark
-transient request-local behavior, and unchanged malformed/tool-call durable
-cooldown behavior. Dev `litellm-dev` was rebuilt/recreated and verified with an
-in-container check showing Spark transient scope `candidate` and subsequent
-selection of `grok-composer-2.5-fast`.
+429/5xx preservation; Codex-family Spark cooldown reuse by
+`aawm-code-anthropic`; Spark-only transient candidate cooldown; non-Spark
+transient request-local behavior; Grok 4.5 alias order, pricing metadata, and
+candidate-unavailable cooldown removal; and explicit weekly/usage/quota
+precedence over generic `candidate_unavailable`. Dev `litellm-dev` was
+restarted/recreated and verified with in-container route metadata showing no
+Grok 4.5 `expected_candidate_unavailable_cooldown_seconds`, native Grok 4.5
+generic `candidate_unavailable` scope `none`, OAuth Grok 4.5 generic
+`candidate_unavailable` scope `request_local`, and Grok 4.5
+`usage_limit_reached` scope `candidate`.
 
 ### aawm.115 — Anthropic SOTA/orchestration alias model selector normalization
 
