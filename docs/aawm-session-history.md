@@ -1234,12 +1234,15 @@ Rows affected by this path may include:
   `grok_native_input_item_rewrite_types`, and
   `grok_native_input_item_rewrites`: Grok-native Responses input items rewritten
   before egress because the selected concrete model rejects those typed
-  Responses variants. For `grok-composer-2.5-fast`, `function_call` and
-  `function_call_output` continuation items are preserved as ordinary message
-  text instead of being sent as raw Responses tool items. The preserved message
-  text uses neutral context-note wording, not `Previous tool call`, `Name`,
-  `Call ID`, or `Arguments` transcript fields, so Grok Composer is not primed to
-  re-emit a non-executing tool-call template as assistant output.
+  Responses variants. For `grok-composer-2.5-fast` and Grok 4.5 native/OIDC
+  routes, `function_call` and `function_call_output` continuation items are
+  preserved as ordinary message text instead of being sent as raw Responses
+  tool items. This avoids the Grok CLI proxy `ModelInput` deserialization
+  failure while retaining the prior tool action and outcome as context. The
+  preserved message text uses neutral context-note wording, not `Previous tool
+  call`, `Name`, `Call ID`, or `Arguments` transcript fields, so Grok Composer
+  is not primed to re-emit a non-executing tool-call template as assistant
+  output.
 - If Grok Composer still emits explicit literal tool-call blocks in assistant
   output, LiteLLM repairs only the bounded pattern with `Tool label:`,
   optional `Correlation ref:`, and JSON `Input payload:` fields whose arguments

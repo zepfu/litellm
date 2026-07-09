@@ -336,6 +336,7 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "aawm_passthrough_input_container_type",
     "aawm_passthrough_input_item_count",
     "aawm_passthrough_input_item_type_counts",
+    "aawm_passthrough_input_item_shape_samples",
     "aawm_passthrough_tool_count",
     "aawm_passthrough_tool_type_counts",
     "aawm_passthrough_request_shape_error_class",

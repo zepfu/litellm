@@ -165,6 +165,7 @@ _AAWM_PASSTHROUGH_ERROR_LOG_REQUEST_SHAPE_KEYS = (
     "aawm_passthrough_input_container_type",
     "aawm_passthrough_input_item_count",
     "aawm_passthrough_input_item_type_counts",
+    "aawm_passthrough_input_item_shape_samples",
     "aawm_passthrough_tool_count",
     "aawm_passthrough_tool_type_counts",
     "aawm_passthrough_request_shape_error_class",
@@ -1709,11 +1710,11 @@ def _passthrough_error_context_metadata_value(value: Any) -> Any:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value
     if isinstance(value, list):
-        cleaned_list = [
-            cleaned
-            for item in value[:20]
-            if (cleaned := _clean_passthrough_error_context_value(item)) is not None
-        ]
+        cleaned_list = []
+        for item in value[:20]:
+            cleaned = _passthrough_error_context_metadata_value(item)
+            if cleaned is not None:
+                cleaned_list.append(cleaned)
         return cleaned_list
     if isinstance(value, dict):
         cleaned_dict: Dict[str, Any] = {}
@@ -1990,6 +1991,7 @@ def _build_passthrough_request_shape_summary(
         "aawm_passthrough_input_container_type",
         "aawm_passthrough_input_item_count",
         "aawm_passthrough_input_item_type_counts",
+        "aawm_passthrough_input_item_shape_samples",
         "aawm_passthrough_tool_count",
         "aawm_passthrough_tool_type_counts",
     )
@@ -2184,6 +2186,48 @@ def _count_passthrough_item_types(items: Any) -> Dict[str, int]:
     return dict(sorted(type_counts.items()))
 
 
+def _build_passthrough_input_item_shape_samples(
+    items: Any,
+    *,
+    max_samples: int = 20,
+) -> list[Dict[str, Any]]:
+    if not isinstance(items, list) or max_samples <= 0:
+        return []
+
+    item_count = len(items)
+    if item_count <= max_samples:
+        sample_indices = list(range(item_count))
+    else:
+        head_count = max_samples // 2
+        tail_count = max_samples - head_count
+        sample_indices = [
+            *range(head_count),
+            *range(item_count - tail_count, item_count),
+        ]
+
+    samples: list[Dict[str, Any]] = []
+    for index in sample_indices:
+        item = items[index]
+        sample: Dict[str, Any] = {
+            "index": index,
+            "container_type": _passthrough_container_type(item),
+        }
+        if isinstance(item, dict):
+            item_type = _clean_passthrough_error_context_value(item.get("type"))
+            sample["type"] = item_type or "object_without_type"
+            item_keys = [
+                key
+                for key in (
+                    _clean_passthrough_error_context_value(key)
+                    for key in sorted(item.keys(), key=str)
+                )
+                if key is not None and key != "litellm_logging_obj"
+            ]
+            sample["keys"] = item_keys[:40]
+        samples.append(sample)
+    return samples
+
+
 def _merge_passthrough_request_shape_metadata(
     metadata: Dict[str, Any],
     *,
@@ -2234,6 +2278,9 @@ def _merge_passthrough_request_shape_metadata(
         metadata[
             "aawm_passthrough_input_item_type_counts"
         ] = _count_passthrough_item_types(input_value)
+        metadata[
+            "aawm_passthrough_input_item_shape_samples"
+        ] = _build_passthrough_input_item_shape_samples(input_value)
 
     tools = body.get("tools")
     if isinstance(tools, list):

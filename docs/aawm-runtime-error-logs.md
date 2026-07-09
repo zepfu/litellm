@@ -236,6 +236,8 @@ Recorded fields include:
   or `generic_deserialization_failed`
 - `aawm_passthrough_request_shape_error_body_preview` (bounded upstream error text)
 - `aawm_passthrough_request_shape_summary` (container/top-level keys, input/tool counts)
+- `aawm_passthrough_input_item_shape_samples` (bounded head/tail samples containing
+  only item index, container type, item type, and sorted key names)
 - `aawm_passthrough_request_shape_fingerprint` (stable grouping key for request shape)
 - `aawm_passthrough_request_shape_error_fingerprint` (stable grouping key for error class)
 

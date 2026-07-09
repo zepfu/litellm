@@ -18920,7 +18920,7 @@ def _assert_openai_grok_native_oidc_prepared_body(
         **source_body["input"][2],
         "arguments": {},
     }
-    if model == "grok-composer-2.5-fast":
+    if model in {"grok-composer-2.5-fast", "grok-4.5"}:
         assert prepared_body["input"] == _expected_grok_composer_rewritten_tool_input(
             source_body["input"][0],
         )
@@ -18961,7 +18961,7 @@ def _assert_openai_grok_native_oidc_metadata(
     assert metadata["codex_unsupported_input_items_removed"] == [
         {"type": "reasoning", "index": 1, "encrypted_content": True}
     ]
-    if model == "grok-composer-2.5-fast":
+    if model in {"grok-composer-2.5-fast", "grok-4.5"}:
         _assert_grok_composer_rewrite_metadata(metadata)
     assert "route:grok_cli_chat_proxy" in metadata["tags"]
     assert "openai-grok-native-responses-adapter" in metadata["tags"]
@@ -19067,6 +19067,65 @@ async def test_prepare_grok_native_oauth_passthrough_request_sanitizes_function_
         "parsed_json_string"
     ]
     assert "grok-native-function-call-arguments-sanitized" in metadata["tags"]
+    _assert_grok_composer_rewrite_metadata(metadata)
+
+
+@pytest.mark.asyncio
+async def test_prepare_grok_4_5_continuation_rewrites_model_input_tool_items():
+    request = MagicMock(spec=Request)
+    request.headers = {
+        "authorization": "Bearer oidc-token",
+        "x-grok-session-id": "session_123",
+    }
+    request_body = {
+        "model": "xai/grok-4.5",
+        "input": [
+            {"type": "message", "role": "user", "content": "continue"},
+            {
+                "type": "reasoning",
+                "id": "rs_worker",
+                "summary": [],
+                "encrypted_content": "encrypted-worker-reasoning",
+            },
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ],
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
+        new=AsyncMock(return_value="grok-oidc-token"),
+    ):
+        prepared, target_base, headers, prepared_body = (
+            await _prepare_grok_native_oauth_passthrough_request(
+                request_body,
+                request=request,
+            )
+        )
+
+    assert prepared is True
+    assert target_base == "https://cli-chat-proxy.grok.com"
+    assert headers["authorization"] == "Bearer grok-oidc-token"
+    assert prepared_body["model"] == "grok-4.5"
+    assert prepared_body["input"] == _expected_grok_composer_rewritten_tool_input(
+        request_body["input"][0],
+        arguments='{"cmd": "pwd"}',
+    )
+    metadata = prepared_body["litellm_metadata"]
+    assert metadata["codex_unsupported_input_item_removed_count"] == 1
+    assert metadata["codex_unsupported_input_item_types_removed"] == ["reasoning"]
+    assert metadata["codex_unsupported_input_items_removed"] == [
+        {"type": "reasoning", "index": 1, "encrypted_content": True}
+    ]
     _assert_grok_composer_rewrite_metadata(metadata)
 
 
@@ -33409,7 +33468,8 @@ class TestOpenAIPassthroughRoute:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "model", ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"]
+        "model",
+        ["grok-build", "grok-build-0.1", "grok-composer-2.5-fast"],
     )
     async def test_openai_passthrough_grok_native_models_use_grok_oidc_headers(
         self,

@@ -42,6 +42,7 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import success_handler
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
+    _build_passthrough_input_item_shape_samples,
     build_aawm_route_access_log_line,
     _build_passthrough_request_shape_failure_request_payload,
     _classify_passthrough_request_shape_deserialization_422,
@@ -120,6 +121,26 @@ def test_request_shape_422_modelinput_enrichment_is_sanitized_and_fingerprinted(
             "function_call": 1,
             "function_call_output": 1,
         },
+        "aawm_passthrough_input_item_shape_samples": [
+            {
+                "index": 0,
+                "container_type": "object",
+                "type": "message",
+                "keys": ["content", "role", "type"],
+            },
+            {
+                "index": 1,
+                "container_type": "object",
+                "type": "function_call",
+                "keys": ["arguments", "call_id", "name", "type"],
+            },
+            {
+                "index": 2,
+                "container_type": "object",
+                "type": "function_call_output",
+                "keys": ["call_id", "output", "type"],
+            },
+        ],
         "aawm_passthrough_tool_count": 2,
         "aawm_passthrough_tool_type_counts": {"function": 2},
     }
@@ -148,6 +169,14 @@ def test_request_shape_422_modelinput_enrichment_is_sanitized_and_fingerprinted(
     )
     assert "ModelInput" in enriched["aawm_passthrough_request_shape_error_body_preview"]
     assert enriched["aawm_passthrough_request_shape_summary"]["input_item_count"] == 3
+    assert enriched["aawm_passthrough_request_shape_summary"][
+        "input_item_shape_samples"
+    ][-1] == {
+        "index": 2,
+        "container_type": "object",
+        "type": "function_call_output",
+        "keys": ["call_id", "output", "type"],
+    }
     assert enriched["aawm_passthrough_request_shape_fingerprint"]
     assert enriched["aawm_passthrough_request_shape_error_fingerprint"]
 
@@ -222,6 +251,7 @@ def test_aawm_error_log_context_allowlist_preserves_request_shape_fields():
         "aawm_passthrough_request_shape_summary",
         "aawm_passthrough_request_shape_fingerprint",
         "aawm_passthrough_request_shape_error_fingerprint",
+        "aawm_passthrough_input_item_shape_samples",
         "failure_kind",
     }
     assert required_fields.issubset(set(_AAWM_ERROR_LOG_CONTEXT_FIELDS))
@@ -241,6 +271,56 @@ def test_aawm_error_log_context_allowlist_preserves_request_shape_fields():
     context = built["context"]
     for field_name in required_fields:
         assert context[field_name] == field_name
+
+
+def test_passthrough_input_item_shape_samples_capture_head_and_tail_without_values():
+    secret_prompt = "PROMPT_VALUE_MUST_NOT_APPEAR"
+    secret_arguments = "TOOL_ARGUMENTS_MUST_NOT_APPEAR"
+    input_items = [
+        {"type": "message", "role": "user", "content": secret_prompt},
+        *[
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": f"middle-{index}",
+            }
+            for index in range(30)
+        ],
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "call_1",
+            "arguments": secret_arguments,
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "SECRET_OUTPUT_MUST_NOT_APPEAR",
+        },
+    ]
+
+    samples = _build_passthrough_input_item_shape_samples(
+        input_items,
+        max_samples=6,
+    )
+
+    assert [sample["index"] for sample in samples] == [0, 1, 2, 30, 31, 32]
+    assert samples[-2] == {
+        "index": 31,
+        "container_type": "object",
+        "type": "function_call",
+        "keys": ["arguments", "call_id", "name", "type"],
+    }
+    assert samples[-1] == {
+        "index": 32,
+        "container_type": "object",
+        "type": "function_call_output",
+        "keys": ["call_id", "output", "type"],
+    }
+    serialized = json.dumps(samples)
+    assert secret_prompt not in serialized
+    assert secret_arguments not in serialized
+    assert "SECRET_OUTPUT" not in serialized
 
 
 def test_sanitize_passthrough_request_shape_error_preview_redacts_secrets():

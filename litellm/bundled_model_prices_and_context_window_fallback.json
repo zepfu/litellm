@@ -39302,6 +39302,10 @@
         "unsupported_input_item_types": [
             "reasoning"
         ],
+        "rewrite_input_item_types": [
+            "function_call",
+            "function_call_output"
+        ],
         "supports_vision": true,
         "supports_web_search": true,
         "input_cost_per_token": 2e-06,
@@ -39332,6 +39336,10 @@
         ],
         "unsupported_input_item_types": [
             "reasoning"
+        ],
+        "rewrite_input_item_types": [
+            "function_call",
+            "function_call_output"
         ],
         "supports_vision": true,
         "supports_web_search": true,
