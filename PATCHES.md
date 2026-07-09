@@ -53,6 +53,25 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.117 — Grok 4.5 rollout image realignment after model-config autobump
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.117`. This release
+keeps the `aawm.116` Grok 4.5 live-route cooldown and alias routing behavior,
+and realigns the fork image tag with the post-`aawm.116` model-config artifact
+autobump commit (`cfg-v0.0.23`).
+
+**Why:** The `aawm.116` image tag was correctly published, but the model-config
+autobump advanced `main` afterward. The production release runbook requires a
+fresh fork image tag from current `main` rather than promoting an image tag that
+is no longer at the promotion branch head.
+
+**Why not upstream:** This is AAWM release-line bookkeeping for fork image and
+overlay artifact alignment.
+
+**Validation status:** Carries forward the `aawm.116` focused validation set.
+The production promotion must use the `v1.82.3-aawm.117` image tag and verify
+the `cfg-v0.0.23` GitHub Release asset exists before rebuilding infrastructure.
+
 ### aawm.116 — Grok 4.5 live-route cooldown and alias routing rollout
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.116`. This release
