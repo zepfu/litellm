@@ -1,11 +1,12 @@
-"""Append-only local intake for detected malformed tool-call events."""
+"""Append-only local intake for malformed tools and terminal agent errors."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 from datetime import UTC, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from litellm._logging import (
     _AAWM_ERROR_LOG_LOCK,
@@ -13,6 +14,7 @@ from litellm._logging import (
     _get_aawm_error_log_environment,
     _normalize_aawm_error_log_file_metadata,
     _parse_aawm_error_log_non_negative_int_env,
+    _redact_string,
 )
 from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_composer_call_literal_text,
@@ -24,10 +26,132 @@ MALFORMED_ERROR_JSONL_FILENAME = "malformed-error.jsonl"
 MALFORMED_TOOL_CALL_SCHEMA_VERSION = 1
 MALFORMED_TOOL_CALL_ERROR_CODE = "aawm_auto_agent_malformed_tool_call_text"
 MALFORMED_TOOL_CALL_FAILURE_KIND = "malformed_tool_call"
+AGENT_TERMINAL_ERROR_SCHEMA_VERSION = 1
 
 _DEFAULT_MAX_TEXT_CHARS = 8_192
 _DEFAULT_MAX_PAYLOAD_CHARS = 16_384
 _MALFORMED_ERROR_LOG_LOCK = threading.Lock()
+_AGENT_TERMINAL_ERROR_LOG_LOCK = threading.Lock()
+
+_AGENT_TERMINAL_CONTEXT_FIELDS = (
+    "source",
+    "container",
+    "endpoint",
+    "incoming_endpoint",
+    "upstream_url",
+    "outgoing_target",
+    "provider",
+    "model",
+    "model_alias",
+    "alias_model",
+    "alias_family",
+    "route_family",
+    "status_code",
+    "error_status_code",
+    "failure_kind",
+    "failure_class",
+    "error_code",
+    "event_type",
+    "candidate_status",
+    "failure_phase",
+    "attempted_provider_call",
+    "repository",
+    "tenant_id",
+    "agent_name",
+    "agent_id",
+    "agent_role",
+    "agent_profile",
+    "thread_source",
+    "session_id",
+    "thread_id",
+    "trace_id",
+    "litellm_call_id",
+    "dispatch_id",
+    "redispatch_ordinal",
+    "cooldown_scope",
+    "cooldown_state_source",
+    "terminal_activity_status",
+    "actual_prior_tool_activity_summary",
+    "attempt_count",
+    "attempts",
+    "candidate_count",
+    "candidates",
+    "hidden_retry_final_outcome",
+    "hidden_retry_failure_classification",
+    "hidden_retry_count",
+    "aawm_passthrough_request_shape_summary",
+    "aawm_passthrough_request_shape_fingerprint",
+    "aawm_passthrough_request_shape_error_class",
+    "aawm_passthrough_request_shape_error_message_class",
+    "aawm_passthrough_request_shape_error_body_preview",
+    "aawm_passthrough_request_shape_error_fingerprint",
+)
+_AGENT_TERMINAL_ROUTING_SEQUENCE_FIELDS = (
+    "attempt_number",
+    "provider",
+    "model",
+    "route_family",
+    "lane_key",
+    "reason",
+    "selection_reason",
+    "status",
+    "candidate_status",
+    "event_type",
+    "failure_class",
+    "error_class",
+    "error_status_code",
+    "error_type",
+    "error_code",
+    "error_tokens",
+    "retry_after_seconds",
+    "failure_phase",
+    "attempted_provider_call",
+    "cooldown_scope",
+    "cooldown_seconds",
+    "cooldown_state_source",
+    "last_resort",
+    "in_flight_session",
+    "redispatch_required",
+    "redispatch_threshold_crossed",
+)
+_AGENT_TERMINAL_ACTIVITY_SUMMARY_FIELDS = (
+    "has_actual_prior_tool_activity",
+    "prior_tool_call_count",
+    "prior_tool_result_count",
+    "prior_tool_names",
+    "has_prior_file_edit_activity",
+    "prior_file_edit_tool_call_count",
+    "prior_file_edit_tool_names",
+    "has_previous_response_id",
+    "has_continuation_state",
+)
+_AGENT_TERMINAL_REQUEST_SHAPE_SUMMARY_FIELDS = (
+    "body_container_type",
+    "body_top_level_keys",
+    "input_container_type",
+    "input_item_count",
+    "input_item_type_counts",
+    "input_item_shape_samples",
+    "tool_count",
+    "tool_type_counts",
+)
+_AGENT_TERMINAL_REQUEST_SHAPE_SAMPLE_FIELDS = (
+    "index",
+    "container_type",
+    "type",
+    "keys",
+)
+_AGENT_TERMINAL_LIST_FIELDS = {
+    "body_top_level_keys",
+    "error_tokens",
+    "keys",
+    "prior_file_edit_tool_names",
+    "prior_tool_names",
+}
+_AGENT_TERMINAL_COUNT_MAPPING_FIELDS = {
+    "input_item_type_counts",
+    "tool_type_counts",
+}
 
 
 def _malformed_error_log_enabled() -> bool:
@@ -217,17 +341,12 @@ def build_malformed_tool_call_intake_record(
 ) -> Dict[str, Any]:
     context = dict(intake_context or {})
     evidence = (
-        [evidence_item]
-        if isinstance(evidence_item, dict)
-        else extract_malformed_tool_call_evidence(response_body)
+        [evidence_item] if isinstance(evidence_item, dict) else extract_malformed_tool_call_evidence(response_body)
     )
     primary = evidence[0] if evidence else {}
 
     response_model = _coerce_optional_str(response_body.get("model"))
-    provider = (
-        _coerce_optional_str(context.get("provider"))
-        or _resolve_provider_from_adapter(adapter)
-    )
+    provider = _coerce_optional_str(context.get("provider")) or _resolve_provider_from_adapter(adapter)
     route_family = _coerce_optional_str(context.get("route_family")) or adapter
 
     record: Dict[str, Any] = {
@@ -245,18 +364,29 @@ def build_malformed_tool_call_intake_record(
         "repository": _coerce_optional_str(context.get("repository")),
         "agent_name": _coerce_optional_str(context.get("agent_name")),
         "agent_id": _coerce_optional_str(context.get("agent_id")),
+        "agent_role": _coerce_optional_str(context.get("agent_role")),
+        "agent_profile": _coerce_optional_str(context.get("agent_profile")),
+        "thread_source": _coerce_optional_str(context.get("thread_source")),
         "session_id": _coerce_optional_str(context.get("session_id")),
+        "thread_id": _coerce_optional_str(context.get("thread_id")),
         "trace_id": _coerce_optional_str(context.get("trace_id")),
         "litellm_call_id": _coerce_optional_str(context.get("litellm_call_id")),
-        "request_started_at": _coerce_optional_str(
-            context.get("request_started_at")
-        ),
+        "dispatch_id": _coerce_optional_str(context.get("dispatch_id")),
+        "redispatch_ordinal": context.get("redispatch_ordinal"),
+        "terminal_outcome": _coerce_optional_str(context.get("terminal_outcome")) or "malformed_tool_call_rejected",
+        "fallback_result": _coerce_optional_str(context.get("fallback_result")) or "none",
+        "redispatch_required": bool(context.get("redispatch_required", False)),
+        "agent_session_killed": bool(context.get("agent_session_killed", True)),
+        "request_started_at": _coerce_optional_str(context.get("request_started_at")),
         "adapter": adapter,
         "adapter_label": adapter_label,
         "malformed_tool_call_text": primary.get("malformed_tool_call_text"),
         "malformed_tool_call_payload": primary.get("malformed_tool_call_payload"),
         "malformed_tool_call_evidence": evidence or None,
     }
+    fingerprint = _build_agent_terminal_failure_fingerprint(record)
+    record["fingerprint"] = fingerprint
+    record["failure_fingerprint"] = fingerprint
     if evidence_index is not None:
         record["malformed_tool_call_index"] = evidence_index
     if evidence_count is not None:
@@ -331,3 +461,283 @@ def persist_malformed_tool_call_detection(
         )
         wrote_any = append_malformed_tool_call_detection(record) or wrote_any
     return wrote_any
+
+
+def _agent_terminal_error_log_enabled() -> bool:
+    raw = os.getenv("LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED", "").strip()
+    if raw:
+        return raw.lower() in {"1", "true", "yes", "on"}
+    if os.getenv("LITELLM_AAWM_ERROR_LOG_DIR", "").strip():
+        return True
+    return os.getenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _build_agent_terminal_failure_fingerprint(
+    context: Mapping[str, Any],
+) -> str:
+    values = (
+        context.get("failure_kind"),
+        context.get("failure_class"),
+        context.get("error_code"),
+        context.get("status_code") or context.get("error_status_code"),
+        context.get("provider"),
+        context.get("model_alias") or context.get("alias_model"),
+        context.get("route_family"),
+        context.get("endpoint") or context.get("incoming_endpoint"),
+        context.get("aawm_passthrough_request_shape_error_fingerprint"),
+    )
+    normalized = "|".join(str(value or "").strip().lower() for value in values)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _get_agent_terminal_error_log_path() -> Optional[str]:
+    if not _agent_terminal_error_log_enabled():
+        return None
+    log_dir = _get_aawm_error_log_dir()
+    if not log_dir:
+        log_dir = os.path.join(os.getcwd(), ".analysis")
+    if not log_dir:
+        return None
+    return os.path.join(
+        log_dir,
+        f"{_get_aawm_error_log_environment()}-error.jsonl",
+    )
+
+
+def _max_agent_terminal_error_log_file_bytes() -> Optional[int]:
+    configured = _parse_aawm_error_log_non_negative_int_env("LITELLM_AAWM_ERROR_LOG_MAX_BYTES")
+    if configured is None or configured <= 0:
+        return None
+    return configured
+
+
+def _sanitize_agent_terminal_context_value(
+    *,
+    field: str,
+    value: Any,
+) -> Any:
+    if field in {"attempts", "candidates"}:
+        return _sanitize_agent_terminal_routing_sequence(value)
+    if field == "actual_prior_tool_activity_summary":
+        return _sanitize_agent_terminal_mapping(
+            value,
+            allowed_fields=_AGENT_TERMINAL_ACTIVITY_SUMMARY_FIELDS,
+        )
+    if field == "aawm_passthrough_request_shape_summary":
+        return _sanitize_agent_terminal_request_shape_summary(value)
+    return _sanitize_agent_terminal_scalar(value)
+
+
+def _sanitize_agent_terminal_count_mapping(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    sanitized: Dict[str, Any] = {}
+    for raw_key, raw_value in list(value.items())[:50]:
+        key = _sanitize_agent_terminal_scalar(raw_key)
+        count = _sanitize_agent_terminal_scalar(raw_value)
+        if isinstance(key, str) and isinstance(count, (int, float)):
+            sanitized[key] = count
+    return sanitized or None
+
+
+def _sanitize_agent_terminal_mapping(
+    value: Any,
+    *,
+    allowed_fields: tuple[str, ...],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    sanitized: Dict[str, Any] = {}
+    for field in allowed_fields:
+        raw_value = value.get(field)
+        if raw_value is None:
+            continue
+        cleaned: Any
+        if field in _AGENT_TERMINAL_LIST_FIELDS:
+            cleaned = _sanitize_agent_terminal_scalar_list(raw_value)
+        elif field in _AGENT_TERMINAL_COUNT_MAPPING_FIELDS:
+            cleaned = _sanitize_agent_terminal_count_mapping(raw_value)
+        else:
+            cleaned = _sanitize_agent_terminal_scalar(raw_value)
+        if cleaned is not None:
+            sanitized[field] = cleaned
+    return sanitized or None
+
+
+def _sanitize_agent_terminal_request_shape_summary(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    sanitized = (
+        _sanitize_agent_terminal_mapping(
+            value,
+            allowed_fields=_AGENT_TERMINAL_REQUEST_SHAPE_SUMMARY_FIELDS,
+        )
+        or {}
+    )
+    samples = value.get("input_item_shape_samples")
+    if isinstance(samples, list):
+        sanitized_samples = [
+            cleaned
+            for item in samples[:20]
+            if (
+                cleaned := _sanitize_agent_terminal_mapping(
+                    item,
+                    allowed_fields=_AGENT_TERMINAL_REQUEST_SHAPE_SAMPLE_FIELDS,
+                )
+            )
+            is not None
+        ]
+        if sanitized_samples:
+            sanitized["input_item_shape_samples"] = sanitized_samples
+    return sanitized or None
+
+
+def _sanitize_agent_terminal_routing_sequence(
+    value: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    if not isinstance(value, list):
+        return None
+    sanitized = [
+        cleaned
+        for item in value[:50]
+        if (
+            cleaned := _sanitize_agent_terminal_mapping(
+                item,
+                allowed_fields=_AGENT_TERMINAL_ROUTING_SEQUENCE_FIELDS,
+            )
+        )
+        is not None
+    ]
+    return sanitized or None
+
+
+def _sanitize_agent_terminal_scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        return _truncate_text(
+            _redact_string(value),
+            max_chars=2_048,
+        )
+    if isinstance(value, (bool, int, float)):
+        return value
+    return None
+
+
+def _sanitize_agent_terminal_scalar_list(
+    value: Any,
+    *,
+    max_items: int = 50,
+) -> Optional[List[Any]]:
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    sanitized = [
+        cleaned for item in list(value)[:max_items] if (cleaned := _sanitize_agent_terminal_scalar(item)) is not None
+    ]
+    return sanitized or None
+
+
+def append_agent_terminal_error(record: Dict[str, Any]) -> bool:
+    """Best-effort append of one terminal agent error JSON object."""
+    log_path = _get_agent_terminal_error_log_path()
+    if not log_path:
+        return False
+
+    try:
+        with _AGENT_TERMINAL_ERROR_LOG_LOCK:
+            with _AAWM_ERROR_LOG_LOCK:
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                max_file_bytes = _max_agent_terminal_error_log_file_bytes()
+                if os.path.exists(log_path):
+                    if max_file_bytes is not None and os.path.getsize(log_path) >= max_file_bytes:
+                        return False
+                with open(log_path, "a", encoding="utf-8") as intake_file:
+                    intake_file.write(safe_dumps(record) + "\n")
+                _normalize_aawm_error_log_file_metadata(log_path)
+        return True
+    except Exception:
+        return False
+
+
+def build_agent_terminal_error_record(
+    *,
+    error_context: Mapping[str, Any],
+    terminal_outcome: Optional[str] = None,
+    fallback_result: Optional[str] = None,
+    redispatch_required: Optional[bool] = None,
+    agent_session_killed: bool,
+) -> Dict[str, Any]:
+    context: Dict[str, Any] = {}
+    for field in _AGENT_TERMINAL_CONTEXT_FIELDS:
+        value = error_context.get(field)
+        if value is None:
+            continue
+        sanitized = _sanitize_agent_terminal_context_value(
+            field=field,
+            value=value,
+        )
+        if sanitized is not None:
+            context[field] = sanitized
+
+    context["terminal_outcome"] = _coerce_optional_str(terminal_outcome)
+    context["fallback_result"] = _coerce_optional_str(fallback_result)
+    context["redispatch_required"] = redispatch_required
+    context["agent_session_killed"] = bool(agent_session_killed)
+    context = {key: value for key, value in context.items() if value is not None}
+
+    failure_kind = _coerce_optional_str(context.get("failure_kind")) or "agent_terminal_error"
+    error_code = (
+        _coerce_optional_str(context.get("error_code"))
+        or _coerce_optional_str(context.get("failure_class"))
+        or failure_kind
+    )
+    fingerprint = _build_agent_terminal_failure_fingerprint(context)
+    return {
+        "schema_version": AGENT_TERMINAL_ERROR_SCHEMA_VERSION,
+        "observed_at": datetime.now(tz=UTC).isoformat(),
+        "environment": _get_aawm_error_log_environment(),
+        "logger": "litellm.proxy.agent_terminal",
+        "level": "ERROR",
+        "message": f"Agent terminal error: {failure_kind}",
+        "traceback": None,
+        "traceback_text": None,
+        "traceback_lines": [],
+        "raw_text": None,
+        "fingerprint": fingerprint,
+        "failure_kind": failure_kind,
+        "error_code": error_code,
+        "status_code": context.get("status_code") or context.get("error_status_code"),
+        "agent_id": context.get("agent_id"),
+        "session_id": context.get("session_id"),
+        "litellm_call_id": context.get("litellm_call_id"),
+        "terminal_outcome": context.get("terminal_outcome"),
+        "fallback_result": context.get("fallback_result"),
+        "redispatch_required": context.get("redispatch_required"),
+        "agent_session_killed": context["agent_session_killed"],
+        "context": context,
+    }
+
+
+def persist_agent_terminal_error(
+    *,
+    error_context: Mapping[str, Any],
+    terminal_outcome: Optional[str] = None,
+    fallback_result: Optional[str] = None,
+    redispatch_required: Optional[bool] = None,
+    agent_session_killed: bool,
+) -> bool:
+    record = build_agent_terminal_error_record(
+        error_context=error_context,
+        terminal_outcome=terminal_outcome,
+        fallback_result=fallback_result,
+        redispatch_required=redispatch_required,
+        agent_session_killed=agent_session_killed,
+    )
+    return append_agent_terminal_error(record)

@@ -485,6 +485,8 @@ async def test_pass_through_request_shape_422_failure_hook_payload_is_sanitized(
         "litellm.proxy.proxy_server.proxy_logging_obj.pre_call_hook",
         new=AsyncMock(side_effect=lambda **kw: kw["data"]),
     ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.emit_aawm_route_access_log",
+    ), patch(
         "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
         new=post_failure_mock,
     ), patch(
@@ -7970,3 +7972,581 @@ async def test_responses_sse_restoration_is_frame_preserving_across_split_chunks
     assert b"event: response.function_call_arguments.done\r\n" in restored
     assert b"data: not-json\n\n" in restored
     assert restored.endswith(b"data: [DONE]\n\n")
+
+
+def _assert_request_shape_422_failure_hook_is_sanitized(
+    *,
+    post_failure_mock: AsyncMock,
+) -> None:
+    post_failure_mock.assert_awaited_once()
+    hook_kwargs = post_failure_mock.await_args.kwargs
+    assert hook_kwargs["traceback_str"] is None
+    request_data = hook_kwargs["request_data"]
+    assert request_data.get("failure_kind") == "request_shape_deserialization_failed"
+
+
+def _assert_request_shape_422_terminal_call_has_agent_attribution(
+    *,
+    terminal_kwargs: dict,
+    secret_prompt: str,
+    secret_token: str,
+) -> None:
+    error_context = terminal_kwargs["error_context"]
+    assert terminal_kwargs["terminal_outcome"] == "request_rejected"
+    assert terminal_kwargs["fallback_result"] == "none"
+    assert terminal_kwargs["redispatch_required"] is False
+    assert terminal_kwargs["agent_session_killed"] is True
+    assert error_context["failure_kind"] == "request_shape_deserialization_failed"
+    assert error_context["status_code"] == 422
+    assert error_context["model_alias"] == "aawm-code"
+    assert error_context["route_family"] == "codex_responses"
+    assert error_context["endpoint"] == "/openai_passthrough/responses"
+    assert error_context["agent_id"] == "agent-route-modelinput"
+    assert error_context["agent_name"] == "worker"
+    assert error_context["agent_role"] == "worker"
+    assert error_context["thread_source"] == "subagent"
+    assert error_context["session_id"] == "session-route-modelinput"
+    assert error_context["dispatch_id"] == "dispatch-route-modelinput"
+    assert error_context["trace_id"] == "trace-route-modelinput"
+    assert error_context["aawm_passthrough_request_shape_error_message_class"] == "model_input_deserialization_failed"
+    preview = error_context.get("aawm_passthrough_request_shape_error_body_preview") or ""
+    assert "ModelInput" in preview
+    assert secret_prompt not in preview
+    assert secret_token not in preview
+
+
+def _assert_request_shape_422_terminal_jsonl_record(
+    *,
+    tmp_path,
+    secret_prompt: str,
+    secret_token: str,
+) -> None:
+    log_path = tmp_path / "test-error.jsonl"
+    assert log_path.exists()
+    record = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert record["failure_kind"] == "request_shape_deserialization_failed"
+    assert record["status_code"] == 422
+    assert record["agent_id"] == "agent-route-modelinput"
+    assert record["session_id"] == "session-route-modelinput"
+    assert record["terminal_outcome"] == "request_rejected"
+    assert record["agent_session_killed"] is True
+    assert record["context"]["model_alias"] == "aawm-code"
+    assert record["context"]["route_family"] == "codex_responses"
+    assert record["context"]["agent_role"] == "worker"
+    assert record["context"]["thread_source"] == "subagent"
+    assert record["context"]["dispatch_id"] == "dispatch-route-modelinput"
+    serialized = json.dumps(record)
+    assert secret_prompt not in serialized
+    assert secret_token not in serialized
+    assert "sk-route-level" not in serialized
+
+
+def _build_request_shape_422_route_level_fixture(
+    *,
+    secret_prompt: str,
+    secret_token: str,
+) -> dict:
+    """Build request/upstream fixtures for Responses ModelInput 422 route tests."""
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+    mock_request.headers = Headers({"content-type": "application/json"})
+    mock_request.query_params = QueryParams({})
+
+    target_url = "https://chatgpt.com/backend-api/codex/responses"
+    upstream_detail = (
+        '{"error":"Failed to deserialize the JSON body into the target type: '
+        f"data did not match any variant of untagged enum ModelInput; prompt={secret_prompt}; "
+        f'token={secret_token}"}}'
+    )
+    upstream_response = httpx.Response(
+        status_code=422,
+        content=upstream_detail.encode("utf-8"),
+        request=httpx.Request("POST", target_url),
+    )
+    request_body = {
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user", "content": secret_prompt}],
+        "tools": [{"type": "function", "name": "exec_command"}],
+        "litellm_metadata": {
+            "route_family": "codex_responses",
+            "inbound_model_alias": "aawm-code",
+            "provider": "openai",
+            "repository": "litellm",
+            "agent_name": "worker",
+            "agent_id": "agent-route-modelinput",
+            "agent_role": "worker",
+            "agent_profile": "worker",
+            "thread_source": "subagent",
+            "session_id": "session-route-modelinput",
+            "trace_id": "trace-route-modelinput",
+            "dispatch_id": "dispatch-route-modelinput",
+            "aawm_passthrough_body_container_type": "object",
+            "aawm_passthrough_body_top_level_keys": ["input", "model", "tools"],
+            "aawm_passthrough_input_container_type": "array",
+            "aawm_passthrough_input_item_count": 1,
+            "aawm_passthrough_input_item_type_counts": {"message": 1},
+            "aawm_passthrough_tool_count": 1,
+            "aawm_passthrough_tool_type_counts": {"function": 1},
+        },
+    }
+    return {
+        "mock_request": mock_request,
+        "target_url": target_url,
+        "upstream_response": upstream_response,
+        "request_body": request_body,
+    }
+
+
+async def _invoke_pass_through_request_shape_422_with_terminal_capture(
+    *,
+    fixture: dict,
+    secret_token: str,
+    post_failure_mock: AsyncMock,
+    terminal_calls: list,
+):
+    from litellm.proxy.aawm_runtime_error_logging import (
+        persist_agent_terminal_error as real_persist_agent_terminal_error,
+    )
+
+    def _capture_terminal(**kwargs):
+        terminal_calls.append(kwargs)
+        return real_persist_agent_terminal_error(**kwargs)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=MagicMock(client=MagicMock()),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=fixture["upstream_response"]),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.pre_call_hook",
+        new=AsyncMock(side_effect=lambda **kw: kw["data"]),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.emit_aawm_route_access_log",
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+        new=post_failure_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        side_effect=_capture_terminal,
+    ) as mock_terminal, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+        return_value={},
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await pass_through_request(
+                request=fixture["mock_request"],
+                target=fixture["target_url"],
+                custom_headers={"authorization": f"Bearer {secret_token}"},
+                user_api_key_dict=MagicMock(),
+                custom_body=fixture["request_body"],
+                custom_llm_provider="openai",
+                stream=False,
+            )
+    return exc_info, mock_terminal
+
+
+def test_agent_terminal_422_intake_is_redacted_and_agent_correlated(
+    tmp_path,
+    monkeypatch,
+):
+    from litellm.proxy.aawm_runtime_error_logging import (
+        persist_agent_terminal_error,
+    )
+
+    monkeypatch.setenv("LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+    secret_prompt = "SUPER_SECRET_TERMINAL_PROMPT"
+    secret_token = "sk-terminal-secret-token"
+    base_context = {
+        "source": "pass_through_endpoint",
+        "endpoint": "/openai_passthrough/responses",
+        "upstream_url": "https://chatgpt.com/backend-api/codex/responses",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "model_alias": "aawm-code",
+        "route_family": "codex_responses",
+        "status_code": 422,
+        "repository": "litellm",
+        "agent_name": "worker",
+        "agent_id": "agent-model-input",
+        "agent_role": "worker",
+        "agent_profile": "worker",
+        "thread_source": "subagent",
+        "session_id": "session-model-input",
+        "trace_id": "trace-model-input",
+        "litellm_call_id": "call-model-input",
+        "dispatch_id": "dispatch-model-input",
+        "aawm_passthrough_body_container_type": "object",
+        "aawm_passthrough_body_top_level_keys": ["input", "model", "tools"],
+        "aawm_passthrough_input_container_type": "array",
+        "aawm_passthrough_input_item_count": 1,
+        "aawm_passthrough_input_item_type_counts": {"message": 1},
+        "aawm_passthrough_input_item_shape_samples": [
+            {
+                "index": 0,
+                "container_type": "object",
+                "type": "message",
+                "keys": ["content", "role", "type"],
+            }
+        ],
+        "aawm_passthrough_tool_count": 1,
+        "aawm_passthrough_tool_type_counts": {"function": 1},
+        "attempts": [
+            {
+                "provider": "xai",
+                "model": "xai/grok-4.5",
+                "route_family": "codex_grok_native_responses_adapter",
+                "status": "cooldown_set",
+                "error_class": "safety_policy_denied",
+                "error_status_code": 403,
+                "error_code": "api_key=terminal-secret-key",
+                "error_message": secret_prompt,
+                "headers": {"authorization": f"Bearer {secret_token}"},
+            }
+        ],
+        "candidates": [
+            {
+                "provider": "xai",
+                "model": "xai/grok-4.5",
+                "route_family": "codex_grok_native_responses_adapter",
+                "last_resort": False,
+                "request_body": {"input": secret_prompt},
+            }
+        ],
+        "actual_prior_tool_activity_summary": {
+            "has_actual_prior_tool_activity": True,
+            "prior_tool_call_count": 1,
+            "prior_tool_names": ["exec_command"],
+            "tool_arguments": {"cmd": secret_prompt},
+        },
+    }
+    exc = HTTPException(
+        status_code=422,
+        detail=(
+            '{"error":"Failed to deserialize the JSON body into the target type: '
+            f"data did not match any variant of untagged enum ModelInput; prompt={secret_prompt}; "
+            f'token={secret_token}"}}'
+        ),
+    )
+    enriched = _enrich_passthrough_error_log_context_for_request_shape_422(
+        error_log_context=base_context,
+        exc=exc,
+    )
+
+    assert persist_agent_terminal_error(
+        error_context=enriched,
+        terminal_outcome="request_rejected",
+        fallback_result="none",
+        redispatch_required=False,
+        agent_session_killed=True,
+    )
+
+    log_path = tmp_path / "test-error.jsonl"
+    record = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert record["failure_kind"] == "request_shape_deserialization_failed"
+    assert record["status_code"] == 422
+    assert record["agent_id"] == "agent-model-input"
+    assert record["session_id"] == "session-model-input"
+    assert record["litellm_call_id"] == "call-model-input"
+    assert record["terminal_outcome"] == "request_rejected"
+    assert record["agent_session_killed"] is True
+    assert record["context"]["agent_role"] == "worker"
+    assert record["context"]["thread_source"] == "subagent"
+    assert record["context"]["dispatch_id"] == "dispatch-model-input"
+    assert record["context"]["aawm_passthrough_request_shape_summary"]["input_item_count"] == 1
+    assert record["context"]["attempts"] == [
+        {
+            "provider": "xai",
+            "model": "xai/grok-4.5",
+            "route_family": "codex_grok_native_responses_adapter",
+            "status": "cooldown_set",
+            "error_class": "safety_policy_denied",
+            "error_status_code": 403,
+            "error_code": "REDACTED",
+        }
+    ]
+    assert record["context"]["candidates"] == [
+        {
+            "provider": "xai",
+            "model": "xai/grok-4.5",
+            "route_family": "codex_grok_native_responses_adapter",
+            "last_resort": False,
+        }
+    ]
+    assert record["context"]["actual_prior_tool_activity_summary"] == {
+        "has_actual_prior_tool_activity": True,
+        "prior_tool_call_count": 1,
+        "prior_tool_names": ["exec_command"],
+    }
+    serialized = json.dumps(record)
+    assert secret_prompt not in serialized
+    assert secret_token not in serialized
+    assert "sk-terminal-secret" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_pass_through_alias_managed_xai_safety_403_skips_generic_failure_hooks():
+    """Alias-managed intermediate SAFETY_CHECK_TYPE_CYBER 403 must not fire generic failure paths.
+
+    Alias fallback still depends on the exception being re-raised to the caller.
+    """
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+    mock_request.headers = Headers({"content-type": "application/json"})
+    mock_request.query_params = QueryParams({})
+
+    target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+    upstream_detail = (
+        '{"code":"permission-denied","error":"Content violates usage guidelines. '
+        'Failed check: SAFETY_CHECK_TYPE_CYBER"}'
+    )
+    upstream_response = httpx.Response(
+        status_code=403,
+        content=upstream_detail.encode("utf-8"),
+        request=httpx.Request("POST", target_url),
+    )
+    request_body = {
+        "model": "xai/grok-4.5",
+        "input": [{"type": "message", "content": "hello"}],
+        "litellm_metadata": {
+            "inbound_model_alias": "aawm-code",
+            "route_family": "codex_grok_native_responses_adapter",
+            "provider": "xai",
+        },
+    }
+
+    post_failure_mock = AsyncMock()
+    direct_capture_mock = AsyncMock()
+    terminal_intake_mock = MagicMock(return_value=True)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=MagicMock(client=MagicMock()),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=upstream_response),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.pre_call_hook",
+        new=AsyncMock(side_effect=lambda **kw: kw["data"]),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.emit_aawm_route_access_log",
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+        new=post_failure_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+        new=direct_capture_mock,
+    ), patch(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        new=terminal_intake_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+        return_value={},
+    ), patch.object(
+        verbose_proxy_logger,
+        "exception",
+    ) as mock_exception, patch.object(
+        verbose_proxy_logger,
+        "error",
+    ) as mock_error, patch.object(
+        verbose_proxy_logger,
+        "warning",
+    ) as mock_warning, patch.object(
+        verbose_proxy_logger,
+        "debug",
+    ) as mock_debug:
+        with pytest.raises(ProxyException) as exc_info:
+            await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer xai-token"},
+                user_api_key_dict=MagicMock(),
+                custom_body=request_body,
+                custom_llm_provider="xai",
+                stream=False,
+            )
+
+    # Exception is re-raised so alias-level request-local fallback remains possible.
+    assert exc_info.value.code == "403"
+    assert "SAFETY_CHECK_TYPE_CYBER" in str(exc_info.value.message)
+    post_failure_mock.assert_not_awaited()
+    direct_capture_mock.assert_not_awaited()
+    terminal_intake_mock.assert_not_called()
+    mock_exception.assert_not_called()
+    mock_error.assert_not_called()
+    mock_warning.assert_not_called()
+    deferred_debug = [
+        call
+        for call in mock_debug.call_args_list
+        if call.args and "deferred alias-managed safety denial" in str(call.args[0])
+    ]
+    assert deferred_debug
+    assert deferred_debug[0].kwargs["extra"]["failure_kind"] == "safety_policy_denied"
+    assert deferred_debug[0].kwargs["extra"]["model_alias"] == "aawm-code"
+
+
+@pytest.mark.asyncio
+async def test_pass_through_direct_xai_safety_403_invokes_generic_failure_handling():
+    """Direct/non-alias SAFETY_CHECK_TYPE_CYBER 403 still uses generic failure handling."""
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = "http://localhost:4001/grok/v1/responses"
+    mock_request.headers = Headers({"content-type": "application/json"})
+    mock_request.query_params = QueryParams({})
+
+    target_url = "https://cli-chat-proxy.grok.com/v1/responses"
+    upstream_detail = (
+        '{"code":"permission-denied","error":"Content violates usage guidelines. '
+        'Failed check: SAFETY_CHECK_TYPE_CYBER"}'
+    )
+    upstream_response = httpx.Response(
+        status_code=403,
+        content=upstream_detail.encode("utf-8"),
+        request=httpx.Request("POST", target_url),
+    )
+    request_body = {
+        "model": "grok-4.5",
+        "input": [{"type": "message", "content": "hello"}],
+        "litellm_metadata": {
+            "inbound_model_alias": "direct-grok",
+            "route_family": "grok_cli_chat_proxy",
+            "provider": "xai",
+        },
+    }
+
+    post_failure_mock = AsyncMock()
+    direct_capture_mock = AsyncMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+        return_value=MagicMock(client=MagicMock()),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(return_value=upstream_response),
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.pre_call_hook",
+        new=AsyncMock(side_effect=lambda **kw: kw["data"]),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.emit_aawm_route_access_log",
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+        new=post_failure_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+        new=direct_capture_mock,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+        return_value={},
+    ), patch.object(
+        verbose_proxy_logger,
+        "exception",
+    ) as mock_exception:
+        with pytest.raises(ProxyException) as exc_info:
+            await pass_through_request(
+                request=mock_request,
+                target=target_url,
+                custom_headers={"authorization": "Bearer xai-token"},
+                user_api_key_dict=MagicMock(),
+                custom_body=request_body,
+                custom_llm_provider="xai",
+                stream=False,
+            )
+
+    assert exc_info.value.code == "403"
+    assert "SAFETY_CHECK_TYPE_CYBER" in str(exc_info.value.message)
+    post_failure_mock.assert_awaited_once()
+    direct_capture_mock.assert_awaited_once()
+    mock_exception.assert_called_once()
+    hook_kwargs = post_failure_mock.await_args.kwargs
+    assert hook_kwargs["traceback_str"] is not None
+    assert "SAFETY_CHECK_TYPE_CYBER" in hook_kwargs["traceback_str"] or ("403" in hook_kwargs["traceback_str"])
+
+
+@pytest.mark.asyncio
+async def test_pass_through_request_shape_422_calls_terminal_jsonl_writer_with_agent_attribution(
+    monkeypatch,
+    tmp_path,
+):
+    """Drive the real Responses ModelInput 422 branch and assert terminal JSONL intake."""
+    secret_prompt = "ROUTE_LEVEL_MODELINPUT_SECRET_PROMPT"
+    secret_token = "sk-route-level-modelinput-token"
+    monkeypatch.setenv("LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+
+    fixture = _build_request_shape_422_route_level_fixture(
+        secret_prompt=secret_prompt,
+        secret_token=secret_token,
+    )
+    post_failure_mock = AsyncMock()
+    terminal_calls: list = []
+
+    exc_info, mock_terminal = await _invoke_pass_through_request_shape_422_with_terminal_capture(
+        fixture=fixture,
+        secret_token=secret_token,
+        post_failure_mock=post_failure_mock,
+        terminal_calls=terminal_calls,
+    )
+
+    assert exc_info.value.code == "422"
+    mock_terminal.assert_called_once()
+    assert len(terminal_calls) == 1
+    _assert_request_shape_422_terminal_call_has_agent_attribution(
+        terminal_kwargs=terminal_calls[0],
+        secret_prompt=secret_prompt,
+        secret_token=secret_token,
+    )
+    _assert_request_shape_422_failure_hook_is_sanitized(
+        post_failure_mock=post_failure_mock,
+    )
+    _assert_request_shape_422_terminal_jsonl_record(
+        tmp_path=tmp_path,
+        secret_prompt=secret_prompt,
+        secret_token=secret_token,
+    )
+
+
+def test_passthrough_agent_terminal_error_context_requires_alias_or_agent_identity():
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        _is_passthrough_agent_terminal_error_context,
+    )
+
+    assert _is_passthrough_agent_terminal_error_context({"model_alias": "aawm-code"})
+    assert _is_passthrough_agent_terminal_error_context({"model_alias": "direct-openai", "agent_id": "agent-123"})
+    assert not _is_passthrough_agent_terminal_error_context({"model_alias": "direct-openai"})
+
+
+def test_passthrough_alias_managed_safety_denial_is_deferred_to_alias_terminal():
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        _is_passthrough_alias_managed_safety_policy_denial,
+    )
+
+    exc = HTTPException(
+        status_code=403,
+        detail=(
+            '{"code":"permission-denied","error":"Content violates usage guidelines. '
+            'Failed check: SAFETY_CHECK_TYPE_CYBER"}'
+        ),
+    )
+    assert _is_passthrough_alias_managed_safety_policy_denial(
+        exc=exc,
+        status_code=403,
+        error_log_context={"model_alias": "aawm-code"},
+    )
+    assert not _is_passthrough_alias_managed_safety_policy_denial(
+        exc=exc,
+        status_code=403,
+        error_log_context={"model_alias": "direct-grok"},
+    )
+    assert not _is_passthrough_alias_managed_safety_policy_denial(
+        exc=HTTPException(status_code=403, detail="Forbidden"),
+        status_code=403,
+        error_log_context={"model_alias": "aawm-code"},
+    )

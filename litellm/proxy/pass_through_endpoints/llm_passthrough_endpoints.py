@@ -3891,14 +3891,10 @@ def _emit_auto_agent_alias_no_candidate_event(
     )
     host_attribution = _resolve_auto_agent_alias_route_host_attribution(request)
     event = {
-        "observed_at": _format_auto_agent_alias_timestamp(
-            datetime.now(timezone.utc)
-        ),
+        "observed_at": _format_auto_agent_alias_timestamp(datetime.now(timezone.utc)),
         "alias_family": alias_family,
         "alias_model": alias_model,
-        "session_id": _extract_auto_agent_alias_session_id(
-            request, request_body
-        ),
+        "session_id": _extract_auto_agent_alias_session_id(request, request_body),
         "agent_id": _extract_auto_agent_alias_metadata_value(
             request_body,
             "agent_id",
@@ -3934,13 +3930,47 @@ def _emit_auto_agent_alias_no_candidate_event(
         include_activity_status=True,
     )
     normalized_attempts = [
-        attempt
-        for attempt in attempts or []
-        if isinstance(attempt, dict)
+        attempt for attempt in attempts or [] if isinstance(attempt, dict)
     ]
     if normalized_attempts:
         event["attempt_count"] = len(normalized_attempts)
         event["attempts"] = copy.deepcopy(normalized_attempts)
+        last_failure_class = normalized_attempts[-1].get("error_class")
+        if last_failure_class is not None:
+            event["failure_class"] = last_failure_class
+    event["terminal_outcome"] = "agent_session_terminated"
+    event["fallback_result"] = "no_candidate_available"
+    event["redispatch_required"] = False
+    event["agent_session_killed"] = True
+    try:
+        from litellm.proxy.aawm_runtime_error_logging import (
+            persist_agent_terminal_error,
+        )
+
+        last_attempt = normalized_attempts[-1] if normalized_attempts else {}
+        persist_agent_terminal_error(
+            error_context={
+                **event,
+                "endpoint": event.get("incoming_endpoint"),
+                "status_code": event.get("error_status_code"),
+                "model_alias": alias_model,
+                "provider": last_attempt.get("provider"),
+                "model": last_attempt.get("model"),
+                "route_family": last_attempt.get("route_family"),
+                "failure_kind": "agent_alias_no_candidate",
+                "error_code": event.get("failure_class")
+                or "all_candidates_unavailable",
+            },
+            terminal_outcome="agent_session_terminated",
+            fallback_result="no_candidate_available",
+            redispatch_required=False,
+            agent_session_killed=True,
+        )
+    except Exception:
+        verbose_proxy_logger.debug(
+            "Failed to append terminal alias error intake",
+            exc_info=True,
+        )
     _emit_auto_agent_alias_route_event(
         event,
         level="warning",
@@ -5191,9 +5221,7 @@ def _add_codex_auto_agent_text_error_tokens(
     text_lower: str,
 ) -> None:
     if "grok build usage balance exhausted" in text_lower:
-        tokens.add(
-            _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN
-        )
+        tokens.add(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN)
     if (
         "usage_limit_reached" in text_lower
         or "usage limit" in text_lower
@@ -5216,8 +5244,7 @@ def _add_codex_auto_agent_text_error_tokens(
     ):
         tokens.add("HIGH_DEMAND")
     if "selected model is at capacity" in text_lower or (
-        "model is at capacity" in text_lower
-        and "try a different model" in text_lower
+        "model is at capacity" in text_lower and "try a different model" in text_lower
     ):
         tokens.add("MODEL_AT_CAPACITY")
     if "model is overloaded" in text_lower or "overloaded_error" in text_lower:
@@ -5233,12 +5260,8 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("RATE_LIMIT_EXCEEDED")
     if "aawm_codex_auto_agent_candidate_unavailable" in text_lower:
         tokens.add("aawm_codex_auto_agent_candidate_unavailable")
-    if (
-        "not supported when using codex with a chatgpt account" in text_lower
-        and (
-            "model is not supported" in text_lower
-            or " is not supported" in text_lower
-        )
+    if "not supported when using codex with a chatgpt account" in text_lower and (
+        "model is not supported" in text_lower or " is not supported" in text_lower
     ):
         tokens.add("aawm_codex_auto_agent_candidate_unavailable")
     if "grok-4.5" in text_lower and any(
@@ -5256,6 +5279,12 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("aawm_auto_agent_failed_responses_payload")
     if "aawm_auto_agent_malformed_tool_call_text" in text_lower:
         tokens.add("aawm_auto_agent_malformed_tool_call_text")
+    if (
+        "permission-denied" in text_lower
+        and "content violates usage guidelines" in text_lower
+        and "safety_check_type_cyber" in text_lower
+    ):
+        tokens.add("safety_policy_denied")
     if (
         "error from provider (deepseek)" in text_lower
         and "assistant message with 'tool_calls' must be followed by tool messages"
@@ -5367,6 +5396,8 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     *,
     candidate: Optional[dict[str, Any]] = None,
 ) -> str:
+    if error_class == "safety_policy_denied":
+        return "request_local"
     # Native Grok 4.5 is live. Broad candidate-unavailable probes can still
     # happen on transient/request-shape blips, so do not evict the native
     # candidate from routing. OAuth-route credential failures still fall through
@@ -5376,19 +5407,18 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         and _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
     ):
         return "none"
-    if error_class == "candidate_unavailable" and _is_codex_auto_agent_grok_4_5_candidate(
-        candidate
+    if (
+        error_class == "candidate_unavailable"
+        and _is_codex_auto_agent_grok_4_5_candidate(candidate)
     ):
         return "request_local"
-    if (
-        _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
-        and _is_codex_auto_agent_transient_internal_error_class(error_class)
-    ):
+    if _is_codex_auto_agent_native_grok_4_5_candidate(
+        candidate
+    ) and _is_codex_auto_agent_transient_internal_error_class(error_class):
         return "none"
-    if (
-        _is_codex_auto_agent_spark_candidate(candidate)
-        and _is_codex_auto_agent_transient_internal_error_class(error_class)
-    ):
+    if _is_codex_auto_agent_spark_candidate(
+        candidate
+    ) and _is_codex_auto_agent_transient_internal_error_class(error_class):
         return "candidate"
     return _get_codex_auto_agent_cooldown_scope(error_class)
 
@@ -5641,6 +5671,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "provider_terminal_error"
     if "aawm_auto_agent_malformed_tool_call_text" in tokens:
         return "malformed_tool_call_text"
+    if "safety_policy_denied" in tokens:
+        return "safety_policy_denied"
     if status_code == 429:
         return "rate_limited"
     if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
@@ -16021,7 +16053,8 @@ def _build_malformed_tool_call_intake_context(
 
     context: dict[str, Any] = {
         "provider": provider,
-        "model_alias": model_alias or _meta("model_alias", "alias_model", "requested_model")
+        "model_alias": model_alias
+        or _meta("model_alias", "alias_model", "requested_model")
         or (body.get("model") if isinstance(body.get("model"), str) else None),
         "route_family": _meta("passthrough_route_family", "route_family") or adapter,
         "endpoint": None,
@@ -16042,20 +16075,47 @@ def _build_malformed_tool_call_intake_context(
             "claude_agent_id",
         ),
         "session_id": None,
+        "agent_role": _meta("agent_role", "aawm_agent_role", "codex_agent_role"),
+        "agent_profile": _meta(
+            "agent_profile",
+            "aawm_agent_profile",
+            "codex_agent_profile",
+        ),
+        "thread_source": _meta(
+            "thread_source",
+            "aawm_thread_source",
+            "codex_thread_source",
+        ),
+        "thread_id": _meta("thread_id", "aawm_thread_id", "codex_thread_id"),
+        "dispatch_id": _meta(
+            "dispatch_id",
+            "agent_dispatch_id",
+            "aawm_dispatch_id",
+            "codex_dispatch_id",
+        ),
+        "redispatch_ordinal": _meta(
+            "redispatch_ordinal",
+            "agent_redispatch_ordinal",
+            "dispatch_ordinal",
+        ),
+        "terminal_outcome": "malformed_tool_call_rejected",
+        "fallback_result": "none",
+        "redispatch_required": False,
+        "agent_session_killed": True,
         "trace_id": _meta("trace_id", "existing_trace_id"),
         "litellm_call_id": _meta("litellm_call_id"),
         "request_started_at": _meta("request_started_at", "start_time"),
     }
     if request is not None:
+        context.update(_extract_auto_agent_alias_agent_dispatch_fields(request, body))
         context["endpoint"] = _extract_auto_agent_alias_incoming_endpoint(request)
         context["session_id"] = _extract_auto_agent_alias_session_id(request, body)
         if not context["repository"]:
             context["repository"] = _extract_passthrough_repository(request, body)
         if not context["trace_id"]:
-            context["trace_id"] = (
-                _get_request_header_or_passthrough_alias(request, "langfuse_trace_id")
-                or _get_request_header_or_passthrough_alias(request, "trace_id")
-            )
+            context["trace_id"] = _get_request_header_or_passthrough_alias(
+                request, "langfuse_trace_id"
+            ) or _get_request_header_or_passthrough_alias(request, "trace_id")
     return {key: value for key, value in context.items() if value is not None}
 
 

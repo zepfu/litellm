@@ -40,6 +40,21 @@ error sink or setting `LITELLM_AAWM_ERROR_LOG_DIR`. The malformed-specific
 enable flag is enough to default the path to the current working directory's
 `.analysis/malformed-error.jsonl`.
 
+Terminal agent-session errors use a dedicated structured writer that appends to
+the normal `<environment>-error.jsonl` file under the same local intake
+directory (`dev-error.jsonl` in dev and `prod-error.jsonl` in prod). Enable it
+explicitly with `LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED=1` (or
+`true`/`yes`/`on`). If that flag is unset, the writer defaults on when either
+`LITELLM_AAWM_ERROR_LOG_DIR` is set or the generic sink is enabled via
+`LITELLM_AAWM_ERROR_LOG_ENABLED=1`. Explicitly setting
+`LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED=0` (or `false`/`no`/`off`)
+disables terminal-agent intake even when the generic sink remains enabled.
+Terminal agent rows honor the shared
+`LITELLM_AAWM_ERROR_LOG_MAX_BYTES` ceiling (when set to a positive integer) and
+stop appending once the target file reaches that size. Malformed-tool rows keep
+their separate optional ceiling via
+`LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES`.
+
 When the proxy or provider-status sidecar runs as root inside a container, a
 plain bind-mount append would create root-owned active intake files on the host.
 After each successful append, the JSONL writers therefore make a best-effort
@@ -225,8 +240,14 @@ unknown tool/input variant errors), LiteLLM classifies the failure as
 `failure_kind=request_shape_deserialization_failed` and adds sanitized
 request-shape fields to the runtime error JSONL `context`.
 
-The instrumentation is detection-only: LiteLLM still returns the upstream `422`
-to the caller and does not retry or rewrite the request body on this path.
+The instrumentation is detection-only for the request body: LiteLLM still
+returns the upstream `422` to the caller and does not retry or rewrite the
+request body on this path. When the failure is tied to an AAWM alias or carries
+agent/dispatch identity, the same classification also emits a structured
+terminal-agent JSONL row (see `Terminal agent error JSONL intake` below) with
+bounded request-shape fields and agent/session correlation when available.
+Unattributed direct Responses `422` requests keep normal failure-hook handling
+but do not create terminal-agent intake.
 
 Recorded fields include:
 
@@ -508,6 +529,166 @@ to Langfuse, session history, another built-in callback, or a custom logger.
 
 Use the structured fields to group and triage failures, but keep
 `.analysis/todo.md` as the source of truth for active work.
+
+## Terminal agent error JSONL intake
+
+Some pass-through and AAWM alias failures terminate a spawned agent session
+before useful work or a final response. Those outcomes can write structured
+rows through `litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error`
+into `.analysis/dev-error.jsonl` (under the configured error-log directory).
+
+This path is best-effort local intake only. It does not replace
+`.analysis/todo.md` as the durable queue, and it does not claim durable
+`session_history` persistence for terminal-agent rows. Alias routing may still
+emit separate audit/route events; those are distinct from this JSONL intake.
+
+### Enablement and size control
+
+- Opt-in flag: `LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED`
+  - explicit truthy values: `1`, `true`, `yes`, `on`
+  - explicit falsy values disable the writer even if the generic error sink is on
+- Default when the flag is unset:
+  - enabled if `LITELLM_AAWM_ERROR_LOG_DIR` is set, or
+  - enabled if `LITELLM_AAWM_ERROR_LOG_ENABLED` is truthy
+  - otherwise disabled
+- Directory resolution reuses `_get_aawm_error_log_dir()` and falls back to the
+  process working directory's `.analysis`
+- Shared max-bytes control: `LITELLM_AAWM_ERROR_LOG_MAX_BYTES`
+  - when unset or non-positive, appends continue without a file-size ceiling
+  - when set to a positive integer, terminal-agent appends stop once
+    `dev-error.jsonl` reaches that size
+- Ownership/mode repair after append reuses the same
+  `LITELLM_AAWM_ERROR_LOG_FILE_UID` / `GID` / `MODE` helpers as the generic sink
+- Append failures are swallowed; terminal intake must never fail the client
+  request
+
+### JSONL fields and semantics
+
+Each terminal-agent row is one append-only JSON object. Top-level fields include:
+
+- `schema_version` (currently `1`)
+- `observed_at` (UTC ISO timestamp)
+- `environment` (from the shared AAWM error-log environment resolver)
+- `logger` = `litellm.proxy.agent_terminal`
+- `level` = `ERROR`
+- `message` = `Agent terminal error: <failure_kind>`
+- `traceback`, `traceback_text`, `traceback_lines`, `raw_text` (structured
+  terminal rows leave these empty/null; they are not traceback dumps)
+- `fingerprint` for stable grouping of repeated failure classes
+- `failure_kind` and `error_code`
+- `status_code` (HTTP/upstream status when known)
+- correlation identity: `agent_id`, `session_id`, `litellm_call_id`
+- terminal semantics:
+  - `terminal_outcome` — why the attempt ended (for example
+    `request_rejected`, `agent_session_terminated`,
+    `malformed_tool_call_rejected`)
+  - `fallback_result` — what same-request fallback produced (for example
+    `none`, `no_candidate_available`)
+  - `redispatch_required` — whether the client/orchestrator should redispatch
+    rather than treat the session as permanently killed by this row alone
+  - `agent_session_killed` — whether this outcome terminated the agent session
+- `context` — bounded nested metadata used for triage
+
+Useful `context` identity and attempt fields (when available):
+
+- route/provider: `source`, `container`, `endpoint` /
+  `incoming_endpoint`, `upstream_url`, `outgoing_target`, `provider`, `model`,
+  `model_alias` / `alias_model`, `alias_family`, `route_family`, `status_code` /
+  `error_status_code`
+- failure classification: `failure_kind`, `failure_class`, `error_code`,
+  `event_type`, `candidate_status`, `failure_phase`, `attempted_provider_call`
+- agent/session correlation: `repository`, `tenant_id`, `agent_name`,
+  `agent_id`, `agent_role`, `agent_profile`, `thread_source`, `session_id`,
+  `thread_id`, `trace_id`, `litellm_call_id`, `dispatch_id`,
+  `redispatch_ordinal`
+- attempt sequence: `attempt_count`, `attempts`, `candidate_count`,
+  `candidates`, plus hidden-retry scalars such as
+  `hidden_retry_final_outcome`, `hidden_retry_failure_classification`,
+  `hidden_retry_count` when the failure exhausted hidden retries
+- cooldown diagnostics when present: `cooldown_scope`, `cooldown_state_source`
+- activity/status summaries: `terminal_activity_status`,
+  `actual_prior_tool_activity_summary`
+- bounded/redacted request-shape fields for Responses `422` killers:
+  `aawm_passthrough_request_shape_summary`,
+  `aawm_passthrough_request_shape_fingerprint`,
+  `aawm_passthrough_request_shape_error_class`,
+  `aawm_passthrough_request_shape_error_message_class`,
+  `aawm_passthrough_request_shape_error_body_preview`,
+  `aawm_passthrough_request_shape_error_fingerprint`
+
+String context values are secret-redacted and truncated (about 2 KiB). Nested
+attempt, candidate, request-shape, and prior-activity structures are rebuilt
+from explicit field allowlists; unknown nested fields such as messages, bodies,
+headers, tool arguments, and provider response detail are dropped rather than
+serialized. Lists are item-bounded before append. The fingerprint is a SHA-256
+over a stable lowercased join of failure class tokens, status code, provider,
+model alias, route family, endpoint, and the request-shape error fingerprint
+when present. Use `fingerprint` to group repeated terminal classes without
+losing per-row agent/session/call identity fields.
+
+Common emission paths:
+
+- Responses request-shape `422` (`failure_kind=request_shape_deserialization_failed`)
+  from the pass-through exception path, with
+  `terminal_outcome=request_rejected`, `fallback_result=none`, and
+  `agent_session_killed=true` when an AAWM alias or agent/dispatch identity is
+  present; unattributed direct `422` responses are not written to this sink
+- AAWM alias no-candidate terminal outcomes
+  (`failure_kind=agent_alias_no_candidate`) with
+  `terminal_outcome=agent_session_terminated` and
+  `fallback_result=no_candidate_available`
+- Malformed tool-call detections continue to use
+  `.analysis/malformed-error.jsonl` with the same terminal semantic fields
+  (`terminal_outcome`, `fallback_result`, `redispatch_required`,
+  `agent_session_killed`) for correlation. New rows expose the stable grouping
+  hash as `fingerprint`; `failure_fingerprint` is retained as a compatibility
+  alias.
+
+### xAI `SAFETY_CHECK_TYPE_CYBER` handling for AAWM aliases
+
+Grok/xAI upstream `403` bodies that include all of `permission-denied`,
+`Content violates usage guidelines`, and `SAFETY_CHECK_TYPE_CYBER` are classified
+as `safety_policy_denied`.
+
+For managed AAWM aliases (`model_alias` starting with `aawm-`):
+
+- intermediate candidate denials are request-local only
+- the denied candidate is excluded for the remainder of the same request so
+  alias routing can fall through to the next declared candidate
+- LiteLLM does **not** set a durable Redis/model cooldown for this class
+- the pass-through layer defers generic failure hooks and does **not** write an
+  intermediate terminal-agent JSONL row while same-request fallback can still
+  advance
+- one terminal-agent JSONL row is written only if fallback exhausts every
+  remaining candidate and the alias ends in a no-candidate / agent-session
+  terminated outcome
+
+This prevents safety denials from being misread as provider unavailability or
+durable cooldown evidence while still creating investigation intake when the
+denial actually kills the agent session.
+
+### Direct / non-alias `403` behavior
+
+Direct Grok/xAI routes and non-AAWM aliases keep normal terminal failure
+handling for the same `SAFETY_CHECK_TYPE_CYBER` body:
+
+- generic pass-through failure logging and hooks still run
+- active error intake is not deferred to alias fallback logic
+- operators should treat these as ordinary upstream permission/safety failures
+  for that direct route rather than as AAWM multi-candidate fallback events
+
+### Privacy boundaries
+
+Terminal-agent JSONL intake intentionally omits:
+
+- prompts and assistant text
+- tool arguments and tool result bodies
+- credentials, OAuth tokens, API keys, cookies, and authorization headers
+- raw request or response bodies
+
+Only bounded/redacted route metadata, identity fields, request-shape summaries,
+and failure classification tokens are recorded. Full-payload capture remains a
+separate, stronger operator opt-in and is not enabled by terminal-agent intake.
 
 ## Agent intake workflow
 

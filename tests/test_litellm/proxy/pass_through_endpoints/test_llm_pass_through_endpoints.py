@@ -5840,9 +5840,7 @@ class TestPassThroughRequestRetryableFailures:
     def test_build_passthrough_error_log_context_uses_safe_metadata(self):
         mock_request = MagicMock(spec=Request)
         mock_request.method = "POST"
-        mock_request.url = (
-            "http://localhost:4001/grok/v1/traces?beta=true&api_key=secret"
-        )
+        mock_request.url = "http://localhost:4001/grok/v1/traces?beta=true&api_key=secret"
         mock_request.query_params = {
             "beta": "true",
             "api_key": "secret",
@@ -5926,6 +5924,19 @@ class TestPassThroughRequestRetryableFailures:
             "auth_credential_source": "none",
             "trace_id": "trace-456",
             "litellm_call_id": "call-123",
+            # Optional agent/session/thread/dispatch attribution keys are always
+            # present and None when source metadata does not supply them.
+            "repository": None,
+            "tenant_id": None,
+            "agent_name": None,
+            "agent_id": None,
+            "agent_role": None,
+            "agent_profile": None,
+            "thread_source": None,
+            "session_id": None,
+            "thread_id": None,
+            "dispatch_id": None,
+            "redispatch_ordinal": None,
             "grok_side_channel": True,
             "grok_side_channel_endpoint_type": "traces",
             "grok_side_channel_endpoint_path_template": "/traces",
@@ -5939,7 +5950,18 @@ class TestPassThroughRequestRetryableFailures:
         serialized_context = json.dumps(context)
         assert "deadbeef" not in serialized_context
         assert "should-not-appear" not in serialized_context
-        assert "session_id" not in serialized_context
+        # Top-level attribution key may serialize as null; secret-bearing
+        # side-channel key metadata and values must still be absent.
+        assert context["session_id"] is None
+        assert context["agent_id"] is None
+        assert context["agent_name"] is None
+        assert context["agent_role"] is None
+        assert context["agent_profile"] is None
+        assert context["thread_source"] is None
+        assert context["thread_id"] is None
+        assert context["dispatch_id"] is None
+        assert context["redispatch_ordinal"] is None
+        assert '"session_id": "string"' not in serialized_context
         assert "api_key" not in serialized_context
         assert "/sessions/body-secret" not in serialized_context
         assert "999" not in serialized_context
@@ -24181,7 +24203,15 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
     body = {
         "model": "aawm-code",
         "instructions": "You are a 'worker' agent.",
-        "litellm_metadata": {"session_id": "codex-session"},
+        "litellm_metadata": {
+            "session_id": "codex-session",
+            "agent_id": "agent-safety-terminal",
+            "agent_name": "worker",
+            "agent_role": "worker",
+            "thread_source": "subagent",
+            "dispatch_id": "dispatch-safety-terminal",
+            "trace_id": "trace-safety-terminal",
+        },
     }
     attempts = [
         {
@@ -24202,12 +24232,14 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
             "lane_key": "__default__",
             "reason": "first_available",
             "status": "cooldown_set",
-            "error_class": "upstream_transient_internal",
-            "error_status_code": 502,
+            "error_class": "safety_policy_denied",
+            "error_status_code": 403,
+            "cooldown_scope": "request_local",
             "attempted_provider_call": True,
         },
     ]
     persisted = []
+    terminal_records = []
 
     monkeypatch.setattr(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
@@ -24216,6 +24248,10 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
     monkeypatch.setattr(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_auto_agent_alias_route_event",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        lambda **kwargs: terminal_records.append(kwargs) or True,
     )
 
     _emit_auto_agent_alias_no_candidate_event(
@@ -24240,6 +24276,21 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
     assert events[-1]["attempt_count"] == 2
     assert events[-1]["attempts"] == attempts
     assert len({event["litellm_call_id"] for event in events}) == 1
+    assert len(terminal_records) == 1
+    terminal_record = terminal_records[0]
+    terminal_context = terminal_record["error_context"]
+    assert terminal_context["failure_kind"] == "agent_alias_no_candidate"
+    assert terminal_context["failure_class"] == "safety_policy_denied"
+    assert terminal_context["agent_id"] == "agent-safety-terminal"
+    assert terminal_context["agent_name"] == "worker"
+    assert terminal_context["agent_role"] == "worker"
+    assert terminal_context["thread_source"] == "subagent"
+    assert terminal_context["dispatch_id"] == "dispatch-safety-terminal"
+    assert terminal_context["session_id"] == "codex-session"
+    assert terminal_record["terminal_outcome"] == "agent_session_terminated"
+    assert terminal_record["fallback_result"] == "no_candidate_available"
+    assert terminal_record["redispatch_required"] is False
+    assert terminal_record["agent_session_killed"] is True
 
 
 @pytest.mark.asyncio
@@ -37260,22 +37311,19 @@ async def test_anthropic_spark_bare_502_sets_candidate_transient_cooldown(monkey
     assert spark_attempt["cooldown_seconds"] == 30.0
     grok_attempt = metadata["anthropic_auto_agent_attempts"][1]
     assert grok_attempt["model"] == "xai/grok-4.5"
-    assert grok_attempt["cooldown_scope"] == "request_local"
+    # Native Grok transient retry stays live: no durable or request-local exclusion.
+    assert grok_attempt["cooldown_scope"] == "none"
     composer_attempt = metadata["anthropic_auto_agent_attempts"][2]
     assert composer_attempt["model"] == "grok-composer-2.5-fast"
     assert composer_attempt["cooldown_scope"] == "request_local"
-    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
-        spark_cooldown_key
-    )
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(spark_cooldown_key)
     assert durable_seconds > 0.0
     assert durable_source in {"durable_cache", "memory"}
     for cooldown_key in (
         "xai:xai/grok-4.5:xai_grok_native",
         "xai:grok-composer-2.5-fast:xai_grok_native",
     ):
-        grok_durable_seconds, grok_durable_source = (
-            await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
-        )
+        grok_durable_seconds, grok_durable_source = await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
         assert grok_durable_seconds == 0.0
         assert grok_durable_source == "local_fallback"
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
@@ -37631,9 +37679,15 @@ def test_malformed_tool_call_intake_appends_single_json_object(tmp_path, monkeyp
         "repository": "litellm",
         "agent_name": "worker",
         "agent_id": "agent-123",
+        "agent_role": "worker",
+        "agent_profile": "worker",
+        "thread_source": "subagent",
         "session_id": "sess-456",
+        "thread_id": "thread-456",
         "trace_id": "trace-789",
         "litellm_call_id": "call-abc",
+        "dispatch_id": "dispatch-abc",
+        "redispatch_ordinal": 2,
         "request_started_at": "2026-06-25T16:00:00+00:00",
     }
 
@@ -37668,9 +37722,20 @@ def test_malformed_tool_call_intake_appends_single_json_object(tmp_path, monkeyp
         "repository",
         "agent_name",
         "agent_id",
+        "agent_role",
+        "agent_profile",
+        "thread_source",
         "session_id",
+        "thread_id",
         "trace_id",
         "litellm_call_id",
+        "dispatch_id",
+        "redispatch_ordinal",
+        "terminal_outcome",
+        "fallback_result",
+        "redispatch_required",
+        "agent_session_killed",
+        "failure_fingerprint",
         "request_started_at",
     ):
         assert field in record, field
@@ -37679,6 +37744,10 @@ def test_malformed_tool_call_intake_appends_single_json_object(tmp_path, monkeyp
     assert record["error_code"] == MALFORMED_TOOL_CALL_ERROR_CODE
     assert record["malformed_tool_call_text"] == "composer_call"
     assert record["environment"] == "test"
+    assert record["terminal_outcome"] == "malformed_tool_call_rejected"
+    assert record["fallback_result"] == "none"
+    assert record["redispatch_required"] is False
+    assert record["agent_session_killed"] is True
 
 
 def test_malformed_tool_call_intake_defaults_to_analysis_with_specific_flag(
@@ -37993,3 +38062,214 @@ def test_malformed_tool_call_intake_write_failure_does_not_break_raise(
     assert exc_info.value.detail["error"]["code"] == (
         "aawm_auto_agent_malformed_tool_call_text"
     )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_grok_safety_denial_falls_back_request_locally_without_durable_cooldown():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    safety_error = ProxyException(
+        message=(
+            '{"code":"permission-denied","error":"Content violates usage guidelines. '
+            'Failed check: SAFETY_CHECK_TYPE_CYBER"}'
+        ),
+        type="permission_denied",
+        param="model",
+        code=403,
+    )
+    composer_success = Response(
+        content='{"ok": true}',
+        media_type="application/json",
+    )
+    spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    grok45_cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
+    await _set_anthropic_auto_agent_cooldown(spark_cooldown_key, 120.0)
+    await _set_codex_auto_agent_cooldown(spark_cooldown_key, 120.0)
+
+    with patch(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+    ) as mock_terminal_intake, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(side_effect=AssertionError("Spark must be skipped")),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=[safety_error, composer_success]),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=AssertionError("Managed fallback must not run")),
+    ) as mock_xai_oauth:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is composer_success
+    mock_terminal_intake.assert_not_called()
+    mock_spark.assert_not_called()
+    assert mock_grok_native.await_count == 2
+    mock_xai_oauth.assert_not_called()
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    assert metadata["anthropic_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    safety_attempt = metadata["anthropic_auto_agent_attempts"][0]
+    assert safety_attempt["model"] == "xai/grok-4.5"
+    assert safety_attempt["status"] == "cooldown_set"
+    assert safety_attempt["error_class"] == "safety_policy_denied"
+    assert safety_attempt["error_status_code"] == 403
+    assert safety_attempt["cooldown_scope"] == "request_local"
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(grok45_cooldown_key)
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+
+    fresh_request = _build_anthropic_auto_agent_request()
+    fresh_body = _build_anthropic_auto_agent_body()
+    fresh_body["model"] = "aawm-code-anthropic"
+    selection = await _select_anthropic_auto_agent_candidate(
+        request=fresh_request,
+        request_body=fresh_body,
+    )
+    assert selection["candidate"]["model"] == "xai/grok-4.5"
+    assert all(skipped["model"] != "xai/grok-4.5" for skipped in selection["skipped"])
+
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+
+
+def test_codex_auto_agent_candidate_cooldown_scope_safety_denial_is_request_local():
+    candidates = (
+        {
+            "model": "grok-4.5",
+            "provider": "xai",
+            "route_family": "codex_grok_native_responses_adapter",
+        },
+        {
+            "model": "oa_xai/grok-4.5",
+            "provider": "xai",
+            "route_family": "codex_xai_oauth_responses_adapter",
+        },
+    )
+
+    for candidate in candidates:
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "safety_policy_denied",
+                candidate=candidate,
+            )
+            == "request_local"
+        )
+
+
+def test_codex_auto_agent_retryable_exhaustion_classifies_xai_cyber_safety_denial():
+    exc = RuntimeError(
+        '{"code":"permission-denied","error":"Content violates usage guidelines. '
+        'Failed check: SAFETY_CHECK_TYPE_CYBER"}'
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "safety_policy_denied"
+    assert "safety_policy_denied" in _extract_codex_auto_agent_error_tokens(exc)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        '{"code":"permission-denied","error":"Access denied."}',
+        "Content violates usage guidelines. Failed check: SAFETY_CHECK_TYPE_CYBER",
+        "403 Forbidden",
+    ],
+)
+def test_codex_auto_agent_retryable_exhaustion_preserves_unrelated_403_failures(
+    message,
+):
+    exc = RuntimeError(message)
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
+    assert "safety_policy_denied" not in _extract_codex_auto_agent_error_tokens(exc)
+
+
+@pytest.mark.asyncio
+async def test_codex_grok_safety_denial_falls_back_request_locally_without_durable_cooldown():
+    """Alias-managed intermediate xAI SAFETY_CHECK_TYPE_CYBER 403 keeps request-local fallback."""
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    safety_error = ProxyException(
+        message=(
+            '{"code":"permission-denied","error":"Content violates usage guidelines. '
+            'Failed check: SAFETY_CHECK_TYPE_CYBER"}'
+        ),
+        type="permission_denied",
+        param="model",
+        code=403,
+    )
+    composer_success = Response(
+        content='{"ok": true}',
+        media_type="application/json",
+    )
+    spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
+    grok45_cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
+    await _set_codex_auto_agent_cooldown(spark_cooldown_key, 120.0)
+
+    with patch(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+    ) as mock_terminal_intake, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_native_openai_request",
+        new=AsyncMock(side_effect=AssertionError("Spark must be skipped")),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(side_effect=[safety_error, composer_success]),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(side_effect=AssertionError("Managed fallback must not run")),
+    ) as mock_xai_oauth:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is composer_success
+    mock_terminal_intake.assert_not_called()
+    mock_spark.assert_not_called()
+    assert mock_grok_native.await_count == 2
+    mock_xai_oauth.assert_not_called()
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_model"] == "grok-composer-2.5-fast"
+    safety_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert safety_attempt["model"] == "xai/grok-4.5"
+    assert safety_attempt["status"] == "cooldown_set"
+    assert safety_attempt["error_class"] == "safety_policy_denied"
+    assert safety_attempt["error_status_code"] == 403
+    assert safety_attempt["cooldown_scope"] == "request_local"
+    durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(grok45_cooldown_key)
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+
+    fresh_request = _build_codex_auto_agent_request()
+    fresh_body = {
+        "model": "aawm-code",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session-fresh"},
+    }
+    selection = await _select_codex_auto_agent_candidate(
+        request=fresh_request,
+        request_body=fresh_body,
+    )
+    assert selection["candidate"]["model"] == "xai/grok-4.5"
+    assert all(skipped["model"] != "xai/grok-4.5" for skipped in selection["skipped"])
+
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)

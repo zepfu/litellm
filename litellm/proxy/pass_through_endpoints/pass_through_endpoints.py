@@ -1642,6 +1642,55 @@ def _should_log_passthrough_terminal_failure_without_traceback(
         return False
 
 
+def _is_passthrough_alias_managed_safety_policy_denial(
+    *,
+    exc: Exception,
+    status_code: Optional[int],
+    error_log_context: Dict[str, Any],
+) -> bool:
+    if status_code != status.HTTP_403_FORBIDDEN:
+        return False
+    model_alias = _clean_passthrough_error_context_value(
+        error_log_context.get("model_alias")
+    )
+    if model_alias is None or not model_alias.lower().startswith("aawm-"):
+        return False
+    text = " ".join(
+        str(value)
+        for value in (
+            exc,
+            getattr(exc, "message", None),
+            getattr(exc, "detail", None),
+        )
+        if value is not None
+    ).lower()
+    return (
+        "permission-denied" in text
+        and "content violates usage guidelines" in text
+        and "safety_check_type_cyber" in text
+    )
+
+
+def _is_passthrough_agent_terminal_error_context(
+    error_log_context: Dict[str, Any],
+) -> bool:
+    model_alias = _clean_passthrough_error_context_value(
+        error_log_context.get("model_alias")
+    )
+    if model_alias and model_alias.lower().startswith("aawm-"):
+        return True
+    return any(
+        error_log_context.get(field)
+        for field in (
+            "agent_id",
+            "agent_name",
+            "agent_role",
+            "thread_source",
+            "dispatch_id",
+        )
+    )
+
+
 def _is_passthrough_rate_limit_retryable(
     *,
     status_code: Optional[int],
@@ -2623,6 +2672,72 @@ def _build_passthrough_error_log_context(
             _AAWM_PASSTHROUGH_ERROR_LOG_TRACE_METADATA_KEYS,
         ),
         "litellm_call_id": _clean_passthrough_error_context_value(litellm_call_id),
+        "repository": _first_passthrough_error_context_value(
+            metadata,
+            ("repository", "repo", "repo_name", "repository_name"),
+        ),
+        "tenant_id": _first_passthrough_error_context_value(
+            metadata,
+            ("tenant_id", "repository", "repo", "repo_name"),
+        ),
+        "agent_name": _first_passthrough_error_context_value(
+            metadata,
+            ("agent_name", "aawm_agent_name", "codex_agent_name"),
+        ),
+        "agent_id": _first_passthrough_error_context_value(
+            metadata,
+            (
+                "agent_id",
+                "aawm_agent_id",
+                "codex_agent_id",
+                "claude_agent_id",
+                "subagent_id",
+                "source_agent_id",
+            ),
+        ),
+        "agent_role": _first_passthrough_error_context_value(
+            metadata,
+            ("agent_role", "aawm_agent_role", "codex_agent_role"),
+        ),
+        "agent_profile": _first_passthrough_error_context_value(
+            metadata,
+            ("agent_profile", "aawm_agent_profile", "codex_agent_profile"),
+        ),
+        "thread_source": _first_passthrough_error_context_value(
+            metadata,
+            ("thread_source", "aawm_thread_source", "codex_thread_source"),
+        ),
+        "session_id": _first_passthrough_error_context_value(
+            metadata,
+            (
+                "session_id",
+                "aawm_session_id",
+                "codex_session_id",
+                "claude_session_id",
+            ),
+        ),
+        "thread_id": _first_passthrough_error_context_value(
+            metadata,
+            ("thread_id", "aawm_thread_id", "codex_thread_id"),
+        ),
+        "dispatch_id": _first_passthrough_error_context_value(
+            metadata,
+            (
+                "dispatch_id",
+                "agent_dispatch_id",
+                "aawm_dispatch_id",
+                "codex_dispatch_id",
+            ),
+        ),
+        "redispatch_ordinal": _first_passthrough_error_context_value(
+            metadata,
+            (
+                "redispatch_ordinal",
+                "agent_redispatch_ordinal",
+                "dispatch_ordinal",
+                "aawm_redispatch_ordinal",
+            ),
+        ),
     }
     context.update(_build_passthrough_error_log_request_shape_context(metadata))
     context.update(grok_side_channel_context)
@@ -4335,6 +4450,19 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code=status_code,
             )
         )
+        suppress_alias_intermediate_safety_policy_denial = (
+            _is_passthrough_alias_managed_safety_policy_denial(
+                exc=e,
+                status_code=status_code,
+                error_log_context=error_log_context,
+            )
+        )
+        if suppress_alias_intermediate_safety_policy_denial:
+            error_log_context = {
+                **error_log_context,
+                "failure_kind": "safety_policy_denied",
+                "failure_class": "safety_policy_denied",
+            }
         suppress_provider_rate_limit_traceback = (
             _is_passthrough_expected_provider_rate_limit(status_code=status_code)
         )
@@ -4420,6 +4548,12 @@ async def pass_through_request(  # noqa: PLR0915
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
                 status_code,
+            )
+        elif suppress_alias_intermediate_safety_policy_denial:
+            verbose_proxy_logger.debug(
+                "Pass through endpoint deferred alias-managed safety denial status=%s to alias fallback handling",
+                status_code,
+                extra=error_log_context,
             )
         elif suppress_provider_rate_limit_traceback:
             verbose_proxy_logger.warning(
@@ -4534,6 +4668,29 @@ async def pass_through_request(  # noqa: PLR0915
         elif error_log_context.get("failure_kind") == (
             "request_shape_deserialization_failed"
         ):
+            try:
+                from litellm.proxy.aawm_runtime_error_logging import (
+                    persist_agent_terminal_error,
+                )
+
+                agent_session_killed = (
+                    _is_passthrough_agent_terminal_error_context(
+                        error_log_context
+                    )
+                )
+                if agent_session_killed:
+                    persist_agent_terminal_error(
+                        error_context=error_log_context,
+                        terminal_outcome="request_rejected",
+                        fallback_result="none",
+                        redispatch_required=False,
+                        agent_session_killed=True,
+                    )
+            except Exception:
+                verbose_proxy_logger.debug(
+                    "Failed to append request-shape terminal error intake",
+                    exc_info=True,
+                )
             verbose_proxy_logger.warning(
                 "Pass through endpoint surfaced Responses request-shape deserialization failure status=%s error=%s",
                 status_code,
@@ -4618,6 +4775,7 @@ async def pass_through_request(  # noqa: PLR0915
         traceback_str = None
         if (
             not suppress_terminal_failure_traceback
+            and not suppress_alias_intermediate_safety_policy_denial
             and not suppress_provider_rate_limit_traceback
             and not suppress_grok_billing_timeout_traceback
             and not suppress_grok_signals_auth_context_traceback
@@ -4637,6 +4795,7 @@ async def pass_through_request(  # noqa: PLR0915
             )
         if (
             not suppress_retryable_failure_logging
+            and not suppress_alias_intermediate_safety_policy_denial
             and not suppress_grok_billing_timeout_traceback
             and not suppress_grok_signals_auth_context_traceback
             and not suppress_grok_replicas_update_not_owned_traceback
