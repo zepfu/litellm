@@ -491,6 +491,46 @@ def test_gpt_5_4_variant_reasoning_effort_flags():
         assert model_info["supports_xhigh_reasoning_effort"] is True
 
 
+def test_gpt_5_6_variant_reasoning_effort_flags():
+    import json
+    from pathlib import Path
+
+    pricing_map_paths = [
+        Path("model_prices_and_context_window.json"),
+        Path("litellm/bundled_model_prices_and_context_window_fallback.json"),
+    ]
+    for pricing_map_path in pricing_map_paths:
+        model_cost = json.loads(pricing_map_path.read_text())
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            model_info = model_cost[model]
+            assert model_info["supports_reasoning"] is True
+            assert model_info["supports_none_reasoning_effort"] is True
+            assert model_info["supports_xhigh_reasoning_effort"] is True
+            assert model_info["supports_max_reasoning_effort"] is True
+
+
+def test_gpt_5_6_reasoning_effort_flags_in_runtime_model_info(monkeypatch):
+    from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+    from litellm.utils import (
+        _invalidate_model_cost_lowercase_map,
+        get_model_info,
+        supports_max_reasoning_effort,
+    )
+
+    local_model_cost = GetModelCostMap.load_local_model_cost_map()
+    monkeypatch.setattr(litellm, "model_cost", local_model_cost)
+    _invalidate_model_cost_lowercase_map()
+    get_model_info.cache_clear()
+
+    for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        model_info = get_model_info(model)
+        assert model_info["supports_reasoning"] is True
+        assert model_info["supports_none_reasoning_effort"] is True
+        assert model_info["supports_xhigh_reasoning_effort"] is True
+        assert model_info["supports_max_reasoning_effort"] is True
+        assert supports_max_reasoning_effort(model) is True
+
+
 def test_gpt_5_4_mini_and_nano_entries_present():
     import json
     from pathlib import Path
@@ -865,6 +905,7 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "supports_minimal_reasoning_effort": {"type": "boolean"},
                 "supports_none_reasoning_effort": {"type": "boolean"},
                 "supports_xhigh_reasoning_effort": {"type": "boolean"},
+                "supports_max_reasoning_effort": {"type": "boolean"},
                 "supports_native_cache_control": {"type": "boolean"},
                 "supports_service_tier": {"type": "boolean"},
                 "supports_preset": {"type": "boolean"},

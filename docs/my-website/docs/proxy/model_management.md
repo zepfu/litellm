@@ -28,10 +28,17 @@ LiteLLM's canonical cost map includes `gpt-5.6-sol`, `gpt-5.6-terra`, and
 cache billing fields are sourced from
 [Previewing GPT-5.6 Sol](https://openai.com/index/previewing-gpt-5-6-sol/)
 (per 1M tokens: Sol $5/$30, Terra $2.50/$15, Luna $1/$6; cache write 1.25× input;
-cache read 10% of input). These entries intentionally include only verified
-pricing/cache billing plus minimal structure (`litellm_provider`, `mode`,
-`supported_endpoints`); they do not copy `gpt-5.5` context-window or capability
-flags until those fields are verified for the gpt-5.6 family. Codex alias routing uses:
+cache read 10% of input). All three entries advertise reasoning efforts through
+API value `max` (`none`, `low`, `medium`, `high`, `xhigh`, `max`) using the
+config-driven `supports_max_reasoning_effort` capability. Context-window and
+unrelated capability fields remain omitted until independently verified.
+
+The user-level Codex model catalog exposes `max` for Sol, Terra, and Luna.
+`ultra` is exposed only for Sol: it is a Codex product intelligence mode that
+combines maximum reasoning with proactive subagent delegation, not an API
+`reasoning.effort` value sent by LiteLLM.
+
+Codex alias routing uses:
 
 - `aawm-sota`: `gpt-5.6-sol` → `gpt-5.5`
 - `aawm-sota-openai`: same order as `aawm-sota` (`gpt-5.6-sol` → `gpt-5.5`)

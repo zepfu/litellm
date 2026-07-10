@@ -334,6 +334,36 @@ def test_gpt5_5_allows_reasoning_effort_xhigh(config: OpenAIConfig):
     assert params["reasoning_effort"] == "xhigh"
 
 
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+def test_gpt5_6_allows_reasoning_effort_max(
+    config: OpenAIConfig, model: str, monkeypatch: pytest.MonkeyPatch
+):
+    from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+    from litellm.utils import _invalidate_model_cost_lowercase_map
+
+    local_model_cost = GetModelCostMap.load_local_model_cost_map()
+    monkeypatch.setattr(litellm, "model_cost", local_model_cost)
+    _invalidate_model_cost_lowercase_map()
+
+    params = config.map_openai_params(
+        non_default_params={"reasoning_effort": "max"},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+    assert params["reasoning_effort"] == "max"
+
+
+def test_gpt5_4_rejects_reasoning_effort_max(config: OpenAIConfig):
+    with pytest.raises(litellm.utils.UnsupportedParamsError):
+        config.map_openai_params(
+            non_default_params={"reasoning_effort": "max"},
+            optional_params={},
+            model="gpt-5.4",
+            drop_params=False,
+        )
+
+
 def test_gpt5_5_supports_sampling_params_with_none_reasoning(config: OpenAIConfig):
     params = config.map_openai_params(
         non_default_params={

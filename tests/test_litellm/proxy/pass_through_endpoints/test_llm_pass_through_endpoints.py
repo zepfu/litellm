@@ -7935,7 +7935,10 @@ class TestOpenRouterAdapterRetry:
                 assert info["cache_creation_input_token_cost"] == cache_w
                 assert info["cache_read_input_token_cost"] == cache_r
                 assert "max_input_tokens" not in info
-                assert "supports_reasoning" not in info
+                assert info["supports_reasoning"] is True
+                assert info["supports_none_reasoning_effort"] is True
+                assert info["supports_xhigh_reasoning_effort"] is True
+                assert info["supports_max_reasoning_effort"] is True
 
     def test_codex_aawm_alias_candidate_model_order(self):
         assert [

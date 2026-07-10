@@ -1270,7 +1270,7 @@ class ResponsesAPIResponse(BaseLiteLLMOpenAIResponseObject):
     @field_validator("reasoning", mode="before")
     @classmethod
     def validate_reasoning_to_dict(cls, value: Any) -> Optional[Dict[str, Any]]:
-        """Accept API reasoning dict (including effort 'none'/'xhigh'); always store as dict."""
+        """Accept API reasoning dict (including effort 'none'/'xhigh'/'max'); always store as dict."""
         if value is None:
             return None
         if isinstance(value, dict):
@@ -1782,7 +1782,9 @@ ResponsesAPIStreamingResponse = Annotated[
 ]
 
 
-REASONING_EFFORT = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+REASONING_EFFORT = Literal[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+]
 
 
 class OpenAIRealtimeStreamSession(TypedDict, total=False):

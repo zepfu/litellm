@@ -2713,6 +2713,19 @@ def supports_xhigh_reasoning_effort(
     )
 
 
+def supports_max_reasoning_effort(
+    model: str, custom_llm_provider: Optional[str] = None
+) -> bool:
+    """
+    Check if the given model supports the max reasoning effort value.
+    """
+    return _supports_factory(
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        key="supports_max_reasoning_effort",
+    )
+
+
 def supports_none_reasoning_effort(
     model: str, custom_llm_provider: Optional[str] = None
 ) -> bool:
@@ -5870,6 +5883,15 @@ def _get_model_info_helper(  # noqa: PLR0915
                 supports_web_search=_model_info.get("supports_web_search", None),
                 supports_url_context=_model_info.get("supports_url_context", None),
                 supports_reasoning=_model_info.get("supports_reasoning", None),
+                supports_none_reasoning_effort=_model_info.get(
+                    "supports_none_reasoning_effort", None
+                ),
+                supports_xhigh_reasoning_effort=_model_info.get(
+                    "supports_xhigh_reasoning_effort", None
+                ),
+                supports_max_reasoning_effort=_model_info.get(
+                    "supports_max_reasoning_effort", None
+                ),
                 supports_computer_use=_model_info.get("supports_computer_use", None),
                 search_context_cost_per_query=_model_info.get(
                     "search_context_cost_per_query", None

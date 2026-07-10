@@ -731,10 +731,16 @@ OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` pricing in
 `model_prices_and_context_window.json` follows the official GPT-5.6 preview page
 (`https://openai.com/index/previewing-gpt-5-6-sol/`): per-token input/output
 costs, cache write at 1.25× uncached input, and cache read at 10% of uncached
-input. That preview source documents pricing and cache billing only; catalog
-entries therefore keep verified cost fields plus minimal structural fields
-(`litellm_provider`, `mode`, `supported_endpoints`) and do not assert
-unsupported context-window or capability metadata.
+input. Official GPT-5.6 API documentation also verifies reasoning efforts
+`none`, `low`, `medium`, `high`, `xhigh`, and `max`; all three entries therefore
+set `supports_reasoning`, `supports_none_reasoning_effort`,
+`supports_xhigh_reasoning_effort`, and `supports_max_reasoning_effort`.
+Unverified context-window and unrelated capability metadata remain omitted.
+
+The user-level Codex model catalog exposes `max` for Sol, Terra, and Luna and
+`ultra` only for Sol. `ultra` is a Codex product intelligence mode that combines
+maximum reasoning with proactive subagent delegation; it is not sent upstream
+as an OpenAI API `reasoning.effort` value.
 
 This is default alias behavior; no staging environment variable is required for
 dev or production routing.
