@@ -1286,6 +1286,24 @@ has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or
 `custom`, that could not be classified while the inbound request model was still
 the abstract alias `aawm-code`.
 
+Selected Grok Responses models declare
+`custom_tool_function_adapters=["apply_patch"]` in the model metadata. For AAWM
+Codex alias candidates only, LiteLLM converts the grammar-backed Codex
+`apply_patch` custom-tool definition into an xAI-compatible function definition
+with one required string field named `input`. Matching custom `tool_choice`,
+`custom_tool_call`, and `custom_tool_call_output` continuation items are converted
+to their function equivalents before provider-specific filtering and input-item
+rewriting. Other custom tools remain unsupported and are still removed.
+
+When the selected Grok candidate returns a matching `function_call`, LiteLLM
+requires its arguments to be exactly one JSON string field named `input`, then
+restores the client-visible item to `custom_tool_call` with the raw patch text.
+Streaming responses are rebuilt with the restored item in
+`response.output_item.done`, which is sufficient for Codex to dispatch the
+client-hosted tool. Invalid or ambiguous arguments fail closed as a retryable
+malformed candidate response so the alias can continue rather than exposing an
+unusable function call to Codex.
+
 OpenRouter completion-adapter candidates classify provider-wrapped 400 responses
 with `metadata.provider_name` and `metadata.raw=ERROR` as terminal candidate
 failures. Alias probes cool down only that OpenRouter candidate, record
@@ -1331,6 +1349,15 @@ Rows affected by this path may include:
   `namespace`, or `tool_search`.
 - `codex_unsupported_hosted_tool_choice_removed`: the removed `tool_choice` when
   it referenced a hosted tool removed by the selected model policy.
+- `codex_custom_tool_function_adapter_count`,
+  `codex_custom_tool_function_adapter_names`,
+  `codex_custom_tool_function_adapter_tools`,
+  `codex_custom_tool_function_adapter_input_item_count`,
+  `codex_custom_tool_function_adapter_input_items`, and
+  `codex_custom_tool_function_adapter_tool_choice`: bounded evidence that an
+  approved custom tool was converted to the provider-compatible function shape.
+  These fields record names, indexes, item types, and counts, but never the raw
+  patch contents.
 - `codex_unsupported_input_item_removed_count`,
   `codex_unsupported_input_item_types_removed`, and
   `codex_unsupported_input_items_removed`: unsupported Responses input items

@@ -140,6 +140,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _response_body_has_grok_composer_literal_tool_label_blocks,
     _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body,
     _validate_codex_auto_agent_responses_payload,
+    _adapt_codex_custom_tools_to_functions_from_request_body,
+    _restore_adapted_custom_tool_calls_in_response_body,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
     _perform_codex_auto_agent_openrouter_completion_request,
@@ -18586,6 +18588,229 @@ def test_grok_native_unsupported_custom_tool_is_removed(model):
     ]
 
 
+def _codex_apply_patch_custom_tool_definition() -> dict[str, Any]:
+    return {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Apply a patch to files in the workspace.",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: /.+/",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "model_catalog_path",
+    [
+        "model_prices_and_context_window.json",
+        "litellm/bundled_model_prices_and_context_window_fallback.json",
+    ],
+)
+def test_grok_apply_patch_custom_tool_adapter_metadata_is_bundled(
+    model_catalog_path,
+):
+    model_catalog = json.loads(Path(model_catalog_path).read_text())
+    for model in (
+        "xai/grok-build",
+        "xai/grok-build-0.1",
+        "xai/grok-composer-2.5-fast",
+        "xai/grok-4.5",
+        "oa_xai/grok-4.5",
+    ):
+        assert model_catalog[model]["custom_tool_function_adapters"] == [
+            "apply_patch"
+        ]
+    assert "custom_tool_function_adapters" not in model_catalog["xai/grok-4"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "grok-build",
+        "grok-build-0.1",
+        "grok-composer-2.5-fast",
+        "xai/grok-4.5",
+        "oa_xai/grok-4.5",
+    ],
+)
+def test_grok_apply_patch_custom_tool_is_adapted_before_unsupported_tools_are_removed(
+    model,
+):
+    patch_text = "*** Begin Patch\n*** End Patch"
+    request_body = {
+        "model": model,
+        "tools": [
+            _codex_apply_patch_custom_tool_definition(),
+            {"type": "custom", "name": "exec_command"},
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+        "tool_choice": {"type": "custom", "name": "apply_patch"},
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_apply_patch",
+                "status": "completed",
+                "call_id": "call_apply_patch",
+                "name": "apply_patch",
+                "input": patch_text,
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_apply_patch",
+                "output": "Exit code: 0",
+            },
+        ],
+    }
+
+    adapted_body, adapted_tools = (
+        _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    )
+    filtered_body, removed_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(adapted_body)
+    )
+
+    assert adapted_tools == [{"name": "apply_patch", "tool_index": 0}]
+    assert removed_tools == [{"type": "custom", "index": 1, "name": "exec_command"}]
+    apply_patch_tool = filtered_body["tools"][0]
+    assert apply_patch_tool["type"] == "function"
+    assert apply_patch_tool["name"] == "apply_patch"
+    assert apply_patch_tool["description"] == (
+        "Apply a patch to files in the workspace."
+    )
+    assert apply_patch_tool["parameters"] == {
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": (
+                    "Raw input for the client-hosted custom tool. For "
+                    "apply_patch this must be the complete patch text."
+                ),
+            }
+        },
+        "required": ["input"],
+        "additionalProperties": False,
+    }
+    assert filtered_body["tools"][1] == request_body["tools"][2]
+    assert filtered_body["tool_choice"] == {
+        "type": "function",
+        "name": "apply_patch",
+    }
+    assert filtered_body["input"][0] == {
+        "type": "function_call",
+        "id": "ctc_apply_patch",
+        "status": "completed",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "arguments": json.dumps(
+            {"input": patch_text},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    assert filtered_body["input"][1] == {
+        "type": "function_call_output",
+        "call_id": "call_apply_patch",
+        "output": "Exit code: 0",
+    }
+    metadata = filtered_body["litellm_metadata"]
+    assert metadata["codex_custom_tool_function_adapter_count"] == 1
+    assert metadata["codex_custom_tool_function_adapter_names"] == ["apply_patch"]
+    assert metadata["codex_custom_tool_function_adapter_input_item_count"] == 2
+    assert metadata["codex_custom_tool_function_adapter_tool_choice"] is True
+
+
+def test_grok_apply_patch_function_response_is_restored_to_custom_tool_call():
+    patch_text = "*** Begin Patch\n*** End Patch"
+    request_body = {
+        "model": "xai/grok-4.5",
+        "tools": [_codex_apply_patch_custom_tool_definition()],
+    }
+    response_body = {
+        "id": "resp_apply_patch",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_apply_patch",
+                "call_id": "call_apply_patch",
+                "name": "apply_patch",
+                "arguments": json.dumps({"input": patch_text}),
+            }
+        ],
+    }
+
+    restored_body, restored_count, adapter_error = (
+        _restore_adapted_custom_tool_calls_in_response_body(
+            response_body,
+            request_body=request_body,
+            adapter_model="grok-4.5",
+        )
+    )
+
+    assert restored_count == 1
+    assert adapter_error is None
+    assert restored_body["output"] == [
+        {
+            "type": "custom_tool_call",
+            "id": "fc_apply_patch",
+            "call_id": "call_apply_patch",
+            "name": "apply_patch",
+            "input": patch_text,
+            "status": "completed",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_reason"),
+    [
+        ("not-json", "arguments_not_json"),
+        ('{"input": 123}', "input_not_string"),
+        ('{"input": "patch", "extra": true}', "arguments_not_exact_input_object"),
+    ],
+)
+def test_grok_apply_patch_function_response_rejects_invalid_arguments(
+    arguments,
+    expected_reason,
+):
+    response_body = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "call_apply_patch",
+                "name": "apply_patch",
+                "arguments": arguments,
+            }
+        ],
+    }
+
+    restored_body, restored_count, adapter_error = (
+        _restore_adapted_custom_tool_calls_in_response_body(
+            response_body,
+            request_body={
+                "tools": [_codex_apply_patch_custom_tool_definition()],
+            },
+            adapter_model="grok-build",
+        )
+    )
+
+    assert restored_body is response_body
+    assert restored_count == 0
+    assert adapter_error == {
+        "name": "apply_patch",
+        "output_index": 0,
+        "reason": expected_reason,
+    }
+
+
 @pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
 @pytest.mark.parametrize("tools", [None, []])
 def test_grok_native_tool_choice_without_tools_is_removed(model, tools):
@@ -25327,6 +25552,178 @@ async def test_codex_auto_agent_grok_native_stream_repairs_literal_tool_label_ex
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter", "adapter_label"),
+    [
+        ("codex_auto_agent_grok_native_responses", "Grok native"),
+        ("codex_auto_agent_xai_oauth_responses", "xAI OAuth"),
+    ],
+)
+async def test_codex_auto_agent_grok_response_restores_apply_patch_custom_tool_call(
+    adapter,
+    adapter_label,
+):
+    patch_text = "*** Begin Patch\n*** End Patch"
+    upstream_response = Response(
+        content=json.dumps(
+            {
+                "id": "resp_apply_patch",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_apply_patch",
+                        "call_id": "call_apply_patch",
+                        "name": "apply_patch",
+                        "arguments": json.dumps({"input": patch_text}),
+                    }
+                ],
+            }
+        ),
+        media_type="application/json",
+    )
+
+    response = await _validate_codex_auto_agent_responses_payload(
+        upstream_response,
+        adapter_model="grok-4.5",
+        adapter=adapter,
+        adapter_label=adapter_label,
+        request_body={
+            "model": "xai/grok-4.5",
+            "tools": [_codex_apply_patch_custom_tool_definition()],
+        },
+    )
+
+    response_body = json.loads(response.body)
+    assert response_body["output"] == [
+        {
+            "type": "custom_tool_call",
+            "id": "fc_apply_patch",
+            "call_id": "call_apply_patch",
+            "name": "apply_patch",
+            "input": patch_text,
+            "status": "completed",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_grok_stream_restores_apply_patch_custom_tool_call():
+    patch_text = "*** Begin Patch\n*** End Patch"
+    function_call = {
+        "type": "function_call",
+        "id": "fc_apply_patch",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "arguments": json.dumps({"input": patch_text}),
+    }
+    response_body = {
+        "id": "resp_apply_patch",
+        "status": "completed",
+        "output": [function_call],
+    }
+
+    async def _chunks():
+        yield (
+            "event: response.output_item.done\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": function_call,
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        yield (
+            "event: response.completed\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": response_body,
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+
+    response = await _validate_codex_auto_agent_responses_payload(
+        StreamingResponse(_chunks(), media_type="text/event-stream"),
+        adapter_model="grok-4.5",
+        adapter="codex_auto_agent_grok_native_responses",
+        adapter_label="Grok native",
+        request_body={
+            "model": "xai/grok-4.5",
+            "tools": [_codex_apply_patch_custom_tool_definition()],
+        },
+    )
+
+    chunks: list[str] = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk))
+    rendered_stream = "".join(chunks)
+    output_item_done = next(
+        json.loads(line.removeprefix("data: "))
+        for line in rendered_stream.splitlines()
+        if line.startswith('data: {"type": "response.output_item.done"')
+    )
+    assert output_item_done["item"] == {
+        "type": "custom_tool_call",
+        "id": "fc_apply_patch",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "input": patch_text,
+        "status": "completed",
+    }
+    assert "response.function_call_arguments.done" not in rendered_stream
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_grok_invalid_apply_patch_arguments_fail_closed():
+    upstream_response = Response(
+        content=json.dumps(
+            {
+                "id": "resp_apply_patch_invalid",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_apply_patch",
+                        "name": "apply_patch",
+                        "arguments": '{"input": 123}',
+                    }
+                ],
+            }
+        ),
+        media_type="application/json",
+    )
+
+    with pytest.raises(ProxyException) as exc_info:
+        await _validate_codex_auto_agent_responses_payload(
+            upstream_response,
+            adapter_model="grok-build",
+            adapter="codex_auto_agent_xai_oauth_responses",
+            adapter_label="xAI OAuth",
+            request_body={
+                "model": "oa_xai/grok-build",
+                "tools": [_codex_apply_patch_custom_tool_definition()],
+            },
+        )
+
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_auto_agent_malformed_tool_call_text"
+    )
+    assert exc_info.value.detail["diagnostic"][
+        "custom_tool_function_adapter_error"
+    ] == {
+        "name": "apply_patch",
+        "output_index": 0,
+        "reason": "input_not_string",
+    }
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_oa_xai_marks_transient_statuses_alias_managed():
     request = _build_codex_auto_agent_request()
     request_body = {
@@ -27046,6 +27443,7 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
         "input": "hello",
         "stream": False,
         "tools": [
+            _codex_apply_patch_custom_tool_definition(),
             {"type": "custom", "name": "exec_command"},
             {
                 "type": "function",
@@ -27053,7 +27451,7 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
                 "parameters": {"type": "object", "properties": {}},
             },
         ],
-        "tool_choice": {"type": "custom", "name": "exec_command"},
+        "tool_choice": {"type": "custom", "name": "apply_patch"},
         "litellm_metadata": {"session_id": "codex-session"},
     }
     spark_error = RuntimeError(
@@ -27098,20 +27496,24 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(
     assert grok_call["custom_llm_provider"] == litellm.LlmProviders.XAI.value
     grok_body = grok_call["custom_body"]
     assert grok_body["model"] == "grok-4.5"
-    assert grok_body["tools"] == [body["tools"][1]]
-    assert "tool_choice" not in grok_body
+    assert grok_body["tools"][0]["type"] == "function"
+    assert grok_body["tools"][0]["name"] == "apply_patch"
+    assert grok_body["tools"][1] == body["tools"][2]
+    assert grok_body["tool_choice"] == {
+        "type": "function",
+        "name": "apply_patch",
+    }
     metadata = grok_body["litellm_metadata"]
     assert metadata["codex_auto_agent_selected_provider"] == "xai"
     assert metadata["codex_auto_agent_selected_model"] == "xai/grok-4.5"
+    assert metadata["codex_custom_tool_function_adapter_count"] == 1
+    assert metadata["codex_custom_tool_function_adapter_names"] == ["apply_patch"]
     assert metadata["codex_unsupported_hosted_tool_removed_count"] == 1
     assert metadata["codex_unsupported_hosted_tool_types_removed"] == ["custom"]
     assert metadata["codex_unsupported_hosted_tools_removed"] == [
-        {"type": "custom", "index": 0, "name": "exec_command"}
+        {"type": "custom", "index": 1, "name": "exec_command"}
     ]
-    assert metadata["codex_unsupported_hosted_tool_choice_removed"] == {
-        "type": "custom",
-        "name": "exec_command",
-    }
+    assert "codex_unsupported_hosted_tool_choice_removed" not in metadata
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "gpt-5.3-codex-spark",
         "xai/grok-4.5",
@@ -27224,6 +27626,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
         "input": "hello",
         "stream": False,
         "tools": [
+            _codex_apply_patch_custom_tool_definition(),
             {"type": "custom", "name": "exec_command"},
             {
                 "type": "function",
@@ -27231,7 +27634,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
                 "parameters": {"type": "object", "properties": {}},
             },
         ],
-        "tool_choice": {"type": "custom", "name": "exec_command"},
+        "tool_choice": {"type": "custom", "name": "apply_patch"},
         "litellm_metadata": {"session_id": "codex-session"},
     }
     spark_error = ProxyException(
@@ -27299,8 +27702,13 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
     assert managed_call["expected_target_family"] == "xai"
     final_body = managed_call["custom_body"]
     assert final_body["model"] == "grok-build"
-    assert final_body["tools"] == [body["tools"][1]]
-    assert "tool_choice" not in final_body
+    assert final_body["tools"][0]["type"] == "function"
+    assert final_body["tools"][0]["name"] == "apply_patch"
+    assert final_body["tools"][1] == body["tools"][2]
+    assert final_body["tool_choice"] == {
+        "type": "function",
+        "name": "apply_patch",
+    }
     metadata = final_body["litellm_metadata"]
     assert metadata["codex_auto_agent_selected_provider"] == "xai"
     assert metadata["codex_auto_agent_selected_model"] == "oa_xai/grok-build"
@@ -27309,15 +27717,14 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
     )
     assert metadata["xai_oauth_public_model"] == "oa_xai/grok-build"
     assert metadata["xai_oauth_upstream_model"] == "xai/grok-build"
+    assert metadata["codex_custom_tool_function_adapter_count"] == 1
+    assert metadata["codex_custom_tool_function_adapter_names"] == ["apply_patch"]
     assert metadata["codex_unsupported_hosted_tool_removed_count"] == 1
     assert metadata["codex_unsupported_hosted_tool_types_removed"] == ["custom"]
     assert metadata["codex_unsupported_hosted_tools_removed"] == [
-        {"type": "custom", "index": 0, "name": "exec_command"}
+        {"type": "custom", "index": 1, "name": "exec_command"}
     ]
-    assert metadata["codex_unsupported_hosted_tool_choice_removed"] == {
-        "type": "custom",
-        "name": "exec_command",
-    }
+    assert "codex_unsupported_hosted_tool_choice_removed" not in metadata
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "gpt-5.3-codex-spark",
         "xai/grok-4.5",

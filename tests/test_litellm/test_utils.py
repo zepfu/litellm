@@ -837,6 +837,9 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "rpm": {"type": "number"},
                 "source": {"type": "string"},
                 "comment": {"type": "string"},
+                "pricing_note": {"type": "string"},
+                "pricing_source": {"type": "string"},
+                "pricing_source_model": {"type": "string"},
                 "supports_assistant_prefill": {"type": "boolean"},
                 "supports_audio_input": {"type": "boolean"},
                 "supports_audio_output": {"type": "boolean"},
@@ -858,13 +861,37 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "supports_multimodal": {"type": "boolean"},
                 "uses_embed_content": {"type": "boolean"},
                 "supports_reasoning": {"type": "boolean"},
+                "supports_reasoning_summary": {"type": "boolean"},
+                "supports_minimal_reasoning_effort": {"type": "boolean"},
                 "supports_none_reasoning_effort": {"type": "boolean"},
                 "supports_xhigh_reasoning_effort": {"type": "boolean"},
+                "supports_native_cache_control": {"type": "boolean"},
                 "supports_service_tier": {"type": "boolean"},
                 "supports_preset": {"type": "boolean"},
                 "tool_use_system_prompt_tokens": {"type": "number"},
                 "tpm": {"type": "number"},
                 "provider_specific_entry": {"type": "object"},
+                "custom_tool_function_adapters": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "unsupported_hosted_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "unsupported_request_params": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "unsupported_input_item_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "rewrite_input_item_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "web_search_billing_unit": {"type": "string"},
                 "supported_endpoints": {
                     "type": "array",
                     "items": {

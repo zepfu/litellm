@@ -33459,6 +33459,9 @@
         "source": "https://docs.x.ai/docs/models",
         "supports_function_calling": true,
         "supports_tool_choice": true,
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
         "unsupported_hosted_tools": [
             "custom",
             "image_generation",
@@ -33489,6 +33492,9 @@
         "source": "https://docs.x.ai/docs/models",
         "supports_function_calling": true,
         "supports_tool_choice": true,
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
         "unsupported_hosted_tools": [
             "custom",
             "image_generation",
@@ -33516,6 +33522,9 @@
         "mode": "responses",
         "output_cost_per_token": 1.5e-05,
         "source": "https://cursor.com/changelog/composer-2-5",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
         "unsupported_hosted_tools": [
             "custom",
             "image_generation",
@@ -39287,6 +39296,9 @@
         "supports_function_calling": true,
         "supports_reasoning": true,
         "supports_tool_choice": true,
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
         "unsupported_hosted_tools": [
             "custom",
             "image_generation",
@@ -39322,6 +39334,9 @@
         "supports_function_calling": true,
         "supports_reasoning": true,
         "supports_tool_choice": true,
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
         "unsupported_hosted_tools": [
             "custom",
             "image_generation",

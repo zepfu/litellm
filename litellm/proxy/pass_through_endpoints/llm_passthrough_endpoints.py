@@ -1429,6 +1429,9 @@ _CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD = "unsupported_hosted_tools"
 _CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD = "unsupported_request_params"
 _CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "unsupported_input_item_types"
 _CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "rewrite_input_item_types"
+_CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = (
+    "custom_tool_function_adapters"
+)
 _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "Use subagents to parallelize independent work while keeping one local owner "
     "on the critical path. Follow the current operator and project instructions "
@@ -16681,6 +16684,154 @@ def _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response
     return repaired_body
 
 
+def _advertised_custom_tool_function_adapter_names(
+    request_body: Optional[dict[str, Any]],
+    *,
+    adapter_model: str,
+) -> set[str]:
+    if not isinstance(request_body, dict):
+        return set()
+
+    configured_names = _get_custom_tool_function_adapter_names_for_model(
+        adapter_model
+    )
+    if not configured_names:
+        return set()
+
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return set()
+
+    advertised_names: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
+        tool_name = _normalize_low_cardinality_tag_value(_get_openai_tool_name(tool))
+        if tool_type == "custom" and tool_name in configured_names:
+            advertised_names.add(tool_name)
+    return advertised_names
+
+
+def _parse_adapted_custom_tool_function_arguments(
+    arguments: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(arguments, str):
+        return None, "arguments_not_string"
+    try:
+        parsed_arguments = json.loads(arguments)
+    except (TypeError, ValueError):
+        return None, "arguments_not_json"
+    if not isinstance(parsed_arguments, dict):
+        return None, "arguments_not_object"
+    if set(parsed_arguments) != {"input"}:
+        return None, "arguments_not_exact_input_object"
+    raw_input = parsed_arguments.get("input")
+    if not isinstance(raw_input, str):
+        return None, "input_not_string"
+    return raw_input, None
+
+
+def _restore_adapted_custom_tool_calls_in_response_body(
+    response_body: dict[str, Any],
+    *,
+    request_body: Optional[dict[str, Any]],
+    adapter_model: str,
+) -> tuple[dict[str, Any], int, Optional[dict[str, Any]]]:
+    adapted_names = _advertised_custom_tool_function_adapter_names(
+        request_body,
+        adapter_model=adapter_model,
+    )
+    if not adapted_names:
+        return response_body, 0, None
+
+    output = response_body.get("output")
+    if not isinstance(output, list):
+        return response_body, 0, None
+
+    restored_output: list[Any] = []
+    restored_count = 0
+    for index, item in enumerate(output):
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            restored_output.append(item)
+            continue
+
+        item_name = _normalize_low_cardinality_tag_value(item.get("name"))
+        if item_name not in adapted_names:
+            restored_output.append(item)
+            continue
+
+        raw_input, error_reason = _parse_adapted_custom_tool_function_arguments(
+            item.get("arguments")
+        )
+        if error_reason is not None or raw_input is None:
+            return (
+                response_body,
+                0,
+                {
+                    "name": item_name,
+                    "output_index": index,
+                    "reason": error_reason or "missing_input",
+                },
+            )
+
+        restored_item = dict(item)
+        restored_item["type"] = "custom_tool_call"
+        restored_item["input"] = raw_input
+        restored_item.setdefault("status", "completed")
+        restored_item.pop("arguments", None)
+        restored_output.append(restored_item)
+        restored_count += 1
+
+    if restored_count == 0:
+        return response_body, 0, None
+
+    restored_body = dict(response_body)
+    restored_body["output"] = restored_output
+    return restored_body, restored_count, None
+
+
+def _raise_codex_auto_agent_malformed_adapted_custom_tool_call(
+    *,
+    response_body: dict[str, Any],
+    adapter_model: str,
+    adapter: str,
+    adapter_label: str,
+    adapter_error: dict[str, Any],
+    stream_event_summaries: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    diagnostic = _build_failed_responses_diagnostic(
+        response_body=response_body,
+        adapter=adapter,
+        adapter_model=adapter_model,
+        stream_event_summaries=stream_event_summaries,
+    )
+    diagnostic["custom_tool_function_adapter_error"] = adapter_error
+    exc = ProxyException(
+        message=(
+            f"Codex auto-agent {adapter_label} candidate returned invalid "
+            "arguments for an adapted custom tool."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_auto_agent_malformed_tool_call_text",
+                "status": "RESPONSES_MALFORMED_TOOL_CALL",
+                "type": "rate_limit_error",
+            },
+            "diagnostic": diagnostic,
+        },
+    )
+    raise exc
+
+
 def _responses_repaired_output_item_id(item: dict[str, Any], index: int) -> str:
     for key in ("id", "call_id"):
         value = item.get(key)
@@ -17193,6 +17344,7 @@ async def _validate_codex_auto_agent_responses_payload(
                 adapter_label=adapter_label,
                 stream_event_summaries=event_summaries,
             )
+        response_changed = False
         repaired_body = (
             _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
                 response_body,
@@ -17203,12 +17355,28 @@ async def _validate_codex_auto_agent_responses_payload(
         )
         if isinstance(repaired_body, dict):
             response_body = repaired_body
-            return StreamingResponse(
-                _responses_sse_from_repaired_response_body(response_body),
-                headers=dict(response.headers),
-                status_code=response.status_code,
-                media_type=response.media_type or "text/event-stream",
+            response_changed = True
+        (
+            restored_body,
+            restored_custom_tool_count,
+            custom_tool_adapter_error,
+        ) = _restore_adapted_custom_tool_calls_in_response_body(
+            response_body,
+            request_body=request_body,
+            adapter_model=adapter_model,
+        )
+        if custom_tool_adapter_error is not None:
+            _raise_codex_auto_agent_malformed_adapted_custom_tool_call(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+                adapter_error=custom_tool_adapter_error,
+                stream_event_summaries=event_summaries,
             )
+        if restored_custom_tool_count:
+            response_body = restored_body
+            response_changed = True
         if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
             _raise_codex_auto_agent_malformed_tool_call_text_payload(
                 response_body=response_body,
@@ -17217,6 +17385,13 @@ async def _validate_codex_auto_agent_responses_payload(
                 adapter_label=adapter_label,
                 intake_context=intake_context,
                 stream_event_summaries=event_summaries,
+            )
+        if response_changed:
+            return StreamingResponse(
+                _responses_sse_from_repaired_response_body(response_body),
+                headers=dict(response.headers),
+                status_code=response.status_code,
+                media_type=response.media_type or "text/event-stream",
             )
 
         async def _replay_iterator() -> Any:
@@ -17253,12 +17428,25 @@ async def _validate_codex_auto_agent_responses_payload(
             )
             if isinstance(repaired_body, dict):
                 response_body = repaired_body
-                return Response(
-                    content=json.dumps(response_body),
-                    media_type=response.media_type or "application/json",
-                    status_code=response.status_code,
-                    headers=dict(response.headers),
+            (
+                restored_body,
+                restored_custom_tool_count,
+                custom_tool_adapter_error,
+            ) = _restore_adapted_custom_tool_calls_in_response_body(
+                response_body,
+                request_body=request_body,
+                adapter_model=adapter_model,
+            )
+            if custom_tool_adapter_error is not None:
+                _raise_codex_auto_agent_malformed_adapted_custom_tool_call(
+                    response_body=response_body,
+                    adapter_model=adapter_model,
+                    adapter=adapter,
+                    adapter_label=adapter_label,
+                    adapter_error=custom_tool_adapter_error,
                 )
+            if restored_custom_tool_count:
+                response_body = restored_body
             if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
                 _raise_codex_auto_agent_malformed_tool_call_text_payload(
                     response_body=response_body,
@@ -17266,6 +17454,13 @@ async def _validate_codex_auto_agent_responses_payload(
                     adapter=adapter,
                     adapter_label=adapter_label,
                     intake_context=intake_context,
+                )
+            if isinstance(repaired_body, dict) or restored_custom_tool_count:
+                return Response(
+                    content=json.dumps(response_body),
+                    media_type=response.media_type or "application/json",
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
                 )
     return response
 
@@ -21942,6 +22137,304 @@ def _get_rewrite_input_item_types_for_model(model: Any) -> set[str]:
             }
 
     return set()
+
+
+def _get_custom_tool_function_adapter_names_for_model(model: Any) -> set[str]:
+    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
+    if not candidate_model_cost_keys:
+        return set()
+
+    model_cost_sources = [
+        litellm.model_cost,
+        _load_bundled_model_cost_map_for_codex_tool_policy(),
+    ]
+    for model_cost in model_cost_sources:
+        for key in candidate_model_cost_keys:
+            model_info = model_cost.get(key)
+            if not isinstance(model_info, dict):
+                continue
+
+            adapter_names = model_info.get(
+                _CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD
+            )
+            if not isinstance(adapter_names, list):
+                continue
+
+            return {
+                normalized
+                for value in adapter_names
+                if (normalized := _normalize_low_cardinality_tag_value(value))
+            }
+
+    return set()
+
+
+def _adapted_custom_tool_function_schema(
+    tool: dict[str, Any],
+    *,
+    tool_name: str,
+) -> dict[str, Any]:
+    adapted_tool: dict[str, Any] = {
+        "type": "function",
+        "name": tool_name,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": (
+                        "Raw input for the client-hosted custom tool. For "
+                        "apply_patch this must be the complete patch text."
+                    ),
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": False,
+        },
+    }
+    description = tool.get("description")
+    if isinstance(description, str) and description.strip():
+        adapted_tool["description"] = description
+    return adapted_tool
+
+
+def _adapt_codex_custom_tool_definitions(
+    tools: Any,
+    *,
+    adapter_names: set[str],
+) -> tuple[Optional[list[Any]], list[dict[str, Any]]]:
+    if not isinstance(tools, list):
+        return None, []
+
+    updated_tools: list[Any] = []
+    adapted_tools: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            updated_tools.append(tool)
+            continue
+        tool_type = _normalize_low_cardinality_tag_value(
+            _get_openai_tool_type(tool)
+        )
+        tool_name = _normalize_low_cardinality_tag_value(
+            _get_openai_tool_name(tool)
+        )
+        if tool_type != "custom" or tool_name not in adapter_names:
+            updated_tools.append(tool)
+            continue
+        updated_tools.append(
+            _adapted_custom_tool_function_schema(
+                tool,
+                tool_name=tool_name,
+            )
+        )
+        adapted_tools.append(
+            {
+                "name": tool_name,
+                "tool_index": index,
+            }
+        )
+    return updated_tools, adapted_tools
+
+
+def _adapted_custom_tool_call_ids(
+    input_items: Any,
+    *,
+    adapter_names: set[str],
+) -> set[str]:
+    if not isinstance(input_items, list):
+        return set()
+
+    adapted_call_ids: set[str] = set()
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("type") != "custom_tool_call":
+            continue
+        item_name = _normalize_low_cardinality_tag_value(item.get("name"))
+        call_id = item.get("call_id")
+        if (
+            item_name in adapter_names
+            and isinstance(call_id, str)
+            and call_id.strip()
+        ):
+            adapted_call_ids.add(call_id.strip())
+    return adapted_call_ids
+
+
+def _adapt_codex_custom_tool_input_items(
+    input_items: Any,
+    *,
+    adapter_names: set[str],
+) -> tuple[Optional[list[Any]], list[dict[str, Any]]]:
+    adapted_call_ids = _adapted_custom_tool_call_ids(
+        input_items,
+        adapter_names=adapter_names,
+    )
+    if not isinstance(input_items, list) or not adapted_call_ids:
+        return None, []
+
+    updated_input_items: list[Any] = []
+    adapted_input_items: list[dict[str, Any]] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            updated_input_items.append(item)
+            continue
+
+        item_type = item.get("type")
+        call_id = item.get("call_id")
+        normalized_call_id = (
+            call_id.strip()
+            if isinstance(call_id, str) and call_id.strip()
+            else None
+        )
+        if item_type == "custom_tool_call":
+            item_name = _normalize_low_cardinality_tag_value(item.get("name"))
+            raw_input = item.get("input")
+            if (
+                item_name in adapter_names
+                and normalized_call_id in adapted_call_ids
+                and isinstance(raw_input, str)
+            ):
+                adapted_item = dict(item)
+                adapted_item["type"] = "function_call"
+                adapted_item["arguments"] = json.dumps(
+                    {"input": raw_input},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                adapted_item.pop("input", None)
+                updated_input_items.append(adapted_item)
+                adapted_input_items.append(
+                    {
+                        "type": item_type,
+                        "name": item_name,
+                        "input_index": index,
+                    }
+                )
+                continue
+        elif (
+            item_type == "custom_tool_call_output"
+            and normalized_call_id in adapted_call_ids
+        ):
+            adapted_item = dict(item)
+            adapted_item["type"] = "function_call_output"
+            updated_input_items.append(adapted_item)
+            adapted_input_items.append(
+                {
+                    "type": item_type,
+                    "input_index": index,
+                }
+            )
+            continue
+
+        updated_input_items.append(item)
+    return updated_input_items, adapted_input_items
+
+
+def _adapt_codex_custom_tool_choice(
+    tool_choice: Any,
+    *,
+    adapter_names: set[str],
+) -> tuple[Any, bool]:
+    if not isinstance(tool_choice, dict):
+        return tool_choice, False
+    tool_choice_type = _normalize_low_cardinality_tag_value(tool_choice.get("type"))
+    tool_choice_name = _normalize_low_cardinality_tag_value(tool_choice.get("name"))
+    if tool_choice_type != "custom" or tool_choice_name not in adapter_names:
+        return tool_choice, False
+    return (
+        {
+            **tool_choice,
+            "type": "function",
+            "name": tool_choice_name,
+        },
+        True,
+    )
+
+
+def _add_codex_custom_tool_function_adapter_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    adapted_tools: list[dict[str, Any]],
+    adapted_input_items: list[dict[str, Any]],
+    adapted_tool_choice: bool,
+) -> dict[str, Any]:
+    adapted_names = _dedupe_sorted_str_list(
+        [
+            str(item["name"])
+            for item in adapted_tools
+            if isinstance(item.get("name"), str)
+        ]
+    )
+    updated_body = _merge_litellm_metadata(
+        request_body,
+        tags_to_add=[
+            "codex-custom-tool-function-adapted",
+            *(f"codex-custom-tool-function:{name}" for name in adapted_names),
+        ],
+        extra_fields={
+            "codex_custom_tool_function_adapter_count": len(adapted_tools),
+            "codex_custom_tool_function_adapter_names": adapted_names,
+            "codex_custom_tool_function_adapter_tools": adapted_tools,
+            "codex_custom_tool_function_adapter_input_item_count": len(
+                adapted_input_items
+            ),
+            "codex_custom_tool_function_adapter_input_items": adapted_input_items,
+            "codex_custom_tool_function_adapter_tool_choice": adapted_tool_choice,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="codex.custom_tool_function_adapted",
+                    metadata={
+                        "tool_count": len(adapted_tools),
+                        "tool_names": adapted_names,
+                        "input_item_count": len(adapted_input_items),
+                        "tool_choice_adapted": adapted_tool_choice,
+                    },
+                )
+            ],
+        },
+    )
+    return updated_body
+
+
+def _adapt_codex_custom_tools_to_functions_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    adapter_names = _get_custom_tool_function_adapter_names_for_model(
+        request_body.get("model")
+    )
+    if not adapter_names:
+        return request_body, []
+
+    updated_tools, adapted_tools = _adapt_codex_custom_tool_definitions(
+        request_body.get("tools"),
+        adapter_names=adapter_names,
+    )
+    updated_input_items, adapted_input_items = (
+        _adapt_codex_custom_tool_input_items(
+            request_body.get("input"),
+            adapter_names=adapter_names,
+        )
+    )
+    updated_tool_choice, adapted_tool_choice = _adapt_codex_custom_tool_choice(
+        request_body.get("tool_choice"),
+        adapter_names=adapter_names,
+    )
+    if not adapted_tools and not adapted_input_items and not adapted_tool_choice:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    if updated_tools is not None and adapted_tools:
+        updated_body["tools"] = updated_tools
+    if updated_input_items is not None and adapted_input_items:
+        updated_body["input"] = updated_input_items
+    if adapted_tool_choice:
+        updated_body["tool_choice"] = updated_tool_choice
+    updated_body = _add_codex_custom_tool_function_adapter_logging_metadata(
+        updated_body,
+        adapted_tools=adapted_tools,
+        adapted_input_items=adapted_input_items,
+        adapted_tool_choice=adapted_tool_choice,
+    )
+    return updated_body, adapted_tools
 
 
 def _openai_tool_choice_references_tool_type(
@@ -28659,11 +29152,14 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
     user_api_key_dict: UserAPIKeyAuth,
     request_body: dict[str, Any],
 ) -> Response:
+    adapted_request_body, _adapted_custom_tools = (
+        _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    )
     try:
         grok_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
             endpoint=endpoint,
             request=request,
-            request_body=request_body,
+            request_body=adapted_request_body,
             extra_headers={},
         )
     except Exception as exc:
@@ -28724,11 +29220,14 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     user_api_key_dict: UserAPIKeyAuth,
     request_body: dict[str, Any],
 ) -> Response:
+    adapted_request_body, _adapted_custom_tools = (
+        _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    )
     try:
         oa_xai_context = (
             await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
                 endpoint=endpoint,
-                request_body=request_body,
+                request_body=adapted_request_body,
             )
         )
     except Exception as exc:
@@ -28781,6 +29280,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
             upstream_url=str(updated_url),
             provider="xai",
         ),
+        request_body=request_body,
     )
 
 
