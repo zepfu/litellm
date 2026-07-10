@@ -757,6 +757,39 @@ set `supports_reasoning`, `supports_none_reasoning_effort`,
 `supports_xhigh_reasoning_effort`, and `supports_max_reasoning_effort`.
 Unverified context-window and unrelated capability metadata remain omitted.
 
+### Codex reasoning-effort reconciliation
+
+Native OpenAI Codex Responses requests reconcile a recognized requested
+reasoning effort after the concrete model is resolved and before provider
+egress. The ordered vocabulary is `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, and `max`.
+
+- The handler only maps downward when the requested tier is above the resolved
+  model's catalog-advertised ceiling. It never raises a requested effort.
+- `gpt-5.3-codex-spark` advertises reasoning through `xhigh`, so an inbound
+  `reasoning.effort=max` is emitted as `xhigh`.
+- GPT-5.6 Sol, Terra, and Luna advertise
+  `supports_max_reasoning_effort=true`, so `max` remains `max`.
+- Alias requests recalculate from the original inbound body for every candidate;
+  a Spark attempt may emit `xhigh` while a later Terra attempt emits the
+  original `max`.
+- Direct concrete-model Codex passthrough requests use the same reconciliation
+  after adapter and alias resolution. Provider routes without an explicit
+  compatible capability contract are unchanged.
+- Unknown effort strings and models without a known ceiling are not guessed or
+  rewritten. Provider-native validation remains authoritative, and
+  deterministic HTTP 400 invalid-effort responses are not classified as
+  retryable alias failures.
+
+Structured metadata records `reasoning_effort_requested`,
+`reasoning_effort_native_value`, `reasoning_effort_supported_ceiling`,
+`reasoning_effort_resolved_model`, `reasoning_effort_resolved_provider`,
+`reasoning_effort_mapping_reason`, and, for aliases,
+`reasoning_effort_candidate_attempt`. Downward mappings also record
+`reasoning_effort_clamped_from` and `reasoning_effort_clamp_reason`. Tags include
+the emitted effort, supported ceiling, mapping, and candidate attempt where
+applicable.
+
 The user-level Codex model catalog exposes `max` for Sol, Terra, and Luna and
 `ultra` only for Sol. `ultra` is a Codex product intelligence mode that combines
 maximum reasoning with proactive subagent delegation; it is not sent upstream

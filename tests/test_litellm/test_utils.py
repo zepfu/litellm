@@ -531,6 +531,44 @@ def test_gpt_5_6_reasoning_effort_flags_in_runtime_model_info(monkeypatch):
         assert supports_max_reasoning_effort(model) is True
 
 
+def test_gpt_5_3_codex_spark_reasoning_effort_flags(monkeypatch):
+    import json
+    from pathlib import Path
+
+    from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+    from litellm.utils import (
+        _invalidate_model_cost_lowercase_map,
+        get_model_info,
+    )
+
+    pricing_map_paths = [
+        Path("model_prices_and_context_window.json"),
+        Path("litellm/bundled_model_prices_and_context_window_fallback.json"),
+    ]
+    for pricing_map_path in pricing_map_paths:
+        model_cost = json.loads(pricing_map_path.read_text())
+        for model in (
+            "gpt-5.3-codex-spark",
+            "chatgpt/gpt-5.3-codex-spark",
+        ):
+            model_info = model_cost[model]
+            assert model_info["supports_reasoning"] is True
+            assert model_info["supports_none_reasoning_effort"] is True
+            assert model_info["supports_minimal_reasoning_effort"] is True
+            assert model_info["supports_xhigh_reasoning_effort"] is True
+            assert "supports_max_reasoning_effort" not in model_info
+
+    local_model_cost = GetModelCostMap.load_local_model_cost_map()
+    monkeypatch.setattr(litellm, "model_cost", local_model_cost)
+    _invalidate_model_cost_lowercase_map()
+    get_model_info.cache_clear()
+
+    model_info = get_model_info("gpt-5.3-codex-spark")
+    assert model_info["supports_reasoning"] is True
+    assert model_info["supports_minimal_reasoning_effort"] is True
+    assert model_info["supports_xhigh_reasoning_effort"] is True
+
+
 def test_gpt_5_4_mini_and_nano_entries_present():
     import json
     from pathlib import Path

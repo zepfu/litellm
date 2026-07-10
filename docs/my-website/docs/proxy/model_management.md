@@ -48,6 +48,33 @@ Codex alias routing uses:
 - `aawm-low`: OpenRouter/OpenCode lanes → `gpt-5.6-luna` → `gpt-5.4-mini`
 - `aawm-orchestration`: `gpt-5.6-terra` → `gpt-5.5`
 
+### Codex reasoning effort follows the resolved model
+
+For native OpenAI Codex Responses traffic, LiteLLM reconciles a recognized
+reasoning effort after alias or adapter resolution and before provider egress.
+The supported order is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+then `max`.
+
+The mapping is capability-driven and downward-only. For example,
+`reasoning.effort=max` becomes `xhigh` when `aawm-code` resolves to
+`gpt-5.3-codex-spark`, while GPT-5.6 Sol, Terra, and Luna retain `max` because
+their model entries advertise `supports_max_reasoning_effort=true`. Direct
+concrete-model Codex passthrough uses the same rule. Alias fallback attempts
+recalculate from the original request, so a later candidate with a higher
+ceiling can retain the original effort.
+
+LiteLLM does not guess for unknown effort strings, unknown model ceilings, or
+providers without an explicit compatible capability contract. Those requests
+retain provider-native validation. A deterministic invalid-effort HTTP 400 is
+not retried as an alias capacity failure.
+
+Operators can inspect `reasoning_effort_requested`,
+`reasoning_effort_native_value`, `reasoning_effort_supported_ceiling`,
+`reasoning_effort_resolved_model`, `reasoning_effort_resolved_provider`,
+`reasoning_effort_mapping_reason`, and the alias candidate attempt in request
+metadata and session history. Downward mappings also carry clamp metadata and
+`reasoning-effort-map:<requested>-to-<emitted>` tags.
+
 :::warning Anthropic models require Anthropic-native egress
 Determine this boundary from the selected upstream provider/model, not from the
 client wire format. Claude Code may send Anthropic-shaped requests to

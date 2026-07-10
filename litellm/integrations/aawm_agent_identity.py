@@ -2398,8 +2398,14 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "reasoning_effort_native_provider",
     "reasoning_effort_native_value",
     "reasoning_effort_native_field",
+    "reasoning_effort_supported_ceiling",
+    "reasoning_effort_resolved_model",
+    "reasoning_effort_resolved_provider",
+    "reasoning_effort_candidate_attempt",
+    "reasoning_effort_mapping_reason",
     "reasoning_effort_clamped_from",
     "reasoning_effort_clamp_reason",
+    "codex_reasoning_effort",
     "openai_reasoning_effort",
     "gemini_reasoning_effort",
     "openrouter_reasoning_effort",
@@ -3439,9 +3445,9 @@ def _load_session_history_spool_records(path: str) -> List[Dict[str, Any]]:
         raise ValueError("session_history spool payload is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise ValueError("session_history spool payload is not a JSON object")
-    records = payload.get("records")
-    if isinstance(records, list):
-        decoded_records = _decode_session_history_spool_value(records)
+    payload_records = payload.get("records")
+    if isinstance(payload_records, list):
+        decoded_records = _decode_session_history_spool_value(payload_records)
         if not all(isinstance(record, dict) for record in decoded_records):
             raise ValueError(
                 "session_history spool payload contains a non-object record"

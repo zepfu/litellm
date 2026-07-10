@@ -3,7 +3,11 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from litellm.utils import supports_reasoning, supports_xhigh_reasoning_effort
+from litellm.utils import (
+    supports_max_reasoning_effort,
+    supports_reasoning,
+    supports_xhigh_reasoning_effort,
+)
 
 
 _EFFORT_BY_BUDGET = (
@@ -135,19 +139,42 @@ def normalize_reasoning_effort_for_provider(
             clamp_reason=f"{provider}_reasoning_unsupported",
         )
 
-    if requested in {"max", "xhigh"}:
-        if provider == "openai" and model and supports_xhigh_reasoning_effort(
-            model=model, custom_llm_provider=custom_llm_provider
+    if requested == "max":
+        if (
+            provider in {"openai", "openrouter"}
+            and model
+            and supports_max_reasoning_effort(
+                model=model, custom_llm_provider=custom_llm_provider
+            )
+        ):
+            native_value = "max"
+        elif (
+            provider in {"openai", "openrouter"}
+            and model
+            and supports_xhigh_reasoning_effort(
+                model=model, custom_llm_provider=custom_llm_provider
+            )
         ):
             native_value = "xhigh"
-        elif provider == "openrouter" and model and supports_xhigh_reasoning_effort(
-            model=model, custom_llm_provider=custom_llm_provider
+            clamped_from = requested
+            clamp_reason = f"{provider}_max_effort_clamped_to_xhigh"
+        else:
+            native_value = "high"
+            clamped_from = requested
+            clamp_reason = f"{provider}_max_effort_clamped_to_high"
+    elif requested == "xhigh":
+        if (
+            provider in {"openai", "openrouter"}
+            and model
+            and supports_xhigh_reasoning_effort(
+                model=model, custom_llm_provider=custom_llm_provider
+            )
         ):
             native_value = "xhigh"
         else:
             native_value = "high"
             clamped_from = requested
-            clamp_reason = f"{provider}_max_effort_clamped_to_high"
+            clamp_reason = f"{provider}_xhigh_effort_clamped_to_high"
     elif provider in {"gemini", "nvidia"} and requested == "minimal":
         native_value = "low"
         clamped_from = requested

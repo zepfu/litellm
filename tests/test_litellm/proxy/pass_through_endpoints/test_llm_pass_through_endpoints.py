@@ -25843,6 +25843,267 @@ def test_codex_auto_agent_alias_last_resort_sets_default_medium_reasoning():
     assert "codex-auto-agent-default-effort:medium" in metadata["tags"]
 
 
+def _use_local_reasoning_model_cost_map(monkeypatch):
+    from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+    from litellm.utils import _invalidate_model_cost_lowercase_map, get_model_info
+
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        GetModelCostMap.load_local_model_cost_map(),
+    )
+    _invalidate_model_cost_lowercase_map()
+    get_model_info.cache_clear()
+
+
+def test_codex_auto_agent_alias_clamps_spark_max_reasoning_to_xhigh(monkeypatch):
+    _use_local_reasoning_model_cost_map(monkeypatch)
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "reasoning": {"effort": "max", "summary": "auto"},
+        "litellm_metadata": {
+            "session_id": "codex-session",
+            "tags": ["codex-effort:max", "effort:max", "keep-me"],
+        },
+    }
+    attempt = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "lane_key": "__default__",
+        "reason": "first_available",
+    }
+
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        body,
+        request=request,
+        selection={
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.3-codex-spark",
+                "route_family": "codex_responses",
+                "last_resort": False,
+            },
+            "selection_reason": "first_available",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[attempt],
+    )
+
+    assert body["reasoning"]["effort"] == "max"
+    assert updated_body["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["reasoning_effort_requested"] == "max"
+    assert metadata["reasoning_effort_native_value"] == "xhigh"
+    assert metadata["reasoning_effort_supported_ceiling"] == "xhigh"
+    assert metadata["reasoning_effort_resolved_model"] == "gpt-5.3-codex-spark"
+    assert metadata["reasoning_effort_resolved_provider"] == "openai"
+    assert metadata["reasoning_effort_candidate_attempt"] == 1
+    assert metadata["reasoning_effort_clamped_from"] == "max"
+    assert metadata["reasoning_effort_clamp_reason"] == (
+        "requested_effort_above_model_supported_ceiling"
+    )
+    assert metadata["codex_reasoning_effort"] == "xhigh"
+    assert metadata["openai_reasoning_effort"] == "xhigh"
+    assert "codex-effort:max" not in metadata["tags"]
+    assert "effort:max" not in metadata["tags"]
+    assert "codex-effort:xhigh" in metadata["tags"]
+    assert "effort:xhigh" in metadata["tags"]
+    assert "reasoning-effort-map:max-to-xhigh" in metadata["tags"]
+    assert "reasoning-effort-clamped" in metadata["tags"]
+    assert "keep-me" in metadata["tags"]
+    assert attempt["reasoning_effort_native_value"] == "xhigh"
+    audit_event = metadata["aawm_alias_routing_audit_events"][-1]
+    assert audit_event["attempt_number"] == 1
+    assert audit_event["reasoning_effort_requested"] == "max"
+    assert audit_event["reasoning_effort_native_value"] == "xhigh"
+    assert audit_event["reasoning_effort_supported_ceiling"] == "xhigh"
+
+
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra"])
+def test_codex_auto_agent_alias_keeps_max_for_max_capable_models(
+    model,
+    monkeypatch,
+):
+    _use_local_reasoning_model_cost_map(monkeypatch)
+    request = _build_codex_auto_agent_request()
+    attempt = {
+        "provider": "openai",
+        "model": model,
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "lane_key": "__default__",
+        "reason": "first_available",
+    }
+
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        {
+            "model": "aawm-code",
+            "reasoning": {"effort": "max"},
+            "litellm_metadata": {"session_id": "codex-session"},
+        },
+        request=request,
+        selection={
+            "candidate": {
+                "provider": "openai",
+                "model": model,
+                "route_family": "codex_responses",
+                "last_resort": False,
+            },
+            "selection_reason": "first_available",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[attempt],
+    )
+
+    assert updated_body["reasoning"]["effort"] == "max"
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["reasoning_effort_native_value"] == "max"
+    assert metadata["reasoning_effort_supported_ceiling"] == "max"
+    assert metadata["reasoning_effort_mapping_reason"] == (
+        "within_supported_ceiling"
+    )
+    assert "reasoning_effort_clamped_from" not in metadata
+    assert "reasoning-effort-clamped" not in metadata["tags"]
+
+
+@pytest.mark.parametrize("effort", ["high", "xhigh"])
+def test_codex_auto_agent_alias_keeps_supported_spark_reasoning_effort(
+    effort,
+    monkeypatch,
+):
+    _use_local_reasoning_model_cost_map(monkeypatch)
+    request = _build_codex_auto_agent_request()
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        {
+            "model": "aawm-code",
+            "reasoning": {"effort": effort},
+            "litellm_metadata": {"session_id": "codex-session"},
+        },
+        request=request,
+        selection={
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.3-codex-spark",
+                "route_family": "codex_responses",
+                "last_resort": False,
+            },
+            "selection_reason": "first_available",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[],
+    )
+
+    assert updated_body["reasoning"]["effort"] == effort
+    metadata = updated_body["litellm_metadata"]
+    assert metadata["reasoning_effort_native_value"] == effort
+    assert metadata["reasoning_effort_supported_ceiling"] == "xhigh"
+    assert "reasoning_effort_clamped_from" not in metadata
+
+
+def test_codex_auto_agent_alias_preserves_unrecognized_reasoning_effort(
+    monkeypatch,
+):
+    _use_local_reasoning_model_cost_map(monkeypatch)
+    request = _build_codex_auto_agent_request()
+    updated_body = _add_codex_auto_agent_alias_metadata(
+        {
+            "model": "aawm-code",
+            "reasoning": {"effort": "hyper"},
+            "litellm_metadata": {"session_id": "codex-session"},
+        },
+        request=request,
+        selection={
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.3-codex-spark",
+                "route_family": "codex_responses",
+                "last_resort": False,
+            },
+            "selection_reason": "first_available",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[],
+    )
+
+    assert updated_body["reasoning"]["effort"] == "hyper"
+    metadata = updated_body["litellm_metadata"]
+    assert "reasoning_effort_supported_ceiling" not in metadata
+    assert "reasoning_effort_mapping_reason" not in metadata
+
+
+def test_codex_auto_agent_alias_recalculates_reasoning_for_each_candidate(
+    monkeypatch,
+):
+    _use_local_reasoning_model_cost_map(monkeypatch)
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "reasoning": {"effort": "max"},
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    spark_attempt = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "lane_key": "__default__",
+        "reason": "first_available",
+    }
+    spark_body = _add_codex_auto_agent_alias_metadata(
+        body,
+        request=request,
+        selection={
+            "candidate": dict(spark_attempt),
+            "selection_reason": "first_available",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[spark_attempt],
+    )
+    terra_attempt = {
+        "provider": "openai",
+        "model": "gpt-5.6-terra",
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "lane_key": "__default__",
+        "reason": "first_available",
+    }
+    terra_body = _add_codex_auto_agent_alias_metadata(
+        body,
+        request=request,
+        selection={
+            "candidate": dict(terra_attempt),
+            "selection_reason": "first_available",
+            "lane_key": "__default__",
+            "skipped": [],
+        },
+        attempts=[spark_attempt, terra_attempt],
+    )
+
+    assert body["reasoning"]["effort"] == "max"
+    assert spark_body["reasoning"]["effort"] == "xhigh"
+    assert terra_body["reasoning"]["effort"] == "max"
+    attempts = terra_body["litellm_metadata"]["codex_auto_agent_attempts"]
+    assert [attempt["reasoning_effort_native_value"] for attempt in attempts] == [
+        "xhigh",
+        "max",
+    ]
+    audit_events = terra_body["litellm_metadata"][
+        "aawm_alias_routing_audit_events"
+    ]
+    assert [event["reasoning_effort_native_value"] for event in audit_events] == [
+        "xhigh",
+        "max",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55():
     request = _build_codex_auto_agent_request()
@@ -26342,6 +26603,25 @@ def test_codex_auto_agent_retryable_exhaustion_ignores_tool_shape_text():
 
     assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
     assert _extract_codex_auto_agent_error_tokens(exc) == set()
+
+
+def test_codex_auto_agent_retryable_exhaustion_ignores_invalid_effort_400():
+    exc = HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "message": (
+                    "Invalid value: 'max'. Supported values are: 'none', "
+                    "'minimal', 'low', 'medium', 'high', and 'xhigh'."
+                ),
+                "type": "invalid_request_error",
+                "param": "reasoning.effort",
+                "code": "invalid_value",
+            }
+        },
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
 
 
 def test_codex_auto_agent_retryable_exhaustion_classifies_deepseek_tool_mismatch():
@@ -30215,11 +30495,23 @@ async def test_openai_passthrough_aawm_read_alias_applies_read_guidance(
     )
 
 
+@pytest.mark.parametrize(
+    ("model", "expected_effort", "expected_ceiling", "expected_clamped"),
+    [
+        ("gpt-5.3-codex-spark", "xhigh", "xhigh", True),
+        ("gpt-5.6-sol", "max", "max", False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_openai_passthrough_codex_spark_does_not_get_prevention_guidance(
+async def test_openai_passthrough_codex_concrete_model_reconciles_reasoning_effort(
+    model,
+    expected_effort,
+    expected_ceiling,
+    expected_clamped,
     monkeypatch,
 ):
     monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+    _use_local_reasoning_model_cost_map(monkeypatch)
 
     mock_request = _build_codex_auto_agent_request("codex-session-123")
     mock_response = MagicMock(spec=Response)
@@ -30229,9 +30521,10 @@ async def test_openai_passthrough_codex_spark_does_not_get_prevention_guidance(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(
             return_value={
-                "model": "gpt-5.3-codex-spark",
+                "model": model,
                 "input": "hello",
                 "instructions": "Existing instructions.",
+                "reasoning": {"effort": "max", "summary": "auto"},
                 "litellm_metadata": {"tags": ["existing-tag"]},
             }
         ),
@@ -30255,16 +30548,31 @@ async def test_openai_passthrough_codex_spark_does_not_get_prevention_guidance(
     assert result == {"ok": True}
     mock_set_parsed_body.assert_called_once()
     prepared_body = mock_set_parsed_body.call_args.args[1]
+    assert prepared_body["model"] == model
     assert prepared_body["instructions"] == "Existing instructions."
-    assert "existing-tag" in prepared_body["litellm_metadata"]["tags"]
-    assert "route:codex_responses" in prepared_body["litellm_metadata"]["tags"]
+    assert prepared_body["reasoning"] == {
+        "effort": expected_effort,
+        "summary": "auto",
+    }
+    metadata = prepared_body["litellm_metadata"]
+    assert "existing-tag" in metadata["tags"]
+    assert "route:codex_responses" in metadata["tags"]
+    assert metadata["reasoning_effort_requested"] == "max"
+    assert metadata["reasoning_effort_native_value"] == expected_effort
+    assert metadata["reasoning_effort_supported_ceiling"] == expected_ceiling
+    assert metadata["reasoning_effort_resolved_model"] == model
+    assert metadata["reasoning_effort_resolved_provider"] == "openai"
+    assert "reasoning_effort_candidate_attempt" not in metadata
+    assert (
+        "reasoning-effort-clamped" in metadata["tags"]
+    ) is expected_clamped
     assert (
         "codex-auto-agent-prevention-guidance"
-        not in prepared_body["litellm_metadata"]["tags"]
+        not in metadata["tags"]
     )
     assert (
         "codex_auto_agent_prevention_guidance_applied"
-        not in prepared_body["litellm_metadata"]
+        not in metadata
     )
 
 

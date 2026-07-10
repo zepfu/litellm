@@ -16645,8 +16645,12 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_reasoning_summary": false,
         "supports_response_schema": true,
+        "supports_none_reasoning_effort": true,
+        "supports_xhigh_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": true,
         "unsupported_hosted_tools": [
             "image_generation"
         ],
@@ -38441,8 +38445,12 @@
         ],
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
         "supports_reasoning_summary": false,
         "supports_response_schema": true,
+        "supports_none_reasoning_effort": true,
+        "supports_xhigh_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": true,
         "unsupported_hosted_tools": [
             "image_generation"
         ],

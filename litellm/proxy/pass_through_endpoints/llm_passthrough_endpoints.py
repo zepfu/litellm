@@ -25,7 +25,7 @@ from pathlib import Path
 from functools import lru_cache
 from importlib.resources import files
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Optional, Tuple, Union, cast
+from typing import Any, Awaitable, Callable, Mapping, Optional, Tuple, Union, cast
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
@@ -355,6 +355,32 @@ _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = """Codex tool contract:
 - If a previous tool call failed because required arguments were missing, either retry once with schema-valid arguments or stop and explain the blocker in the final answer.
 - Final answers must address the assigned task directly. Do not return generic descriptions of files unless the user asked for a file overview."""
 _CODEX_AUTO_AGENT_MODEL_ALIAS = "aawm-codex-agent-auto"
+_CODEX_REASONING_EFFORT_TIERS = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+_CODEX_REASONING_EFFORT_TIER_INDEX = {
+    effort: index for index, effort in enumerate(_CODEX_REASONING_EFFORT_TIERS)
+}
+_CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS = (
+    "reasoning_effort_requested",
+    "reasoning_effort_source",
+    "reasoning_effort_native_provider",
+    "reasoning_effort_native_value",
+    "reasoning_effort_native_field",
+    "reasoning_effort_supported_ceiling",
+    "reasoning_effort_resolved_model",
+    "reasoning_effort_resolved_provider",
+    "reasoning_effort_candidate_attempt",
+    "reasoning_effort_mapping_reason",
+    "reasoning_effort_clamped_from",
+    "reasoning_effort_clamp_reason",
+)
 _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME = (
     "codex_auto_agent_prevention_guidance"
 )
@@ -4232,6 +4258,10 @@ def _build_auto_agent_alias_audit_event(
         cooldown_state_source = selection.get("cooldown_state_source")
     if cooldown_state_source is not None:
         event["cooldown_state_source"] = cooldown_state_source
+    for field in _CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS:
+        value = candidate.get(field)
+        if value is not None:
+            event[field] = value
 
     include_activity_status = event_type in {
         "no_candidate_available",
@@ -6066,6 +6096,175 @@ def _record_auto_agent_alias_attempt_failure(
     return failure_body
 
 
+def _extract_codex_reasoning_effort(
+    request_body: dict[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    reasoning = request_body.get("reasoning")
+    if isinstance(reasoning, dict) and "effort" in reasoning:
+        value = reasoning.get("effort")
+        return (value if isinstance(value, str) else None), "reasoning.effort"
+    if "reasoning_effort" in request_body:
+        value = request_body.get("reasoning_effort")
+        return (value if isinstance(value, str) else None), "reasoning_effort"
+    return None, None
+
+
+def _get_codex_reasoning_effort_ceiling(
+    resolved_route: dict[str, Any],
+) -> Optional[str]:
+    if (
+        resolved_route.get("provider") != litellm.LlmProviders.OPENAI.value
+        or resolved_route.get("route_family") != "codex_responses"
+    ):
+        return None
+
+    model = resolved_route.get("model")
+    if not isinstance(model, str) or not model:
+        return None
+    model_info_sources: list[Mapping[str, Any]] = []
+    try:
+        resolved_model_info = litellm.get_model_info(
+            model=model,
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+        )
+        if isinstance(resolved_model_info, dict):
+            model_info_sources.append(resolved_model_info)
+    except Exception:
+        pass
+    for model_cost in (
+        litellm.model_cost,
+        _load_bundled_model_cost_map_for_codex_policy(),
+    ):
+        catalog_model_info = model_cost.get(model)
+        if isinstance(catalog_model_info, dict):
+            model_info_sources.append(catalog_model_info)
+
+    if any(
+        model_info.get("supports_max_reasoning_effort") is True
+        for model_info in model_info_sources
+    ):
+        return "max"
+    if any(
+        model_info.get("supports_xhigh_reasoning_effort") is True
+        for model_info in model_info_sources
+    ):
+        return "xhigh"
+    if (
+        any(
+            model_info.get("supports_reasoning") is True
+            for model_info in model_info_sources
+        )
+        and any(
+            model_info.get("supports_xhigh_reasoning_effort") is False
+            for model_info in model_info_sources
+        )
+    ):
+        return "high"
+    return None
+
+
+def _normalize_codex_reasoning_effort_for_resolved_route(
+    request_body: dict[str, Any],
+    *,
+    resolved_route: dict[str, Any],
+    attempt_number: Optional[int] = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    requested_effort, native_field = _extract_codex_reasoning_effort(request_body)
+    if (
+        requested_effort not in _CODEX_REASONING_EFFORT_TIER_INDEX
+        or native_field is None
+    ):
+        return request_body, {}
+
+    supported_ceiling = _get_codex_reasoning_effort_ceiling(resolved_route)
+    if supported_ceiling is None:
+        return request_body, {}
+
+    emitted_effort = requested_effort
+    mapping_reason = "within_supported_ceiling"
+    if (
+        _CODEX_REASONING_EFFORT_TIER_INDEX[requested_effort]
+        > _CODEX_REASONING_EFFORT_TIER_INDEX[supported_ceiling]
+    ):
+        emitted_effort = supported_ceiling
+        mapping_reason = "requested_effort_above_model_supported_ceiling"
+
+    updated_body = dict(request_body)
+    if emitted_effort != requested_effort:
+        if native_field == "reasoning.effort":
+            reasoning = dict(updated_body.get("reasoning") or {})
+            reasoning["effort"] = emitted_effort
+            updated_body["reasoning"] = reasoning
+        else:
+            updated_body["reasoning_effort"] = emitted_effort
+
+    litellm_metadata = dict(updated_body.get("litellm_metadata") or {})
+    existing_tags = litellm_metadata.get("tags")
+    if isinstance(existing_tags, list):
+        litellm_metadata["tags"] = [
+            tag
+            for tag in existing_tags
+            if not (
+                isinstance(tag, str)
+                and (
+                    tag == "reasoning-effort-clamped"
+                    or tag.startswith("codex-effort:")
+                    or tag.startswith("effort:")
+                    or tag.startswith("reasoning-effort-ceiling:")
+                    or tag.startswith("reasoning-effort-map:")
+                    or tag.startswith("codex-auto-agent-attempt:")
+                )
+            )
+        ]
+    updated_body["litellm_metadata"] = litellm_metadata
+
+    provider = str(resolved_route["provider"])
+    model = str(resolved_route["model"])
+    mapping_metadata: dict[str, Any] = {
+        "codex_reasoning_effort": emitted_effort,
+        "reasoning_effort_requested": requested_effort,
+        "reasoning_effort_source": native_field,
+        "reasoning_effort_native_provider": provider,
+        "reasoning_effort_native_value": emitted_effort,
+        "reasoning_effort_native_field": native_field,
+        "reasoning_effort_supported_ceiling": supported_ceiling,
+        "reasoning_effort_resolved_model": model,
+        "reasoning_effort_resolved_provider": provider,
+        "reasoning_effort_mapping_reason": mapping_reason,
+        "openai_reasoning_effort": emitted_effort,
+    }
+    tags_to_add = [
+        f"codex-effort:{emitted_effort}",
+        f"effort:{emitted_effort}",
+        f"reasoning-effort-ceiling:{supported_ceiling}",
+    ]
+    if attempt_number is not None:
+        mapping_metadata["reasoning_effort_candidate_attempt"] = attempt_number
+        tags_to_add.append(f"codex-auto-agent-attempt:{attempt_number}")
+    if emitted_effort != requested_effort:
+        mapping_metadata.update(
+            {
+                "reasoning_effort_clamped_from": requested_effort,
+                "reasoning_effort_clamp_reason": mapping_reason,
+            }
+        )
+        tags_to_add.extend(
+            [
+                "reasoning-effort-clamped",
+                f"reasoning-effort-map:{requested_effort}-to-{emitted_effort}",
+            ]
+        )
+
+    return (
+        _merge_litellm_metadata(
+            updated_body,
+            tags_to_add=tags_to_add,
+            extra_fields=mapping_metadata,
+        ),
+        mapping_metadata,
+    )
+
+
 def _add_codex_auto_agent_alias_metadata(
     request_body: dict[str, Any],
     *,
@@ -6097,13 +6296,33 @@ def _add_codex_auto_agent_alias_metadata(
                 "effort": default_reasoning_effort,
             }
             default_reasoning_applied = True
+    attempt_number = max(1, len(attempts))
+    updated_body, reasoning_effort_metadata = (
+        _normalize_codex_reasoning_effort_for_resolved_route(
+            updated_body,
+            resolved_route=candidate,
+            attempt_number=attempt_number,
+        )
+    )
+    audit_selection = selection
+    if reasoning_effort_metadata:
+        if attempts:
+            attempts[-1].update(reasoning_effort_metadata)
+        else:
+            audit_selection = {
+                **selection,
+                "candidate": {
+                    **candidate,
+                    **reasoning_effort_metadata,
+                },
+            }
     skipped = selection.get("skipped") or []
     audit_events = _build_auto_agent_alias_audit_events(
         alias_family="codex_auto_agent",
         alias_model=alias_model,
         request=request,
         request_body=request_body,
-        selection=selection,
+        selection=audit_selection,
         attempts=attempts,
     )
     return _merge_litellm_metadata(
@@ -6140,7 +6359,10 @@ def _add_codex_auto_agent_alias_metadata(
                     "codex_auto_agent_default_reasoning_effort": (
                         default_reasoning_effort
                     ),
-                    "codex_reasoning_effort": default_reasoning_effort,
+                    "codex_reasoning_effort": (
+                        reasoning_effort_metadata.get("codex_reasoning_effort")
+                        or default_reasoning_effort
+                    ),
                 }
                 if default_reasoning_applied
                 else {}
@@ -6159,6 +6381,7 @@ def _add_codex_auto_agent_alias_metadata(
             "aawm_alias_routing_audit_events": audit_events,
         },
     )
+
 
 def _normalize_anthropic_auto_agent_alias_model(model: Any) -> Optional[str]:
     if not isinstance(model, str):
@@ -22082,7 +22305,7 @@ def _get_openai_tool_type(tool: dict[str, Any]) -> Optional[str]:
 
 
 @lru_cache(maxsize=1)
-def _load_bundled_model_cost_map_for_codex_tool_policy() -> dict[str, Any]:
+def _load_bundled_model_cost_map_for_codex_policy() -> dict[str, Any]:
     try:
         content = files("litellm").joinpath(
             "bundled_model_prices_and_context_window_fallback.json"
@@ -22145,7 +22368,7 @@ def _get_unsupported_hosted_tool_types_for_model(model: Any) -> set[str]:
 
     model_cost_sources = [
         litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_tool_policy(),
+        _load_bundled_model_cost_map_for_codex_policy(),
     ]
     for model_cost in model_cost_sources:
         for key in candidate_model_cost_keys:
@@ -22175,7 +22398,7 @@ def _get_unsupported_request_param_names_for_model(model: Any) -> set[str]:
 
     model_cost_sources = [
         litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_tool_policy(),
+        _load_bundled_model_cost_map_for_codex_policy(),
     ]
     for model_cost in model_cost_sources:
         for key in candidate_model_cost_keys:
@@ -22205,7 +22428,7 @@ def _get_unsupported_input_item_types_for_model(model: Any) -> set[str]:
 
     model_cost_sources = [
         litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_tool_policy(),
+        _load_bundled_model_cost_map_for_codex_policy(),
     ]
     for model_cost in model_cost_sources:
         for key in candidate_model_cost_keys:
@@ -22235,7 +22458,7 @@ def _get_rewrite_input_item_types_for_model(model: Any) -> set[str]:
 
     model_cost_sources = [
         litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_tool_policy(),
+        _load_bundled_model_cost_map_for_codex_policy(),
     ]
     for model_cost in model_cost_sources:
         for key in candidate_model_cost_keys:
@@ -22265,7 +22488,7 @@ def _get_custom_tool_function_adapter_names_for_model(model: Any) -> set[str]:
 
     model_cost_sources = [
         litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_tool_policy(),
+        _load_bundled_model_cost_map_for_codex_policy(),
     ]
     for model_cost in model_cost_sources:
         for key in candidate_model_cost_keys:
@@ -30550,6 +30773,19 @@ class BaseOpenAIPassThroughHandler:
                             user_api_key_dict=user_api_key_dict,
                             prepared_request_body=prepared_request_body,
                             adapter_model=google_adapter_model,
+                        )
+                    direct_model = prepared_request_body.get("model")
+                    if isinstance(direct_model, str) and direct_model:
+                        (
+                            prepared_request_body,
+                            _direct_reasoning_effort_metadata,
+                        ) = _normalize_codex_reasoning_effort_for_resolved_route(
+                            prepared_request_body,
+                            resolved_route={
+                                "provider": litellm.LlmProviders.OPENAI.value,
+                                "model": direct_model,
+                                "route_family": "codex_responses",
+                            },
                         )
             else:
                 prepared_request_body = _add_route_family_logging_metadata(
