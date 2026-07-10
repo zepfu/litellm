@@ -83,7 +83,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     EndpointType,
     PassthroughStandardLoggingPayload,
 )
-from litellm.types.utils import StandardLoggingUserAPIKeyMetadata
+from litellm.types.utils import AllMessageValues, StandardLoggingUserAPIKeyMetadata
 
 from .streaming_handler import PassThroughStreamingHandler
 from .success_handler import PassThroughEndpointLogging
@@ -688,7 +688,7 @@ class PassthroughRequestObservabilityEnvelope:
 
     parsed_body: Optional[dict]
     serialized_body: str
-    logging_input: List[Dict[str, str]]
+    logging_input: List[AllMessageValues]
 
     @property
     def complete_input_dict(self) -> Optional[dict]:
@@ -702,13 +702,16 @@ def _build_passthrough_request_observability_envelope(
     return PassthroughRequestObservabilityEnvelope(
         parsed_body=parsed_body,
         serialized_body=serialized_body,
-        logging_input=[{"role": "user", "content": serialized_body}],
+        logging_input=cast(
+            List[AllMessageValues],
+            [{"role": "user", "content": serialized_body}],
+        ),
     )
 
 
 def _build_passthrough_logging_input(
     parsed_body: Optional[dict],
-) -> List[Dict[str, str]]:
+) -> List[AllMessageValues]:
     """Build the serialized passthrough logging envelope once for reuse."""
     return _build_passthrough_request_observability_envelope(parsed_body).logging_input
 
@@ -1574,9 +1577,13 @@ def _classify_passthrough_hidden_retry_failure(
     if isinstance(exc, httpx.ReadError):
         return None, "upstream_connectivity_failure", "upstream_connectivity_failure"
 
-    status_code = _extract_exception_status_code(exc)
-    if status_code is not None:
-        return status_code, f"http_status_{status_code}", None
+    extracted_status_code = _extract_exception_status_code(exc)
+    if extracted_status_code is not None:
+        return (
+            extracted_status_code,
+            f"http_status_{extracted_status_code}",
+            None,
+        )
 
     return None, exc.__class__.__name__, None
 
@@ -2450,7 +2457,7 @@ def _headers_for_json_passthrough_egress(
             content_type = _clean_passthrough_error_context_value(
                 json_headers[header_name]
             )
-            media_type = content_type.split(";", 1)[0].strip().lower()
+            media_type = cast(str, content_type).split(";", 1)[0].strip().lower()
             if media_type == "application/json" or media_type.endswith("+json"):
                 has_json_content_type = True
                 continue
@@ -3834,18 +3841,18 @@ async def pass_through_request(  # noqa: PLR0915
             span_metadata={"stage": "pre_send_prepare"},
         )
 
-        metadata = _ensure_passthrough_metadata(kwargs)
-        metadata["aawm_passthrough_endpoint_type"] = endpoint_type.value
+        passthrough_metadata: Dict[str, Any] = _ensure_passthrough_metadata(kwargs)
+        passthrough_metadata["aawm_passthrough_endpoint_type"] = endpoint_type.value
         if (
             responses_function_name_rewrite is not None
             and responses_function_name_rewrite.changed
         ):
             _record_responses_function_name_diagnostics(
-                metadata,
+                passthrough_metadata,
                 responses_function_name_rewrite,
             )
         _merge_passthrough_request_shape_metadata(
-            metadata,
+            passthrough_metadata,
             request=request,
             parsed_body=_parsed_body,
             provider_bound_body=provider_bound_body,
@@ -3917,7 +3924,7 @@ async def pass_through_request(  # noqa: PLR0915
             url=url,
             headers=headers,
             requested_query_params=requested_query_params,
-            metadata=metadata,
+            metadata=passthrough_metadata,
             custom_llm_provider=custom_llm_provider,
         )
 
@@ -3962,7 +3969,7 @@ async def pass_through_request(  # noqa: PLR0915
                     ) = _headers_for_json_passthrough_egress(headers)
                     if removed_content_type:
                         _merge_passthrough_request_shape_metadata(
-                            metadata,
+                            passthrough_metadata,
                             request=request,
                             parsed_body=_parsed_body,
                             provider_bound_body=provider_bound_body,
@@ -3971,7 +3978,7 @@ async def pass_through_request(  # noqa: PLR0915
                         if error_log_context is not None:
                             error_log_context.update(
                                 _build_passthrough_error_log_request_shape_context(
-                                    metadata
+                                    passthrough_metadata
                                 )
                             )
                 req = async_client.build_request(
@@ -4067,7 +4074,7 @@ async def pass_through_request(  # noqa: PLR0915
                 ) = _headers_for_json_passthrough_egress(headers)
                 if removed_content_type:
                     _merge_passthrough_request_shape_metadata(
-                        metadata,
+                        passthrough_metadata,
                         request=request,
                         parsed_body=_parsed_body,
                         provider_bound_body=provider_bound_body,
@@ -4075,7 +4082,9 @@ async def pass_through_request(  # noqa: PLR0915
                     )
                     if error_log_context is not None:
                         error_log_context.update(
-                            _build_passthrough_error_log_request_shape_context(metadata)
+                            _build_passthrough_error_log_request_shape_context(
+                                passthrough_metadata
+                            )
                         )
             response = (
                 await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
@@ -4253,12 +4262,12 @@ async def pass_through_request(  # noqa: PLR0915
             end_time=end_time,
             span_metadata={"stage": "post_response_finalize", "stream": False},
         )
-        metadata = _ensure_passthrough_metadata(kwargs)
-        if metadata:
-            metadata["aawm_total_proxy_overhead_ms"] = round(
+        duration_metadata = _ensure_passthrough_metadata(kwargs)
+        if duration_metadata:
+            duration_metadata["aawm_total_proxy_overhead_ms"] = round(
                 local_prepare_ms + local_finalize_ms, 3
             )
-            metadata["aawm_total_proxy_duration_ms"] = round(
+            duration_metadata["aawm_total_proxy_duration_ms"] = round(
                 max(0.0, (end_time - start_time).total_seconds() * 1000.0), 3
             )
 
