@@ -8,13 +8,13 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
 
 import litellm
-from litellm._logging import verbose_proxy_logger
+from litellm._logging import _redact_string, verbose_proxy_logger
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.litellm_logging import (
     get_standard_logging_object_payload,
@@ -33,6 +33,7 @@ from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
+from litellm.types.llms.openai import RESPONSES_API_TERMINAL_STREAM_EVENTS
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     EndpointType,
     PassthroughStandardLoggingPayload,
@@ -689,6 +690,192 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return "".join(text_parts)
 
     @staticmethod
+    def _sanitize_responses_terminal_error_for_logging(error: Any, *, limit: int = 500) -> Optional[str]:
+        if error is None:
+            return None
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                text_value = message.strip()
+            else:
+                try:
+                    text_value = json.dumps(error, ensure_ascii=False, sort_keys=True)
+                except (TypeError, ValueError):
+                    text_value = str(error)
+        elif isinstance(error, str):
+            text_value = error.strip()
+        else:
+            text_value = str(error)
+        if not text_value:
+            return None
+        text_value = _redact_string(text_value)
+        if len(text_value) > limit:
+            return text_value[: limit - 3] + "..."
+        return text_value
+
+    @staticmethod
+    def _sanitize_responses_terminal_incomplete_details_for_logging(
+        incomplete_details: Any, *, limit: int = 500
+    ) -> Optional[str]:
+        if not isinstance(incomplete_details, dict):
+            return None
+        reason = incomplete_details.get("reason")
+        if not isinstance(reason, str):
+            return None
+        reason_value = reason.strip()
+        if not reason_value:
+            return None
+        redacted = _redact_string(reason_value)
+        if len(redacted) > limit:
+            return redacted[: limit - 3] + "..."
+        return redacted
+
+    @staticmethod
+    def _annotate_responses_terminal_hidden_params(
+        model_response: ModelResponse,
+        *,
+        terminal_event_type: str,
+        response_payload: dict,
+    ) -> None:
+        hidden_params = getattr(model_response, "_hidden_params", None)
+        if not isinstance(hidden_params, dict):
+            hidden_params = {}
+            model_response._hidden_params = hidden_params
+        hidden_params["responses_terminal_event_type"] = terminal_event_type
+        hidden_params["responses_terminal_status"] = response_payload.get("status")
+        hidden_params["responses_terminal_error"] = (
+            OpenAIPassthroughLoggingHandler._sanitize_responses_terminal_error_for_logging(
+                response_payload.get("error")
+            )
+        )
+        hidden_params["responses_terminal_incomplete_details"] = (
+            OpenAIPassthroughLoggingHandler._sanitize_responses_terminal_incomplete_details_for_logging(
+                response_payload.get("incomplete_details")
+            )
+        )
+
+    @staticmethod
+    def _responses_stream_has_terminal_event(all_chunks: List[str]) -> bool:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+            if parsed_chunk.get("type") in RESPONSES_API_TERMINAL_STREAM_EVENTS:
+                return True
+        return False
+
+    @staticmethod
+    def _stream_qualifies_for_output_text_done_synthesis(all_chunks: List[str]) -> bool:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        if OpenAIPassthroughLoggingHandler._responses_stream_has_terminal_event(
+            all_chunks
+        ):
+            return False
+
+        saw_output_text_done = False
+        saw_done_marker = False
+        for chunk_str in all_chunks:
+            if str(chunk_str).strip() == "data: [DONE]":
+                saw_done_marker = True
+                continue
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+            if parsed_chunk.get("type") == "response.output_text.done":
+                text = parsed_chunk.get("text")
+                if isinstance(text, str) and text:
+                    saw_output_text_done = True
+        return saw_output_text_done and saw_done_marker
+
+    @staticmethod
+    def _extract_terminal_response_payload_from_stream(
+        all_chunks: List[str],
+    ) -> tuple[Optional[str], Optional[dict]]:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        terminal_event_type: Optional[str] = None
+        terminal_response_payload: Optional[dict] = None
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+            chunk_type = parsed_chunk.get("type")
+            if chunk_type in RESPONSES_API_TERMINAL_STREAM_EVENTS:
+                response_payload = parsed_chunk.get("response")
+                if isinstance(response_payload, dict):
+                    terminal_event_type = str(chunk_type)
+                    terminal_response_payload = response_payload
+        return terminal_event_type, terminal_response_payload
+
+    @staticmethod
+    def _responses_stream_standard_logging_status(
+        *,
+        terminal_event_type: Optional[str],
+        response_payload: Optional[dict],
+    ) -> Literal["success", "failure"]:
+        if terminal_event_type in {
+            "response.failed",
+            "response.incomplete",
+        }:
+            return "failure"
+        if isinstance(response_payload, dict):
+            status = response_payload.get("status")
+            if status in {"failed", "incomplete"}:
+                return "failure"
+        return "success"
+
+    @staticmethod
+    def _build_responses_api_terminal_model_response(
+        *,
+        response_body: dict,
+        fallback_model: str,
+        all_chunks: List[str],
+        terminal_event_type: str,
+    ) -> ModelResponse:
+        reconstructed_output = (
+            OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
+                all_chunks
+            )
+        )
+        responses_output = response_body.get("output")
+        merged_output = OpenAIPassthroughLoggingHandler._merge_responses_output_lists(
+            responses_output if isinstance(responses_output, list) else [],
+            reconstructed_output,
+        )
+        model_response = (
+            OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
+                response_body=response_body,
+                fallback_model=fallback_model,
+                assistant_content="",
+                reasoning_content=OpenAIPassthroughLoggingHandler._extract_responses_api_reasoning_summary_text(
+                    merged_output
+                ),
+                responses_output=merged_output or None,
+            )
+        )
+        OpenAIPassthroughLoggingHandler._annotate_responses_terminal_hidden_params(
+            model_response,
+            terminal_event_type=terminal_event_type,
+            response_payload=response_body,
+        )
+        return model_response
+
+    @staticmethod
     def _build_responses_api_fallback_model_response_from_stream(
         *,
         all_chunks: List[str],
@@ -745,6 +932,8 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             model_response._hidden_params = hidden_params
         hidden_params["openai_responses_stream_missing_completed"] = True
         hidden_params["openai_responses_stream_usage_estimated"] = True
+        hidden_params["openai_responses_stream_synthesized_terminal"] = True
+        hidden_params["openai_responses_stream_missing_formal_terminal_event"] = True
         return model_response
 
     @staticmethod
@@ -1648,41 +1837,50 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         some ChatGPT/Codex stream shapes.
         """
         try:
-            from litellm.llms.base_llm.base_model_iterator import (
-                BaseModelResponseIterator,
-            )
             from litellm.types.llms.openai import ResponsesAPIResponse
 
             responses_transformer = LiteLLMResponsesTransformationHandler()
-            completed_response_payload = None
-            output_text_parts: List[str] = []
-
-            for chunk_str in all_chunks:
-                parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
-                    str_line=chunk_str
+            streamed_output_text = (
+                OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
+                    all_chunks
                 )
-                if not isinstance(parsed_chunk, dict):
-                    continue
-                chunk_type = parsed_chunk.get("type")
-                if chunk_type == "response.output_text.delta":
-                    delta = parsed_chunk.get("delta")
-                    if isinstance(delta, str):
-                        output_text_parts.append(delta)
-                elif chunk_type == "response.completed":
-                    response_payload = parsed_chunk.get("response")
-                    if isinstance(response_payload, dict):
-                        completed_response_payload = response_payload
+            )
+            terminal_event_type, terminal_response_payload = (
+                OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
+                    all_chunks
+                )
+            )
 
-            if completed_response_payload is None:
+            if terminal_response_payload is None:
+                if OpenAIPassthroughLoggingHandler._stream_qualifies_for_output_text_done_synthesis(
+                    all_chunks
+                ):
+                    return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response_from_stream(
+                        all_chunks=all_chunks,
+                        request_body=request_body,
+                        fallback_model=model,
+                    )
                 verbose_proxy_logger.warning(
-                    "No response.completed event found in OpenAI responses stream"
+                    "No recognized Responses terminal event found in OpenAI responses stream"
                 )
-                return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response_from_stream(
-                    all_chunks=all_chunks,
-                    request_body=request_body,
-                    fallback_model=model,
-                )
+                return None
 
+            if terminal_event_type in {
+                "response.failed",
+                "response.incomplete",
+            } or terminal_response_payload.get("status") in {"failed", "incomplete"}:
+                terminal_model_response = (
+                    OpenAIPassthroughLoggingHandler._build_responses_api_terminal_model_response(
+                        response_body=terminal_response_payload,
+                        fallback_model=model,
+                        all_chunks=all_chunks,
+                        terminal_event_type=terminal_event_type
+                        or str(terminal_response_payload.get("status")),
+                    )
+                )
+                return terminal_model_response
+
+            completed_response_payload = terminal_response_payload
             responses_output = completed_response_payload.get("output")
             completed_response_model_payload = completed_response_payload
             if "output" not in completed_response_model_payload:
@@ -1708,14 +1906,21 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             )
             raw_response_hidden_params = getattr(completed_response, "_hidden_params", {})
             if len(getattr(completed_response, "output", []) or []) == 0:
-                return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
+                empty_fallback_response = OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
                     response_body=completed_response_payload,
                     fallback_model=model,
-                    assistant_content="".join(output_text_parts),
+                    assistant_content=streamed_output_text,
                     reasoning_content=reasoning_summary_text,
                     responses_output=merged_output,
                     raw_hidden_params=raw_response_hidden_params,
                 )
+                if terminal_event_type:
+                    OpenAIPassthroughLoggingHandler._annotate_responses_terminal_hidden_params(
+                        empty_fallback_response,
+                        terminal_event_type=terminal_event_type,
+                        response_payload=completed_response_payload,
+                    )
+                return empty_fallback_response
 
             try:
                 model_response = responses_transformer.transform_response(
@@ -1732,26 +1937,41 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 )
             except ValueError as e:
                 if "Unknown items in responses API response" in str(e):
-                    return OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
+                    ve_fallback_response = OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
                         response_body=completed_response_payload,
                         fallback_model=model,
-                        assistant_content="".join(output_text_parts),
+                        assistant_content=streamed_output_text,
                         reasoning_content=reasoning_summary_text,
                         responses_output=merged_output,
                         raw_hidden_params=raw_response_hidden_params,
                     )
+                    if terminal_event_type:
+                        OpenAIPassthroughLoggingHandler._annotate_responses_terminal_hidden_params(
+                            ve_fallback_response,
+                            terminal_event_type=terminal_event_type,
+                            response_payload=completed_response_payload,
+                        )
+                    return ve_fallback_response
                 raise
             backfilled_response = self._backfill_responses_api_model_response(
                 model_response,
                 completed_response_payload,
                 model,
             )
+            if backfilled_response is None:
+                return None
             if not hasattr(backfilled_response, "_hidden_params") or not isinstance(
                 getattr(backfilled_response, "_hidden_params", None), dict
             ):
                 backfilled_response._hidden_params = {}
             if merged_output:
                 backfilled_response._hidden_params["responses_output"] = merged_output
+            if terminal_event_type:
+                OpenAIPassthroughLoggingHandler._annotate_responses_terminal_hidden_params(
+                    backfilled_response,
+                    terminal_event_type=terminal_event_type,
+                    response_payload=completed_response_payload,
+                )
             return backfilled_response
         except Exception as e:
             verbose_proxy_logger.error(
@@ -1876,13 +2096,46 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                         "response_cost": response_cost,
                     },
                 )
+            hidden_params = getattr(complete_response, "_hidden_params", None)
+            terminal_event_type = None
+            terminal_response_payload = None
+            terminal_event_type, terminal_response_payload = (
+                OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
+                    all_chunks
+                )
+            )
+            if terminal_event_type is None and isinstance(hidden_params, dict):
+                terminal_event_type = hidden_params.get(
+                    "responses_terminal_event_type"
+                )
+            standard_logging_status = (
+                OpenAIPassthroughLoggingHandler._responses_stream_standard_logging_status(
+                    terminal_event_type=terminal_event_type,
+                    response_payload=terminal_response_payload,
+                )
+            )
+            # Compute sanitized error for failure terminals so it flows through
+            # the standard logging payload constructor (error_str param) and
+            # appears in the canonical schema.
+            error_str_for_logging = None
+            if standard_logging_status == "failure":
+                if isinstance(terminal_response_payload, dict):
+                    error_str_for_logging = (
+                        OpenAIPassthroughLoggingHandler._sanitize_responses_terminal_error_for_logging(
+                            terminal_response_payload.get("error")
+                        )
+                    )
+                if not error_str_for_logging and isinstance(hidden_params, dict):
+                    error_str_for_logging = hidden_params.get("responses_terminal_error")
+
             logging_kwargs["standard_logging_object"] = get_standard_logging_object_payload(
                 kwargs=logging_kwargs,
                 init_response_obj=complete_response,
                 start_time=start_time,
                 end_time=end_time,
                 logging_obj=litellm_logging_obj,
-                status="success",
+                status=standard_logging_status,
+                error_str=error_str_for_logging,
             )
 
             verbose_proxy_logger.debug(

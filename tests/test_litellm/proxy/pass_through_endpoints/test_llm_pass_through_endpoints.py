@@ -14668,6 +14668,50 @@ class TestClaudePersistedOutputExpansion:
         ]
 
     @pytest.mark.asyncio
+    async def test_collect_responses_stream_raises_502_and_closes_source_when_no_terminal(
+        self,
+    ):
+        class _ClosableStream:
+            def __init__(self, chunks: list[bytes]):
+                self._chunks = list(chunks)
+                self.closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                raise StopAsyncIteration
+
+            async def aclose(self):
+                self.closed = True
+
+        source_stream = _ClosableStream(
+            [
+                b'event: response.created\ndata: {"type":"response.created"}\n\n',
+                b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"msg_123","delta":"partial"}\n\n',
+                b"data: [DONE]\n\n",
+            ]
+        )
+
+        response = StreamingResponse(
+            source_stream,
+            status_code=200,
+            media_type="text/event-stream",
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await _collect_responses_response_from_stream(response)
+
+        assert exc_info.value.status_code == 502
+        assert (
+            exc_info.value.detail
+            == "OpenAI Responses stream completed without a response payload."
+        )
+        assert source_stream.closed is True
+
+    @pytest.mark.asyncio
     async def test_collect_responses_stream_drains_after_completed_for_logging(self):
         state = {"yielded_after_completed": False}
 
@@ -14687,6 +14731,123 @@ class TestClaudePersistedOutputExpansion:
 
         assert collected["id"] == "resp_codex"
         assert state["yielded_after_completed"] is True
+
+
+    @pytest.mark.asyncio
+    async def test_collect_responses_stream_returns_failed_terminal_payload(self):
+        async def _responses_stream():
+            chunks = [
+                b'event: response.created\ndata: {"type":"response.created"}\n\n',
+                b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"msg_123","delta":"partial"}\n\n',
+                b'event: response.failed\ndata: {"type":"response.failed","response":{"id":"resp_failed","status":"failed","model":"gpt-5.4","output":[],"error":{"message":"upstream timeout"}}}\n\n',
+                b'data: [DONE]\n\n',
+            ]
+            for chunk in chunks:
+                yield chunk
+
+        response = StreamingResponse(
+            _responses_stream(),
+            status_code=200,
+            media_type="text/event-stream",
+        )
+
+        collected = await _collect_responses_response_from_stream(response)
+
+        assert collected["id"] == "resp_failed"
+        assert collected["status"] == "failed"
+        assert collected["error"]["message"] == "upstream timeout"
+        assert collected["output"][0]["content"][0]["text"] == "partial"
+
+    @pytest.mark.asyncio
+    async def test_collect_responses_stream_returns_incomplete_terminal_payload(self):
+        async def _responses_stream():
+            chunks = [
+                b'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","model":"gpt-5.4","output":[],"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+                b'data: [DONE]\n\n',
+            ]
+            for chunk in chunks:
+                yield chunk
+
+        response = StreamingResponse(
+            _responses_stream(),
+            status_code=200,
+            media_type="text/event-stream",
+        )
+
+        collected = await _collect_responses_response_from_stream(response)
+
+        assert collected["id"] == "resp_incomplete"
+        assert collected["status"] == "incomplete"
+        assert collected["incomplete_details"]["reason"] == "max_output_tokens"
+
+    @pytest.mark.asyncio
+    async def test_collect_responses_stream_drains_after_failed_terminal(self):
+        state = {"yielded_after_failed": False}
+
+        async def _responses_stream():
+            yield b'event: response.failed\ndata: {"type":"response.failed","response":{"id":"resp_failed","status":"failed","model":"gpt-5.4","output":[]}}\n\n'
+            state["yielded_after_failed"] = True
+            yield b'data: [DONE]\n\n'
+
+        response = StreamingResponse(
+            _responses_stream(),
+            status_code=200,
+            media_type="text/event-stream",
+        )
+
+        collected = await _collect_responses_response_from_stream(response)
+
+        assert collected["status"] == "failed"
+        assert state["yielded_after_failed"] is True
+
+    @pytest.mark.asyncio
+    async def test_post_first_byte_failed_terminal_chunks_are_logged_as_failure(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.streaming_handler import (
+            PassThroughStreamingHandler,
+        )
+
+        terminal_chunks = (
+            PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                endpoint_type=EndpointType.OPENAI,
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                failure_context={
+                    "failure_kind": "streaming_upstream_read_timeout",
+                    "model": "gpt-5.4",
+                },
+                exc=Exception("timeout"),
+            )
+        )
+        streaming_chunks = [
+            line.strip()
+            for chunk in terminal_chunks
+            for line in chunk.decode("utf-8").splitlines()
+            if line.strip()
+        ]
+
+        mock_logging_obj = MagicMock()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        with patch("litellm.completion_cost", return_value=0.0):
+            result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+                litellm_logging_obj=mock_logging_obj,
+                passthrough_success_handler_obj=MagicMock(),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.4", "input": "probe"},
+                endpoint_type="openai",
+                start_time=datetime.now(),
+                all_chunks=streaming_chunks,
+                end_time=datetime.now(),
+            )
+
+        assert result["result"] is not None
+        assert result["kwargs"]["standard_logging_object"]["status"] == "failure"
+        assert streaming_chunks[0].startswith("event: response.failed")
 
     @pytest.mark.asyncio
     async def test_gemini_tool_use_stream_preserves_input_json_delta_when_starting_new_block(

@@ -116,6 +116,47 @@ async def test_stream_wrapper_failed_response_raises_provider_error():
 
 
 @pytest.mark.asyncio
+async def test_stream_wrapper_incomplete_event_emits_message_delta_max_tokens():
+    response_obj = SimpleNamespace(
+        id="resp_incomplete",
+        status="incomplete",
+        model="gpt-5.4",
+        usage=SimpleNamespace(
+            input_tokens=12,
+            output_tokens=4,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+        output=[],
+        incomplete_details={"reason": "max_output_tokens"},
+    )
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_stream(
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(
+                type="response.output_text.done",
+                item_id="msg_incomplete",
+                output_index=0,
+                text="adapter incomplete stream",
+            ),
+            SimpleNamespace(type="response.incomplete", response=response_obj),
+        ),
+        model="gpt-5.4",
+    )
+
+    chunks = [chunk async for chunk in wrapper]
+
+    assert [chunk["type"] for chunk in chunks] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "message_delta",
+        "message_stop",
+    ]
+    assert chunks[3]["delta"]["stop_reason"] == "max_tokens"
+
+
+@pytest.mark.asyncio
 async def test_stream_wrapper_seeds_function_call_input_when_added_item_has_dict_arguments():
     response_obj = SimpleNamespace(
         status="completed",

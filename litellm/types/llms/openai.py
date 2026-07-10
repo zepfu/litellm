@@ -1425,6 +1425,15 @@ class ResponsesAPIStreamEvents(str, Enum):
     ERROR = "error"
 
 
+RESPONSES_API_TERMINAL_STREAM_EVENTS: frozenset[str] = frozenset(
+    {
+        ResponsesAPIStreamEvents.RESPONSE_COMPLETED.value,
+        ResponsesAPIStreamEvents.RESPONSE_FAILED.value,
+        ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE.value,
+    }
+)
+
+
 class ResponseCreatedEvent(BaseLiteLLMOpenAIResponseObject):
     type: Literal[ResponsesAPIStreamEvents.RESPONSE_CREATED]
     response: ResponsesAPIResponse

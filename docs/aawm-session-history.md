@@ -57,6 +57,30 @@ Anthropic but no extended-context evidence exists. Historical backfill only
 classifies rows when retained header or suffix evidence exists; otherwise it
 sets `unknown` / `unavailable` markers.
 
+## Responses terminal stream semantics
+
+OpenAI/Codex Responses passthrough streams now treat
+`response.completed`, `response.failed`, and `response.incomplete` as the
+shared terminal event set for both logging reconstruction and
+`_collect_responses_response_from_stream`.
+
+- Recognized failed/incomplete terminals are logged with standard logging
+  `status=failure` and carry stable terminal diagnostics in `_hidden_params`:
+  bounded/redacted `responses_terminal_error` and bounded/redacted
+  `responses_terminal_incomplete_details` reason. The collector keeps the full
+  terminal `response` payload (including status and incomplete details) for
+  adapter behavior while only persisting bounded/redacted fields for
+  diagnostics.
+- Post-first-byte proxy terminal chunks that emit `response.failed` + `[DONE]`
+  are consumed as first-class terminal events by both the logging handler and
+  the Responses collector.
+- The only synthesized success fallback is the explicit clean
+  `response.output_text.done` + `[DONE]` shape with no formal terminal event;
+  that path is marked in hidden params as estimated/synthesized.
+- Streams with no recognized terminal event and no clean done-only fallback
+  produce no reconstructed logging success; the collector closes the source
+  iterator and raises HTTP 502.
+
 ### Repairing existing rows (`--repair-session-history`)
 
 To stamp or refresh Anthropic context-window metadata on rows already stored in

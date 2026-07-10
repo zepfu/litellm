@@ -136,7 +136,11 @@ from litellm.proxy.vector_store_endpoints.utils import (
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str
-from litellm.types.llms.openai import AllMessageValues, ResponsesAPIOptionalRequestParams
+from litellm.types.llms.openai import (
+    AllMessageValues,
+    RESPONSES_API_TERMINAL_STREAM_EVENTS,
+    ResponsesAPIOptionalRequestParams,
+)
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
 
@@ -17443,7 +17447,7 @@ async def _collect_responses_response_from_stream(
     ordered_keys: list[str] = []
     key_aliases: dict[str, str] = {}
     key_by_output_index: dict[int, str] = {}
-    completed_response_dict: Optional[dict[str, Any]] = None
+    terminal_response_dict: Optional[dict[str, Any]] = None
     event_iterator = _iterate_responses_sse_events(response.body_iterator)
     try:
         async for event in event_iterator:
@@ -17487,23 +17491,23 @@ async def _collect_responses_response_from_stream(
                     key_aliases=key_aliases,
                     key_by_output_index=key_by_output_index,
                 )
-            if event_type == "response.completed":
+            if event_type in RESPONSES_API_TERMINAL_STREAM_EVENTS:
                 response_payload = getattr(event, "response", None)
                 if response_payload is None:
                     continue
                 response_dict = _coerce_namespace_to_mapping(response_payload)
                 if isinstance(response_dict, dict):
-                    completed_response_dict = response_dict
+                    terminal_response_dict = response_dict
     finally:
-        if completed_response_dict is None:
+        if terminal_response_dict is None:
             await event_iterator.aclose()
             body_iterator = getattr(response, "body_iterator", None)
             aclose = getattr(body_iterator, "aclose", None)
             if callable(aclose):
                 await aclose()
-    if completed_response_dict is not None:
+    if terminal_response_dict is not None:
         return _finalize_collected_responses_stream_response(
-            response_dict=completed_response_dict,
+            response_dict=terminal_response_dict,
             output_text_parts=output_text_parts,
             output_items=output_items,
             ordered_keys=ordered_keys,

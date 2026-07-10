@@ -696,6 +696,247 @@ class TestOpenAIPassthroughLoggingHandler:
         assert mock_completion_cost.call_args.kwargs["call_type"] == "responses"
         assert result["kwargs"]["response_cost"] == 0.444
 
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_failed_terminal_without_missing_completed_warning(
+        self, mock_completion_cost, caplog
+    ):
+        mock_completion_cost.return_value = 0.0
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-failed","status":"in_progress","model":"gpt-5.4","output":[]}}',
+            'event: response.output_text.delta',
+            'data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":"partial"}',
+            'event: response.failed',
+            'data: {"type":"response.failed","response":{"id":"resp-failed","object":"response","status":"failed","model":"gpt-5.4","output":[],"error":{"type":"proxy_stream_terminal_error","message":"Streaming response interrupted after first byte due to upstream read timeout"}}}',
+            "data: [DONE]",
+        ]
+
+        with caplog.at_level("WARNING"):
+            result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+                litellm_logging_obj=mock_logging_obj,
+                passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.4", "input": "probe"},
+                endpoint_type="openai",
+                start_time=self.start_time,
+                all_chunks=streaming_chunks,
+                end_time=self.end_time,
+            )
+
+        assert result["result"] is not None
+        assert result["result"].choices[0].message.content == ""
+        assert result["result"]._hidden_params["responses_terminal_event_type"] == "response.failed"
+        assert result["result"]._hidden_params["responses_terminal_status"] == "failed"
+        assert "timeout" in result["result"]._hidden_params["responses_terminal_error"]
+        assert result["kwargs"]["standard_logging_object"]["status"] == "failure"
+        assert "timeout" in result["kwargs"]["standard_logging_object"]["error_str"]
+        assert "No response.completed event found" not in caplog.text
+        assert "No recognized Responses terminal event found" not in caplog.text
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_incomplete_terminal_as_failure(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.0
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'data: {"type":"response.incomplete","response":{"id":"resp-incomplete","object":"response","status":"incomplete","model":"gpt-5.4","output":[],"incomplete_details":{"reason":"max_output_tokens"}}}',
+            "data: [DONE]",
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "gpt-5.4", "input": "probe"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        assert result["result"] is not None
+        assert result["result"]._hidden_params["responses_terminal_event_type"] == "response.incomplete"
+        assert result["result"]._hidden_params["responses_terminal_status"] == "incomplete"
+        assert result["kwargs"]["standard_logging_object"]["status"] == "failure"
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_completed_terminal_failed_status_as_failure(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.0
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-completed-failed","object":"response","status":"in_progress","model":"gpt-5.4","output":[]}}',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp-completed-failed","object":"response","status":"failed","model":"gpt-5.4","output":[],"error":{"type":"proxy_stream_terminal_error","message":"Streaming response failed with credentials Bearer sk-1234567890abcdefghijklmnopqrstuv"}}}',
+            "data: [DONE]",
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "gpt-5.4", "input": "probe"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        assert result["result"] is not None
+        assert (
+            result["result"]._hidden_params["responses_terminal_event_type"]
+            == "response.completed"
+        )
+        assert result["result"]._hidden_params["responses_terminal_status"] == "failed"
+        hidden_error = result["result"]._hidden_params["responses_terminal_error"]
+        assert hidden_error is not None
+        assert "Bearer sk-" not in hidden_error
+        assert "REDACTED" in hidden_error
+        assert result["kwargs"]["standard_logging_object"]["status"] == "failure"
+        assert "REDACTED" in result["kwargs"]["standard_logging_object"]["error_str"]
+        assert "sk-" not in result["kwargs"]["standard_logging_object"]["error_str"]
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_rebuilds_completed_terminal_incomplete_status_as_failure(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.0
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-completed-incomplete","object":"response","status":"in_progress","model":"gpt-5.4","output":[]}}',
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"id":"resp-completed-incomplete","object":"response","status":"incomplete","model":"gpt-5.4","output":[],"incomplete_details":{"reason":"max_output_tokens","attempt_count":3}}}',
+            "data: [DONE]",
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "gpt-5.4", "input": "probe"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        assert result["result"] is not None
+        assert (
+            result["result"]._hidden_params["responses_terminal_event_type"]
+            == "response.completed"
+        )
+        assert result["result"]._hidden_params["responses_terminal_status"] == "incomplete"
+        assert (
+            result["result"]._hidden_params["responses_terminal_incomplete_details"]
+            == "max_output_tokens"
+        )
+        assert "attempt_count" not in str(
+            result["result"]._hidden_params["responses_terminal_incomplete_details"]
+        )
+        assert result["kwargs"]["standard_logging_object"]["status"] == "failure"
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_returns_none_for_no_terminal_stream(
+        self, mock_completion_cost, caplog
+    ):
+        mock_completion_cost.return_value = 0.0
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openai",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-truncated","status":"in_progress","model":"gpt-5.4","output":[]}}',
+            'event: response.output_text.done',
+            'data: {"type":"response.output_text.done","item_id":"msg_123","output_index":0,"content_index":0,"text":"partial only"}',
+        ]
+
+        with caplog.at_level("WARNING"):
+            result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+                litellm_logging_obj=mock_logging_obj,
+                passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                request_body={"model": "gpt-5.4", "input": "probe"},
+                endpoint_type="openai",
+                start_time=self.start_time,
+                all_chunks=streaming_chunks,
+                end_time=self.end_time,
+            )
+
+        assert result["result"] is None
+        assert "No recognized Responses terminal event found" in caplog.text
+
+    @patch("litellm.completion_cost")
+    def test_openai_streaming_handler_marks_output_text_done_fallback_as_synthesized(
+        self, mock_completion_cost
+    ):
+        mock_completion_cost.return_value = 0.444
+
+        mock_logging_obj = self._create_mock_logging_obj()
+        mock_logging_obj.model_call_details = {
+            "custom_llm_provider": "openrouter",
+            "litellm_params": {},
+        }
+
+        streaming_chunks = [
+            'event: response.created',
+            'data: {"type":"response.created","response":{"id":"resp-missing-completed","object":"response","created_at":1775869960,"status":"in_progress","model":"openai/gpt-oss-120b:free","output":[]}}',
+            'event: response.output_text.done',
+            'data: {"type":"response.output_text.done","item_id":"msg_123","output_index":0,"content_index":0,"text":"oss120 smoke"}',
+            "data: [DONE]",
+        ]
+
+        result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
+            litellm_logging_obj=mock_logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://openrouter.ai/api/v1/responses",
+            request_body={"model": "openai/gpt-oss-120b:free", "input": "probe"},
+            endpoint_type="openai",
+            start_time=self.start_time,
+            all_chunks=streaming_chunks,
+            end_time=self.end_time,
+        )
+
+        hidden = result["result"]._hidden_params
+        assert hidden["openai_responses_stream_missing_completed"] is True
+        assert hidden["openai_responses_stream_usage_estimated"] is True
+        assert hidden["openai_responses_stream_synthesized_terminal"] is True
+        assert hidden["openai_responses_stream_missing_formal_terminal_event"] is True
+        assert result["kwargs"]["standard_logging_object"]["status"] == "success"
+
     def test_openai_passthrough_handler_backfills_openrouter_responses_usage_and_model(self):
         mock_httpx_response = self._create_mock_httpx_response(
             {
