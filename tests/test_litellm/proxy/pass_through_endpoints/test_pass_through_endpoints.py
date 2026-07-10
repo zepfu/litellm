@@ -3421,6 +3421,9 @@ async def test_pass_through_request_does_not_mutate_custom_body_on_failure():
         "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
         new=post_failure_mock,
     ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+        new=AsyncMock(),
+    ), patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
         return_value={},
     ):
