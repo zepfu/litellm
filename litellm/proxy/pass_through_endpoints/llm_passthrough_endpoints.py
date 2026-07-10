@@ -775,11 +775,18 @@ _AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX = "aawm:alias-routing"
 
 
 def _get_aawm_alias_routing_state_namespace() -> str:
-    raw = _clean_codex_auth_value(
-        os.getenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE")
-    )
-    if raw is not None:
-        return raw
+    try:
+        from litellm.proxy.aawm_alias_routing_redis import (
+            resolve_alias_routing_state_namespace,
+        )
+
+        return resolve_alias_routing_state_namespace()
+    except Exception:
+        raw = _clean_codex_auth_value(
+            os.getenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE")
+        )
+        if raw is not None:
+            return raw
     return _AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT
 
 
@@ -799,6 +806,44 @@ def _build_aawm_alias_routing_durable_cache_key(
 
 
 def _get_aawm_alias_routing_dual_cache() -> Optional[Any]:
+    """Return the DualCache used for AAWM alias-routing durable state.
+
+    Prefer the dedicated alias-routing Redis manager. When that manager is
+    configured but currently unavailable/unhealthy, return None rather than
+    falling back to the shared proxy internal usage cache (auth/budget/rate
+    limit plane). Legacy shared-cache fallback is only allowed when dedicated
+    routing Redis is unconfigured.
+    """
+    try:
+        from litellm.proxy import aawm_alias_routing_redis
+
+        # Prefer a healthy dedicated dual cache first.
+        try:
+            dual_cache = aawm_alias_routing_redis.get_dual_cache()
+            if (
+                dual_cache is not None
+                and getattr(dual_cache, "redis_cache", None) is not None
+            ):
+                return dual_cache
+        except Exception:
+            # Dual-cache access is best-effort; fail safe into status/fallback.
+            dual_cache = None
+
+        # After dedicated get_dual_cache(), consult status. Configured but no
+        # dedicated cache must not use shared internal_usage_cache.
+        try:
+            status = aawm_alias_routing_redis.get_status()
+            if isinstance(status, dict) and status.get("configured") is True:
+                return None
+        except Exception:
+            # Status lookup is best-effort; do not break request paths. Treat as
+            # unconfigured only for the legacy shared fallback decision below.
+            pass
+    except Exception:
+        # Fail-safe: if the dedicated manager cannot be consulted at all, keep
+        # the historical unconfigured legacy fallback path below.
+        pass
+
     try:
         from litellm.proxy.proxy_server import proxy_logging_obj
     except Exception:
@@ -878,8 +923,11 @@ async def _write_aawm_alias_routing_durable_payload(
     durable_payload["expires_at_epoch"] = (
         time.time() + max(0.0, float(ttl_seconds))
     )
+    redis_cache = getattr(dual_cache, "redis_cache", None)
+    if redis_cache is None:
+        return False
     try:
-        await dual_cache.async_set_cache(
+        await redis_cache.async_set_cache(
             key=cache_key,
             value=durable_payload,
             ttl=max(1.0, float(ttl_seconds)),

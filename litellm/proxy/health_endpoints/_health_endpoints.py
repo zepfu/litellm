@@ -145,6 +145,58 @@ def get_callback_identifier(callback):
     return callback_name(callback)
 
 
+def _build_default_aawm_alias_routing_cache_status() -> Dict[str, Any]:
+    return {
+        "configured": False,
+        "mode": "memory",
+        "state_source": "memory",
+        "reachable": "unknown",
+        "namespace": "default",
+        "key_prefix": "aawm:alias-routing:default",
+        "error_type": None,
+    }
+
+
+def _get_aawm_alias_routing_cache_status() -> Dict[str, Any]:
+    """
+    Return sanitized readiness telemetry for alias-routing Redis wiring.
+    This only exposes stable status fields and avoids leaking secret values.
+    """
+    try:
+        from litellm.proxy import aawm_alias_routing_redis
+
+        status_provider = getattr(aawm_alias_routing_redis, "get_status", None)
+        if status_provider is None:
+            manager = getattr(
+                aawm_alias_routing_redis, "aawm_alias_routing_redis_manager", None
+            )
+            status_provider = manager.get_status if manager is not None else None
+
+        if status_provider is None:
+            return _build_default_aawm_alias_routing_cache_status()
+
+        if not callable(status_provider):
+            return _build_default_aawm_alias_routing_cache_status()
+
+        raw_status = status_provider()
+        if not isinstance(raw_status, dict):
+            return _build_default_aawm_alias_routing_cache_status()
+
+        namespace = raw_status.get("namespace") or "default"
+        return {
+            "configured": bool(raw_status.get("configured")),
+            "mode": raw_status.get("mode", "memory"),
+            "state_source": raw_status.get("state_source", "memory"),
+            "reachable": raw_status.get("reachable", "unknown"),
+            "namespace": namespace,
+            "key_prefix": raw_status.get("key_prefix")
+            or f"aawm:alias-routing:{namespace}",
+            "error_type": raw_status.get("error_type"),
+        }
+    except Exception:
+        return _build_default_aawm_alias_routing_cache_status()
+
+
 router = APIRouter()
 services = Union[
     Literal[
@@ -1326,6 +1378,7 @@ async def health_readiness():
                 "db": db_health_status["status"],
                 "cache": cache_type,
                 "litellm_version": version,
+                "aawm_alias_routing_cache": _get_aawm_alias_routing_cache_status(),
                 "success_callbacks": success_callback_names,
                 "use_aiohttp_transport": AsyncHTTPHandler._should_use_aiohttp_transport(),
                 "log_level": log_level_name,
@@ -1337,6 +1390,7 @@ async def health_readiness():
                 "db": "Not connected",
                 "cache": cache_type,
                 "litellm_version": version,
+                "aawm_alias_routing_cache": _get_aawm_alias_routing_cache_status(),
                 "success_callbacks": success_callback_names,
                 "use_aiohttp_transport": AsyncHTTPHandler._should_use_aiohttp_transport(),
                 "log_level": log_level_name,

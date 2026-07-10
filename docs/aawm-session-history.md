@@ -442,13 +442,18 @@ state source in metadata rather than labeling it durable.
 
 Operational notes:
 
-- Namespace env: `AAWM_ALIAS_ROUTING_STATE_NAMESPACE` (default: `aawm-routing-v1`).
-  Prod and dev instances that should share routing state must use the same value.
+- Namespace env: `AAWM_ALIAS_ROUTING_STATE_NAMESPACE`.
+  When it is omitted, `LITELLM_LANGFUSE_TRACE_ENVIRONMENT` (falling back to
+  `LITELLM_AAWM_ERROR_LOG_ENV`) derives `aawm-routing-dev-v1` or
+  `aawm-routing-prod-v1`. Use one explicit shared namespace only for
+  intentionally shared routing planes.
 - Durable key shape:
   `aawm:alias-routing:{namespace}:{family}:{kind}:{state_key}` where `family` is
   `codex` or `anthropic`, and `kind` is `affinity` or `cooldown`.
 - Durable payloads store absolute wall-clock expiry (`expires_at_epoch` via
   `time.time()`). Process-local maps still use monotonic expiry for the fast path.
+- `AAWM_ALIAS_ROUTING_REDIS_*` settings only control alias-routing state persistence.
+  They do not enable or alter LLM response caching.
 - Read order: memory first, then durable cache hydrate; if durable cache is absent
   or unavailable, selectors keep the existing in-memory fallback without failing
   the request.
@@ -461,6 +466,11 @@ Operational notes:
   means the selector skipped a candidate because a separate quota observation,
   rather than candidate-specific cooldown state, showed the provider account or
   lane was exhausted until a known reset time.
+- Readiness reporting should reflect whether routing state is coming from durable
+  cache (`durable_cache`) or local fallback (`local_fallback` / in-memory), so
+  operators can distinguish persistent state from process-local behavior.
+- Shared PostgreSQL durable quota (`durable_quota`) remains separate and is not
+  merged across routing namespaces.
 - Bare transient upstream statuses (`500`, `502`, `503`, and `529`) that do not
   carry explicit capacity, quota, rate-limit, or usage-limit evidence are
   treated as request-local alias failures. They are skipped for the current

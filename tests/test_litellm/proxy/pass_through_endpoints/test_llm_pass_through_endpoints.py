@@ -35247,9 +35247,8 @@ class TestCursorProxyRoute:
 
 
 class _FakeAawmAliasRoutingDualCache:
-    redis_cache = object()
-
     def __init__(self, *, fail_writes: bool = False) -> None:
+        self.redis_cache = self
         self.fail_writes = fail_writes
         self.store: dict[str, Any] = {}
         self.set_calls: list[dict[str, Any]] = []

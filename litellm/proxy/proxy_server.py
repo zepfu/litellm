@@ -335,6 +335,10 @@ from litellm.proxy.health_endpoints._health_endpoints import router as health_ro
 from litellm.proxy.hooks.model_max_budget_limiter import (
     _PROXY_VirtualKeyModelMaxBudgetLimiter,
 )
+from litellm.proxy.aawm_alias_routing_redis import (
+    initialize as initialize_aawm_alias_routing_redis,
+    shutdown as shutdown_aawm_alias_routing_redis,
+)
 from litellm.proxy.hooks.prompt_injection_detection import (
     _OPTIONAL_PromptInjectionDetection,
 )
@@ -708,6 +712,7 @@ def cleanup_router_config_variables():
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
+    await shutdown_aawm_alias_routing_redis()
     try:
         await litellm.close_litellm_async_clients()
     except Exception as e:
@@ -964,6 +969,8 @@ async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
         proxy_logging_obj=proxy_logging_obj,
         redis_usage_cache=redis_usage_cache,
     )
+
+    await initialize_aawm_alias_routing_redis()
 
     ## Validate use_redis_transaction_buffer requires Redis cache ##
     ProxyStartupEvent._validate_redis_transaction_buffer_config(
