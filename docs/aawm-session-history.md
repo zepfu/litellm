@@ -473,10 +473,16 @@ Operational notes:
   merged across routing namespaces.
 - Bare transient upstream statuses (`500`, `502`, `503`, and `529`) that do not
   carry explicit capacity, quota, rate-limit, or usage-limit evidence are
-  treated as request-local alias failures. They are skipped for the current
-  alias progression so failover can continue, but they do not write durable
-  provider/model cooldown state. Explicit capacity/rate-limit/usage-limit
-  failures still use candidate cooldowns.
+  treated as request-local alias failures for most candidates. They are skipped
+  for the current alias progression so failover can continue, but they do not
+  write durable provider/model cooldown state. Native Grok 4.5 candidates on
+  `codex_grok_native_responses_adapter` and
+  `anthropic_grok_native_responses_adapter` use cooldown scope `none` for these
+  bare transient classes: fresh requests exclude the failed native candidate for
+  that request only, while in-flight continuations retry the same affinity
+  candidate within the existing attempt budget instead of signaling
+  `redispatch_required`. Explicit capacity/rate-limit/usage-limit failures still
+  use candidate cooldowns.
 - For the `gpt-5.3-codex-spark` candidate only, durable capacity, rate-limit,
   usage-limit, malformed_tool_call_text, upstream-overloaded, and upstream-timeout
   cooldowns are capped at five minutes. Other candidates keep the default durable

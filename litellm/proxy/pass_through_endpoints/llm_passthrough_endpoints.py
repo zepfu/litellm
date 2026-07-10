@@ -5377,6 +5377,11 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     ):
         return "request_local"
     if (
+        _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
+        and _is_codex_auto_agent_transient_internal_error_class(error_class)
+    ):
+        return "none"
+    if (
         _is_codex_auto_agent_spark_candidate(candidate)
         and _is_codex_auto_agent_transient_internal_error_class(error_class)
     ):
