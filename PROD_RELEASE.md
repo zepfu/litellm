@@ -193,6 +193,31 @@ when reproducing a historical build exactly.
 
 ## Promote Infrastructure
 
+### D1-508 Production Alias-routing Redis Readiness
+
+Before any production release that relies on durable alias-routing state:
+
+- Configure a dedicated, reachable production alias-routing Redis endpoint
+  using a DNS service name (for example `aawm-alias-routing-redis`) rather than
+  hardcoded Docker bridge IPs.
+- Set production state namespace explicitly to `aawm-routing-prod-v1` via
+  `AAWM_ALIAS_ROUTING_STATE_NAMESPACE`.
+- Keep the production namespace and routing network isolated from dev
+  (`aawm-routing-dev-v1`); do not reuse the dev service or namespace.
+- Point production to Redis with persistent storage and health/readiness
+  dependencies so `aawm-litellm` starts alias-routing reads/writes only after
+  Redis is reachable.
+- Treat `AAWM_ALIAS_ROUTING_REDIS_*` settings as routing-state controls only.
+  They do not enable response caching.
+- Add post-release probes before production acceptance:
+  - Confirm `:4000` readiness/health telemetry reports routing
+    `state_source=durable_cache` and namespace `aawm-routing-prod-v1`.
+  - Probe `aawm:alias-routing:aawm-routing-prod-v1:*` keyspace and check key
+    TTLs against expected cooldown windows.
+  - Run cross-environment namespace checks: production must not consume keys
+    from `aawm-routing-dev-v1`, and dev validation should not consume keys
+    from `aawm-routing-prod-v1`.
+
 Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
 1. Update the prod LiteLLM base image pin in the infrastructure files.

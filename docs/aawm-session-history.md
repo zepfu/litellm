@@ -476,8 +476,10 @@ Operational notes:
   `codex` or `anthropic`, and `kind` is `affinity` or `cooldown`.
 - Durable payloads store absolute wall-clock expiry (`expires_at_epoch` via
   `time.time()`). Process-local maps still use monotonic expiry for the fast path.
-- `AAWM_ALIAS_ROUTING_REDIS_*` settings only control alias-routing state persistence.
-  They do not enable or alter LLM response caching.
+- `AAWM_ALIAS_ROUTING_REDIS_*` settings only control alias-routing state
+  persistence. They do not enable or alter LLM response caching.
+- Standard LiteLLM Router `failed_calls` counters remain process-local
+  telemetry and are not mirrored by the durable alias-routing Redis manager.
 - Read order: memory first, then durable cache hydrate; if durable cache is absent
   or unavailable, selectors keep the existing in-memory fallback without failing
   the request.
