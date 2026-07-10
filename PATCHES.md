@@ -53,6 +53,52 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.118 — Durable alias-routing state and Responses terminal hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.118`. This release
+carries the validated commits after `aawm.117` and updates the release-head
+metadata for the D1-508 workstream:
+
+- Persist AAWM alias routing cooldown and affinity state in Redis, with explicit
+  environment-scoped namespace behavior (`aawm-routing-dev-v1` in dev and
+  `aawm-routing-prod-v1` for production).
+- Surface cache readiness and fallback visibility by keeping the routing state
+  source explicit (`durable_cache`, `local_fallback`, or memory) in readiness
+  and alias-routing diagnostics.
+- Handle and log Responses terminal outcomes (`completed`, `failed`, and
+  `incomplete`) safely in stream workflows with terminal diagnostic redaction
+  and correct status classification.
+- Capture terminal agent alias outcomes, including stable `call_id` and
+  partial-edit activity, as audit-only evidence without synthetic
+  `session_history` writes.
+- Rewrite Grok 4.5 Responses continuation payloads so function-call and
+  function-call-output paths remain compatible with Responses/OIDC callers,
+  including safe function-name sanitization and native Grok transient retries.
+- Isolate passthrough failure capture and stabilize passthrough test teardown so
+  passthrough tests end cleanly without leaking process-local stream state.
+- Adapt Codex `apply_patch` compatibility for Grok alias paths and document
+  environment-specific terminal intake expectations.
+- Fix direct passthrough typing and route-suppression assertions supporting the
+  continuity and terminal fixes.
+
+**Why:** Alias routing now depends on durable, restart-safe state for D1-508
+behavior and on predictable terminal-stream semantics for continuation and
+error observability. This patch consolidates those capabilities into one fork
+release so promotion proceeds from a coherent image head.
+
+**Why not upstream:** Redis namespace-scoped routing durability, terminal
+observability contracts for AAWM workflows, safe Responses compatibility
+shaping, and passthrough test-teardown hardening are fork-local operational
+behaviors with explicit AAWM production requirements.
+
+**Validation status:** The release validation includes terminal-stream, Grok
+continuation, terminal alias audit, passthrough failure/logging, and Redis
+durability tests. **Production promotion is not complete yet:** follow
+`PROD_RELEASE.md`, build from the approved `main` promotion head, and configure
+production with
+`AAWM_ALIAS_ROUTING_STATE_NAMESPACE=aawm-routing-prod-v1` without sharing the
+dev namespace before declaring rollout complete.
+
 ### aawm.117 — Grok 4.5 rollout image realignment after model-config autobump
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.117`. This release
