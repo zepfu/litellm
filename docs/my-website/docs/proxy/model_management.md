@@ -48,6 +48,22 @@ Codex alias routing uses:
 - `aawm-low`: OpenRouter/OpenCode lanes → `gpt-5.6-luna` → `gpt-5.4-mini`
 - `aawm-orchestration`: `gpt-5.6-terra` → `gpt-5.5`
 
+:::warning Anthropic models require Anthropic-native egress
+Determine this boundary from the selected upstream provider/model, not from the
+client wire format. Claude Code may send Anthropic-shaped requests to
+non-Anthropic alias candidates through supported adapters, but a selected
+Anthropic/Claude model must use an Anthropic-native route and provider
+credential.
+
+Never route an Anthropic/Claude model through Codex/ChatGPT OAuth,
+`chatgpt.com/backend-api/codex/responses`, an OpenAI/Codex adapter, or another
+provider's transport. This includes alias fallback, retries, cooldown recovery,
+probes, smoke tests, acceptance harnesses, and manual diagnostics. If the
+Anthropic-native route is unavailable, fail closed instead of rerouting; treat
+cross-provider Anthropic-model egress as a potential terms-of-service
+violation.
+:::
+
 :::tip Sync Model Data
 Keep your model pricing data up to date by [syncing models from GitHub](sync_models_github.md).
 :::

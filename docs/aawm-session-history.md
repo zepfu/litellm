@@ -637,6 +637,26 @@ serve. If a declared candidate mishandles tools, that is an adapter translation
 defect to fix or evidence for removing/reclassifying the candidate; it is not a
 selector-side compatibility decision.
 
+## Anthropic Upstream Egress Boundary
+
+The Anthropic/Claude routing boundary is determined by the selected upstream
+provider and model, not by the request's wire format. An Anthropic-shaped
+Claude Code request may use a supported adapter to reach a non-Anthropic model.
+That adapter flow does not authorize an Anthropic/Claude model to use the same
+cross-provider egress.
+
+Any selected Anthropic/Claude model must use an Anthropic-native route and
+Anthropic-native provider credential. It must never be sent through
+Codex/ChatGPT OAuth, `chatgpt.com/backend-api/codex/responses`, an OpenAI/Codex
+adapter, or another provider's transport. This prohibition applies to alias
+candidate selection, fallbacks, retries, cooldown recovery, probes, smoke
+tests, acceptance harnesses, and manual diagnostics.
+
+If the Anthropic-native route or credential is unavailable, routing must fail
+closed and retain explicit failure/audit metadata. It must not silently select
+a Codex path for the Anthropic model. Cross-provider egress for a selected
+Anthropic/Claude model is treated as a potential terms-of-service violation.
+
 ## Anthropic Adapter Usage Visibility
 
 Anthropic-compatible adapter streams can expose client-visible usage estimates

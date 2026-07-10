@@ -24,6 +24,25 @@ one-off incident investigation. Normal release validation should use the named
 target profile so port, container, and Langfuse environment checks stay tied
 together.
 
+## Anthropic Model Routing TOS Boundary
+
+Release validation must determine Anthropic model traffic from the selected
+upstream provider/model, not merely from an Anthropic-shaped request path.
+Claude Code adapter cases may intentionally select non-Anthropic models, but
+any selected Anthropic/Claude model must use an Anthropic-native route and
+Anthropic-native provider credential.
+
+Never use Codex/ChatGPT OAuth, `chatgpt.com/backend-api/codex/responses`, an
+OpenAI/Codex adapter, or another provider's transport for an Anthropic/Claude
+model. This applies to configured aliases, fallback and retry candidates,
+cooldown recovery, focused probes, smoke tests, acceptance-harness cases, and
+ad hoc release diagnostics.
+
+If an Anthropic-native route or credential is unavailable, the affected check
+must fail closed with an explicit error. Do not add or execute a cross-provider
+Anthropic-model fallback to make a release gate pass. Treat such routing as a
+potential terms-of-service violation.
+
 ## Preconditions
 
 Before cutting or promoting a release:

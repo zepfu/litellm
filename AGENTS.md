@@ -29,6 +29,29 @@ LiteLLM is a unified interface for 100+ LLMs that:
 
 ## ORCHESTRATOR PROMPT GUIDANCE
 
+### Anthropic Model Routing TOS Boundary
+
+Anthropic/Claude models may receive traffic only through Claude-native or
+Anthropic-native provider routes using credentials accepted for that native
+route. Never send traffic for a selected Anthropic/Claude model through Codex
+or ChatGPT OAuth, `chatgpt.com/backend-api/codex/responses`, an OpenAI/Codex
+adapter, or any other cross-provider egress path.
+
+This boundary follows the resolved upstream provider and model, not the inbound
+wire format. Claude Code may send Anthropic-shaped requests to aliases that
+select non-Anthropic models through supported adapters; that does not make the
+selected upstream model Anthropic traffic. If the selected upstream model is
+Anthropic/Claude, however, its egress must remain Anthropic-native.
+
+Apply this rule to normal routing, alias candidates, cross-provider fallbacks,
+retries, cooldown recovery, probes, smoke tests, acceptance harnesses, and ad
+hoc diagnostics. If the native Anthropic route or credential is unavailable,
+fail closed with an explicit routing/authentication error and audit evidence.
+Do not reroute the Anthropic model through Codex to recover availability,
+consume a different account entitlement, or make a test pass. Treat any such
+cross-provider Anthropic-model routing as a potential terms-of-service
+violation.
+
 ### Investigation Ownership For AAWM Alias Flows
 
 This fork owns the AAWM model aliases and the LiteLLM-side routing,
