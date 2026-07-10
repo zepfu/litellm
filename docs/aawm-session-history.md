@@ -1052,6 +1052,39 @@ WHERE h.session_id = $1
 The durable table stores sanitized/redacted definitions only. It should be used
 for drill-down and attribution evidence, not as proof that any tool was called.
 
+## OpenAI Responses Function-Name Sanitization
+
+OpenAI Responses requests may contain the same function name in historical
+`input` items, current `tools` declarations, and a function `tool_choice`.
+Before direct Codex/OpenAI Responses egress, including
+Anthropic-to-Responses adapter routes, LiteLLM builds one request-local mapping
+for names longer than 64 characters and applies it consistently to:
+
+- top-level `input` items with `type=function_call`;
+- top-level `tools` entries with `type=function`;
+- top-level function `tool_choice` values.
+
+Existing names of 64 characters or fewer are reserved unchanged. Rewritten
+names use a deterministic digest and collision fallback so distinct original
+names cannot silently merge. The mapping exists only for the lifetime of the
+request. Successful JSON and SSE Responses output restores the original
+client-visible name on function-call items, function-argument completion
+events, and terminal response payloads.
+
+When rewriting occurs, bounded metadata may include:
+
+- `responses_function_name_sanitization_algorithm`;
+- `responses_function_name_sanitization_max_length`;
+- `responses_function_name_sanitized_distinct_count`;
+- `responses_function_name_sanitized_occurrence_count`;
+- `responses_function_name_sanitized_surfaces`;
+- `responses_function_name_sanitization_collision_fallback`.
+
+These fields describe the adaptation only. They never contain the original
+names, rewritten names, or the request-local mapping. Use them to explain why
+the provider-bound shape differs from captured client input, not as evidence
+that a function was selected or executed.
+
 ## Output Contract Metadata
 
 Runtime session-history scoring records bounded output-contract classifications in

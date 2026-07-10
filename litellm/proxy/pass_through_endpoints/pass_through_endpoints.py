@@ -10,7 +10,7 @@ from base64 import b64encode
 from datetime import datetime, timezone
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 import httpx
@@ -72,6 +72,11 @@ from litellm.proxy.common_utils.http_parsing_utils import (
 )
 from litellm.proxy.litellm_pre_call_utils import clean_headers
 from litellm.proxy.utils import get_server_root_path, normalize_route_for_root_path
+from litellm.responses.function_name_sanitization import (
+    ResponsesFunctionNameRewrite,
+    restore_function_names_in_responses_body,
+    sanitize_responses_function_names,
+)
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.custom_http import httpxSpecialProvider
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
@@ -103,6 +108,150 @@ _ANTHROPIC_CONTEXT_OVERFLOW_MARKERS = (
     "maximum context length",
     "too many tokens",
 )
+
+
+def _is_openai_responses_function_name_target(
+    *,
+    url: httpx.URL,
+    custom_llm_provider: Optional[str],
+) -> bool:
+    provider = (
+        custom_llm_provider.value
+        if isinstance(custom_llm_provider, litellm.LlmProviders)
+        else custom_llm_provider
+    )
+    if str(provider or "").lower() != litellm.LlmProviders.OPENAI.value:
+        return False
+    path = str(url.path or "").lower().rstrip("/")
+    return path.endswith("/responses") or "/responses/" in path
+
+
+def _record_responses_function_name_diagnostics(
+    metadata: dict[str, Any],
+    rewrite: ResponsesFunctionNameRewrite,
+) -> None:
+    diagnostics = rewrite.diagnostics
+    metadata.update(
+        {
+            "responses_function_name_sanitization_algorithm": (
+                diagnostics.algorithm_version
+            ),
+            "responses_function_name_sanitization_max_length": (diagnostics.max_length),
+            "responses_function_name_sanitized_distinct_count": (
+                diagnostics.distinct_rewritten_count
+            ),
+            "responses_function_name_sanitized_occurrence_count": (
+                diagnostics.rewritten_occurrence_count
+            ),
+            "responses_function_name_sanitized_surfaces": list(
+                diagnostics.affected_surfaces
+            ),
+            "responses_function_name_sanitization_collision_fallback": (
+                diagnostics.collision_fallback_used
+            ),
+        }
+    )
+
+
+def _restore_responses_sse_payload(
+    payload: Any,
+    rewrite: ResponsesFunctionNameRewrite,
+) -> Any:
+    restored = restore_function_names_in_responses_body(
+        payload,
+        rewrite.upstream_to_original,
+    )
+    if not isinstance(restored, dict):
+        return restored
+    if restored.get("type") != "response.function_call_arguments.done":
+        return restored
+    name = restored.get("name")
+    original_name = rewrite.restore_name(name)
+    if original_name == name:
+        return restored
+    updated = dict(restored)
+    updated["name"] = original_name
+    return updated
+
+
+def _restore_responses_sse_frame(
+    frame: bytes,
+    rewrite: ResponsesFunctionNameRewrite,
+) -> bytes:
+    updated_lines: list[bytes] = []
+    changed = False
+    for line in frame.splitlines(keepends=True):
+        line_ending = b""
+        content = line
+        if line.endswith(b"\r\n"):
+            content = line[:-2]
+            line_ending = b"\r\n"
+        elif line.endswith(b"\n"):
+            content = line[:-1]
+            line_ending = b"\n"
+        if not content.startswith(b"data:"):
+            updated_lines.append(line)
+            continue
+
+        prefix = b"data: " if content.startswith(b"data: ") else b"data:"
+        payload_bytes = content[len(prefix) :]
+        if payload_bytes.strip() == b"[DONE]":
+            updated_lines.append(line)
+            continue
+        try:
+            payload = json.loads(payload_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            updated_lines.append(line)
+            continue
+        restored = _restore_responses_sse_payload(payload, rewrite)
+        if restored is payload:
+            updated_lines.append(line)
+            continue
+        updated_lines.append(
+            prefix
+            + json.dumps(
+                restored,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + line_ending
+        )
+        changed = True
+    return b"".join(updated_lines) if changed else frame
+
+
+def _next_sse_frame_boundary(buffer: bytes) -> Optional[tuple[int, int]]:
+    boundaries = [
+        (index, len(delimiter))
+        for delimiter in (b"\r\n\r\n", b"\n\n")
+        if (index := buffer.find(delimiter)) >= 0
+    ]
+    return min(boundaries) if boundaries else None
+
+
+async def _restore_responses_function_names_in_sse_chunks(
+    chunks: Any,
+    rewrite: ResponsesFunctionNameRewrite,
+) -> AsyncIterator[bytes]:
+    buffer = b""
+    async for chunk in chunks:
+        if isinstance(chunk, str):
+            buffer += chunk.encode("utf-8")
+        elif isinstance(chunk, bytes):
+            buffer += chunk
+        else:
+            buffer += bytes(chunk)
+
+        while (boundary := _next_sse_frame_boundary(buffer)) is not None:
+            frame_end, delimiter_length = boundary
+            complete_end = frame_end + delimiter_length
+            frame = buffer[:complete_end]
+            buffer = buffer[complete_end:]
+            yield _restore_responses_sse_frame(frame, rewrite)
+
+    if buffer:
+        yield _restore_responses_sse_frame(buffer, rewrite)
+
 
 # Global registry to track registered pass-through routes and prevent memory leaks
 _registered_pass_through_routes: Dict[
@@ -3484,6 +3633,7 @@ async def pass_through_request(  # noqa: PLR0915
     kwargs: Optional[dict] = None
     error_log_context: Optional[Dict[str, Any]] = None
     raw_body: Optional[bytes] = None
+    responses_function_name_rewrite: Optional[ResponsesFunctionNameRewrite] = None
     route_custom_headers = dict(custom_headers or {})
     headers: Dict[str, Any] = dict(route_custom_headers)
     retryable_status_codes = {
@@ -3665,6 +3815,15 @@ async def pass_through_request(  # noqa: PLR0915
         provider_bound_body = _provider_bound_body_from_kwargs(kwargs)
         if provider_bound_body is None:
             provider_bound_body = _parsed_body if isinstance(_parsed_body, dict) else {}
+        if _is_openai_responses_function_name_target(
+            url=url,
+            custom_llm_provider=custom_llm_provider,
+        ):
+            responses_function_name_rewrite = sanitize_responses_function_names(
+                provider_bound_body
+            )
+            if responses_function_name_rewrite.changed:
+                provider_bound_body = responses_function_name_rewrite.body
         local_prepare_completed_at = datetime.now()
         local_prepare_ms = _record_passthrough_duration(
             kwargs,
@@ -3677,6 +3836,14 @@ async def pass_through_request(  # noqa: PLR0915
 
         metadata = _ensure_passthrough_metadata(kwargs)
         metadata["aawm_passthrough_endpoint_type"] = endpoint_type.value
+        if (
+            responses_function_name_rewrite is not None
+            and responses_function_name_rewrite.changed
+        ):
+            _record_responses_function_name_diagnostics(
+                metadata,
+                responses_function_name_rewrite,
+            )
         _merge_passthrough_request_shape_metadata(
             metadata,
             request=request,
@@ -3856,23 +4023,32 @@ async def pass_through_request(  # noqa: PLR0915
                 span_metadata={"stage": "upstream_wait", "stream": True},
             )
 
+            processed_chunks = PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body=_parsed_body,
+                litellm_logging_obj=logging_obj,
+                endpoint_type=endpoint_type,
+                start_time=start_time,
+                passthrough_success_handler_obj=pass_through_endpoint_logging,
+                url_route=str(url),
+                passthrough_logging_payload=passthrough_logging_payload,
+                custom_llm_provider=custom_llm_provider,
+                success_handler_kwargs=kwargs,
+                upstream_wait_started_at=upstream_wait_started_at,
+                upstream_wait_completed_at=upstream_wait_completed_at,
+                local_prepare_ms=local_prepare_ms,
+                error_log_context=error_log_context,
+            )
+            if (
+                responses_function_name_rewrite is not None
+                and responses_function_name_rewrite.changed
+            ):
+                processed_chunks = _restore_responses_function_names_in_sse_chunks(
+                    processed_chunks,
+                    responses_function_name_rewrite,
+                )
             return StreamingResponse(
-                PassThroughStreamingHandler.chunk_processor(
-                    response=response,
-                    request_body=_parsed_body,
-                    litellm_logging_obj=logging_obj,
-                    endpoint_type=endpoint_type,
-                    start_time=start_time,
-                    passthrough_success_handler_obj=pass_through_endpoint_logging,
-                    url_route=str(url),
-                    passthrough_logging_payload=passthrough_logging_payload,
-                    custom_llm_provider=custom_llm_provider,
-                    success_handler_kwargs=kwargs,
-                    upstream_wait_started_at=upstream_wait_started_at,
-                    upstream_wait_completed_at=upstream_wait_completed_at,
-                    local_prepare_ms=local_prepare_ms,
-                    error_log_context=error_log_context,
-                ),
+                processed_chunks,
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
                     litellm_call_id=litellm_call_id,
@@ -3974,23 +4150,32 @@ async def pass_through_request(  # noqa: PLR0915
         verbose_proxy_logger.debug("response.headers= %s", response.headers)
 
         if _is_streaming_response(response) is True:
+            processed_chunks = PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body=_parsed_body,
+                litellm_logging_obj=logging_obj,
+                endpoint_type=endpoint_type,
+                start_time=start_time,
+                passthrough_success_handler_obj=pass_through_endpoint_logging,
+                url_route=str(url),
+                passthrough_logging_payload=passthrough_logging_payload,
+                custom_llm_provider=custom_llm_provider,
+                success_handler_kwargs=kwargs,
+                upstream_wait_started_at=upstream_wait_started_at,
+                upstream_wait_completed_at=upstream_wait_completed_at,
+                local_prepare_ms=local_prepare_ms,
+                error_log_context=error_log_context,
+            )
+            if (
+                responses_function_name_rewrite is not None
+                and responses_function_name_rewrite.changed
+            ):
+                processed_chunks = _restore_responses_function_names_in_sse_chunks(
+                    processed_chunks,
+                    responses_function_name_rewrite,
+                )
             return StreamingResponse(
-                PassThroughStreamingHandler.chunk_processor(
-                    response=response,
-                    request_body=_parsed_body,
-                    litellm_logging_obj=logging_obj,
-                    endpoint_type=endpoint_type,
-                    start_time=start_time,
-                    passthrough_success_handler_obj=pass_through_endpoint_logging,
-                    url_route=str(url),
-                    passthrough_logging_payload=passthrough_logging_payload,
-                    custom_llm_provider=custom_llm_provider,
-                    success_handler_kwargs=kwargs,
-                    upstream_wait_started_at=upstream_wait_started_at,
-                    upstream_wait_completed_at=upstream_wait_completed_at,
-                    local_prepare_ms=local_prepare_ms,
-                    error_log_context=error_log_context,
-                ),
+                processed_chunks,
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
                     litellm_call_id=litellm_call_id,
@@ -4014,6 +4199,22 @@ async def pass_through_request(  # noqa: PLR0915
 
         ## LOG SUCCESS
         response_body: Optional[dict] = get_response_body(response)
+        if (
+            response_body is not None
+            and responses_function_name_rewrite is not None
+            and responses_function_name_rewrite.changed
+        ):
+            restored_response_body = restore_function_names_in_responses_body(
+                response_body,
+                responses_function_name_rewrite.upstream_to_original,
+            )
+            if restored_response_body is not response_body:
+                response_body = restored_response_body
+                content = json.dumps(
+                    restored_response_body,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
         passthrough_logging_payload["response_body"] = response_body
         capture_passthrough_shape(
             mode="nonstream",
@@ -4070,13 +4271,19 @@ async def pass_through_request(  # noqa: PLR0915
             api_base=str(url._uri_reference),
         )
 
+        response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+            headers=response.headers,
+            custom_headers=custom_headers,
+        )
+        if (
+            responses_function_name_rewrite is not None
+            and responses_function_name_rewrite.changed
+        ):
+            response_headers.pop("content-length", None)
         return Response(
             content=content,
             status_code=response.status_code,
-            headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                headers=response.headers,
-                custom_headers=custom_headers,
-            ),
+            headers=response_headers,
         )
     except Exception as e:
         custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(

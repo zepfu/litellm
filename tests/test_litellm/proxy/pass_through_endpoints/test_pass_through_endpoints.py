@@ -57,12 +57,16 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _is_known_grok_build_usage_balance_exhausted_response,
     _get_passthrough_grok_build_usage_balance_exhausted_failure_kind,
     _is_known_chatgpt_codex_model_not_supported_for_account_response,
+    _restore_responses_function_names_in_sse_chunks,
     _get_passthrough_chatgpt_codex_model_not_supported_failure_kind,
     _record_grok_billing_passthrough_request_contract,
     _record_passthrough_hidden_retry_metadata,
     _should_log_passthrough_terminal_failure_without_traceback,
     emit_aawm_route_access_log,
     pass_through_request,
+)
+from litellm.responses.function_name_sanitization import (
+    sanitize_responses_function_names,
 )
 from litellm.proxy.pass_through_endpoints.streaming_handler import (
     PassThroughStreamingHandler,
@@ -7745,3 +7749,221 @@ async def test_route_streaming_logging_captures_code_assist_quota_observation(
         metadata["google_retrieve_user_quota"]["buckets"]["items"][0]["resetTime"]
         == "2026-06-04T00:00:00Z"
     )
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_passthrough_sanitizes_and_restores_function_names():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _build_anthropic_responses_adapter_request_body,
+    )
+
+    original_name = "mcp__server__" + ("long_function_name_" * 8)
+    translated_body = _build_anthropic_responses_adapter_request_body(
+        {
+            "model": "gpt-5.5",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_history",
+                            "name": original_name,
+                            "input": {"value": 1},
+                        }
+                    ],
+                }
+            ],
+            "max_tokens": 32,
+            "tools": [
+                {
+                    "name": original_name,
+                    "description": "Use the long-named tool.",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": original_name},
+        },
+        adapter_model="gpt-5.5",
+        use_chatgpt_codex_defaults=True,
+    )
+    translated_body["stream"] = False
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.url = MagicMock()
+    mock_request.url.path = "/anthropic/v1/messages"
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.query_params = {}
+    captured_body = {}
+
+    async def fake_non_stream_handler(**kwargs):
+        provider_body = kwargs["_parsed_body"]
+        captured_body.update(provider_body)
+        upstream_name = provider_body["tools"][0]["name"]
+        return httpx.Response(
+            status_code=200,
+            content=json.dumps(
+                {
+                    "id": "resp_d1_500",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "gpt-5.5",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_d1_500",
+                            "call_id": "call_d1_500",
+                            "name": upstream_name,
+                            "arguments": "{}",
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ).encode("utf-8"),
+            headers={
+                "content-type": "application/json",
+                "content-length": "1",
+                "x-request-id": "request-d1-500",
+            },
+            request=httpx.Request(
+                "POST",
+                "https://chatgpt.com/backend-api/codex/responses",
+            ),
+        )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+        "get_async_httpx_client"
+    ) as mock_get_client, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+        "HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=fake_non_stream_handler,
+    ), patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj"
+    ) as mock_logging_obj, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+        "capture_passthrough_shape"
+    ):
+        mock_client_obj = MagicMock()
+        mock_client_obj.client = MagicMock()
+        mock_get_client.return_value = mock_client_obj
+        mock_logging_obj.pre_call_hook = AsyncMock(return_value=translated_body)
+
+        response = await pass_through_request(
+            request=mock_request,
+            target="https://chatgpt.com/backend-api/codex/responses",
+            custom_headers={"authorization": "Bearer test"},
+            user_api_key_dict=MagicMock(),
+            custom_body=translated_body,
+            custom_llm_provider="openai",
+            stream=False,
+        )
+
+    historical_name = next(
+        item["name"]
+        for item in captured_body["input"]
+        if item.get("type") == "function_call"
+    )
+    assert len(historical_name) <= 64
+    assert historical_name == captured_body["tools"][0]["name"]
+    assert historical_name == captured_body["tool_choice"]["name"]
+    assert historical_name != original_name
+    assert (
+        next(
+            item["call_id"]
+            for item in captured_body["input"]
+            if item.get("type") == "function_call"
+        )
+        == "toolu_history"
+    )
+
+    response_body = json.loads(response.body)
+    assert response_body["output"][0]["name"] == original_name
+    assert response_body["output"][0]["call_id"] == "call_d1_500"
+    assert response.headers["x-request-id"] == "request-d1-500"
+    assert int(response.headers["content-length"]) == len(response.body)
+
+
+@pytest.mark.asyncio
+async def test_responses_sse_restoration_is_frame_preserving_across_split_chunks():
+    original_name = "stream_tool_" + ("x" * 80)
+    rewrite = sanitize_responses_function_names(
+        {
+            "tools": [{"type": "function", "name": original_name}],
+        }
+    )
+    upstream_name = rewrite.original_to_upstream[original_name]
+    raw_stream = (
+        "event: response.output_item.added\n"
+        + "data: "
+        + json.dumps(
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_stream",
+                    "call_id": "call_stream",
+                    "name": upstream_name,
+                    "arguments": "",
+                },
+            }
+        )
+        + "\n\n"
+        + "event: response.function_call_arguments.done\r\n"
+        + "data: "
+        + json.dumps(
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_stream",
+                "name": upstream_name,
+                "arguments": "{}",
+            }
+        )
+        + "\r\n\r\n"
+        + "event: response.completed\n"
+        + "data: "
+        + json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": upstream_name,
+                            "call_id": "call_stream",
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n\n"
+        + "data: not-json\n\n"
+        + "data: [DONE]\n\n"
+    ).encode("utf-8")
+
+    async def split_chunks():
+        for boundary in (7, 53, 127, 211, len(raw_stream)):
+            start = getattr(split_chunks, "start", 0)
+            if start >= len(raw_stream):
+                break
+            yield raw_stream[start:boundary]
+            split_chunks.start = boundary
+
+    split_chunks.start = 0
+    restored = b"".join(
+        [
+            chunk
+            async for chunk in _restore_responses_function_names_in_sse_chunks(
+                split_chunks(),
+                rewrite,
+            )
+        ]
+    )
+
+    assert original_name.encode("utf-8") in restored
+    assert upstream_name.encode("utf-8") not in restored
+    assert b"event: response.output_item.added\n" in restored
+    assert b"event: response.function_call_arguments.done\r\n" in restored
+    assert b"data: not-json\n\n" in restored
+    assert restored.endswith(b"data: [DONE]\n\n")
