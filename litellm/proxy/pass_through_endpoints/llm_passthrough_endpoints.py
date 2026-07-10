@@ -3241,6 +3241,580 @@ def _should_emit_auto_agent_alias_route_event(
     return True
 
 
+
+_AUTO_AGENT_ROLE_DECLARATION_RE = re.compile(
+    r"^[ \t]*You are a '(?P<agent>explorer|worker|default)' agent\.[ \t]*$",
+    re.MULTILINE,
+)
+_AUTO_AGENT_KNOWN_ROLE_NAMES = frozenset({"explorer", "worker", "default"})
+_AUTO_AGENT_PRIOR_TOOL_ITEM_TYPES = frozenset(
+    {
+        "function_call",
+        "function_call_output",
+        "tool_use",
+        "tool_result",
+        "mcp_call",
+        "mcp_tool_call",
+        "mcp_approval_request",
+        "mcp_approval_response",
+    }
+)
+_AUTO_AGENT_FILE_EDIT_TOOL_NAMES = frozenset(
+    {
+        "apply_patch",
+        "create_file",
+        "edit_file",
+        "multi_replace_file_content",
+        "replace_file_content",
+        "write_file",
+    }
+)
+_AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
+
+
+def _extract_auto_agent_alias_text_blobs(request_body: dict[str, Any]) -> list[str]:
+    blobs: list[str] = []
+    for key in ("instructions", "system"):
+        value = request_body.get(key)
+        if isinstance(value, str) and value.strip():
+            blobs.append(value)
+        elif isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+            if parts:
+                blobs.append("\n".join(parts))
+    messages = request_body.get("messages")
+    if isinstance(messages, list):
+        for message in messages[:5]:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").lower()
+            if role not in {"system", "developer"}:
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                blobs.append(content)
+            elif isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text") or block.get("content")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text)
+                    elif isinstance(block, str) and block.strip():
+                        parts.append(block)
+                if parts:
+                    blobs.append("\n".join(parts))
+    return blobs
+
+
+def _extract_auto_agent_alias_role_from_text(text: str) -> Optional[str]:
+    if not isinstance(text, str) or not text:
+        return None
+    match = _AUTO_AGENT_ROLE_DECLARATION_RE.search(text)
+    if not match:
+        return None
+    role = _clean_codex_auth_value(match.group("agent"))
+    if role is None:
+        return None
+    normalized = role.lower()
+    return normalized if normalized in _AUTO_AGENT_KNOWN_ROLE_NAMES else None
+
+
+def _infer_auto_agent_alias_role_from_request_body(
+    request_body: dict[str, Any],
+) -> Optional[str]:
+    for blob in _extract_auto_agent_alias_text_blobs(request_body):
+        role = _extract_auto_agent_alias_role_from_text(blob)
+        if role is not None:
+            return role
+    return None
+
+
+def _iter_auto_agent_alias_metadata_dicts(
+    request: Request,
+    request_body: dict[str, Any],
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for candidate in (
+        request_body.get("litellm_metadata"),
+        request_body.get("metadata"),
+        request_body.get("source"),
+    ):
+        if isinstance(candidate, dict):
+            sources.append(candidate)
+            nested_source = candidate.get("source")
+            if isinstance(nested_source, dict):
+                sources.append(nested_source)
+    headers = _safe_get_request_headers(request)
+    if isinstance(headers, dict) and headers:
+        sources.append(headers)
+    return sources
+
+
+def _extract_auto_agent_alias_agent_dispatch_fields(
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract explicit agent/dispatch fields with role-declaration fallback.
+
+    Prefer structured metadata when present. Fall back only to the exact
+    profile sentence form: ``You are a '<role>' agent.`` for explorer/worker/default.
+    """
+    fields: dict[str, Any] = {}
+    sources = _iter_auto_agent_alias_metadata_dicts(request, request_body)
+
+    def _first_from_sources(*keys: str) -> Optional[str]:
+        for source in sources:
+            for key in keys:
+                value = _clean_codex_auth_value(source.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    agent_name = _first_from_sources(
+        "agent_name",
+        "aawm_agent_name",
+        "aawm_claude_agent_name",
+        "codex_agent_name",
+    )
+    agent_role = _first_from_sources(
+        "agent_role",
+        "aawm_agent_role",
+        "codex_agent_role",
+        "agent_nickname",
+    )
+    agent_id = _first_from_sources(
+        "agent_id",
+        "aawm_agent_id",
+        "codex_agent_id",
+        "claude_agent_id",
+        "subagent_id",
+        "source_agent_id",
+    )
+    thread_source = _first_from_sources(
+        "thread_source",
+        "aawm_thread_source",
+        "codex_thread_source",
+    )
+    redispatch_ordinal = None
+    for source in sources:
+        for key in (
+            "redispatch_ordinal",
+            "agent_redispatch_ordinal",
+            "dispatch_ordinal",
+            "aawm_redispatch_ordinal",
+        ):
+            raw = source.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                redispatch_ordinal = int(raw)
+            except (TypeError, ValueError):
+                redispatch_ordinal = _clean_codex_auth_value(raw)
+            if redispatch_ordinal is not None:
+                break
+        if redispatch_ordinal is not None:
+            break
+    dispatch_id = _first_from_sources(
+        "dispatch_id",
+        "agent_dispatch_id",
+        "aawm_dispatch_id",
+        "codex_dispatch_id",
+    )
+    agent_profile = _first_from_sources(
+        "agent_profile",
+        "aawm_agent_profile",
+        "codex_agent_profile",
+    )
+
+    inferred_role = (
+        _infer_auto_agent_alias_role_from_request_body(request_body)
+        if agent_name is None or agent_role is None
+        else None
+    )
+    if inferred_role is not None:
+        if agent_role is None:
+            agent_role = inferred_role
+        if agent_name is None:
+            agent_name = inferred_role
+        if agent_profile is None:
+            agent_profile = inferred_role
+    if thread_source is None and inferred_role is not None:
+        thread_source = "subagent"
+
+    if agent_name is not None:
+        fields["agent_name"] = agent_name
+    if agent_role is not None:
+        fields["agent_role"] = agent_role
+    if agent_id is not None:
+        fields["agent_id"] = agent_id
+    if thread_source is not None:
+        fields["thread_source"] = thread_source
+    if redispatch_ordinal is not None:
+        fields["redispatch_ordinal"] = redispatch_ordinal
+    if dispatch_id is not None:
+        fields["dispatch_id"] = dispatch_id
+    if agent_profile is not None:
+        fields["agent_profile"] = agent_profile
+    return fields
+
+
+def _walk_auto_agent_alias_prior_tool_activity(
+    value: Any,
+    *,
+    tool_names: list[str],
+    file_edit_tool_names: list[str],
+    counters: dict[str, int],
+    _seen: Optional[set[int]] = None,
+) -> None:
+    if isinstance(value, (dict, list)):
+        if _seen is None:
+            _seen = set()
+        value_id = id(value)
+        if value_id in _seen:
+            return
+        _seen.add(value_id)
+
+    def _record_tool_name(name: Any, *, is_call: bool) -> None:
+        if not isinstance(name, str) or not name.strip():
+            return
+        clean_name = name.strip()
+        if clean_name not in tool_names:
+            tool_names.append(clean_name)
+        if not is_call:
+            return
+        normalized = clean_name.lower().replace("-", "_")
+        short_name = re.split(r"[./:]", normalized)[-1]
+        if short_name not in _AUTO_AGENT_FILE_EDIT_TOOL_NAMES:
+            return
+        counters["prior_file_edit_tool_call_count"] += 1
+        if clean_name not in file_edit_tool_names:
+            file_edit_tool_names.append(clean_name)
+
+    if isinstance(value, dict):
+        item_type = value.get("type")
+        role = str(value.get("role") or "").lower()
+        if isinstance(item_type, str) and item_type in _AUTO_AGENT_PRIOR_TOOL_ITEM_TYPES:
+            is_tool_call = item_type in {
+                "function_call",
+                "tool_use",
+                "mcp_call",
+                "mcp_tool_call",
+                "mcp_approval_request",
+            }
+            if item_type in {
+                "function_call",
+                "tool_use",
+                "mcp_call",
+                "mcp_tool_call",
+                "mcp_approval_request",
+            }:
+                counters["prior_tool_call_count"] += 1
+            elif item_type in {
+                "function_call_output",
+                "tool_result",
+                "mcp_approval_response",
+            }:
+                counters["prior_tool_result_count"] += 1
+            name = value.get("name")
+            if not isinstance(name, str) or not name:
+                function_obj = value.get("function")
+                if isinstance(function_obj, dict):
+                    name = function_obj.get("name")
+            _record_tool_name(name, is_call=is_tool_call)
+        if role == "tool" or value.get("tool_call_id") or value.get("tool_calls"):
+            if role == "tool" or value.get("tool_call_id"):
+                counters["prior_tool_result_count"] += 1
+            tool_calls = value.get("tool_calls")
+            if isinstance(tool_calls, list):
+                counters["prior_tool_call_count"] += len(tool_calls)
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    name = tool_call.get("name")
+                    function_obj = tool_call.get("function")
+                    if not isinstance(name, str) or not name:
+                        if isinstance(function_obj, dict):
+                            name = function_obj.get("name")
+                    _record_tool_name(name, is_call=True)
+        for child in value.values():
+            _walk_auto_agent_alias_prior_tool_activity(
+                child,
+                tool_names=tool_names,
+                file_edit_tool_names=file_edit_tool_names,
+                counters=counters,
+                _seen=_seen,
+            )
+        return
+
+    if isinstance(value, list):
+        for item in value:
+            _walk_auto_agent_alias_prior_tool_activity(
+                item,
+                tool_names=tool_names,
+                file_edit_tool_names=file_edit_tool_names,
+                counters=counters,
+                _seen=_seen,
+            )
+
+
+def _summarize_auto_agent_alias_actual_prior_tool_activity(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    """Conservative summary of actual prior tool activity in the request.
+
+    Counts only concrete tool-call/result evidence already present in the
+    request body. Continuation markers alone do not count as partial activity.
+    """
+    tool_names: list[str] = []
+    file_edit_tool_names: list[str] = []
+    counters = {
+        "prior_tool_call_count": 0,
+        "prior_tool_result_count": 0,
+        "prior_file_edit_tool_call_count": 0,
+    }
+    for key in ("input", "messages", "content", "tools_results", "tool_results"):
+        if key in request_body:
+            _walk_auto_agent_alias_prior_tool_activity(
+                request_body.get(key),
+                tool_names=tool_names,
+                file_edit_tool_names=file_edit_tool_names,
+                counters=counters,
+            )
+    has_actual_prior_tool_activity = bool(
+        counters["prior_tool_call_count"] or counters["prior_tool_result_count"]
+    )
+    has_previous_response_id = bool(
+        _clean_codex_auth_value(request_body.get("previous_response_id"))
+    )
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
+        request_body
+    )
+    return {
+        "has_actual_prior_tool_activity": has_actual_prior_tool_activity,
+        "prior_tool_call_count": counters["prior_tool_call_count"],
+        "prior_tool_result_count": counters["prior_tool_result_count"],
+        "prior_tool_names": tool_names[:20],
+        "has_prior_file_edit_activity": bool(
+            counters["prior_file_edit_tool_call_count"]
+        ),
+        "prior_file_edit_tool_call_count": counters[
+            "prior_file_edit_tool_call_count"
+        ],
+        "prior_file_edit_tool_names": file_edit_tool_names[:20],
+        "has_previous_response_id": has_previous_response_id,
+        "has_continuation_state": bool(has_continuation_state),
+    }
+
+
+def _classify_auto_agent_alias_terminal_activity_status(
+    prior_tool_activity_summary: Optional[dict[str, Any]],
+) -> str:
+    if isinstance(prior_tool_activity_summary, dict) and prior_tool_activity_summary.get(
+        "has_actual_prior_tool_activity"
+    ):
+        return "failed_after_partial_activity"
+    return "failed_no_activity"
+
+
+def _get_or_create_auto_agent_alias_request_call_id(
+    request: Request,
+    request_body: dict[str, Any],
+) -> str:
+    """Return one stable call ID for all alias audit events in this request."""
+    request_state = getattr(request, "state", None)
+    if request_state is not None:
+        existing = getattr(
+            request_state,
+            _AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY,
+            None,
+        )
+        if isinstance(existing, str) and existing.strip():
+            return existing.strip()
+
+    litellm_call_id = _extract_auto_agent_alias_metadata_value(
+        request_body,
+        "litellm_call_id",
+        "call_id",
+        "aawm_litellm_call_id",
+    )
+    if litellm_call_id is None:
+        scope = request.scope if isinstance(getattr(request, "scope", None), dict) else {}
+        for key in ("litellm_call_id", "call_id", "request_id"):
+            value = _clean_codex_auth_value(scope.get(key))
+            if value is not None:
+                litellm_call_id = value
+                break
+    if litellm_call_id is None and request_state is not None:
+        for key in ("litellm_call_id", "call_id", "request_id"):
+            value = getattr(request_state, key, None)
+            if not isinstance(value, str):
+                continue
+            cleaned = _clean_codex_auth_value(value)
+            if cleaned is not None:
+                litellm_call_id = cleaned
+                break
+    if litellm_call_id is None:
+        headers = _safe_get_request_headers(request)
+        if isinstance(headers, dict):
+            for key in (
+                "x-litellm-call-id",
+                "litellm-call-id",
+                "x-request-id",
+            ):
+                value = _clean_codex_auth_value(headers.get(key))
+                if value is not None:
+                    litellm_call_id = value
+                    break
+    if litellm_call_id is None:
+        litellm_call_id = str(uuid4())
+
+    if request_state is not None:
+        setattr(
+            request_state,
+            _AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY,
+            litellm_call_id,
+        )
+    return litellm_call_id
+
+
+def _attach_auto_agent_alias_terminal_context_fields(
+    event: dict[str, Any],
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+    selection: Optional[dict[str, Any]] = None,
+    candidate: Optional[dict[str, Any]] = None,
+    include_activity_status: bool = False,
+) -> dict[str, Any]:
+    """Attach direct context IDs, agent/dispatch fields, and activity summary."""
+    agent_dispatch = _extract_auto_agent_alias_agent_dispatch_fields(
+        request,
+        request_body,
+    )
+    for key, value in agent_dispatch.items():
+        if value is not None and event.get(key) is None:
+            event[key] = value
+
+    # Prefer existing agent_id extraction when structured fields omit it.
+    if event.get("agent_id") is None:
+        agent_id = _extract_auto_agent_alias_metadata_value(
+            request_body,
+            "agent_id",
+            "aawm_agent_id",
+            "codex_agent_id",
+            "claude_agent_id",
+        )
+        if agent_id is not None:
+            event["agent_id"] = agent_id
+
+    if event.get("session_id") is None:
+        event["session_id"] = _extract_auto_agent_alias_session_id(
+            request,
+            request_body,
+        )
+
+    if event.get("litellm_call_id") is None:
+        event["litellm_call_id"] = (
+            _get_or_create_auto_agent_alias_request_call_id(
+                request,
+                request_body,
+            )
+        )
+
+    trace_id = _extract_auto_agent_alias_metadata_value(
+        request_body,
+        "trace_id",
+        "langfuse_trace_id",
+        "aawm_trace_id",
+    )
+    if trace_id is not None and event.get("trace_id") is None:
+        event["trace_id"] = trace_id
+
+    cooldown_state_source = None
+    if isinstance(candidate, dict):
+        cooldown_state_source = candidate.get("cooldown_state_source")
+    if cooldown_state_source is None and isinstance(selection, dict):
+        cooldown_state_source = selection.get("cooldown_state_source")
+    if cooldown_state_source is not None and event.get("cooldown_state_source") is None:
+        event["cooldown_state_source"] = cooldown_state_source
+
+    prior_summary = _summarize_auto_agent_alias_actual_prior_tool_activity(
+        request_body
+    )
+    event["actual_prior_tool_activity_summary"] = prior_summary
+    if include_activity_status:
+        event["terminal_activity_status"] = (
+            _classify_auto_agent_alias_terminal_activity_status(prior_summary)
+        )
+    return event
+
+
+def _persist_auto_agent_alias_audit_only_events_best_effort(
+    events: list[dict[str, Any]],
+    *,
+    request_body: Optional[dict[str, Any]] = None,
+) -> None:
+    """Best-effort audit-only persistence without session_history inserts.
+
+    Used for terminal/no-candidate Codex+Anthropic alias events that never reach
+    a normal success/fallback write path. Failures are swallowed so routing is
+    never blocked by observability.
+    """
+    if not events:
+        return
+    try:
+        from litellm.integrations.aawm_agent_identity import (
+            _build_alias_routing_audit_only_record,
+            _enqueue_session_history_record,
+        )
+    except Exception:
+        verbose_proxy_logger.debug(
+            "Unable to import alias routing audit-only helpers",
+            exc_info=True,
+        )
+        return
+
+    primary = events[0] if events else {}
+    metadata: dict[str, Any] = {
+        "aawm_alias_routing_audit_only": True,
+        "source": "auto_agent_alias_terminal_or_no_candidate",
+    }
+    if isinstance(request_body, dict):
+        litellm_metadata = request_body.get("litellm_metadata")
+        if isinstance(litellm_metadata, dict):
+            for key in (
+                "requested_model_alias",
+                "model_alias_label",
+                "repository",
+            ):
+                value = litellm_metadata.get(key)
+                if value is not None:
+                    metadata[key] = value
+    try:
+        record = _build_alias_routing_audit_only_record(
+            events=events,
+            session_id=primary.get("session_id"),
+            litellm_call_id=primary.get("litellm_call_id"),
+            model=primary.get("model") or primary.get("alias_model"),
+            provider=primary.get("provider"),
+            metadata=metadata,
+        )
+        _enqueue_session_history_record(record)
+    except Exception:
+        verbose_proxy_logger.debug(
+            "Failed to enqueue alias routing audit-only record",
+            exc_info=True,
+        )
+
+
 def _emit_auto_agent_alias_no_candidate_event(
     *,
     alias_family: str,
@@ -3248,6 +3822,7 @@ def _emit_auto_agent_alias_no_candidate_event(
     request: Request,
     request_body: dict[str, Any],
     exc: HTTPException,
+    attempts: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     detail = exc.detail if isinstance(exc.detail, dict) else {}
     candidates = detail.get("candidates") if isinstance(detail, dict) else None
@@ -3263,45 +3838,86 @@ def _emit_auto_agent_alias_no_candidate_event(
         request_body,
     )
     host_attribution = _resolve_auto_agent_alias_route_host_attribution(request)
+    event = {
+        "observed_at": _format_auto_agent_alias_timestamp(
+            datetime.now(timezone.utc)
+        ),
+        "alias_family": alias_family,
+        "alias_model": alias_model,
+        "session_id": _extract_auto_agent_alias_session_id(
+            request, request_body
+        ),
+        "agent_id": _extract_auto_agent_alias_metadata_value(
+            request_body,
+            "agent_id",
+            "aawm_agent_id",
+            "codex_agent_id",
+            "claude_agent_id",
+        ),
+        "repository": repository,
+        "client_product_label": client_product_label,
+        "client_ip": host_attribution.get("client_ip"),
+        "client_ip_source": host_attribution.get("client_ip_source"),
+        "host_name": host_attribution.get("host_name"),
+        "host_name_source": host_attribution.get("host_name_source"),
+        "rollup_group_header_label": _build_auto_agent_alias_rollup_group_header_label(
+            repository=repository,
+            client_product_label=client_product_label,
+            host_name=host_attribution.get("host_name"),
+        ),
+        "incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint(request),
+        "outgoing_target": "candidate_selection",
+        "event_type": "no_candidate_available",
+        "candidate_status": "all_candidates_unavailable",
+        "failure_phase": "candidate_selection",
+        "attempted_provider_call": False,
+        "error_status_code": exc.status_code,
+        "candidate_count": len(candidates) if isinstance(candidates, list) else 0,
+        "candidates": candidates if isinstance(candidates, list) else None,
+    }
+    _attach_auto_agent_alias_terminal_context_fields(
+        event,
+        request=request,
+        request_body=request_body,
+        include_activity_status=True,
+    )
+    normalized_attempts = [
+        attempt
+        for attempt in attempts or []
+        if isinstance(attempt, dict)
+    ]
+    if normalized_attempts:
+        event["attempt_count"] = len(normalized_attempts)
+        event["attempts"] = copy.deepcopy(normalized_attempts)
     _emit_auto_agent_alias_route_event(
-        {
-            "observed_at": _format_auto_agent_alias_timestamp(
-                datetime.now(timezone.utc)
-            ),
-            "alias_family": alias_family,
-            "alias_model": alias_model,
-            "session_id": _extract_auto_agent_alias_session_id(
-                request, request_body
-            ),
-            "agent_id": _extract_auto_agent_alias_metadata_value(
-                request_body,
-                "agent_id",
-                "aawm_agent_id",
-                "codex_agent_id",
-                "claude_agent_id",
-            ),
-            "repository": repository,
-            "client_product_label": client_product_label,
-            "client_ip": host_attribution.get("client_ip"),
-            "client_ip_source": host_attribution.get("client_ip_source"),
-            "host_name": host_attribution.get("host_name"),
-            "host_name_source": host_attribution.get("host_name_source"),
-            "rollup_group_header_label": _build_auto_agent_alias_rollup_group_header_label(
-                repository=repository,
-                client_product_label=client_product_label,
-                host_name=host_attribution.get("host_name"),
-            ),
-            "incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint(request),
-            "outgoing_target": "candidate_selection",
-            "event_type": "no_candidate_available",
-            "candidate_status": "all_candidates_unavailable",
-            "failure_phase": "candidate_selection",
-            "attempted_provider_call": False,
-            "error_status_code": exc.status_code,
-            "candidate_count": len(candidates) if isinstance(candidates, list) else 0,
-            "candidates": candidates if isinstance(candidates, list) else None,
-        },
+        event,
         level="warning",
+    )
+    # Terminal no-candidate outcomes never complete a normal provider write path.
+    # Persist audit rows only so partial-activity vs no-op failures remain queryable.
+    audit_events: list[dict[str, Any]] = []
+    if normalized_attempts:
+        last_attempt = normalized_attempts[-1]
+        audit_events.extend(
+            _build_auto_agent_alias_audit_events(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                request_body=request_body,
+                selection={
+                    "candidate": last_attempt,
+                    "session_key": event.get("session_key"),
+                    "lane_key": last_attempt.get("lane_key"),
+                    "selection_reason": last_attempt.get("reason"),
+                    "skipped": [],
+                },
+                attempts=normalized_attempts,
+            )
+        )
+    audit_events.append(event)
+    _persist_auto_agent_alias_audit_only_events_best_effort(
+        audit_events,
+        request_body=request_body,
     )
 
 
@@ -3430,6 +4046,28 @@ def _build_auto_agent_alias_audit_event(
         event["error_tokens"] = error_tokens
     elif isinstance(error_tokens, set):
         event["error_tokens"] = sorted(error_tokens)
+
+    cooldown_state_source = candidate.get("cooldown_state_source")
+    if cooldown_state_source is None:
+        cooldown_state_source = selection.get("cooldown_state_source")
+    if cooldown_state_source is not None:
+        event["cooldown_state_source"] = cooldown_state_source
+
+    include_activity_status = event_type in {
+        "no_candidate_available",
+        "redispatch_required",
+        "candidate_retryable_failure",
+    } or bool(redispatch_required) or (
+        isinstance(error_status_code, int) and error_status_code == 429
+    )
+    _attach_auto_agent_alias_terminal_context_fields(
+        event,
+        request=request,
+        request_body=request_body,
+        selection=selection,
+        candidate=candidate,
+        include_activity_status=include_activity_status,
+    )
     return {key: value for key, value in event.items() if value is not None}
 
 
@@ -5176,8 +5814,20 @@ def _record_auto_agent_alias_attempt_failure(
         attempts=attempts,
     )
     _safe_set_request_parsed_body(request, failure_body)
-    _emit_auto_agent_alias_route_event(
-        _build_auto_agent_alias_audit_event(
+    failure_metadata = failure_body.get("litellm_metadata")
+    full_audit_events = (
+        failure_metadata.get("aawm_alias_routing_audit_events")
+        if isinstance(failure_metadata, dict)
+        else None
+    )
+    audit_events = [
+        event
+        for event in full_audit_events or []
+        if isinstance(event, dict)
+    ]
+    audit_event = audit_events[-1] if audit_events else None
+    if audit_event is None:
+        audit_event = _build_auto_agent_alias_audit_event(
             alias_family=alias_family,
             alias_model=alias_model,
             request=request,
@@ -5202,11 +5852,24 @@ def _record_auto_agent_alias_attempt_failure(
             error_tokens=attempt_record.get("error_tokens"),
             retry_after_seconds=attempt_record.get("retry_after_seconds"),
             failure_phase=attempt_record.get("failure_phase"),
-            attempted_provider_call=attempt_record.get("attempted_provider_call"),
+            attempted_provider_call=attempt_record.get(
+                "attempted_provider_call"
+            ),
             redispatch_required=redispatch_required,
-        ),
+        )
+        audit_events = [audit_event]
+    _emit_auto_agent_alias_route_event(
+        audit_event,
         level="warning",
     )
+    # Only terminal redispatch outcomes use audit-only persistence. Mid-loop
+    # retryable 429s that continue failover still reach a normal success or
+    # no-candidate write path and must not double-write audit rows.
+    if redispatch_required:
+        _persist_auto_agent_alias_audit_only_events_best_effort(
+            audit_events,
+            request_body=prepared_request_body,
+        )
     return failure_body
 
 
@@ -25830,6 +26493,7 @@ async def _handle_anthropic_auto_agent_alias_route(
                     request=request,
                     request_body=prepared_request_body,
                     exc=exc,
+                    attempts=attempts,
                 )
             raise
         candidate = selection["candidate"]
@@ -28705,6 +29369,7 @@ async def _handle_codex_auto_agent_alias_route(
                     request=request,
                     request_body=prepared_request_body,
                     exc=exc,
+                    attempts=attempts,
                 )
             raise
         candidate = selection["candidate"]

@@ -397,7 +397,10 @@ def test_build_session_history_record_extracts_agent_from_responses_instructions
     }
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.4-mini",
-        "instructions": "You are a 'worker' agent. Always follow repository instructions.",
+        "instructions": (
+            "You are a 'worker' agent.\n"
+            "Always follow repository instructions."
+        ),
         "input": [
             {
                 "role": "user",
@@ -9813,7 +9816,165 @@ def test_build_tool_definition_snapshot_db_payloads_deduplicates_session_hash() 
     assert payload[11] == "call-tool-snapshot-1"
 
 
+def test_build_alias_routing_audit_only_record_skips_session_history_and_keeps_events() -> None:
+    events = [
+        {
+            "event_type": "no_candidate_available",
+            "alias_model": "aawm-sota",
+            "alias_family": "codex_auto_agent",
+            "session_id": "session-audit-only",
+            "litellm_call_id": "call-audit-only",
+            "agent_name": "worker",
+            "agent_role": "worker",
+            "thread_source": "subagent",
+            "redispatch_ordinal": 3,
+            "terminal_activity_status": "failed_no_activity",
+            "actual_prior_tool_activity_summary": {
+                "has_actual_prior_tool_activity": False,
+                "prior_tool_call_count": 0,
+                "prior_tool_result_count": 0,
+            },
+            "cooldown_state_source": "local_fallback",
+        }
+    ]
+
+    record = aawm_agent_identity._build_alias_routing_audit_only_record(
+        events=events,
+        session_id="session-audit-only",
+        litellm_call_id="call-audit-only",
+        model="aawm-sota",
+        provider=None,
+        metadata={"source": "unit-test"},
+    )
+
+    assert record["_skip_session_history"] is True
+    assert record["session_id"] == "session-audit-only"
+    assert record["litellm_call_id"] == "call-audit-only"
+    assert record["aawm_alias_routing_audit_events"][0]["event_type"] == (
+        "no_candidate_available"
+    )
+    assert record["metadata"]["aawm_alias_routing_audit_only"] is True
+    assert record["metadata"]["agent_name"] == "worker"
+    assert record["metadata"]["terminal_activity_status"] == "failed_no_activity"
+    assert record["metadata"]["cooldown_state_source"] == "local_fallback"
+    assert record["metadata"]["source"] == "unit-test"
+
+
+def test_build_alias_routing_audit_only_record_promotes_terminal_event_metadata() -> None:
+    record = aawm_agent_identity._build_alias_routing_audit_only_record(
+        events=[
+            {
+                "event_type": "candidate_retryable_failure",
+                "litellm_call_id": "call-terminal-primary",
+                "agent_name": "worker",
+                "terminal_activity_status": "failed_no_activity",
+            },
+            {
+                "event_type": "no_candidate_available",
+                "litellm_call_id": "call-terminal-primary",
+                "agent_name": "worker",
+                "terminal_activity_status": "failed_after_partial_activity",
+                "cooldown_state_source": "durable_cache",
+            },
+        ]
+    )
+
+    assert record["metadata"]["terminal_activity_status"] == (
+        "failed_after_partial_activity"
+    )
+    assert record["metadata"]["cooldown_state_source"] == "durable_cache"
+
+
+def test_build_session_history_record_extracts_exact_role_sentence_for_explorer() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["litellm_call_id"] = "call-codex-explorer-role"
+    kwargs["model"] = "openai/gpt-5.4-mini"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "repository": "litellm",
+            "session_id": "session-codex-explorer-role",
+            "trace_user_id": "codex",
+            "thread_source": "subagent",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {
+            "langfuse_trace_name": "codex",
+            "langfuse_trace_user_id": "codex",
+            "user-agent": "codex-tui/0.142.5",
+        }
+    }
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4-mini",
+        "instructions": "You are a 'explorer' agent.\nRead only.",
+        "input": [{"role": "user", "content": "Inspect the queue."}],
+    }
+    result = {
+        "id": "resp-codex-explorer-role",
+        "usage": {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10},
+        "output": [],
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result=result,
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert record["agent_name"] == "explorer"
+
+
+def test_extract_agent_context_role_profile_requires_exact_supported_sentence() -> None:
+    assert aawm_agent_identity._extract_agent_context_from_text(
+        "You are a 'worker' agent.\nImplement the scoped change."
+    ) == ("worker", None)
+    assert aawm_agent_identity._extract_agent_context_from_text(
+        "You are a 'orchestrator' agent."
+    ) == (None, None)
+    assert aawm_agent_identity._extract_agent_context_from_text(
+        "The phrase You are a 'worker' agent. is attribution metadata."
+    ) == (None, None)
+
+
 @pytest.mark.asyncio
+async def test_persist_alias_routing_audit_best_effort_from_audit_only_record() -> None:
+    conn = AsyncMock()
+    record = aawm_agent_identity._build_alias_routing_audit_only_record(
+        events=[
+            {
+                "alias_family": "codex_auto_agent",
+                "alias_model": "aawm-sota",
+                "event_type": "no_candidate_available",
+                "candidate_status": "all_candidates_unavailable",
+                "session_id": "session-audit-only-persist",
+                "error_status_code": 429,
+                "terminal_activity_status": "failed_after_partial_activity",
+            }
+        ],
+        session_id="session-audit-only-persist",
+        litellm_call_id="call-audit-only-persist",
+    )
+
+    await aawm_agent_identity._persist_alias_routing_audit_best_effort(
+        conn,
+        [record],
+    )
+
+    conn.executemany.assert_awaited_once()
+    sql, payloads = conn.executemany.await_args.args
+    assert sql == aawm_agent_identity._AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL
+    assert len(payloads) == 1
+    assert payloads[0][6] == "aawm-sota"
+    assert payloads[0][14] == "no_candidate_available"
+    metadata = json.loads(payloads[0][28])
+    assert metadata["terminal_activity_status"] == "failed_after_partial_activity"
+
+
 async def test_persist_alias_routing_audit_best_effort_uses_executemany() -> None:
     conn = AsyncMock()
     record = {

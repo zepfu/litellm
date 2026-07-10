@@ -525,7 +525,41 @@ In-flight redispatch-required 429 responses include bounded audit metadata such
 as `failure_class`, `cooldown_scope`, `error_status_code`, `retry_after_seconds`,
 `aawm_alias_routing_audit_events`, and the attempt/skipped-candidate summaries
 so operators can correlate client-visible redispatch failures with the durable
-cooldown that triggered them. For tool-bearing or stateful
+cooldown that triggered them.
+
+Terminal Codex and Anthropic auto-agent outcomes that never complete a normal
+provider write path (all-candidates-unavailable / no-candidate, and in-flight
+`redispatch_required` 429s) also emit **audit-only** persistence:
+
+- events are enqueued with `_skip_session_history=true` so they do **not** insert
+  a `session_history` row and do **not** double-write through a later success or
+  normal fallback path;
+- durable rows still land in `aawm_alias_routing_audit` via the existing
+  best-effort audit insert;
+- direct event context IDs (`session_id`, `trace_id`, `litellm_call_id`,
+  `agent_id`) are attached on the event itself; when no upstream
+  `litellm_call_id` is available, one request-scoped fallback ID is generated
+  and reused across every terminal attempt event;
+- structured agent/dispatch fields (`agent_name`, `agent_role`, `agent_profile`,
+  `thread_source`, `dispatch_id`, `redispatch_ordinal`) are preferred from
+  request metadata; when those are absent, the exact role-profile sentence
+  `You are a '<role>' agent.` is used as a fallback for `explorer` /
+  `worker` / `default`, and inferred profiles set `thread_source=subagent`;
+- `actual_prior_tool_activity_summary` records a conservative count of prior
+  tool calls/results already present on the request (continuation markers alone
+  do not count), with separate `has_prior_file_edit_activity`,
+  `prior_file_edit_tool_call_count`, and `prior_file_edit_tool_names` fields
+  for recognized edit/write/`apply_patch` tools;
+- terminal audit-only persistence carries the accumulated candidate/fallback
+  attempt events, not only the final failed candidate;
+- terminal events set `terminal_activity_status` to
+  `failed_after_partial_activity` or `failed_no_activity` so parents can
+  distinguish partial-edit failures from no-op capacity failures;
+- `cooldown_state_source` is propagated from the selected candidate/selection
+  state onto the audit event when known.
+
+These fields are observability-only. They do not change candidate order,
+affinity, cooldown duration, or redispatch thresholds. For tool-bearing or stateful
 `aawm-code-anthropic` requests, every declared candidate route is treated as a
 Claude Code tool-contract route: if the alias declares OpenAI, xAI,
 native Anthropic, or another provider/model target, that target must preserve

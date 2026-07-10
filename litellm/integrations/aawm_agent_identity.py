@@ -5,7 +5,8 @@ request prompts, then enriches the langfuse_trace_name request header so
 each agent's API calls can be distinguished in Langfuse.
 
 The hook injects: "You are '<agent-name>' and you are working..."
-Role profiles can also declare: "You are a '<agent-name>' agent."
+Role profiles can also declare one exact supported profile sentence, such as:
+"You are a 'worker' agent."
 When no agent designation is found, defaults to "orchestrator".
 
 Enriches langfuse_trace_name from "claude-code" to "claude-code.<agent>"
@@ -83,7 +84,10 @@ _AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
 _AGENT_TENANT_RE = re.compile(
     r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project"
 )
-_AGENT_ROLE_RE = re.compile(r"You are (?:an?\s+)?'(?P<agent>[^']+)'\s+agent\b")
+_AGENT_ROLE_RE = re.compile(
+    r"^[ \t]*You are a '(?P<agent>explorer|worker|default)' agent\.[ \t]*$",
+    re.MULTILINE,
+)
 _DEFAULT_AGENT = "orchestrator"
 _CLAUDE_EXPERIMENT_ID_RE = re.compile(
     rb"(?<![A-Za-z0-9._-])([A-Za-z][A-Za-z0-9._-]{11,})(?![A-Za-z0-9._-])"
@@ -10655,6 +10659,68 @@ def _build_provider_error_observation(
         ),
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "metadata": observation_metadata,
+    }
+
+
+def _build_alias_routing_audit_only_record(
+    *,
+    events: List[Dict[str, Any]],
+    session_id: Optional[str] = None,
+    litellm_call_id: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build an audit-only record that skips session_history inserts.
+
+    Terminal Codex/Anthropic auto-agent no-candidate and redispatch 429 paths can
+    finish without a normal session_history write. This record still persists
+    ``aawm_alias_routing_audit`` events best-effort while avoiding a duplicate
+    session_history row or a normal success/fallback double-write.
+    """
+    normalized_events = [
+        event for event in events if isinstance(event, dict)
+    ]
+    primary = normalized_events[-1] if normalized_events else {}
+    record_metadata: Dict[str, Any] = {
+        "aawm_alias_routing_audit_only": True,
+        "aawm_alias_routing_audit_events": normalized_events,
+    }
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            if value is not None and key not in record_metadata:
+                record_metadata[key] = value
+    # Promote direct event context IDs for durable audit payload builders.
+    for key in (
+        "session_id",
+        "session_key",
+        "trace_id",
+        "litellm_call_id",
+        "agent_id",
+        "agent_name",
+        "agent_role",
+        "agent_profile",
+        "thread_source",
+        "dispatch_id",
+        "redispatch_ordinal",
+        "cooldown_state_source",
+        "terminal_activity_status",
+        "actual_prior_tool_activity_summary",
+        "repository",
+        "alias_model",
+        "alias_family",
+    ):
+        value = primary.get(key)
+        if value is not None and key not in record_metadata:
+            record_metadata[key] = value
+    return {
+        "_skip_session_history": True,
+        "litellm_call_id": litellm_call_id or primary.get("litellm_call_id"),
+        "session_id": session_id or primary.get("session_id"),
+        "model": model or primary.get("model") or primary.get("alias_model"),
+        "provider": provider or primary.get("provider"),
+        "aawm_alias_routing_audit_events": normalized_events,
+        "metadata": record_metadata,
     }
 
 

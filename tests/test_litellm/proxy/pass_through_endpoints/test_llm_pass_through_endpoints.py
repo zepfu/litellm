@@ -72,6 +72,12 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _classify_codex_auto_agent_retryable_exhaustion,
     _codex_auto_agent_request_has_continuation_state,
+    _classify_auto_agent_alias_terminal_activity_status,
+    _attach_auto_agent_alias_terminal_context_fields,
+    _emit_auto_agent_alias_no_candidate_event,
+    _extract_auto_agent_alias_agent_dispatch_fields,
+    _extract_auto_agent_alias_role_from_text,
+    _summarize_auto_agent_alias_actual_prior_tool_activity,
     _codex_google_code_assist_tool_call_arguments_cache,
     _codex_google_code_assist_tool_call_name_cache,
     _codex_auto_agent_cooldown_until_monotonic_by_key,
@@ -6194,7 +6200,7 @@ class TestPassThroughRequestRetryableFailures:
             "model": "grok-composer-2.5-fast",
             "model_alias": "aawm-code-anthropic",
             "route_family": "grok_cli_chat_proxy",
-            "status_code": None,
+            "status_code": 504,
             "trace_id": "trace-stream-timeout",
             "litellm_call_id": "call-stream-timeout",
         }
@@ -11127,8 +11133,14 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             ],
         }
 
-        async def perform_operation(adapter_model, operation, log_warnings=True):
-            assert log_warnings is False
+        async def perform_operation(
+            adapter_model,
+            operation,
+            log_warnings=True,
+            use_alias_candidate_probe=False,
+        ):
+            assert log_warnings is True
+            assert use_alias_candidate_probe is False
             return await operation()
 
         with patch(
@@ -19272,7 +19284,11 @@ def _build_codex_auto_agent_request(session_id: str = "codex-session"):
 
 
 @pytest.fixture(autouse=True)
-def clear_codex_auto_agent_alias_state():
+def clear_codex_auto_agent_alias_state(monkeypatch):
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: None,
+    )
     aawm_claude_control_plane._claude_tool_advertisement_compaction_cache.clear()
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
@@ -20245,8 +20261,7 @@ async def test_anthropic_auto_agent_alias_low_uses_default_low_candidates(
         "openrouter/owl-alpha",
         "deepseek-v4-flash",
         "big-pickle",
-        "gpt-5.6-luna",
-        "gpt-5.4-mini",
+        "claude-haiku-4-5-20251001",
     ]
 
 
@@ -20734,13 +20749,13 @@ async def test_anthropic_read_agent_alias_openai_adapter_cooldown_survives_fresh
 
 
 @pytest.mark.asyncio
-async def test_anthropic_sota_alias_does_not_fallback_after_opus_high_demand(
+async def test_anthropic_sota_alias_falls_back_to_opus_after_fable_high_demand(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-sota-anthropic"
-    opus_error = RuntimeError(
+    high_demand_error = RuntimeError(
         "We're currently experiencing high demand, which may cause temporary errors."
     )
 
@@ -20754,7 +20769,7 @@ async def test_anthropic_sota_alias_does_not_fallback_after_opus_high_demand(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body",
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
-        new=AsyncMock(side_effect=opus_error),
+        new=AsyncMock(side_effect=high_demand_error),
     ) as mock_native, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
         new=AsyncMock(),
@@ -20770,7 +20785,7 @@ async def test_anthropic_sota_alias_does_not_fallback_after_opus_high_demand(
                 custom_headers={"x-api-key": "anthropic-key"},
             )
 
-    mock_native.assert_awaited_once()
+    assert mock_native.await_count == 2
     mock_antigravity.assert_not_called()
     mock_antigravity_lane.assert_not_called()
     mock_google_lane.assert_not_called()
@@ -21390,7 +21405,9 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
         "grok-composer-2.5-fast",
         "oa_xai/grok-build",
     ]
-    assert metadata["anthropic_auto_agent_attempts"][1]["status"] == "cooldown_set"
+    assert metadata["anthropic_auto_agent_attempts"][1]["status"] == (
+        "retryable_no_cooldown"
+    )
     assert metadata["anthropic_auto_agent_attempts"][2]["status"] == "cooldown_set"
 
 
@@ -21812,10 +21829,15 @@ async def test_anthropic_openrouter_completion_adapter_strips_provider_prefix_fo
     success = {"ok": True}
 
     async def fake_openrouter_completion_operation(
-        *, adapter_model, operation, log_warnings=True
+        *,
+        adapter_model,
+        operation,
+        log_warnings=True,
+        use_alias_candidate_probe=False,
     ):
         assert adapter_model == upstream_model
         assert log_warnings is True
+        assert use_alias_candidate_probe is False
         return await operation()
 
     with patch(
@@ -21942,6 +21964,8 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
+    body["system"] = "You are a 'worker' agent."
+    body["litellm_metadata"]["agent_id"] = "agent-anthropic-terminal"
     body["messages"] = [
         {
             "role": "user",
@@ -21976,6 +22000,11 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
             "status": "RESOURCE_EXHAUSTED",
         }
     }
+    persisted = []
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: persisted.append(events),
+    )
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
@@ -22039,6 +22068,16 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
     assert redispatch_event["failure_phase"] == "provider_attempt"
     assert redispatch_event["attempted_provider_call"] is True
     assert redispatch_event["redispatch_required"] is True
+    assert redispatch_event["agent_name"] == "worker"
+    assert redispatch_event["agent_role"] == "worker"
+    assert redispatch_event["thread_source"] == "subagent"
+    assert redispatch_event["agent_id"] == "agent-anthropic-terminal"
+    assert redispatch_event["litellm_call_id"]
+    assert len(persisted) == 1
+    assert persisted[0][-1]["event_type"] == "redispatch_required"
+    assert persisted[0][-1]["litellm_call_id"] == redispatch_event[
+        "litellm_call_id"
+    ]
     assert _alias_route_log_payloads(mock_warning) == []
     mock_openrouter.assert_awaited_once()
     mock_spark.assert_not_called()
@@ -23781,6 +23820,357 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
         "candidate_attempt_started",
     )
     assert _alias_route_log_payloads(mock_warning) == []
+
+
+
+def test_auto_agent_alias_prior_tool_activity_summary_is_conservative():
+    empty = _summarize_auto_agent_alias_actual_prior_tool_activity(
+        {
+            "previous_response_id": "resp_existing",
+            "input": [{"role": "user", "content": "continue"}],
+        }
+    )
+    assert empty["has_actual_prior_tool_activity"] is False
+    assert empty["has_previous_response_id"] is True
+    assert empty["prior_tool_call_count"] == 0
+    assert (
+        _classify_auto_agent_alias_terminal_activity_status(empty)
+        == "failed_no_activity"
+    )
+
+    partial = _summarize_auto_agent_alias_actual_prior_tool_activity(
+        {
+            "previous_response_id": "resp_existing",
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "call_id": "call_1",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                },
+            ],
+        }
+    )
+    assert partial["has_actual_prior_tool_activity"] is True
+    assert partial["prior_tool_call_count"] == 1
+    assert partial["prior_tool_result_count"] == 1
+    assert partial["prior_tool_names"] == ["apply_patch"]
+    assert partial["has_prior_file_edit_activity"] is True
+    assert partial["prior_file_edit_tool_call_count"] == 1
+    assert partial["prior_file_edit_tool_names"] == ["apply_patch"]
+    assert (
+        _classify_auto_agent_alias_terminal_activity_status(partial)
+        == "failed_after_partial_activity"
+    )
+
+
+def test_auto_agent_alias_agent_dispatch_fields_prefer_metadata_and_role_fallback():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota",
+        "instructions": "You are a 'worker' agent.\nImplement the scoped change.",
+        "litellm_metadata": {
+            "session_id": "codex-session",
+            "agent_id": "019f4944-802f-7372-8319-cdd509faac17",
+            "redispatch_ordinal": 3,
+            "dispatch_id": "dispatch-abc",
+            "litellm_call_id": "call-terminal-1",
+            "trace_id": "trace-terminal-1",
+        },
+    }
+    fields = _extract_auto_agent_alias_agent_dispatch_fields(request, body)
+    assert fields["agent_name"] == "worker"
+    assert fields["agent_role"] == "worker"
+    assert fields["agent_id"] == "019f4944-802f-7372-8319-cdd509faac17"
+    assert fields["thread_source"] == "subagent"
+    assert fields["redispatch_ordinal"] == 3
+    assert fields["dispatch_id"] == "dispatch-abc"
+    assert fields["agent_profile"] == "worker"
+
+    explicit = {
+        "model": "aawm-sota",
+        "instructions": "You are a 'default' agent.",
+        "litellm_metadata": {
+            "agent_name": "engineer",
+            "agent_role": "engineer",
+            "agent_id": "agent-explicit",
+        },
+    }
+    explicit_fields = _extract_auto_agent_alias_agent_dispatch_fields(
+        request, explicit
+    )
+    assert explicit_fields["agent_name"] == "engineer"
+    assert explicit_fields["agent_role"] == "engineer"
+    assert "thread_source" not in explicit_fields
+
+    assert (
+        _extract_auto_agent_alias_role_from_text(
+            "You are a 'orchestrator' agent."
+        )
+        is None
+    )
+    assert (
+        _extract_auto_agent_alias_role_from_text(
+            "The phrase You are a 'worker' agent. is attribution metadata."
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_no_candidate_persists_audit_only_with_activity_status(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota",
+        "instructions": "You are a 'worker' agent.",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "edited files",
+            }
+        ],
+        "litellm_metadata": {
+            "session_id": "codex-session",
+            "agent_id": "agent-partial",
+            "thread_source": "subagent",
+            "redispatch_ordinal": 2,
+            "repository": "litellm",
+        },
+    }
+    enqueued = []
+
+    def _fake_persist(events, *, request_body=None):
+        enqueued.append({"events": events, "request_body": request_body})
+
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
+        _fake_persist,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_google_lane_key",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.emit_aawm_route_status_event",
+    ):
+        selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+        await _set_codex_auto_agent_cooldown(selection["cooldown_key"], 60.0)
+        selection2 = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+        await _set_codex_auto_agent_cooldown(selection2["cooldown_key"], 60.0)
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert exc_info.value.status_code == 429
+    assert len(enqueued) == 1
+    event = enqueued[0]["events"][0]
+    assert event["event_type"] == "no_candidate_available"
+    assert event["agent_name"] == "worker"
+    assert event["agent_role"] == "worker"
+    assert event["agent_id"] == "agent-partial"
+    assert event["thread_source"] == "subagent"
+    assert event["redispatch_ordinal"] == 2
+    assert isinstance(event["litellm_call_id"], str)
+    assert event["litellm_call_id"]
+    assert event["terminal_activity_status"] == "failed_after_partial_activity"
+    assert event["actual_prior_tool_activity_summary"][
+        "has_actual_prior_tool_activity"
+    ] is True
+    repeated_event = {}
+    _attach_auto_agent_alias_terminal_context_fields(
+        repeated_event,
+        request=request,
+        request_body=body,
+    )
+    assert repeated_event["litellm_call_id"] == event["litellm_call_id"]
+
+
+def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "instructions": "You are a 'worker' agent.",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    attempts = [
+        {
+            "provider": "openai",
+            "model": "gpt-5.3-codex-spark",
+            "route_family": "codex_responses",
+            "lane_key": "__default__",
+            "reason": "first_available",
+            "status": "cooldown_set",
+            "error_class": "rate_limited",
+            "error_status_code": 429,
+            "attempted_provider_call": True,
+        },
+        {
+            "provider": "xai",
+            "model": "xai/grok-4.5",
+            "route_family": "codex_grok_native_responses_adapter",
+            "lane_key": "__default__",
+            "reason": "first_available",
+            "status": "cooldown_set",
+            "error_class": "upstream_transient_internal",
+            "error_status_code": 502,
+            "attempted_provider_call": True,
+        },
+    ]
+    persisted = []
+
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: persisted.append(events),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_auto_agent_alias_route_event",
+        lambda *args, **kwargs: None,
+    )
+
+    _emit_auto_agent_alias_no_candidate_event(
+        alias_family="codex_auto_agent",
+        alias_model="aawm-code",
+        request=request,
+        request_body=body,
+        exc=HTTPException(
+            status_code=429,
+            detail={"candidates": [], "error": {"code": "all_unavailable"}},
+        ),
+        attempts=attempts,
+    )
+
+    assert len(persisted) == 1
+    events = persisted[0]
+    assert [event["model"] for event in events[:-1]] == [
+        "gpt-5.3-codex-spark",
+        "xai/grok-4.5",
+    ]
+    assert events[-1]["event_type"] == "no_candidate_available"
+    assert events[-1]["attempt_count"] == 2
+    assert events[-1]["attempts"] == attempts
+    assert len({event["litellm_call_id"] for event in events}) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_alias_redispatch_audit_event_includes_cooldown_state_and_activity(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-low",
+        "instructions": "You are a 'explorer' agent.",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {
+            "session_id": "codex-session",
+            "agent_id": "agent-redispatch",
+            "thread_source": "subagent",
+            "redispatch_ordinal": 1,
+        },
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-low:codex-session:session:codex-session"
+    ] = {
+        "provider": "openrouter",
+        "model": "openrouter/cohere/north-mini-code:free",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    openrouter_error = ProxyException(
+        message="openrouter exhausted",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    openrouter_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+    enqueued = []
+
+    def _fake_persist(events, *, request_body=None):
+        enqueued.append(events)
+
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
+        _fake_persist,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
+        new=AsyncMock(side_effect=openrouter_error),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    detail = exc_info.value.detail
+    assert detail["error"]["code"] == "aawm_codex_auto_agent_redispatch_required"
+    redispatch_events = [
+        event
+        for event in detail["aawm_alias_routing_audit_events"]
+        if event["event_type"] == "redispatch_required"
+    ]
+    assert redispatch_events
+    event = redispatch_events[-1]
+    assert event["agent_name"] == "explorer"
+    assert event["agent_role"] == "explorer"
+    assert event["agent_id"] == "agent-redispatch"
+    assert event["redispatch_ordinal"] == 1
+    assert event["terminal_activity_status"] == "failed_after_partial_activity"
+    assert "cooldown_state_source" in event or event.get("cooldown_scope") is not None
+    assert len(enqueued) >= 1
+    assert enqueued[-1][0]["event_type"] == "redispatch_required"
+
 
 
 @pytest.mark.asyncio
@@ -26123,7 +26513,7 @@ async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_codex_sota_alias_does_not_fallback_after_gpt55_high_demand(
+async def test_codex_sota_alias_falls_back_to_gpt55_after_sol_high_demand(
     monkeypatch,
 ):
     request = _build_codex_auto_agent_request()
@@ -26162,7 +26552,7 @@ async def test_codex_sota_alias_does_not_fallback_after_gpt55_high_demand(
                 forward_headers=True,
             )
 
-    mock_pass_through.assert_awaited_once()
+    assert mock_pass_through.await_count == 2
     mock_antigravity.assert_not_called()
     mock_antigravity_lane.assert_not_called()
     mock_google_lane.assert_not_called()
