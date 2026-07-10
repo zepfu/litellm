@@ -455,6 +455,7 @@ class RedisCache(BaseCache):
         from redis.asyncio import Redis
 
         start_time = time.time()
+        raise_on_error = bool(kwargs.pop("raise_on_error", False))
         try:
             _redis_client: Redis = self.init_async_client()  # type: ignore
         except Exception as e:
@@ -476,7 +477,7 @@ class RedisCache(BaseCache):
                 str(e),
                 value,
             )
-            raise e
+            raise
 
         key = self.check_and_fix_namespace(key=key)
         ttl = self.get_ttl(**kwargs)
@@ -529,6 +530,8 @@ class RedisCache(BaseCache):
                 str(e),
                 value,
             )
+            if raise_on_error:
+                raise
 
     async def _pipeline_helper(
         self,

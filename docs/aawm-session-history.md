@@ -471,6 +471,16 @@ Operational notes:
   `LITELLM_AAWM_ERROR_LOG_ENV`) derives `aawm-routing-dev-v1` or
   `aawm-routing-prod-v1`. Use one explicit shared namespace only for
   intentionally shared routing planes.
+- Redis timeout and write-retry behavior is controlled by:
+  - `AAWM_ALIAS_ROUTING_REDIS_TIMEOUT_SECONDS` (`float`, default `10`, clamped
+    to `1.0`–`60.0`): passed to the alias-routing Redis client
+    `socket_timeout` and shared by both URL and host-based Redis
+    configuration. Non-finite values (`nan`, `inf`, `-inf`) fall back to the
+    default `10`.
+  - `AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS` (`float`,
+    default `0.25`, clamped to `0.05`–`2.0`): wait time before one bounded retry
+    for durable `SET` write failures when the failure is retryable. Non-finite
+    values (`nan`, `inf`, `-inf`) fall back to the default `0.25`.
 - Durable key shape:
   `aawm:alias-routing:{namespace}:{family}:{kind}:{state_key}` where `family` is
   `codex` or `anthropic`, and `kind` is `affinity` or `cooldown`.
@@ -478,6 +488,21 @@ Operational notes:
   `time.time()`). Process-local maps still use monotonic expiry for the fast path.
 - `AAWM_ALIAS_ROUTING_REDIS_*` settings only control alias-routing state
   persistence. They do not enable or alter LLM response caching.
+- Durable writes are bounded:
+  - The alias-routing writer opts into Redis `SET` exception propagation so it
+    can retry accurately; unrelated `RedisCache.async_set_cache` callers retain
+    the existing default write-error suppression behavior.
+  - Alias-routing durability attempts one retry max when a write fails with
+    connection/timeout-class exceptions.
+  - Retriable write exceptions are limited to Redis `TimeoutError`,
+    Redis `ConnectionError`, and Python timeout/connection-class failures.
+  - Non-retryable errors fail fast and return `False` immediately.
+  - If the retry attempt also fails, the final visible durable-write result is
+    `False`; it must never be treated as success.
+- Payload and TTL are preserved on retries:
+  - The exact durable payload is written with unchanged content and stable positive
+    TTL on each attempt, including the `expires_at_epoch` field calculated once for
+    the request.
 - Standard LiteLLM Router `failed_calls` counters remain process-local
   telemetry and are not mirrored by the durable alias-routing Redis manager.
 - Read order: memory first, then durable cache hydrate; if durable cache is absent

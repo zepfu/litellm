@@ -7,6 +7,7 @@ LiteLLM cache/Router internals.
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
 import os
 from typing import Any, Dict, Optional, Union
@@ -44,6 +45,10 @@ class AAWMAliasRoutingRedisManager:
     """Standalone alias-routing Redis cache manager."""
 
     DEFAULT_NAMESPACE = "default"
+    DEFAULT_SOCKET_TIMEOUT_SECONDS = 10.0
+    MIN_SOCKET_TIMEOUT_SECONDS = 1.0
+    MAX_SOCKET_TIMEOUT_SECONDS = 60.0
+    SOCKET_TIMEOUT_ENV_VAR = "AAWM_ALIAS_ROUTING_REDIS_TIMEOUT_SECONDS"
     # Bounded startup retries for transient sidecar readiness races. Kept small so
     # permanent failures still fall back to memory quickly and visibly.
     STARTUP_CONNECT_ATTEMPTS = 3
@@ -77,8 +82,38 @@ class AAWMAliasRoutingRedisManager:
             )
             return None
 
+    @staticmethod
+    def _parse_float(
+        value: Optional[str], *, default: float, minimum: float, maximum: float
+    ) -> float:
+        if not value:
+            return default
+        try:
+            parsed = float(value.strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid float config for AAWM alias routing Redis settings; using fallback."
+            )
+            return default
+        if not math.isfinite(parsed):
+            logger.warning(
+                "Non-finite float config for AAWM alias routing Redis settings; using fallback."
+            )
+            return default
+        return max(minimum, min(maximum, parsed))
+
+    @classmethod
+    def _resolve_alias_routing_redis_socket_timeout(cls) -> float:
+        return cls._parse_float(
+            os.getenv(cls.SOCKET_TIMEOUT_ENV_VAR),
+            default=cls.DEFAULT_SOCKET_TIMEOUT_SECONDS,
+            minimum=cls.MIN_SOCKET_TIMEOUT_SECONDS,
+            maximum=cls.MAX_SOCKET_TIMEOUT_SECONDS,
+        )
+
     def _load_env_config(self) -> Dict[str, Any]:
         namespace = resolve_alias_routing_state_namespace()
+        socket_timeout = self._resolve_alias_routing_redis_socket_timeout()
 
         redis_url = os.getenv("AAWM_ALIAS_ROUTING_REDIS_URL")
         if redis_url:
@@ -91,6 +126,7 @@ class AAWMAliasRoutingRedisManager:
                 "config_mode": "url",
                 "namespace": namespace,
                 "url": redis_url.strip(),
+                "socket_timeout": socket_timeout,
                 "configured": True,
             }
 
@@ -117,6 +153,7 @@ class AAWMAliasRoutingRedisManager:
             "username": os.getenv("AAWM_ALIAS_ROUTING_REDIS_USERNAME"),
             "db": self._parse_int(os.getenv("AAWM_ALIAS_ROUTING_REDIS_DB")),
             "ssl": self._parse_bool(os.getenv("AAWM_ALIAS_ROUTING_REDIS_SSL")),
+            "socket_timeout": socket_timeout,
             "configured": True,
         }
 
@@ -127,7 +164,7 @@ class AAWMAliasRoutingRedisManager:
     @classmethod
     def _build_redis_cache(cls, config: Dict[str, Any]) -> RedisCache:
         if config["mode"] == "url":
-            return RedisCache(url=config["url"], socket_timeout=5.0)
+            return RedisCache(url=config["url"], socket_timeout=config["socket_timeout"])
 
         redis_kwargs = {
             "host": config["host"],
@@ -135,7 +172,7 @@ class AAWMAliasRoutingRedisManager:
             "password": config["password"],
             "username": config["username"],
             "db": config["db"],
-            "socket_timeout": 5.0,
+            "socket_timeout": config["socket_timeout"],
         }
         # LiteLLM's shared async pool currently selects SSLConnection whenever
         # the ssl key is present, including ssl=False. Omit the key for plaintext.

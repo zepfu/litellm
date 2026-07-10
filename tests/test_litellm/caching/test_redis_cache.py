@@ -1,9 +1,9 @@
 import os
+import json
 import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
 sys.path.insert(
     0, os.path.abspath("../../..")
@@ -120,6 +120,64 @@ async def test_handle_lpop_count_for_older_redis_versions(monkeypatch):
     assert result == [b"value1", b"value2"]
     assert mock_pipeline.lpop.call_count == 2
     assert mock_pipeline.execute.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_redis_cache_async_set_cache_suppresses_underlying_set_failure_by_default(
+    monkeypatch, redis_no_ping
+):
+    mock_async_client = AsyncMock()
+    mock_async_client.set = AsyncMock(side_effect=TimeoutError("set failed"))
+
+    with patch(
+        "litellm._redis.get_redis_client", return_value=MagicMock()
+    ), patch(
+        "litellm._redis.get_redis_connection_pool",
+        return_value=MagicMock(),
+    ):
+        redis_cache = RedisCache()
+    with patch.object(redis_cache, "init_async_client", return_value=mock_async_client):
+        result = await redis_cache.async_set_cache(
+            key="test_key", value={"status": "cached", "value": 42}
+        )
+
+    assert result is None
+    mock_async_client.set.assert_awaited_once_with(
+        name="test_key",
+        value=json.dumps({"status": "cached", "value": 42}),
+        nx=False,
+        ex=redis_cache.default_ttl,
+    )
+
+
+@pytest.mark.asyncio
+async def test_redis_cache_async_set_cache_can_raise_underlying_set_failure(
+    monkeypatch, redis_no_ping
+):
+    mock_async_client = AsyncMock()
+    mock_async_client.set = AsyncMock(side_effect=TimeoutError("set failed"))
+
+    with patch(
+        "litellm._redis.get_redis_client", return_value=MagicMock()
+    ), patch(
+        "litellm._redis.get_redis_connection_pool",
+        return_value=MagicMock(),
+    ):
+        redis_cache = RedisCache()
+    with patch.object(redis_cache, "init_async_client", return_value=mock_async_client):
+        with pytest.raises(TimeoutError, match="set failed"):
+            await redis_cache.async_set_cache(
+                key="test_key",
+                value={"status": "cached", "value": 42},
+                raise_on_error=True,
+            )
+
+    mock_async_client.set.assert_awaited_once_with(
+        name="test_key",
+        value=json.dumps({"status": "cached", "value": 42}),
+        nx=False,
+        ex=redis_cache.default_ttl,
+    )
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ Use litellm with Anthropic SDK, Vertex AI SDK, Cohere SDK, etc.
 import ast
 import asyncio
 import base64
+import math
 import codecs
 import contextlib
 import copy
@@ -776,6 +777,75 @@ _codex_auto_agent_antigravity_lane_key_by_key: dict[str, str] = {}
 _codex_auto_agent_lane_state_cache_lock = asyncio.Lock()
 _AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT = "aawm-routing-v1"
 _AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX = "aawm:alias-routing"
+_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_ATTEMPTS = 1
+_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS_DEFAULT = 0.25
+_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS_MIN = 0.05
+_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS_MAX = 2.0
+_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS_ENV = (
+    "AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS"
+)
+
+
+def _parse_aawm_alias_routing_retryable_float_setting(
+    *,
+    env_key: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw = os.getenv(env_key, "")
+    if not raw:
+        return default
+    try:
+        value = float(raw.strip())
+    except (TypeError, ValueError):
+        verbose_proxy_logger.warning(
+            "Invalid AAWM alias-routing Redis setting: %s=%r; using %s",
+            env_key,
+            raw,
+            default,
+        )
+        return default
+    if not math.isfinite(value):
+        verbose_proxy_logger.warning(
+            "Non-finite AAWM alias-routing Redis setting: %s=%r; using %s",
+            env_key,
+            raw,
+            default,
+        )
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _get_aawm_alias_routing_durable_write_retry_backoff_seconds() -> float:
+    return _parse_aawm_alias_routing_retryable_float_setting(
+        env_key=_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS_ENV,
+        default=_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS_DEFAULT,
+        minimum=_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS_MIN,
+        maximum=_AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS_MAX,
+    )
+
+
+def _is_aawm_alias_routing_retryable_redis_error(exc: BaseException) -> bool:
+    redis_retryable_errors: tuple[type[BaseException], ...] = ()
+    try:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+        redis_retryable_errors = (RedisConnectionError, RedisTimeoutError)
+    except Exception:
+        pass
+    if isinstance(
+        exc,
+        (
+            asyncio.TimeoutError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    ) or (
+        redis_retryable_errors and isinstance(exc, redis_retryable_errors)
+    ):
+        return True
+    return False
 
 
 def _get_aawm_alias_routing_state_namespace() -> str:
@@ -930,21 +1000,46 @@ async def _write_aawm_alias_routing_durable_payload(
     redis_cache = getattr(dual_cache, "redis_cache", None)
     if redis_cache is None:
         return False
-    try:
-        await redis_cache.async_set_cache(
-            key=cache_key,
-            value=durable_payload,
-            ttl=max(1.0, float(ttl_seconds)),
-        )
-        return True
-    except Exception:
-        verbose_proxy_logger.warning(
-            "AAWM alias routing durable write failed for family=%s kind=%s",
-            alias_family,
-            state_kind,
-            exc_info=True,
-        )
-        return False
+    ttl = max(1.0, float(ttl_seconds))
+    max_attempts = 1 + _AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_ATTEMPTS
+    retry_backoff_seconds = _get_aawm_alias_routing_durable_write_retry_backoff_seconds()
+    for attempt in range(max_attempts):
+        try:
+            await redis_cache.async_set_cache(
+                key=cache_key,
+                value=durable_payload,
+                ttl=ttl,
+                raise_on_error=True,
+            )
+            return True
+        except Exception as exc:
+            if attempt >= max_attempts - 1:
+                verbose_proxy_logger.warning(
+                    "AAWM alias routing durable write failed after retry exhaustion for family=%s kind=%s",
+                    alias_family,
+                    state_kind,
+                    exc_info=True,
+                )
+                return False
+            if not _is_aawm_alias_routing_retryable_redis_error(exc):
+                verbose_proxy_logger.warning(
+                    "AAWM alias routing durable write failed with non-retryable error for family=%s kind=%s",
+                    alias_family,
+                    state_kind,
+                    exc_info=True,
+                )
+                return False
+            verbose_proxy_logger.warning(
+                "AAWM alias routing durable write retrying after timeout/connection error for family=%s kind=%s",
+                alias_family,
+                state_kind,
+                exc_info=True,
+            )
+            if retry_backoff_seconds > 0:
+                await asyncio.sleep(retry_backoff_seconds)
+            continue
+
+    return False
 
 
 def _hydrate_aawm_alias_routing_cooldown_memory(

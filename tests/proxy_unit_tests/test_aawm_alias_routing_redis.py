@@ -23,6 +23,9 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _read_aawm_alias_routing_durable_payload,
     _write_aawm_alias_routing_durable_payload,
 )
+from litellm.proxy.pass_through_endpoints import (
+    llm_passthrough_endpoints as _aawm_alias_lpt,
+)
 
 
 def _build_fake_aawm_alias_cache():
@@ -30,6 +33,49 @@ def _build_fake_aawm_alias_cache():
     fake_cache.ping = AsyncMock(return_value=True)
     fake_cache.disconnect = AsyncMock()
     return fake_cache
+
+
+def _build_redis_cache_for_async_set_errors():
+    sync_cache = MagicMock()
+    sync_cache.ping.return_value = None
+    with patch(
+        "asyncio.get_running_loop", side_effect=RuntimeError("No running event loop")
+    ):
+        with patch("litellm._redis.get_redis_client", return_value=sync_cache), patch(
+            "litellm._redis.get_redis_connection_pool", return_value=MagicMock()
+        ):
+            return RedisCache()
+
+
+@pytest.mark.parametrize(
+    ("timeout_env", "expected_timeout"),
+    [
+        ("0.5", 1.0),
+        ("120", 60.0),
+        ("nan", 10.0),
+        ("inf", 10.0),
+        ("-inf", 10.0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_timeout_env_is_validated_and_bounded(
+    monkeypatch, timeout_env, expected_timeout
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_TIMEOUT_SECONDS", timeout_env)
+
+    fake_cache = _build_fake_aawm_alias_cache()
+
+    with patch(
+        "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+        side_effect=lambda *args, **kwargs: fake_cache,
+    ) as mock_redis_ctor:
+        manager = AAWMAliasRoutingRedisManager()
+        await manager.initialize()
+
+        _, cache_kwargs = mock_redis_ctor.call_args
+        assert cache_kwargs["socket_timeout"] == expected_timeout
 
 
 def _build_proxy_logging_obj(dual_cache=None):
@@ -57,6 +103,8 @@ def _reset_aawm_alias_env(monkeypatch):
         "AAWM_ALIAS_ROUTING_REDIS_USERNAME",
         "AAWM_ALIAS_ROUTING_REDIS_DB",
         "AAWM_ALIAS_ROUTING_REDIS_SSL",
+        "AAWM_ALIAS_ROUTING_REDIS_TIMEOUT_SECONDS",
+        "AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS",
         "AAWM_ALIAS_ROUTING_STATE_NAMESPACE",
         "LITELLM_LANGFUSE_TRACE_ENVIRONMENT",
         "LITELLM_AAWM_ERROR_LOG_ENV",
@@ -107,12 +155,12 @@ async def test_aawm_alias_routing_redis_parses_url_config_and_builds_alias_cache
         await manager.initialize()
 
         assert fake_cache.ping.await_count == 1
-        assert fake_cache.ping.awaited()
+        fake_cache.ping.assert_awaited_once()
         _, cache_kwargs = mock_redis_ctor.call_args
         assert cache_kwargs["url"] == redis_url
         assert "namespace" not in cache_kwargs
         assert "host" not in cache_kwargs
-        assert cache_kwargs["socket_timeout"] == 5.0
+        assert cache_kwargs["socket_timeout"] == 10.0
         status = manager.get_status()
         assert status["mode"] == "redis"
         assert status["config_mode"] == "url"
@@ -165,6 +213,25 @@ async def test_aawm_alias_routing_redis_parses_host_config_port_ssl(
         dual_cache = manager.get_dual_cache()
         assert dual_cache is not None
         assert dual_cache.redis_cache is fake_cache
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_respects_alias_timeout_env(monkeypatch):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_TIMEOUT_SECONDS", "15.5")
+
+    fake_cache = _build_fake_aawm_alias_cache()
+
+    with patch(
+        "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+        side_effect=lambda *args, **kwargs: fake_cache,
+    ) as mock_redis_ctor:
+        manager = AAWMAliasRoutingRedisManager()
+        await manager.initialize()
+
+        _, cache_kwargs = mock_redis_ctor.call_args
+        assert cache_kwargs["socket_timeout"] == 15.5
 
 
 @pytest.mark.asyncio
@@ -386,7 +453,10 @@ async def test_aawm_alias_routing_durable_write_surfaces_redis_failure(
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
         return_value=dual_cache,
-    ):
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        AsyncMock(),
+    ) as mock_sleep:
         write_ok = await _write_aawm_alias_routing_durable_payload(
             alias_family="codex",
             state_kind="cooldown",
@@ -398,6 +468,155 @@ async def test_aawm_alias_routing_durable_write_surfaces_redis_failure(
     assert write_ok is False
     redis_cache.async_set_cache.assert_awaited_once()
     dual_cache.async_set_cache.assert_not_awaited()
+    assert mock_sleep.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_write_retries_once_on_timeout_with_real_redis_set(
+    monkeypatch,
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv(
+        "AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS", "0.05"
+    )
+
+    base_timestamp = 1_000.0
+    redis_cache = _build_redis_cache_for_async_set_errors()
+    set_mock = AsyncMock(side_effect=[TimeoutError("initial timeout"), None])
+
+    with patch.object(
+        redis_cache,
+        "init_async_client",
+        return_value=SimpleNamespace(set=set_mock),
+    ):
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+            return_value=SimpleNamespace(redis_cache=redis_cache),
+        ), patch.object(_aawm_alias_lpt.time, "time", lambda: base_timestamp), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+            AsyncMock(),
+        ) as mock_sleep:
+            write_ok = await _write_aawm_alias_routing_durable_payload(
+                alias_family="codex",
+                state_kind="cooldown",
+                state_key="candidate-key",
+                payload={"cooldown_key": "candidate-key"},
+                ttl_seconds=30,
+            )
+
+    assert write_ok is True
+    assert set_mock.await_count == 2
+    assert mock_sleep.await_count == 1
+    assert mock_sleep.await_args_list[0].args == (0.05,)
+
+    first_call = set_mock.await_args_list[0].kwargs
+    second_call = set_mock.await_args_list[1].kwargs
+    first_payload = json.loads(first_call["value"])
+    second_payload = json.loads(second_call["value"])
+
+    assert first_call["ex"] == 30.0
+    assert second_call["ex"] == 30.0
+    assert first_payload == second_payload
+    assert first_payload["cooldown_key"] == "candidate-key"
+    assert first_payload["expires_at_epoch"] == base_timestamp + 30.0
+    assert second_payload["expires_at_epoch"] == base_timestamp + 30.0
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_write_fails_without_retry_on_non_retryable_real_set_error(
+    monkeypatch,
+):
+    _reset_aawm_alias_env(monkeypatch)
+
+    redis_cache = _build_redis_cache_for_async_set_errors()
+    set_mock = AsyncMock(side_effect=RuntimeError("redis write failed"))
+
+    with patch.object(
+        redis_cache,
+        "init_async_client",
+        return_value=SimpleNamespace(set=set_mock),
+    ):
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+            return_value=SimpleNamespace(redis_cache=redis_cache),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+            AsyncMock(),
+        ) as mock_sleep:
+            write_ok = await _write_aawm_alias_routing_durable_payload(
+                alias_family="codex",
+                state_kind="cooldown",
+                state_key="candidate-key",
+                payload={"cooldown_key": "candidate-key"},
+                ttl_seconds=30,
+            )
+
+    assert write_ok is False
+    assert set_mock.await_count == 1
+    assert mock_sleep.await_count == 0
+
+
+@pytest.mark.parametrize(
+    ("backoff_env", "expected_backoff"),
+    [
+        ("0", 0.05),
+        ("5", 2.0),
+        ("invalid", 0.25),
+        ("nan", 0.25),
+        ("inf", 0.25),
+        ("-inf", 0.25),
+    ],
+)
+def test_aawm_alias_routing_durable_write_retry_backoff_env_is_validated_and_bounded(
+    monkeypatch, backoff_env, expected_backoff
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv(
+        "AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS",
+        backoff_env,
+    )
+    assert (
+        _aawm_alias_lpt._get_aawm_alias_routing_durable_write_retry_backoff_seconds()
+        == expected_backoff
+    )
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_durable_write_exhausts_retry_on_timeout(monkeypatch):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv(
+        "AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS", "0.05"
+    )
+
+    redis_cache = SimpleNamespace(
+        async_set_cache=AsyncMock(
+            side_effect=[TimeoutError("timeout"), TimeoutError("timeout")]
+        )
+    )
+    dual_cache = SimpleNamespace(
+        redis_cache=redis_cache,
+        async_set_cache=AsyncMock(),
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch.object(_aawm_alias_lpt.time, "time", lambda: 1_000.0), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        AsyncMock(),
+    ) as mock_sleep:
+        write_ok = await _write_aawm_alias_routing_durable_payload(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key="candidate-key",
+            payload={"cooldown_key": "candidate-key"},
+            ttl_seconds=30,
+        )
+
+    assert write_ok is False
+    assert redis_cache.async_set_cache.await_count == 2
+    assert mock_sleep.await_count == 1
+    assert mock_sleep.await_args_list[0].args == (0.05,)
 
 
 @pytest.mark.parametrize(
