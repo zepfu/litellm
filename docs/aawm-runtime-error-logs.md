@@ -535,7 +535,8 @@ Use the structured fields to group and triage failures, but keep
 Some pass-through and AAWM alias failures terminate a spawned agent session
 before useful work or a final response. Those outcomes can write structured
 rows through `litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error`
-into `.analysis/dev-error.jsonl` (under the configured error-log directory).
+into `.analysis/<environment>-error.jsonl` under the configured error-log
+directory, using the shared AAWM error-log environment resolver.
 
 This path is best-effort local intake only. It does not replace
 `.analysis/todo.md` as the durable queue, and it does not claim durable
@@ -556,7 +557,7 @@ emit separate audit/route events; those are distinct from this JSONL intake.
 - Shared max-bytes control: `LITELLM_AAWM_ERROR_LOG_MAX_BYTES`
   - when unset or non-positive, appends continue without a file-size ceiling
   - when set to a positive integer, terminal-agent appends stop once
-    `dev-error.jsonl` reaches that size
+    the active `<environment>-error.jsonl` file reaches that size
 - Ownership/mode repair after append reuses the same
   `LITELLM_AAWM_ERROR_LOG_FILE_UID` / `GID` / `MODE` helpers as the generic sink
 - Append failures are swallowed; terminal intake must never fail the client
