@@ -6820,7 +6820,10 @@ class TestPassThroughRequestRetryableFailures:
         ) as mock_get_client, patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
             new=AsyncMock(),
-        ), patch(
+        ) as mock_direct_capture, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ) as mock_hidden_retry_sleep, patch(
             "litellm.proxy.proxy_server.proxy_logging_obj"
         ) as mock_logging_obj:
             mock_client_obj = MagicMock()
@@ -6842,6 +6845,15 @@ class TestPassThroughRequestRetryableFailures:
 
         assert exc_info.value.code == "504"
         mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert mock_client.send.await_count == 6
+        assert mock_hidden_retry_sleep.await_args_list == [
+            mock.call(5.0),
+            mock.call(15.0),
+            mock.call(30.0),
+            mock.call(60.0),
+            mock.call(120.0),
+        ]
+        mock_direct_capture.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_pass_through_request_preserves_retry_headers_and_skips_failure_hook(
@@ -6934,7 +6946,10 @@ class TestPassThroughRequestRetryableFailures:
         ), patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
             new=AsyncMock(return_value=upstream_response),
-        ), patch(
+        ) as mock_non_streaming_handler, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=AsyncMock(),
+        ) as mock_hidden_retry_sleep, patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
         ) as mock_get_client, patch(
             "litellm.proxy.proxy_server.proxy_logging_obj"
@@ -6959,6 +6974,14 @@ class TestPassThroughRequestRetryableFailures:
 
         assert exc_info.value.code == "502"
         assert exc_info.value.detail == '{"error":"provider failed"}'
+        assert mock_non_streaming_handler.await_count == 6
+        assert mock_hidden_retry_sleep.await_args_list == [
+            mock.call(5.0),
+            mock.call(15.0),
+            mock.call(30.0),
+            mock.call(60.0),
+            mock.call(120.0),
+        ]
         mock_logging_obj.post_call_failure_hook.assert_not_awaited()
         mock_log_exception.assert_not_called()
 
@@ -17707,10 +17730,13 @@ async def test_iterate_google_code_assist_unwrapped_stream_yields_text_chunks():
         yield b'data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}],\"role\":\"model\"}}]}}\n\n'
 
     iterator = _iterate_google_code_assist_unwrapped_stream(_body_iterator())
-    chunk = await iterator.__anext__()
+    try:
+        chunk = await iterator.__anext__()
 
-    assert isinstance(chunk, str)
-    assert chunk.startswith('data: {\"candidates\"')
+        assert isinstance(chunk, str)
+        assert chunk.startswith('data: {\"candidates\"')
+    finally:
+        await iterator.aclose()
 
 
 @pytest.mark.asyncio
@@ -17726,14 +17752,17 @@ async def test_iterate_google_code_assist_unwrapped_stream_yields_all_chunks_fro
         )
 
     iterator = _iterate_google_code_assist_unwrapped_stream(_body_iterator())
-    first_chunk = await iterator.__anext__()
-    second_chunk = await iterator.__anext__()
+    try:
+        first_chunk = await iterator.__anext__()
+        second_chunk = await iterator.__anext__()
 
-    assert isinstance(first_chunk, str)
-    assert isinstance(second_chunk, str)
-    assert '\"Mon Apr 2\"' in first_chunk
-    assert '\"finishReason\": \"STOP\"' in second_chunk
-    assert '\"0 22:02:44 UTC\"' in second_chunk
+        assert isinstance(first_chunk, str)
+        assert isinstance(second_chunk, str)
+        assert '\"Mon Apr 2\"' in first_chunk
+        assert '\"finishReason\": \"STOP\"' in second_chunk
+        assert '\"0 22:02:44 UTC\"' in second_chunk
+    finally:
+        await iterator.aclose()
 
 @pytest.mark.asyncio
 async def test_iterate_google_code_assist_unwrapped_stream_arms_post_tool_cooldown(monkeypatch):
@@ -17748,10 +17777,13 @@ async def test_iterate_google_code_assist_unwrapped_stream_arms_post_tool_cooldo
         )
 
     iterator = module._iterate_google_code_assist_unwrapped_stream(_body_iterator())
-    first_chunk = await iterator.__anext__()
+    try:
+        first_chunk = await iterator.__anext__()
 
-    assert 'functionCall' in first_chunk
-    assert module._google_adapter_rate_limit_until_monotonic_by_key['__default__'] >= time.monotonic() + 2.5
+        assert 'functionCall' in first_chunk
+        assert module._google_adapter_rate_limit_until_monotonic_by_key['__default__'] >= time.monotonic() + 2.5
+    finally:
+        await iterator.aclose()
 
 
 def _decode_anthropic_sse_events(chunks: list[bytes]) -> list[dict[str, Any]]:

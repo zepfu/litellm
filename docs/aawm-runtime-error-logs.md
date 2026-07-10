@@ -329,6 +329,11 @@ streaming response has been handed to the client, midstream failures remain
 terminal for that stream and are recorded through the streaming error context
 path instead of replaying the request.
 
+Adapted Google Code Assist streams also own cleanup of their nested event
+parser and source body iterator. If a downstream client stops consuming the
+stream early, both iterators are closed before teardown; this releases upstream
+resources without synthesizing a terminal event or replaying the request.
+
 Post-first-byte upstream read timeouts also emit an explicit terminal stream
 event to the client after any bytes already forwarded. The proxy preserves the
 partial stream, appends a route-family-specific terminal failure chunk, and does

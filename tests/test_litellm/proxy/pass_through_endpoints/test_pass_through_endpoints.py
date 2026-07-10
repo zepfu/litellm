@@ -4018,7 +4018,10 @@ class TestGrokBillingPassthroughTimeoutLogging:
                 "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
             ) as mock_get_client, patch(
                 "litellm.proxy.proxy_server.proxy_logging_obj"
-            ) as mock_logging_obj:
+            ) as mock_logging_obj, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+                new=AsyncMock(),
+            ) as mock_direct_capture:
                 mock_client_obj = MagicMock()
                 mock_client_obj.client = MagicMock()
                 mock_get_client.return_value = mock_client_obj
@@ -4043,6 +4046,7 @@ class TestGrokBillingPassthroughTimeoutLogging:
                         "traceback_str"
                     ]
                 )
+                mock_direct_capture.assert_awaited_once()
         finally:
             TestPassThroughTerminalFailureLogging._restore_verbose_proxy_logger(
                 saved_handlers,
