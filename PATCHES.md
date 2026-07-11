@@ -53,6 +53,51 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.119 — Route-aware reasoning reconciliation and release parity
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.119`. This release
+carries the validated commits after `aawm.118` and keeps the independently
+deployed callback and harness artifacts aligned with the fork behavior:
+
+- Make Redis-backed alias-routing writes raise on failure when the routing
+  repository requests strict durability, rather than allowing a failed write to
+  look successful.
+- Mark GPT-5.6 Sol, Terra, and Luna as supporting the native `max` reasoning
+  tier in both model-config sources and the OpenAI transformation/type surfaces.
+- Reconcile requested reasoning effort after the concrete Codex route is
+  selected: retain `max` for GPT-5.6 models, clamp it to `xhigh` for
+  GPT-5.3 Codex Spark, and emit the resolved model, provider, ceiling, mapping,
+  clamp, and candidate-attempt metadata used by session history and routing
+  audit records.
+- Document the fail-closed Anthropic routing boundary so selected
+  Anthropic/Claude models remain on Anthropic-native egress and credentials
+  regardless of the inbound request wire format.
+- Restore byte-for-byte callback-wheel parity for the new reasoning metadata
+  and session-history spool decoder.
+- Harden the release harness for Claude Code JSON event arrays, canonical
+  tenant attribution, and compacted Langfuse tool state while preserving
+  redacted argument validation through matching CLI output.
+
+**Why:** A request-level reasoning tier is not valid until it is reconciled
+against the selected model's capabilities. Durable route state also must not
+report success when Redis rejected the write, and independently released
+callback/harness artifacts must observe the same behavior as the integrated
+fork source.
+
+**Why not upstream:** The AAWM alias chains, post-route reasoning attribution,
+session-history metadata, artifact split, and provider-routing policy are
+fork-local operational contracts.
+
+**Validation status:** Focused routing, Redis-write, GPT-5.6 transformation,
+model-config, passthrough reasoning, callback parity, and harness tests pass.
+The dev focused artifact
+`/tmp/litellm-dev-aawm119-focused-fixed.json` and default artifact
+`/tmp/litellm-dev-aawm119-default-fixed.json` both report zero failures and
+zero warnings. **Production promotion is not complete yet:** follow
+`PROD_RELEASE.md`, publish and verify the image and independently deployable
+artifacts from the final `main` head, then rebuild and validate
+`aawm-litellm`.
+
 ### aawm.118 — Durable alias-routing state and Responses terminal hardening
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.118`. This release
