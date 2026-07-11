@@ -3933,11 +3933,11 @@ def _attach_auto_agent_alias_terminal_context_fields(
     return event
 
 
-def _persist_auto_agent_alias_audit_only_events_best_effort(
+def _persist_auto_agent_alias_audit_only_events_best_effort(  # noqa: PLR0915
     events: list[dict[str, Any]],
     *,
     request_body: Optional[dict[str, Any]] = None,
-) -> None:
+) -> str:
     """Best-effort audit-only persistence without session_history inserts.
 
     Used for terminal/no-candidate Codex+Anthropic alias events that never reach
@@ -3945,20 +3945,48 @@ def _persist_auto_agent_alias_audit_only_events_best_effort(
     never blocked by observability.
     """
     if not events:
-        return
-    try:
-        from litellm.integrations.aawm_agent_identity import (
-            _build_alias_routing_audit_only_record,
-            _enqueue_session_history_record,
-        )
-    except Exception:
-        verbose_proxy_logger.debug(
-            "Unable to import alias routing audit-only helpers",
-            exc_info=True,
-        )
-        return
+        return "skip_empty"
 
-    primary = events[0] if events else {}
+    max_event_types_for_log = 8
+
+    def _sanitize_identifier(value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            return "<missing>"
+        try:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+        except Exception:
+            digest = "<redacted>"
+        return digest
+
+    def _sanitize_log_label(value: Any, *, max_length: int) -> str:
+        if not isinstance(value, str) or not value.strip():
+            return "<missing>"
+        sanitized = re.sub(
+            r"[^A-Za-z0-9_.:/-]+",
+            "_",
+            value.strip(),
+        )
+        return sanitized[:max_length] or "<missing>"
+
+    def _collect_event_types() -> str:
+        event_types: list[str] = []
+        omitted_count = 0
+        for event in events:
+            event_type = event.get("event_type") if isinstance(event, dict) else None
+            if not isinstance(event_type, str):
+                continue
+            sanitized = _sanitize_log_label(event_type, max_length=64)
+            if sanitized in event_types:
+                continue
+            if len(event_types) >= max_event_types_for_log:
+                omitted_count += 1
+                continue
+            event_types.append(sanitized)
+        if omitted_count:
+            event_types.append(f"+{omitted_count}_more")
+        return f"[{','.join(event_types)}]"
+
+    primary = events[-1] if isinstance(events[-1], dict) else {}
     metadata: dict[str, Any] = {
         "aawm_alias_routing_audit_only": True,
         "source": "auto_agent_alias_terminal_or_no_candidate",
@@ -3974,6 +4002,40 @@ def _persist_auto_agent_alias_audit_only_events_best_effort(
                 value = litellm_metadata.get(key)
                 if value is not None:
                     metadata[key] = value
+
+    event_types = _collect_event_types()
+    alias = _sanitize_log_label(
+        primary.get("alias_model")
+        or primary.get("requested_model_alias")
+        or metadata.get("requested_model_alias")
+        or metadata.get("model_alias_label"),
+        max_length=96,
+    )
+    session_id_hash = _sanitize_identifier(primary.get("session_id"))
+    litellm_call_id_hash = _sanitize_identifier(primary.get("litellm_call_id"))
+    trace_id_hash = _sanitize_identifier(primary.get("trace_id"))
+
+    try:
+        from litellm.integrations.aawm_agent_identity import (
+            _build_alias_routing_audit_only_record,
+            _enqueue_session_history_record,
+            _spool_session_history_records,
+        )
+    except Exception as import_exc:
+        verbose_proxy_logger.warning(
+            "AAWM_ALIAS_ROUTE: unable to import alias routing audit-only helpers "
+            "(persistence_disposition=fail_import, exception_class=%s, alias=%s, "
+            "session_id_hash=%s, litellm_call_id_hash=%s, event_types=%s, "
+            "event_count=%d)",
+            type(import_exc).__name__,
+            alias,
+            session_id_hash,
+            litellm_call_id_hash,
+            event_types,
+            len(events),
+        )
+        return "fail_import"
+
     try:
         record = _build_alias_routing_audit_only_record(
             events=events,
@@ -3983,12 +4045,59 @@ def _persist_auto_agent_alias_audit_only_events_best_effort(
             provider=primary.get("provider"),
             metadata=metadata,
         )
-        _enqueue_session_history_record(record)
-    except Exception:
-        verbose_proxy_logger.debug(
-            "Failed to enqueue alias routing audit-only record",
-            exc_info=True,
+    except Exception as build_exc:
+        verbose_proxy_logger.warning(
+            "AAWM_ALIAS_ROUTE: failed to build alias routing audit-only record "
+            "(persistence_disposition=fail_build, exception_class=%s, alias=%s, "
+            "session_id_hash=%s, litellm_call_id_hash=%s, event_types=%s, "
+            "event_count=%d)",
+            type(build_exc).__name__,
+            alias,
+            session_id_hash,
+            litellm_call_id_hash,
+            event_types,
+            len(events),
         )
+        return "fail_build"
+
+    try:
+        _spool_session_history_records(
+            [record],
+            reason="alias audit terminal write-ahead",
+        )
+        return "spool_only"
+    except Exception as spool_exc:
+        verbose_proxy_logger.warning(
+            "AAWM_ALIAS_ROUTE: failed to spool terminal alias audit event; "
+            "queue_disposition=spool_failed, alias=%s, session_id_hash=%s, "
+            "litellm_call_id_hash=%s, trace_id_hash=%s, event_types=%s, "
+            "event_count=%d, exception_class=%s",
+            alias,
+            session_id_hash,
+            litellm_call_id_hash,
+            trace_id_hash,
+            event_types,
+            len(events),
+            type(spool_exc).__name__,
+        )
+        try:
+            _enqueue_session_history_record(record)
+        except Exception as enqueue_exc:
+            verbose_proxy_logger.warning(
+                "AAWM_ALIAS_ROUTE: failed terminal alias audit fallback enqueue; "
+                "queue_disposition=enqueue_failed, alias=%s, session_id_hash=%s, "
+                "litellm_call_id_hash=%s, event_types=%s, event_count=%d, "
+                "spool_exception_class=%s, enqueue_exception_class=%s",
+                alias,
+                session_id_hash,
+                litellm_call_id_hash,
+                event_types,
+                len(events),
+                type(spool_exc).__name__,
+                type(enqueue_exc).__name__,
+            )
+            return "spool_enqueue_failed"
+        return "spool_fallback_enqueue"
 
 
 def _emit_auto_agent_alias_no_candidate_event(

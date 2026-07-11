@@ -74,6 +74,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _codex_auto_agent_request_has_continuation_state,
     _classify_auto_agent_alias_terminal_activity_status,
     _attach_auto_agent_alias_terminal_context_fields,
+    _persist_auto_agent_alias_audit_only_events_best_effort,
     _emit_auto_agent_alias_no_candidate_event,
     _extract_auto_agent_alias_agent_dispatch_fields,
     _extract_auto_agent_alias_role_from_text,
@@ -19887,6 +19888,244 @@ def _assert_alias_route_logs_exclude_event_types(
     )
 
 
+def _format_warning_messages(mock_warning: Mock) -> list[str]:
+    warnings: list[str] = []
+    for call in mock_warning.call_args_list:
+        args = call.args
+        if not args:
+            continue
+        message = str(args[0])
+        if len(args) > 1:
+            try:
+                message = message % args[1:]
+            except Exception:
+                pass
+        warnings.append(message)
+    return warnings
+
+
+def test_persist_auto_agent_alias_audit_only_events_best_effort_spools_with_reason(
+    monkeypatch,
+):
+    events = [
+        {
+            "event_type": "candidate_retryable_failure",
+            "provider": "xai",
+            "model": "xai/grok-4.5",
+            "litellm_call_id": "call-nonterminal",
+            "session_id": "session-nonterminal",
+        },
+        {
+            "event_type": "redispatch_required",
+            "provider": "openai",
+            "model": "gpt-5.3-codex-spark",
+            "litellm_call_id": "call-001",
+            "session_id": "session-001",
+            "alias_model": "aawm-anthropic-agent-auto",
+        }
+    ]
+    request_body = {
+        "litellm_metadata": {
+            "requested_model_alias": "aawm-anthropic-agent-auto",
+            "model_alias_label": "aawm-anthropic-agent-auto-label",
+            "repository": "litellm",
+            "trace_id": "trace-001",
+        }
+    }
+    spooled = []
+
+    def _capture_spool(records, *, reason: str) -> str:
+        spooled.append((records, reason))
+        return "spool-path"
+
+    with patch(
+        "litellm.integrations.aawm_agent_identity._spool_session_history_records",
+        new=Mock(side_effect=_capture_spool),
+    ) as mock_spool, patch(
+        "litellm.integrations.aawm_agent_identity._enqueue_session_history_record",
+        new=Mock(),
+    ) as mock_enqueue:
+        disposition = _persist_auto_agent_alias_audit_only_events_best_effort(
+            events,
+            request_body=request_body,
+        )
+
+    assert disposition == "spool_only"
+    assert len(spooled) == 1
+    records, reason = spooled[0]
+    assert reason == "alias audit terminal write-ahead"
+    assert isinstance(records, list)
+    assert len(records) == 1
+    assert records[0]["_skip_session_history"] is True
+    assert records[0]["session_id"] == "session-001"
+    assert records[0]["litellm_call_id"] == "call-001"
+    assert records[0]["model"] == "gpt-5.3-codex-spark"
+    assert records[0]["provider"] == "openai"
+    assert records[0]["metadata"]["requested_model_alias"] == "aawm-anthropic-agent-auto"
+    assert records[0]["metadata"]["model_alias_label"] == "aawm-anthropic-agent-auto-label"
+    assert records[0]["metadata"]["repository"] == "litellm"
+    assert mock_spool.call_count == 1
+    mock_enqueue.assert_not_called()
+
+
+def test_persist_auto_agent_alias_audit_only_events_best_effort_falls_back_to_enqueue(
+    monkeypatch,
+):
+    events = [
+        {
+            "event_type": "redispatch_required",
+            "provider": "openai",
+            "model": "gpt-5.3-codex-spark",
+            "session_id": "session-spool-fallback",
+            "litellm_call_id": "call-fallback",
+            "alias_model": "aawm-anthropic-agent-auto",
+        }
+    ]
+    enqueued: list[dict[str, Any]] = []
+
+    def _capture_enqueue(record: dict[str, Any]) -> None:
+        enqueued.append(record)
+
+    with patch(
+        "litellm.integrations.aawm_agent_identity._spool_session_history_records",
+        new=Mock(side_effect=RuntimeError("spool unavailable")),
+    ) as mock_spool, patch(
+        "litellm.integrations.aawm_agent_identity._enqueue_session_history_record",
+        new=_capture_enqueue,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        disposition = _persist_auto_agent_alias_audit_only_events_best_effort(events)
+
+    assert disposition == "spool_fallback_enqueue"
+    assert len(enqueued) == 1
+    assert mock_spool.call_count == 1
+    warnings = " ".join(_format_warning_messages(mock_warning))
+    assert "AAWM_ALIAS_ROUTE: failed to spool terminal alias audit event" in warnings
+    assert "queue_disposition=spool_failed" in warnings
+    assert "alias=aawm-anthropic-agent-auto" in warnings
+    assert "session_id_hash=" in warnings
+    assert "litellm_call_id_hash=" in warnings
+    assert "session-spool-fallback" not in warnings
+    assert "call-fallback" not in warnings
+    assert "event_count=1" in warnings
+    assert "exception_class=RuntimeError" in warnings
+
+
+def test_persist_auto_agent_alias_audit_only_events_best_effort_total_failure_sanitizes_log(
+    monkeypatch,
+):
+    events = [
+        {
+            "event_type": "redispatch_required",
+            "provider": "openai",
+            "model": "gpt-5.3-codex-spark",
+            "session_id": "sensitive-session-id",
+            "litellm_call_id": "sensitive-call-id",
+            "trace_id": "sensitive-trace-id",
+            "alias_model": "aawm-anthropic-agent-auto",
+        }
+    ]
+
+    with patch(
+        "litellm.integrations.aawm_agent_identity._spool_session_history_records",
+        new=Mock(side_effect=ValueError("spool crash")),
+    ) as mock_spool, patch(
+        "litellm.integrations.aawm_agent_identity._enqueue_session_history_record",
+        new=Mock(side_effect=KeyError("enqueue crash")),
+    ) as mock_enqueue, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        disposition = _persist_auto_agent_alias_audit_only_events_best_effort(events)
+
+    assert disposition == "spool_enqueue_failed"
+    assert mock_spool.call_count == 1
+    assert mock_enqueue.call_count == 1
+    warnings = " ".join(_format_warning_messages(mock_warning))
+    assert "sensitive-session-id" not in warnings
+    assert "sensitive-call-id" not in warnings
+    assert "sensitive-trace-id" not in warnings
+    assert "alias=aawm-anthropic-agent-auto" in warnings
+    assert "spool_exception_class=ValueError" in warnings
+    assert "enqueue_exception_class=KeyError" in warnings
+    assert "event_count=1" in warnings
+
+
+def test_persist_auto_agent_alias_audit_only_events_best_effort_import_failure_is_bounded_and_sanitized():
+    events = [
+        {
+            "event_type": f"event-{index}-{'x' * 100}",
+        }
+        for index in range(10)
+    ]
+    events[-1].update(
+        {
+            "alias_model": "aawm secret alias",
+            "session_id": "sensitive-import-session",
+            "litellm_call_id": "sensitive-import-call",
+        }
+    )
+    original_import = __import__
+
+    def _fail_identity_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "litellm.integrations.aawm_agent_identity":
+            raise ImportError("sensitive import failure")
+        return original_import(name, globals, locals, fromlist, level)
+
+    with patch(
+        "builtins.__import__",
+        side_effect=_fail_identity_import,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        disposition = _persist_auto_agent_alias_audit_only_events_best_effort(events)
+
+    assert disposition == "fail_import"
+    warnings = " ".join(_format_warning_messages(mock_warning))
+    assert "persistence_disposition=fail_import" in warnings
+    assert "exception_class=ImportError" in warnings
+    assert "alias=aawm_secret_alias" in warnings
+    assert "session_id_hash=" in warnings
+    assert "litellm_call_id_hash=" in warnings
+    assert "event_count=10" in warnings
+    assert "+2_more" in warnings
+    assert "x" * 65 not in warnings
+    assert "sensitive-import-session" not in warnings
+    assert "sensitive-import-call" not in warnings
+    assert len(warnings) < 1000
+    assert all("exc_info" not in call.kwargs for call in mock_warning.call_args_list)
+
+
+def test_persist_auto_agent_alias_audit_only_events_best_effort_build_failure_is_sanitized():
+    events = [
+        {
+            "event_type": "redispatch required\nunsafe",
+            "alias_model": "aawm-code-anthropic",
+            "session_id": "sensitive-build-session",
+            "litellm_call_id": "sensitive-build-call",
+        }
+    ]
+
+    with patch(
+        "litellm.integrations.aawm_agent_identity._build_alias_routing_audit_only_record",
+        new=Mock(side_effect=ValueError("sensitive build failure")),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
+    ) as mock_warning:
+        disposition = _persist_auto_agent_alias_audit_only_events_best_effort(events)
+
+    assert disposition == "fail_build"
+    warnings = " ".join(_format_warning_messages(mock_warning))
+    assert "persistence_disposition=fail_build" in warnings
+    assert "exception_class=ValueError" in warnings
+    assert "alias=aawm-code-anthropic" in warnings
+    assert "event_types=[redispatch_required_unsafe]" in warnings
+    assert "event_count=1" in warnings
+    assert "sensitive-build-session" not in warnings
+    assert "sensitive-build-call" not in warnings
+    assert all("exc_info" not in call.kwargs for call in mock_warning.call_args_list)
+
+
 @pytest.mark.parametrize(
     "alias",
     [
@@ -22402,7 +22641,7 @@ async def test_anthropic_auto_agent_alias_routes_haiku_last_resort_native(
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
+async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(  # noqa: PLR0915
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
@@ -22443,10 +22682,15 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
             "status": "RESOURCE_EXHAUSTED",
         }
     }
-    persisted = []
+    spooled_records: list[tuple[list[dict[str, Any]], str]] = []
+
+    def _capture_spool(records, *, reason: str) -> str:
+        spooled_records.append((records, reason))
+        return "spool-path"
+
     monkeypatch.setattr(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
-        lambda events, *, request_body=None: persisted.append(events),
+        _persist_auto_agent_alias_audit_only_events_best_effort,
     )
 
     with patch(
@@ -22460,7 +22704,10 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
         new=AsyncMock(),
     ) as mock_native, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning"
-    ) as mock_warning:
+    ) as mock_warning, patch(
+        "litellm.integrations.aawm_agent_identity._spool_session_history_records",
+        new=Mock(side_effect=_capture_spool),
+    ) as mock_spool:
         with pytest.raises(HTTPException) as exc_info:
             await _handle_anthropic_auto_agent_alias_route(
                 endpoint="/v1/messages",
@@ -22516,11 +22763,18 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
     assert redispatch_event["thread_source"] == "subagent"
     assert redispatch_event["agent_id"] == "agent-anthropic-terminal"
     assert redispatch_event["litellm_call_id"]
-    assert len(persisted) == 1
-    assert persisted[0][-1]["event_type"] == "redispatch_required"
-    assert persisted[0][-1]["litellm_call_id"] == redispatch_event[
-        "litellm_call_id"
-    ]
+    assert len(spooled_records) == 1
+    assert mock_spool.call_count == 1
+    spooled_batch, reason = spooled_records[0]
+    assert reason == "alias audit terminal write-ahead"
+    assert len(spooled_batch) == 1
+    assert spooled_batch[0]["metadata"]["aawm_alias_routing_audit_only"] is True
+    assert (
+        spooled_batch[0]["metadata"]["aawm_alias_routing_audit_events"][-1][
+            "event_type"
+        ]
+        == "redispatch_required"
+    )
     assert _alias_route_log_payloads(mock_warning) == []
     mock_openrouter.assert_awaited_once()
     mock_spark.assert_not_called()
