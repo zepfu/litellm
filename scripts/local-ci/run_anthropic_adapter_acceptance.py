@@ -125,10 +125,13 @@ def _extract_path_value(value: Any, path: str) -> Any | None:
 
 
 def _parse_command_output_json(stdout: str) -> dict[str, Any] | None:
-    for obj in RA._parse_stdout_json_objects(stdout):
-        if isinstance(obj, dict):
+    objects = RA._parse_stdout_json_objects(stdout)
+    if not objects:
+        return None
+    for obj in reversed(objects):
+        if obj.get('type') == 'result':
             return obj
-    return None
+    return objects[-1]
 
 
 def _extract_command_session_id(stdout: str) -> str | None:
@@ -330,6 +333,11 @@ def _apply_target_profile_to_config(
                 repository=repository_tenant_id,
             )
         )
+        expected_original_tenant_id = (
+            _resolve_expected_codex_trace_user_id(tenant_id)
+            if cli_kind == 'codex'
+            else tenant_id
+        )
         updated_case['tenant_id'] = tenant_id
         harness_run_id = str(
             updated_case.get('harness_run_id')
@@ -372,19 +380,17 @@ def _apply_target_profile_to_config(
             updated_case.get('require_trace_user_id', True) is not False
         )
         if require_trace_user_id:
-            metadata_required_equals.setdefault(
-                'tenant_id',
-                expected_session_history_tenant_id,
+            metadata_required_equals['tenant_id'] = (
+                expected_session_history_tenant_id
             )
-            if expected_session_history_tenant_id != tenant_id:
-                metadata_required_equals.setdefault(
-                    'aawm_original_tenant_id',
-                    tenant_id,
+            metadata_required_equals.pop('aawm_original_tenant_id', None)
+            metadata_required_equals.pop('aawm_harness_tenant_alias', None)
+            if expected_session_history_tenant_id != expected_original_tenant_id:
+                metadata_required_equals['aawm_original_tenant_id'] = (
+                    expected_original_tenant_id
                 )
-                metadata_required_equals.setdefault(
-                    'aawm_harness_tenant_alias',
-                    True,
-                )
+                if _is_harness_tenant_alias(expected_original_tenant_id):
+                    metadata_required_equals['aawm_harness_tenant_alias'] = True
         session_history_validation['metadata_required_equals'] = (
             metadata_required_equals
         )
@@ -402,9 +408,8 @@ def _apply_target_profile_to_config(
                 for row in expected_rows
             ]
         elif require_trace_user_id:
-            session_history_validation.setdefault(
-                'expected_tenant_id',
-                expected_session_history_tenant_id,
+            session_history_validation['expected_tenant_id'] = (
+                expected_session_history_tenant_id
             )
         session_history_validation.setdefault('require_runtime_identity', True)
         updated_case['session_history_validation'] = session_history_validation
@@ -1120,6 +1125,7 @@ def _collect_stream_tool_call_state(
     event_types: list[str] = []
     event_counts: dict[str, int] = {}
     tool_state: list[dict[str, Any]] = []
+    compacted_tool_state = False
 
     for observation in observations:
         metadata = observation.get('metadata')
@@ -1141,6 +1147,24 @@ def _collect_stream_tool_call_state(
                 for item in metadata_tool_state:
                     if isinstance(item, dict):
                         tool_state.append(dict(item))
+            elif (
+                isinstance(metadata_tool_state, dict)
+                and metadata_tool_state.get('type')
+                == 'litellm_langfuse_metadata_compacted'
+            ):
+                compacted_tool_state = True
+                for item in metadata_tool_state.get('sample_tool_calls') or []:
+                    if not isinstance(item, dict):
+                        continue
+                    tool_state.append(
+                        {
+                            'type': item.get('type'),
+                            'name': item.get('name'),
+                            'call_id': item.get('call_id'),
+                            'arguments': '',
+                            'arguments_compacted': True,
+                        }
+                    )
 
         output = observation.get('output')
         if isinstance(output, dict):
@@ -1181,12 +1205,87 @@ def _collect_stream_tool_call_state(
             for item in deduped_tool_state
             if isinstance(item.get('name'), str) and item.get('name')
         ],
+        'compacted_tool_state': compacted_tool_state,
     }
+
+
+def _command_tool_state_from_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = item.get('type')
+    if item_type == 'command_execution':
+        command = item.get('command')
+        if not isinstance(command, str) or not command:
+            return None
+        return {
+            'type': 'function_call',
+            'name': 'exec_command',
+            'call_id': item.get('id'),
+            'arguments': json.dumps({'cmd': command}, sort_keys=True),
+            'source': 'command_stdout',
+        }
+    if item_type != 'tool_use':
+        return None
+
+    tool_name = item.get('name')
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    tool_input = item.get('input')
+    if tool_name == 'Bash':
+        tool_name = 'exec_command'
+        if isinstance(tool_input, dict):
+            normalized_input = dict(tool_input)
+            if 'command' in normalized_input:
+                normalized_input['cmd'] = normalized_input.pop('command')
+            tool_input = normalized_input
+    try:
+        arguments = json.dumps(tool_input, sort_keys=True)
+    except (TypeError, ValueError):
+        arguments = str(tool_input or '')
+    return {
+        'type': 'function_call',
+        'name': tool_name,
+        'call_id': item.get('id'),
+        'arguments': arguments,
+        'source': 'command_stdout',
+    }
+
+
+def _collect_command_tool_call_state(stdout: str) -> list[dict[str, Any]]:
+    collected: list[dict[str, Any]] = []
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            state_item = _command_tool_state_from_item(value)
+            if state_item is not None:
+                collected.append(state_item)
+            for child in value.values():
+                _walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                _walk(child)
+
+    for obj in RA._parse_stdout_json_objects(stdout):
+        _walk(obj)
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in collected:
+        key = (
+            str(item.get('type') or ''),
+            str(item.get('name') or ''),
+            str(item.get('arguments') or ''),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def _stream_tool_state_matches_expected(
     item: dict[str, Any],
     expected: dict[str, Any],
+    *,
+    check_arguments: bool = True,
 ) -> bool:
     expected_name = expected.get('tool_name')
     if expected_name is not None and item.get('name') != expected_name:
@@ -1203,6 +1302,9 @@ def _stream_tool_state_matches_expected(
     if isinstance(type_one_of, list) and type_one_of:
         if item.get('type') not in set(type_one_of):
             return False
+
+    if not check_arguments:
+        return True
 
     argument_text = str(item.get('arguments') or '')
     required_substrings = []
@@ -1224,6 +1326,7 @@ def _validate_stream_tool_call_state(
     family: str,
     observations: list[dict[str, Any]],
     checks: dict[str, Any],
+    command_stdout: str = '',
 ) -> tuple[dict[str, Any], list[str]]:
     if not checks:
         return {}, []
@@ -1252,6 +1355,13 @@ def _validate_stream_tool_call_state(
     tool_state = [
         item for item in summary.get('tool_state') or [] if isinstance(item, dict)
     ]
+    command_tool_state = _collect_command_tool_call_state(command_stdout)
+    summary['command_tool_state'] = command_tool_state
+    summary['command_tool_names'] = [
+        item.get('name')
+        for item in command_tool_state
+        if isinstance(item.get('name'), str) and item.get('name')
+    ]
     for expected in checks.get('expected_tools') or []:
         if not isinstance(expected, dict):
             continue
@@ -1264,9 +1374,28 @@ def _validate_stream_tool_call_state(
             for item in tool_state
             if _stream_tool_state_matches_expected(item, expected)
         ]
-        if len(matches) < minimum_count:
+        compacted_matches = [
+            item
+            for item in tool_state
+            if item.get('arguments_compacted') is True
+            and _stream_tool_state_matches_expected(
+                item,
+                expected,
+                check_arguments=False,
+            )
+        ]
+        command_matches = [
+            item
+            for item in command_tool_state
+            if _stream_tool_state_matches_expected(item, expected)
+        ]
+        matched_count = len(matches) + min(
+            len(compacted_matches),
+            len(command_matches),
+        )
+        if matched_count < minimum_count:
             failures.append(
-                f'{family} missing Responses stream tool state for {expected!r}; expected >= {minimum_count}, got {len(matches)}'
+                f'{family} missing Responses stream tool state for {expected!r}; expected >= {minimum_count}, got {matched_count}'
             )
 
     return summary, failures
@@ -3484,6 +3613,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         family=name,
         observations=raw_generation_observations,
         checks=config.get('stream_tool_call_state_validation') or {},
+        command_stdout=run.get('stdout', ''),
     )
     failures.extend(stream_tool_call_state_failures)
     stream_tool_call_state_passed = (

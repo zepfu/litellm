@@ -479,6 +479,40 @@ def test_command_json_validator_accepts_required_regex():
     assert summary["required_regex_hits"] == {"result": "2026-04-27\n"}
 
 
+def test_command_json_validator_selects_terminal_claude_result_from_event_array():
+    harness = _load_harness_module()
+    stdout = json.dumps(
+        [
+            {"type": "system", "subtype": "init", "session_id": "session-1"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "ok",
+                "total_cost_usd": 0.01,
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            },
+        ]
+    )
+
+    summary, failures = harness._validate_command_output_json(
+        family="case",
+        stdout=stdout,
+        checks={
+            "required_equals": {"is_error": False, "result": "ok"},
+            "required_minimums": {
+                "usage.input_tokens": 1,
+                "usage.output_tokens": 1,
+                "total_cost_usd": 1e-06,
+            },
+        },
+    )
+
+    assert failures == []
+    assert summary["parsed"]["type"] == "result"
+
+
 def test_command_json_validator_rejects_required_regex_mismatch():
     harness = _load_harness_module()
     pattern = r"^\d{4}-\d{2}-\d{2}\s*$"
@@ -629,6 +663,76 @@ def test_stream_tool_call_state_validation_rejects_missing_event_and_tool():
         "case missing any Responses stream event type from ['response.function_call_arguments.delta', 'response.function_call_arguments.done']",
         "case missing Responses stream tool state for {'tool_name': 'Bash', 'arguments_required_substrings': ['pwd']}; expected >= 1, got 0",
     ]
+
+
+def test_stream_tool_call_state_uses_command_output_for_compacted_arguments():
+    harness = _load_harness_module()
+    observation = {
+        "id": "generation-1",
+        "metadata": {
+            "responses_stream_event_types": [
+                "response.output_item.added",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+            ],
+            "responses_stream_tool_state": {
+                "type": "litellm_langfuse_metadata_compacted",
+                "field": "responses_stream_tool_state",
+                "tool_call_count": 1,
+                "tool_names": ["exec_command"],
+                "tool_type_counts": {"function_call": 1},
+                "sample_tool_calls": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call-pwd",
+                        "arguments_hash": "hash",
+                    }
+                ],
+            },
+        },
+    }
+    command_stdout = json.dumps(
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call-pwd",
+                            "name": "Bash",
+                            "input": {"command": "pwd"},
+                        }
+                    ]
+                },
+            }
+        ]
+    )
+
+    summary, failures = harness._validate_stream_tool_call_state(
+        family="case",
+        observations=[observation],
+        checks={
+            "required_event_types": [
+                "response.output_item.added",
+                "response.output_item.done",
+            ],
+            "expected_tools": [
+                {
+                    "tool_name": "exec_command",
+                    "tool_type": "function_call",
+                    "arguments_required_substrings": ["pwd"],
+                }
+            ],
+        },
+        command_stdout=command_stdout,
+    )
+
+    assert failures == []
+    assert summary["compacted_tool_state"] is True
+    assert summary["tool_names"] == ["exec_command"]
+    assert summary["command_tool_names"] == ["exec_command"]
 
 
 def test_provider_unavailable_command_failure_can_soft_fail_with_exact_log_signature():
@@ -1079,6 +1183,46 @@ def test_target_profile_sets_session_history_runtime_identity_expectations(monke
     assert "harness_run_id" in updated["cases"]["claude_adapter_gpt55"]
 
 
+def test_target_profile_overrides_stale_case_level_harness_tenant_expectations():
+    harness = _load_harness_module()
+
+    config = {
+        "default_tenant_id": "adapter-harness-tenant",
+        "cases": {
+            "claude_adapter_openai_output_config_effort": {
+                "http_request": {"path": "/anthropic/v1/messages"},
+                "session_history_validation": {
+                    "expected_tenant_id": "adapter-harness-tenant",
+                    "metadata_required_equals": {
+                        "tenant_id": "adapter-harness-tenant"
+                    },
+                },
+            }
+        },
+    }
+    updated = harness._apply_target_profile_to_config(
+        config,
+        target="dev",
+        profile={
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+            "docker_container_name": "litellm-dev",
+            "expected_trace_environment": "dev",
+        },
+    )
+
+    validation = updated["cases"]["claude_adapter_openai_output_config_effort"][
+        "session_history_validation"
+    ]
+    assert validation["expected_tenant_id"] == "litellm"
+    assert validation["metadata_required_equals"]["tenant_id"] == "litellm"
+    assert (
+        validation["metadata_required_equals"]["aawm_original_tenant_id"]
+        == "adapter-harness-tenant"
+    )
+    assert validation["metadata_required_equals"]["aawm_harness_tenant_alias"] is True
+
+
 def test_target_profile_can_skip_trace_environment_validation():
     harness = _load_harness_module()
 
@@ -1255,12 +1399,10 @@ def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeyp
     ] == "zepfu/litellm"
     assert session_history_validation["metadata_required_equals"][
         "aawm_original_tenant_id"
-    ] == "adapter-harness-tenant"
+    ] == "litellm"
     assert (
-        session_history_validation["metadata_required_equals"][
-            "aawm_harness_tenant_alias"
-        ]
-        is True
+        "aawm_harness_tenant_alias"
+        not in session_history_validation["metadata_required_equals"]
     )
 
 

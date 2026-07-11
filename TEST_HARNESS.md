@@ -99,6 +99,14 @@ This suite shells out to the real Claude CLI and then validates:
 - provider-family egress separation
 - adapted access-log labeling
 
+Claude Code may return `--output-format json` as an event array. The harness
+validates the terminal `type=result` object rather than the initial
+`type=system` event. When Langfuse compacts `responses_stream_tool_state`, the
+harness requires the compacted provider-side tool identity/count and uses the
+matching Claude/Codex command event only to validate redacted argument details.
+This preserves the tool-call gate without requiring raw tool arguments to be
+stored in Langfuse metadata.
+
 Basic OpenAI smoke cases (`gpt-5.4`, `gpt-5.5`, and `gpt-5.4-mini`) intentionally
 do not hard-gate the exact natural-language result string. They hard-gate command
 success, usage/cost, routing, request payload logging, Langfuse
