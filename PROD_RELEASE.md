@@ -521,6 +521,26 @@ command result and prod logs clearly show `usage_limit_reached` with a
 `resets_at` timestamp from `https://chatgpt.com/backend-api/codex/responses`.
 Convert that epoch to an exact UTC reset time and rerun after the reset.
 
+When a release depends on Codex functionality, the Codex canary itself is an
+explicit production gate:
+
+- Run Codex acceptance only through the real ChatGPT Codex OAuth/OIDC route to
+  `chatgpt.com/backend-api/codex/responses` via the normal
+  `native_openai_passthrough_responses_codex` lane in the existing native
+  passthrough harness.
+- Do not use OpenAI API-key-backed egress as a Codex test or fallback for
+  Codex acceptance. API-key OpenAI traffic, if separately enabled for other
+  lanes, is treated as a distinct route and cannot satisfy Codex acceptance
+  criteria.
+- If the OIDC/OAuth route is not available (missing tokens, missing managed auth
+  mount, refresh failure, or provider-status health signal), the Codex gate must
+  fail closed or be explicitly marked blocked. Do not substitute an
+  OpenAI API-key probe to move the release forward.
+- Acceptance evidence for Codex must identify the OAuth/OIDC Codex route
+  explicitly (for example, endpoint host/path and auth mode) and must not
+  include secrets. Keep evidence redacted to identifiers such as trace id,
+  session id, case list, and non-sensitive log fields.
+
 Do not silently ignore other harness failures. Non-Codex cases should still
 pass, warning-only canaries should remain warning-only, and the post-harness log
 scan should not contain unrelated ASGI/task/`Content-Length`/`h11`/database
