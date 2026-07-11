@@ -79,8 +79,10 @@ deployed callback and harness artifacts aligned with the fork behavior:
   redacted argument validation through matching CLI output.
 - Pin Docker auto-router packaging to semantic-router `0.1.15`, the first
   release outside GHSA-98x5-vq43-vc5p / CVE-2026-42208, and isolate both wheel
-  staging and runtime installation from transitive dependency resolution so an
-  external LiteLLM wheel cannot replace the fork build.
+  staging and runtime installation from transitive dependency resolution.
+  Explicitly pin its declared `colorama` runtime companion to `0.4.6` and run
+  build-time import/version assertions so an external LiteLLM wheel cannot
+  replace the fork build and dependency isolation cannot omit the companion.
 
 **Why:** A request-level reasoning tier is not valid until it is reconciled
 against the selected model's capabilities. Durable route state also must not
@@ -88,7 +90,8 @@ report success when Redis rejected the write, and independently released
 callback/harness artifacts must observe the same behavior as the integrated
 fork source. The container dependency path must also avoid yanked
 semantic-router releases and must not resolve an upstream LiteLLM wheel while
-building the fork image.
+building the fork image or omit declared runtime dependencies while using
+`--no-deps`.
 
 **Why not upstream:** The AAWM alias chains, post-route reasoning attribution,
 session-history metadata, artifact split, and provider-routing policy are
@@ -96,8 +99,9 @@ fork-local operational contracts.
 
 **Validation status:** Focused routing, Redis-write, GPT-5.6 transformation,
 model-config, passthrough reasoning, callback parity, and harness tests pass.
-The semantic-router Docker pin/isolation regression test passes; real image and
-Thoth prod/dev runtime verification remain part of the pending promotion.
+The semantic-router Docker pin/isolation regression test covers the exact
+`colorama` companion and build-time imports; real image and Thoth prod/dev
+runtime verification remain part of the pending promotion.
 The dev focused artifact
 `/tmp/litellm-dev-aawm119-focused-fixed.json` and default artifact
 `/tmp/litellm-dev-aawm119-default-fixed.json` both report zero failures and

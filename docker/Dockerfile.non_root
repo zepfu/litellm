@@ -32,7 +32,7 @@ RUN for i in 1 2 3; do \
 # Cache Python dependencies
 COPY requirements.txt .
 RUN pip wheel --no-cache-dir --wheel-dir=/wheels/ -r requirements.txt \
-  && pip wheel --no-cache-dir --wheel-dir=/wheels/ --no-deps "semantic_router==0.1.15" \
+  && pip wheel --no-cache-dir --wheel-dir=/wheels/ --no-deps "semantic_router==0.1.15" "colorama==0.4.6" \
   && pip wheel --no-cache-dir --wheel-dir=/wheels/ "aurelio-sdk==0.0.19" "PyJWT==2.12.0"
 
 # Copy source after dependency layers
@@ -159,8 +159,9 @@ ENV PRISMA_BINARY_CACHE_DIR=/app/.cache/prisma-python/binaries \
 # Install packages from wheels and optional extras without network
 RUN pip install --no-index --find-links=/wheels/ -r requirements.txt && \
     pip install --no-index --find-links=/wheels/ /wheels/litellm-*-py3-none-any.whl && \
-    pip install --no-index --find-links=/wheels/ --no-deps semantic_router==0.1.15 && \
+    pip install --no-index --find-links=/wheels/ --no-deps semantic_router==0.1.15 colorama==0.4.6 && \
     pip install --no-index --find-links=/wheels/ aurelio-sdk==0.0.19 && \
+    python -c 'from importlib.metadata import version; import colorama; from semantic_router.routers import SemanticRouter; from semantic_router.routers.base import Route; assert version("semantic-router") == "0.1.15"; assert version("colorama") == "0.4.6"' && \
     if [ "$PROXY_EXTRAS_SOURCE" = "local" ]; then \
       if ls /wheels/litellm_proxy_extras-*.whl >/dev/null 2>&1; then \
         pip install --no-index --find-links=/wheels/ /wheels/litellm_proxy_extras-*.whl; \
