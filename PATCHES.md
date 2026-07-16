@@ -53,6 +53,35 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.120 — Cooldown labeling and xAI candidate-unavailable policy
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.120`. This release
+carries the validated cooldown and xAI candidate-classification fixes after
+`aawm.119`:
+
+- Fix false `retryable_no_cooldown` rollup labels so request-local / non-cooldown
+  outcomes are not misreported as cooldown-eligible rollups.
+- Change generic xAI `candidate_unavailable` handling to request-local, except
+  native Grok 4.5 which remains `none` (no request-local rewrite for that native
+  path).
+- Keep native Grok 4.5 malformed tool-call output rejected and redispatchable,
+  but request-local rather than cooldown-bearing.
+- Leave explicit rate/capacity/quota failures and non-native malformed behavior
+  unchanged.
+
+**Why:** Rollup labels and cooldown scope must match the actual failure class so
+alias routing does not suppress healthy candidates or mis-attribute request-local
+xAI unavailability as durable cooldown state.
+
+**Why not upstream:** AAWM alias-chain cooldown semantics, xAI/Grok candidate
+classification, and rollup label contracts are fork-local operational behavior.
+
+**Validation status:** Focused tests and ruff pass locally. **Thoth
+deployment/runtime proof is still pending** before production promotion:
+follow `PROD_RELEASE.md`, publish and verify the image and independently
+deployable artifacts from the final `main` head, then rebuild and validate
+`aawm-litellm`.
+
 ### aawm.119 — Route-aware reasoning reconciliation and release parity
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.119`. This release

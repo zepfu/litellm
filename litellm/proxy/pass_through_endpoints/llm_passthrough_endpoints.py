@@ -3242,11 +3242,38 @@ def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str
     candidate_status = str(event.get("candidate_status") or "")
     selection_reason = str(event.get("selection_reason") or "")
     failure_class = str(event.get("failure_class") or "")
+    cooldown_scope = str(event.get("cooldown_scope") or "")
     if event_type == "no_candidate_available":
         return "Exhausted"
     if "auth_degraded" in candidate_status or "auth_degraded" in selection_reason:
         return "Degraded"
-    if event.get("redispatch_required") or "cooldown" in candidate_status:
+    # request-local / no-cooldown failures must not look like durable cool-downs.
+    # Note: do not substring-match "cooldown" — retryable_no_cooldown contains it.
+    if candidate_status == "retryable_no_cooldown" or cooldown_scope == "none":
+        if event.get("error_status_code") or failure_class:
+            return "Failed"
+        return None
+    if cooldown_scope == "request_local":
+        if (
+            event.get("error_status_code")
+            or failure_class
+            or event.get("redispatch_required")
+        ):
+            return "Failed"
+        return None
+    if candidate_status in {
+        "cooldown_set",
+        "terminal_in_flight_cooldown_set",
+        "skipped_cooldown",
+    } or (
+        candidate_status.startswith("skipped_")
+        and "cooldown" in candidate_status
+        and "auth_degraded" not in candidate_status
+    ):
+        return "Cooling Down"
+    if cooldown_scope == "candidate" or (
+        event.get("redispatch_required") and cooldown_scope != "request_local"
+    ):
         return "Cooling Down"
     if failure_class in {"rate_limited", "capacity_exhausted", "transient_error"}:
         return "Cooling Down"
@@ -5624,6 +5651,14 @@ def _is_codex_auto_agent_native_grok_4_5_candidate(
     }
 
 
+def _is_codex_auto_agent_xai_candidate(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    return candidate.get("provider") == _CODEX_AUTO_AGENT_XAI_PROVIDER
+
+
 def _is_codex_auto_agent_transient_internal_error_class(error_class: Optional[str]) -> bool:
     return error_class in {"upstream_transient_internal", "upstream_transient"}
 
@@ -5643,8 +5678,10 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         return "request_local"
     # Native Grok 4.5 is live. Broad candidate-unavailable probes can still
     # happen on transient/request-shape blips, so do not evict the native
-    # candidate from routing. OAuth-route credential failures still fall through
-    # request-locally to the native Grok candidate.
+    # candidate from routing. Other xAI alias candidates (Composer, Grok Build,
+    # managed OAuth Grok 4.5, etc.) stay request-local so missing/refreshing
+    # credentials cannot leave multi-hour Redis candidate cooldowns.
+    # Explicit rate-limit / capacity / quota classes still use candidate scope.
     if (
         error_class == "candidate_unavailable"
         and _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
@@ -5652,7 +5689,16 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         return "none"
     if (
         error_class == "candidate_unavailable"
-        and _is_codex_auto_agent_grok_4_5_candidate(candidate)
+        and _is_codex_auto_agent_xai_candidate(candidate)
+    ):
+        return "request_local"
+    # Native Grok 4.5 malformed tool-call text remains rejected and can still
+    # redispatch in-flight, but must not write a durable candidate cooldown.
+    # Composer / Grok Build / non-native candidates keep durable candidate
+    # cooldowns for this class.
+    if (
+        error_class == "malformed_tool_call_text"
+        and _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
     ):
         return "request_local"
     if _is_codex_auto_agent_native_grok_4_5_candidate(

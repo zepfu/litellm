@@ -131,6 +131,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _handle_anthropic_auto_agent_alias_route,
     _handle_codex_opencode_zen_adapter_route,
     _resolve_auto_agent_alias_route_rollup_outgoing_target,
+    _auto_agent_alias_route_rollup_status,
     _handle_codex_auto_agent_alias_route,
     _handle_codex_google_code_assist_adapter_route,
     _get_anthropic_auto_agent_candidates_for_alias,
@@ -22169,6 +22170,7 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permi
     composer_attempt = metadata["anthropic_auto_agent_attempts"][1]
     assert composer_attempt["status"] == "cooldown_set"
     assert composer_attempt["error_class"] == "candidate_unavailable"
+    assert composer_attempt["cooldown_scope"] == "request_local"
     assert "aawm_codex_auto_agent_candidate_unavailable" in composer_attempt[
         "error_tokens"
     ]
@@ -22180,6 +22182,11 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permi
     assert metadata["anthropic_auto_agent_skipped_candidates"][0]["model"] == (
         "gpt-5.3-codex-spark"
     )
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:grok-composer-2.5-fast:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
 
 
 @pytest.mark.asyncio
@@ -23059,6 +23066,195 @@ async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redi
     mock_spark.assert_not_called()
     mock_xai_oauth.assert_not_called()
     mock_native.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_in_flight_native_grok_4_5_malformed_redispatches_request_local(
+    monkeypatch,
+):
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "xai",
+        "model": "xai/grok-4.5",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    malformed_error = ProxyException(
+        message=(
+            "Codex auto-agent Grok native candidate returned a malformed "
+            "Responses marker payload."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    malformed_error.detail = {
+        "error": {
+            "message": malformed_error.message,
+            "code": "aawm_auto_agent_malformed_tool_call_text",
+            "status": "RESPONSES_MALFORMED_TOOL_CALL",
+            "type": "rate_limit_error",
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=malformed_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
+        new=AsyncMock(),
+    ) as mock_native:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_redispatch_required"
+    )
+    assert exc_info.value.detail["redispatch_required"] is True
+    assert exc_info.value.detail["selected_model"] == "xai/grok-4.5"
+    assert exc_info.value.detail["failure_class"] == "malformed_tool_call_text"
+    assert exc_info.value.detail["cooldown_scope"] == "request_local"
+    parsed_body = request.scope["parsed_body"][1]
+    metadata = parsed_body["litellm_metadata"]
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["model"] == "xai/grok-4.5"
+    assert attempts[0]["status"] == "terminal_in_flight_cooldown_set"
+    assert attempts[0]["error_class"] == "malformed_tool_call_text"
+    assert attempts[0]["cooldown_scope"] == "request_local"
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:xai/grok-4.5:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+    mock_grok_native.assert_awaited_once()
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+    mock_native.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_in_flight_native_grok_4_5_malformed_redispatches_request_local(
+    monkeypatch,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-code:codex-session:session:codex-session"
+    ] = {
+        "provider": "xai",
+        "model": "xai/grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    malformed_error = ProxyException(
+        message=(
+            "Codex auto-agent Grok native candidate returned a malformed "
+            "Responses marker payload."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    malformed_error.detail = {
+        "error": {
+            "message": malformed_error.message,
+            "code": "aawm_auto_agent_malformed_tool_call_text",
+            "status": "RESPONSES_MALFORMED_TOOL_CALL",
+            "type": "rate_limit_error",
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(side_effect=malformed_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(),
+    ) as mock_pass_through:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    assert exc_info.value.detail["redispatch_required"] is True
+    assert exc_info.value.detail["selected_model"] == "xai/grok-4.5"
+    assert exc_info.value.detail["failure_class"] == "malformed_tool_call_text"
+    assert exc_info.value.detail["cooldown_scope"] == "request_local"
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["codex_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["model"] == "xai/grok-4.5"
+    assert attempts[0]["status"] == "terminal_in_flight_cooldown_set"
+    assert attempts[0]["error_class"] == "malformed_tool_call_text"
+    assert attempts[0]["cooldown_scope"] == "request_local"
+    durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+        "xai:xai/grok-4.5:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+    mock_grok_native.assert_awaited_once()
+    mock_xai_oauth.assert_not_called()
+    mock_pass_through.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -26814,6 +27010,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permissio
     composer_attempt = metadata["codex_auto_agent_attempts"][1]
     assert composer_attempt["status"] == "cooldown_set"
     assert composer_attempt["error_class"] == "candidate_unavailable"
+    assert composer_attempt["cooldown_scope"] == "request_local"
     assert "aawm_codex_auto_agent_candidate_unavailable" in composer_attempt[
         "error_tokens"
     ]
@@ -26825,6 +27022,11 @@ async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permissio
     assert metadata["codex_auto_agent_skipped_candidates"][0]["model"] == (
         "gpt-5.3-codex-spark"
     )
+    durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+        "xai:grok-composer-2.5-fast:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
 
 
 @pytest.mark.parametrize(
@@ -27224,6 +27426,186 @@ def test_codex_auto_agent_candidate_cooldown_scope_explicit_exhaustion_classes_s
         )
 
 
+def test_codex_auto_agent_candidate_cooldown_scope_xai_candidate_unavailable_is_request_local():
+    candidates = (
+        {
+            "model": "grok-composer-2.5-fast",
+            "provider": "xai",
+            "route_family": "codex_grok_native_responses_adapter",
+        },
+        {
+            "model": "oa_xai/grok-build",
+            "provider": "xai",
+            "route_family": "codex_xai_oauth_responses_adapter",
+        },
+        {
+            "model": "oa_xai/grok-4.5",
+            "provider": "xai",
+            "route_family": "codex_xai_oauth_responses_adapter",
+        },
+        {
+            "model": "grok-build",
+            "provider": "xai",
+            "route_family": "anthropic_grok_native_responses_adapter",
+        },
+    )
+    for candidate in candidates:
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "candidate_unavailable",
+                candidate=candidate,
+            )
+            == "request_local"
+        )
+
+
+def test_codex_auto_agent_candidate_cooldown_scope_native_grok_4_5_malformed_is_request_local():
+    candidates = (
+        {
+            "model": "xai/grok-4.5",
+            "provider": "xai",
+            "route_family": "codex_grok_native_responses_adapter",
+        },
+        {
+            "model": "grok-4.5",
+            "provider": "xai",
+            "route_family": "anthropic_grok_native_responses_adapter",
+        },
+    )
+    for candidate in candidates:
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "malformed_tool_call_text",
+                candidate=candidate,
+            )
+            == "request_local"
+        )
+
+
+def test_codex_auto_agent_candidate_cooldown_scope_non_native_malformed_stays_candidate():
+    candidates = (
+        {
+            "model": "grok-composer-2.5-fast",
+            "provider": "xai",
+            "route_family": "codex_grok_native_responses_adapter",
+        },
+        {
+            "model": "oa_xai/grok-build",
+            "provider": "xai",
+            "route_family": "codex_xai_oauth_responses_adapter",
+        },
+        {
+            "model": "gpt-5.3-codex-spark",
+            "provider": "openai",
+            "route_family": "codex_responses",
+        },
+    )
+    for candidate in candidates:
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "malformed_tool_call_text",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+
+
+def test_auto_agent_alias_route_rollup_status_request_local_and_none_are_failed():
+    assert (
+        _auto_agent_alias_route_rollup_status(
+            {
+                "event_type": "candidate_retryable_failure",
+                "candidate_status": "retryable_no_cooldown",
+                "failure_class": "candidate_unavailable",
+                "error_status_code": 502,
+                "cooldown_scope": "none",
+            }
+        )
+        == "Failed"
+    )
+    assert (
+        _auto_agent_alias_route_rollup_status(
+            {
+                "event_type": "candidate_retryable_failure",
+                "candidate_status": "cooldown_set",
+                "failure_class": "candidate_unavailable",
+                "error_status_code": 429,
+                "cooldown_scope": "request_local",
+            }
+        )
+        == "Failed"
+    )
+    assert (
+        _auto_agent_alias_route_rollup_status(
+            {
+                "event_type": "redispatch_required",
+                "candidate_status": "terminal_in_flight_cooldown_set",
+                "failure_class": "malformed_tool_call_text",
+                "error_status_code": 429,
+                "cooldown_scope": "request_local",
+                "redispatch_required": True,
+            }
+        )
+        == "Failed"
+    )
+
+
+def test_auto_agent_alias_route_rollup_status_preserves_true_cooldown_labels():
+    assert (
+        _auto_agent_alias_route_rollup_status(
+            {
+                "event_type": "candidate_retryable_failure",
+                "candidate_status": "cooldown_set",
+                "failure_class": "rate_limited",
+                "cooldown_scope": "candidate",
+            }
+        )
+        == "Cooling Down"
+    )
+    assert (
+        _auto_agent_alias_route_rollup_status(
+            {
+                "event_type": "candidate_skipped_cooldown",
+                "candidate_status": "skipped_cooldown",
+                "selection_reason": "cooldown",
+            }
+        )
+        == "Cooling Down"
+    )
+    assert (
+        _auto_agent_alias_route_rollup_status(
+            {
+                "event_type": "redispatch_required",
+                "candidate_status": "terminal_in_flight_cooldown_set",
+                "failure_class": "malformed_tool_call_text",
+                "cooldown_scope": "candidate",
+                "redispatch_required": True,
+            }
+        )
+        == "Cooling Down"
+    )
+    assert (
+        _auto_agent_alias_route_rollup_status(
+            {
+                "event_type": "no_candidate_available",
+                "candidate_status": "all_candidates_unavailable",
+                "error_status_code": 429,
+            }
+        )
+        == "Exhausted"
+    )
+    assert (
+        _auto_agent_alias_route_rollup_status(
+            {
+                "event_type": "candidate_skipped_provider_degraded",
+                "candidate_status": "skipped_auth_degraded",
+                "selection_reason": "auth_degraded",
+            }
+        )
+        == "Degraded"
+    )
+
+
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries_without_redispatch():
     request = _build_codex_auto_agent_request()
@@ -27406,7 +27788,7 @@ async def test_provider_terminal_error_writes_durable_cooldown():
 
 
 @pytest.mark.asyncio
-async def test_candidate_unavailable_writes_durable_cooldown():
+async def test_candidate_unavailable_xai_is_request_local_without_durable_write():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
     candidate = {
@@ -27426,6 +27808,40 @@ async def test_candidate_unavailable_writes_durable_cooldown():
             candidate=candidate,
             lane_key="xai_grok_native",
             selected_cooldown_key=cooldown_key,
+            cooldown_seconds=10800.0,
+            error_class="candidate_unavailable",
+        )
+        durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+
+    assert scope == "request_local"
+    assert dual_cache.set_calls == []
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_candidate_unavailable_non_xai_still_writes_durable_cooldown():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_codex_auto_agent_request()
+    candidate = {
+        "provider": "openrouter",
+        "model": "openrouter/owl-alpha",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    cooldown_key = "openrouter:openrouter/owl-alpha:openrouter"
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        scope = await _apply_codex_auto_agent_alias_cooldown(
+            request=request,
+            candidate=candidate,
+            lane_key="openrouter",
+            selected_cooldown_key=cooldown_key,
             cooldown_seconds=30.0,
             error_class="candidate_unavailable",
         )
@@ -27439,6 +27855,40 @@ async def test_candidate_unavailable_writes_durable_cooldown():
     assert dual_cache.set_calls[0]["key"].endswith(cooldown_key)
     assert durable_seconds > 0.0
     assert durable_source == "durable_cache"
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_call_text_native_grok_4_5_is_request_local_without_durable_write():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    request = _build_codex_auto_agent_request()
+    candidate = {
+        "provider": "xai",
+        "model": "xai/grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+    }
+    cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        scope = await _apply_codex_auto_agent_alias_cooldown(
+            request=request,
+            candidate=candidate,
+            lane_key="xai_grok_native",
+            selected_cooldown_key=cooldown_key,
+            cooldown_seconds=1800.0,
+            error_class="malformed_tool_call_text",
+        )
+        durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+            cooldown_key
+        )
+
+    assert scope == "request_local"
+    assert dual_cache.set_calls == []
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
 
 
 @pytest.mark.asyncio

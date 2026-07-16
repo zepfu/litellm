@@ -534,12 +534,24 @@ Operational notes:
   candidate within the existing attempt budget instead of signaling
   `redispatch_required`. Explicit capacity/rate-limit/usage-limit failures still
   use candidate cooldowns.
+- Generic xAI `candidate_unavailable` failures (missing, expired, or refreshing
+  credentials; broad probe unavailability) never write durable candidate
+  cooldowns. Native Grok 4.5 keeps cooldown scope `none` for that class; all
+  other xAI alias candidates (`oa_xai/grok-4.5`, Composer, Grok Build, managed
+  OAuth lanes) use request-local exclusion only so transient credential gaps
+  cannot leave multi-hour Redis keys. Explicit rate-limit, capacity, usage, and
+  quota classes on xAI candidates still use durable candidate cooldowns.
+- `malformed_tool_call_text` remains a hard reject with in-flight redispatch /
+  failover. For native Grok 4.5 only, that class is request-local (no durable
+  30-minute candidate cooldown). Composer, Grok Build, Spark, and other
+  candidates keep durable candidate cooldowns for malformed tool-call text.
 - For the `gpt-5.3-codex-spark` candidate only, durable capacity, rate-limit,
   usage-limit, malformed_tool_call_text, upstream-overloaded, and upstream-timeout
   cooldowns are capped at five minutes. Other candidates keep the default durable
   behavior: 3-hour caps for capacity/rate-limit/usage-limit and 30-minute
-  candidate-cached malformed tool-call cooldowns, with request-local transient
-  cooldowns remaining separate.
+  candidate-cached malformed tool-call cooldowns (except native Grok 4.5
+  malformed tool-call text, which is request-local), with request-local
+  transient cooldowns remaining separate.
 
 ## Alias Routing Audit Metadata
 
@@ -696,8 +708,13 @@ documented in the Antigravity OAuth Credentials section.
 
 Grok 4.5 is treated as a live candidate. Generic
 `aawm_codex_auto_agent_candidate_unavailable` probe failures do not apply a
-durable Grok 4.5 cooldown; explicit usage, quota, rate-limit, or capacity
-signals still use the normal cooldown/fallback path.
+durable Grok 4.5 cooldown: native Grok 4.5 uses cooldown scope `none`, and
+other xAI alias candidates (Composer, Grok Build, managed OAuth Grok 4.5)
+use request-local exclusion only. Explicit usage, quota, rate-limit, or
+capacity signals still use the normal durable candidate cooldown/fallback
+path. Native Grok 4.5 `malformed_tool_call_text` remains rejected and can
+redispatch in-flight, but is request-local rather than a durable candidate
+cooldown.
 
 `aawm-sota` uses this order:
 
@@ -1037,7 +1054,11 @@ the route owner.
 `[EARLY]` appears only when a bounded in-memory cap forces a flush before the
 interval elapses. Each rollup subline uses ` - model(alias) - Turns: N` with an
 optional trailing status tag (`[Degraded]`, `[Cooling Down]`, `[Failed]`, or
-`[Exhausted]`). The subline appends ` -> outgoing` only when the model's
+`[Exhausted]`). `Cooling Down` is reserved for actual candidate-scoped cooldown
+or skipped-cooldown state; `retryable_no_cooldown`, scope `none`, and
+request-local redispatch/failover failures render as `Failed` instead of
+`Cooling Down`. Exhausted and Degraded labels are unchanged. The subline appends
+` -> outgoing` only when the model's
 destination differs from the incoming endpoint's default upstream target for
 the group. For example, native Anthropic traffic under `/anthropic/v1/messages`
 omits `api.anthropic.com/v1/messages`, and Codex passthrough traffic under
