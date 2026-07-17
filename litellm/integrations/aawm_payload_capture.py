@@ -29,6 +29,7 @@ Registration in litellm-config.yaml:
         - "litellm.integrations.aawm_payload_capture.aawm_payload_capture_instance"
 """
 
+import asyncio
 import json
 import os
 import re
@@ -267,8 +268,11 @@ class AawmPayloadCapture(CustomLogger):
     async def async_logging_hook(
         self, kwargs: Dict[str, Any], result: Any, call_type: str
     ) -> Tuple[dict, Any]:
-        """Async hook — same as sync hook, no awaiting needed."""
-        _dump_capture(kwargs)
+        """Async hook — offload filesystem capture so the event loop stays free.
+
+        Gating remains inside ``_dump_capture`` (AAWM_CAPTURE + debug logging).
+        """
+        await asyncio.to_thread(_dump_capture, kwargs)
         return kwargs, result
 
 
