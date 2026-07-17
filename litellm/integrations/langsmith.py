@@ -110,6 +110,64 @@ class LangsmithLogger(CustomBatchLogger):
             LANGSMITH_TENANT_ID=_credentials_tenant_id,
         )
 
+    def _extract_metadata_fields(
+        self, metadata: dict, credentials: LangsmithCredentialsObject
+    ):
+        return {
+            "project_name": metadata.get(
+                "project_name", credentials["LANGSMITH_PROJECT"]
+            ),
+            "run_name": metadata.get("run_name", self.langsmith_default_run_name),
+            "run_id": metadata.get("id", metadata.get("run_id", None)),
+            "parent_run_id": metadata.get("parent_run_id", None),
+            "trace_id": metadata.get("trace_id", None),
+            "session_id": metadata.get("session_id", None),
+            "dotted_order": metadata.get("dotted_order", None),
+        }
+
+    def _build_extra_metadata(self, metadata: Dict):
+        extra_metadata = dict(metadata)
+        requester_metadata = extra_metadata.get("requester_metadata")
+        if requester_metadata and isinstance(requester_metadata, dict):
+            for key in ("session_id", "thread_id", "conversation_id"):
+                if key in requester_metadata and key not in extra_metadata:
+                    extra_metadata[key] = requester_metadata[key]
+        return extra_metadata
+
+    def _build_outputs_with_usage(
+        self, payload: StandardLoggingPayload
+    ) -> Dict[str, Any]:
+        # LangSmith Cost column reads outputs.usage_metadata.total_cost.
+        # Forward token/cost fields from StandardLoggingPayload so the UI
+        # can display cost without a separate usage lookup.
+        response = payload["response"]
+        outputs: Dict[str, Any]
+        if isinstance(response, dict):
+            outputs = {**response}
+        else:
+            outputs = {"output": response}
+        outputs["usage_metadata"] = {
+            "input_tokens": payload.get("prompt_tokens", 0),
+            "output_tokens": payload.get("completion_tokens", 0),
+            "total_tokens": payload.get("total_tokens", 0),
+            "total_cost": payload.get("response_cost", 0),
+        }
+        return outputs
+
+    def _ensure_required_ids(self, data: dict, run_id: Optional[str]):
+        # for /batch langsmith requires id, trace_id and dotted_order passed as params
+        if "id" not in data or data["id"] is None:
+            run_id = str(uuid.uuid4())
+            data["id"] = run_id
+
+        if "trace_id" not in data or data["trace_id"] is None:
+            if run_id is not None and isinstance(run_id, str):
+                data["trace_id"] = run_id
+
+        if "dotted_order" not in data or data["dotted_order"] is None:
+            if run_id is not None and isinstance(run_id, str):
+                data["dotted_order"] = self.make_dot_order(run_id=run_id)
+
     def _prepare_log_data(
         self,
         kwargs,
@@ -121,59 +179,28 @@ class LangsmithLogger(CustomBatchLogger):
         try:
             _litellm_params = kwargs.get("litellm_params", {}) or {}
             metadata = _litellm_params.get("metadata", {}) or {}
-            project_name = metadata.get(
-                "project_name", credentials["LANGSMITH_PROJECT"]
-            )
-            run_name = metadata.get("run_name", self.langsmith_default_run_name)
-            run_id = metadata.get("id", metadata.get("run_id", None))
-            parent_run_id = metadata.get("parent_run_id", None)
-            trace_id = metadata.get("trace_id", None)
-            session_id = metadata.get("session_id", None)
-            dotted_order = metadata.get("dotted_order", None)
+
+            fields = self._extract_metadata_fields(metadata, credentials)
             verbose_logger.debug(
-                f"Langsmith Logging - project_name: {project_name}, run_name {run_name}"
+                f"Langsmith Logging - project_name: {fields['project_name']}, run_name {fields['run_name']}"
             )
 
-            # Ensure everything in the payload is converted to str
             payload: Optional[StandardLoggingPayload] = kwargs.get(
                 "standard_logging_object", None
             )
-
             if payload is None:
                 raise Exception("Error logging request payload. Payload=none.")
 
-            metadata = payload[
-                "metadata"
-            ]  # ensure logged metadata is json serializable
-
-            extra_metadata = dict(metadata)
-            requester_metadata = extra_metadata.get("requester_metadata")
-            if requester_metadata and isinstance(requester_metadata, dict):
-                for key in ("session_id", "thread_id", "conversation_id"):
-                    if key in requester_metadata and key not in extra_metadata:
-                        extra_metadata[key] = requester_metadata[key]
-
-            # LangSmith Cost column reads outputs.usage_metadata.total_cost.
-            # Forward token/cost fields from StandardLoggingPayload so the UI
-            # can display cost without a separate usage lookup.
-            outputs = payload["response"]
-            if isinstance(outputs, dict):
-                outputs = {**outputs}
-            else:
-                outputs = {"output": outputs}
-            outputs["usage_metadata"] = {
-                "input_tokens": payload.get("prompt_tokens", 0),
-                "output_tokens": payload.get("completion_tokens", 0),
-                "total_tokens": payload.get("total_tokens", 0),
-                "total_cost": payload.get("response_cost", 0),
-            }
+            metadata = payload["metadata"]  # ensure logged metadata is json serializable
+            extra_metadata = self._build_extra_metadata(dict(metadata))
+            outputs = self._build_outputs_with_usage(payload)
 
             data = {
-                "name": run_name,
-                "run_type": "llm",  # this should always be llm, since litellm always logs llm calls. Langsmith allow us to log "chain"
+                "name": fields["run_name"],
+                "run_type": "llm",
                 "inputs": payload,
                 "outputs": outputs,
-                "session_name": project_name,
+                "session_name": fields["project_name"],
                 "start_time": payload["startTime"],
                 "end_time": payload["endTime"],
                 "tags": payload["request_tags"],
@@ -183,46 +210,19 @@ class LangsmithLogger(CustomBatchLogger):
             if payload["error_str"] is not None and payload["status"] == "failure":
                 data["error"] = payload["error_str"]
 
-            if run_id:
-                data["id"] = run_id
-
-            if parent_run_id:
-                data["parent_run_id"] = parent_run_id
-
-            if trace_id:
-                data["trace_id"] = trace_id
-
-            if session_id:
-                data["session_id"] = session_id
-
-            if dotted_order:
-                data["dotted_order"] = dotted_order
-
-            run_id: Optional[str] = data.get("id")  # type: ignore
-            if "id" not in data or data["id"] is None:
-                """
-                for /batch langsmith requires id, trace_id and dotted_order passed as params
-                """
-                run_id = str(uuid.uuid4())
-
-                data["id"] = run_id
-
-            if (
-                "trace_id" not in data
-                or data["trace_id"] is None
-                and (run_id is not None and isinstance(run_id, str))
+            for key in (
+                "id",
+                "parent_run_id",
+                "trace_id",
+                "session_id",
+                "dotted_order",
             ):
-                data["trace_id"] = run_id
+                field_key = "run_id" if key == "id" else key
+                if fields[field_key]:
+                    data[key] = fields[field_key]
 
-            if (
-                "dotted_order" not in data
-                or data["dotted_order"] is None
-                and (run_id is not None and isinstance(run_id, str))
-            ):
-                data["dotted_order"] = self.make_dot_order(run_id=run_id)  # type: ignore
-
+            self._ensure_required_ids(data, fields["run_id"])
             verbose_logger.debug("Langsmith Logging data on langsmith: %s", data)
-
             return data
         except Exception:
             raise
