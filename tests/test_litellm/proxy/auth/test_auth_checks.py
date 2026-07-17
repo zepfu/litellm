@@ -1629,3 +1629,190 @@ async def test_custom_auth_common_checks_opt_in():
             parent_otel_span=None,
         )
         mock_common.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_common_checks_emits_datadog_step_spans():
+    """
+    RR-045: common_checks should wrap auth-pipeline steps with Datadog
+    tracer.trace spans for per-step latency triage.
+
+    When USE_DDTRACE is off the tracer is a no-op, but the wrappers must still
+    call tracer.trace with the upstream span names so DD APM regains granularity.
+    """
+    from fastapi import Request
+
+    from litellm.proxy.auth.auth_checks import common_checks
+
+    request_body = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "test"}],
+    }
+    mock_request = MagicMock(spec=Request)
+    valid_token = UserAPIKeyAuth(token="test-token", models=["gpt-3.5-turbo"])
+    team_object = LiteLLM_TeamTable(
+        team_id="team-1",
+        models=["gpt-3.5-turbo"],
+        max_budget=None,
+        spend=0,
+    )
+
+    mock_tracer = MagicMock()
+    mock_span = MagicMock()
+    mock_tracer.trace.return_value.__enter__.return_value = mock_span
+    mock_tracer.trace.return_value.__exit__.return_value = None
+
+    with patch("litellm.proxy.auth.auth_checks.tracer", mock_tracer), patch(
+        "litellm.proxy.auth.auth_checks.can_team_access_model",
+        new_callable=AsyncMock,
+        return_value=True,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._run_project_checks",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._team_max_budget_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._team_soft_budget_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._organization_max_budget_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._tag_max_budget_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._check_team_member_budget",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks.vector_store_access_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks.check_tools_allowlist",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._is_allowed_route",
+        return_value=True,
+    ), patch(
+        "litellm.proxy.auth.auth_checks.organization_role_based_access_check",
+    ), patch(
+        "litellm.proxy.proxy_server.prisma_client",
+        None,
+    ), patch(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        MagicMock(),
+    ):
+        result = await common_checks(
+            request_body=request_body,
+            team_object=team_object,
+            user_object=None,
+            end_user_object=None,
+            global_proxy_spend=None,
+            general_settings={},
+            route="/chat/completions",
+            llm_router=None,
+            proxy_logging_obj=MagicMock(),
+            valid_token=valid_token,
+            request=mock_request,
+        )
+
+    assert result is True
+
+    expected_spans = [
+        "litellm.proxy.auth.common_checks.can_team_access_model",
+        "litellm.proxy.auth.common_checks.run_project_checks",
+        "litellm.proxy.auth.common_checks.team_max_budget_check",
+        "litellm.proxy.auth.common_checks.team_soft_budget_check",
+        "litellm.proxy.auth.common_checks.organization_max_budget_check",
+        "litellm.proxy.auth.common_checks.tag_max_budget_check",
+        "litellm.proxy.auth.common_checks.check_team_member_budget",
+        "litellm.proxy.auth.common_checks.vector_store_access_check",
+        "litellm.proxy.auth.common_checks.check_tools_allowlist",
+    ]
+    actual_spans = [call.args[0] for call in mock_tracer.trace.call_args_list]
+    assert actual_spans == expected_spans
+
+
+@pytest.mark.asyncio
+async def test_common_checks_emits_user_model_access_span_for_personal_key():
+    """Personal keys should emit the can_user_call_model Datadog span."""
+    from fastapi import Request
+
+    from litellm.proxy.auth.auth_checks import common_checks
+
+    request_body = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "test"}],
+    }
+    mock_request = MagicMock(spec=Request)
+    valid_token = UserAPIKeyAuth(token="test-token", models=["gpt-3.5-turbo"])
+    user_object = LiteLLM_UserTable(
+        user_id="user-1",
+        max_budget=None,
+        spend=0,
+        models=["gpt-3.5-turbo"],
+        user_email="u@example.com",
+    )
+
+    mock_tracer = MagicMock()
+    mock_span = MagicMock()
+    mock_tracer.trace.return_value.__enter__.return_value = mock_span
+    mock_tracer.trace.return_value.__exit__.return_value = None
+
+    with patch("litellm.proxy.auth.auth_checks.tracer", mock_tracer), patch(
+        "litellm.proxy.auth.auth_checks.can_user_call_model",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._run_project_checks",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._team_max_budget_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._team_soft_budget_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._organization_max_budget_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._tag_max_budget_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._check_team_member_budget",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks.vector_store_access_check",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks.check_tools_allowlist",
+        new_callable=AsyncMock,
+    ), patch(
+        "litellm.proxy.auth.auth_checks._is_allowed_route",
+        return_value=True,
+    ), patch(
+        "litellm.proxy.auth.auth_checks.organization_role_based_access_check",
+    ), patch(
+        "litellm.proxy.proxy_server.prisma_client",
+        None,
+    ), patch(
+        "litellm.proxy.proxy_server.user_api_key_cache",
+        MagicMock(),
+    ):
+        result = await common_checks(
+            request_body=request_body,
+            team_object=None,
+            user_object=user_object,
+            end_user_object=None,
+            global_proxy_spend=None,
+            general_settings={},
+            route="/chat/completions",
+            llm_router=None,
+            proxy_logging_obj=MagicMock(),
+            valid_token=valid_token,
+            request=mock_request,
+        )
+
+    assert result is True
+    actual_spans = [call.args[0] for call in mock_tracer.trace.call_args_list]
+    assert "litellm.proxy.auth.common_checks.can_user_call_model" in actual_spans
+    assert "litellm.proxy.auth.common_checks.can_team_access_model" not in actual_spans
