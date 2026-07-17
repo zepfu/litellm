@@ -6821,12 +6821,19 @@ async def test_pass_through_request_full_payload_capture_uses_upstream_http_requ
     assert artifact["capture_scope"] == "upstream_http_transaction"
     assert artifact["request"]["method"] == "POST"
     assert artifact["request"]["url"] == target_url
-    assert artifact["request"]["headers"]["authorization"] == (
-        "Bearer full-upstream-token"
-    )
-    assert artifact["request"]["headers"]["x-xai-token-auth"] == "full-xai-token"
+    # A6: full-payload capture drops sensitive auth headers; keep non-secret wire metadata.
+    request_headers = {
+        str(k).lower(): v for k, v in artifact["request"]["headers"].items()
+    }
+    response_headers = {
+        str(k).lower(): v for k, v in artifact["response"]["headers"].items()
+    }
+    assert "authorization" not in request_headers
+    assert "x-xai-token-auth" not in request_headers
+    assert request_headers.get("content-type") == "application/json"
     assert artifact["request"]["body"]["json"]["input"] == "wire body"
-    assert artifact["response"]["headers"]["authorization"] == "Bearer response-token"
+    assert "authorization" not in response_headers
+    assert response_headers.get("content-type") == "application/json"
     assert artifact["response"]["body"]["json"]["model"] == "grok-composer-2.5-fast"
 
 
