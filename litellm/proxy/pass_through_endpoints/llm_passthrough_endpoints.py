@@ -18,6 +18,7 @@ import importlib
 import hashlib
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
 from starlette.websockets import WebSocketState
+from typing_extensions import NotRequired, TypedDict
 
 import litellm
 from litellm import get_llm_provider
@@ -423,6 +425,25 @@ _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL = (
 )
 _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 30.0
 _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset({500, 502, 503, 529})
+_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS = 8
+_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS_ENV = (
+    "AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS"
+)
+_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS = 0.05
+_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS = 1.0
+_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS = 0.05
+
+
+class _NativeGrokContinuationRetryMetadata(TypedDict):
+    status: str
+    provider_attempt: int
+    max_attempts: int
+    provider: Optional[str]
+    model: Optional[str]
+    route_family: Optional[str]
+    backoff_seconds: NotRequired[float]
+
+
 _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
     {
         "capacity_exhausted",
@@ -5660,7 +5681,160 @@ def _is_codex_auto_agent_xai_candidate(
 
 
 def _is_codex_auto_agent_transient_internal_error_class(error_class: Optional[str]) -> bool:
-    return error_class in {"upstream_transient_internal", "upstream_transient"}
+    # Classifier emits upstream_transient_internal only; do not accept a dead alias.
+    return error_class == "upstream_transient_internal"
+
+
+def _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() -> int:
+    """Request-scoped total provider attempts for native Grok continuation retries.
+
+    Independent of alias candidate-pool length and preserved across outer
+    candidate-selection re-entry within the same request. Default 8 so bursts
+    of 3-6 terminal-event 502s can recover without switching providers.
+    """
+    raw_value = _clean_codex_auth_value(
+        os.getenv(_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS_ENV)
+    )
+    if raw_value is None:
+        return _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS
+    # Conservative clamp: never drop below 6 (live aawm-code pool size) and
+    # never allow unbounded same-candidate storms.
+    return max(6, min(16, parsed))
+
+
+def _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(
+    failed_attempt: int,
+) -> float:
+    """Short exponential backoff with bounded jitter; each delay capped near 1s."""
+    attempt_index = max(1, int(failed_attempt))
+    base_seconds = min(
+        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS,
+        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS
+        * (2 ** (attempt_index - 1)),
+    )
+    jitter_cap = min(
+        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS,
+        base_seconds,
+    )
+    jitter_seconds = random.uniform(0.0, jitter_cap) if jitter_cap > 0 else 0.0
+    return min(
+        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS,
+        base_seconds + jitter_seconds,
+    )
+
+
+def _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+    *,
+    is_native_grok_4_5_candidate: bool,
+    has_continuation_state: bool,
+    error_class: Optional[str],
+    cooldown_scope: Optional[str],
+) -> bool:
+    """Whether this failure may consume the native Grok continuation transient budget.
+
+    Deliberately excludes ``candidate_unavailable`` even when native Grok 4.5 uses
+    cooldown scope ``none`` for that class. Generic probe/credential unavailability
+    must not enter the same-candidate 502-style retry budget; only bare transient
+    internal failures (``upstream_transient_internal``) are eligible.
+    """
+    # Keep this allow-list tight: do not treat candidate_unavailable as eligible.
+    return bool(
+        has_continuation_state
+        and cooldown_scope == "none"
+        and is_native_grok_4_5_candidate
+        and _is_codex_auto_agent_transient_internal_error_class(error_class)
+    )
+
+
+def _build_codex_auto_agent_native_grok_continuation_retry_metadata(
+    *,
+    status: str,
+    provider_attempt: int,
+    max_attempts: int,
+    provider: Optional[str],
+    model: Optional[str],
+    route_family: Optional[str],
+    backoff_seconds: Optional[float] = None,
+) -> _NativeGrokContinuationRetryMetadata:
+    metadata: _NativeGrokContinuationRetryMetadata = {
+        "status": status,
+        "provider_attempt": int(provider_attempt),
+        "max_attempts": int(max_attempts),
+        "provider": provider,
+        "model": model,
+        "route_family": route_family,
+    }
+    if backoff_seconds is not None:
+        metadata["backoff_seconds"] = round(float(backoff_seconds), 3)
+    return metadata
+
+
+def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+    *,
+    is_native_grok_4_5_candidate: bool,
+    has_continuation_state: bool,
+    error_class: Optional[str],
+    cooldown_scope: Optional[str],
+    provider_attempt: int,
+    provider: Optional[str],
+    model: Optional[str],
+    route_family: Optional[str],
+    max_attempts: Optional[int] = None,
+) -> tuple[
+    bool,
+    Optional[float],
+    Optional[_NativeGrokContinuationRetryMetadata],
+]:
+    """Annotate attempt metadata and decide whether to retry the same candidate.
+
+    ``provider_attempt`` must be the request-scoped total of eligible native Grok
+    continuation transient provider attempts so far (not reset on outer
+    candidate-selection re-entry). Backoff is only returned when a same-candidate
+    retry is scheduled; callers must not sleep after the final failed attempt.
+    """
+    if not _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+        is_native_grok_4_5_candidate=is_native_grok_4_5_candidate,
+        has_continuation_state=has_continuation_state,
+        error_class=error_class,
+        cooldown_scope=cooldown_scope,
+    ):
+        return False, None, None
+
+    resolved_max_attempts = (
+        int(max_attempts)
+        if max_attempts is not None
+        else _get_codex_auto_agent_native_grok_continuation_transient_max_attempts()
+    )
+    if provider_attempt < resolved_max_attempts:
+        backoff_seconds = (
+            _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(
+                provider_attempt
+            )
+        )
+        metadata = _build_codex_auto_agent_native_grok_continuation_retry_metadata(
+            status="scheduled_same_candidate_retry",
+            provider_attempt=provider_attempt,
+            max_attempts=resolved_max_attempts,
+            provider=provider,
+            model=model,
+            route_family=route_family,
+            backoff_seconds=backoff_seconds,
+        )
+        return True, backoff_seconds, metadata
+
+    metadata = _build_codex_auto_agent_native_grok_continuation_retry_metadata(
+        status="same_candidate_retry_exhausted",
+        provider_attempt=provider_attempt,
+        max_attempts=resolved_max_attempts,
+        provider=provider,
+        model=model,
+        route_family=route_family,
+    )
+    return False, None, metadata
 
 
 def _get_codex_auto_agent_cooldown_scope(error_class: Optional[str]) -> str:
@@ -27561,7 +27735,7 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
     return response
 
 
-async def _handle_anthropic_auto_agent_alias_route(
+async def _handle_anthropic_auto_agent_alias_route(  # noqa: PLR0915
     *,
     endpoint: str,
     request: Request,
@@ -27581,9 +27755,16 @@ async def _handle_anthropic_auto_agent_alias_route(
         or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
     )
 
-    for _attempt_number in range(
-        len(_get_anthropic_auto_agent_candidates_for_alias(alias_model))
-    ):
+    max_candidate_attempts = len(
+        _get_anthropic_auto_agent_candidates_for_alias(alias_model)
+    )
+    native_grok_continuation_transient_max_attempts = (
+        _get_codex_auto_agent_native_grok_continuation_transient_max_attempts()
+    )
+    # Request-scoped total for eligible native Grok continuation transient
+    # attempts. Must not reset when the outer candidate-selection loop re-enters.
+    native_grok_continuation_transient_provider_attempts = 0
+    for _attempt_number in range(max_candidate_attempts):
         try:
             selection = await _select_anthropic_auto_agent_candidate(
                 request=request,
@@ -27620,53 +27801,138 @@ async def _handle_anthropic_auto_agent_alias_route(
             attempt_record=attempt_record,
             add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
         )
-
-        try:
-            response = await _perform_anthropic_auto_agent_alias_candidate_request(
-                endpoint=endpoint,
-                request=request,
-                fastapi_response=fastapi_response,
-                user_api_key_dict=user_api_key_dict,
-                candidate=candidate,
-                candidate_body=candidate_body,
-                target_url=target_url,
-                custom_headers=custom_headers,
-            )
-            await _set_anthropic_auto_agent_session_affinity(
-                selection.get("session_key"),
-                candidate,
-            )
-            return response
-        except Exception as exc:
-            error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
-            if error_class is None:
-                raise
-            last_retryable_exc = exc
-            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
-            cooldown_scope = await _apply_anthropic_auto_agent_alias_cooldown(
-                request=request,
-                candidate=candidate,
-                lane_key=selection.get("lane_key"),
-                selected_cooldown_key=selection["cooldown_key"],
-                cooldown_seconds=cooldown_seconds,
-                error_class=error_class,
-            )
-            error_tokens = _update_codex_auto_agent_retryable_attempt_record(
-                attempt_record=attempt_record,
-                exc=exc,
-                error_class=error_class,
-                cooldown_seconds=cooldown_seconds,
-                cooldown_scope=cooldown_scope,
-            )
-            if cooldown_scope == "none" and not has_continuation_state:
-                _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
-                    request,
+        while True:
+            try:
+                response = await _perform_anthropic_auto_agent_alias_candidate_request(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    candidate=candidate,
+                    candidate_body=candidate_body,
+                    target_url=target_url,
+                    custom_headers=custom_headers,
+                )
+                await _set_anthropic_auto_agent_session_affinity(
+                    selection.get("session_key"),
+                    candidate,
+                )
+                return response
+            except Exception as exc:
+                error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
+                if error_class is None:
+                    raise
+                last_retryable_exc = exc
+                cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
+                    exc,
+                    candidate=candidate,
+                )
+                cooldown_scope = await _apply_anthropic_auto_agent_alias_cooldown(
+                    request=request,
                     candidate=candidate,
                     lane_key=selection.get("lane_key"),
+                    selected_cooldown_key=selection["cooldown_key"],
+                    cooldown_seconds=cooldown_seconds,
+                    error_class=error_class,
                 )
-            if has_continuation_state and cooldown_scope != "none":
-                attempt_record["status"] = "terminal_in_flight_cooldown_set"
-                failure_body = _record_auto_agent_alias_attempt_failure(
+                error_tokens = _update_codex_auto_agent_retryable_attempt_record(
+                    attempt_record=attempt_record,
+                    exc=exc,
+                    error_class=error_class,
+                    cooldown_seconds=cooldown_seconds,
+                    cooldown_scope=cooldown_scope,
+                )
+                if cooldown_scope == "none" and not has_continuation_state:
+                    _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+                        request,
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
+                    )
+                if has_continuation_state and cooldown_scope != "none":
+                    attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                    failure_body = _record_auto_agent_alias_attempt_failure(
+                        alias_family="anthropic_auto_agent",
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
+                        redispatch_required=True,
+                    )
+                    failure_metadata = failure_body.get("litellm_metadata") or {}
+                    verbose_proxy_logger.debug(
+                        "Anthropic auto-agent alias %s target %s/%s hit %s "
+                        "for an in-flight session on attempt %s; signaling redispatch",
+                        alias_model,
+                        candidate["provider"],
+                        candidate["model"],
+                        error_class,
+                        len(attempts),
+                    )
+                    _raise_anthropic_auto_agent_redispatch_required(
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
+                        cooldown_seconds=cooldown_seconds,
+                        error_tokens=error_tokens,
+                        alias_model=alias_model,
+                        error_class=error_class,
+                        cooldown_scope=cooldown_scope,
+                        error_status_code=attempt_record.get("error_status_code"),
+                        error_type=attempt_record.get("error_type"),
+                        error_code=attempt_record.get("error_code"),
+                        retry_after_seconds=attempt_record.get("retry_after_seconds"),
+                        failure_phase=attempt_record.get("failure_phase"),
+                        attempted_provider_call=attempt_record.get(
+                            "attempted_provider_call"
+                        ),
+                        audit_events=failure_metadata.get(
+                            "aawm_alias_routing_audit_events"
+                        ),
+                        attempts=failure_metadata.get("anthropic_auto_agent_attempts"),
+                        skipped_candidates=failure_metadata.get(
+                            "anthropic_auto_agent_skipped_candidates"
+                        ),
+                    )
+                native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+                    is_native_grok_4_5_candidate=(
+                        _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
+                    ),
+                    has_continuation_state=has_continuation_state,
+                    error_class=error_class,
+                    cooldown_scope=cooldown_scope,
+                )
+                if native_grok_retry_eligible:
+                    native_grok_continuation_transient_provider_attempts += 1
+                    native_grok_provider_attempt = (
+                        native_grok_continuation_transient_provider_attempts
+                    )
+                else:
+                    native_grok_provider_attempt = 0
+                (
+                    should_retry_same_candidate,
+                    same_candidate_backoff_seconds,
+                    native_grok_retry_metadata,
+                ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+                    is_native_grok_4_5_candidate=(
+                        _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
+                    ),
+                    has_continuation_state=has_continuation_state,
+                    error_class=error_class,
+                    cooldown_scope=cooldown_scope,
+                    provider_attempt=native_grok_provider_attempt,
+                    provider=str(candidate.get("provider") or "") or None,
+                    model=str(candidate.get("model") or "") or None,
+                    route_family=str(candidate.get("route_family") or "") or None,
+                    max_attempts=native_grok_continuation_transient_max_attempts,
+                )
+                if native_grok_retry_metadata is not None:
+                    attempt_record["native_grok_continuation_retry"] = (
+                        native_grok_retry_metadata
+                    )
+                _record_auto_agent_alias_attempt_failure(
                     alias_family="anthropic_auto_agent",
                     alias_model=alias_model,
                     request=request,
@@ -27676,61 +27942,46 @@ async def _handle_anthropic_auto_agent_alias_route(
                     attempt_record=attempt_record,
                     error_class=error_class,
                     add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
-                    redispatch_required=True,
                 )
-                failure_metadata = failure_body.get("litellm_metadata") or {}
                 verbose_proxy_logger.debug(
-                    "Anthropic auto-agent alias %s target %s/%s hit %s "
-                    "for an in-flight session on attempt %s; signaling redispatch",
+                    "Anthropic auto-agent alias %s target %s/%s hit %s on attempt %s; "
+                    "cooldown %.1fs scope=%s tokens=%s",
                     alias_model,
                     candidate["provider"],
                     candidate["model"],
                     error_class,
                     len(attempts),
+                    cooldown_seconds,
+                    cooldown_scope,
+                    sorted(error_tokens),
                 )
-                _raise_anthropic_auto_agent_redispatch_required(
-                    candidate=candidate,
-                    lane_key=selection.get("lane_key"),
-                    cooldown_seconds=cooldown_seconds,
-                    error_tokens=error_tokens,
-                    alias_model=alias_model,
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                    error_status_code=attempt_record.get("error_status_code"),
-                    error_type=attempt_record.get("error_type"),
-                    error_code=attempt_record.get("error_code"),
-                    retry_after_seconds=attempt_record.get("retry_after_seconds"),
-                    failure_phase=attempt_record.get("failure_phase"),
-                    attempted_provider_call=attempt_record.get("attempted_provider_call"),
-                    audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
-                    attempts=failure_metadata.get("anthropic_auto_agent_attempts"),
-                    skipped_candidates=failure_metadata.get(
-                        "anthropic_auto_agent_skipped_candidates"
-                    ),
-                )
-            _record_auto_agent_alias_attempt_failure(
-                alias_family="anthropic_auto_agent",
-                alias_model=alias_model,
-                request=request,
-                prepared_request_body=prepared_request_body,
-                selection=selection,
-                attempts=attempts,
-                attempt_record=attempt_record,
-                error_class=error_class,
-                add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
-            )
-            verbose_proxy_logger.debug(
-                "Anthropic auto-agent alias %s target %s/%s hit %s on attempt %s; "
-                "cooldown %.1fs tokens=%s",
-                alias_model,
-                candidate["provider"],
-                candidate["model"],
-                error_class,
-                len(attempts),
-                cooldown_seconds,
-                sorted(error_tokens),
-            )
-            continue
+                if should_retry_same_candidate:
+                    if (
+                        same_candidate_backoff_seconds
+                        and same_candidate_backoff_seconds > 0
+                    ):
+                        await asyncio.sleep(same_candidate_backoff_seconds)
+                    attempt_record = _codex_auto_agent_candidate_public_shape(
+                        candidate,
+                        lane_key=selection.get("lane_key"),
+                        reason="native_grok_continuation_same_candidate_retry",
+                    )
+                    attempts.append(attempt_record)
+                    candidate_body = _record_auto_agent_alias_attempt_started(
+                        alias_family="anthropic_auto_agent",
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
+                    )
+                    continue
+                if native_grok_retry_eligible:
+                    # Same-candidate budget exhausted; do not switch providers.
+                    raise last_retryable_exc
+                break
 
     if last_retryable_exc is not None:
         raise last_retryable_exc
@@ -30443,7 +30694,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
     return response
 
 
-async def _handle_codex_auto_agent_alias_route(
+async def _handle_codex_auto_agent_alias_route(  # noqa: PLR0915
     *,
     endpoint: str,
     request: Request,
@@ -30464,9 +30715,14 @@ async def _handle_codex_auto_agent_alias_route(
         or _CODEX_AUTO_AGENT_MODEL_ALIAS
     )
 
-    for _attempt_number in range(
-        len(_get_codex_auto_agent_candidates_for_alias(alias_model))
-    ):
+    max_candidate_attempts = len(_get_codex_auto_agent_candidates_for_alias(alias_model))
+    native_grok_continuation_transient_max_attempts = (
+        _get_codex_auto_agent_native_grok_continuation_transient_max_attempts()
+    )
+    # Request-scoped total for eligible native Grok continuation transient
+    # attempts. Must not reset when the outer candidate-selection loop re-enters.
+    native_grok_continuation_transient_provider_attempts = 0
+    for _attempt_number in range(max_candidate_attempts):
         try:
             selection = await _select_codex_auto_agent_candidate(
                 request=request,
@@ -30503,54 +30759,139 @@ async def _handle_codex_auto_agent_alias_route(
             attempt_record=attempt_record,
             add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
         )
-
-        try:
-            response = await _perform_codex_auto_agent_alias_candidate_request(
-                endpoint=endpoint,
-                request=request,
-                fastapi_response=fastapi_response,
-                user_api_key_dict=user_api_key_dict,
-                candidate=candidate,
-                candidate_body=candidate_body,
-                target_url=target_url,
-                api_key=api_key,
-                forward_headers=forward_headers,
-            )
-            await _set_codex_auto_agent_session_affinity(
-                selection.get("session_key"),
-                candidate,
-            )
-            return response
-        except Exception as exc:
-            error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
-            if error_class is None:
-                raise
-            last_retryable_exc = exc
-            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
-            cooldown_scope = await _set_codex_auto_agent_candidate_cooldowns(
-                request=request,
-                candidate=candidate,
-                lane_key=selection.get("lane_key"),
-                selected_cooldown_key=selection["cooldown_key"],
-                cooldown_seconds=cooldown_seconds,
-                error_class=error_class,
-            )
-            error_tokens = _update_codex_auto_agent_retryable_attempt_record(
-                attempt_record=attempt_record,
-                exc=exc,
-                error_class=error_class,
-                cooldown_seconds=cooldown_seconds,
-                cooldown_scope=cooldown_scope,
-            )
-            if cooldown_scope == "none" and not has_continuation_state:
-                _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
-                    request,
+        while True:
+            try:
+                response = await _perform_codex_auto_agent_alias_candidate_request(
+                    endpoint=endpoint,
+                    request=request,
+                    fastapi_response=fastapi_response,
+                    user_api_key_dict=user_api_key_dict,
+                    candidate=candidate,
+                    candidate_body=candidate_body,
+                    target_url=target_url,
+                    api_key=api_key,
+                    forward_headers=forward_headers,
+                )
+                await _set_codex_auto_agent_session_affinity(
+                    selection.get("session_key"),
+                    candidate,
+                )
+                return response
+            except Exception as exc:
+                error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
+                if error_class is None:
+                    raise
+                last_retryable_exc = exc
+                cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
+                    exc,
+                    candidate=candidate,
+                )
+                cooldown_scope = await _set_codex_auto_agent_candidate_cooldowns(
+                    request=request,
                     candidate=candidate,
                     lane_key=selection.get("lane_key"),
+                    selected_cooldown_key=selection["cooldown_key"],
+                    cooldown_seconds=cooldown_seconds,
+                    error_class=error_class,
                 )
-            if has_continuation_state and cooldown_scope != "none":
-                attempt_record["status"] = "terminal_in_flight_cooldown_set"
-                failure_body = _record_auto_agent_alias_attempt_failure(
+                error_tokens = _update_codex_auto_agent_retryable_attempt_record(
+                    attempt_record=attempt_record,
+                    exc=exc,
+                    error_class=error_class,
+                    cooldown_seconds=cooldown_seconds,
+                    cooldown_scope=cooldown_scope,
+                )
+                if cooldown_scope == "none" and not has_continuation_state:
+                    _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+                        request,
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
+                    )
+                if has_continuation_state and cooldown_scope != "none":
+                    attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                    failure_body = _record_auto_agent_alias_attempt_failure(
+                        alias_family="codex_auto_agent",
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
+                        redispatch_required=True,
+                    )
+                    failure_metadata = failure_body.get("litellm_metadata") or {}
+                    verbose_proxy_logger.debug(
+                        "Codex auto-agent alias %s target %s/%s hit %s "
+                        "for an in-flight session on attempt %s; signaling redispatch",
+                        alias_model,
+                        candidate["provider"],
+                        candidate["model"],
+                        error_class,
+                        len(attempts),
+                    )
+                    _raise_codex_auto_agent_redispatch_required(
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
+                        cooldown_seconds=cooldown_seconds,
+                        error_tokens=error_tokens,
+                        alias_model=alias_model,
+                        error_class=error_class,
+                        cooldown_scope=cooldown_scope,
+                        error_status_code=attempt_record.get("error_status_code"),
+                        error_type=attempt_record.get("error_type"),
+                        error_code=attempt_record.get("error_code"),
+                        retry_after_seconds=attempt_record.get("retry_after_seconds"),
+                        failure_phase=attempt_record.get("failure_phase"),
+                        attempted_provider_call=attempt_record.get(
+                            "attempted_provider_call"
+                        ),
+                        audit_events=failure_metadata.get(
+                            "aawm_alias_routing_audit_events"
+                        ),
+                        attempts=failure_metadata.get("codex_auto_agent_attempts"),
+                        skipped_candidates=failure_metadata.get(
+                            "codex_auto_agent_skipped_candidates"
+                        ),
+                    )
+                native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+                    is_native_grok_4_5_candidate=(
+                        _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
+                    ),
+                    has_continuation_state=has_continuation_state,
+                    error_class=error_class,
+                    cooldown_scope=cooldown_scope,
+                )
+                if native_grok_retry_eligible:
+                    native_grok_continuation_transient_provider_attempts += 1
+                    native_grok_provider_attempt = (
+                        native_grok_continuation_transient_provider_attempts
+                    )
+                else:
+                    native_grok_provider_attempt = 0
+                (
+                    should_retry_same_candidate,
+                    same_candidate_backoff_seconds,
+                    native_grok_retry_metadata,
+                ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+                    is_native_grok_4_5_candidate=(
+                        _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
+                    ),
+                    has_continuation_state=has_continuation_state,
+                    error_class=error_class,
+                    cooldown_scope=cooldown_scope,
+                    provider_attempt=native_grok_provider_attempt,
+                    provider=str(candidate.get("provider") or "") or None,
+                    model=str(candidate.get("model") or "") or None,
+                    route_family=str(candidate.get("route_family") or "") or None,
+                    max_attempts=native_grok_continuation_transient_max_attempts,
+                )
+                if native_grok_retry_metadata is not None:
+                    attempt_record["native_grok_continuation_retry"] = (
+                        native_grok_retry_metadata
+                    )
+                _record_auto_agent_alias_attempt_failure(
                     alias_family="codex_auto_agent",
                     alias_model=alias_model,
                     request=request,
@@ -30560,62 +30901,46 @@ async def _handle_codex_auto_agent_alias_route(
                     attempt_record=attempt_record,
                     error_class=error_class,
                     add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
-                    redispatch_required=True,
                 )
-                failure_metadata = failure_body.get("litellm_metadata") or {}
                 verbose_proxy_logger.debug(
-                    "Codex auto-agent alias %s target %s/%s hit %s "
-                    "for an in-flight session on attempt %s; signaling redispatch",
+                    "Codex auto-agent alias %s target %s/%s hit %s on attempt %s; "
+                    "cooldown %.1fs scope=%s tokens=%s",
                     alias_model,
                     candidate["provider"],
                     candidate["model"],
                     error_class,
                     len(attempts),
+                    cooldown_seconds,
+                    cooldown_scope,
+                    sorted(error_tokens),
                 )
-                _raise_codex_auto_agent_redispatch_required(
-                    candidate=candidate,
-                    lane_key=selection.get("lane_key"),
-                    cooldown_seconds=cooldown_seconds,
-                    error_tokens=error_tokens,
-                    alias_model=alias_model,
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                    error_status_code=attempt_record.get("error_status_code"),
-                    error_type=attempt_record.get("error_type"),
-                    error_code=attempt_record.get("error_code"),
-                    retry_after_seconds=attempt_record.get("retry_after_seconds"),
-                    failure_phase=attempt_record.get("failure_phase"),
-                    attempted_provider_call=attempt_record.get("attempted_provider_call"),
-                    audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
-                    attempts=failure_metadata.get("codex_auto_agent_attempts"),
-                    skipped_candidates=failure_metadata.get(
-                        "codex_auto_agent_skipped_candidates"
-                    ),
-                )
-            _record_auto_agent_alias_attempt_failure(
-                alias_family="codex_auto_agent",
-                alias_model=alias_model,
-                request=request,
-                prepared_request_body=prepared_request_body,
-                selection=selection,
-                attempts=attempts,
-                attempt_record=attempt_record,
-                error_class=error_class,
-                add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
-            )
-            verbose_proxy_logger.debug(
-                "Codex auto-agent alias %s target %s/%s hit %s on attempt %s; "
-                "cooldown %.1fs scope=%s tokens=%s",
-                alias_model,
-                candidate["provider"],
-                candidate["model"],
-                error_class,
-                len(attempts),
-                cooldown_seconds,
-                cooldown_scope,
-                sorted(error_tokens),
-            )
-            continue
+                if should_retry_same_candidate:
+                    if (
+                        same_candidate_backoff_seconds
+                        and same_candidate_backoff_seconds > 0
+                    ):
+                        await asyncio.sleep(same_candidate_backoff_seconds)
+                    attempt_record = _codex_auto_agent_candidate_public_shape(
+                        candidate,
+                        lane_key=selection.get("lane_key"),
+                        reason="native_grok_continuation_same_candidate_retry",
+                    )
+                    attempts.append(attempt_record)
+                    candidate_body = _record_auto_agent_alias_attempt_started(
+                        alias_family="codex_auto_agent",
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
+                    )
+                    continue
+                if native_grok_retry_eligible:
+                    # Same-candidate budget exhausted; do not switch providers.
+                    raise last_retryable_exc
+                break
 
     if last_retryable_exc is not None:
         raise last_retryable_exc

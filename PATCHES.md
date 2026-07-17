@@ -53,6 +53,66 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.121 — Native Grok continuation same-candidate transient retries
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.121`. For genuine
+continuation requests pinned to native Grok 4.5
+(`codex_grok_native_responses_adapter` /
+`anthropic_grok_native_responses_adapter`), bare transient upstream failures such
+as 502 are retried on the **same candidate** with a dedicated total-attempt budget
+independent of alias candidate-pool length:
+
+- Default budget is **8** total native-Grok continuation provider attempts for
+  the whole request (`AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS`,
+  clamped 6–16). The counter is request-scoped and does not reset on outer
+  candidate-selection re-entry.
+- Short exponential backoff with bounded jitter between retries; each delay is
+  capped near 1s and there is no sleep after the final failed attempt.
+- No provider/model switch during these retries; no local or Redis candidate
+  cooldown (`retryable_no_cooldown`, `cooldown_scope=none`).
+- Eligibility is limited to bare transient internal failures
+  (`upstream_transient_internal`); `candidate_unavailable` is deliberately
+  excluded even when native Grok 4.5 uses cooldown scope `none`.
+- Sanitized attempt metadata records scheduled same-candidate retries and
+  exhausted retry state.
+- Codex and Anthropic ingress paths share the same helpers and behavior.
+- Fresh-dispatch fallback, explicit 429/quota/capacity cooldowns, malformed-output
+  redispatch, and non-native candidates are unchanged.
+
+**Why:** Live native Grok continuation traffic can emit bursts of 3–6
+terminal-event 502s before recovery. The previous attempt budget was effectively
+bounded by the outer candidate-pool loop and could under-retry a pinned native
+candidate (and risk abandoning affinity) on recoverable transient bursts. A
+dedicated same-candidate budget of at least six—default eight—covers observed
+bursts without durable cooldown churn or cross-provider continuation breakage.
+
+**Why not upstream:** AAWM alias affinity, native Grok adapter routes, and
+continuation redispatch policy are fork-local operational behavior.
+
+**Validation status:** Focused parity and broader alias-routing tests, ruff,
+`py_compile`, targeted mypy, `pytest-testable`, baselined
+`pytest-classifier`, and `git diff --check` pass locally. The final reviewed
+module SHA
+`b614e07cfa8cc8bbd64700da5a33fb0b9e20408a72af2ca2e5af062f4b1c3586`
+was loaded into Thoth `litellm-dev` at `2026-07-17 01:35:02.932 UTC`.
+Post-refresh native Grok 4.5 continuations recovered on the same candidate
+after both three and five consecutive transient 502s:
+
+- session `019f5336-ec2a-7840-9bce-2caaa6858b76`, row `66535`, succeeded on
+  attempt 4 at `2026-07-17 01:36:19.956 UTC` with 47,481 total tokens;
+- session `019f532b-0e75-78a3-a845-09e246b3762f`, row `66606`, succeeded on
+  attempt 6 at `2026-07-17 01:39:22.602 UTC` with 59,891 total tokens.
+
+Every preceding attempt remained `xai/grok-4.5`,
+`retryable_no_cooldown`, `cooldown_scope=none`, and
+`redispatch_required=false`. Alias-routing Redis contained six Grok/xAI
+affinity keys and zero Grok/xAI cooldown keys. A bounded ten-step worker
+continuation canary also completed on the refreshed dev runtime. Production
+`aawm-litellm` retained its prior start time and zero restart count and was not
+modified. Production promotion still requires following `PROD_RELEASE.md`,
+publishing and verifying the image and independently deployable artifacts from
+the final `main` head, then rebuilding and validating `aawm-litellm`.
+
 ### aawm.120 — Cooldown labeling and xAI candidate-unavailable policy
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.120`. This release

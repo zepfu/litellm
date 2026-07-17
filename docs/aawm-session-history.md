@@ -530,10 +530,19 @@ Operational notes:
   `codex_grok_native_responses_adapter` and
   `anthropic_grok_native_responses_adapter` use cooldown scope `none` for these
   bare transient classes: fresh requests exclude the failed native candidate for
-  that request only, while in-flight continuations retry the same affinity
-  candidate within the existing attempt budget instead of signaling
-  `redispatch_required`. Explicit capacity/rate-limit/usage-limit failures still
-  use candidate cooldowns.
+  that request only, while in-flight continuations retry the **same affinity
+  candidate** with a dedicated **request-scoped** total-attempt budget (default
+  **8**, independent of alias candidate-pool length and preserved across outer
+  candidate-selection re-entry within the same request; override
+  `AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS`, clamped 6–16) and short
+  exponential backoff capped near 1s between retries. These retries never switch
+  provider/model, never write local or Redis candidate cooldown, and do not
+  signal `redispatch_required`. Generic `candidate_unavailable` is deliberately
+  excluded from this budget. Attempt metadata may include
+  `native_grok_continuation_retry` with `scheduled_same_candidate_retry` or
+  `same_candidate_retry_exhausted` status. Explicit capacity/rate-limit/usage-limit
+  failures still use candidate cooldowns; malformed-output redispatch and
+  non-native candidates are unchanged.
 - Generic xAI `candidate_unavailable` failures (missing, expired, or refreshing
   credentials; broad probe unavailability) never write durable candidate
   cooldowns. Native Grok 4.5 keeps cooldown scope `none` for that class; all

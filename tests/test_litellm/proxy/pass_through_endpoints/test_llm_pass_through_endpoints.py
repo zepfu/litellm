@@ -191,6 +191,10 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_codex_auto_agent_cooldown_seconds,
     _get_codex_auto_agent_cooldown_scope,
     _get_codex_auto_agent_candidate_cooldown_scope,
+    _get_codex_auto_agent_native_grok_continuation_transient_max_attempts,
+    _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds,
+    _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible,
+    _plan_codex_auto_agent_native_grok_continuation_transient_retry,
     _apply_codex_auto_agent_alias_cooldown,
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
@@ -27645,7 +27649,10 @@ async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries
     ) as mock_grok_native, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
         new=AsyncMock(),
-    ) as mock_xai_oauth:
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -27660,6 +27667,7 @@ async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries
     assert response is success
     assert mock_grok_native.await_count == 2
     mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 1
     metadata = request.scope["parsed_body"][1]["litellm_metadata"]
     attempts = metadata["codex_auto_agent_attempts"]
     assert [attempt["model"] for attempt in attempts] == ["grok-4.5", "grok-4.5"]
@@ -27667,6 +27675,15 @@ async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries
     assert attempts[0]["error_class"] == "upstream_transient_internal"
     assert attempts[0]["cooldown_scope"] == "none"
     assert "cooldown_seconds" not in attempts[0]
+    assert attempts[0]["native_grok_continuation_retry"]["status"] == (
+        "scheduled_same_candidate_retry"
+    )
+    assert attempts[0]["native_grok_continuation_retry"]["provider_attempt"] == 1
+    assert attempts[0]["native_grok_continuation_retry"]["max_attempts"] == 8
+    assert attempts[0]["native_grok_continuation_retry"]["backoff_seconds"] is not None
+    assert attempts[1]["reason"] == "native_grok_continuation_same_candidate_retry"
+    assert "native_grok_continuation_retry" not in attempts[1]
+    assert "error_class" not in attempts[1]
     assert metadata["codex_auto_agent_selected_model"] == "grok-4.5"
     durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
         "xai:grok-4.5:xai_grok_native"
@@ -27718,7 +27735,10 @@ async def test_anthropic_auto_agent_alias_in_flight_native_grok_4_5_bare_502_ret
     ) as mock_spark, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
         new=AsyncMock(),
-    ) as mock_xai_oauth:
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
         response = await _handle_anthropic_auto_agent_alias_route(
             endpoint="/v1/messages",
             request=request,
@@ -27733,6 +27753,7 @@ async def test_anthropic_auto_agent_alias_in_flight_native_grok_4_5_bare_502_ret
     assert mock_grok_native.await_count == 2
     mock_spark.assert_not_called()
     mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 1
     metadata = request.scope["parsed_body"][1]["litellm_metadata"]
     attempts = metadata["anthropic_auto_agent_attempts"]
     assert [attempt["model"] for attempt in attempts] == [
@@ -27743,12 +27764,1034 @@ async def test_anthropic_auto_agent_alias_in_flight_native_grok_4_5_bare_502_ret
     assert attempts[0]["error_class"] == "upstream_transient_internal"
     assert attempts[0]["cooldown_scope"] == "none"
     assert "cooldown_seconds" not in attempts[0]
+    assert attempts[0]["native_grok_continuation_retry"]["status"] == (
+        "scheduled_same_candidate_retry"
+    )
+    assert attempts[0]["native_grok_continuation_retry"]["provider_attempt"] == 1
+    assert attempts[0]["native_grok_continuation_retry"]["max_attempts"] == 8
+    assert attempts[0]["native_grok_continuation_retry"]["backoff_seconds"] is not None
+    assert attempts[1]["reason"] == "native_grok_continuation_same_candidate_retry"
+    assert "native_grok_continuation_retry" not in attempts[1]
+    assert "error_class" not in attempts[1]
     assert metadata["anthropic_auto_agent_selected_model"] == "xai/grok-4.5"
     durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
         "xai:xai/grok-4.5:xai_grok_native"
     )
     assert durable_seconds == 0.0
     assert durable_source == "local_fallback"
+
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_after_seven_failures():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota-xai",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-sota-xai:codex-session:session:codex-session"
+    ] = {
+        "provider": "xai",
+        "model": "grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    success = Response(content='{"ok": true}', media_type="application/json")
+    side_effects = [transient_error] * 7 + [success]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(side_effect=side_effects),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is success
+    assert mock_grok_native.await_count == 8
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 7
+    for call in mock_sleep.await_args_list:
+        assert 0 < call.args[0] <= 1.0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["codex_auto_agent_attempts"]
+    assert len(attempts) == 8
+    assert [attempt["model"] for attempt in attempts] == ["grok-4.5"] * 8
+    assert all(attempt["cooldown_scope"] == "none" for attempt in attempts[:7])
+    assert all(
+        attempt["status"] == "retryable_no_cooldown" for attempt in attempts[:7]
+    )
+    assert all(
+        attempt["native_grok_continuation_retry"]["status"]
+        == "scheduled_same_candidate_retry"
+        for attempt in attempts[:7]
+    )
+    assert [
+        attempt["native_grok_continuation_retry"]["provider_attempt"]
+        for attempt in attempts[:7]
+    ] == list(range(1, 8))
+    assert all(
+        attempt["native_grok_continuation_retry"]["max_attempts"] == 8
+        for attempt in attempts[:7]
+    )
+    assert attempts[7]["reason"] == "native_grok_continuation_same_candidate_retry"
+    assert "native_grok_continuation_retry" not in attempts[7]
+    assert "error_class" not in attempts[7]
+    durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+        "xai:grok-4.5:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_after_seven_failures():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "xai",
+        "model": "xai/grok-4.5",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    success = Response(content='{"ok": true}', media_type="application/json")
+    side_effects = [transient_error] * 7 + [success]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=side_effects),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is success
+    assert mock_grok_native.await_count == 8
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 7
+    for call in mock_sleep.await_args_list:
+        assert 0 < call.args[0] <= 1.0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert len(attempts) == 8
+    assert [attempt["model"] for attempt in attempts] == ["xai/grok-4.5"] * 8
+    assert all(attempt["cooldown_scope"] == "none" for attempt in attempts[:7])
+    assert all(
+        attempt["native_grok_continuation_retry"]["status"]
+        == "scheduled_same_candidate_retry"
+        for attempt in attempts[:7]
+    )
+    assert [
+        attempt["native_grok_continuation_retry"]["provider_attempt"]
+        for attempt in attempts[:7]
+    ] == list(range(1, 8))
+    assert attempts[7]["reason"] == "native_grok_continuation_same_candidate_retry"
+    assert "native_grok_continuation_retry" not in attempts[7]
+    assert "error_class" not in attempts[7]
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:xai/grok-4.5:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same_candidate_budget():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota-xai",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-sota-xai:codex-session:session:codex-session"
+    ] = {
+        "provider": "xai",
+        "model": "grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(side_effect=[transient_error] * 8),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert str(exc_info.value.message) == "Temporary upstream provider failure"
+    assert str(exc_info.value.code) == "502"
+    assert mock_grok_native.await_count == 8
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 7
+    for call in mock_sleep.await_args_list:
+        assert 0 < call.args[0] <= 1.0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["codex_auto_agent_attempts"]
+    assert len(attempts) == 8
+    assert all(attempt["model"] == "grok-4.5" for attempt in attempts)
+    assert all(attempt["cooldown_scope"] == "none" for attempt in attempts)
+    assert [
+        attempt["native_grok_continuation_retry"]["status"] for attempt in attempts[:7]
+    ] == ["scheduled_same_candidate_retry"] * 7
+    assert attempts[7]["native_grok_continuation_retry"]["status"] == (
+        "same_candidate_retry_exhausted"
+    )
+    assert attempts[7]["native_grok_continuation_retry"]["provider_attempt"] == 8
+    assert attempts[7]["native_grok_continuation_retry"]["max_attempts"] == 8
+    assert "backoff_seconds" not in attempts[7]["native_grok_continuation_retry"]
+    durable_seconds, durable_source = await _get_codex_auto_agent_active_cooldown_state(
+        "xai:grok-4.5:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same_candidate_budget():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "xai",
+        "model": "xai/grok-4.5",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=[transient_error] * 8),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        with pytest.raises(ProxyException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    assert str(exc_info.value.message) == "Temporary upstream provider failure"
+    assert str(exc_info.value.code) == "502"
+    assert mock_grok_native.await_count == 8
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 7
+    for call in mock_sleep.await_args_list:
+        assert 0 < call.args[0] <= 1.0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert len(attempts) == 8
+    assert all(attempt["model"] == "xai/grok-4.5" for attempt in attempts)
+    assert all(attempt["cooldown_scope"] == "none" for attempt in attempts)
+    assert [
+        attempt["native_grok_continuation_retry"]["status"] for attempt in attempts[:7]
+    ] == ["scheduled_same_candidate_retry"] * 7
+    assert attempts[7]["native_grok_continuation_retry"]["status"] == (
+        "same_candidate_retry_exhausted"
+    )
+    assert attempts[7]["native_grok_continuation_retry"]["provider_attempt"] == 8
+    assert attempts[7]["native_grok_continuation_retry"]["max_attempts"] == 8
+    assert "backoff_seconds" not in attempts[7]["native_grok_continuation_retry"]
+    durable_seconds, durable_source = await _get_anthropic_auto_agent_active_cooldown_state(
+        "xai:xai/grok-4.5:xai_grok_native"
+    )
+    assert durable_seconds == 0.0
+    assert durable_source == "local_fallback"
+
+
+def test_native_grok_continuation_transient_max_attempts_default_and_clamp(monkeypatch):
+    monkeypatch.delenv(
+        "AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS",
+        raising=False,
+    )
+    assert _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() == 8
+    monkeypatch.setenv("AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS", "3")
+    assert _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() == 6
+    monkeypatch.setenv("AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS", "40")
+    assert _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() == 16
+    # Non-integer / blank fall back to default; negatives clamp to the floor.
+    monkeypatch.setenv("AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS", "abc")
+    assert _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() == 8
+    monkeypatch.setenv("AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS", "   ")
+    assert _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() == 8
+    monkeypatch.setenv("AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS", "-1")
+    assert _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() == 6
+
+
+def test_native_grok_continuation_transient_backoff_is_bounded(monkeypatch):
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.random.uniform",
+        lambda a, b: b,
+    )
+    delays = [
+        _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(i)
+        for i in range(1, 8)
+    ]
+    assert all(0 < delay <= 1.0 for delay in delays)
+    assert delays[0] <= delays[1] <= delays[-1]
+
+
+def test_native_grok_continuation_transient_eligibility_excludes_candidate_unavailable():
+    # Deliberate exclusion: candidate_unavailable may use cooldown scope "none" on
+    # native Grok 4.5, but it must not consume the same-candidate 502 retry budget.
+    assert (
+        _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+            is_native_grok_4_5_candidate=True,
+            has_continuation_state=True,
+            error_class="upstream_transient_internal",
+            cooldown_scope="none",
+        )
+        is True
+    )
+    assert (
+        _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+            is_native_grok_4_5_candidate=True,
+            has_continuation_state=True,
+            error_class="candidate_unavailable",
+            cooldown_scope="none",
+        )
+        is False
+    )
+    should_retry, backoff, retry_metadata = (
+        _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+            is_native_grok_4_5_candidate=True,
+            has_continuation_state=True,
+            error_class="candidate_unavailable",
+            cooldown_scope="none",
+            provider_attempt=1,
+            provider="xai",
+            model="grok-4.5",
+            route_family="codex_grok_native_responses_adapter",
+            max_attempts=8,
+        )
+    )
+    assert should_retry is False
+    assert backoff is None
+    assert retry_metadata is None
+
+
+def test_native_grok_continuation_transient_eligibility_requires_continuation_and_native():
+    # Fresh (non-continuation) native 502 must not use the dedicated budget.
+    assert (
+        _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+            is_native_grok_4_5_candidate=True,
+            has_continuation_state=False,
+            error_class="upstream_transient_internal",
+            cooldown_scope="none",
+        )
+        is False
+    )
+    # Non-native managed/composer continuation 502 must not use this budget, even
+    # if a caller mis-tags cooldown_scope as "none".
+    for cooldown_scope in ("request_local", "none"):
+        assert (
+            _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+                is_native_grok_4_5_candidate=False,
+                has_continuation_state=True,
+                error_class="upstream_transient_internal",
+                cooldown_scope=cooldown_scope,
+            )
+            is False
+        )
+
+
+def test_native_grok_continuation_transient_plan_uses_request_scoped_provider_attempt():
+    # Simulates outer candidate-selection re-entry with a request-scoped counter
+    # that has already consumed 7 of 8 total attempts.
+    should_retry, backoff, retry_metadata = (
+        _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+            is_native_grok_4_5_candidate=True,
+            has_continuation_state=True,
+            error_class="upstream_transient_internal",
+            cooldown_scope="none",
+            provider_attempt=7,
+            provider="xai",
+            model="grok-4.5",
+            route_family="codex_grok_native_responses_adapter",
+            max_attempts=8,
+        )
+    )
+    assert should_retry is True
+    assert backoff is not None
+    assert retry_metadata is not None
+    assert retry_metadata["provider_attempt"] == 7
+    assert retry_metadata["status"] == "scheduled_same_candidate_retry"
+
+    should_retry, backoff, retry_metadata = (
+        _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+            is_native_grok_4_5_candidate=True,
+            has_continuation_state=True,
+            error_class="upstream_transient_internal",
+            cooldown_scope="none",
+            provider_attempt=8,
+            provider="xai",
+            model="grok-4.5",
+            route_family="codex_grok_native_responses_adapter",
+            max_attempts=8,
+        )
+    )
+    assert should_retry is False
+    assert backoff is None
+    assert retry_metadata is not None
+    assert retry_metadata["status"] == "same_candidate_retry_exhausted"
+    assert "backoff_seconds" not in retry_metadata
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_continuation_budget():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota-xai",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    # Force native Grok 4.5 first: managed oa_xai/grok-4.5 is otherwise preferred.
+    await _set_codex_auto_agent_cooldown(
+        "xai:oa_xai/grok-4.5:xai_grok_native",
+        60.0,
+    )
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(side_effect=[transient_error, success]),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is success
+    assert mock_grok_native.await_count == 2
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["codex_auto_agent_attempts"]
+    assert [attempt["model"] for attempt in attempts] == ["grok-4.5", "grok-build"]
+    assert attempts[0]["error_class"] == "upstream_transient_internal"
+    assert attempts[0]["cooldown_scope"] == "none"
+    assert "native_grok_continuation_retry" not in attempts[0]
+    assert attempts[0].get("reason") != (
+        "native_grok_continuation_same_candidate_retry"
+    )
+    assert metadata["codex_auto_agent_selected_model"] == "grok-build"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_continuation_budget():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    # Force native Grok 4.5 first: spark is preferred for aawm-code-anthropic.
+    await _set_anthropic_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:__default__",
+        60.0,
+    )
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    success = Response(content='{"ok": true}', media_type="application/json")
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=[transient_error, success]),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        response = await _handle_anthropic_auto_agent_alias_route(
+            endpoint="/v1/messages",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://api.anthropic.com/v1/messages",
+            custom_headers={"x-api-key": "anthropic-key"},
+        )
+
+    assert response is success
+    assert mock_grok_native.await_count == 2
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert [attempt["model"] for attempt in attempts] == [
+        "xai/grok-4.5",
+        "grok-composer-2.5-fast",
+    ]
+    assert attempts[0]["error_class"] == "upstream_transient_internal"
+    assert attempts[0]["cooldown_scope"] == "none"
+    assert "native_grok_continuation_retry" not in attempts[0]
+    assert attempts[0].get("reason") != (
+        "native_grok_continuation_same_candidate_retry"
+    )
+    assert metadata["anthropic_auto_agent_selected_model"] == (
+        "grok-composer-2.5-fast"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_in_flight_native_grok_4_5_429_redispatches_without_same_candidate_budget():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota-xai",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-sota-xai:codex-session:session:codex-session"
+    ] = {
+        "provider": "xai",
+        "model": "grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    rate_limit_error = ProxyException(
+        message="rate limited",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    rate_limit_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(side_effect=rate_limit_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    assert mock_grok_native.await_count == 1
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["codex_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["model"] == "grok-4.5"
+    assert attempts[0]["error_class"] == "rate_limited"
+    assert "native_grok_continuation_retry" not in attempts[0]
+    assert attempts[0]["status"] == "terminal_in_flight_cooldown_set"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_in_flight_native_grok_4_5_429_redispatches_without_same_candidate_budget():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "xai",
+        "model": "xai/grok-4.5",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    rate_limit_error = ProxyException(
+        message="rate limited",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    rate_limit_error.detail = {
+        "error": {
+            "message": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+        }
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=rate_limit_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_redispatch_required"
+    )
+    assert mock_grok_native.await_count == 1
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["model"] == "xai/grok-4.5"
+    assert attempts[0]["error_class"] == "rate_limited"
+    assert "native_grok_continuation_retry" not in attempts[0]
+    assert attempts[0]["status"] == "terminal_in_flight_cooldown_set"
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_in_flight_non_native_grok_composer_502_does_not_use_continuation_budget():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-code",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-code:codex-session:session:codex-session"
+    ] = {
+        "provider": "xai",
+        "model": "grok-composer-2.5-fast",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(side_effect=transient_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    assert mock_grok_native.await_count == 1
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["codex_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["model"] == "grok-composer-2.5-fast"
+    assert attempts[0]["error_class"] == "upstream_transient_internal"
+    assert attempts[0]["cooldown_scope"] == "request_local"
+    assert "native_grok_continuation_retry" not in attempts[0]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_auto_agent_in_flight_non_native_grok_composer_502_does_not_use_continuation_budget():
+    request = _build_anthropic_auto_agent_request()
+    body = _build_anthropic_auto_agent_body()
+    body["model"] = "aawm-code-anthropic"
+    body["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_existing",
+                    "content": "{}",
+                }
+            ],
+        }
+    ]
+    _anthropic_auto_agent_session_affinity_by_key[
+        "aawm-code-anthropic:claude-session:session:claude-session"
+    ] = {
+        "provider": "xai",
+        "model": "grok-composer-2.5-fast",
+        "route_family": "anthropic_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
+        new=AsyncMock(side_effect=transient_error),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_spark, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_anthropic_auto_agent_alias_route(
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://api.anthropic.com/v1/messages",
+                custom_headers={"x-api-key": "anthropic-key"},
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_anthropic_auto_agent_redispatch_required"
+    )
+    assert mock_grok_native.await_count == 1
+    mock_spark.assert_not_called()
+    mock_xai_oauth.assert_not_called()
+    assert mock_sleep.await_count == 0
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["anthropic_auto_agent_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["model"] == "grok-composer-2.5-fast"
+    assert attempts[0]["error_class"] == "upstream_transient_internal"
+    assert attempts[0]["cooldown_scope"] == "request_local"
+    assert "native_grok_continuation_retry" not in attempts[0]
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_native_grok_continuation_budget_survives_outer_selector_reentry():
+    """Eligible attempt counter is request-scoped across outer re-entry.
+
+    Interleave a non-eligible no-cooldown failure (candidate_unavailable with
+    scope none) between bare-502 same-candidate retries and prove the provider
+    attempt counter continues instead of resetting.
+    """
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "aawm-sota-xai",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_existing",
+                "output": "{}",
+            }
+        ],
+        "stream": False,
+        "previous_response_id": "resp_existing",
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    _codex_auto_agent_session_affinity_by_key[
+        "aawm-sota-xai:codex-session:session:codex-session"
+    ] = {
+        "provider": "xai",
+        "model": "grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+        "expires_at_monotonic": time.monotonic() + 3600,
+    }
+    transient_error = ProxyException(
+        message="Temporary upstream provider failure",
+        type="None",
+        param="None",
+        code=502,
+    )
+    unavailable_error = ProxyException(
+        message="candidate unavailable",
+        type="None",
+        param="None",
+        code=400,
+    )
+    unavailable_error.detail = {
+        "error": {
+            "message": "probe failed",
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    success = Response(content='{"ok": true}', media_type="application/json")
+    # eligible 502, non-eligible unavailable (outer re-entry), eligible 502, success
+    side_effects = [transient_error, unavailable_error, transient_error, success]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
+        new=AsyncMock(side_effect=side_effects),
+    ) as mock_grok_native, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
+        new=AsyncMock(),
+    ) as mock_xai_oauth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
+        new=AsyncMock(),
+    ) as mock_sleep:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is success
+    assert mock_grok_native.await_count == 4
+    mock_xai_oauth.assert_not_called()
+    # Only the two scheduled same-candidate 502 retries sleep; unavailable does not.
+    assert mock_sleep.await_count == 2
+    metadata = request.scope["parsed_body"][1]["litellm_metadata"]
+    attempts = metadata["codex_auto_agent_attempts"]
+    assert [attempt["model"] for attempt in attempts] == ["grok-4.5"] * 4
+    assert attempts[0]["error_class"] == "upstream_transient_internal"
+    assert attempts[0]["native_grok_continuation_retry"]["provider_attempt"] == 1
+    assert attempts[0]["native_grok_continuation_retry"]["status"] == (
+        "scheduled_same_candidate_retry"
+    )
+    assert attempts[1]["error_class"] == "candidate_unavailable"
+    assert attempts[1]["cooldown_scope"] == "none"
+    assert "native_grok_continuation_retry" not in attempts[1]
+    # After outer re-entry, eligible counter continues at 2 (not reset to 1).
+    assert attempts[2]["error_class"] == "upstream_transient_internal"
+    assert attempts[2]["native_grok_continuation_retry"]["provider_attempt"] == 2
+    assert attempts[2]["native_grok_continuation_retry"]["status"] == (
+        "scheduled_same_candidate_retry"
+    )
+    assert attempts[3]["reason"] == "native_grok_continuation_same_candidate_retry"
+    assert "native_grok_continuation_retry" not in attempts[3]
+    assert "error_class" not in attempts[3]
 
 
 @pytest.mark.asyncio
