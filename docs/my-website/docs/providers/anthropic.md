@@ -171,6 +171,11 @@ os.environ["ANTHROPIC_API_KEY"] = "your-api-key"
 # os.environ["LITELLM_ANTHROPIC_DISABLE_URL_SUFFIX"] = "true" # [OPTIONAL] Disable automatic URL suffix appending
 ```
 
+For an Anthropic-compatible endpoint that uses Bearer authentication, set
+`ANTHROPIC_AUTH_TOKEN` instead of `ANTHROPIC_API_KEY`. LiteLLM sends it as an
+`Authorization: Bearer` header. When both variables are set,
+`ANTHROPIC_API_KEY` takes precedence.
+
 :::tip Azure Foundry Support
 
 Claude models are also available via Microsoft Azure Foundry. Use the `azure/` prefix instead of `anthropic/` and configure Azure authentication. See the [Azure Anthropic documentation](../providers/azure/azure_anthropic) for details.
