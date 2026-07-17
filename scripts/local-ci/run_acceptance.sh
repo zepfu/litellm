@@ -82,9 +82,14 @@ PY
 }
 
 should_rebuild_litellm_dev() {
+  # Decision only — never persist BUILD_STATE_PATH here. Writing the fingerprint
+  # before docker compose succeeds would skip rebuilds after a failed build (RR-081).
   local state_json current_fingerprint previous_fingerprint image_present container_present
   state_json="$(compute_build_fingerprint)"
   current_fingerprint="$("$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.stdin.read())["fingerprint"])' <<<"$state_json")"
+  # Export for caller to persist only after a successful rebuild.
+  LITELLM_DEV_BUILD_STATE_JSON="$state_json"
+  export LITELLM_DEV_BUILD_STATE_JSON
 
   previous_fingerprint=""
   if [[ -f "$BUILD_STATE_PATH" ]]; then
@@ -95,16 +100,23 @@ should_rebuild_litellm_dev() {
   container_present="$(docker ps -a --filter name=^litellm-dev$ --format '{{.ID}}' 2>/dev/null || true)"
 
   if [[ -z "$image_present" || -z "$container_present" ]]; then
-    echo "$state_json" > "$BUILD_STATE_PATH"
     return 0
   fi
 
   if [[ "$current_fingerprint" != "$previous_fingerprint" ]]; then
-    echo "$state_json" > "$BUILD_STATE_PATH"
     return 0
   fi
 
   return 1
+}
+
+persist_litellm_dev_build_state() {
+  mkdir -p "$(dirname "$BUILD_STATE_PATH")"
+  if [[ -n "${LITELLM_DEV_BUILD_STATE_JSON:-}" ]]; then
+    printf '%s\n' "$LITELLM_DEV_BUILD_STATE_JSON" > "$BUILD_STATE_PATH"
+  else
+    compute_build_fingerprint > "$BUILD_STATE_PATH"
+  fi
 }
 
 TARGET_LITELLM_BASE_URL="$(resolve_litellm_base_url)"
@@ -114,6 +126,8 @@ if [[ "$TARGET_LITELLM_BASE_URL" == "http://127.0.0.1:4001" ]]; then
     echo "litellm-dev image inputs changed; rebuilding and recreating the container..."
     docker compose -f docker-compose.dev.yml build litellm-dev
     docker compose -f docker-compose.dev.yml up -d --force-recreate litellm-dev
+    # Only record fingerprint after successful build+recreate (set -e aborts otherwise).
+    persist_litellm_dev_build_state
     echo "Waiting briefly for litellm-dev to finish booting..."
     sleep 10
   elif [[ "$REBUILD_LITELLM_DEV" == "1" ]]; then

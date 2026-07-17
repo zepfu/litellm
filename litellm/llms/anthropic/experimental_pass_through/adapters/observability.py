@@ -226,12 +226,38 @@ def _collect_cache_control_material(payload: Any, collector: list[Any]) -> None:
             _collect_cache_control_material(item, collector)
 
 
-def derive_prompt_cache_key(payload: Any, *, prefix: str = "anthropic-cache") -> Optional[str]:
-    cache_material: list[Any] = []
-    _collect_cache_control_material(payload, cache_material)
-    if not cache_material:
+def _stable_prompt_cache_roots(payload: Any) -> Optional[Dict[str, Any]]:
+    """Prefer system + tools (stable Anthropic cache surface) over full body.
+
+    Hashing every cache_control-bearing dict (including per-turn user blocks)
+    makes prompt_cache_key volatile and defeats server-side prompt cache hits.
+    Returns None when neither system nor tools is present.
+    """
+    if not isinstance(payload, dict):
         return None
-    encoded = json.dumps(cache_material, sort_keys=True, default=str, separators=(",", ":"))
+    roots: Dict[str, Any] = {}
+    for key in ("system", "tools"):
+        if key in payload:
+            roots[key] = payload[key]
+    return roots or None
+
+
+def derive_prompt_cache_key(payload: Any, *, prefix: str = "anthropic-cache") -> Optional[str]:
+    stable_payload = _stable_prompt_cache_roots(payload)
+    if not stable_payload:
+        return None
+    cache_material: list[Any] = []
+    _collect_cache_control_material(stable_payload, cache_material)
+    if not cache_material:
+        # No cache_control markers under system/tools: hash the stable roots
+        # themselves so tools+system alone still produce a stable key.
+        encoded = json.dumps(
+            stable_payload, sort_keys=True, default=str, separators=(",", ":")
+        )
+    else:
+        encoded = json.dumps(
+            cache_material, sort_keys=True, default=str, separators=(",", ":")
+        )
     cleaned_prefix = prefix.strip()[:23] or "cache"
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:40]
     return f"{cleaned_prefix}-{digest}"[:64]
