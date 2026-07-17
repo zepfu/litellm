@@ -16,10 +16,24 @@ from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.llms.openrouter import OpenRouterErrorMessage
 from litellm.types.utils import ModelResponse, ModelResponseStream
-from litellm.utils import supports_native_cache_control
+from litellm.utils import get_model_info, supports_native_cache_control
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 from ..common_utils import OpenRouterException
+
+
+# Vendor-family tokens used only when cost-map metadata is missing for a model.
+# Explicit supports_native_cache_control=True/False from model cost metadata always
+# takes precedence. These are family markers (not model IDs) so newly listed
+# OpenRouter routes for known cache-control-capable vendors keep working before
+# the cost map is updated.
+_OPENROUTER_CACHE_CONTROL_VENDOR_FAMILIES: Tuple[str, ...] = (
+    "claude",
+    "gemini",
+    "minimax",
+    "glm",
+    "z-ai",
+)
 
 
 class OpenrouterConfig(OpenAIGPTConfig):
@@ -70,10 +84,49 @@ class OpenrouterConfig(OpenAIGPTConfig):
         Check if the model supports cache_control in content blocks.
 
         Returns:
-            bool: True if model metadata declares native cache_control support.
+            bool: True when model cost metadata declares native cache_control
+            support, or when the model is unmapped/missing that flag but belongs
+            to a known OpenRouter vendor family that accepts cache_control
+            content blocks. Explicit ``supports_native_cache_control=False`` in
+            the cost map always wins.
         """
-        return supports_native_cache_control(
+        if supports_native_cache_control(
             model=model, custom_llm_provider="openrouter"
+        ):
+            return True
+
+        explicit_flag = self._get_explicit_native_cache_control_flag(model)
+        if explicit_flag is False:
+            return False
+        if explicit_flag is True:
+            return True
+
+        return self._model_matches_cache_control_vendor_family(model)
+
+    @staticmethod
+    def _get_explicit_native_cache_control_flag(model: str) -> Optional[bool]:
+        """
+        Return the cost-map value for supports_native_cache_control when the
+        model is mapped, else None (unmapped / lookup failure).
+        """
+        try:
+            model_info = get_model_info(
+                model=model, custom_llm_provider="openrouter"
+            )
+        except Exception:
+            return None
+
+        flag = model_info.get("supports_native_cache_control")
+        if flag is True or flag is False:
+            return flag
+        return None
+
+    @staticmethod
+    def _model_matches_cache_control_vendor_family(model: str) -> bool:
+        model_lower = model.lower()
+        return any(
+            family in model_lower
+            for family in _OPENROUTER_CACHE_CONTROL_VENDOR_FAMILIES
         )
 
     def remove_cache_control_flag_from_messages_and_tools(

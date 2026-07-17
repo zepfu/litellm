@@ -15,6 +15,7 @@ from litellm.llms.openrouter.chat.transformation import (
     OpenrouterConfig,
     OpenRouterException,
 )
+from litellm.utils import get_model_info
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +33,9 @@ def openrouter_cache_control_model_metadata(monkeypatch):
         "supports_native_cache_control",
         False,
     )
+    get_model_info.cache_clear()
+    yield
+    get_model_info.cache_clear()
 
 
 class TestOpenRouterChatCompletionStreamingHandler:
@@ -540,3 +544,132 @@ def test_openrouter_non_reasoning_models_do_not_add_reasoning_effort():
     )
 
     assert "reasoning_effort" not in supported_params
+
+
+def test_openrouter_unmapped_vendor_family_keeps_cache_control():
+    """
+    Unmapped OpenRouter models in known cache-control vendor families should
+    keep cache_control via the family fallback (belt-and-suspenders for cost-map lag).
+    """
+    config = OpenrouterConfig()
+    messages = [
+        {
+            "role": "user",
+            "content": "Hello, world!",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+    # Not present in the cost map yet, but Claude family should still support
+    # content-block cache_control on OpenRouter.
+    transformed_request = config.transform_request(
+        model="openrouter/anthropic/claude-opus-5",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+
+    user_message = transformed_request["messages"][0]
+    assert isinstance(user_message["content"], list)
+    assert user_message["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in user_message
+
+
+def test_openrouter_missing_flag_vendor_family_keeps_cache_control(monkeypatch):
+    """
+    Mapped models with no supports_native_cache_control flag should fall back
+    to vendor-family detection rather than silently strip cache_control.
+    """
+    config = OpenrouterConfig()
+    model = "openrouter/minimax/minimax-m2.5:free"
+    # Ensure the model is mapped but the capability flag is absent (not False).
+    if model not in litellm.model_cost:
+        monkeypatch.setitem(
+            litellm.model_cost,
+            model,
+            {
+                "litellm_provider": "openrouter",
+                "mode": "chat",
+                "max_tokens": 8192,
+                "max_input_tokens": 8192,
+                "max_output_tokens": 8192,
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+            },
+        )
+    else:
+        # Drop explicit True/False so family fallback is exercised.
+        entry = dict(litellm.model_cost[model])
+        entry.pop("supports_native_cache_control", None)
+        monkeypatch.setitem(litellm.model_cost, model, entry)
+
+    messages = [
+        {
+            "role": "user",
+            "content": "Hello, world!",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    transformed_messages, _ = config.remove_cache_control_flag_from_messages_and_tools(
+        model=model, messages=messages
+    )
+    assert transformed_messages[0].get("cache_control") == {"type": "ephemeral"}
+
+
+def test_openrouter_explicit_false_native_cache_control_strips(monkeypatch):
+    """
+    Explicit supports_native_cache_control=False must win over vendor-family fallback.
+    """
+    config = OpenrouterConfig()
+    model = "openrouter/anthropic/claude-family-explicit-false"
+    monkeypatch.setitem(
+        litellm.model_cost,
+        model,
+        {
+            "litellm_provider": "openrouter",
+            "mode": "chat",
+            "max_tokens": 8192,
+            "max_input_tokens": 8192,
+            "max_output_tokens": 8192,
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+            "supports_native_cache_control": False,
+        },
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": "Hello, world!",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    transformed_request = config.transform_request(
+        model=model,
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+    assert transformed_request["messages"][0].get("cache_control") is None
+
+
+def test_openrouter_unmapped_non_family_model_strips_cache_control():
+    """Unmapped models outside known vendor families still strip cache_control."""
+    config = OpenrouterConfig()
+    messages = [
+        {
+            "role": "user",
+            "content": "Hello, world!",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    transformed_request = config.transform_request(
+        model="openrouter/acme/unknown-model-xyz",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+    assert transformed_request["messages"][0].get("cache_control") is None
