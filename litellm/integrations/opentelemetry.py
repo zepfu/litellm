@@ -11,7 +11,7 @@ from litellm.integrations._types.open_inference import (
 )
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
-from litellm.secret_managers.main import get_secret_bool
+from litellm.secret_managers.main import get_secret_bool, str_to_bool
 from litellm.types.services import ServiceLoggerPayload
 from litellm.types.utils import (
     ChatCompletionMessageToolCall,
@@ -68,6 +68,7 @@ class OpenTelemetryConfig:
     service_name: Optional[str] = None
     deployment_environment: Optional[str] = None
     model_id: Optional[str] = None
+    ignore_context_propagation: Optional[bool] = None
 
     def __post_init__(self) -> None:
         # If endpoint is specified but exporter is still the default "console",
@@ -89,6 +90,10 @@ class OpenTelemetryConfig:
             )
         if not self.model_id:
             self.model_id = os.getenv("OTEL_MODEL_ID", self.service_name)
+        if self.ignore_context_propagation is None:
+            self.ignore_context_propagation = str_to_bool(
+                os.getenv("OTEL_IGNORE_CONTEXT_PROPAGATION")
+            )
 
     @classmethod
     def from_env(cls):
@@ -152,6 +157,7 @@ class OpenTelemetry(CustomLogger):
 
         self.config = config
         self.callback_name = callback_name
+        self._is_langfuse_otel = callback_name == "langfuse_otel"
         self.OTEL_EXPORTER = self.config.exporter
         self.OTEL_ENDPOINT = self.config.endpoint
         self.OTEL_HEADERS = self.config.headers
@@ -176,6 +182,23 @@ class OpenTelemetry(CustomLogger):
         self._init_metrics(meter_provider)
         self._init_logs(logger_provider)
         self._init_otel_logger_on_litellm_proxy()
+
+    @property
+    def is_langfuse_otel(self) -> bool:
+        """True when this logger instance is the langfuse_otel callback."""
+        return bool(getattr(self, "_is_langfuse_otel", False))
+
+    def _should_ignore_context_propagation(self) -> bool:
+        """
+        Whether inbound parent spans / global OTEL context should be ignored.
+
+        General knob: ``OpenTelemetryConfig.ignore_context_propagation`` /
+        ``OTEL_IGNORE_CONTEXT_PROPAGATION`` (any OTEL-family backend).
+
+        Special case: ``langfuse_otel`` always ignores inbound parent context
+        to prevent trace corruption from other providers' spans.
+        """
+        return bool(self.config.ignore_context_propagation) or self.is_langfuse_otel
 
     @staticmethod
     def _get_litellm_resource(config: OpenTelemetryConfig):
@@ -298,10 +321,9 @@ class OpenTelemetry(CustomLogger):
             provider.add_span_processor(self._get_span_processor())
             return provider
 
-        # CRITICAL FIX: For Langfuse OTEL, skip setting global provider to prevent interference
-        skip_global = (
-            hasattr(self, "callback_name") and self.callback_name == "langfuse_otel"
-        )
+        # Skip setting the global TracerProvider when context isolation is
+        # requested (general knob or langfuse_otel special case).
+        skip_global = self._should_ignore_context_propagation()
 
         tracer_provider = self._get_or_create_provider(
             provider=tracer_provider,
@@ -620,7 +642,7 @@ class OpenTelemetry(CustomLogger):
             )
         else:
             # For langfuse_otel without dynamic headers, create a provider with env var credentials
-            if hasattr(self, "callback_name") and self.callback_name == "langfuse_otel":
+            if self.is_langfuse_otel:
                 # Use the headers from config (which were set from env vars during init)
                 env_var_headers = (
                     self._get_headers_dictionary(self.OTEL_HEADERS)
@@ -710,13 +732,11 @@ class OpenTelemetry(CustomLogger):
         )
         ctx, parent_span = self._get_span_context(kwargs)
 
-        # CRITICAL FIX: For langfuse_otel, ALWAYS create primary spans
-        # Don't use parent spans from other providers as they cause trace corruption
-        is_langfuse_otel = (
-            hasattr(self, "callback_name") and self.callback_name == "langfuse_otel"
-        )
-        if is_langfuse_otel:
-            parent_span = None  # Ignore parent spans from other providers
+        # Ignore inbound parent context when configured generally
+        # (OTEL_IGNORE_CONTEXT_PROPAGATION) or for langfuse_otel (prevents
+        # trace corruption from other providers' spans).
+        if self._should_ignore_context_propagation():
+            parent_span = None
             ctx = None
 
         # Decide whether to create a primary span
@@ -1256,13 +1276,11 @@ class OpenTelemetry(CustomLogger):
         )
         _parent_context, parent_otel_span = self._get_span_context(kwargs)
 
-        # CRITICAL FIX: For langfuse_otel, ALWAYS create primary spans
-        # Don't use parent spans from other providers as they cause trace corruption
-        is_langfuse_otel = (
-            hasattr(self, "callback_name") and self.callback_name == "langfuse_otel"
-        )
-        if is_langfuse_otel:
-            parent_otel_span = None  # Ignore parent spans from other providers
+        # Ignore inbound parent context when configured generally
+        # (OTEL_IGNORE_CONTEXT_PROPAGATION) or for langfuse_otel (prevents
+        # trace corruption from other providers' spans).
+        if self._should_ignore_context_propagation():
+            parent_otel_span = None
             _parent_context = None
 
         # Decide whether to create a primary span

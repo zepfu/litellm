@@ -87,6 +87,21 @@ Use just 1 line of code, to instantly log your LLM responses **across all provid
 litellm.callbacks = ["otel"]
 ```
 
+### Ignore inbound trace context
+
+Set `OTEL_IGNORE_CONTEXT_PROPAGATION=true` when the upstream caller or collector
+injects parent trace context that should not be reused by LiteLLM. This makes
+the OpenTelemetry callback create an isolated trace instead of attaching spans
+to the inbound parent context.
+
+```shell
+OTEL_IGNORE_CONTEXT_PROPAGATION=true
+```
+
+This setting applies to all OpenTelemetry-family callbacks. The
+`langfuse_otel` callback always uses isolated context to avoid combining
+Langfuse traces with parent spans created by another integration.
+
 ## Redacting Messages, Response Content from OpenTelemetry Logging
 
 ### Redact Messages and Responses from all OpenTelemetry Logging

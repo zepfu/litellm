@@ -3,7 +3,7 @@ import os
 import sys
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 # Adds the grandparent directory to sys.path to allow importing project modules
@@ -492,7 +492,6 @@ class TestOpenTelemetry(unittest.TestCase):
             self.assertEqual(
                 result, {"arize-space-id": "test-space", "api_key": "test-key"}
             )
-
             # Test case 2: Without standard_callback_dynamic_params
             kwargs_empty = {}
             result_empty = otel._get_dynamic_otel_headers_from_kwargs(kwargs_empty)
@@ -2674,3 +2673,246 @@ class TestResponseIdFallback(unittest.TestCase):
         mock_span.set_attribute.assert_any_call(
             "gen_ai.response.id", "litellm-img-call-101"
         )
+
+
+class TestOpenTelemetryIgnoreContextPropagation(unittest.TestCase):
+    """RR-015: general OTEL_IGNORE_CONTEXT_PROPAGATION + langfuse_otel special case."""
+
+    def _make_kwargs(self, parent_span, with_exception: bool = False):
+        kwargs = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "optional_params": {},
+            "litellm_params": {
+                "custom_llm_provider": "openai",
+                "metadata": {"litellm_parent_otel_span": parent_span},
+            },
+            "standard_logging_object": {
+                "id": "test-id",
+                "call_type": "completion",
+                "metadata": {},
+            },
+        }
+        if with_exception:
+            kwargs["exception"] = Exception("test error")
+        return kwargs
+
+    def _make_response(self):
+        return {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hi"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+
+    def test_config_from_env_sets_ignore_context_propagation_true(self):
+        with patch.dict(os.environ, {"OTEL_IGNORE_CONTEXT_PROPAGATION": "true"}, clear=False):
+            config = OpenTelemetryConfig.from_env()
+        self.assertTrue(config.ignore_context_propagation)
+
+    def test_config_from_env_sets_ignore_context_propagation_false(self):
+        with patch.dict(
+            os.environ, {"OTEL_IGNORE_CONTEXT_PROPAGATION": "false"}, clear=False
+        ):
+            config = OpenTelemetryConfig.from_env()
+        self.assertFalse(config.ignore_context_propagation)
+
+    def test_config_explicit_true_not_overridden_by_env(self):
+        with patch.dict(
+            os.environ, {"OTEL_IGNORE_CONTEXT_PROPAGATION": "false"}, clear=False
+        ):
+            config = OpenTelemetryConfig(ignore_context_propagation=True)
+        self.assertTrue(config.ignore_context_propagation)
+
+    def test_config_default_none_when_env_unset(self):
+        env = os.environ.copy()
+        env.pop("OTEL_IGNORE_CONTEXT_PROPAGATION", None)
+        with patch.dict(os.environ, env, clear=True):
+            # from_env still reads other OTEL_* vars; rebuild from clean env without the knob
+            config = OpenTelemetryConfig()
+        # None is falsy for the OR gate; post_init leaves None when env unset
+        self.assertIn(config.ignore_context_propagation, (None, False))
+        self.assertFalse(bool(config.ignore_context_propagation))
+
+    def test_should_ignore_or_with_langfuse_and_config(self):
+        plain = OpenTelemetry(
+            config=OpenTelemetryConfig(ignore_context_propagation=False)
+        )
+        self.assertFalse(plain._should_ignore_context_propagation())
+        self.assertFalse(plain.is_langfuse_otel)
+
+        generic_ignore = OpenTelemetry(
+            config=OpenTelemetryConfig(ignore_context_propagation=True)
+        )
+        self.assertTrue(generic_ignore._should_ignore_context_propagation())
+        self.assertFalse(generic_ignore.is_langfuse_otel)
+
+        langfuse = OpenTelemetry(
+            callback_name="langfuse_otel",
+            config=OpenTelemetryConfig(ignore_context_propagation=False),
+        )
+        self.assertTrue(langfuse.is_langfuse_otel)
+        self.assertTrue(langfuse._should_ignore_context_propagation())
+
+    def test_generic_ignore_context_nulls_parent_on_success(self):
+        span_exporter = InMemorySpanExporter()
+        tracer_provider = TracerProvider()
+        tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+
+        otel = OpenTelemetry(
+            config=OpenTelemetryConfig(ignore_context_propagation=True),
+            tracer_provider=tracer_provider,
+        )
+        otel.tracer = tracer_provider.get_tracer("litellm")
+        parent_span = otel.tracer.start_span("parent_span")
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(seconds=1)
+
+        with patch.dict(os.environ, {"USE_OTEL_LITELLM_REQUEST_SPAN": "true"}):
+            otel._handle_success(
+                self._make_kwargs(parent_span), self._make_response(), start, end
+            )
+        parent_span.end()
+
+        spans = span_exporter.get_finished_spans()
+        child_spans = [s for s in spans if s.name != "parent_span"]
+        self.assertTrue(child_spans, "Expected at least one child span")
+        child_span_ids = {s.context.span_id for s in child_spans if s.context}
+        for span in child_spans:
+            self.assertTrue(
+                span.parent is None or span.parent.span_id in child_span_ids,
+                f"ignore_context_propagation should drop external parents, got {span.parent}",
+            )
+
+    def test_generic_ignore_context_nulls_parent_on_failure(self):
+        span_exporter = InMemorySpanExporter()
+        tracer_provider = TracerProvider()
+        tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+
+        otel = OpenTelemetry(
+            config=OpenTelemetryConfig(ignore_context_propagation=True),
+            tracer_provider=tracer_provider,
+        )
+        otel.tracer = tracer_provider.get_tracer("litellm")
+        parent_span = otel.tracer.start_span("parent_span")
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(seconds=1)
+
+        with patch.dict(os.environ, {"USE_OTEL_LITELLM_REQUEST_SPAN": "true"}):
+            otel._handle_failure(
+                self._make_kwargs(parent_span, with_exception=True),
+                None,
+                start,
+                end,
+            )
+        parent_span.end()
+
+        spans = span_exporter.get_finished_spans()
+        child_spans = [s for s in spans if s.name != "parent_span"]
+        self.assertTrue(child_spans, "Expected at least one failure span")
+        child_span_ids = {s.context.span_id for s in child_spans if s.context}
+        for span in child_spans:
+            self.assertTrue(
+                span.parent is None or span.parent.span_id in child_span_ids,
+                f"ignore_context_propagation should drop external parents, got {span.parent}",
+            )
+
+    def test_generic_default_preserves_parent_on_success(self):
+        span_exporter = InMemorySpanExporter()
+        tracer_provider = TracerProvider()
+        tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+
+        otel = OpenTelemetry(
+            config=OpenTelemetryConfig(ignore_context_propagation=False),
+            tracer_provider=tracer_provider,
+        )
+        otel.tracer = tracer_provider.get_tracer("litellm")
+        parent_span = otel.tracer.start_span("parent_span")
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(seconds=1)
+
+        with patch.dict(os.environ, {"USE_OTEL_LITELLM_REQUEST_SPAN": "true"}):
+            otel._handle_success(
+                self._make_kwargs(parent_span), self._make_response(), start, end
+            )
+        parent_span.end()
+
+        spans = span_exporter.get_finished_spans()
+        child_spans = [s for s in spans if s.name != "parent_span"]
+        self.assertTrue(child_spans, "Expected at least one child span")
+        for span in child_spans:
+            self.assertIsNotNone(
+                span.parent,
+                "Default OTEL should preserve parent spans",
+            )
+
+    def test_langfuse_otel_nulls_parent_on_success_without_config_knob(self):
+        """langfuse_otel special case must still force root spans without the env knob."""
+        span_exporter = InMemorySpanExporter()
+        tracer_provider = TracerProvider()
+        tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+
+        otel = OpenTelemetry(
+            callback_name="langfuse_otel",
+            config=OpenTelemetryConfig(ignore_context_propagation=False),
+            tracer_provider=tracer_provider,
+        )
+        otel.tracer = tracer_provider.get_tracer("litellm")
+        parent_span = otel.tracer.start_span("other_provider_span")
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(seconds=1)
+
+        otel._handle_success(
+            self._make_kwargs(parent_span), self._make_response(), start, end
+        )
+        parent_span.end()
+
+        spans = span_exporter.get_finished_spans()
+        child_spans = [s for s in spans if s.name != "other_provider_span"]
+        self.assertTrue(child_spans, "Expected at least one langfuse_otel span")
+        child_span_ids = {s.context.span_id for s in child_spans if s.context}
+        for span in child_spans:
+            self.assertTrue(
+                span.parent is None or span.parent.span_id in child_span_ids,
+                f"langfuse_otel success span should not use external parent, got {span.parent}",
+            )
+
+    def test_langfuse_otel_nulls_parent_on_failure_without_config_knob(self):
+        span_exporter = InMemorySpanExporter()
+        tracer_provider = TracerProvider()
+        tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+
+        otel = OpenTelemetry(
+            callback_name="langfuse_otel",
+            config=OpenTelemetryConfig(ignore_context_propagation=False),
+            tracer_provider=tracer_provider,
+        )
+        otel.tracer = tracer_provider.get_tracer("litellm")
+        parent_span = otel.tracer.start_span("other_provider_span")
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(seconds=1)
+
+        otel._handle_failure(
+            self._make_kwargs(parent_span, with_exception=True), None, start, end
+        )
+        parent_span.end()
+
+        spans = span_exporter.get_finished_spans()
+        child_spans = [s for s in spans if s.name != "other_provider_span"]
+        self.assertTrue(child_spans, "Expected at least one langfuse_otel failure span")
+        child_span_ids = {s.context.span_id for s in child_spans if s.context}
+        for span in child_spans:
+            self.assertTrue(
+                span.parent is None or span.parent.span_id in child_span_ids,
+                f"langfuse_otel failure span should not use external parent, got {span.parent}",
+            )
