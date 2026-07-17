@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 import litellm
 from litellm.cost_calculator import (
+    _map_traffic_type_to_service_tier,
     completion_cost,
     handle_realtime_stream_cost_calculation,
     response_cost_calculator,
@@ -1774,6 +1775,27 @@ def test_completion_cost_service_tier_for_bedrock():
     )
 
     assert priority_cost > default_cost > flex_cost > 0
+
+
+def test_map_traffic_type_to_service_tier_handles_non_string_and_normal_tiers():
+    """RR-005: defensive non-string traffic_type handling + normal tier mapping."""
+    class FakeTrafficType:
+        def __str__(self):
+            return "ON_DEMAND_PRIORITY"
+
+    # Truthy non-string values must not raise AttributeError.
+    assert _map_traffic_type_to_service_tier(FakeTrafficType()) == "priority"
+    assert _map_traffic_type_to_service_tier(object()) is None
+
+    # Valid string semantics remain unchanged (case-insensitive mapping).
+    assert _map_traffic_type_to_service_tier(None) is None
+    assert _map_traffic_type_to_service_tier("ON_DEMAND") is None
+    assert _map_traffic_type_to_service_tier("on_demand") is None
+    assert _map_traffic_type_to_service_tier("ON_DEMAND_PRIORITY") == "priority"
+    assert _map_traffic_type_to_service_tier("on_demand_priority") == "priority"
+    assert _map_traffic_type_to_service_tier("FLEX") == "flex"
+    assert _map_traffic_type_to_service_tier("BATCH") == "flex"
+    assert _map_traffic_type_to_service_tier("UNKNOWN_TIER") is None
 
 
 def test_gemini_cache_tokens_details_no_negative_values():

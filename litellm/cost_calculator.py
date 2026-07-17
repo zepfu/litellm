@@ -757,7 +757,8 @@ def _map_traffic_type_to_service_tier(traffic_type: Optional[str]) -> Optional[s
     """
     if traffic_type is None:
         return None
-    service_tier = _GEMINI_TRAFFIC_TYPE_TO_SERVICE_TIER.get(traffic_type.upper())
+    # Coerce to str so non-string runtime values (enums/ints) do not raise AttributeError.
+    service_tier = _GEMINI_TRAFFIC_TYPE_TO_SERVICE_TIER.get(str(traffic_type).upper())
     return service_tier
 
 
