@@ -13,6 +13,8 @@ import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_stream_shape,
+    diagnostic_payload_capture_enabled,
+    passthrough_full_payload_capture_enabled,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.thread_pool_executor import executor
@@ -559,12 +561,18 @@ class PassThroughStreamingHandler:
         try:
             raw_bytes: List[bytes] = []
             line_accumulator: Optional[_PassThroughStreamLineAccumulator] = None
+            buffer_raw_bytes = True
             if PassThroughStreamingHandler._stream_summary_first_finalize_eligible(
                 endpoint_type=endpoint_type,
                 url_route=url_route,
                 custom_llm_provider=custom_llm_provider,
             ):
                 line_accumulator = _PassThroughStreamLineAccumulator()
+            buffer_raw_bytes = (
+                PassThroughStreamingHandler._should_buffer_raw_stream_bytes(
+                    line_accumulator_enabled=line_accumulator is not None,
+                )
+            )
             chunk_count = 0
             total_stream_bytes = 0
             first_chunk_at: Optional[datetime] = None
@@ -575,6 +583,7 @@ class PassThroughStreamingHandler:
                 endpoint_type=endpoint_type,
                 custom_llm_provider=custom_llm_provider,
             )
+            metadata["aawm_stream_raw_bytes_buffered"] = buffer_raw_bytes
             # Extract model name for cost injection
             model_name = PassThroughStreamingHandler._extract_model_for_cost_injection(
                 request_body=request_body,
@@ -624,7 +633,8 @@ class PassThroughStreamingHandler:
                         },
                     )
 
-                raw_bytes.append(chunk)
+                if buffer_raw_bytes:
+                    raw_bytes.append(chunk)
                 if line_accumulator is not None:
                     line_accumulator.feed(chunk)
                 if (
@@ -1409,6 +1419,36 @@ class PassThroughStreamingHandler:
         if endpoint_type == EndpointType.OPENAI:
             return OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
         return False
+
+    @staticmethod
+    def _raw_stream_bytes_capture_required() -> bool:
+        """True when capture paths still need retained raw stream bytes.
+
+        Shape-only capture is driven by decoded ``all_chunks``/lines. Full
+        payload capture stores raw chunk bytes, and diagnostic payload
+        manifests still record raw chunk counts/hashes. When either of those
+        capture paths is enabled, keep buffering raw bytes even if
+        line-accumulator finalize is active.
+        """
+        return (
+            passthrough_full_payload_capture_enabled()
+            or diagnostic_payload_capture_enabled()
+        )
+
+    @staticmethod
+    def _should_buffer_raw_stream_bytes(
+        *,
+        line_accumulator_enabled: bool,
+    ) -> bool:
+        """Prefer skipping ``raw_bytes`` retention in summary-first finalize.
+
+        When incremental line accumulation already supplies finalize logging
+        lines and no debug/raw stream-shape capture path needs the raw chunks,
+        drop the second full-body buffer for the stream lifetime.
+        """
+        if not line_accumulator_enabled:
+            return True
+        return PassThroughStreamingHandler._raw_stream_bytes_capture_required()
 
     @staticmethod
     def _resolve_stream_logging_lines(

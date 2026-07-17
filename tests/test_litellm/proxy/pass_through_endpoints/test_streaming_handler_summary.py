@@ -193,3 +193,169 @@ async def test_chunk_processor_increments_summary_lines_for_codex_responses(monk
         'data: {"delta":1}',
         "data: [DONE]",
     ]
+
+
+
+def test_should_buffer_raw_stream_bytes_skips_when_summary_and_capture_off(monkeypatch):
+    monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+    monkeypatch.delenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", raising=False)
+    monkeypatch.delenv(
+        "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_CONTROL_FILE", raising=False
+    )
+    assert PassThroughStreamingHandler._should_buffer_raw_stream_bytes(
+        line_accumulator_enabled=True
+    ) is False
+    assert PassThroughStreamingHandler._should_buffer_raw_stream_bytes(
+        line_accumulator_enabled=False
+    ) is True
+
+
+def test_should_buffer_raw_stream_bytes_keeps_raw_when_full_payload_capture_on(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", "1")
+    assert PassThroughStreamingHandler._should_buffer_raw_stream_bytes(
+        line_accumulator_enabled=True
+    ) is True
+
+
+def test_should_buffer_raw_stream_bytes_keeps_raw_when_diagnostic_capture_on(
+    monkeypatch,
+):
+    monkeypatch.setenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", "1")
+    monkeypatch.setenv(
+        "AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE_ROUTE_FAMILIES",
+        "openai_responses",
+    )
+    assert PassThroughStreamingHandler._should_buffer_raw_stream_bytes(
+        line_accumulator_enabled=True
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_skips_raw_bytes_when_summary_finalize_and_capture_off(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,
+        "1",
+    )
+    monkeypatch.delenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", raising=False)
+    monkeypatch.delenv("AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE", raising=False)
+    monkeypatch.delenv(
+        "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_CONTROL_FILE", raising=False
+    )
+
+    async def _aiter_bytes():
+        yield b'data: {"delta":1}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    response = MagicMock()
+    response.headers = httpx.Headers({})
+    response.aiter_bytes = _aiter_bytes
+
+    logging_obj = MagicMock()
+    logging_obj._update_completion_start_time = MagicMock()
+    route_kwargs: dict = {}
+
+    async def _capture_route(**kwargs):
+        route_kwargs.update(kwargs)
+
+    success_handler_kwargs = {"litellm_params": {"metadata": {}}}
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        side_effect=_capture_route,
+    ):
+        chunks = []
+        async for chunk in PassThroughStreamingHandler.chunk_processor(
+            response=response,
+            request_body={"model": "gpt-5.4"},
+            litellm_logging_obj=logging_obj,
+            endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now(),
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            custom_llm_provider="openai",
+            success_handler_kwargs=success_handler_kwargs,
+        ):
+            chunks.append(chunk)
+
+    await asyncio.sleep(0.05)
+
+    assert chunks == [b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"]
+    assert route_kwargs["raw_bytes"] == []
+    assert route_kwargs["precomputed_lines"] == [
+        'data: {"delta":1}',
+        "data: [DONE]",
+    ]
+    assert (
+        success_handler_kwargs["litellm_params"]["metadata"][
+            "aawm_stream_raw_bytes_buffered"
+        ]
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_keeps_raw_bytes_when_summary_finalize_and_capture_on(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,
+        "1",
+    )
+    monkeypatch.setenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", "1")
+
+    async def _aiter_bytes():
+        yield b'data: {"delta":1}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    response = MagicMock()
+    response.headers = httpx.Headers({})
+    response.aiter_bytes = _aiter_bytes
+
+    logging_obj = MagicMock()
+    logging_obj._update_completion_start_time = MagicMock()
+    route_kwargs: dict = {}
+
+    async def _capture_route(**kwargs):
+        route_kwargs.update(kwargs)
+
+    success_handler_kwargs = {"litellm_params": {"metadata": {}}}
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        side_effect=_capture_route,
+    ):
+        chunks = []
+        async for chunk in PassThroughStreamingHandler.chunk_processor(
+            response=response,
+            request_body={"model": "gpt-5.4"},
+            litellm_logging_obj=logging_obj,
+            endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now(),
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            custom_llm_provider="openai",
+            success_handler_kwargs=success_handler_kwargs,
+        ):
+            chunks.append(chunk)
+
+    await asyncio.sleep(0.05)
+
+    assert chunks == [b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"]
+    assert route_kwargs["raw_bytes"] == [
+        b'data: {"delta":1}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    assert route_kwargs["precomputed_lines"] == [
+        'data: {"delta":1}',
+        "data: [DONE]",
+    ]
+    assert (
+        success_handler_kwargs["litellm_params"]["metadata"][
+            "aawm_stream_raw_bytes_buffered"
+        ]
+        is True
+    )

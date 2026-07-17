@@ -462,7 +462,7 @@ router_settings:
 | AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS | Hidden retry budget in seconds for AAWM OpenRouter adapter transient recovery.
 | AAWM_OPENROUTER_ADAPTER_MAX_RETRIES | Maximum retry attempts for AAWM OpenRouter adapter requests.
 | AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS | Cooldown in seconds after AAWM OpenRouter adapter failures.
-| AAWM_STREAM_SUMMARY_FIRST_FINALIZE | Opt-in streaming-finalize CPU optimization for eligible Anthropic Messages and OpenAI Responses passthrough streams. Builds logging lines incrementally while preserving streamed bytes; default is **false**.
+| AAWM_STREAM_SUMMARY_FIRST_FINALIZE | Opt-in streaming-finalize optimization for eligible Anthropic Messages and OpenAI Responses passthrough streams. Builds logging lines incrementally while yielding raw streamed bytes unchanged. When enabled and full/diagnostic raw stream capture is off, skips retaining a second full raw-byte buffer for finalize (CPU + peak memory). If `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS` or scoped `AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE` is on, raw bytes are still retained for capture fidelity. Default is **false**.
 | ANTHROPIC_API_KEY | API key for Anthropic service
 | ANTHROPIC_API_BASE | Base URL for Anthropic API. Default is https://api.anthropic.com
 | ANTHROPIC_TOKEN_COUNTING_BETA_VERSION | Beta version header for Anthropic token counting API. Default is `token-counting-2024-11-01`
