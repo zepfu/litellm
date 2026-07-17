@@ -2840,6 +2840,17 @@ class TestDDSpanTaggerTagRequest:
 
 
 class TestExpectedProviderAuthConfigurationException:
+    def test_matches_direct_anthropic_missing_key_with_anthropic_provider(self):
+        exc = litellm.AuthenticationError(
+            message=(
+                "Missing Anthropic API Key - A direct Anthropic route requires "
+                "a server-side credential: configure deployment `api_key`."
+            ),
+            llm_provider="anthropic",
+            model="anthropic/claude-sonnet-4-6",
+        )
+        assert _is_expected_provider_auth_configuration_exception(exc) is True
+
     def test_matches_direct_anthropic_missing_key_without_llm_provider(self):
         exc = litellm.AuthenticationError(
             message=(
@@ -2871,6 +2882,30 @@ class TestExpectedProviderAuthConfigurationException:
             model="gpt-4",
         )
         assert _is_expected_provider_auth_configuration_exception(exc) is False
+
+    def test_rejects_matching_message_from_non_anthropic_provider(self):
+        exc = litellm.AuthenticationError(
+            message=(
+                "Missing Anthropic API Key - A direct Anthropic route requires "
+                "a server-side credential: configure deployment `api_key`."
+            ),
+            llm_provider="openai",
+            model="gpt-4",
+        )
+        assert _is_expected_provider_auth_configuration_exception(exc) is False
+
+    def test_rejects_wrapped_matching_message_from_non_anthropic_provider(self):
+        inner = litellm.AuthenticationError(
+            message=(
+                "Missing Anthropic API Key - A direct Anthropic route requires "
+                "a server-side credential: configure deployment `api_key`."
+            ),
+            llm_provider="azure",
+            model="gpt-4",
+        )
+        outer = RuntimeError("wrapper")
+        outer.__cause__ = inner
+        assert _is_expected_provider_auth_configuration_exception(outer) is False
 
     def test_rejects_non_anthropic_missing_credential_message(self):
         exc = litellm.AuthenticationError(
