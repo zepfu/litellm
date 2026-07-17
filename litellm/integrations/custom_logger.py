@@ -126,20 +126,6 @@ class CustomLogger:  # https://docs.litellm.ai/docs/observability/custom_callbac
     def log_post_api_call(self, kwargs, response_obj, start_time, end_time):
         pass
 
-    def get_available_deployment(
-        self,
-        model: str,
-        messages: Optional[List[Dict[str, str]]] = None,
-        input: Optional[Union[str, List]] = None,
-        specific_deployment: Optional[bool] = False,
-        request_kwargs: Optional[Dict] = None,
-    ) -> Optional[Any]:
-        """
-        Custom routing logic.
-        Return the model ID (string) or the deployment (dict) to use.
-        """
-        return None
-
     def log_stream_event(self, kwargs, response_obj, start_time, end_time):
         pass
 
