@@ -1685,27 +1685,35 @@ class AawmRouteRollupAccumulator:
         return lines
 
 
-def get_aawm_route_rollup_accumulator() -> AawmRouteRollupAccumulator:
+def _get_or_replace_aawm_route_rollup_accumulator_locked() -> "AawmRouteRollupAccumulator":
+    """Return the configured singleton.
+
+    Caller must hold ``_aawm_route_rollup_lock``. Replaces the singleton when it
+    is missing or when the configured interval no longer matches so callers that
+    mutate rollup state never operate on an orphaned instance.
+    """
     global _aawm_route_rollup_accumulator
+    interval_seconds = get_aawm_route_rollup_interval_seconds()
+    if (
+        _aawm_route_rollup_accumulator is None
+        or _aawm_route_rollup_accumulator.interval_seconds() != interval_seconds
+    ):
+        _aawm_route_rollup_accumulator = AawmRouteRollupAccumulator()
+    return _aawm_route_rollup_accumulator
+
+
+def get_aawm_route_rollup_accumulator() -> AawmRouteRollupAccumulator:
     with _aawm_route_rollup_lock:
-        interval_seconds = get_aawm_route_rollup_interval_seconds()
-        if (
-            _aawm_route_rollup_accumulator is None
-            or _aawm_route_rollup_accumulator.interval_seconds() != interval_seconds
-        ):
-            _aawm_route_rollup_accumulator = AawmRouteRollupAccumulator()
-        accumulator = _aawm_route_rollup_accumulator
+        accumulator = _get_or_replace_aawm_route_rollup_accumulator_locked()
+    # Flush-worker lifecycle uses a separate lock and may join a worker that
+    # itself takes `_aawm_route_rollup_lock`; never call it while holding that lock.
     _ensure_aawm_route_rollup_flush_worker()
     return accumulator
 
 
 def clear_aawm_route_rollups() -> None:
-    global _aawm_route_rollup_accumulator
     with _aawm_route_rollup_lock:
-        if _aawm_route_rollup_accumulator is None:
-            _aawm_route_rollup_accumulator = AawmRouteRollupAccumulator()
-        else:
-            _aawm_route_rollup_accumulator.clear()
+        _get_or_replace_aawm_route_rollup_accumulator_locked().clear()
 
 
 def _set_aawm_route_rollup_monotonic_now_for_tests(
@@ -1721,8 +1729,10 @@ def _tick_aawm_route_rollup_interval_flush() -> None:
     if not aawm_route_rollups_enabled():
         return
     with _aawm_route_rollup_lock:
-        accumulator = _aawm_route_rollup_accumulator
-        if accumulator is None or not accumulator.enabled():
+        # Obtain/replace under the same critical section as flush_due so a
+        # concurrent interval change cannot leave this tick mutating an orphan.
+        accumulator = _get_or_replace_aawm_route_rollup_accumulator_locked()
+        if not accumulator.enabled():
             return
         lines = accumulator.flush_due(monotonic_now=_aawm_route_rollup_monotonic_now())
     _emit_aawm_route_rollup_lines(lines)
@@ -1778,9 +1788,13 @@ def flush_aawm_route_rollups(
     now: Optional[datetime] = None,
     early: bool = False,
 ) -> list[str]:
-    accumulator = get_aawm_route_rollup_accumulator()
     with _aawm_route_rollup_lock:
-        return accumulator.flush(force=force, now=now, early=early)
+        accumulator = _get_or_replace_aawm_route_rollup_accumulator_locked()
+        lines = accumulator.flush(force=force, now=now, early=early)
+    # Ensure the background flush worker tracks the current interval without
+    # holding the rollup lock (worker stop may re-enter that lock).
+    _ensure_aawm_route_rollup_flush_worker()
+    return lines
 
 
 def _emit_aawm_route_rollup_lines(lines: list[str]) -> None:
@@ -1937,8 +1951,10 @@ def record_aawm_route_rollup(
     status: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> None:
-    accumulator = get_aawm_route_rollup_accumulator()
     with _aawm_route_rollup_lock:
+        # Get-or-replace and record under one continuous critical section so an
+        # interval-driven singleton swap cannot orphan this mutation.
+        accumulator = _get_or_replace_aawm_route_rollup_accumulator_locked()
         lines = accumulator.record(
             group_header_label=group_header_label,
             incoming_endpoint=incoming_endpoint,
@@ -1948,6 +1964,7 @@ def record_aawm_route_rollup(
             status=status,
             now=now,
         )
+    _ensure_aawm_route_rollup_flush_worker()
     _emit_aawm_route_rollup_lines(lines)
 
 

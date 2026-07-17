@@ -3353,3 +3353,88 @@ class TestAawmRouteRollup:
         clear_aawm_route_rollups()
         get_aawm_route_rollup_accumulator()
         assert aawm_route_logging._aawm_route_rollup_flush_thread is None
+
+    def test_route_rollup_record_replace_shares_one_critical_section(
+        self,
+        monkeypatch,
+    ):
+        """RR-043 #4: get-or-replace + record stay under one rollup lock.
+
+        Freezes inside record while holding the lock; concurrent get cannot
+        replace the singleton until the continuous critical section ends, and
+        recorded turns remain on the live singleton when interval is unchanged.
+        """
+        import threading
+        import time
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import (
+            _stop_aawm_route_rollup_flush_worker,
+            clear_aawm_route_rollups,
+            flush_aawm_route_rollups,
+            get_aawm_route_rollup_accumulator,
+            record_aawm_route_rollup,
+        )
+
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        _stop_aawm_route_rollup_flush_worker()
+        clear_aawm_route_rollups()
+        now = datetime(2026, 6, 23, 3, 0, 0)
+        in_record = threading.Event()
+        release_record = threading.Event()
+        original_record = aawm_route_logging.AawmRouteRollupAccumulator.record
+        seen: dict[str, object] = {"record_id": None, "errors": []}
+
+        def slow_record(self, *args, **kwargs):
+            seen["record_id"] = id(self)
+            assert aawm_route_logging._aawm_route_rollup_lock.locked()
+            in_record.set()
+            assert release_record.wait(timeout=5.0)
+            assert aawm_route_logging._aawm_route_rollup_accumulator is self
+            return original_record(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            aawm_route_logging.AawmRouteRollupAccumulator, "record", slow_record
+        )
+
+        def recorder() -> None:
+            try:
+                record_aawm_route_rollup(
+                    group_header_label="litellm@Codex[0.141.0]",
+                    incoming_endpoint="/openai_passthrough/responses",
+                    outgoing_target="chatgpt.com/backend-api/codex/responses",
+                    model_label="gpt-5.5",
+                    turns=4,
+                    now=now,
+                )
+            except BaseException as exc:  # pragma: no cover
+                seen["errors"].append(exc)
+
+        recorder_thread = threading.Thread(target=recorder)
+        getter_done = threading.Event()
+        getter_thread = threading.Thread(
+            target=lambda: (get_aawm_route_rollup_accumulator(), getter_done.set())
+        )
+        recorder_thread.start()
+        assert in_record.wait(timeout=2.0)
+
+        # Old split-lock let a concurrent interval get replace and orphan record.
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "90")
+        getter_thread.start()
+        time.sleep(0.1)
+        assert recorder_thread.is_alive() and getter_thread.is_alive()
+        assert not getter_done.is_set()
+
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        release_record.set()
+        recorder_thread.join(timeout=2.0)
+        getter_thread.join(timeout=2.0)
+        assert not recorder_thread.is_alive() and not getter_thread.is_alive()
+        assert seen["errors"] == [] and seen["record_id"] is not None
+
+        live = get_aawm_route_rollup_accumulator()
+        assert id(live) == seen["record_id"] and live.interval_seconds() == 60
+        flushed = flush_aawm_route_rollups(force=True, now=now)
+        assert any("Turns: 4" in line for line in flushed), flushed
+        _stop_aawm_route_rollup_flush_worker()
+        clear_aawm_route_rollups()
