@@ -87,6 +87,8 @@ from litellm.types.llms.openai import (
     OpenAIModerationResponse,
     ResponseAPIUsage,
     ResponseCompletedEvent,
+    ResponseFailedEvent,
+    ResponseIncompleteEvent,
     ResponsesAPIResponse,
 )
 from litellm.types.mcp import MCPPostCallResponseObject
@@ -491,6 +493,23 @@ class Logging(LiteLLMLoggingBaseClass):
                 processed_list.append(callback)
         return processed_list
 
+    def get_router_model_id(self) -> Optional[str]:
+        """Extract the router deployment model_id from litellm_params.
+
+        Checks both litellm_metadata and metadata for model_info.id.
+        Used by cost calculators to look up custom pricing registered
+        under the deployment's model_info.id in litellm.model_cost.
+        """
+        if not hasattr(self, "litellm_params"):
+            return None
+        for key in ("litellm_metadata", "metadata"):
+            meta = self.litellm_params.get(key, {}) or {}
+            info = meta.get("model_info", {}) or {}
+            model_id = info.get("id")
+            if model_id is not None:
+                return model_id
+        return None
+
     def initialize_standard_callback_dynamic_params(
         self, kwargs: Optional[Dict] = None
     ) -> StandardCallbackDynamicParams:
@@ -595,9 +614,33 @@ class Logging(LiteLLMLoggingBaseClass):
             base_litellm_params["litellm_metadata"] = kwargs["litellm_metadata"]
             if "metadata" not in base_litellm_params:
                 base_litellm_params["metadata"] = kwargs["litellm_metadata"].copy()
+            else:
+                # Merge litellm_metadata into metadata without overwriting existing
+                # keys so API key fields are visible to callbacks even when
+                # Anthropic's native metadata is present (/v1/messages).
+                for key, value in kwargs["litellm_metadata"].items():
+                    if key not in base_litellm_params["metadata"]:
+                        base_litellm_params["metadata"][key] = value
 
         if litellm_params:
             base_litellm_params.update(litellm_params)
+
+        # Merge litellm_metadata into metadata AFTER .update(litellm_params) so
+        # the merge isn't silently overwritten. This ensures API key fields
+        # (user_api_key_hash, etc.) are visible to callbacks even when the
+        # request uses "litellm_metadata" (e.g. /v1/messages from Claude Code).
+        if "litellm_metadata" in kwargs and isinstance(
+            kwargs["litellm_metadata"], dict
+        ):
+            if not base_litellm_params.get("metadata"):
+                base_litellm_params["metadata"] = dict(kwargs["litellm_metadata"])
+            else:
+                base_litellm_params["metadata"] = dict(
+                    base_litellm_params["metadata"]
+                )
+                for key, value in kwargs["litellm_metadata"].items():
+                    if key not in base_litellm_params["metadata"]:
+                        base_litellm_params["metadata"][key] = value
 
         self.update_environment_variables(
             litellm_params=base_litellm_params,
@@ -1457,6 +1500,13 @@ class Logging(LiteLLMLoggingBaseClass):
                 router_model_id is None and "model_id" in hidden_params
             ):  # use model_id if not already set
                 router_model_id = hidden_params["model_id"]
+
+        # Fallback: extract router_model_id from litellm_params when not available
+        # from the result object. ResponsesAPIResponse objects (used by
+        # /v1/responses streaming) don't carry _hidden_params["model_id"] like
+        # ModelResponse does.
+        if router_model_id is None:
+            router_model_id = self.get_router_model_id()
 
         ## RESPONSE COST ##
         custom_pricing = use_custom_pricing_for_model(
@@ -3325,6 +3375,8 @@ class Logging(LiteLLMLoggingBaseClass):
             TextCompletionResponse,
             ModelResponseStream,
             ResponseCompletedEvent,
+            ResponseIncompleteEvent,
+            ResponseFailedEvent,
             Any,
         ],
         start_time: datetime.datetime,
@@ -3338,7 +3390,10 @@ class Logging(LiteLLMLoggingBaseClass):
             return result
         elif isinstance(result, TextCompletionResponse):
             return result
-        elif isinstance(result, ResponseCompletedEvent):
+        elif isinstance(
+            result,
+            (ResponseCompletedEvent, ResponseIncompleteEvent, ResponseFailedEvent),
+        ):
             ## return unified Usage object
             if isinstance(result.response.usage, ResponseAPIUsage):
                 transformed_usage = (
@@ -3359,7 +3414,6 @@ class Logging(LiteLLMLoggingBaseClass):
             return result.response
         else:
             return None
-        return None
 
     def _handle_anthropic_messages_response_logging(self, result: Any) -> ModelResponse:
         """

@@ -149,3 +149,33 @@ class TestGetLitellmParamsTraceAndSessionSeparation:
         )
         assert result["litellm_trace_id"] == "trace-abc"
         assert result["litellm_session_id"] == "session-xyz"
+
+
+class TestGetLitellmParamsMetadataMerge:
+    """RR-017: soft-merge litellm_metadata into metadata for callbacks."""
+
+    def test_litellm_metadata_only_becomes_metadata(self):
+        lm = {"user_api_key_hash": "h1", "model_info": {"id": "d1"}}
+        result = get_litellm_params(litellm_metadata=lm)
+        assert result["metadata"] == lm
+        assert result["litellm_metadata"] == lm
+
+    def test_soft_merge_does_not_overwrite_existing_metadata_keys(self):
+        result = get_litellm_params(
+            metadata={"user_api_key": "sk-real", "keep": 1},
+            litellm_metadata={
+                "user_api_key": "sk-other",
+                "user_api_key_hash": "hash-lm",
+            },
+        )
+        assert result["metadata"]["user_api_key"] == "sk-real"
+        assert result["metadata"]["keep"] == 1
+        assert result["metadata"]["user_api_key_hash"] == "hash-lm"
+
+    def test_does_not_mutate_caller_metadata_dict(self):
+        original = {"user_api_key": "sk-real"}
+        get_litellm_params(
+            metadata=original,
+            litellm_metadata={"user_api_key_hash": "h"},
+        )
+        assert original == {"user_api_key": "sk-real"}

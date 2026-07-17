@@ -222,15 +222,56 @@ class TestUpdateFromKwargs:
 
         assert logging_obj.litellm_params["metadata"] == lm_meta
 
-    def test_no_backfill_when_metadata_already_present(self, logging_obj):
+    def test_soft_merge_when_metadata_already_present(self, logging_obj):
+        """litellm_metadata fills missing keys; existing metadata keys win."""
         metadata = {"user_api_key": "sk-real"}
-        lm_meta = {"model_info": {"id": "deploy-1"}}
+        lm_meta = {"model_info": {"id": "deploy-1"}, "user_api_key": "sk-other"}
         kwargs = {"metadata": metadata, "litellm_metadata": lm_meta}
 
         logging_obj.update_from_kwargs(kwargs=kwargs)
 
-        assert logging_obj.litellm_params["metadata"] == metadata
+        assert logging_obj.litellm_params["metadata"]["user_api_key"] == "sk-real"
+        assert logging_obj.litellm_params["metadata"]["model_info"] == {
+            "id": "deploy-1"
+        }
         assert logging_obj.litellm_params["litellm_metadata"] == lm_meta
+
+    def test_merge_survives_caller_litellm_params_metadata_replace(self, logging_obj):
+        """
+        After base_litellm_params.update(litellm_params) replaces metadata,
+        litellm_metadata keys must still soft-merge back into metadata (RR-019 #1).
+        """
+        kwargs = {
+            "litellm_metadata": {
+                "user_api_key_hash": "hash-from-lm",
+                "model_info": {"id": "deploy-lm"},
+            }
+        }
+        logging_obj.update_from_kwargs(
+            kwargs=kwargs,
+            litellm_params={
+                "metadata": {"user_api_key": "sk-caller-only"},
+                "litellm_call_id": "x",
+            },
+        )
+
+        meta = logging_obj.litellm_params["metadata"]
+        assert meta["user_api_key"] == "sk-caller-only"
+        assert meta["user_api_key_hash"] == "hash-from-lm"
+        assert meta["model_info"]["id"] == "deploy-lm"
+
+    def test_get_router_model_id_from_litellm_metadata(self, logging_obj):
+        logging_obj.litellm_params = {
+            "litellm_metadata": {"model_info": {"id": "router-deploy-1"}},
+            "metadata": {},
+        }
+        assert logging_obj.get_router_model_id() == "router-deploy-1"
+
+    def test_get_router_model_id_falls_back_to_metadata(self, logging_obj):
+        logging_obj.litellm_params = {
+            "metadata": {"model_info": {"id": "router-deploy-meta"}},
+        }
+        assert logging_obj.get_router_model_id() == "router-deploy-meta"
 
     def test_caller_litellm_params_win_over_kwargs(self, logging_obj):
         """Explicit litellm_params from the caller should override auto-extracted values."""
