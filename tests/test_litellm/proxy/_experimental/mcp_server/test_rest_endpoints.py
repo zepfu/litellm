@@ -158,7 +158,6 @@ class TestExecuteWithMcpClient:
 
 
     @pytest.mark.asyncio
-    @pytest.mark.skip(reason="PR #23187 changed has_client_credentials to require explicit oauth2_flow opt-in, but NewMCPServerRequest and _execute_with_mcp_client were not updated - needs fix")
     async def test_m2m_credentials_forwarded_to_server_model(self, monkeypatch):
         """M2M OAuth credentials (client_id, client_secret) from the nested
         ``credentials`` dict must be forwarded to the MCPServer model so that
@@ -210,10 +209,10 @@ class TestExecuteWithMcpClient:
         assert server.client_secret == "my-secret"
         assert server.token_url == "https://auth.example.com/token"
         assert server.scopes == ["read", "write"]
+        assert server.oauth2_flow == "client_credentials"
         assert server.has_client_credentials is True
 
     @pytest.mark.asyncio
-    @pytest.mark.skip(reason="PR #23187 changed has_client_credentials to require explicit oauth2_flow opt-in, but NewMCPServerRequest and _execute_with_mcp_client were not updated - needs fix")
     async def test_m2m_drops_incoming_oauth2_headers(self, monkeypatch):
         """For M2M OAuth servers the incoming Authorization header (which carries
         the litellm API key) must NOT be forwarded as extra_headers — otherwise
@@ -265,6 +264,92 @@ class TestExecuteWithMcpClient:
         # The incoming Authorization must be dropped — extra_headers should
         # contain no oauth2 headers (only static_headers, which are None here).
         assert captured["extra_headers"] is None or "Authorization" not in captured["extra_headers"]
+
+    @pytest.mark.asyncio
+    async def test_oauth2_credentials_without_token_url_do_not_opt_into_m2m(
+        self, monkeypatch
+    ):
+        """client_id/client_secret alone are not M2M — token_url is required.
+
+        Interactive OAuth servers also carry client credentials; without an
+        explicit M2M signal (here: token_url present on the test request) we
+        must leave oauth2_flow unset so has_client_credentials stays False.
+        """
+        captured: dict = {}
+
+        def fake_build_stdio_env(server, raw_headers):
+            return None
+
+        async def fake_create_client(*args, **kwargs):
+            captured["server"] = kwargs.get("server")
+            captured["extra_headers"] = kwargs.get("extra_headers")
+            return object()
+
+        monkeypatch.setattr(
+            rest_endpoints.global_mcp_server_manager,
+            "_build_stdio_env",
+            fake_build_stdio_env,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            rest_endpoints.global_mcp_server_manager,
+            "_create_mcp_client",
+            fake_create_client,
+            raising=False,
+        )
+
+        async def ok_operation(client):
+            return {"status": "ok"}
+
+        payload = NewMCPServerRequest(
+            server_name="interactive-oauth",
+            url="https://example.com",
+            auth_type=MCPAuth.oauth2,
+            # No token_url: credentials alone must not imply M2M.
+            credentials={
+                "client_id": "my-id",
+                "client_secret": "my-secret",
+            },
+        )
+
+        incoming_oauth2 = {"Authorization": "Bearer user-token"}
+        result = await rest_endpoints._execute_with_mcp_client(
+            payload,
+            ok_operation,
+            oauth2_headers=incoming_oauth2,
+        )
+
+        assert result["status"] == "ok"
+        server = captured["server"]
+        assert server.oauth2_flow is None
+        assert server.has_client_credentials is False
+        # Non-M2M path preserves caller oauth2 headers (user token).
+        assert captured["extra_headers"] == incoming_oauth2
+
+    @pytest.mark.asyncio
+    async def test_new_mcp_server_request_has_no_oauth2_flow_contract(self):
+        """REST test/preview body cannot express authorization_code vs M2M.
+
+        Restoring request.oauth2_flow would invent a field that is not on the
+        NewMCPServerRequest contract; callers cannot pass it through normal
+        validation, so the helper must not pretend to honor it.
+        """
+        assert "oauth2_flow" not in NewMCPServerRequest.model_fields
+        payload = NewMCPServerRequest(
+            server_name="example",
+            url="https://example.com",
+            auth_type=MCPAuth.oauth2,
+            token_url="https://auth.example.com/token",
+            credentials={
+                "client_id": "my-id",
+                "client_secret": "my-secret",
+            },
+            # Extra kwargs are ignored by the request model (not a field).
+            oauth2_flow="authorization_code",
+        )
+        assert not hasattr(payload, "oauth2_flow")
+        with pytest.raises(AttributeError):
+            _ = payload.oauth2_flow  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_catches_exception_group(self, monkeypatch):

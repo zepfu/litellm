@@ -885,9 +885,17 @@ if MCP_AVAILABLE:
         """
         Create a temporary MCP client from *request*, run *operation*, and return the result.
 
-        For M2M OAuth servers (those with ``client_id``, ``client_secret``, and
-        ``token_url``), the incoming ``oauth2_headers`` are dropped so that
+        For M2M OAuth servers, the incoming ``oauth2_headers`` are dropped so that
         ``resolve_mcp_auth`` can auto-fetch a token via ``client_credentials``.
+
+        ``NewMCPServerRequest`` (the REST test/preview body type) does not expose
+        an ``oauth2_flow`` field. This helper therefore only ever surfaces
+        ``client_credentials`` or ``None``: when ``client_id``, ``client_secret``,
+        and ``token_url`` are all present it opts the temporary ``MCPServer`` into
+        the M2M path (required because ``MCPServer.has_client_credentials`` is an
+        explicit ``oauth2_flow == "client_credentials"`` check). There is no
+        request-contract path to pass ``authorization_code`` here; interactive
+        OAuth for registered servers is handled outside this preview helper.
 
         Args:
             request: MCP server configuration submitted by the UI.
@@ -903,9 +911,14 @@ if MCP_AVAILABLE:
         try:
             client_id, client_secret, scopes = _extract_credentials(request)
 
-            _oauth2_flow: Optional[
-                Literal["client_credentials", "authorization_code"]
-            ] = (
+            # Contract: NewMCPServerRequest has no oauth2_flow field, so explicit
+            # authorization_code/client_credentials selection is not available on
+            # this endpoint. Infer M2M only when all client-credentials inputs are
+            # present; otherwise leave oauth2_flow unset (interactive/user-token
+            # path). Do not reintroduce a silent request.oauth2_flow read — that
+            # attribute does not exist on the request model and would either crash
+            # or invent caller intent that the REST contract cannot express.
+            _oauth2_flow: Optional[Literal["client_credentials"]] = (
                 "client_credentials"
                 if client_id and client_secret and request.token_url
                 else None
