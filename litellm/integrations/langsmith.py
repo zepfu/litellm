@@ -153,11 +153,26 @@ class LangsmithLogger(CustomBatchLogger):
                     if key in requester_metadata and key not in extra_metadata:
                         extra_metadata[key] = requester_metadata[key]
 
+            # LangSmith Cost column reads outputs.usage_metadata.total_cost.
+            # Forward token/cost fields from StandardLoggingPayload so the UI
+            # can display cost without a separate usage lookup.
+            outputs = payload["response"]
+            if isinstance(outputs, dict):
+                outputs = {**outputs}
+            else:
+                outputs = {"output": outputs}
+            outputs["usage_metadata"] = {
+                "input_tokens": payload.get("prompt_tokens", 0),
+                "output_tokens": payload.get("completion_tokens", 0),
+                "total_tokens": payload.get("total_tokens", 0),
+                "total_cost": payload.get("response_cost", 0),
+            }
+
             data = {
                 "name": run_name,
                 "run_type": "llm",  # this should always be llm, since litellm always logs llm calls. Langsmith allow us to log "chain"
                 "inputs": payload,
-                "outputs": payload["response"],
+                "outputs": outputs,
                 "session_name": project_name,
                 "start_time": payload["startTime"],
                 "end_time": payload["endTime"],

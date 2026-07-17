@@ -191,13 +191,21 @@ class OpenRouterRerankConfig(BaseRerankConfig):
         request_data: dict,
         optional_params: dict,
     ) -> None:
+        """
+        Store a heuristic token estimate on meta, never in billed_units.
+
+        billed_units.total_tokens is treated as provider-authoritative by the
+        cost calculator. Heuristic estimates must not be written there.
+        """
         meta = raw_response_json.setdefault("meta", {})
         if not isinstance(meta, dict):
             return
-        billed_units = meta.setdefault("billed_units", {})
-        if not isinstance(billed_units, dict):
+
+        # Preserve provider-reported billed_units; never overwrite with estimates.
+        billed_units = meta.get("billed_units")
+        if isinstance(billed_units, dict) and billed_units.get("total_tokens"):
             return
-        if billed_units.get("total_tokens"):
+        if meta.get("estimated_total_tokens"):
             return
 
         token_source = request_data if request_data else optional_params
@@ -206,7 +214,7 @@ class OpenRouterRerankConfig(BaseRerankConfig):
             request_data=token_source,
         )
         if estimated_tokens is not None:
-            billed_units["total_tokens"] = estimated_tokens
+            meta["estimated_total_tokens"] = estimated_tokens
 
     def transform_rerank_response(
         self,
@@ -245,8 +253,19 @@ class OpenRouterRerankConfig(BaseRerankConfig):
             request_data=request_data,
             optional_params=optional_params,
         )
+        estimated_total_tokens = None
+        meta_pre = raw_response_json.get("meta")
+        if isinstance(meta_pre, dict):
+            estimated_total_tokens = meta_pre.get("estimated_total_tokens")
 
         response = RerankResponse(**raw_response_json)
+        # RerankResponse may drop non-schema meta keys; re-attach the estimate.
+        if estimated_total_tokens is not None:
+            if not isinstance(response.meta, dict):
+                response.meta = {}
+            else:
+                response.meta = dict(response.meta)
+            response.meta["estimated_total_tokens"] = estimated_total_tokens
         if usage:
             response._hidden_params["openrouter_usage"] = usage
             response._hidden_params["openrouter_provider"] = raw_response_json.get(

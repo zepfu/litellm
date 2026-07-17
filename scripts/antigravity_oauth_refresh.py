@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import time
@@ -17,6 +18,9 @@ from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+
+_STAGED_HOME_DIR_MODE = 0o700
+_STAGED_AUTH_FILE_MODE = 0o600
 
 DEFAULT_ANTIGRAVITY_AUTH_FILE = (
     "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token"
@@ -477,6 +481,62 @@ def _apply_refresh_payload(
     return updated_token_data
 
 
+def _mkdir_private(path: Path, *, mode: int = _STAGED_HOME_DIR_MODE) -> None:
+    """Create a directory with restrictive permissions from the start."""
+    path.mkdir(mode=mode, exist_ok=True)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _write_private_text(path: Path, content: str, *, mode: int = _STAGED_AUTH_FILE_MODE) -> None:
+    """Write ``content`` to ``path`` with mode ``mode`` at creation time."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(path), flags, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _stage_cli_auth_home(staged_home: Path, seed_auth_file: Path) -> Path:
+    """Stage a private HOME tree containing the seed OAuth token file.
+
+    Returns the staged auth-file path. Caller must remove ``staged_home``.
+    """
+    _mkdir_private(staged_home)
+    gemini_dir = staged_home / ".gemini"
+    _mkdir_private(gemini_dir)
+    cli_dir = gemini_dir / "antigravity-cli"
+    _mkdir_private(cli_dir)
+    staged_auth_path = cli_dir / "antigravity-oauth-token"
+    _write_private_text(
+        staged_auth_path,
+        seed_auth_file.read_text(encoding="utf-8"),
+        mode=_STAGED_AUTH_FILE_MODE,
+    )
+    return staged_auth_path
+
+
+def _cleanup_staged_home(staged_home: Optional[Path]) -> None:
+    if staged_home is None:
+        return
+    try:
+        shutil.rmtree(staged_home)
+    except OSError:
+        pass
+
+
 def _refresh_token_data_via_cli(
     auth_path: Path,
     *,
@@ -496,53 +556,46 @@ def _refresh_token_data_via_cli(
 
     staged_home: Optional[Path] = None
     staged_auth_path = cli_auth_path
-    if seed_auth_file is not None and seed_auth_file != auth_path:
-        staged_home = Path(os.getenv("TMPDIR") or "/tmp") / (
-            f"litellm-antigravity-cli-home-{os.getpid()}-{time.monotonic_ns()}"
-        )
-        staged_auth_path = (
-            staged_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-        )
-        staged_auth_path.parent.mkdir(parents=True, exist_ok=True)
-        staged_auth_path.write_text(
-            seed_auth_file.read_text(encoding="utf-8"),
-            encoding="utf-8",
-        )
-        refresh_home = staged_home
-
-    log_path = Path(os.getenv("TMPDIR") or "/tmp") / (
-        f"litellm-antigravity-refresh-{os.getpid()}-{time.monotonic_ns()}.log"
-    )
-    env = dict(os.environ)
-    env["HOME"] = str(refresh_home)
     try:
-        process = subprocess.run(
-            [str(cli_binary), "--log-file", str(log_path), "models"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            timeout=max(timeout_seconds, 1.0),
-            check=False,
+        if seed_auth_file is not None and seed_auth_file != auth_path:
+            staged_home = Path(os.getenv("TMPDIR") or "/tmp") / (
+                f"litellm-antigravity-cli-home-{os.getpid()}-{time.monotonic_ns()}"
+            )
+            staged_auth_path = _stage_cli_auth_home(staged_home, seed_auth_file)
+            refresh_home = staged_home
+
+        log_path = Path(os.getenv("TMPDIR") or "/tmp") / (
+            f"litellm-antigravity-refresh-{os.getpid()}-{time.monotonic_ns()}.log"
         )
-    except subprocess.TimeoutExpired as exc:
-        raise ValueError("AGY CLI silent auth refresh timed out.") from exc
-    except OSError as exc:
-        raise ValueError(
-            f"AGY CLI silent auth refresh failed ({type(exc).__name__})."
-        ) from exc
-    finally:
+        env = dict(os.environ)
+        env["HOME"] = str(refresh_home)
         try:
-            log_path.unlink()
-        except OSError:
-            pass
+            process = subprocess.run(
+                [str(cli_binary), "--log-file", str(log_path), "models"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                timeout=max(timeout_seconds, 1.0),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("AGY CLI silent auth refresh timed out.") from exc
+        except OSError as exc:
+            raise ValueError(
+                f"AGY CLI silent auth refresh failed ({type(exc).__name__})."
+            ) from exc
+        finally:
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
 
-    if process.returncode != 0:
-        raise ValueError(
-            "AGY CLI silent auth refresh failed. Re-authenticate Antigravity CLI "
-            "before using Antigravity passthrough."
-        )
+        if process.returncode != 0:
+            raise ValueError(
+                "AGY CLI silent auth refresh failed. Re-authenticate Antigravity CLI "
+                "before using Antigravity passthrough."
+            )
 
-    try:
         refreshed_token_data = _read_token_data(staged_auth_path)
         if not _token_is_valid(refreshed_token_data, buffer_seconds=60):
             if (
@@ -555,13 +608,9 @@ def _refresh_token_data_via_cli(
             )
         return refreshed_token_data
     finally:
-        if staged_home is not None:
-            try:
-                import shutil
-
-                shutil.rmtree(staged_home)
-            except OSError:
-                pass
+        # Always remove staged credential dirs, including timeout / OSError /
+        # non-zero CLI exit paths that previously left orphan token trees.
+        _cleanup_staged_home(staged_home)
 
 
 def _get_cli_refresh_home(auth_path: Path) -> Optional[Path]:

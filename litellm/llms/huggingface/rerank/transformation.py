@@ -215,9 +215,11 @@ class HuggingFaceRerankConfig(BaseRerankConfig):
                 len(input_text) * 4 if "input_text" in locals() else 0
             )
 
+        # search_units=1 is a fixed unit count for this provider path.
+        # estimated_input_tokens is a heuristic — put it on tokens only, never
+        # on billed_units.total_tokens (cost_calculator treats that as provider truth).
         _billed_units = RerankBilledUnits(
             search_units=1,
-            total_tokens=estimated_input_tokens,
         )
         _tokens = RerankTokens(
             input_tokens=estimated_input_tokens, output_tokens=estimated_output_tokens

@@ -145,7 +145,8 @@ def test_openrouter_rerank_transform_response_estimates_total_tokens() -> None:
     )
 
     assert result.meta is not None
-    billed_units = result.meta["billed_units"]
-    assert billed_units["search_units"] == 1
-    assert billed_units["total_tokens"] is not None
-    assert billed_units["total_tokens"] > 0
+    # Estimates must not appear as provider-authoritative billed_units.
+    billed_units = result.meta.get("billed_units") or {}
+    assert billed_units.get("total_tokens") in (None, 0)
+    assert result.meta.get("estimated_total_tokens") is not None
+    assert result.meta["estimated_total_tokens"] > 0
