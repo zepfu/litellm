@@ -50,6 +50,23 @@ from litellm.types.utils import (
 from litellm.utils import ModelResponse, TextCompletionResponse
 
 
+# Process-lifetime caches for on-disk model price fallback.
+# litellm.model_cost stays a live first-source check; these only avoid re-reading
+# and re-parsing the large JSON price maps (and re-scanning them for known misses).
+_MODEL_PRICE_MAP_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+_MODEL_PRICE_DISK_MISS_CACHE: set[str] = set()
+_MODEL_PRICE_DISK_MISS_CACHE_MAXSIZE = 4096
+
+
+def _reset_model_price_lookup_caches() -> None:
+    """Clear on-disk model-price map and negative-lookup caches.
+
+    Intended for tests so process-lifetime memoization does not leak across cases.
+    """
+    _MODEL_PRICE_MAP_CACHE.clear()
+    _MODEL_PRICE_DISK_MISS_CACHE.clear()
+
+
 class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     """
     OpenAI-specific passthrough logging handler that provides cost tracking for /chat/completions endpoints.
@@ -105,6 +122,53 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
     @staticmethod
+    def _model_price_file_paths() -> tuple[Path, ...]:
+        """Return on-disk model price sources in lookup precedence order."""
+        package_root = Path(getattr(litellm, "__file__", "")).resolve().parent
+        return (
+            package_root / "model_prices_and_context_window.json",
+            package_root / "bundled_model_prices_and_context_window_fallback.json",
+            package_root.parent / "model_prices_and_context_window.json",
+        )
+
+    @staticmethod
+    def _get_cached_model_price_map(price_file: Path) -> Optional[Dict[str, Any]]:
+        """
+        Load and cache a single on-disk model price map for process lifetime.
+
+        Missing, unreadable, or non-dict files are cached as None so later
+        fallbacks do not re-stat/re-read them on every request.
+        """
+        cache_key = str(price_file)
+        if cache_key in _MODEL_PRICE_MAP_CACHE:
+            return _MODEL_PRICE_MAP_CACHE[cache_key]
+
+        price_map: Optional[Dict[str, Any]]
+        if not price_file.is_file():
+            price_map = None
+        else:
+            try:
+                loaded = json.loads(price_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                price_map = None
+            else:
+                price_map = loaded if isinstance(loaded, dict) else None
+
+        _MODEL_PRICE_MAP_CACHE[cache_key] = price_map
+        return price_map
+
+    @staticmethod
+    def _record_model_price_disk_miss(candidates: List[str]) -> None:
+        """Remember candidates confirmed missing from all on-disk price maps."""
+        for candidate in candidates:
+            if candidate in _MODEL_PRICE_DISK_MISS_CACHE:
+                continue
+            if len(_MODEL_PRICE_DISK_MISS_CACHE) >= _MODEL_PRICE_DISK_MISS_CACHE_MAXSIZE:
+                # Drop an arbitrary entry; correctness only requires eventual re-scan.
+                _MODEL_PRICE_DISK_MISS_CACHE.pop()
+            _MODEL_PRICE_DISK_MISS_CACHE.add(candidate)
+
+    @staticmethod
     def _lookup_model_price_info(
         model: str,
         custom_llm_provider: Optional[str],
@@ -121,25 +185,27 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                 if isinstance(model_info, dict):
                     return model_info
 
-        package_root = Path(getattr(litellm, "__file__", "")).resolve().parent
-        price_files = (
-            package_root / "model_prices_and_context_window.json",
-            package_root / "bundled_model_prices_and_context_window_fallback.json",
-            package_root.parent / "model_prices_and_context_window.json",
-        )
-        for price_file in price_files:
-            if not price_file.is_file():
+        # Candidates already confirmed absent from every on-disk map can skip
+        # the disk scan. Runtime litellm.model_cost was already checked above.
+        disk_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate not in _MODEL_PRICE_DISK_MISS_CACHE
+        ]
+        if not disk_candidates:
+            return None
+
+        for price_file in OpenAIPassthroughLoggingHandler._model_price_file_paths():
+            price_map = OpenAIPassthroughLoggingHandler._get_cached_model_price_map(
+                price_file
+            )
+            if price_map is None:
                 continue
-            try:
-                price_map = json.loads(price_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(price_map, dict):
-                continue
-            for candidate in candidates:
+            for candidate in disk_candidates:
                 model_info = price_map.get(candidate)
                 if isinstance(model_info, dict):
                     return model_info
+        OpenAIPassthroughLoggingHandler._record_model_price_disk_miss(disk_candidates)
         return None
 
     @staticmethod

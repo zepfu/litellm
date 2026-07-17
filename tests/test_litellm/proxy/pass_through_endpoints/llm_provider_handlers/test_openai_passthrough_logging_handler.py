@@ -16,6 +16,9 @@ sys.path.insert(
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.openai_passthrough_logging_handler import (
     OpenAIPassthroughLoggingHandler,
+    _MODEL_PRICE_DISK_MISS_CACHE,
+    _MODEL_PRICE_MAP_CACHE,
+    _reset_model_price_lookup_caches,
 )
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
@@ -2089,6 +2092,217 @@ class TestOpenAIPassthroughIntegration:
         assert mock_logging_obj.model_call_details["response_cost"] == 0.020
         assert mock_logging_obj.model_call_details["model"] == "dall-e-2"
         assert mock_logging_obj.model_call_details["custom_llm_provider"] == "openai"
+
+
+class TestModelPriceLookupCache:
+    """RR-055: on-disk model price map and negative lookup caches."""
+
+    def setup_method(self):
+        _reset_model_price_lookup_caches()
+
+    def teardown_method(self):
+        _reset_model_price_lookup_caches()
+
+    def test_lookup_reads_and_parses_each_price_source_once_across_hits(
+        self, tmp_path, monkeypatch
+    ):
+        """Repeated hits must reuse the parsed map, not re-read/re-parse JSON."""
+        package_root = tmp_path / "litellm_pkg"
+        package_root.mkdir()
+        package_file = package_root / "__init__.py"
+        package_file.write_text("# stub litellm package path\n", encoding="utf-8")
+
+        primary = package_root / "model_prices_and_context_window.json"
+        bundled = package_root / "bundled_model_prices_and_context_window_fallback.json"
+        parent = package_root.parent / "model_prices_and_context_window.json"
+        # Put the hit only in the last source so the first lookup must open every
+        # source once, proving map-level memoization across repeated hits.
+        primary.write_text("{}", encoding="utf-8")
+        bundled.write_text("{}", encoding="utf-8")
+        parent.write_text(
+            json.dumps(
+                {
+                    "openrouter/test-model-hit": {
+                        "input_cost_per_token": 0.001,
+                        "output_cost_per_token": 0.002,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(litellm, "__file__", str(package_file))
+        monkeypatch.setattr(litellm, "model_cost", {}, raising=False)
+
+        read_counts = {"count": 0}
+        original_read_text = type(primary).read_text
+
+        def counting_read_text(self, *args, **kwargs):
+            read_counts["count"] += 1
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(primary), "read_text", counting_read_text)
+
+        first = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            "openrouter/test-model-hit",
+            "openrouter",
+        )
+        second = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            "openrouter/test-model-hit",
+            "openrouter",
+        )
+        third = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            "openrouter/test-model-hit",
+            "openrouter",
+        )
+
+        assert first == {
+            "input_cost_per_token": 0.001,
+            "output_cost_per_token": 0.002,
+        }
+        assert second is first
+        assert third is first
+        # One parse/read per source path (primary + bundled + parent), not per request.
+        assert read_counts["count"] == 3
+        assert len(_MODEL_PRICE_MAP_CACHE) == 3
+
+    def test_lookup_caches_negative_disk_misses_without_rereads(
+        self, tmp_path, monkeypatch
+    ):
+        """Known-absent models must skip subsequent on-disk map scans."""
+        package_root = tmp_path / "litellm_pkg"
+        package_root.mkdir()
+        package_file = package_root / "__init__.py"
+        package_file.write_text("# stub litellm package path\n", encoding="utf-8")
+
+        primary = package_root / "model_prices_and_context_window.json"
+        bundled = package_root / "bundled_model_prices_and_context_window_fallback.json"
+        parent = package_root.parent / "model_prices_and_context_window.json"
+        primary.write_text(json.dumps({"other-model": {"input_cost_per_token": 1}}), encoding="utf-8")
+        bundled.write_text("{}", encoding="utf-8")
+        parent.write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(litellm, "__file__", str(package_file))
+        monkeypatch.setattr(litellm, "model_cost", {}, raising=False)
+
+        read_counts = {"count": 0}
+        original_read_text = type(primary).read_text
+
+        def counting_read_text(self, *args, **kwargs):
+            read_counts["count"] += 1
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(primary), "read_text", counting_read_text)
+
+        missing = "totally-unmapped-model-rr055"
+        first = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            missing,
+            "openrouter",
+        )
+        second = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            missing,
+            "openrouter",
+        )
+        third = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            missing,
+            "openrouter",
+        )
+
+        assert first is None
+        assert second is None
+        assert third is None
+        # Initial miss reads each source once; later misses use negative cache.
+        assert read_counts["count"] == 3
+        assert missing in _MODEL_PRICE_DISK_MISS_CACHE
+        assert f"openrouter/{missing}" in _MODEL_PRICE_DISK_MISS_CACHE
+
+    def test_lookup_prefers_runtime_model_cost_over_disk_cache(
+        self, tmp_path, monkeypatch
+    ):
+        """Runtime litellm.model_cost remains the first source and is not cached away."""
+        package_root = tmp_path / "litellm_pkg"
+        package_root.mkdir()
+        package_file = package_root / "__init__.py"
+        package_file.write_text("# stub litellm package path\n", encoding="utf-8")
+
+        primary = package_root / "model_prices_and_context_window.json"
+        primary.write_text(
+            json.dumps(
+                {
+                    "runtime-vs-disk": {
+                        "input_cost_per_token": 0.1,
+                        "output_cost_per_token": 0.2,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (package_root / "bundled_model_prices_and_context_window_fallback.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (package_root.parent / "model_prices_and_context_window.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(litellm, "__file__", str(package_file))
+        monkeypatch.setattr(
+            litellm,
+            "model_cost",
+            {
+                "runtime-vs-disk": {
+                    "input_cost_per_token": 9.0,
+                    "output_cost_per_token": 8.0,
+                }
+            },
+            raising=False,
+        )
+
+        result = OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            "runtime-vs-disk",
+            None,
+        )
+        assert result == {
+            "input_cost_per_token": 9.0,
+            "output_cost_per_token": 8.0,
+        }
+        # Runtime hit must not populate on-disk caches.
+        assert _MODEL_PRICE_MAP_CACHE == {}
+        assert _MODEL_PRICE_DISK_MISS_CACHE == set()
+
+    def test_reset_helper_clears_process_lifetime_caches(self, tmp_path, monkeypatch):
+        package_root = tmp_path / "litellm_pkg"
+        package_root.mkdir()
+        package_file = package_root / "__init__.py"
+        package_file.write_text("# stub litellm package path\n", encoding="utf-8")
+        (package_root / "model_prices_and_context_window.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (package_root / "bundled_model_prices_and_context_window_fallback.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (package_root.parent / "model_prices_and_context_window.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(litellm, "__file__", str(package_file))
+        monkeypatch.setattr(litellm, "model_cost", {}, raising=False)
+
+        OpenAIPassthroughLoggingHandler._lookup_model_price_info(
+            "never-exists-rr055",
+            None,
+        )
+        assert _MODEL_PRICE_MAP_CACHE
+        assert "never-exists-rr055" in _MODEL_PRICE_DISK_MISS_CACHE
+
+        _reset_model_price_lookup_caches()
+        assert _MODEL_PRICE_MAP_CACHE == {}
+        assert _MODEL_PRICE_DISK_MISS_CACHE == set()
+
+
 
 
 if __name__ == "__main__":
