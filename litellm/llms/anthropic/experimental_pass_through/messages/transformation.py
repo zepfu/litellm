@@ -172,12 +172,15 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
     ) -> Tuple[dict, Optional[str]]:
         import os
 
-        # Check for Anthropic OAuth token in Authorization header
+        # Resolve ambient credentials first, then OAuth header rewrite. OAuth
+        # tokens (sk-ant-oat*) from env/config must run through
+        # optionally_handle_anthropic_oauth so Authorization: Bearer is set
+        # before any x-api-key fallback (RR-029).
+        if api_key is None:
+            api_key = os.getenv("ANTHROPIC_API_KEY")
         headers, api_key = optionally_handle_anthropic_oauth(
             headers=headers, api_key=api_key
         )
-        if api_key is None:
-            api_key = os.getenv("ANTHROPIC_API_KEY")
 
         if "x-api-key" not in headers and "authorization" not in headers and api_key:
             headers["x-api-key"] = api_key

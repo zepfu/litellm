@@ -843,17 +843,36 @@ def _git_force_tracking_paths(command: str) -> Tuple[bool, List[str], str]:
 
 
 def _path_has_common_ignored_prefix(path: str, prefixes: Sequence[str]) -> bool:
+    """Return True if path is under any common ignored prefix.
+
+    Matches relative paths and absolute paths on any host (no hardcoded
+    developer home). Absolute forms like ``/home/user/projects/repo/.analysis/x``
+    match prefix ``.analysis/`` via path-segment containment.
+    """
     normalized = path.strip().strip("\"'").replace("\\", "/")
     while normalized.startswith("./"):
         normalized = normalized[2:]
-    if "/home/zepfu/projects/" in normalized:
-        remainder = normalized.split("/home/zepfu/projects/", 1)[1]
-        normalized = remainder.split("/", 1)[1] if "/" in remainder else ""
-    return any(
-        normalized == prefix.rstrip("/") or normalized.startswith(prefix)
-        for prefix in prefixes
-        if prefix
-    )
+    # Drop through a ``projects/<repo>/`` absolute prefix when present so
+    # remaining path is repo-relative for prefix compares.
+    parts = [p for p in normalized.split("/") if p]
+    if "projects" in parts:
+        idx = parts.index("projects")
+        if idx + 2 < len(parts):
+            normalized = "/".join(parts[idx + 2 :])
+        elif idx + 1 < len(parts):
+            normalized = "/".join(parts[idx + 1 :])
+    for prefix in prefixes:
+        if not prefix:
+            continue
+        pref = prefix.rstrip("/")
+        if (
+            normalized == pref
+            or normalized.startswith(pref + "/")
+            or f"/{pref}/" in f"/{normalized}/"
+            or normalized.endswith("/" + pref)
+        ):
+            return True
+    return False
 
 
 def _score_ignored_path_tracking(
