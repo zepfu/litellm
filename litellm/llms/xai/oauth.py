@@ -58,6 +58,26 @@ _XAI_UNSUPPORTED_REASONING_INPUT_REMOVED_TAG = (
 _refresh_locks: Dict[str, asyncio.Lock] = {}
 
 
+def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
+    """Create/write path with restrictive mode at creation time (no umask window)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(path), flags, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+
 def is_oa_xai_model(model: Any) -> bool:
     return isinstance(model, str) and model.startswith(OA_XAI_PROVIDER_PREFIX)
 
@@ -910,8 +930,6 @@ def _write_credential_payload(credential_path: Path, payload: Dict[str, Any]) ->
     tmp_path = credential_path.with_name(
         f".{credential_path.name}.{os.getpid()}.tmp"
     )
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.chmod(0o600)
+    content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    _write_private_file_text(tmp_path, content, mode=0o600)
     os.replace(tmp_path, credential_path)

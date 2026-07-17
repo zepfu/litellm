@@ -59,6 +59,26 @@ class CodexOAuthRefreshSummary:
         }
 
 
+def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
+    """Create/write path with restrictive mode at creation time (no umask window)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(path), flags, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+
 def refresh_codex_oauth_auth_file(
     auth_file: str | Path,
     *,
@@ -428,7 +448,8 @@ def _write_auth_data(auth_path: Path, auth_data: Mapping[str, Any]) -> None:
     tmp_path = auth_path.with_name(f".{auth_path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
         payload = json.dumps(auth_data, indent=2) + "\n"
-        tmp_path.write_text(payload, encoding="utf-8")
+        mode = metadata.mode if not (metadata.mode & 0o077) else 0o600
+        _write_private_file_text(tmp_path, payload, mode=mode)
         _apply_credential_file_metadata(tmp_path, metadata)
         os.replace(tmp_path, auth_path)
     except (OSError, TypeError, ValueError) as exc:

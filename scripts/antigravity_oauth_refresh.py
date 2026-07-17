@@ -808,9 +808,13 @@ def _write_token_data(auth_path: Path, token_data: Mapping[str, Any]) -> None:
         )
     tmp_path = auth_path.with_name(f".{auth_path.name}.{os.getpid()}.tmp")
     try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(token_data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        payload = json.dumps(token_data, indent=2, sort_keys=True) + "\n"
+        write_mode = (
+            metadata.mode
+            if not (metadata.mode & 0o077)
+            else DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE
+        )
+        _write_private_text(tmp_path, payload, mode=write_mode)
         _apply_credential_file_metadata(tmp_path, metadata)
         os.replace(tmp_path, auth_path)
     except Exception:

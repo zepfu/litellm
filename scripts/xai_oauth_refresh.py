@@ -55,6 +55,26 @@ class XaiOAuthRefreshSummary:
         }
 
 
+def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
+    """Create/write path with restrictive mode at creation time (no umask window)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(path), flags, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+
 def refresh_xai_oauth_auth_file(
     auth_file: str | Path,
     *,
@@ -361,12 +381,14 @@ def _write_credential_payload(auth_path: Path, payload: Mapping[str, Any]) -> No
     auth_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = auth_path.with_name(f".{auth_path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
         try:
             current_mode = auth_path.stat().st_mode & 0o777
-            os.chmod(tmp_path, current_mode)
+            if current_mode & 0o077:
+                current_mode = 0o600
         except OSError:
-            tmp_path.chmod(0o600)
+            current_mode = 0o600
+        _write_private_file_text(tmp_path, content, mode=current_mode)
         os.replace(tmp_path, auth_path)
     except (OSError, TypeError, ValueError) as exc:
         try:

@@ -72,6 +72,26 @@ class GrokOidcMetadataRepairSummary:
         }
 
 
+def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
+    """Create/write path with restrictive mode at creation time (no umask window)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(path), flags, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+
 def refresh_grok_oidc_auth_file(
     auth_file: str | Path,
     *,
@@ -516,9 +536,9 @@ def _write_credential_payload(credential_path: Path, payload: Mapping[str, Any])
         f".{credential_path.name}.{os.getpid()}.tmp"
     )
     try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        mode = metadata.mode if not (metadata.mode & 0o077) else 0o600
+        _write_private_file_text(tmp_path, content, mode=mode)
         _apply_credential_file_metadata(tmp_path, metadata)
         os.replace(tmp_path, credential_path)
     except Exception:
