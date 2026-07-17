@@ -27,6 +27,44 @@ Historical rows written before this field existed may be `NULL` unless they were
 explicitly backfilled from prior metadata.
 
 
+## Trace And Session Header Semantics
+
+`x-litellm-trace-id` and `x-litellm-session-id` are distinct request headers and
+must not be treated as interchangeable on the primary proxy request path.
+
+- `x-litellm-session-id` is the stable session/conversation lineage id. It
+  populates `litellm_session_id` / `metadata.session_id` and is what
+  `session_history` grouping and Langfuse `sessionId` correlation use.
+- `x-litellm-trace-id` is the per-request or per-turn trace id. It populates
+  `litellm_trace_id` / `metadata.trace_id` when the caller supplies it.
+- When only `x-litellm-session-id` is present, LiteLLM does **not** copy that
+  value into `litellm_trace_id`. Logging generates a distinct request-scoped
+  trace id so one session can contain multiple traces.
+- When only `x-litellm-trace-id` is present, LiteLLM does **not** copy that
+  value into `litellm_session_id`. Session-history rows that require a session
+  id still need an explicit session header (or equivalent metadata).
+- When both headers are present with different values, both values are
+  preserved exactly; the proxy never collapses them.
+
+This separation is intentional (commit `08cd1ea667` and the local acceptance
+harness `require_trace_ids_distinct_from_session_ids`). First-party AAWM callers
+such as `aawm-tap` send both headers when they have both identities. Operator
+smoke scripts that send only `x-litellm-session-id` still get session grouping;
+they receive an internally generated trace id rather than reusing the session
+id as the Langfuse/standard-logging trace id.
+
+Related helpers:
+
+- `get_trace_id_from_headers()` / `get_session_id_from_headers()` extract each
+  header independently.
+- `get_chain_id_from_headers()` remains as a narrow backwards-compatible OR for
+  call sites that still want a single generic chain id; new paths should not
+  use it to reintroduce interchangeable trace/session semantics.
+
+Consumer docs (`LOCAL_LLM_CONSUMER.md`, `LOCAL_EMBED_RERANK_CONSUMER.md`,
+`OPENROUTER_EMBED_RERANK_CONSUMER.md`) already document both headers as
+distinct fields.
+
 ## Anthropic / Claude Context Window Selection
 
 LiteLLM records **requested** Claude/Anthropic context-window mode in
