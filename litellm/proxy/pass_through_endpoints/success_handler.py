@@ -7,6 +7,11 @@ import httpx
 import litellm
 
 from litellm._logging import verbose_proxy_logger
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.redact_messages import (
+    redact_message_input_output_from_custom_logger,
+    redact_message_input_output_from_logging,
+)
 from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_turn
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
@@ -212,11 +217,36 @@ class PassThroughEndpointLogging:
             dict,
         ] = standard_logging_response_object
 
+        # Match native async_success_handler ordering: global redaction first so
+        # turn_off_message_logging is honored for non-streaming pass-through.
+        model_call_details = getattr(logging_obj, "model_call_details", None)
+        if not isinstance(model_call_details, dict):
+            model_call_details = current_kwargs
+        else:
+            model_call_details.setdefault(
+                "standard_callback_dynamic_params",
+                current_kwargs.get("standard_callback_dynamic_params", {}),
+            )
+        current_result = redact_message_input_output_from_logging(
+            model_call_details=model_call_details,
+            result=current_result,
+        )
+        if model_call_details is not current_kwargs:
+            for _key in ("messages", "prompt", "input"):
+                if _key in model_call_details:
+                    current_kwargs[_key] = model_call_details[_key]
+
         sync_callbacks = logging_obj.get_combined_callback_list(
             dynamic_success_callbacks=logging_obj.dynamic_success_callbacks,
             global_callbacks=litellm.success_callback,
         )
         for callback in sync_callbacks:
+            if isinstance(callback, CustomLogger):
+                current_result = redact_message_input_output_from_custom_logger(
+                    result=current_result,
+                    litellm_logging_obj=logging_obj,
+                    custom_logger=callback,
+                )
             logging_hook = getattr(callback, "logging_hook", None)
             if callable(logging_hook):
                 try:
@@ -254,6 +284,12 @@ class PassThroughEndpointLogging:
             global_callbacks=litellm._async_success_callback,
         )
         for callback in async_callbacks:
+            if isinstance(callback, CustomLogger):
+                current_result = redact_message_input_output_from_custom_logger(
+                    result=current_result,
+                    litellm_logging_obj=logging_obj,
+                    custom_logger=callback,
+                )
             async_logging_hook = getattr(callback, "async_logging_hook", None)
             if callable(async_logging_hook):
                 current_kwargs, current_result = await async_logging_hook(

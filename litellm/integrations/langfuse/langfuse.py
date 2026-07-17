@@ -2643,11 +2643,14 @@ class LangFuseLogger:
                     if self._supports_costs() and cost is not None:
                         cost_details = LangfuseCostDetails(total=float(cost))
 
+            # Primary usage uses Langfuse input/output keys (not prompt_tokens/
+            # completion_tokens). Guard on those so cache-aware primary usage is
+            # not discarded when standard_logging_object also has totals.
             if (
                 usage is None
                 or (
-                    usage.get("prompt_tokens", 0) == 0
-                    and usage.get("completion_tokens", 0) == 0
+                    usage.get("input", 0) == 0
+                    and usage.get("output", 0) == 0
                     and fallback_total_tokens > 0
                 )
             ) and fallback_total_tokens > 0:

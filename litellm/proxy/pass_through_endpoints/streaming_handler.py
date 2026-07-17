@@ -2,6 +2,7 @@ import asyncio
 import codecs
 import json
 import os
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -776,6 +777,23 @@ class PassThroughStreamingHandler:
                 # cannot be retried or completed truthfully. Error intake and
                 # route rollup above carry the terminal failure; do not send
                 # partial chunks through the normal success callback pipeline.
+                #
+                # Still run the standard failure logging pipeline so Langfuse /
+                # session_history / spend callbacks observe the mid-stream
+                # timeout (success handlers must not run on partial streams).
+                try:
+                    await litellm_logging_obj.async_failure_handler(
+                        exception=e,
+                        traceback_exception=traceback.format_exc(),
+                        start_time=start_time,
+                        end_time=datetime.now(),
+                    )
+                except Exception as logging_exc:
+                    verbose_proxy_logger.exception(
+                        "async_failure_handler failed after mid-stream ReadTimeout: %s",
+                        str(logging_exc),
+                        extra=exception_context,
+                    )
                 for terminal_chunk in (
                     PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
                         endpoint_type=endpoint_type,
