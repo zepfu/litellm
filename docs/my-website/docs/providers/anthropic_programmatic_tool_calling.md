@@ -140,6 +140,12 @@ Every tool use block includes a `caller` field indicating how it was invoked:
 
 The `tool_id` references the code execution tool that made the programmatic call.
 
+When Anthropic streams a `bash_code_execution_tool_result` through LiteLLM's
+Responses API, LiteLLM also emits a provider-neutral
+`code_interpreter_call` output item. The item includes the executed command,
+container ID when Anthropic supplies one, completion status, and combined
+stdout/stderr logs.
+
 ## Container Lifecycle
 
 Programmatic tool calling uses code execution containers:
@@ -432,4 +438,3 @@ The following tools cannot currently be called programmatically:
 
 - [Anthropic Tool Search](./anthropic_tool_search.md) - Dynamically discover and load tools on-demand
 - [Anthropic Provider](./anthropic.md) - General Anthropic provider documentation
-
