@@ -1,15 +1,10 @@
-import asyncio
-import json
 import os
 import sys
-from typing import Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
-
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -685,3 +680,282 @@ class TestJWTOAuth2Coexistence:
             # OAuth2 should handle it since JWT auth is disabled
             mock_oauth2.assert_called_once_with(token=jwt_like_token)
             assert result.user_id == "oauth2-user"
+
+
+@pytest.mark.asyncio
+async def test_should_emit_datadog_step_spans_from_user_api_key_auth_builder():
+    """
+    RR-047: _user_api_key_auth_builder should wrap auth-pipeline steps with
+    Datadog tracer.trace spans for per-step latency triage.
+
+    When USE_DDTRACE is off the tracer is a no-op, but the wrappers must still
+    call tracer.trace with the upstream span names so DD APM regains granularity.
+    """
+    from fastapi import Request
+    from starlette.datastructures import URL
+
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.auth.user_api_key_auth import _user_api_key_auth_builder
+    from litellm.proxy.proxy_server import hash_token
+
+    api_key = "sk-test-dd-span-key"
+    hashed_key = hash_token(api_key)
+    valid_token = UserAPIKeyAuth(
+        api_key=api_key,
+        token=hashed_key,
+        user_id="user-dd-1",
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        models=["gpt-3.5-turbo"],
+        team_id=None,
+        spend=0,
+        max_budget=None,
+        expires=None,
+    )
+
+    mock_tracer = MagicMock()
+    mock_span = MagicMock()
+    mock_tracer.trace.return_value.__enter__.return_value = mock_span
+    mock_tracer.trace.return_value.__exit__.return_value = None
+
+    mock_cache = MagicMock()
+    mock_cache.async_get_cache = AsyncMock(return_value=None)
+    mock_cache.set_cache = MagicMock()
+    mock_cache.delete_cache = MagicMock()
+
+    mock_proxy_logging_obj = MagicMock()
+    mock_proxy_logging_obj.internal_usage_cache = MagicMock()
+    mock_proxy_logging_obj.internal_usage_cache.dual_cache = AsyncMock()
+    mock_proxy_logging_obj.internal_usage_cache.dual_cache.async_delete_cache = (
+        AsyncMock()
+    )
+    mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+    mock_proxy_logging_obj.budget_alerts = AsyncMock()
+
+    mock_prisma_client = MagicMock()
+    mock_model_max_budget_limiter = MagicMock()
+    mock_model_max_budget_limiter.is_key_within_model_budget = AsyncMock()
+    mock_model_max_budget_limiter.is_end_user_within_model_budget = AsyncMock()
+
+    import litellm.proxy.proxy_server as _proxy_server_mod
+
+    _attrs_to_set = {
+        "prisma_client": mock_prisma_client,
+        "user_api_key_cache": mock_cache,
+        "proxy_logging_obj": mock_proxy_logging_obj,
+        "master_key": "sk-master-key-not-used",
+        "general_settings": {},
+        "llm_model_list": [],
+        "llm_router": None,
+        "open_telemetry_logger": None,
+        "model_max_budget_limiter": mock_model_max_budget_limiter,
+        "user_custom_auth": None,
+        "jwt_handler": None,
+        "litellm_proxy_admin_name": "admin",
+    }
+    _original_values = {
+        attr: getattr(_proxy_server_mod, attr, None) for attr in _attrs_to_set
+    }
+
+    request = Request(scope={"type": "http"})
+    request._url = URL(url="/chat/completions")
+    request_data = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    # Cache miss, then DB hit so both get_key_object_check_cache and
+    # get_key_object_from_db wrappers execute.
+    async def _get_key_object(**kwargs):
+        if kwargs.get("check_cache_only"):
+            raise Exception("cache miss")
+        return valid_token
+
+    try:
+        for attr, val in _attrs_to_set.items():
+            setattr(_proxy_server_mod, attr, val)
+
+        with patch(
+            "litellm.proxy.auth.user_api_key_auth.tracer", mock_tracer
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.enterprise_custom_auth",
+            None,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.pre_db_read_auth_checks",
+            new_callable=AsyncMock,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.get_key_object",
+            new_callable=AsyncMock,
+            side_effect=_get_key_object,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.get_user_object",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.get_end_user_object",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.get_team_object",
+            new_callable=AsyncMock,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.common_checks",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth._virtual_key_max_budget_check",
+            new_callable=AsyncMock,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth._virtual_key_max_budget_alert_check",
+            new_callable=AsyncMock,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth._virtual_key_soft_budget_check",
+            new_callable=AsyncMock,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth._cache_key_object",
+            new_callable=AsyncMock,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth._return_user_api_key_auth_obj",
+            new_callable=AsyncMock,
+            return_value=valid_token,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.get_secret_bool",
+            return_value=False,
+        ):
+            result = await _user_api_key_auth_builder(
+                request=request,
+                api_key=f"Bearer {api_key}",
+                azure_api_key_header="",
+                anthropic_api_key_header=None,
+                google_ai_studio_api_key_header=None,
+                azure_apim_header=None,
+                request_data=request_data,
+            )
+
+        assert result is not None
+        actual_spans = [call.args[0] for call in mock_tracer.trace.call_args_list]
+
+        # Core virtual-key auth path spans restored for RR-047.
+        expected_present = [
+            "litellm.proxy.auth.pre_db_read_auth_checks",
+            "litellm.proxy.auth.get_key_object_check_cache",
+            "litellm.proxy.auth.get_key_object_from_db",
+            "litellm.proxy.auth.get_user_object",
+            "litellm.proxy.auth.budget_checks",
+            "litellm.proxy.auth.common_checks",
+        ]
+        for span_name in expected_present:
+            assert span_name in actual_spans, (
+                f"Missing Datadog span {span_name!r}; got {actual_spans}"
+            )
+
+        # enterprise_custom_auth / jwt_auth_builder only fire on those branches.
+        assert "litellm.proxy.auth.enterprise_custom_auth" not in actual_spans
+        assert "litellm.proxy.auth.jwt_auth_builder" not in actual_spans
+    finally:
+        for attr, val in _original_values.items():
+            setattr(_proxy_server_mod, attr, val)
+
+
+@pytest.mark.asyncio
+async def test_should_emit_enterprise_custom_auth_datadog_span():
+    """RR-047: enterprise custom auth path emits its Datadog step span."""
+    from fastapi import Request
+    from starlette.datastructures import URL
+
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.auth.user_api_key_auth import _user_api_key_auth_builder
+
+    mock_tracer = MagicMock()
+    mock_span = MagicMock()
+    mock_tracer.trace.return_value.__enter__.return_value = mock_span
+    mock_tracer.trace.return_value.__exit__.return_value = None
+
+    validated = UserAPIKeyAuth(api_key="sk-custom", token="hashed-custom")
+    enterprise_auth = AsyncMock(return_value=validated)
+
+    mock_cache = MagicMock()
+    mock_proxy_logging_obj = MagicMock()
+    mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+
+    import litellm.proxy.proxy_server as _proxy_server_mod
+
+    _attrs_to_set = {
+        "prisma_client": MagicMock(),
+        "user_api_key_cache": mock_cache,
+        "proxy_logging_obj": mock_proxy_logging_obj,
+        "master_key": "sk-master-key",
+        "general_settings": {},
+        "llm_model_list": [],
+        "llm_router": None,
+        "open_telemetry_logger": None,
+        "model_max_budget_limiter": MagicMock(),
+        "user_custom_auth": None,
+        "jwt_handler": None,
+        "litellm_proxy_admin_name": "admin",
+    }
+    _original_values = {
+        attr: getattr(_proxy_server_mod, attr, None) for attr in _attrs_to_set
+    }
+
+    request = Request(scope={"type": "http"})
+    request._url = URL(url="/chat/completions")
+
+    try:
+        for attr, val in _attrs_to_set.items():
+            setattr(_proxy_server_mod, attr, val)
+
+        with patch(
+            "litellm.proxy.auth.user_api_key_auth.tracer", mock_tracer
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.enterprise_custom_auth",
+            enterprise_auth,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth.pre_db_read_auth_checks",
+            new_callable=AsyncMock,
+        ), patch(
+            "litellm.proxy.auth.user_api_key_auth._run_post_custom_auth_checks",
+            new_callable=AsyncMock,
+            return_value=validated,
+        ):
+            result = await _user_api_key_auth_builder(
+                request=request,
+                api_key="Bearer sk-custom",
+                azure_api_key_header="",
+                anthropic_api_key_header=None,
+                google_ai_studio_api_key_header=None,
+                azure_apim_header=None,
+                request_data={},
+            )
+
+        assert result is validated
+        actual_spans = [call.args[0] for call in mock_tracer.trace.call_args_list]
+        assert "litellm.proxy.auth.pre_db_read_auth_checks" in actual_spans
+        assert "litellm.proxy.auth.enterprise_custom_auth" in actual_spans
+    finally:
+        for attr, val in _original_values.items():
+            setattr(_proxy_server_mod, attr, val)
+
+
+def test_should_restore_datadog_step_span_wrappers_in_user_api_key_auth_source():
+    """
+    RR-047 static guard: intended upstream per-step Datadog wrappers remain in
+    _user_api_key_auth_builder source (not just documented as stripped).
+    """
+    from pathlib import Path
+
+    source = Path("litellm/proxy/auth/user_api_key_auth.py").read_text()
+    expected_spans = [
+        'with tracer.trace("litellm.proxy.auth.pre_db_read_auth_checks")',
+        'with tracer.trace("litellm.proxy.auth.enterprise_custom_auth")',
+        'with tracer.trace("litellm.proxy.auth.jwt_auth_builder")',
+        'with tracer.trace("litellm.proxy.auth.get_end_user_object")',
+        'with tracer.trace("litellm.proxy.auth.get_key_object_check_cache")',
+        'with tracer.trace("litellm.proxy.auth.get_key_object_from_db")',
+        'with tracer.trace("litellm.proxy.auth.get_user_object")',
+        'with tracer.trace("litellm.proxy.auth.budget_checks")',
+        'with tracer.trace("litellm.proxy.auth.get_team_object")',
+        'with tracer.trace("litellm.proxy.auth.get_global_proxy_spend")',
+        'with tracer.trace("litellm.proxy.auth.common_checks")',
+    ]
+    for span in expected_spans:
+        assert span in source, f"Missing Datadog wrapper in source: {span}"
