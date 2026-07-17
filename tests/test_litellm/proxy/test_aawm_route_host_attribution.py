@@ -1,3 +1,4 @@
+import socket
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -63,7 +64,10 @@ def test_resolve_aawm_route_host_attribution_loopback_resolves_local_magicdns(
         Mock(return_value="seshat"),
     )
 
-    attribution = resolve_aawm_route_host_attribution(request)
+    attribution = resolve_aawm_route_host_attribution(
+        request,
+        allow_blocking_lookup=True,
+    )
     assert attribution["client_ip"] == "127.0.0.1"
     assert attribution["host_name"] == "seshat"
     assert attribution["host_name_source"] == "magicdns_local"
@@ -95,7 +99,10 @@ def test_resolve_aawm_route_host_attribution_docker_gateway_resolves_local_magic
         Mock(return_value="thoth"),
     )
 
-    attribution = resolve_aawm_route_host_attribution(request)
+    attribution = resolve_aawm_route_host_attribution(
+        request,
+        allow_blocking_lookup=True,
+    )
     assert attribution["client_ip"] == "172.19.0.1"
     assert attribution["host_name"] == "thoth"
     assert attribution["host_name_source"] == "magicdns_local"
@@ -111,15 +118,18 @@ def test_resolve_aawm_route_host_attribution_keeps_lan_ip_fallback(monkeypatch):
         "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
         lambda request, general_settings=None: "192.168.1.42",
     )
+    gethostbyaddr = Mock(side_effect=OSError("no reverse dns"))
     monkeypatch.setattr(
         "litellm.proxy.aawm_route_logging.socket.gethostbyaddr",
-        Mock(side_effect=OSError("no reverse dns")),
+        gethostbyaddr,
     )
 
+    # Default sync API is non-blocking: reverse DNS is not required to return.
     attribution = resolve_aawm_route_host_attribution(request)
     assert attribution["client_ip"] == "192.168.1.42"
     assert attribution["host_name"] == "192.168.1.42"
     assert attribution["host_name_source"] == "ip_literal"
+    gethostbyaddr.assert_not_called()
 
 
 def test_resolve_aawm_route_host_attribution_reverse_dns_fallback(monkeypatch):
@@ -137,13 +147,19 @@ def test_resolve_aawm_route_host_attribution_reverse_dns_fallback(monkeypatch):
         lambda ip: ("thoth.tailnet.ts.net", [], ["100.99.1.5"]),
     )
 
-    attribution = resolve_aawm_route_host_attribution(request)
+    attribution = resolve_aawm_route_host_attribution(
+        request,
+        allow_blocking_lookup=True,
+    )
     assert attribution["client_ip"] == "100.99.1.5"
     assert attribution["host_name"] == "thoth"
     assert attribution["host_name_source"] in {"reverse_dns", "reverse_dns_cache"}
 
 
 def test_attach_aawm_route_rollup_context_copies_host_metadata(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
     request = Mock(spec=Request)
     request.method = "POST"
     request.url = "http://127.0.0.1:4001/openai_passthrough/responses"
@@ -170,6 +186,12 @@ def test_attach_aawm_route_rollup_context_copies_host_metadata(monkeypatch):
         "litellm.proxy.aawm_route_logging.socket.gethostbyaddr",
         lambda ip: ("thoth.tailnet.ts.net", [], ["100.99.1.5"]),
     )
+    # Pre-warm host cache with a blocking lookup so rollup can use the
+    # non-blocking sync path without waiting on background enrichment.
+    route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.1.5",
+        allow_blocking_lookup=True,
+    )
 
     context = attach_aawm_route_rollup_context(
         request=request,
@@ -185,7 +207,7 @@ def test_attach_aawm_route_rollup_context_copies_host_metadata(monkeypatch):
     )
     assert metadata["client_ip"] == "100.99.1.5"
     assert metadata["host_name"] == "thoth"
-    assert metadata["host_name_source"] == "reverse_dns"
+    assert metadata["host_name_source"] in {"reverse_dns", "reverse_dns_cache"}
     assert metadata["aawm_route_rollup_context"]["host_name"] == "thoth"
 
 
@@ -825,3 +847,212 @@ def test_resolve_local_display_host_falls_back_when_tailscale_self_snapshot_inva
     )
     assert host_name == "seshat"
     assert source == "magicdns_local"
+
+
+def test_resolve_host_name_never_mutates_socket_default_timeout(monkeypatch):
+    """B1 / RR-041 / RR-049: no process-global socket.setdefaulttimeout mutation."""
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    original_default = socket.getdefaulttimeout()
+    setdefault_calls: list = []
+
+    real_setdefault = socket.setdefaulttimeout
+
+    def tracking_setdefault(value):
+        setdefault_calls.append(value)
+        return real_setdefault(value)
+
+    monkeypatch.setattr(route_logging.socket, "setdefaulttimeout", tracking_setdefault)
+    monkeypatch.setattr(socket, "setdefaulttimeout", tracking_setdefault)
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        lambda ip: ("thoth.tailnet.ts.net", [], [ip]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value=None),
+    )
+
+    host_name, source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.1.5",
+        monotonic_now=6000.0,
+        allow_blocking_lookup=True,
+    )
+    assert host_name == "thoth"
+    assert source == "reverse_dns"
+    assert setdefault_calls == []
+    assert socket.getdefaulttimeout() == original_default
+
+    # Local discovery path also must not mutate the global default.
+    monkeypatch.setattr(
+        route_logging,
+        "_local_tailscale_hostname_lookup_names",
+        Mock(return_value=["desktop-qjhrj1m.tailf1878c.ts.net"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_getaddrinfo_with_timeout",
+        Mock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_ipv4_via_magicdns",
+        Mock(return_value=[]),
+    )
+    route_logging._discover_hostname_tailscale_ipv4_candidates()
+    assert setdefault_calls == []
+    assert socket.getdefaulttimeout() == original_default
+
+
+def test_resolve_host_attribution_default_returns_ip_without_reverse_dns(monkeypatch):
+    """B1: sync hot-path returns IP attribution immediately without reverse DNS."""
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    request = Mock(spec=Request)
+    request.headers = {}
+    request.client = SimpleNamespace(host="100.99.1.5", port=12345)
+    request.scope = {"client": ("100.99.1.5", 12345)}
+
+    monkeypatch.setattr(
+        "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
+        lambda request, general_settings=None: "100.99.1.5",
+    )
+    gethostbyaddr = Mock(
+        side_effect=AssertionError("gethostbyaddr must not run on default path")
+    )
+    monkeypatch.setattr(route_logging.socket, "gethostbyaddr", gethostbyaddr)
+    magic = Mock(
+        side_effect=AssertionError("magicdns must not run on default path")
+    )
+    monkeypatch.setattr(route_logging, "_resolve_hostname_via_magicdns", magic)
+    # Suppress background enrichment so it cannot call DNS during the test.
+    monkeypatch.setattr(
+        route_logging,
+        "_schedule_aawm_route_host_name_enrichment",
+        Mock(),
+    )
+
+    attribution = resolve_aawm_route_host_attribution(request)
+    assert attribution["client_ip"] == "100.99.1.5"
+    assert attribution["host_name"] == "100.99.1.5"
+    assert attribution["host_name_source"] == "ip_literal"
+    gethostbyaddr.assert_not_called()
+    magic.assert_not_called()
+
+
+def test_resolve_host_name_fast_path_schedules_background_enrichment(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    scheduled: list = []
+
+    def capture_schedule(client_ip, *, local_source=None):
+        scheduled.append((client_ip, local_source))
+
+    monkeypatch.setattr(
+        route_logging,
+        "_schedule_aawm_route_host_name_enrichment",
+        capture_schedule,
+    )
+    gethostbyaddr = Mock(
+        side_effect=AssertionError("blocking reverse dns not allowed on fast path")
+    )
+    monkeypatch.setattr(route_logging.socket, "gethostbyaddr", gethostbyaddr)
+
+    host_name, source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.166.16",
+        monotonic_now=7000.0,
+        allow_blocking_lookup=False,
+    )
+    assert host_name == "100.99.166.16"
+    assert source == "ip_literal"
+    assert scheduled == [("100.99.166.16", None)]
+    gethostbyaddr.assert_not_called()
+    # Provisional IP must not be cached so enrichment can still resolve later.
+    assert "100.99.166.16" not in route_logging._aawm_route_host_reverse_dns_cache
+
+
+def test_aresolve_host_attribution_offloads_blocking_lookup(monkeypatch):
+    import asyncio
+
+    from litellm.proxy import aawm_route_logging as route_logging
+    from litellm.proxy.aawm_route_logging import aresolve_aawm_route_host_attribution
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    request = Mock(spec=Request)
+    request.headers = {}
+    request.client = SimpleNamespace(host="100.99.1.5", port=12345)
+    request.scope = {"client": ("100.99.1.5", 12345)}
+
+    monkeypatch.setattr(
+        "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
+        lambda request, general_settings=None: "100.99.1.5",
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        lambda ip: ("thoth.tailnet.ts.net", [], [ip]),
+    )
+
+    to_thread_calls: list = []
+    real_to_thread = asyncio.to_thread
+
+    async def tracking_to_thread(fn, *args, **kwargs):
+        to_thread_calls.append((fn, args, kwargs))
+        return await real_to_thread(fn, *args, **kwargs)
+
+    monkeypatch.setattr(route_logging.asyncio, "to_thread", tracking_to_thread)
+
+    attribution = asyncio.run(
+        aresolve_aawm_route_host_attribution(
+            request,
+            allow_blocking_lookup=True,
+        )
+    )
+    assert attribution["host_name"] == "thoth"
+    assert attribution["host_name_source"] == "reverse_dns"
+    assert len(to_thread_calls) == 1
+    assert to_thread_calls[0][0] is route_logging.resolve_aawm_route_host_attribution
+    assert to_thread_calls[0][2].get("allow_blocking_lookup") is True
+
+
+def test_aresolve_host_attribution_fast_path_skips_to_thread(monkeypatch):
+    import asyncio
+
+    from litellm.proxy import aawm_route_logging as route_logging
+    from litellm.proxy.aawm_route_logging import aresolve_aawm_route_host_attribution
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    request = Mock(spec=Request)
+    request.headers = {}
+    request.client = SimpleNamespace(host="192.168.1.42", port=54321)
+    request.scope = {"client": ("192.168.1.42", 54321)}
+
+    monkeypatch.setattr(
+        "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
+        lambda request, general_settings=None: "192.168.1.42",
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_schedule_aawm_route_host_name_enrichment",
+        Mock(),
+    )
+
+    async def fail_to_thread(*args, **kwargs):
+        raise AssertionError("to_thread must not be used on non-blocking path")
+
+    monkeypatch.setattr(route_logging.asyncio, "to_thread", fail_to_thread)
+
+    attribution = asyncio.run(
+        aresolve_aawm_route_host_attribution(
+            request,
+            allow_blocking_lookup=False,
+        )
+    )
+    assert attribution["host_name"] == "192.168.1.42"
+    assert attribution["host_name_source"] == "ip_literal"
+

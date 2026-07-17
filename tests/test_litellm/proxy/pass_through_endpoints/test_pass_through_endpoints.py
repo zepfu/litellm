@@ -50,7 +50,9 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _enrich_passthrough_error_log_context_for_request_shape_422,
     _sanitize_passthrough_request_shape_error_preview,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
+    _get_passthrough_hidden_retry_budget_seconds,
     _headers_for_json_passthrough_egress,
+    _is_aawm_agent_identity_registered_in_litellm_callbacks,
     _is_known_grok_billing_passthrough_timeout_cancel_response,
     _is_known_grok_personal_team_spending_limit_response,
     _get_passthrough_grok_personal_team_spending_limit_failure_kind,
@@ -3493,6 +3495,11 @@ async def test_pass_through_request_adds_xai_context_on_failure_logging():
         "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
         new=post_failure_mock,
     ), patch(
+        # Force the fallback direct-capture path so we still assert xAI context
+        # enrichment on the shared request payload (B7 skips when registered).
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._is_aawm_agent_identity_registered_in_litellm_callbacks",
+        return_value=False,
+    ), patch(
         "litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance.async_post_call_failure_hook",
         new=direct_capture_mock,
     ), patch(
@@ -3585,13 +3592,19 @@ async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallba
                     async_post_call_failure_hook=direct_capture_mock,
                 )
             )
-        raise AssertionError(f"unexpected module import {module_name}")
+        # Allow incidental imports from nested patch target resolution.
+        return importlib.import_module(module_name)
 
     request_payload = {"model": "grok-build", "custom_llm_provider": "xai"}
     user_api_key_dict = MagicMock()
     original_exception = HTTPException(status_code=401, detail="xai auth failed")
 
+    # Patch registration check first so nested patch() can resolve targets
+    # without hitting the fake import_module side effect.
     with patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._is_aawm_agent_identity_registered_in_litellm_callbacks",
+        return_value=False,
+    ), patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.importlib.import_module",
         side_effect=fake_import_module,
     ):
@@ -3610,6 +3623,92 @@ async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallba
         request_data=request_payload,
         traceback_str="traceback",
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_capture_xai_passthrough_failure_skips_when_agent_identity_in_callbacks():
+    """B7 / RR-056 #2: do not double-invoke agent identity when already registered."""
+    import litellm
+
+    direct_capture_mock = AsyncMock()
+
+    class FakeAawmAgentIdentity:
+        async def async_post_call_failure_hook(self, *args, **kwargs):
+            return await direct_capture_mock(*args, **kwargs)
+
+    FakeAawmAgentIdentity.__module__ = "litellm.integrations.aawm_agent_identity"
+    FakeAawmAgentIdentity.__name__ = "AawmAgentIdentity"
+    agent_identity_callback = FakeAawmAgentIdentity()
+
+    import_mock = MagicMock(
+        side_effect=AssertionError(
+            "direct capture must not import agent identity when already registered"
+        )
+    )
+    request_payload = {"model": "grok-build", "custom_llm_provider": "xai"}
+    original_exception = HTTPException(status_code=401, detail="xai auth failed")
+    original_callbacks = list(getattr(litellm, "callbacks", []) or [])
+    original_failure_callbacks = list(getattr(litellm, "failure_callback", []) or [])
+
+    try:
+        litellm.callbacks = [agent_identity_callback]
+        litellm.failure_callback = []
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.importlib.import_module",
+            new=import_mock,
+        ):
+            assert _is_aawm_agent_identity_registered_in_litellm_callbacks() is True
+            await _direct_capture_xai_passthrough_failure(
+                request_payload=request_payload,
+                original_exception=original_exception,
+                user_api_key_dict=MagicMock(),
+                traceback_str="traceback",
+                url=httpx.URL("https://cli-chat-proxy.grok.com/v1/responses"),
+                custom_llm_provider="xai",
+            )
+    finally:
+        litellm.callbacks = original_callbacks
+        litellm.failure_callback = original_failure_callbacks
+
+    direct_capture_mock.assert_not_awaited()
+    import_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_direct_capture_xai_passthrough_failure_skips_string_callback_registration():
+    """String callback entries (config form) also suppress the direct xAI path."""
+    import litellm
+
+    import_mock = MagicMock(
+        side_effect=AssertionError(
+            "should not import agent identity when string callback registered"
+        )
+    )
+    original_callbacks = list(getattr(litellm, "callbacks", []) or [])
+    original_failure_callbacks = list(getattr(litellm, "failure_callback", []) or [])
+
+    try:
+        litellm.callbacks = [
+            "litellm.integrations.aawm_agent_identity.aawm_agent_identity_instance",
+        ]
+        litellm.failure_callback = []
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.importlib.import_module",
+            new=import_mock,
+        ):
+            await _direct_capture_xai_passthrough_failure(
+                request_payload={"model": "grok-build", "custom_llm_provider": "xai"},
+                original_exception=HTTPException(status_code=500, detail="boom"),
+                user_api_key_dict=MagicMock(),
+                traceback_str=None,
+                url=httpx.URL("https://cli-chat-proxy.grok.com/v1/responses"),
+                custom_llm_provider="xai",
+            )
+    finally:
+        litellm.callbacks = original_callbacks
+        litellm.failure_callback = original_failure_callbacks
+
+    import_mock.assert_not_called()
 
 
 class TestGrokPersonalTeamSpendingLimitLogging:
@@ -6171,7 +6270,11 @@ class TestPassThroughHiddenRetry:
         assert handler.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_hidden_retry_exhausts_timeout_failures_with_metadata(self):
+    async def test_hidden_retry_exhausts_timeout_failures_with_metadata(
+        self, monkeypatch
+    ):
+        # Disable wall-clock bound so this case exercises the attempt-count ceiling.
+        monkeypatch.setenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", "0")
         kwargs: dict = {}
         target_url = "https://api.anthropic.com/v1/messages"
         operation = AsyncMock(
@@ -6207,6 +6310,102 @@ class TestPassThroughHiddenRetry:
             "upstream_connectivity_failure"
         )
         assert metadata["aawm_passthrough_hidden_retry_count"] == 6
+
+    def test_hidden_retry_budget_defaults_to_backoff_sum(self, monkeypatch):
+        monkeypatch.delenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", raising=False)
+        assert _get_passthrough_hidden_retry_budget_seconds() == 230.0
+
+    def test_hidden_retry_budget_env_override(self, monkeypatch):
+        monkeypatch.setenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", "12.5")
+        assert _get_passthrough_hidden_retry_budget_seconds() == 12.5
+        monkeypatch.setenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", "0")
+        assert _get_passthrough_hidden_retry_budget_seconds() == 0.0
+
+    @pytest.mark.asyncio
+    async def test_hidden_retry_stops_when_wall_clock_budget_exceeded(
+        self, monkeypatch
+    ):
+        """B2 / RR-056 #1: wall-clock ceiling stops retries before attempt budget."""
+        # First backoff is 5s; with a 4s budget the next wait alone exceeds the ceiling.
+        monkeypatch.setenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", "4")
+        kwargs: dict = {}
+        target_url = "https://api.anthropic.com/v1/messages"
+        operation = AsyncMock(
+            side_effect=httpx.ReadTimeout(
+                "read timed out",
+                request=httpx.Request("POST", target_url),
+            )
+        )
+        sleep_mock = AsyncMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=sleep_mock,
+        ):
+            with pytest.raises(httpx.ReadTimeout):
+                await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                    kwargs=kwargs,
+                    operation_name="test_operation",
+                    operation=operation,
+                    caller_managed_hidden_retry=False,
+                )
+
+        # Only the first attempt runs; no sleep, no further attempts.
+        assert operation.await_count == 1
+        sleep_mock.assert_not_awaited()
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "failed_without_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_budget_exhausted"] is True
+        assert metadata["aawm_passthrough_hidden_retry_budget_seconds"] == 4.0
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 1
+        assert metadata["aawm_passthrough_hidden_retry_failure_classification"] == (
+            "upstream_connectivity_failure"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hidden_retry_stops_mid_loop_when_elapsed_exceeds_budget(
+        self, monkeypatch
+    ):
+        """Elapsed wall clock (attempt runtime) can exhaust the budget mid-loop."""
+        monkeypatch.setenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", "20")
+        kwargs: dict = {}
+        target_url = "https://api.anthropic.com/v1/messages"
+        operation = AsyncMock(
+            side_effect=httpx.ConnectError(
+                "connection refused",
+                request=httpx.Request("POST", target_url),
+            )
+        )
+        sleep_mock = AsyncMock()
+        # Attempt 1: elapsed 0 → wait 5 allowed → sleep.
+        # Attempt 2: elapsed 18 → wait 15 would exceed 20 → stop.
+        monotonic_values = iter([100.0, 100.0, 118.0, 118.0])
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=sleep_mock,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.time.monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            with pytest.raises(httpx.ConnectError):
+                await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                    kwargs=kwargs,
+                    operation_name="test_operation",
+                    operation=operation,
+                    caller_managed_hidden_retry=False,
+                )
+
+        assert operation.await_count == 2
+        sleep_mock.assert_awaited_once_with(5.0)
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "failed_after_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_budget_exhausted"] is True
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 2
 
     @pytest.mark.asyncio
     async def test_pass_through_request_does_not_retry_429(self):

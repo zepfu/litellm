@@ -100,6 +100,20 @@ PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (
     120,
 )
 PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504, 529})
+# Wall-clock ceiling for shared pre-first-byte hidden retries (RR-056 / B2).
+# Bounds total elapsed time across attempts + backoff, independent of per-attempt
+# HTTP timeouts (which can be many minutes each and otherwise amplify outages).
+# Override via AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS.
+# Set to 0 to disable the wall-clock bound (attempt-count limit still applies).
+# Default equals the sum of the fixed backoff schedule so fast failures can still
+# exercise the full attempt budget, while slow timed-out attempts abort early.
+DEFAULT_PASSTHROUGH_PRE_FIRST_BYTE_HIDDEN_RETRY_BUDGET_SECONDS = float(
+    sum(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS)
+)
+_AAWM_AGENT_IDENTITY_CALLBACK_MARKERS = (
+    "aawm_agent_identity",
+    "aawm_litellm_callbacks.agent_identity",
+)
 _ANTHROPIC_INVALID_AUTHENTICATION_MARKER = "invalid authentication credentials"
 _ANTHROPIC_MODEL_NOT_FOUND_PREFIX = "model:"
 _ANTHROPIC_CONTEXT_OVERFLOW_MARKERS = (
@@ -1366,6 +1380,56 @@ def _enrich_passthrough_failure_request_payload(
             request_payload["model"] = model_override
 
 
+def _iter_litellm_failure_surface_callbacks() -> List[Any]:
+    """Return callbacks that receive async_post_call_failure_hook."""
+    callbacks: List[Any] = []
+    for attr_name in ("callbacks", "failure_callback"):
+        value = getattr(litellm, attr_name, None)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            callbacks.extend(value)
+        else:
+            callbacks.append(value)
+    return callbacks
+
+
+def _is_aawm_agent_identity_callback_entry(callback: Any) -> bool:
+    """True when a litellm callback entry is the AAWM agent-identity hook."""
+    if callback is None:
+        return False
+
+    if isinstance(callback, str):
+        normalized = callback.strip().lower()
+        return any(marker in normalized for marker in _AAWM_AGENT_IDENTITY_CALLBACK_MARKERS)
+
+    module_name = str(getattr(type(callback), "__module__", "") or "").lower()
+    class_name = str(getattr(type(callback), "__name__", "") or "")
+    if any(marker in module_name for marker in _AAWM_AGENT_IDENTITY_CALLBACK_MARKERS):
+        return True
+    if class_name == "AawmAgentIdentity":
+        return True
+
+    # Match the documented module-level singleton even if it was wrapped/proxied.
+    instance_module = str(getattr(callback, "__module__", "") or "").lower()
+    instance_name = str(getattr(callback, "__name__", "") or "").lower()
+    if "aawm_agent_identity" in instance_module or instance_name == "aawm_agent_identity_instance":
+        return True
+    return False
+
+
+def _is_aawm_agent_identity_registered_in_litellm_callbacks() -> bool:
+    """
+    Return True when generic post_call_failure_hook will already invoke
+    AawmAgentIdentity.async_post_call_failure_hook via litellm.callbacks /
+    litellm.failure_callback (RR-056 / B7).
+    """
+    return any(
+        _is_aawm_agent_identity_callback_entry(callback)
+        for callback in _iter_litellm_failure_surface_callbacks()
+    )
+
+
 async def _direct_capture_xai_passthrough_failure(
     *,
     request_payload: dict,
@@ -1379,6 +1443,12 @@ async def _direct_capture_xai_passthrough_failure(
         url=url,
         custom_llm_provider=custom_llm_provider,
     ):
+        return
+
+    # Avoid double session_history / failure bookkeeping when agent identity is
+    # already registered on the generic failure-callback surface. Keep the
+    # direct path only as a fallback for deployments that forgot to register it.
+    if _is_aawm_agent_identity_registered_in_litellm_callbacks():
         return
 
     try:
@@ -1553,6 +1623,24 @@ def _get_passthrough_hidden_retry_wait_seconds(attempt_index: int) -> float:
     if attempt_index < len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS):
         return float(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS[attempt_index])
     return float(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS[-1])
+
+
+def _get_passthrough_hidden_retry_budget_seconds() -> float:
+    """
+    Wall-clock budget for shared pre-first-byte hidden retries.
+
+    Independent of per-attempt HTTP timeouts. When the budget is exceeded the
+    retry loop stops even if attempt-count budget remains. Env:
+    AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS (0 disables the wall-clock bound).
+    """
+    raw_value = os.getenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS")
+    if raw_value is None or not str(raw_value).strip():
+        return DEFAULT_PASSTHROUGH_PRE_FIRST_BYTE_HIDDEN_RETRY_BUDGET_SECONDS
+    try:
+        parsed = float(str(raw_value).strip())
+    except Exception:
+        return DEFAULT_PASSTHROUGH_PRE_FIRST_BYTE_HIDDEN_RETRY_BUDGET_SECONDS
+    return max(0.0, parsed)
 
 
 def _classify_passthrough_hidden_retry_failure(
@@ -1808,6 +1896,9 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
         return await operation()
 
     max_attempts = len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS) + 1
+    # Wall-clock deadline independent of per-attempt HTTP timeout (RR-056 / B2).
+    budget_seconds = _get_passthrough_hidden_retry_budget_seconds()
+    start_monotonic = time.monotonic()
     attempt_number = 0
     while True:
         attempt_number += 1
@@ -1855,6 +1946,53 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
             wait_seconds = _get_passthrough_hidden_retry_wait_seconds(
                 attempt_number - 1
             )
+            elapsed_seconds = time.monotonic() - start_monotonic
+            # Stop when wall-clock budget is already exhausted, or when the next
+            # fixed backoff alone would push total elapsed past the ceiling.
+            # budget_seconds <= 0 disables this bound (attempt-count still applies).
+            budget_exhausted = bool(
+                budget_seconds > 0
+                and (
+                    elapsed_seconds >= budget_seconds
+                    or (elapsed_seconds + wait_seconds) > budget_seconds
+                )
+            )
+            if budget_exhausted:
+                _record_passthrough_hidden_retry_metadata(
+                    kwargs,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    status_code=status_code,
+                    failure_class=failure_class,
+                    wait_seconds=0.0,
+                    final_outcome=(
+                        "failed_after_retry"
+                        if attempt_number > 1
+                        else "failed_without_retry"
+                    ),
+                    failure_classification=failure_classification,
+                )
+                if isinstance(kwargs, dict):
+                    metadata = _ensure_passthrough_metadata(kwargs)
+                    metadata["aawm_passthrough_hidden_retry_budget_seconds"] = (
+                        budget_seconds
+                    )
+                    metadata["aawm_passthrough_hidden_retry_budget_exhausted"] = True
+                    metadata["aawm_passthrough_hidden_retry_elapsed_seconds"] = round(
+                        elapsed_seconds, 3
+                    )
+                verbose_proxy_logger.info(
+                    "Pass-through %s stopping hidden retries after attempt %s/%s: "
+                    "wall-clock budget %.1fs exceeded (elapsed %.1fs, next_wait %.1fs)",
+                    operation_name,
+                    attempt_number,
+                    max_attempts,
+                    budget_seconds,
+                    elapsed_seconds,
+                    wait_seconds,
+                )
+                raise
+
             _record_passthrough_hidden_retry_metadata(
                 kwargs,
                 attempt_number=attempt_number,

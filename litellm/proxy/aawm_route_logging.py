@@ -1,4 +1,6 @@
 import atexit
+import asyncio
+import concurrent.futures
 import ipaddress
 import json
 import logging
@@ -221,6 +223,162 @@ _AAWM_ROUTE_HOST_LOCAL_FALLBACK_SOURCES = {
 }
 _aawm_route_host_reverse_dns_cache_lock = threading.Lock()
 _aawm_route_host_reverse_dns_cache: dict[str, tuple[str, str, float]] = {}
+
+# Dedicated pools so hot-path callers never block the event loop on reverse DNS /
+# MagicDNS, and so timeout wrappers never deadlock with enrichment workers.
+_aawm_route_host_dns_lookup_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="aawm-host-dns-lookup",
+)
+_aawm_route_host_enrichment_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="aawm-host-dns-enrich",
+)
+_aawm_route_host_enrichment_lock = threading.Lock()
+_aawm_route_host_enrichment_inflight: set[str] = set()
+_aawm_route_host_enrichment_local_key = "__aawm_local_display_host_enrich__"
+
+
+def _close_aawm_route_host_dns_executors() -> None:
+    for executor in (
+        _aawm_route_host_dns_lookup_executor,
+        _aawm_route_host_enrichment_executor,
+    ):
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # Python <3.9 has no cancel_futures
+            try:
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+atexit.register(_close_aawm_route_host_dns_executors)
+
+
+def _run_socket_call_with_timeout(
+    fn: Callable[..., Any],
+    timeout_seconds: float,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run a blocking socket/NSS helper with a per-call timeout.
+
+    Never mutates process-global ``socket.setdefaulttimeout``.
+    """
+    future = _aawm_route_host_dns_lookup_executor.submit(fn, *args, **kwargs)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError(
+            f"socket call timed out after {timeout_seconds}s"
+        ) from exc
+
+
+def _gethostbyaddr_with_timeout(
+    client_ip: str,
+    *,
+    timeout_seconds: float = _AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS,
+) -> Optional[str]:
+    try:
+        hostname, _, _ = _run_socket_call_with_timeout(
+            socket.gethostbyaddr,
+            timeout_seconds,
+            client_ip,
+        )
+    except Exception:
+        return None
+    return hostname
+
+
+def _getaddrinfo_with_timeout(
+    name: str,
+    *,
+    timeout_seconds: float = _AAWM_ROUTE_HOST_LOCAL_DISCOVERY_TIMEOUT_SECONDS,
+) -> list[Any]:
+    try:
+        return list(
+            _run_socket_call_with_timeout(
+                socket.getaddrinfo,
+                timeout_seconds,
+                name,
+                None,
+                socket.AF_INET,
+                socket.SOCK_DGRAM,
+            )
+        )
+    except Exception:
+        return []
+
+
+def _store_aawm_route_host_reverse_dns_cache(
+    cache_key: str,
+    host_name: str,
+    source: str,
+    *,
+    now: float,
+    ttl_for_source: Optional[Callable[[str], float]] = None,
+) -> None:
+    ttl_fn = ttl_for_source or _aawm_route_host_cache_ttl_for_source
+    with _aawm_route_host_reverse_dns_cache_lock:
+        if (
+            len(_aawm_route_host_reverse_dns_cache)
+            >= _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES
+        ):
+            _aawm_route_host_reverse_dns_cache.clear()
+        _aawm_route_host_reverse_dns_cache[cache_key] = (
+            host_name,
+            source,
+            now + ttl_fn(source),
+        )
+
+
+def _schedule_aawm_route_host_name_enrichment(
+    client_ip: str,
+    *,
+    local_source: Optional[str] = None,
+) -> None:
+    """Background-enrich reverse DNS / MagicDNS without blocking the caller."""
+    if local_source is not None:
+        work_key = f"{_aawm_route_host_enrichment_local_key}:{local_source}"
+    else:
+        normalized = _normalize_aawm_route_client_ip(client_ip)
+        if not normalized:
+            return
+        work_key = normalized
+        client_ip = normalized
+
+    with _aawm_route_host_enrichment_lock:
+        if work_key in _aawm_route_host_enrichment_inflight:
+            return
+        _aawm_route_host_enrichment_inflight.add(work_key)
+
+    def _work() -> None:
+        try:
+            if local_source is not None:
+                _resolve_aawm_route_local_display_host(
+                    local_source=local_source,
+                    allow_blocking_lookup=True,
+                )
+            else:
+                _resolve_aawm_route_host_name_from_ip(
+                    client_ip,
+                    allow_blocking_lookup=True,
+                )
+        except Exception:
+            pass
+        finally:
+            with _aawm_route_host_enrichment_lock:
+                _aawm_route_host_enrichment_inflight.discard(work_key)
+
+    try:
+        _aawm_route_host_enrichment_executor.submit(_work)
+    except RuntimeError:
+        with _aawm_route_host_enrichment_lock:
+            _aawm_route_host_enrichment_inflight.discard(work_key)
 
 
 def _clean_aawm_route_client_ip(value: Any) -> Optional[str]:
@@ -463,40 +621,29 @@ def _discover_hostname_tailscale_ipv4_candidates(
     candidate_names = _local_tailscale_hostname_lookup_names()
     candidates: list[str] = []
     seen_ips: set[str] = set()
-    previous_timeout = socket.getdefaulttimeout()
-    try:
-        socket.setdefaulttimeout(timeout_seconds)
-        for name in candidate_names:
-            try:
-                infos = socket.getaddrinfo(
-                    name,
-                    None,
-                    family=socket.AF_INET,
-                    type=socket.SOCK_DGRAM,
-                )
-            except OSError:
-                infos = []
-            for info in infos:
-                sockaddr = info[4]
-                if not isinstance(sockaddr, tuple) or not sockaddr:
-                    continue
-                ip = str(sockaddr[0])
-                if not _is_tailscale_cgnat_client_ip(ip) or ip in seen_ips:
+    # Resolver-local timeouts only — never mutate process-global
+    # socket.setdefaulttimeout (RR-041 / RR-049 / D1-529).
+    for name in candidate_names:
+        infos = _getaddrinfo_with_timeout(name, timeout_seconds=timeout_seconds)
+        for info in infos:
+            sockaddr = info[4]
+            if not isinstance(sockaddr, tuple) or not sockaddr:
+                continue
+            ip = str(sockaddr[0])
+            if not _is_tailscale_cgnat_client_ip(ip) or ip in seen_ips:
+                continue
+            candidates.append(ip)
+            seen_ips.add(ip)
+            if len(candidates) >= max_candidates:
+                return candidates
+        if _is_aawm_route_tailnet_domain(name):
+            for ip in _resolve_ipv4_via_magicdns(name):
+                if ip in seen_ips:
                     continue
                 candidates.append(ip)
                 seen_ips.add(ip)
                 if len(candidates) >= max_candidates:
                     return candidates
-            if _is_aawm_route_tailnet_domain(name):
-                for ip in _resolve_ipv4_via_magicdns(name):
-                    if ip in seen_ips:
-                        continue
-                    candidates.append(ip)
-                    seen_ips.add(ip)
-                    if len(candidates) >= max_candidates:
-                        return candidates
-    finally:
-        socket.setdefaulttimeout(previous_timeout)
     return candidates
 
 
@@ -529,6 +676,7 @@ def _resolve_aawm_route_local_display_host(
     local_source: str,
     monotonic_now: Optional[float] = None,
     snapshot_paths: Optional[tuple[str, ...]] = None,
+    allow_blocking_lookup: bool = True,
 ) -> tuple[str, str]:
     now = time.monotonic() if monotonic_now is None else monotonic_now
     fallback_cache_key = _aawm_route_host_local_cache_key(local_source)
@@ -554,12 +702,22 @@ def _resolve_aawm_route_local_display_host(
                 )
             _aawm_route_host_reverse_dns_cache.pop(fallback_cache_key, None)
 
+    # Tailscale self-identity snapshot is local file I/O only (no DNS).
     tailscale_self = _resolve_aawm_route_host_name_from_tailscale_self_identity(
         monotonic_now=now,
         snapshot_paths=snapshot_paths,
     )
     if tailscale_self is not None:
         return tailscale_self
+
+    if not allow_blocking_lookup:
+        # Fast path for hot request handlers: return loopback immediately and
+        # enrich MagicDNS / hostname discovery in the background.
+        _schedule_aawm_route_host_name_enrichment(
+            local_source,
+            local_source=local_source,
+        )
+        return _AAWM_ROUTE_HOST_LOOPBACK_LABEL, local_source
 
     resolved_host: Optional[str] = None
     resolved_source = "magicdns_local"
@@ -569,32 +727,22 @@ def _resolve_aawm_route_local_display_host(
             break
 
     if resolved_host:
-        with _aawm_route_host_reverse_dns_cache_lock:
-            if (
-                len(_aawm_route_host_reverse_dns_cache)
-                >= _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES
-            ):
-                _aawm_route_host_reverse_dns_cache.clear()
-            _aawm_route_host_reverse_dns_cache[
-                _AAWM_ROUTE_HOST_LOCAL_LOOKUP_CACHE_KEY
-            ] = (
-                resolved_host,
-                resolved_source,
-                now + _aawm_route_host_local_cache_ttl_for_source(resolved_source),
-            )
+        _store_aawm_route_host_reverse_dns_cache(
+            _AAWM_ROUTE_HOST_LOCAL_LOOKUP_CACHE_KEY,
+            resolved_host,
+            resolved_source,
+            now=now,
+            ttl_for_source=_aawm_route_host_local_cache_ttl_for_source,
+        )
         return resolved_host, resolved_source
 
-    with _aawm_route_host_reverse_dns_cache_lock:
-        if (
-            len(_aawm_route_host_reverse_dns_cache)
-            >= _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES
-        ):
-            _aawm_route_host_reverse_dns_cache.clear()
-        _aawm_route_host_reverse_dns_cache[fallback_cache_key] = (
-            _AAWM_ROUTE_HOST_LOOPBACK_LABEL,
-            local_source,
-            now + _aawm_route_host_local_cache_ttl_for_source(local_source),
-        )
+    _store_aawm_route_host_reverse_dns_cache(
+        fallback_cache_key,
+        _AAWM_ROUTE_HOST_LOOPBACK_LABEL,
+        local_source,
+        now=now,
+        ttl_for_source=_aawm_route_host_local_cache_ttl_for_source,
+    )
     return _AAWM_ROUTE_HOST_LOOPBACK_LABEL, local_source
 
 
@@ -819,6 +967,7 @@ def _resolve_aawm_route_host_name_from_ip(
     client_ip: Optional[str],
     *,
     monotonic_now: Optional[float] = None,
+    allow_blocking_lookup: bool = True,
 ) -> tuple[Optional[str], Optional[str]]:
     normalized_ip = _normalize_aawm_route_client_ip(client_ip)
     if not normalized_ip:
@@ -828,6 +977,7 @@ def _resolve_aawm_route_host_name_from_ip(
         return _resolve_aawm_route_local_display_host(
             local_source=local_source,
             monotonic_now=monotonic_now,
+            allow_blocking_lookup=allow_blocking_lookup,
         )
     try:
         ipaddress.ip_address(normalized_ip)
@@ -843,36 +993,37 @@ def _resolve_aawm_route_host_name_from_ip(
                 return host_name, _aawm_route_host_cache_source_label(cached_source)
             _aawm_route_host_reverse_dns_cache.pop(normalized_ip, None)
 
+    if not allow_blocking_lookup:
+        # Critical path: return IP attribution immediately. Do not cache the
+        # provisional IP-literal so background enrichment can still perform
+        # reverse DNS / MagicDNS and populate the cache for later requests
+        # (RR-041 / RR-049 / D1-529).
+        _schedule_aawm_route_host_name_enrichment(normalized_ip)
+        return normalized_ip, "ip_literal"
+
     host_name = normalized_ip
     source = "ip_literal"
-    previous_timeout = socket.getdefaulttimeout()
-    try:
-        socket.setdefaulttimeout(_AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS)
-        hostname, _, _ = socket.gethostbyaddr(normalized_ip)
+    # Never touch process-global socket.setdefaulttimeout. Use a dedicated
+    # executor + per-call future timeout for gethostbyaddr; MagicDNS already
+    # uses sock.settimeout on its own UDP socket.
+    hostname = _gethostbyaddr_with_timeout(normalized_ip)
+    if hostname:
         resolved = _hostname_label_from_reverse_lookup(hostname)
         if resolved:
             host_name = resolved
             source = "reverse_dns"
-    except Exception:
-        if _is_tailscale_cgnat_client_ip(normalized_ip):
-            resolved = _resolve_hostname_via_magicdns(normalized_ip)
-            if resolved:
-                host_name = resolved
-                source = "magicdns_reverse"
-    finally:
-        socket.setdefaulttimeout(previous_timeout)
+    if source == "ip_literal" and _is_tailscale_cgnat_client_ip(normalized_ip):
+        resolved = _resolve_hostname_via_magicdns(normalized_ip)
+        if resolved:
+            host_name = resolved
+            source = "magicdns_reverse"
 
-    with _aawm_route_host_reverse_dns_cache_lock:
-        if (
-            len(_aawm_route_host_reverse_dns_cache)
-            >= _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_MAX_ENTRIES
-        ):
-            _aawm_route_host_reverse_dns_cache.clear()
-        _aawm_route_host_reverse_dns_cache[normalized_ip] = (
-            host_name,
-            source,
-            now + _aawm_route_host_cache_ttl_for_source(source),
-        )
+    _store_aawm_route_host_reverse_dns_cache(
+        normalized_ip,
+        host_name,
+        source,
+        now=now,
+    )
     return host_name, source
 
 
@@ -910,7 +1061,17 @@ def resolve_aawm_route_host_attribution(
     general_settings: Optional[dict[str, Any]] = None,
     client_ip: Optional[str] = None,
     client_ip_source: Optional[str] = None,
+    allow_blocking_lookup: bool = False,
 ) -> dict[str, Optional[str]]:
+    """Resolve client IP + host label for route attribution.
+
+    By default this is a non-blocking fast path suitable for hot request
+    handlers: cache hits and local-file Tailscale identity return immediately,
+    while reverse DNS / MagicDNS are scheduled as background enrichment.
+    Pass ``allow_blocking_lookup=True`` (or use
+    ``aresolve_aawm_route_host_attribution``) when the caller can wait for a
+    full resolution off the event loop.
+    """
     if client_ip is None:
         client_ip, client_ip_source = _extract_aawm_route_request_client_ip(
             request,
@@ -918,13 +1079,48 @@ def resolve_aawm_route_host_attribution(
         )
     else:
         client_ip = _normalize_aawm_route_client_ip(client_ip)
-    host_name, host_name_source = _resolve_aawm_route_host_name_from_ip(client_ip)
+    host_name, host_name_source = _resolve_aawm_route_host_name_from_ip(
+        client_ip,
+        allow_blocking_lookup=allow_blocking_lookup,
+    )
     return {
         "client_ip": client_ip,
         "client_ip_source": client_ip_source,
         "host_name": host_name,
         "host_name_source": host_name_source,
     }
+
+
+async def aresolve_aawm_route_host_attribution(
+    request: Request,
+    *,
+    general_settings: Optional[dict[str, Any]] = None,
+    client_ip: Optional[str] = None,
+    client_ip_source: Optional[str] = None,
+    allow_blocking_lookup: bool = True,
+) -> dict[str, Optional[str]]:
+    """Async host attribution that never blocks the event loop on DNS.
+
+    When ``allow_blocking_lookup`` is True (default), reverse DNS / MagicDNS
+    run via ``asyncio.to_thread``. When False, returns the same immediate
+    IP-literal / cache fast path as the sync API.
+    """
+    if not allow_blocking_lookup:
+        return resolve_aawm_route_host_attribution(
+            request,
+            general_settings=general_settings,
+            client_ip=client_ip,
+            client_ip_source=client_ip_source,
+            allow_blocking_lookup=False,
+        )
+    return await asyncio.to_thread(
+        resolve_aawm_route_host_attribution,
+        request,
+        general_settings=general_settings,
+        client_ip=client_ip,
+        client_ip_source=client_ip_source,
+        allow_blocking_lookup=True,
+    )
 
 
 def _format_aawm_route_client_version_label(
