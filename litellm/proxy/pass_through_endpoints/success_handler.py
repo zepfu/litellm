@@ -13,7 +13,10 @@ from litellm.litellm_core_utils.redact_messages import (
     redact_message_input_output_from_logging,
 )
 from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_turn
-from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.litellm_core_utils.litellm_logging import (
+    Logging as LiteLLMLoggingObj,
+    emit_standard_logging_payload,
+)
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     PassthroughStandardLoggingPayload,
@@ -193,6 +196,87 @@ class PassThroughEndpointLogging:
         if sanitized_headers:
             metadata["anthropic_response_headers"] = sanitized_headers
 
+    @staticmethod
+    def _ensure_standard_logging_object(
+        *,
+        logging_obj: LiteLLMLoggingObj,
+        model_call_details: dict,
+        current_kwargs: dict,
+        current_result: Any,
+        start_time: datetime,
+        end_time: datetime,
+        cache_hit: bool,
+    ) -> None:
+        """
+        Attach a standard_logging_object for non-streaming pass-through callbacks.
+
+        Prefer an object already built by a provider handler. Otherwise build one
+        with the same helper the native LiteLLM success path uses, without calling
+        async_success_handler (which would re-run callbacks / spend persistence).
+        """
+        existing = current_kwargs.get("standard_logging_object")
+        if existing is None and isinstance(model_call_details, dict):
+            existing = model_call_details.get("standard_logging_object")
+
+        # Native builder reads logging_obj.model_call_details; only mutate that dict
+        # when it is a real mapping so callback kwargs stay free of bookkeeping.
+        logging_details = getattr(logging_obj, "model_call_details", None)
+        if not isinstance(logging_details, dict):
+            logging_details = None
+
+        if existing is None:
+            if logging_details is not None:
+                logging_details.setdefault("log_event_type", "successful_api_call")
+                logging_details["end_time"] = end_time
+                logging_details["cache_hit"] = cache_hit
+                for key in (
+                    "response_cost",
+                    "model",
+                    "custom_llm_provider",
+                    "litellm_params",
+                    "passthrough_logging_payload",
+                    "standard_pass_through_logging_payload",
+                    "messages",
+                    "prompt",
+                    "input",
+                ):
+                    if key in current_kwargs and (
+                        key not in logging_details
+                        or logging_details.get(key) is None
+                    ):
+                        logging_details[key] = current_kwargs[key]
+                if current_kwargs.get("response_cost") is not None:
+                    logging_details["response_cost"] = current_kwargs["response_cost"]
+
+            build_fn = getattr(logging_obj, "_build_standard_logging_payload", None)
+            if callable(build_fn):
+                try:
+                    payload = build_fn(current_result, start_time, end_time)
+                except Exception as exc:
+                    verbose_proxy_logger.warning(
+                        "Pass-through standard_logging_object build failed: %s",
+                        exc,
+                    )
+                    payload = None
+                # StandardLoggingPayload is a TypedDict/dict; ignore non-dict mocks.
+                if isinstance(payload, dict):
+                    existing = payload
+                    emit_standard_logging_payload(payload)
+
+        if existing is not None:
+            current_kwargs["standard_logging_object"] = existing
+            if isinstance(model_call_details, dict):
+                model_call_details["standard_logging_object"] = existing
+            if logging_details is not None:
+                logging_details["standard_logging_object"] = existing
+            # Keep response_cost visible on kwargs for spend-track fallbacks.
+            if (
+                current_kwargs.get("response_cost") is None
+                and isinstance(existing, dict)
+                and existing.get("response_cost") is not None
+            ):
+                current_kwargs["response_cost"] = existing.get("response_cost")
+
     async def _handle_logging(
         self,
         logging_obj: LiteLLMLoggingObj,
@@ -227,6 +311,19 @@ class PassThroughEndpointLogging:
                 "standard_callback_dynamic_params",
                 current_kwargs.get("standard_callback_dynamic_params", {}),
             )
+
+        # Build / attach standard_logging_object before redaction + callbacks so
+        # non-streaming pass-through matches native LiteLLM payload parity.
+        self._ensure_standard_logging_object(
+            logging_obj=logging_obj,
+            model_call_details=model_call_details,
+            current_kwargs=current_kwargs,
+            current_result=current_result,
+            start_time=start_time,
+            end_time=end_time,
+            cache_hit=cache_hit,
+        )
+
         current_result = redact_message_input_output_from_logging(
             model_call_details=model_call_details,
             result=current_result,
@@ -284,27 +381,58 @@ class PassThroughEndpointLogging:
             global_callbacks=litellm._async_success_callback,
         )
         for callback in async_callbacks:
-            if isinstance(callback, CustomLogger):
-                current_result = redact_message_input_output_from_custom_logger(
-                    result=current_result,
-                    litellm_logging_obj=logging_obj,
-                    custom_logger=callback,
-                )
-            async_logging_hook = getattr(callback, "async_logging_hook", None)
-            if callable(async_logging_hook):
-                current_kwargs, current_result = await async_logging_hook(
-                    kwargs=current_kwargs,
-                    result=current_result,
-                    call_type=call_type,
-                )
+            # Isolate each async callback so one failure cannot abort later
+            # callbacks or pass_through_async_success_handler route-rollup work.
+            try:
+                if isinstance(callback, CustomLogger):
+                    current_result = redact_message_input_output_from_custom_logger(
+                        result=current_result,
+                        litellm_logging_obj=logging_obj,
+                        custom_logger=callback,
+                    )
+                async_logging_hook = getattr(callback, "async_logging_hook", None)
+                if callable(async_logging_hook):
+                    try:
+                        hook_result = await async_logging_hook(
+                            kwargs=current_kwargs,
+                            result=current_result,
+                            call_type=call_type,
+                        )
+                        if (
+                            isinstance(hook_result, tuple)
+                            and len(hook_result) == 2
+                            and isinstance(hook_result[0], dict)
+                        ):
+                            current_kwargs, current_result = hook_result
+                    except Exception as exc:
+                        verbose_proxy_logger.warning(
+                            "Pass-through async_logging_hook failed for callback=%s: %s",
+                            callback,
+                            exc,
+                        )
 
-            async_log_success_event = getattr(callback, "async_log_success_event", None)
-            if callable(async_log_success_event):
-                await async_log_success_event(
-                    current_kwargs,
-                    current_result,
-                    start_time,
-                    end_time,
+                async_log_success_event = getattr(
+                    callback, "async_log_success_event", None
+                )
+                if callable(async_log_success_event):
+                    try:
+                        await async_log_success_event(
+                            current_kwargs,
+                            current_result,
+                            start_time,
+                            end_time,
+                        )
+                    except Exception as exc:
+                        verbose_proxy_logger.warning(
+                            "Pass-through async_log_success_event failed for callback=%s: %s",
+                            callback,
+                            exc,
+                        )
+            except Exception as exc:
+                verbose_proxy_logger.warning(
+                    "Pass-through async success callback failed for callback=%s: %s",
+                    callback,
+                    exc,
                 )
 
     def normalize_llm_passthrough_logging_payload(
