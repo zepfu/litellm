@@ -644,30 +644,103 @@ def build_record_from_langfuse_event(
     )
 
 
-def _observation_signature(observation: Dict[str, Any]) -> Tuple[Any, ...]:
-    return (
-        observation.get("source"),
-        _rate_limit_storage_provider(observation),
-        observation.get("model"),
-        _rate_limit_storage_quota_key(observation),
-        _signature_datetime_millis(observation.get("observed_at")),
-        _signature_datetime_millis(observation.get("provider_resets_at")),
-        _rate_limit_storage_remaining_pct(observation),
-        _rate_limit_storage_quota_limit(observation),
-        _rate_limit_storage_quota_used(observation),
-        _rate_limit_storage_quota_remaining(observation),
-        _signature_datetime_millis(_rate_limit_storage_billing_period_start_at(observation)),
-        _signature_datetime_millis(_rate_limit_storage_billing_period_end_at(observation)),
-        observation.get("trace_id"),
-    )
+def _signature_datetime_millis(value: Any) -> Optional[str]:
+    """Normalize datetimes for signature equality.
 
-
-def _signature_datetime_millis(value: Any) -> str:
+    None stays None so missing timestamps compare equal across builder paths.
+    Non-datetime values fall back to str() for defensive compatibility.
+    """
+    if value is None:
+        return None
     if isinstance(value, datetime):
         if value.tzinfo is not None:
             value = value.astimezone(timezone.utc)
         return value.isoformat(timespec="milliseconds")
     return str(value)
+
+
+def _canonical_observation_signature(
+    *,
+    source: Any,
+    provider: Any,
+    model: Any,
+    quota_key: Any,
+    observed_at: Any,
+    provider_resets_at: Any,
+    remaining_pct: Any,
+    quota_limit: Any,
+    quota_used: Any,
+    quota_remaining: Any,
+    billing_period_start_at: Any,
+    billing_period_end_at: Any,
+    trace_id: Any,
+) -> Tuple[Any, ...]:
+    """Single 13-element signature used by both write-path and DB filter-path.
+
+    Field order must stay identical for write-side observations and DB rows so
+    re-runs skip true duplicates instead of inserting or dropping the wrong rows.
+    """
+    return (
+        source,
+        provider,
+        model,
+        quota_key,
+        _signature_datetime_millis(observed_at),
+        _signature_datetime_millis(provider_resets_at),
+        remaining_pct,
+        quota_limit,
+        quota_used,
+        quota_remaining,
+        _signature_datetime_millis(billing_period_start_at),
+        _signature_datetime_millis(billing_period_end_at),
+        trace_id,
+    )
+
+
+def _observation_signature(observation: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Signature for a runtime / extracted observation dict (write path)."""
+    return _canonical_observation_signature(
+        source=observation.get("source"),
+        provider=_rate_limit_storage_provider(observation),
+        model=observation.get("model"),
+        quota_key=_rate_limit_storage_quota_key(observation),
+        observed_at=observation.get("observed_at"),
+        provider_resets_at=observation.get("provider_resets_at"),
+        remaining_pct=_rate_limit_storage_remaining_pct(observation),
+        quota_limit=_rate_limit_storage_quota_limit(observation),
+        quota_used=_rate_limit_storage_quota_used(observation),
+        quota_remaining=_rate_limit_storage_quota_remaining(observation),
+        billing_period_start_at=_rate_limit_storage_billing_period_start_at(
+            observation
+        ),
+        billing_period_end_at=_rate_limit_storage_billing_period_end_at(observation),
+        trace_id=observation.get("trace_id"),
+    )
+
+
+def _observation_signature_from_db_row(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Signature for a public.rate_limit_observations DB row (filter path).
+
+    Columns are already storage-normalized at write time (provider, quota_key,
+    remaining_pct, quota_*, billing_period_*), so read them directly rather
+    than re-deriving through extractors that expect runtime observation fields
+    like limit_id/limit_scope.
+    """
+    return _canonical_observation_signature(
+        source=row.get("source"),
+        provider=row.get("provider"),
+        model=row.get("model"),
+        quota_key=row.get("quota_key"),
+        observed_at=row.get("observed_at"),
+        provider_resets_at=row.get("provider_resets_at"),
+        remaining_pct=row.get("remaining_pct"),
+        quota_limit=row.get("quota_limit"),
+        quota_used=row.get("quota_used"),
+        quota_remaining=row.get("quota_remaining"),
+        billing_period_start_at=row.get("billing_period_start_at"),
+        billing_period_end_at=row.get("billing_period_end_at"),
+        trace_id=row.get("trace_id"),
+    )
 
 
 async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -710,21 +783,10 @@ async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[D
         )
     finally:
         await conn.close()
-    existing = set()
-    for row in rows:
-        row_dict = dict(row)
-        existing.add(
-            (
-                row_dict.get("source"),
-                row_dict.get("provider"),
-                row_dict.get("model"),
-                row_dict.get("quota_key"),
-                _signature_datetime_millis(row_dict.get("observed_at")),
-                _signature_datetime_millis(row_dict.get("provider_resets_at")),
-                row_dict.get("remaining_pct"),
-                row_dict.get("trace_id"),
-            )
-        )
+    existing = {
+        _observation_signature_from_db_row(dict(row))
+        for row in rows
+    }
     filtered: List[Dict[str, Any]] = []
     for record in records:
         observations = [

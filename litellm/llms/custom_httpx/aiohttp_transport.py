@@ -281,6 +281,9 @@ class AiohttpTransport(httpx.AsyncBaseTransport):
 
 
 class LiteLLMAiohttpTransport(AiohttpTransport):
+    # Bound retained replaced sessions so loop churn cannot grow unbounded.
+    _MAX_RETAINED_REPLACED_SESSIONS = 32
+
     """
     LiteLLM wrapper around AiohttpTransport to handle %-encodings in URLs
     and event loop lifecycle issues in CI/CD environments
@@ -329,8 +332,29 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         )
         return session
 
+    def _is_session_close_safe_on_current_loop(self, session: Any) -> bool:
+        """Return True only when closing ``session`` on the running loop is safe."""
+        try:
+            session_loop = getattr(session, "_loop", None)
+            current_loop = asyncio.get_running_loop()
+            return (
+                session_loop is not None
+                and session_loop == current_loop
+                and not session_loop.is_closed()
+            )
+        except RuntimeError:
+            return False
+
     async def _close_owned_replaced_session(self, session: Any) -> None:
         if not self._owns_session or getattr(session, "closed", False):
+            return
+        # Never await close() for a session bound to a different/closed loop.
+        if not self._is_session_close_safe_on_current_loop(session):
+            verbose_logger.debug(
+                "Skipping unsafe close of replaced owned session (different/closed loop); "
+                "attribution: %s",
+                get_litellm_aiohttp_session_attribution(session),
+            )
             return
         close = getattr(session, "close", None)
         if not callable(close):
@@ -346,10 +370,37 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         except Exception as e:
             verbose_logger.debug(f"Error closing old session: {e}")
 
+    def _enforce_retained_replaced_sessions_cap(self) -> None:
+        """Bound retained list length; close oldest only when safe on this loop."""
+        max_retained = self._MAX_RETAINED_REPLACED_SESSIONS
+        while len(self._retained_replaced_sessions) > max_retained:
+            oldest = self._retained_replaced_sessions.pop(0)
+            if getattr(oldest, "closed", False):
+                continue
+            try:
+                if self._is_session_close_safe_on_current_loop(oldest):
+                    close = getattr(oldest, "close", None)
+                    if callable(close):
+                        result = close()
+                        if inspect.isawaitable(result):
+                            asyncio.create_task(result)
+                    continue
+            except Exception as e:
+                verbose_logger.debug(
+                    "Error closing over-cap retained aiohttp session: %s", e
+                )
+            verbose_logger.warning(
+                "Dropping over-cap retained aiohttp session without close "
+                "(unsafe loop); attribution: %s",
+                get_litellm_aiohttp_session_attribution(oldest),
+            )
+
     def _retain_replaced_owned_session(self, session: Any) -> None:
         if not self._owns_session:
             return
         if getattr(session, "closed", False):
+            return
+        if session in self._retained_replaced_sessions:
             return
         _set_litellm_aiohttp_session_attribution(
             session,
@@ -359,6 +410,7 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
             overwrite=True,
         )
         self._retained_replaced_sessions.append(session)
+        self._enforce_retained_replaced_sessions_cap()
 
     def _release_or_retain_replaced_owned_session(self, session: Any) -> None:
         """Sync replacement-path cleanup: close immediately when safe, otherwise retain."""
@@ -413,9 +465,29 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
         for session in retained:
             await self._close_owned_replaced_session(session)
 
+    async def _release_or_retain_replaced_owned_session_async(
+        self, session: Any
+    ) -> None:
+        """Async replacement-path cleanup: await close when safe, otherwise retain."""
+        if not self._owns_session or getattr(session, "closed", False):
+            return
+        if self._is_session_close_safe_on_current_loop(session):
+            await self._close_owned_replaced_session(session)
+            return
+        _set_litellm_aiohttp_session_attribution(
+            session,
+            owner_kind="custom_httpx_transport",
+            creation_site=(
+                "LiteLLMAiohttpTransport._release_or_retain_replaced_owned_session_async"
+            ),
+            litellm_owns_session=self._owns_session,
+        )
+        self._retain_replaced_owned_session(session)
+
     async def _get_valid_client_session_for_request(self) -> ClientSession:
         """
-        Async request-path variant that awaits cleanup before replacing sessions.
+        Async request-path variant that awaits cleanup before replacing sessions
+        when (and only when) closing on the current loop is safe.
         """
         if not isinstance(self.client, ClientSession):
             self.client = self._create_replacement_client_session()
@@ -429,7 +501,7 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 creation_site="LiteLLMAiohttpTransport._get_valid_client_session_for_request",
                 litellm_owns_session=self._owns_session,
             )
-            await self._close_owned_replaced_session(old_session)
+            await self._release_or_retain_replaced_owned_session_async(old_session)
             self.client = self._create_replacement_client_session()
             return self.client
 
@@ -449,7 +521,8 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                     creation_site="LiteLLMAiohttpTransport._get_valid_client_session_for_request",
                     litellm_owns_session=self._owns_session,
                 )
-                await self._close_owned_replaced_session(old_session)
+                # Different/closed loop: retain for later; do not await close.
+                await self._release_or_retain_replaced_owned_session_async(old_session)
                 self.client = self._create_replacement_client_session()
 
         except (RuntimeError, AttributeError):
@@ -460,7 +533,7 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 creation_site="LiteLLMAiohttpTransport._get_valid_client_session_for_request",
                 litellm_owns_session=self._owns_session,
             )
-            await self._close_owned_replaced_session(old_session)
+            await self._release_or_retain_replaced_owned_session_async(old_session)
             self.client = self._create_replacement_client_session()
 
         return self.client

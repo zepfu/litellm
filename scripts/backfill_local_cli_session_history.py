@@ -1489,10 +1489,67 @@ def _postgres_dsn_from_args(args: argparse.Namespace) -> str:
     return f"postgresql://{quote(user)}:{quote(password)}@{host}:{port}/{quote(args.target_db_name)}"
 
 
-def _fetch_existing_days(args: argparse.Namespace, tz_name: str) -> set[date]:
+def _storage_client_names_for_sources(clients: Iterable[str]) -> list[str]:
+    """Map source client keys (claude/codex/...) to storage client_name values."""
+    names = {_storage_client_name(str(client)) for client in clients}
+    return sorted(name for name in names if name)
+
+
+def _existing_days_query(
+    *,
+    tz_name: str,
+    client_names: Iterable[str],
+    source_import: str = IMPORT_MARKER,
+) -> tuple[str, tuple[Any, ...]]:
+    """Build SQL that finds days already imported for the given clients/source.
+
+    Days are scoped to both ``client_name`` and ``metadata.source_import`` so a
+    live proxy row (or another client's backfill) cannot falsely skip a
+    different client/source during re-runs.
+    """
+    names = [str(name) for name in client_names if str(name)]
+    if not names:
+        # Empty IN () is invalid SQL; force a no-row result while keeping the
+        # same column shape for callers that unpack (client_name, day).
+        sql = """
+                SELECT DISTINCT
+                    client_name,
+                    (COALESCE(start_time, created_at) AT TIME ZONE %s)::date AS day
+                FROM public.session_history
+                WHERE FALSE
+                """
+        return sql, (tz_name,)
+
+    placeholders = ", ".join(["%s"] * len(names))
+    sql = f"""
+                SELECT DISTINCT
+                    client_name,
+                    (COALESCE(start_time, created_at) AT TIME ZONE %s)::date AS day
+                FROM public.session_history
+                WHERE COALESCE(start_time, created_at) IS NOT NULL
+                  AND client_name IN ({placeholders})
+                  AND metadata->>'source_import' = %s
+                """
+    return sql, (tz_name, *names, source_import)
+
+
+def _fetch_existing_days(
+    args: argparse.Namespace,
+    tz_name: str,
+    client_names: Iterable[str],
+    *,
+    source_import: str = IMPORT_MARKER,
+) -> dict[str, set[date]]:
+    """Return calendar days that already have backfill rows, keyed by client_name."""
     if psycopg is None:
         raise RuntimeError("psycopg is required for the session_history day check")
     dsn = _postgres_dsn_from_args(args)
+    sql, params = _existing_days_query(
+        tz_name=tz_name,
+        client_names=client_names,
+        source_import=source_import,
+    )
+    existing: dict[str, set[date]] = defaultdict(set)
     with psycopg.connect(dsn, connect_timeout=args.pg_connect_timeout) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT current_database()")
@@ -1502,15 +1559,12 @@ def _fetch_existing_days(args: argparse.Namespace, tz_name: str) -> set[date]:
                     f"Refusing to use database {current_database!r}; expected "
                     f"{args.target_db_name!r}"
                 )
-            cur.execute(
-                """
-                SELECT DISTINCT (COALESCE(start_time, created_at) AT TIME ZONE %s)::date
-                FROM public.session_history
-                WHERE COALESCE(start_time, created_at) IS NOT NULL
-                """,
-                (tz_name,),
-            )
-            return {row[0] for row in cur.fetchall() if row[0] is not None}
+            cur.execute(sql, params)
+            for client_name, day in cur.fetchall():
+                if client_name is None or day is None:
+                    continue
+                existing[str(client_name)].add(day)
+    return dict(existing)
 
 
 SESSION_HISTORY_INSERT_SQL = """
@@ -1756,18 +1810,30 @@ def _print_summary(
     *,
     summary: DryRunSummary,
     stats: ScanStats,
-    existing_days: set[date],
+    existing_days: dict[str, set[date]],
     args: argparse.Namespace,
 ) -> None:
     print("Local CLI session_history backfill dry run")
     print(f"target_database: {args.target_db_name}")
     print(f"day_timezone: {args.day_timezone}")
     print(f"source_import: {IMPORT_MARKER}")
-    if existing_days:
+    all_existing_days = {
+        day for days in existing_days.values() for day in days
+    }
+    if all_existing_days:
         print(
             "existing_session_history_days: "
-            f"{len(existing_days)} ({min(existing_days).isoformat()}..{max(existing_days).isoformat()})"
+            f"{len(all_existing_days)} "
+            f"({min(all_existing_days).isoformat()}..{max(all_existing_days).isoformat()})"
         )
+        for client_name in sorted(existing_days):
+            days = existing_days[client_name]
+            if not days:
+                continue
+            print(
+                f"  existing_days[{client_name}]: "
+                f"{len(days)} ({min(days).isoformat()}..{max(days).isoformat()})"
+            )
     else:
         print("existing_session_history_days: 0")
     print(f"records_that_would_be_added: {summary.records}")
@@ -1907,7 +1973,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     tz = ZoneInfo(args.day_timezone)
     from_date = _optional_date(args.from_date)
     to_date = _optional_date(args.to_date)
-    existing_days = _fetch_existing_days(args, args.day_timezone)
+    storage_client_names = _storage_client_names_for_sources(args.clients)
+    existing_days = _fetch_existing_days(
+        args,
+        args.day_timezone,
+        storage_client_names,
+        source_import=IMPORT_MARKER,
+    )
     stats = ScanStats()
     summary = DryRunSummary()
 
@@ -1934,7 +2006,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 continue
             if to_date and day > to_date:
                 continue
-            if day in existing_days:
+            # Only skip days that already have rows for THIS client/source.
+            if day in existing_days.get(client, set()):
                 stats.records_skipped_existing_day[client] += 1
                 continue
             stats.records_after_day_filter[client] += 1

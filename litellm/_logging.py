@@ -10,6 +10,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from logging import Formatter
+from logging.handlers import RotatingFileHandler
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote
 
@@ -104,6 +105,36 @@ _secret_filter = SecretRedactionFilter()
 
 _AAWM_ERROR_LOG_HANDLER_NAME = "aawm_error_log_file_handler"
 _AAWM_ERROR_LOG_LOCK = threading.Lock()
+
+
+_AAWM_ERROR_LOG_DEFAULT_MAX_BYTES = 10 * 1024 * 1024
+_AAWM_ERROR_LOG_DEFAULT_BACKUP_COUNT = 5
+
+
+def _get_aawm_error_log_max_bytes() -> int:
+    """Max bytes per AAWM error JSONL file before rotation (default 10 MiB)."""
+    raw = os.getenv("LITELLM_AAWM_ERROR_LOG_MAX_BYTES", "").strip()
+    if not raw:
+        return _AAWM_ERROR_LOG_DEFAULT_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return _AAWM_ERROR_LOG_DEFAULT_MAX_BYTES
+    return value if value > 0 else _AAWM_ERROR_LOG_DEFAULT_MAX_BYTES
+
+
+def _get_aawm_error_log_backup_count() -> int:
+    """Number of rotated AAWM error JSONL backups to keep (default 5)."""
+    raw = os.getenv("LITELLM_AAWM_ERROR_LOG_BACKUP_COUNT", "").strip()
+    if not raw:
+        return _AAWM_ERROR_LOG_DEFAULT_BACKUP_COUNT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _AAWM_ERROR_LOG_DEFAULT_BACKUP_COUNT
+    return value if value >= 0 else _AAWM_ERROR_LOG_DEFAULT_BACKUP_COUNT
+
+
 
 
 _LANGFUSE_SUPPORT_STRING_COALESCE_DEFAULT_TTL_SECONDS = 300
@@ -497,7 +528,11 @@ def _extract_aiohttp_attribution_from_asyncio_context(
 
 
 class AawmErrorLogFileHandler(logging.Handler):
-    """Append sanitized LiteLLM ERROR records to the local .analysis intake log."""
+    """Append sanitized LiteLLM ERROR records to the local .analysis intake log.
+
+    Uses size-based rotation (maxBytes + backupCount) so opt-in error JSONL
+    sinks cannot grow without bound under bursty ERROR traffic (RR-004).
+    """
 
     _formatter = logging.Formatter(
         "%(asctime)s - %(name)s:%(levelname)s: %(filename)s:%(lineno)s - %(message)s",
@@ -510,6 +545,57 @@ class AawmErrorLogFileHandler(logging.Handler):
         self.name = _AAWM_ERROR_LOG_HANDLER_NAME
         self.addFilter(_secret_filter)
         self.setFormatter(self._formatter)
+        self._rotating_handler: Optional[RotatingFileHandler] = None
+        self._rotating_handler_path: Optional[str] = None
+        self._rotating_handler_max_bytes: Optional[int] = None
+        self._rotating_handler_backup_count: Optional[int] = None
+
+    def _get_rotating_file_handler(self, log_path: str) -> RotatingFileHandler:
+        max_bytes = _get_aawm_error_log_max_bytes()
+        backup_count = _get_aawm_error_log_backup_count()
+        if (
+            self._rotating_handler is not None
+            and self._rotating_handler_path == log_path
+            and self._rotating_handler_max_bytes == max_bytes
+            and self._rotating_handler_backup_count == backup_count
+        ):
+            return self._rotating_handler
+
+        if self._rotating_handler is not None:
+            try:
+                self._rotating_handler.close()
+            except Exception:
+                pass
+            self._rotating_handler = None
+
+        parent = os.path.dirname(log_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        handler = RotatingFileHandler(
+            log_path,
+            mode="a",
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+            delay=True,
+        )
+        self._rotating_handler = handler
+        self._rotating_handler_path = log_path
+        self._rotating_handler_max_bytes = max_bytes
+        self._rotating_handler_backup_count = backup_count
+        return handler
+
+    def close(self) -> None:
+        if self._rotating_handler is not None:
+            try:
+                self._rotating_handler.close()
+            except Exception:
+                pass
+            self._rotating_handler = None
+            self._rotating_handler_path = None
+            self._rotating_handler_max_bytes = None
+            self._rotating_handler_backup_count = None
+        super().close()
 
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(self._emit_state, "active", False):
@@ -533,11 +619,21 @@ class AawmErrorLogFileHandler(logging.Handler):
             payload = _build_aawm_error_log_record(record, formatter=self._formatter)
             if _should_suppress_langfuse_support_string_coalesce(payload):
                 return
+            line = safe_dumps(payload) + "\n"
             with _AAWM_ERROR_LOG_LOCK:
-                os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                with open(log_path, "a", encoding="utf-8") as error_log:
-                    error_log.write(safe_dumps(payload))
-                    error_log.write("\n")
+                rotating = self._get_rotating_file_handler(log_path)
+                if rotating.stream is None:
+                    rotating.stream = rotating._open()  # type: ignore[attr-defined]
+                rotating.stream.write(line)
+                rotating.stream.flush()
+                try:
+                    if rotating.maxBytes > 0 and rotating.stream.tell() >= rotating.maxBytes:
+                        rotating.doRollover()
+                        # Ensure active sink exists after rollover for subsequent emits/tests.
+                        if rotating.stream is None:
+                            rotating.stream = rotating._open()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
                 _normalize_aawm_error_log_file_metadata(log_path)
         except Exception:
             # Never let local error-intake logging break application logging.

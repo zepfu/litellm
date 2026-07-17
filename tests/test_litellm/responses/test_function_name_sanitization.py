@@ -78,6 +78,110 @@ def test_same_prefix_long_names_remain_distinct_and_deterministic() -> None:
     )
 
 
+def test_same_tool_set_in_different_order_yields_same_mapping() -> None:
+    """Mapping must not depend on tools[] dict/list order — only the name set."""
+    names = [
+        "alpha_" + ("a" * 100),
+        "beta_" + ("b" * 100),
+        "gamma_" + ("c" * 100),
+        "short_ok",
+    ]
+    body_forward = {
+        "tools": [{"type": "function", "name": name} for name in names],
+    }
+    body_reversed = {
+        "tools": [{"type": "function", "name": name} for name in reversed(names)],
+    }
+    body_scrambled = {
+        "tools": [
+            {"type": "function", "name": names[2]},
+            {"type": "function", "name": names[0]},
+            {"type": "function", "name": names[3]},
+            {"type": "function", "name": names[1]},
+        ],
+    }
+
+    forward = sanitize_responses_function_names(body_forward)
+    reversed_result = sanitize_responses_function_names(body_reversed)
+    scrambled = sanitize_responses_function_names(body_scrambled)
+
+    assert forward.original_to_upstream == reversed_result.original_to_upstream
+    assert forward.original_to_upstream == scrambled.original_to_upstream
+    # Prefer nonce=0 derived from the original alone when free.
+    for long_name in names[:3]:
+        preferred = _build_sanitized_name_candidate(
+            long_name,
+            DEFAULT_MAX_FUNCTION_NAME_LENGTH,
+            nonce=0,
+        )
+        assert forward.original_to_upstream[long_name] == preferred
+
+
+def test_colliding_long_names_get_stable_nonces() -> None:
+    """When preferred candidates collide, sorted-original order assigns nonces."""
+    # Lexicographic order: a_... before z_... so a wins nonce=0, z takes nonce=1.
+    earlier = "a_colliding_long_name_" + ("e" * 80)
+    later = "z_colliding_long_name_" + ("l" * 80)
+    shared_candidate = "shared_forced_candidate_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    assert len(shared_candidate) <= DEFAULT_MAX_FUNCTION_NAME_LENGTH
+
+    def forced_candidate(
+        original: str,
+        max_length: int,
+        *,
+        nonce: int = 0,
+    ) -> str:
+        if original in {earlier, later} and nonce == 0:
+            return shared_candidate
+        return _build_sanitized_name_candidate(
+            original,
+            max_length,
+            nonce=nonce,
+        )
+
+    body_later_first = {
+        "tools": [
+            {"type": "function", "name": later},
+            {"type": "function", "name": earlier},
+        ]
+    }
+    body_earlier_first = {
+        "tools": [
+            {"type": "function", "name": earlier},
+            {"type": "function", "name": later},
+        ]
+    }
+
+    with patch(
+        "litellm.responses.function_name_sanitization."
+        "_build_sanitized_name_candidate",
+        side_effect=forced_candidate,
+    ):
+        later_first = sanitize_responses_function_names(body_later_first)
+        earlier_first = sanitize_responses_function_names(body_earlier_first)
+        alone_earlier = sanitize_responses_function_names(
+            {"tools": [{"type": "function", "name": earlier}]}
+        )
+        alone_later = sanitize_responses_function_names(
+            {"tools": [{"type": "function", "name": later}]}
+        )
+
+    assert later_first.original_to_upstream == earlier_first.original_to_upstream
+    assert later_first.original_to_upstream[earlier] == shared_candidate
+    expected_later = _build_sanitized_name_candidate(
+        later,
+        DEFAULT_MAX_FUNCTION_NAME_LENGTH,
+        nonce=1,
+    )
+    assert later_first.original_to_upstream[later] == expected_later
+    assert later_first.diagnostics.collision_fallback_used is True
+
+    # Alone, each name still prefers nonce=0 when free (cross-request stability
+    # for the uncontested preferred candidate).
+    assert alone_earlier.original_to_upstream[earlier] == shared_candidate
+    assert alone_later.original_to_upstream[later] == shared_candidate
+
+
 def test_valid_short_name_is_reserved_when_generated_candidate_collides() -> None:
     short_name = "reserved_short_name"
     long_name = "reserved_short_name_" + ("x" * 80)

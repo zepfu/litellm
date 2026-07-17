@@ -41,6 +41,7 @@ import json
 from pathlib import Path
 
 root = Path.cwd()
+# Heavy / volatile trees that must not affect rebuild fingerprint I/O or churn.
 exclude_prefixes = [
     ".git/",
     ".analysis/",
@@ -48,21 +49,70 @@ exclude_prefixes = [
     "scripts/local-ci/",
     ".gemini/",
     ".codex/",
+    ".venv/",
+    "venv/",
+    "node_modules/",
+    "ui/litellm-dashboard/node_modules/",
+    "ui/litellm-dashboard/.next/",
+    "__pycache__/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".tox/",
+    "dist/",
+    "build/",
+    ".wheel-build/",
+    "htmlcov/",
+    ".coverage/",
+    "docs/my-website/node_modules/",
+    "docs/my-website/build/",
+    "docs/my-website/.docusaurus/",
 ]
 exclude_exact = {
     "langfuse-traces.png",
     "litellm/integrations/aawm_agent_identity.py",
     "litellm/integrations/aawm_payload_capture.py",
     "litellm-dev-config.yaml",
+    ".env",
+    ".env.local",
 }
+exclude_suffixes = (
+    ".pyc",
+    ".pyo",
+    ".pyd",
+    ".so",
+    ".egg-info",
+)
+exclude_name_parts = (
+    "/__pycache__/",
+    "/node_modules/",
+    "/.venv/",
+    "/venv/",
+    "/.pytest_cache/",
+    "/.mypy_cache/",
+    "/.ruff_cache/",
+    "/.git/",
+    "/dist/",
+    "/build/",
+)
 
 def include(path: Path) -> bool:
     rel = path.relative_to(root).as_posix()
     if rel in exclude_exact:
         return False
-    for prefix in exclude_prefixes:
-        if rel.startswith(prefix):
-            return False
+    if any(rel.startswith(prefix) for prefix in exclude_prefixes):
+        return False
+    # Nested vendor/cache dirs anywhere in the tree (e.g. package/node_modules/).
+    if any(part in f"/{rel}/" or part in f"/{rel}" for part in exclude_name_parts):
+        return False
+    if any(rel.endswith(suffix) for suffix in exclude_suffixes):
+        return False
+    # Drop compiled/cache artifacts by basename.
+    name = path.name
+    if name == ".env" or name.startswith(".env."):
+        return False
+    if name.endswith(".pyc") or name == "__pycache__":
+        return False
     return True
 
 sha = hashlib.sha256()

@@ -452,15 +452,18 @@ def _log_signature(
     *,
     container: str,
     timestamp_text: str,
-    line_index: int,
     content: str,
 ) -> str:
+    """Stable dedupe key for a docker log line.
+
+    Uses container + docker timestamp text + content only. Stream-relative
+    line_index is intentionally excluded so the same log line yields the same
+    signature across reruns with different --since/--until windows.
+    """
     digest = hashlib.sha256()
     digest.update(container.encode("utf-8"))
     digest.update(b"\0")
     digest.update(timestamp_text.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(str(line_index).encode("ascii"))
     digest.update(b"\0")
     digest.update(content.encode("utf-8", errors="replace"))
     return digest.hexdigest()
@@ -656,7 +659,6 @@ def _build_metadata(
         "log_signature": _log_signature(
             container=container,
             timestamp_text=source_entry.timestamp_text,
-            line_index=source_entry.line_index,
             content=source_entry.clean_content,
         ),
         "raw_log_excerpt": raw_excerpt[:1000],

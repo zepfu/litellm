@@ -141,8 +141,18 @@ def _allocate_name_mapping(
     *,
     max_length: int,
 ) -> tuple[dict[str, str], bool]:
-    short_names = {name for name in names if len(name) <= max_length}
-    long_names = [name for name in names if len(name) > max_length]
+    # Deterministic allocation for tool identity / prompt-cache stability:
+    # 1. Prefer the nonce=0 candidate derived from the original name alone so a
+    #    tool keeps the same upstream name across requests whenever that
+    #    preferred candidate is free.
+    # 2. On in-request collisions (preferred candidate taken by a short name or
+    #    another long name), walk nonces in order and assign in sorted-original
+    #    order. Sorting — not set/dict iteration order — is the only tie-break,
+    #    so the same set of originals always yields the same mapping regardless
+    #    of tools[] / input[] order in the request body.
+    unique_names = sorted(set(names))
+    short_names = {name for name in unique_names if len(name) <= max_length}
+    long_names = [name for name in unique_names if len(name) > max_length]
     used_names = set(short_names)
     mapping: dict[str, str] = {}
     collision_fallback_used = False

@@ -26,6 +26,7 @@ from litellm.types.llms.openai import (
     OutputTextDeltaEvent,
     ResponseAPIUsage,
     ResponseCompletedEvent,
+    RESPONSES_API_TERMINAL_STREAM_EVENTS,
     ResponsesAPIRequestParams,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
@@ -166,11 +167,21 @@ class BaseResponsesAPIStreamingIterator:
                                     )
                                     setattr(item, "encrypted_content", wrapped_content)
 
-                # Store the completed response
+                # Store terminal response events (completed / failed / incomplete)
+                # so post-chunk logging runs for non-happy terminal paths too.
+                event_type = (
+                    getattr(openai_responses_api_chunk, "type", None)
+                    if openai_responses_api_chunk
+                    else None
+                )
+                event_type_value = (
+                    event_type.value
+                    if isinstance(event_type, ResponsesAPIStreamEvents)
+                    else event_type
+                )
                 if (
                     openai_responses_api_chunk
-                    and getattr(openai_responses_api_chunk, "type", None)
-                    == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+                    and event_type_value in RESPONSES_API_TERMINAL_STREAM_EVENTS
                 ):
                     self.completed_response = openai_responses_api_chunk
                     # Add cost to usage object if include_cost_in_streaming_usage is True
