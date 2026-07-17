@@ -4271,6 +4271,24 @@ def _flush_session_history_batch_with_retry(
                 retry_write_ahead_spool_path=retry_write_ahead_spool_path,
             ):
                 return
+            # Exhaustion handler could not spool; do not loop forever (B5).
+            failure_text = (
+                _format_exception_for_warning(last_failure)
+                if last_failure is not None
+                else "unknown"
+            )
+            verbose_logger.error(
+                "AawmAgentIdentity: dropping %d session_history records after "
+                "retry exhaustion without durable spool "
+                "(retry_message=%s, retry_count=%d, max_retries=%d, "
+                "last_failure=%s, at_risk_of_loss=true)",
+                len(batch),
+                retry_message,
+                retry_count,
+                max_retries,
+                failure_text,
+            )
+            return
 
         (
             retryable_last_failure,
@@ -4329,6 +4347,15 @@ def _session_history_worker_main() -> None:
                 continue
 
             if first_item is None:
+                # Sentinel: flush any backlog left behind the sentinel (B5).
+                while True:
+                    try:
+                        leftover = _aawm_session_history_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if leftover is None:
+                        continue
+                    _flush_session_history_batch_with_retry([leftover], loop=loop)
                 break
 
             batch: List[Dict[str, Any]] = [first_item]
@@ -4343,6 +4370,17 @@ def _session_history_worker_main() -> None:
                     break
                 if next_item is None:
                     _flush_session_history_batch_with_retry(batch, loop=loop)
+                    # Drain remaining non-sentinel items before exit (B5).
+                    while True:
+                        try:
+                            leftover = _aawm_session_history_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if leftover is None:
+                            continue
+                        _flush_session_history_batch_with_retry(
+                            [leftover], loop=loop
+                        )
                     return
                 batch.append(next_item)
 

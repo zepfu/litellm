@@ -9,13 +9,11 @@ Enable with ``AAWM_CAPTURE_PASSTHROUGH_SHAPES=1``. Artifacts are written under
 in the local dev compose stack.
 
 For targeted investigations that need the complete provider payload, enable
-``AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS=1`` or write a truthy value to
-``/tmp/captures/pass_through_full_payloads.enabled``. Full payload artifacts are
-written under ``/tmp/captures/pass_through_full_payloads`` by default and
-intentionally persist request/response bodies without content redaction.
-Request and response headers are persisted without redaction. The control file
-is checked on each capture attempt, so it can be flipped without restarting the
-proxy process.
+``AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS=1`` or a *trusted* process-owned control
+file (default under world-writable ``/tmp`` is ignored). Full payload artifacts
+persist bodies without content redaction but drop sensitive headers
+(Authorization, cookies, tokens, secrets). Capture dirs use mode ``0700`` and
+artifact files are written atomically mode ``0600``.
 """
 
 import base64
@@ -23,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import threading
 from collections import Counter
 from datetime import datetime, timezone
@@ -151,7 +150,43 @@ def passthrough_shape_capture_enabled() -> bool:
     return _is_truthy(os.environ.get(_ENV_FLAG, ""))
 
 
+def _control_file_is_trusted(control_file: Path) -> bool:
+    """Only honor process-owned control files under non-world-writable parents.
+
+    The default path under world-writable /tmp is intentionally untrusted so
+    a co-located process cannot flip full-payload capture on.
+    """
+    try:
+        file_stat = control_file.stat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(file_stat.st_mode):
+        return False
+    try:
+        if file_stat.st_uid != os.getuid():
+            return False
+    except AttributeError:
+        return False
+    if file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    try:
+        parent = control_file.resolve().parent
+        parent_stat = parent.stat()
+    except OSError:
+        return False
+    try:
+        if parent_stat.st_uid != os.getuid():
+            return False
+    except AttributeError:
+        return False
+    if parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    return True
+
+
 def passthrough_full_payload_capture_enabled() -> bool:
+    if _is_truthy(os.environ.get(_FULL_PAYLOAD_ENV_FLAG, "")):
+        return True
     control_file = Path(
         os.environ.get(
             _FULL_PAYLOAD_CONTROL_FILE_ENV,
@@ -159,11 +194,13 @@ def passthrough_full_payload_capture_enabled() -> bool:
         )
     )
     try:
-        if control_file.exists():
-            return _is_truthy(control_file.read_text(encoding="utf-8"))
+        if not control_file.exists():
+            return False
+        if not _control_file_is_trusted(control_file):
+            return False
+        return _is_truthy(control_file.read_text(encoding="utf-8"))
     except Exception:
-        pass
-    return _is_truthy(os.environ.get(_FULL_PAYLOAD_ENV_FLAG, ""))
+        return False
 
 
 def _split_scope_values(value: str) -> List[str]:
@@ -634,11 +671,19 @@ def _sanitize_headers(headers: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _header_name_is_sensitive(header_name: str) -> bool:
+    normalized_name = str(header_name).lower()
+    return any(term in normalized_name for term in _HEADER_DROP_TERMS)
+
+
 def _full_payload_headers(headers: Optional[Mapping[str, Any]]) -> Dict[str, str]:
+    """Copy headers for full-payload capture, dropping sensitive names."""
     if not headers:
         return {}
     values: Dict[str, str] = {}
     for header_name, header_value in headers.items():
+        if _header_name_is_sensitive(str(header_name)):
+            continue
         values[str(header_name)] = str(header_value)
     return dict(sorted(values.items(), key=lambda item: item[0].lower()))
 
@@ -655,6 +700,7 @@ def _full_payload_header_items(
     return [
         {"name": str(header_name), "value": str(header_value)}
         for header_name, header_value in raw_items
+        if not _header_name_is_sensitive(str(header_name))
     ]
 
 
@@ -1169,26 +1215,72 @@ def _write_artifact(artifact: Dict[str, Any]) -> Optional[str]:
         return None
 
 
+def _ensure_private_dir(path: Path) -> None:
+    """Create path (and parents) with mode 0700; tighten existing dirs."""
+    parts_to_create: List[Path] = []
+    current = path
+    while not current.exists():
+        parts_to_create.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for directory in reversed(parts_to_create):
+        try:
+            directory.mkdir(mode=0o700, exist_ok=True)
+        except FileExistsError:
+            pass
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+    if path.exists():
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+
+
+def _atomic_write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Atomically write JSON with mode 0600 at creation (no write-then-chmod)."""
+    serialized = json.dumps(payload, indent=2, sort_keys=True, default=str)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{_next_counter()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(str(tmp_path), flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _write_full_payload_artifact(artifact: Dict[str, Any]) -> Optional[str]:
     if not passthrough_full_payload_capture_enabled():
         return None
     try:
         capture_dir = _full_payload_capture_dir()
-        capture_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(capture_dir)
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         counter = _next_counter()
         provider = _sanitize_filename_part(artifact.get("provider"))
         mode = _sanitize_filename_part(artifact.get("mode"))
         call_id = _sanitize_filename_part(artifact.get("litellm_call_id"))[:18]
         path = capture_dir / f"{ts}_{counter:04d}_{provider}_{mode}_{call_id}.json"
-        path.write_text(
-            json.dumps(artifact, indent=2, sort_keys=True, default=str),
-            encoding="utf-8",
-        )
-        try:
-            path.chmod(0o600)
-        except Exception:
-            pass
+        _atomic_write_private_json(path, artifact)
         return str(path)
     except Exception as exc:
         verbose_proxy_logger.warning(
