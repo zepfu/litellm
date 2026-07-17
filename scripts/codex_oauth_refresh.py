@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from litellm.secret_managers.credential_file_lock import credential_file_lock
+
 import base64
 import json
 import os
@@ -173,7 +175,10 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
 
 @contextmanager
 def _credential_file_lock(lock_path: Path) -> Iterator[None]:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    """Delegate to shared credential_file_lock (fcntl + warning on failure)."""
+    with credential_file_lock(lock_path):
+        yield
+
     handle = lock_path.open("a+", encoding="utf-8")
     try:
         try:

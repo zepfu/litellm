@@ -1,3 +1,4 @@
+from litellm.secret_managers.credential_file_lock import credential_file_lock
 import asyncio
 from contextlib import contextmanager
 import json
@@ -676,7 +677,10 @@ async def _get_xai_oauth_access_token_locked(
 
 @contextmanager
 def _credential_file_lock(lock_path: Optional[Path]) -> Iterator[None]:
-    if lock_path is None:
+    """Delegate to shared credential_file_lock (fcntl + warning on failure)."""
+    with credential_file_lock(lock_path):
+        yield
+
         yield
         return
 
