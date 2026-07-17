@@ -142,23 +142,23 @@ class VertexAIBatchTransformation:
         Gets the output file id from the Vertex AI Batch response
         """
 
-        output_file_id: str = (
-            response.get("outputInfo", OutputInfo()).get("gcsOutputDirectory", "")
-            + "/predictions.jsonl"
+        gcs_output_directory = (
+            response.get("outputInfo", OutputInfo()).get("gcsOutputDirectory", "") or ""
         )
-        if output_file_id != "/predictions.jsonl":
-            return output_file_id
+        gcs_output_directory = str(gcs_output_directory).rstrip("/")
+        if gcs_output_directory:
+            return f"{gcs_output_directory}/predictions.jsonl"
 
         output_config = response.get("outputConfig")
         if output_config is None:
-            return output_file_id
+            return "/predictions.jsonl"
 
         gcs_destination = output_config.get("gcsDestination")
         if gcs_destination is None:
-            return output_file_id
+            return "/predictions.jsonl"
 
-        output_uri_prefix = gcs_destination.get("outputUriPrefix", "")
-        return output_uri_prefix
+        output_uri_prefix = gcs_destination.get("outputUriPrefix", "") or ""
+        return str(output_uri_prefix).rstrip("/")
 
     @classmethod
     def _get_batch_job_status_from_vertex_ai_batch_response(

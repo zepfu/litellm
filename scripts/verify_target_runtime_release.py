@@ -435,14 +435,36 @@ def _run_session_history_lane(
         ev["db_name"] = db_name
         return 2, ev
 
-    row, _ = query_session_history_row(
-        dsn=dsn,
-        db_name=db_name,
-        marker_id=marker_id,
-        session_id=(args.session_id or "").strip() or None,
-        trace_id=(args.trace_id or "").strip() or None,
-        litellm_call_id=(args.litellm_call_id or "").strip() or None,
-    )
+    try:
+        row, _ = query_session_history_row(
+            dsn=dsn,
+            db_name=db_name,
+            marker_id=marker_id,
+            session_id=(args.session_id or "").strip() or None,
+            trace_id=(args.trace_id or "").strip() or None,
+            litellm_call_id=(args.litellm_call_id or "").strip() or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface redacted DB failures only
+        # Never print raw DSN (may embed password from AAWM_DB_*).
+        redacted = redact_text(str(exc))
+        # Also strip any accidental embedding of the full DSN string.
+        if dsn:
+            redacted = redacted.replace(dsn, "<redacted-dsn>")
+        ev = _failure_evidence(
+            target=target,
+            reason=f"session-history query failed ({type(exc).__name__}): {redacted}",
+            workspace_root=workspace_root,
+            lanes_requested=lanes_requested,
+        )
+        ev.update(
+            {
+                "db_name": db_name,
+                "dsn_source": dsn_source,
+                "marker_id": marker_id,
+                "http_success_not_accepted": True,
+            }
+        )
+        return 2, ev
     if row is None:
         ev = _failure_evidence(
             target=target,
