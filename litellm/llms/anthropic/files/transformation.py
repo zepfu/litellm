@@ -34,7 +34,11 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.utils import LlmProviders
 
-from ..common_utils import AnthropicError, AnthropicModelInfo
+from ..common_utils import (
+    AnthropicError,
+    AnthropicModelInfo,
+    optionally_handle_anthropic_oauth,
+)
 
 ANTHROPIC_FILES_API_BASE = "https://api.anthropic.com"
 ANTHROPIC_FILES_BETA_HEADER = "files-api-2025-04-14"
@@ -105,6 +109,10 @@ class AnthropicFilesConfig(BaseFilesConfig):
                 "anthropic-version": "2023-06-01",
                 "anthropic-beta": ANTHROPIC_FILES_BETA_HEADER,
             }
+        )
+        # OAuth tokens (sk-ant-oat*) use Authorization: Bearer, not x-api-key
+        headers, _ = optionally_handle_anthropic_oauth(
+            headers=headers, api_key=api_key
         )
         return headers
 

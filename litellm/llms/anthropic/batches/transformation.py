@@ -10,6 +10,8 @@ from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.openai import AllMessageValues, CreateBatchRequest
 from litellm.types.utils import LiteLLMBatch, LlmProviders, ModelResponse
 
+from ..common_utils import optionally_handle_anthropic_oauth
+
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 
@@ -58,6 +60,10 @@ class AnthropicBatchesConfig(BaseBatchesConfig):
         if "anthropic-beta" not in headers:
             headers["anthropic-beta"] = "message-batches-2024-09-24"
         headers.update(_headers)
+        # OAuth tokens (sk-ant-oat*) use Authorization: Bearer, not x-api-key
+        headers, _ = optionally_handle_anthropic_oauth(
+            headers=headers, api_key=api_key
+        )
         return headers
 
     def get_complete_batch_url(
