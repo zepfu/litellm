@@ -4,6 +4,7 @@ Helper functions for health check calls.
 
 from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional
 
+from litellm.litellm_core_utils.health_check_utils import _filter_model_params
 from litellm.types.utils import LIST_BATCHES_SUPPORTED_PROVIDERS
 
 if TYPE_CHECKING:
@@ -90,8 +91,6 @@ class HealthCheckHelpers:
         model_params: dict,
         custom_llm_provider: str,
     ) -> dict:
-        from litellm.litellm_core_utils.health_check_utils import _filter_model_params
-
         filtered_params = _filter_model_params(model_params=model_params)
         filtered_params.pop("max_tokens", None)
 
@@ -103,8 +102,6 @@ class HealthCheckHelpers:
 
     @staticmethod
     def _get_rerank_health_check_params(model_params: dict) -> dict:
-        from litellm.litellm_core_utils.health_check_utils import _filter_model_params
-
         filtered_params = _filter_model_params(model_params=model_params)
         filtered_params.pop("max_tokens", None)
         return filtered_params
@@ -173,7 +170,6 @@ class HealthCheckHelpers:
         from litellm.litellm_core_utils.audio_utils.utils import (
             get_audio_file_for_health_check,
         )
-        from litellm.litellm_core_utils.health_check_utils import _filter_model_params
         from litellm.realtime_api.main import _realtime_health_check
 
         return {
