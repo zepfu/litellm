@@ -68,7 +68,9 @@ sequenceDiagram
 
 - Request body
 - Response body
-- Provider-specific parameters## AAWM shared pass-through request engine (RR-056)
+- Provider-specific parameters
+
+## AAWM shared pass-through request engine (RR-056)
 
 `pass_through_endpoints.py` is the shared HTTP/WebSocket pass-through core used
 by provider routes. Operator-facing behaviors that are easy to miss:
