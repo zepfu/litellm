@@ -1285,6 +1285,146 @@ def extract_images_from_message(message: AllMessageValues) -> List[str]:
     return images
 
 
+# Object-key identifiers auto-quoted when found outside string literals.
+# Intentionally narrow (ASCII identifiers) to match the historical regex repair.
+_BARE_OBJECT_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
+
+
+def _try_quote_bare_object_key_at(
+    candidate: str, start: int
+) -> Optional[Tuple[str, int]]:
+    """
+    If ``candidate[start:]`` begins with a bare object key followed by ``:``,
+    return ``(quoted_key, next_index)`` where ``next_index`` points at the
+    colon (after any optional stray closing quote). Otherwise return ``None``.
+    """
+    if start < len(candidate) and candidate[start] == '"':
+        return None
+    key_match = _BARE_OBJECT_KEY_RE.match(candidate, start)
+    if key_match is None:
+        return None
+    j = key_match.end()
+    # Optional trailing quote (malformed ``{command": ...``).
+    has_closing_quote = j < len(candidate) and candidate[j] == '"'
+    colon_idx = j + 1 if has_closing_quote else j
+    k = colon_idx
+    while k < len(candidate) and candidate[k].isspace():
+        k += 1
+    if k >= len(candidate) or candidate[k] != ":":
+        return None
+    return f'"{key_match.group(0)}"', colon_idx
+
+
+def _copy_whitespace(candidate: str, start: int, out: list[str]) -> int:
+    i = start
+    while i < len(candidate) and candidate[i].isspace():
+        out.append(candidate[i])
+        i += 1
+    return i
+
+
+def _maybe_emit_bare_object_key(
+    candidate: str, i: int, out: list[str]
+) -> int:
+    """Skip whitespace then optionally quote a bare object key at ``i``."""
+    i = _copy_whitespace(candidate, i, out)
+    quoted = _try_quote_bare_object_key_at(candidate, i)
+    if quoted is None:
+        return i
+    key, next_i = quoted
+    out.append(key)
+    return next_i
+
+
+def _quote_bare_object_keys(candidate: str) -> str:
+    """
+    Quote bare object keys at structural object-key positions.
+
+    Rewrites only when not inside a string literal and only at object-key
+    positions (immediately after ``{``, or after ``,`` while the structural
+    stack top is an object). Patterns inside already-quoted string values
+    (e.g. ``"urgent, action: required"``) or after commas inside arrays
+    (e.g. ``[1, two: 3]``) are left alone.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(candidate)
+    in_string = False
+    escape_next = False
+    # Track container nesting: "{" for object, "[" for array.
+    stack: list[str] = []
+
+    while i < n:
+        ch = candidate[i]
+
+        if in_string:
+            out.append(ch)
+            if escape_next:
+                escape_next = False
+            elif ch == "\\":
+                escape_next = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "{":
+            out.append(ch)
+            stack.append("{")
+            i = _maybe_emit_bare_object_key(candidate, i + 1, out)
+            continue
+
+        if ch == "[":
+            out.append(ch)
+            stack.append("[")
+            i += 1
+            continue
+
+        if ch in "}]":
+            if stack and (
+                (ch == "}" and stack[-1] == "{")
+                or (ch == "]" and stack[-1] == "[")
+            ):
+                stack.pop()
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "," and stack and stack[-1] == "{":
+            out.append(ch)
+            i = _maybe_emit_bare_object_key(candidate, i + 1, out)
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _repair_missing_key_quotes(candidate: str) -> Optional[Any]:
+    """
+    Fail-safe bare-key quote repair.
+
+    Returns the parsed JSON value when rewriting bare object keys yields valid
+    JSON; otherwise ``None`` so callers keep the original candidate.
+    """
+    import json
+
+    repaired_candidate = _quote_bare_object_keys(candidate)
+    if repaired_candidate == candidate:
+        return None
+    try:
+        return json.loads(repaired_candidate)
+    except json.JSONDecodeError:
+        return None
+
+
 def _attempt_json_repair(s: str) -> Optional[Any]:
     """
     Attempt to repair malformed JSON produced by LLM tool calls.
@@ -1294,22 +1434,14 @@ def _attempt_json_repair(s: str) -> Optional[Any]:
     a narrow malformed-key pattern we see from some tool-calling providers
     (for example ``{command": "date -u"}``).
 
+    Bare-object-key quoting is string-literal and object-position aware: it
+    only rewrites identifier keys outside strings and only at object-key
+    positions. If a rewrite still cannot be parsed, repair returns ``None``
+    (fail closed) so callers keep the original text.
+
     Returns the parsed value on success, or None if repair fails.
     """
     import json
-
-    def _repair_missing_key_quotes(candidate: str) -> Optional[Any]:
-        repaired_candidate = re.sub(
-            r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_.-]*)(")?(\s*:)',
-            r'\1"\2"\4',
-            candidate,
-        )
-        if repaired_candidate == candidate:
-            return None
-        try:
-            return json.loads(repaired_candidate)
-        except json.JSONDecodeError:
-            return None
 
     stripped = s.rstrip()
     if not stripped:
@@ -1364,6 +1496,7 @@ def _attempt_json_repair(s: str) -> Optional[Any]:
         return repaired_key_quotes
 
     return None
+
 
 
 def parse_tool_call_arguments(

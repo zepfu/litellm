@@ -1,8 +1,6 @@
 import json
 import os
 import sys
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 sys.path.insert(
@@ -10,9 +8,12 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    _attempt_json_repair,
+    _quote_bare_object_keys,
     add_system_prompt_to_messages,
     get_format_from_file_id,
     handle_any_messages_to_chat_completion_str_messages_conversion,
+    parse_tool_call_arguments,
     split_concatenated_json_objects,
     update_messages_with_model_file_ids,
 )
@@ -254,3 +255,133 @@ def test_split_concatenated_json_invalid_raises():
     """Completely invalid JSON raises JSONDecodeError."""
     with pytest.raises(json.JSONDecodeError):
         split_concatenated_json_objects("not json at all")
+
+
+
+# ============ RR-020: string-literal/object-position aware key-quote repair ============
+
+
+def test_rr020_missing_key_quote_repair_is_string_literal_aware():
+    """Comma/word/colon sequences inside strings must not be rewritten as keys."""
+    valid = '{"msg": "urgent, action: required", "note": "See config, timeout: 30"}'
+    assert _quote_bare_object_keys(valid) == valid
+    assert _attempt_json_repair(valid) is None
+    assert parse_tool_call_arguments(valid) == {
+        "msg": "urgent, action: required",
+        "note": "See config, timeout: 30",
+    }
+
+    braces_in_string = '{"cmd": "echo {a:1, b:2}, done"}'
+    assert _quote_bare_object_keys(braces_in_string) == braces_in_string
+    assert _attempt_json_repair(braces_in_string) is None
+    assert parse_tool_call_arguments(braces_in_string) == {
+        "cmd": "echo {a:1, b:2}, done"
+    }
+
+
+def test_rr020_preserves_escaped_quotes_and_backslashes_inside_strings():
+    """Escaped quotes / backslashes must not desync string tracking."""
+    escaped_quote = r'{"text": "say \"hi\", action: now", "path": "C:\\tmp"}'
+    assert _quote_bare_object_keys(escaped_quote) == escaped_quote
+    assert _attempt_json_repair(escaped_quote) is None
+    assert parse_tool_call_arguments(escaped_quote) == {
+        "text": 'say "hi", action: now',
+        "path": "C:\\tmp",
+    }
+
+    # Odd number of backslashes before a quote keeps the quote escaped.
+    odd_escape = r'{"a": "x\\\"y, z: w"}'
+    assert _quote_bare_object_keys(odd_escape) == odd_escape
+    assert _attempt_json_repair(odd_escape) is None
+    assert parse_tool_call_arguments(odd_escape) == {"a": 'x\\"y, z: w'}
+
+    # Bare key after a string that contains lookalike comma/colon patterns.
+    mixed = r'{"msg": "path\\, action: keep", bare: 1}'
+    assert _attempt_json_repair(mixed) == {"msg": "path\\, action: keep", "bare": 1}
+
+
+def test_rr020_braces_and_commas_inside_strings_do_not_change_structure():
+    nested_braces = '{"x": "use {foo: bar, baz: {q:1}}"}'
+    assert _quote_bare_object_keys(nested_braces) == nested_braces
+    assert _attempt_json_repair(nested_braces) is None
+    assert parse_tool_call_arguments(nested_braces) == {
+        "x": "use {foo: bar, baz: {q:1}}"
+    }
+
+    # Unmatched { / [ only inside a string must not trigger bracket repair.
+    openers_in_string = '{"x": "open { and [ here"}'
+    assert _attempt_json_repair(openers_in_string) is None
+    assert parse_tool_call_arguments(openers_in_string) == {
+        "x": "open { and [ here"
+    }
+
+
+def test_rr020_repairs_bare_and_half_quoted_object_keys():
+    assert _attempt_json_repair('{command": "date -u"}') == {"command": "date -u"}
+    assert _attempt_json_repair('{command: "date -u", retries: 2}') == {
+        "command": "date -u",
+        "retries": 2,
+    }
+    assert _attempt_json_repair('{"ok": 1, bare: true, empty: null}') == {
+        "ok": 1,
+        "bare": True,
+        "empty": None,
+    }
+
+
+def test_rr020_nested_objects_and_arrays_with_bare_keys():
+    nested = '{a: {b: [{c: 1}, {d: "x, y: z"}]}}'
+    assert _attempt_json_repair(nested) == {
+        "a": {"b": [{"c": 1}, {"d": "x, y: z"}]}
+    }
+    truncated = (
+        '{meta: {note: "urgent, action: required"}, '
+        'command: "x", count: 1'
+    )
+    assert _attempt_json_repair(truncated) == {
+        "meta": {"note": "urgent, action: required"},
+        "command": "x",
+        "count": 1,
+    }
+    assert _attempt_json_repair('{"items": [{id: 1}, {id: 2}') == {
+        "items": [{"id": 1}, {"id": 2}]
+    }
+
+
+def test_rr020_array_commas_are_not_object_key_positions():
+    """Comma separators inside arrays must not be treated as object-key sites."""
+    false_array_keys = "[1, two: 3]"
+    assert _quote_bare_object_keys(false_array_keys) == false_array_keys
+    assert _attempt_json_repair(false_array_keys) is None
+
+    # Bare keys inside objects that are array elements still repair.
+    assert _attempt_json_repair("[{a: 1}, {b: 2}]") == [{"a": 1}, {"b": 2}]
+
+
+def test_rr020_fail_closed_for_unrepairable_malformed_input():
+    """If quoting bare keys is insufficient, return None (do not surface corruption)."""
+    assert _attempt_json_repair("{a: 1, b}") is None
+    assert _attempt_json_repair("{command: date}") is None
+    assert _attempt_json_repair("{'command': 'x'}") is None
+    assert _attempt_json_repair('{1: "x"}') is None
+    assert _attempt_json_repair('{"a":1}{"b":2}') is None
+    assert _attempt_json_repair('{a: [b, c]}') is None
+    assert _attempt_json_repair('{"key": "incomplete value') is None
+
+
+def test_rr020_already_valid_json_is_identity_no_repair():
+    """Valid JSON must not be rewritten; _attempt_json_repair returns None."""
+    samples = [
+        "{}",
+        "[]",
+        '{"a": 1}',
+        '{"a": [{"b": {"c": 1}}]}',
+        '{"msg": "urgent, action: required"}',
+        r'{"t": "say \"hi\", action: now"}',
+        '{"cmd": "echo {a:1, b:2}"}',
+    ]
+    for raw in samples:
+        assert _quote_bare_object_keys(raw) == raw
+        assert _attempt_json_repair(raw) is None
+        # parse_tool_call_arguments still returns the normal loads() result
+        assert parse_tool_call_arguments(raw) == json.loads(raw)

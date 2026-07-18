@@ -1511,6 +1511,166 @@ def test_attempt_json_repair_missing_opening_key_quote():
     assert result == {"command": "date -u"}
 
 
+def test_attempt_json_repair_fully_bare_object_keys():
+    """Repair tool-call JSON where object keys have no quotes at all."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+    )
+
+    malformed = '{command: "date -u", retries: 2}'
+    result = _attempt_json_repair(malformed)
+    assert result is not None
+    assert result == {"command": "date -u", "retries": 2}
+
+
+def test_attempt_json_repair_does_not_rewrite_colon_patterns_inside_strings():
+    """String values with comma/word/colon must not be treated as object keys."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+        parse_tool_call_arguments,
+    )
+
+    # Valid JSON: repair helper should leave it alone (no change).
+    valid = '{"msg": "urgent, action: required", "note": "See config, timeout: 30"}'
+    assert _attempt_json_repair(valid) is None
+    assert parse_tool_call_arguments(valid) == {
+        "msg": "urgent, action: required",
+        "note": "See config, timeout: 30",
+    }
+
+    # Truncated valid structure: bracket repair must preserve string contents
+    # that look like bare-key patterns.
+    truncated = (
+        '{"msg": "urgent, action: required", '
+        '"note": "See config, timeout: 30", "count": 1'
+    )
+    result = _attempt_json_repair(truncated)
+    assert result is not None
+    assert result == {
+        "msg": "urgent, action: required",
+        "note": "See config, timeout: 30",
+        "count": 1,
+    }
+
+    # Malformed bare key plus in-string lookalike patterns.
+    malformed = '{command": "urgent, action: required", note: "See config, timeout: 30"}'
+    result = _attempt_json_repair(malformed)
+    assert result is not None
+    assert result == {
+        "command": "urgent, action: required",
+        "note": "See config, timeout: 30",
+    }
+
+
+def test_attempt_json_repair_nested_bare_keys_with_string_lookalikes():
+    """Nested bare keys plus in-string lookalikes must both be handled correctly."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+    )
+
+    malformed = '{meta: {note: "urgent, action: required"}, command: "x"}'
+    result = _attempt_json_repair(malformed)
+    assert result == {
+        "meta": {"note": "urgent, action: required"},
+        "command": "x",
+    }
+
+    truncated = (
+        '{meta: {note: "urgent, action: required"}, '
+        'command: "x", count: 1'
+    )
+    result = _attempt_json_repair(truncated)
+    assert result == {
+        "meta": {"note": "urgent, action: required"},
+        "command": "x",
+        "count": 1,
+    }
+
+
+def test_attempt_json_repair_preserves_escaped_string_lookalikes():
+    """Escaped quotes / backslashes must not break string tracking."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+        parse_tool_call_arguments,
+    )
+
+    valid = r'{"text": "say \"hi\", action: now", "path": "C:\\tmp"}'
+    assert _attempt_json_repair(valid) is None
+    assert parse_tool_call_arguments(valid) == {
+        "text": 'say "hi", action: now',
+        "path": "C:\\tmp",
+    }
+
+    mixed = r'{"msg": "path\\, action: keep", bare: 1}'
+    result = _attempt_json_repair(mixed)
+    assert result == {"msg": "path\\, action: keep", "bare": 1}
+
+
+def test_attempt_json_repair_array_of_bare_key_objects():
+    """Bare keys inside array elements should still be repaired."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+    )
+
+    assert _attempt_json_repair("[{a: 1}, {b: 2}]") == [{"a": 1}, {"b": 2}]
+    assert _attempt_json_repair('{"items": [{id: 1}, {id: 2}]}') == {
+        "items": [{"id": 1}, {"id": 2}]
+    }
+
+
+def test_attempt_json_repair_mixed_quoted_and_bare_keys():
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+    )
+
+    assert _attempt_json_repair('{"ok": 1, bare: 2}') == {"ok": 1, "bare": 2}
+    assert _attempt_json_repair('{"outer": {inner: 1}}') == {"outer": {"inner": 1}}
+
+
+def test_attempt_json_repair_fails_safe_for_unrepairable_bare_fragments():
+    """Incomplete bare-key fragments that remain invalid must return None."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+    )
+
+    assert _attempt_json_repair("{a: 1, b}") is None
+    assert _attempt_json_repair("{command: date}") is None
+    assert _attempt_json_repair("{1: \"x\"}") is None
+
+
+def test_attempt_json_repair_array_commas_are_not_object_key_positions():
+    """Array commas must not be treated as object-key separators (RR-020)."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+        _quote_bare_object_keys,
+    )
+
+    false_array_keys = "[1, two: 3]"
+    assert _quote_bare_object_keys(false_array_keys) == false_array_keys
+    assert _attempt_json_repair(false_array_keys) is None
+
+
+def test_attempt_json_repair_valid_json_identity_with_nested_and_escapes():
+    """Already-valid nested/escaped JSON must remain untouched (repair returns None)."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import (
+        _attempt_json_repair,
+        _quote_bare_object_keys,
+        parse_tool_call_arguments,
+    )
+    import json as _json
+
+    samples = [
+        '{"a": [{"b": {"c": 1}}]}',
+        r'{"t": "say \"hi\", action: now"}',
+        '{"x": "use {foo: bar, baz: {q:1}}"}',
+        '{"x": "open { and [ here"}',
+    ]
+    for raw in samples:
+        assert _quote_bare_object_keys(raw) == raw
+        assert _attempt_json_repair(raw) is None
+        assert parse_tool_call_arguments(raw) == _json.loads(raw)
+
+
 def test_attempt_json_repair_returns_none_for_unterminated_string():
     """Cannot repair an unterminated string — returns None."""
     from litellm.litellm_core_utils.prompt_templates.common_utils import (
