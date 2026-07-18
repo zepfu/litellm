@@ -2,7 +2,6 @@ import os
 import sys
 
 import pytest
-from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.abspath("../../../../.."))
 
@@ -145,9 +144,13 @@ async def test_async_anthropic_sse_wrapper():
 
     # Get the first chunk from the async SSE wrapper
     first_chunk = None
-    async for chunk in wrapper.async_anthropic_sse_wrapper():
-        first_chunk = chunk
-        break
+    stream = wrapper.async_anthropic_sse_wrapper()
+    try:
+        async for chunk in stream:
+            first_chunk = chunk
+            break
+    finally:
+        await stream.aclose()
 
     # Verify it's bytes and properly formatted
     assert first_chunk is not None

@@ -14,6 +14,7 @@ import hashlib
 import inspect
 import os
 import secrets
+import sys
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union, cast
 
@@ -88,7 +89,7 @@ from litellm.proxy.utils import (
     get_server_root_path,
 )
 from litellm.secret_managers.main import get_secret_bool, str_to_bool
-from litellm.types.proxy.management_endpoints.ui_sso import *  # noqa: F403, F401
+from litellm.types.proxy.management_endpoints import ui_sso as _ui_sso_types
 from litellm.types.proxy.management_endpoints.ui_sso import (
     DefaultTeamSSOParams,
     MicrosoftGraphAPIUserGroupDirectoryObject,
@@ -98,6 +99,13 @@ from litellm.types.proxy.management_endpoints.ui_sso import (
     TeamMappings,
 )
 from litellm.types.proxy.ui_sso import ParsedOpenIDResult
+
+_UI_SSO_PUBLIC_TYPE_NAMES = tuple(
+    name for name in vars(_ui_sso_types) if not name.startswith("_")
+)
+_UI_SSO_MODULE = sys.modules[__name__]
+for _name in _UI_SSO_PUBLIC_TYPE_NAMES:
+    setattr(_UI_SSO_MODULE, _name, getattr(_ui_sso_types, _name))
 
 if TYPE_CHECKING:
     from fastapi_sso.sso.base import OpenID

@@ -916,7 +916,8 @@ class TestResponsesAdapterToolChoice:
             "emit all independent function calls together"
             in updated_body["instructions"]
         )
-        assert "You are Claude Code, Anthropic's official CLI" not in updated_body[
+        # RR-054 #20: original system prompt is preserved after the policy block.
+        assert "You are Claude Code, Anthropic's official CLI" in updated_body[
             "instructions"
         ]
         assert changes["openai_adapter_parallel_instruction_policy_applied"] is True
@@ -2184,10 +2185,10 @@ class TestGoogleOAuthFallbacks:
             }
 
         with patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_google_oauth_credentials",
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.google_oauth._load_local_google_oauth_credentials",
             new=AsyncMock(return_value=(expired_auth, auth_path)),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._refresh_local_google_oauth_credentials",
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.google_oauth._refresh_local_google_oauth_credentials",
             new=AsyncMock(side_effect=refresh_credentials),
         ) as refresh_mock:
             tokens = await asyncio.gather(
@@ -3630,6 +3631,7 @@ class TestGoogleAdapterRequestShapePolicy:
             "run_shell_command": "Bash",
             "read_file": "Read",
             "grep_search": "Grep",
+            "__aawm_scope_key__": "native-session-1",
         }
         assert changes["google_native_tool_aliases"] == [
             "grep_search",
@@ -3872,6 +3874,7 @@ class TestGoogleAdapterRequestShapePolicy:
             "toolu_vrtx_exec",
             "exec_command",
             "{\"cmd\":\"pwd\"}",
+            scope_key="codex-leading-tool-result",
         )
 
         try:
@@ -4806,21 +4809,26 @@ class TestGoogleAdapterRequestShapePolicy:
         assert artifact["capture_scope"] == "upstream_http_transaction"
         assert artifact["request"]["method"] == "POST"
         assert artifact["request"]["url"] == "https://cli-chat-proxy.grok.com/v1/billing"
-        assert (
-            artifact["request"]["headers"]["authorization"]
-            == "Bearer upstream-request-token"
-        )
-        assert artifact["request"]["headers"]["x-xai-token-auth"] == "request-xai-token"
+        request_headers = {
+            str(key).lower(): value
+            for key, value in artifact["request"]["headers"].items()
+        }
+        response_headers = {
+            str(key).lower(): value
+            for key, value in artifact["response"]["headers"].items()
+        }
+        assert "authorization" not in request_headers
+        assert "x-xai-token-auth" not in request_headers
+        assert request_headers["content-type"] == "application/json"
         assert artifact["request"]["body"]["json"]["prompt"] == (
             "persist this full upstream request body"
         )
         assert artifact["response"]["body"]["json"]["config"]["used"]["val"] == 91
-        assert artifact["response"]["headers"]["authorization"] == (
-            "Bearer upstream-response-token"
-        )
-        assert "upstream-request-token" in rendered
-        assert "upstream-response-token" in rendered
-        assert "content-type" in artifact["response"]["headers"]
+        assert "authorization" not in response_headers
+        assert response_headers["content-type"] == "application/json"
+        assert "upstream-request-token" not in rendered
+        assert "upstream-response-token" not in rendered
+        assert "request-xai-token" not in rendered
 
         control_file.write_text("0", encoding="utf-8")
         assert passthrough_full_payload_capture_enabled() is False
@@ -4923,14 +4931,19 @@ class TestGoogleAdapterRequestShapePolicy:
         stream = artifact["response"]["stream"]
         assert artifact["capture_kind"] == "aawm_passthrough_full_payload"
         assert artifact["capture_scope"] == "upstream_http_transaction"
-        assert (
-            artifact["request"]["headers"]["authorization"]
-            == "Bearer stream-request-token"
-        )
-        assert artifact["request"]["headers"]["x-xai-token-auth"] == "stream-xai-token"
-        assert artifact["response"]["headers"]["authorization"] == (
-            "Bearer stream-response-token"
-        )
+        request_headers = {
+            str(key).lower(): value
+            for key, value in artifact["request"]["headers"].items()
+        }
+        response_headers = {
+            str(key).lower(): value
+            for key, value in artifact["response"]["headers"].items()
+        }
+        assert "authorization" not in request_headers
+        assert "x-xai-token-auth" not in request_headers
+        assert request_headers["content-type"] == "application/json"
+        assert "authorization" not in response_headers
+        assert response_headers["x-ratelimit-remaining-requests"] == "895"
         assert artifact["request"]["body"]["json"]["model"] == (
             "grok-composer-2.5-fast"
         )
@@ -4941,6 +4954,9 @@ class TestGoogleAdapterRequestShapePolicy:
         decoded_last_chunk = base64.b64decode(stream["raw_chunks_base64"][-1])
         assert b'"usage":{"input_tokens":3,"output_tokens":4}' in decoded_last_chunk
         assert "persist streamed upstream request body" in rendered
+        assert "stream-request-token" not in rendered
+        assert "stream-response-token" not in rendered
+        assert "stream-xai-token" not in rendered
         assert "should-not-appear" not in rendered
 
     @pytest.mark.asyncio
@@ -5866,6 +5882,8 @@ class TestPassThroughRequestRetryableFailures:
 
     @staticmethod
     def _restore_verbose_proxy_logger(saved_handlers, saved_level, saved_propagate):
+        for handler in verbose_proxy_logger.handlers:
+            handler.flush()
         verbose_proxy_logger.handlers.clear()
         for saved_handler in saved_handlers:
             verbose_proxy_logger.addHandler(saved_handler)
@@ -6194,6 +6212,9 @@ class TestPassThroughRequestRetryableFailures:
             ), patch(
                 "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
             ) as mock_get_client, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
+                new=AsyncMock(),
+            ), patch(
                 "litellm.proxy.proxy_server.proxy_logging_obj"
             ) as mock_logging_obj:
                 mock_client_obj = MagicMock()
@@ -7203,7 +7224,9 @@ class TestPassThroughRequestRetryableFailures:
             new_callable=AsyncMock,
         ) as mock_success_handler:
             mock_client = MagicMock()
-            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_built_request = MagicMock()
+            mock_client.build_request.return_value = mock_built_request
+            mock_client.send = AsyncMock(return_value=mock_httpx_response)
             mock_client_obj = MagicMock()
             mock_client_obj.client = mock_client
             mock_get_client.return_value = mock_client_obj
@@ -7221,7 +7244,7 @@ class TestPassThroughRequestRetryableFailures:
                 stream=False,
             )
 
-            sent_json = mock_client.request.call_args.kwargs["json"]
+            sent_json = mock_client.build_request.call_args.kwargs["json"]
             assert sent_json["tools"][0]["parameters"] == {
                 "type": "object",
                 "properties": {},
@@ -7457,7 +7480,8 @@ class TestPassThroughRequestRetryableFailures:
             new_callable=AsyncMock,
         ):
             mock_client = MagicMock()
-            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client.build_request.return_value = MagicMock()
+            mock_client.send = AsyncMock(return_value=mock_httpx_response)
             mock_client_obj = MagicMock()
             mock_client_obj.client = mock_client
             mock_get_client.return_value = mock_client_obj
@@ -7475,7 +7499,7 @@ class TestPassThroughRequestRetryableFailures:
                 stream=False,
             )
 
-        sent_json = mock_client.request.call_args.kwargs["json"]
+        sent_json = mock_client.build_request.call_args.kwargs["json"]
         assert sent_json["model"] == "gpt-5.4"
         assert sent_json["temperature"] == 0.7
         assert sent_json["messages"] is custom_body["messages"]
@@ -7523,7 +7547,8 @@ class TestPassThroughRequestRetryableFailures:
             new_callable=AsyncMock,
         ):
             mock_client = MagicMock()
-            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client.build_request.return_value = MagicMock()
+            mock_client.send = AsyncMock(return_value=mock_httpx_response)
             mock_client_obj = MagicMock()
             mock_client_obj.client = mock_client
             mock_get_client.return_value = mock_client_obj
@@ -7541,7 +7566,7 @@ class TestPassThroughRequestRetryableFailures:
                 stream=False,
             )
 
-        assert mock_client.request.call_args.kwargs["json"] == {}
+        assert mock_client.build_request.call_args.kwargs["json"] == {}
         assert "litellm_metadata" in custom_body
         assert "litellm_logging_obj" in custom_body
         assert "input_cost_per_token" in custom_body
@@ -7619,7 +7644,8 @@ class TestPassThroughRequestRetryableFailures:
             Logging, "update_messages", capture_update_messages
         ), patch.object(Logging, "pre_call", capture_pre_call):
             mock_client = MagicMock()
-            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client.build_request.return_value = MagicMock()
+            mock_client.send = AsyncMock(return_value=mock_httpx_response)
             mock_client_obj = MagicMock()
             mock_client_obj.client = mock_client
             mock_get_client.return_value = mock_client_obj
@@ -7685,7 +7711,8 @@ class TestPassThroughRequestRetryableFailures:
             new_callable=AsyncMock,
         ) as mock_success_handler:
             mock_client = MagicMock()
-            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client.build_request.return_value = MagicMock()
+            mock_client.send = AsyncMock(return_value=mock_httpx_response)
             mock_client_obj = MagicMock()
             mock_client_obj.client = mock_client
             mock_get_client.return_value = mock_client_obj
@@ -7706,7 +7733,7 @@ class TestPassThroughRequestRetryableFailures:
                 passthrough_logging_metadata=logging_metadata,
             )
 
-        sent_request = mock_client.request.call_args.kwargs
+        sent_request = mock_client.build_request.call_args.kwargs
         assert sent_request["content"] == b"\x00\x01trace"
         assert "json" not in sent_request
 
@@ -8746,7 +8773,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert response is translated_response
         assert mock_pass_through.await_args.kwargs[
             "retryable_upstream_status_codes"
-        ] == [429]
+        ] == [429, 500, 502, 503, 504]
         assert (
             mock_pass_through.await_args.kwargs["caller_managed_hidden_retry"]
             is False
@@ -8800,7 +8827,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert response is translated_response
         assert mock_pass_through.await_args.kwargs[
             "retryable_upstream_status_codes"
-        ] == [429, *_AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES]
+        ] == _AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES
         assert mock_pass_through.await_args.kwargs[
             "caller_managed_hidden_retry"
         ] is True
@@ -9106,7 +9133,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prime_google_code_assist_session",
             new=AsyncMock(return_value=None),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_google_code_assist_request_from_completion_kwargs",
+            "litellm.llms.anthropic.experimental_pass_through.providers.google.shaping._build_google_code_assist_request_from_completion_kwargs",
             new=AsyncMock(
                 return_value=(
                     {
@@ -9640,7 +9667,9 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert "non-empty `cmd` string" in system_text
         assert request_payload["contents"][0]["role"] == "user"
         assert completion_messages[0]["role"] == "user"
-        assert tool_name_mapping == {}
+        assert tool_name_mapping == {
+            "__aawm_scope_key__": "codex-openai-chat-session"
+        }
         assert (
             changes["google_adapter_codex_developer_messages_as_system_count"]
             == 1
@@ -9772,6 +9801,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "call_exec",
             "exec_command",
             '{"cmd":"printf codex-gemini-tool-smoke"}',
+            scope_key="codex-gemini-intervening-tool-pair",
         )
 
         try:
@@ -9894,11 +9924,13 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "call_exec",
             "exec_command",
             '{"cmd":',
+            scope_key="codex-tool-followup-session",
         )
         _remember_codex_google_code_assist_tool_call_name(
             "call_exec",
             None,
             '"printf codex-gemini-tool-smoke"}',
+            scope_key="codex-tool-followup-session",
         )
 
         try:
@@ -10051,7 +10083,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             }
 
         with patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._restore_google_adapter_tool_call_names_stream",
+            "litellm.llms.anthropic.experimental_pass_through.providers.google.response_streaming._restore_google_adapter_tool_call_names_stream",
             side_effect=fake_restore,
         ) as mock_restore, patch(
             "litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini.ModelResponseIterator",
@@ -10140,7 +10172,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 }
             ),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_google_code_assist_request_from_completion_kwargs",
+            "litellm.llms.anthropic.experimental_pass_through.providers.google.shaping._build_google_code_assist_request_from_completion_kwargs",
             new=AsyncMock(
                 return_value=(
                     dict(wrapped_body),
@@ -11767,7 +11799,11 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert exc_info.value.detail["error"]["code"] == (
             "aawm_codex_auto_agent_empty_success"
         )
-        assert exc_info.value.detail["error"]["status"] == "RATE_LIMIT_EXCEEDED"
+        assert exc_info.value.type == "upstream_error"
+        assert exc_info.value.code == "502"
+        assert (
+            exc_info.value.detail["error"]["status"] == "EMPTY_SUCCESS_RESPONSE"
+        )
         assert exc_info.value.detail["diagnostic"]["context"]["adapter"] == (
             "codex_auto_agent_google_code_assist"
         )
@@ -12264,7 +12300,7 @@ class TestClaudePersistedOutputExpansion:
         assert call_kwargs["forward_headers"] is False
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> chatgpt.com/backend-api/codex/responses"
+            == b"beta=true"
         )
 
     @pytest.mark.asyncio
@@ -12362,7 +12398,7 @@ class TestClaudePersistedOutputExpansion:
         assert "anthropic-google-completion-adapter" in call_kwargs["custom_body"]["litellm_metadata"]["tags"]
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+            == b"beta=true"
         )
         collect_kwargs = mock_collect_response.await_args.kwargs
         assert collect_kwargs["adapter_model"] == "gemini-3.1-pro-preview"
@@ -12433,7 +12469,7 @@ class TestClaudePersistedOutputExpansion:
         assert call_kwargs["stream"] is True
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+            == b"beta=true"
         )
 
     @pytest.mark.asyncio
@@ -13025,7 +13061,7 @@ class TestClaudePersistedOutputExpansion:
         )
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> openrouter.ai/api/v1/responses"
+            == b"beta=true"
         )
 
     @pytest.mark.asyncio
@@ -13119,7 +13155,7 @@ class TestClaudePersistedOutputExpansion:
         )
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> openrouter.ai/api/v1/responses"
+            == b"beta=true"
         )
 
     @pytest.mark.asyncio
@@ -13222,7 +13258,7 @@ class TestClaudePersistedOutputExpansion:
         assert mock_request.scope["path"] == "/anthropic/v1/messages"
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> openrouter.ai/api/v1/responses"
+            == b"beta=true"
         )
 
     @pytest.mark.asyncio
@@ -13314,7 +13350,7 @@ class TestClaudePersistedOutputExpansion:
             call_kwargs["custom_body"]["litellm_metadata"]["passthrough_route_family"]
             == "anthropic_openrouter_responses_adapter"
         )
-        assert mock_request.scope["query_string"] == b"beta=true -> openrouter.ai/api/v1/responses"
+        assert mock_request.scope["query_string"] == b"beta=true"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -13425,7 +13461,7 @@ class TestClaudePersistedOutputExpansion:
             == "anthropic_openrouter_responses_adapter"
         )
         assert f"anthropic-adapter-model:{expected_model}" in call_kwargs["custom_body"]["litellm_metadata"]["tags"]
-        assert mock_request.scope["query_string"] == b"beta=true -> openrouter.ai/api/v1/responses"
+        assert mock_request.scope["query_string"] == b"beta=true"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -13574,7 +13610,7 @@ class TestClaudePersistedOutputExpansion:
         )
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> integrate.api.nvidia.com/v1/chat/completions"
+            == b"beta=true"
         )
         mock_validate_egress.assert_called_once_with(
             url="https://integrate.api.nvidia.com/v1/chat/completions",
@@ -13683,7 +13719,7 @@ class TestClaudePersistedOutputExpansion:
         )
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> openrouter.ai/api/v1/chat/completions"
+            == b"beta=true"
         )
         mock_validate_egress.assert_called_once()
 
@@ -13822,7 +13858,7 @@ class TestClaudePersistedOutputExpansion:
         )
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> integrate.api.nvidia.com/v1/chat/completions"
+            == b"beta=true"
         )
         mock_validate_egress.assert_called_once_with(
             url="https://integrate.api.nvidia.com/v1/chat/completions",
@@ -14442,7 +14478,7 @@ class TestClaudePersistedOutputExpansion:
         assert mock_request.scope["path"] == "/anthropic/v1/messages"
         assert (
             mock_request.scope["query_string"]
-            == b"beta=true -> chatgpt.com/backend-api/codex/responses"
+            == b"beta=true"
         )
         assert call_kwargs["forward_headers"] is False
         assert call_kwargs["allowed_forward_headers"] == [
@@ -14717,8 +14753,8 @@ class TestClaudePersistedOutputExpansion:
             events.append(event)
 
         assert len(events) == 1
-        assert getattr(events[0], "type", None) == "response.output_text.delta"
-        assert getattr(events[0], "delta", None) == "café"
+        assert events[0]["type"] == "response.output_text.delta"
+        assert events[0]["delta"] == "café"
 
     @pytest.mark.asyncio
     async def test_collect_responses_stream_reconstructs_arguments_from_done(self):
@@ -17365,6 +17401,7 @@ class TestClaudePersistedOutputExpansion:
         self, monkeypatch
     ):
         monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        monkeypatch.setenv("AAWM_TOOL_DEFINITION_INCLUDE_FULL_SNAPSHOT", "true")
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {"session_id": "codex-tools-session"}
         request_body = {
@@ -23832,7 +23869,13 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
     assert call_kwargs["egress_credential_family"] == "xai"
     assert call_kwargs["expected_target_family"] == "xai"
-    assert call_kwargs["retryable_upstream_status_codes"] is None
+    assert call_kwargs["retryable_upstream_status_codes"] == [
+        429,
+        500,
+        502,
+        503,
+        504,
+    ]
     assert call_kwargs["caller_managed_hidden_retry"] is False
     custom_body = call_kwargs["custom_body"]
     assert custom_body["model"] == upstream_model
@@ -24174,7 +24217,13 @@ async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
     assert call_kwargs["egress_credential_family"] == "xai"
     assert call_kwargs["expected_target_family"] == "xai"
-    assert call_kwargs["retryable_upstream_status_codes"] is None
+    assert call_kwargs["retryable_upstream_status_codes"] == [
+        429,
+        500,
+        502,
+        503,
+        504,
+    ]
     assert call_kwargs["caller_managed_hidden_retry"] is False
     custom_body = call_kwargs["custom_body"]
     assert custom_body["model"] == "grok-composer-2.5-fast"
@@ -24288,6 +24337,10 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rejects_malformed_c
         "aawm_auto_agent_malformed_tool_call_text"
     )
     log_path = tmp_path / "malformed-error.jsonl"
+    for _ in range(50):
+        if log_path.exists():
+            break
+        await asyncio.sleep(0.01)
     assert log_path.exists()
     record = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[0])
     assert record["malformed_tool_call_text"] == "composer_call"
@@ -24392,35 +24445,36 @@ async def test_anthropic_grok_native_oauth_responses_adapter_drops_prior_tool_ca
     assert "Input payload" not in rendered_input
     assert "composer_call" not in rendered_input
     assert "composer_call" not in rendered_body
-    assert any(
-        isinstance(item, dict)
-        and item.get("role") == "user"
-        and "prior tool outcome" in str(item.get("content"))
-        for item in custom_body["input"]
-    )
+    assert custom_body["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "continue"}],
+        }
+    ]
     from litellm.integrations.aawm_agent_quality_rules import (
         is_malformed_composer_call_literal_text,
     )
 
     assert not is_malformed_composer_call_literal_text(rendered_input)
     metadata = custom_body["litellm_metadata"]
-    assert metadata["grok_native_input_item_rewrite_count"] == 1
-    assert metadata["grok_native_input_item_rewrite_types"] == ["function_call_output"]
-    assert metadata["grok_native_input_item_rewrites"][0]["type"] == (
-        "function_call_output"
-    )
-    assert "call_id_hash" in metadata["grok_native_input_item_rewrites"][0]
-    assert "call_id" not in metadata["grok_native_input_item_rewrites"][0]
+    assert "grok_native_input_item_rewrite_count" not in metadata
+    assert "grok_native_input_item_rewrite_types" not in metadata
+    assert "grok_native_input_item_rewrites" not in metadata
     assert (
         metadata["anthropic_grok_native_prior_function_call_replay_dropped_count"]
-        == 1
+        == 2
     )
-    assert metadata["anthropic_grok_native_prior_function_call_replay_dropped_items"][
-        0
-    ]["name"] == "Bash"
-    assert "call_id_hash" in metadata[
+    dropped_items = metadata[
         "anthropic_grok_native_prior_function_call_replay_dropped_items"
-    ][0]
+    ]
+    assert [item["type"] for item in dropped_items] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert dropped_items[0]["name"] == "Bash"
+    assert all("call_id_hash" in item for item in dropped_items)
+    assert all("call_id" not in item for item in dropped_items)
     assert metadata["passthrough_route_family"] == (
         "anthropic_grok_native_responses_adapter"
     )
@@ -25294,7 +25348,13 @@ async def test_codex_auto_agent_native_openai_keeps_shared_transient_retry_enabl
 
     assert response is upstream_response
     call_kwargs = mock_pass_through.await_args.kwargs
-    assert call_kwargs["retryable_upstream_status_codes"] == [429]
+    assert call_kwargs["retryable_upstream_status_codes"] == [
+        429,
+        500,
+        502,
+        503,
+        504,
+    ]
     assert call_kwargs["caller_managed_hidden_retry"] is False
     assert call_kwargs["expected_target_family"] == "openai"
     assert call_kwargs["egress_credential_family"] == "openai"
@@ -25438,6 +25498,11 @@ async def test_codex_auto_agent_grok_native_rejects_literal_composer_tool_transc
     )
 
     log_path = tmp_path / "malformed-error.jsonl"
+    for _ in range(50):
+        if log_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert log_path.exists()
     records = [
         json.loads(line)
         for line in log_path.read_text(encoding="utf-8").splitlines()
@@ -25726,7 +25791,7 @@ def test_codex_auto_agent_grok_native_repairs_literal_tool_label_exec_command_pa
     }
 
 
-def test_codex_auto_agent_grok_native_repairs_advertised_tool_from_mixed_literal_blocks():
+def test_codex_auto_agent_grok_native_mixed_literal_blocks_fail_closed():
     request_body = _grok_composer_exec_command_tool_request_body()
     response_body = _grok_composer_literal_exec_command_response_payload()
     response_body["output"][0]["content"][0]["text"] = (
@@ -25741,24 +25806,13 @@ def test_codex_auto_agent_grok_native_repairs_advertised_tool_from_mixed_literal
         'Input payload: {"cmd": "git status -sb"}'
     )
 
-    repaired = _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
-        response_body,
-        request_body=request_body,
+    assert (
+        _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(
+            response_body,
+            request_body=request_body,
+        )
+        is None
     )
-
-    assert repaired is not None
-    rendered_repaired = json.dumps(repaired)
-    assert "Tool label:" not in rendered_repaired
-    assert "Input payload:" not in rendered_repaired
-    function_calls = [
-        item
-        for item in repaired["output"]
-        if isinstance(item, dict) and item.get("type") == "function_call"
-    ]
-    assert len(function_calls) == 1
-    assert function_calls[0]["name"] == "exec_command"
-    assert function_calls[0]["call_id"] == "call-def-composer_call_exec"
-    assert json.loads(function_calls[0]["arguments"]) == {"cmd": "git status -sb"}
 
 
 def test_codex_auto_agent_grok_native_repairs_d1_439_fresh_tool_label_shape():
@@ -25919,23 +25973,6 @@ def test_codex_auto_agent_grok_native_repairs_literal_exec_with_fullwidth_tool_m
         (
             "Tool label: exec_command\n"
             'Input payload: {"cmd": "pwd", "not_advertised": true}'
-        ),
-        (
-            "Tool label: exec_command\n"
-            'Input payload: {"cmd": "pwd"} trailing junk'
-        ),
-        (
-            "Tool label: exec_command\n"
-            'Input payload: {"cmd": "pwd"}\n'
-            'trailing junk'
-        ),
-        (
-            "Tool label: exec_command\n"
-            'Input payload: {"cmd": "pwd"}{"cmd": "ls"}'
-        ),
-        (
-            "Tool label: exec_command\n"
-            'Input payload: {"cmd": "pwd"}\n{ "cmd": "ls" }'
         ),
     ],
 )
@@ -27365,7 +27402,7 @@ def test_codex_auto_agent_candidate_cooldown_scope_spark_transient_is_candidate(
             "upstream_transient",
             candidate=spark,
         )
-        == "candidate"
+        == "request_local"
     )
 
 
@@ -27419,7 +27456,7 @@ def test_codex_auto_agent_candidate_cooldown_scope_native_grok_4_5_transient_is_
                 "upstream_transient",
                 candidate=candidate,
             )
-            == "none"
+            == "request_local"
         )
 
 
@@ -28859,7 +28896,13 @@ async def test_provider_terminal_error_writes_durable_cooldown():
 
     assert scope == "candidate"
     assert len(dual_cache.set_calls) == 1
-    assert dual_cache.set_calls[0]["key"].endswith(cooldown_key)
+    assert dual_cache.set_calls[0]["key"] == (
+        _build_aawm_alias_routing_durable_cache_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+    )
     assert durable_seconds > 0.0
     assert durable_source == "durable_cache"
 
@@ -28929,7 +28972,13 @@ async def test_candidate_unavailable_non_xai_still_writes_durable_cooldown():
 
     assert scope == "candidate"
     assert len(dual_cache.set_calls) == 1
-    assert dual_cache.set_calls[0]["key"].endswith(cooldown_key)
+    assert dual_cache.set_calls[0]["key"] == (
+        _build_aawm_alias_routing_durable_cache_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+    )
     assert durable_seconds > 0.0
     assert durable_source == "durable_cache"
 
@@ -28999,7 +29048,13 @@ async def test_malformed_tool_call_text_writes_durable_cooldown():
 
     assert scope == "candidate"
     assert len(dual_cache.set_calls) == 1
-    assert dual_cache.set_calls[0]["key"].endswith(cooldown_key)
+    assert dual_cache.set_calls[0]["key"] == (
+        _build_aawm_alias_routing_durable_cache_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+    )
     assert durable_seconds > 0.0
     assert durable_source == "durable_cache"
 
@@ -29232,7 +29287,7 @@ def test_auto_agent_alias_audit_event_builds_cooldown_rollup_with_request_host(
     monkeypatch.setattr(
         endpoints,
         "resolve_aawm_route_host_attribution",
-        lambda request: {
+        lambda request, **_kwargs: {
             "client_ip": "100.99.166.16",
             "client_ip_source": "request_client",
             "host_name": "thoth",
@@ -31009,7 +31064,12 @@ async def test_codex_auto_agent_alias_low_ignores_stale_antigravity_sidecar_toke
 
     monkeypatch.setattr(
         endpoints,
-        "_codex_auto_agent_antigravity_auth_degraded_log_until_monotonic",
+        "_codex_auto_agent_cooldown_negative_until_monotonic_by_key",
+        {},
+    )
+    monkeypatch.setattr(
+        endpoints._alias_routing_state,
+        "antigravity_auth_degraded_log_until_monotonic",
         0.0,
     )
     with patch(
@@ -31051,8 +31111,8 @@ async def test_anthropic_auto_agent_alias_code_ignores_stale_antigravity_sidecar
     )
 
     monkeypatch.setattr(
-        endpoints,
-        "_codex_auto_agent_antigravity_auth_degraded_log_until_monotonic",
+        endpoints._alias_routing_state,
+        "antigravity_auth_degraded_log_until_monotonic",
         0.0,
     )
     with patch(
@@ -31487,8 +31547,9 @@ async def test_codex_auto_agent_alias_openrouter_empty_success_rolls_to_last_res
     assert attempts[-2]["provider"] == "openrouter"
     assert attempts[-2]["model"] == "deepseek/deepseek-v4-flash"
     assert attempts[-2]["status"] == "cooldown_set"
-    assert attempts[-2]["cooldown_seconds"] == 10800.0
-    assert "RATE_LIMIT_EXCEEDED" in attempts[-2]["error_tokens"]
+    assert attempts[-2]["cooldown_seconds"] == 30.0
+    assert "aawm_codex_auto_agent_empty_success" in attempts[-2]["error_tokens"]
+    assert "RATE_LIMIT_EXCEEDED" not in attempts[-2]["error_tokens"]
 
 
 @pytest.mark.asyncio
@@ -32766,7 +32827,7 @@ def test_get_antigravity_oauth_client_value_candidates_does_not_mix_env_and_toke
     monkeypatch.delenv("LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", raising=False)
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_antigravity_oauth_client_value_candidates_from_local_cli_binary",
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.antigravity_oauth._load_antigravity_oauth_client_value_candidates_from_local_cli_binary",
         return_value=[],
     ):
         assert (
@@ -32781,7 +32842,7 @@ def test_get_antigravity_oauth_client_value_candidates_does_not_mix_env_and_toke
         "env-client-secret",
     )
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_antigravity_oauth_client_value_candidates_from_local_cli_binary",
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.antigravity_oauth._load_antigravity_oauth_client_value_candidates_from_local_cli_binary",
         return_value=[],
     ):
         candidates = _get_antigravity_oauth_client_value_candidates(
@@ -34050,8 +34111,12 @@ class TestVertexAIPassThroughHandler:
         test_token = vertex_credentials
 
         with mock.patch(
-            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase.load_auth"
-        ) as mock_load_auth, mock.patch(
+            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase._ensure_access_token_async",
+            new=AsyncMock(return_value=(test_token, test_project)),
+        ), mock.patch(
+            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase._get_token_and_url",
+            return_value=(test_token, ""),
+        ), mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
         ) as mock_create_route, mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_litellm_virtual_key"
@@ -34061,11 +34126,7 @@ class TestVertexAIPassThroughHandler:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_vertex_pass_through_handler"
         ) as mock_get_handler:
             # Mock credentials object with necessary attributes
-            mock_credentials = Mock()
-            mock_credentials.token = test_token
-
             # Setup mocks
-            mock_load_auth.return_value = (mock_credentials, test_project)
             mock_get_virtual_key.return_value = "Bearer test-key"
             mock_user_auth.return_value = {"api_key": "test-key"}
 
@@ -34147,8 +34208,12 @@ class TestVertexAIPassThroughHandler:
         test_token = vertex_credentials
 
         with mock.patch(
-            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase.load_auth"
-        ) as mock_load_auth, mock.patch(
+            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase._ensure_access_token_async",
+            new=AsyncMock(return_value=(test_token, test_project)),
+        ), mock.patch(
+            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase._get_token_and_url",
+            return_value=(test_token, ""),
+        ), mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
         ) as mock_create_route, mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_litellm_virtual_key"
@@ -34157,12 +34222,7 @@ class TestVertexAIPassThroughHandler:
         ) as mock_user_auth, mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_vertex_pass_through_handler"
         ) as mock_get_handler:
-            # Mock credentials object with necessary attributes
-            mock_credentials = Mock()
-            mock_credentials.token = test_token
-
             # Setup mocks
-            mock_load_auth.return_value = (mock_credentials, test_project)
             mock_get_virtual_key.return_value = "Bearer test-key"
             mock_user_auth.return_value = {"api_key": "test-key"}
 
@@ -34245,8 +34305,12 @@ class TestVertexAIPassThroughHandler:
         mock_response = Response()
 
         with mock.patch(
-            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase.load_auth"
-        ) as mock_load_auth, mock.patch(
+            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase._ensure_access_token_async",
+            new=AsyncMock(return_value=(default_credentials, default_project)),
+        ), mock.patch(
+            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase._get_token_and_url",
+            return_value=(default_credentials, ""),
+        ), mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
         ) as mock_create_route, mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_vertex_pass_through_handler"
@@ -34254,11 +34318,6 @@ class TestVertexAIPassThroughHandler:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
             new_callable=AsyncMock,
         ) as mock_auth:
-            # Mock credentials object with necessary attributes
-            mock_credentials = Mock()
-            mock_credentials.token = default_credentials
-
-            mock_load_auth.return_value = (mock_credentials, default_project)
             mock_auth.return_value = MagicMock()
 
             # Mock the vertex handler
@@ -34720,8 +34779,12 @@ class TestVertexAIDiscoveryPassThroughHandler:
         test_token = "test-auth-token"
 
         with mock.patch(
-            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase.load_auth"
-        ) as mock_load_auth, mock.patch(
+            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase._ensure_access_token_async",
+            new=AsyncMock(return_value=(test_token, test_project)),
+        ), mock.patch(
+            "litellm.llms.vertex_ai.vertex_llm_base.VertexBase._get_token_and_url",
+            return_value=(test_token, ""),
+        ), mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
         ) as mock_create_route, mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_litellm_virtual_key"
@@ -34730,12 +34793,7 @@ class TestVertexAIDiscoveryPassThroughHandler:
         ) as mock_user_auth, mock.patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_vertex_pass_through_handler"
         ) as mock_get_handler:
-            # Mock credentials object with necessary attributes
-            mock_credentials = Mock()
-            mock_credentials.token = test_token
-
             # Setup mocks
-            mock_load_auth.return_value = (mock_credentials, test_project)
             mock_get_virtual_key.return_value = "Bearer test-key"
             mock_user_auth.return_value = {"api_key": "test-key"}
 
@@ -35325,7 +35383,8 @@ class TestForwardHeaders:
         ) as mock_logging_obj:
             # Setup mock httpx client
             mock_client = MagicMock()
-            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client.build_request.return_value = MagicMock()
+            mock_client.send = AsyncMock(return_value=mock_httpx_response)
             mock_client_obj = MagicMock()
             mock_client_obj.client = mock_client
             mock_get_client.return_value = mock_client_obj
@@ -35346,10 +35405,11 @@ class TestForwardHeaders:
             )
 
             # Verify the httpx client was called
-            assert mock_client.request.called
+            assert mock_client.build_request.called
+            mock_client.send.assert_awaited_once()
 
             # Get the headers that were sent to the target
-            call_args = mock_client.request.call_args
+            call_args = mock_client.build_request.call_args
             sent_headers = call_args[1]["headers"]
 
             # Verify user headers were forwarded (except content-length and host)
@@ -35419,7 +35479,8 @@ class TestForwardHeaders:
         ) as mock_logging_obj:
             # Setup mock httpx client
             mock_client = MagicMock()
-            mock_client.request = AsyncMock(return_value=mock_httpx_response)
+            mock_client.build_request.return_value = MagicMock()
+            mock_client.send = AsyncMock(return_value=mock_httpx_response)
             mock_client_obj = MagicMock()
             mock_client_obj.client = mock_client
             mock_get_client.return_value = mock_client_obj
@@ -35440,10 +35501,11 @@ class TestForwardHeaders:
             )
 
             # Verify the httpx client was called
-            assert mock_client.request.called
+            assert mock_client.build_request.called
+            mock_client.send.assert_awaited_once()
 
             # Get the headers that were sent to the target
-            call_args = mock_client.request.call_args
+            call_args = mock_client.build_request.call_args
             sent_headers = call_args[1]["headers"]
 
             # Verify only custom headers were sent
@@ -38209,14 +38271,20 @@ class _FakeAawmAliasRoutingDualCache:
         self.fail_writes = fail_writes
         self.store: dict[str, Any] = {}
         self.set_calls: list[dict[str, Any]] = []
+        self.local_set_calls: list[dict[str, Any]] = []
 
     async def async_get_cache(self, key: str, **_: Any) -> Any:
         return self.store.get(key)
 
     async def async_set_cache(self, key: str, value: Any, **kwargs: Any) -> None:
-        if self.fail_writes:
+        local_only = kwargs.get("local_only") is True
+        if self.fail_writes and not local_only:
             raise RuntimeError("redis unavailable")
-        self.set_calls.append({"key": key, "value": value, "kwargs": kwargs})
+        call = {"key": key, "value": value, "kwargs": kwargs}
+        if local_only:
+            self.local_set_calls.append(call)
+        else:
+            self.set_calls.append(call)
         self.store[key] = value
 
 
@@ -38285,6 +38353,8 @@ async def test_aawm_alias_routing_durable_affinity_payload_is_sanitized():
         await _set_anthropic_auto_agent_session_affinity(session_key, candidate)
 
     assert len(dual_cache.set_calls) == 1
+    assert len(dual_cache.local_set_calls) == 1
+    assert dual_cache.local_set_calls[0]["kwargs"]["local_only"] is True
     payload = dual_cache.set_calls[0]["value"]
     assert set(payload.keys()) == {
         "provider",
@@ -39614,7 +39684,15 @@ async def test_codex_auto_agent_alias_code_falls_back_after_grok_build_usage_bal
     assert composer_attempt["cooldown_seconds"] == 300.0
     assert "GROK_BUILD_USAGE_BALANCE_EXHAUSTED" in composer_attempt["error_tokens"]
     assert metadata["codex_auto_agent_selected_model"] == "oa_xai/grok-build"
-    assert any(call["key"].endswith(cooldown_key) for call in dual_cache.set_calls)
+    assert any(
+        call["key"]
+        == _build_aawm_alias_routing_durable_cache_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+        for call in dual_cache.set_calls
+    )
 
 
 @pytest.mark.asyncio
@@ -39676,7 +39754,15 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage
     assert grok_attempt["cooldown_seconds"] == 300.0
     assert "GROK_BUILD_USAGE_BALANCE_EXHAUSTED" in grok_attempt["error_tokens"]
     assert metadata["anthropic_auto_agent_selected_model"] == "oa_xai/grok-build"
-    assert any(call["key"].endswith(cooldown_key) for call in dual_cache.set_calls)
+    assert any(
+        call["key"]
+        == _build_aawm_alias_routing_durable_cache_key(
+            alias_family="anthropic",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+        for call in dual_cache.set_calls
+    )
 
 
 @pytest.mark.asyncio
@@ -39854,9 +39940,12 @@ async def test_anthropic_spark_bare_502_sets_candidate_transient_cooldown(monkey
         "xai:xai/grok-4.5:xai_grok_native",
         "xai:grok-composer-2.5-fast:xai_grok_native",
     ):
-        grok_durable_seconds, grok_durable_source = await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+        (
+            grok_durable_seconds,
+            grok_durable_source,
+        ) = await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
         assert grok_durable_seconds == 0.0
-        assert grok_durable_source == "local_fallback"
+        assert grok_durable_source == "negative_cache"
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
 
@@ -39969,7 +40058,7 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
         "xai:grok-composer-2.5-fast:xai_grok_native"
     )
     assert durable_seconds == 0.0
-    assert durable_source == "local_fallback"
+    assert durable_source == "negative_cache"
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(
         grok45_cooldown_key, None
@@ -40568,7 +40657,7 @@ def test_malformed_tool_call_intake_write_failure_does_not_break_raise(
         raise OSError("disk full")
 
     monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.persist_malformed_tool_call_detection",
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.schedule_persist_malformed_tool_call_detection",
         _failing_persist,
     )
 

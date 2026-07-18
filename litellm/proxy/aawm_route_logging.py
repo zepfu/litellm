@@ -2383,13 +2383,21 @@ def _get_aawm_route_native_access_log_path(request: Request) -> Optional[str]:
     if not isinstance(scope, dict):
         return None
 
+    # RR-054 #39: prefer private adapted display path; never require mutated query_string.
+    display_path = scope.get("_aawm_adapted_access_log_display_path")
+    if isinstance(display_path, str) and display_path:
+        return display_path
+
     path = scope.get("path")
     if not isinstance(path, str):
         return None
 
     full_path = quote(path)
+    target_label = scope.get("_aawm_adapted_access_log_target")
     query_string = scope.get("query_string")
     if not query_string:
+        if isinstance(target_label, str) and target_label:
+            return f"{full_path}?adapted_to={target_label}"
         return full_path
 
     try:
@@ -2400,6 +2408,9 @@ def _get_aawm_route_native_access_log_path(request: Request) -> Optional[str]:
     except UnicodeDecodeError:
         return full_path
 
+    # Legacy: some call sites previously encoded " -> target" into query_string.
+    if isinstance(target_label, str) and target_label and f" -> {target_label}" not in query_label and f"adapted_to={target_label}" not in query_label:
+        query_label = f"{query_label} -> {target_label}" if query_label else f"adapted_to={target_label}"
     return f"{full_path}?{query_label}"
 
 
@@ -2456,6 +2467,7 @@ def _get_aawm_route_log_context_label(
     elif agent_id:
         agent_label = f"#{agent_id}"
 
+    owner_label: Optional[str]
     if agent_label and repository:
         owner_label = f"{agent_label}@{repository}"
     else:

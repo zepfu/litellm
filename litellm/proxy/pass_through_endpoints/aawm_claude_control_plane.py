@@ -2299,7 +2299,11 @@ def _extract_aawm_dispatch_context_references(
     if not isinstance(text, str):
         return []
 
-    scan_text = _AAWM_SYSTEM_REMINDER_BLOCK_PATTERN.sub("\n", text)
+    scan_text = (
+        _AAWM_SYSTEM_REMINDER_BLOCK_PATTERN.sub("\n", text)
+        if "</system-reminder>" in text
+        else text
+    )
     if "`" not in scan_text and re.search(r"\b[A-Z][A-Z0-9]{1,}\b", scan_text) is None:
         return []
 

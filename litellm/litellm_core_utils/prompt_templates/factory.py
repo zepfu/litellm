@@ -80,7 +80,11 @@ _EPHEMERAL_MESSAGE_TAG_RE = re.compile(
 
 def _sanitize_gemini_tool_response_text(text: str) -> str:
     """Remove Claude-side reminder wrappers from tool results before sending to Gemini."""
-    cleaned = _SYSTEM_REMINDER_BLOCK_RE.sub("\n", text)
+    cleaned = (
+        _SYSTEM_REMINDER_BLOCK_RE.sub("\n", text)
+        if "</system-reminder>" in text
+        else text
+    )
     cleaned = _EPHEMERAL_MESSAGE_BLOCK_RE.sub("\n", cleaned)
     cleaned = _EPHEMERAL_MESSAGE_TAG_RE.sub("\n", cleaned)
     cleaned = cleaned.replace("<tool_use_error>", "")

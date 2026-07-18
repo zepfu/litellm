@@ -52,6 +52,40 @@ sequenceDiagram
 
 ## Shared Anthropic SSE emission (Chat + Responses)
 
+## AAWM provider route preparation
+
+AAWM's OpenAI-compatible Anthropic pass-through routes use provider-owned
+preparation modules under `providers/<provider>/adapter.py`. These modules own
+the preparation that has been extracted for their routes: provider-specific
+ordering of request transforms, policy application, credential/target
+preparation, and construction of the immutable route plan. `providers/common.py`
+owns the shared Anthropic-to-Responses translation, prompt-cache/reasoning
+metadata, completion preparation, and config-selected tool/parallel policy
+sequencing used by those modules.
+
+The proxy route module injects runtime callbacks for FastAPI request access,
+credential stores, target URL helpers, egress validation, and transport
+operations. Provider algorithms are not implemented in
+`llm_passthrough_endpoints.py`: the route module keeps thin compatibility
+wrappers and runtime assembly so existing private imports and monkeypatch-based
+tests continue to observe the same call sites.
+
+Google's larger shaping surface is split by responsibility across
+`providers/google/` modules for content selection and compaction, schema and
+prompt policy, Anthropic replay, tool pairing and aliasing, request assembly and
+preparation, response translation and streaming, persisted-output compaction,
+and error shaping. `providers/google/shaping.py` is a compatibility facade that
+re-exports those provider-owned functions and binds route-layer runtime
+dependencies into the implementation modules. Its checked-in `shaping.pyi`
+records the static callable contract for type checkers; it is not a second
+implementation.
+
+The same ownership rule applies to Grok normalization and composer repair,
+OpenCode Zen normalization, and OpenRouter error/retry transport. The god-file
+may delegate through the historical private function names, but ownership tests
+require the substantive function bodies to live under
+`experimental_pass_through/providers/`.
+
 There are two parallel adapter trees that reconstruct Anthropic `/v1/messages`
 SSE for non-native backends:
 

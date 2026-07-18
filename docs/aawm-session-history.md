@@ -901,9 +901,11 @@ Operational notes:
 
 - Namespace env: `AAWM_ALIAS_ROUTING_STATE_NAMESPACE`.
   When it is omitted, `LITELLM_LANGFUSE_TRACE_ENVIRONMENT` (falling back to
-  `LITELLM_AAWM_ERROR_LOG_ENV`) derives `aawm-routing-dev-v1` or
-  `aawm-routing-prod-v1`. Use one explicit shared namespace only for
-  intentionally shared routing planes.
+  `LITELLM_AAWM_ERROR_LOG_ENV`) maps `dev` / `development` to
+  `aawm-routing-dev-v1` and `prod` / `production` to
+  `aawm-routing-prod-v1`. Any other or empty environment uses the manager
+  namespace `default`. Use one explicit shared namespace only for intentionally
+  shared routing planes.
 - Redis timeout, reconnect, and write-retry behavior is controlled by the
   dedicated alias-routing Redis manager (`litellm/proxy/aawm_alias_routing_redis.py`):
   - `AAWM_ALIAS_ROUTING_REDIS_TIMEOUT_SECONDS` (`float`, default `10`, clamped
@@ -929,8 +931,9 @@ Operational notes:
     emit a single config warning listing the ignored names so partial migrations
     do not fail opaquely later.
 - Durable key shape:
-  `aawm:alias-routing:{namespace}:{family}:{kind}:{state_key}` where `family` is
-  `codex` or `anthropic`, and `kind` is `affinity` or `cooldown`.
+  `aawm:alias-routing:{namespace}:{family}:{kind}:{sha256_hex(state_key)}` where
+  `family` is `codex` or `anthropic`, and `kind` is `affinity` or `cooldown`.
+  The raw client/session state key is not stored in Redis.
 - Durable payloads store absolute wall-clock expiry (`expires_at_epoch` via
   `time.time()`). Process-local maps still use monotonic expiry for the fast path.
 - `AAWM_ALIAS_ROUTING_REDIS_*` settings only control alias-routing state
@@ -946,10 +949,40 @@ Operational notes:
   - Non-retryable errors fail fast and return `False` immediately.
   - If the retry attempt also fails, the final visible durable-write result is
     `False`; it must never be treated as success.
-- Payload and TTL are preserved on retries:
-  - The exact durable payload is written with unchanged content and stable positive
-    TTL on each attempt, including the `expires_at_epoch` field calculated once for
-    the request.
+- Max-expiry and TTL semantics are owned by
+  `pass_through_endpoints/aawm_alias_routing/durable.py`:
+  - Each write calculates a new absolute expiry, reads the existing durable
+    payload, and preserves whichever valid `expires_at_epoch` is later.
+    Non-expiry fields from the new payload still update the stored record, so a
+    short transient cooldown cannot truncate a longer capacity or usage-limit
+    cooldown.
+  - Redis TTL is derived from the winning expiry and floored to one second.
+    The max-expiry merge happens once before the retry loop; every retry uses
+    the same merged payload and positive TTL.
+  - Affinity writes additionally use
+    `AAWM_ALIAS_ROUTING_DURABLE_AFFINITY_KEY_LIMIT` (default `4096`) as a
+    process-local cardinality gate. An over-limit affinity write is skipped
+    rather than creating another Redis key.
+- Redis and DualCache ownership is split:
+  - `litellm/proxy/aawm_alias_routing_redis.py` owns connection setup,
+    `DualCache` attachment, self-heal, readiness, and write-retry policy.
+  - Durable writes issue Redis `SET` first with error propagation enabled, then
+    best-effort write the same payload and TTL through DualCache for in-process
+    coherency. A memory write-through failure does not turn a successful Redis
+    write into a durable failure.
+  - Reads use DualCache and treat missing, non-dict, or expired payloads as
+    misses.
+- DualCache selection is fail-closed:
+  - A live dedicated alias-routing manager cache is preferred.
+  - If dedicated routing Redis is configured but unavailable, selectors use
+    process-local state and do not fall back to the shared
+    `internal_usage_cache.dual_cache`.
+  - The legacy shared DualCache path is considered only when dedicated routing
+    Redis is not configured.
+- `llm_passthrough_endpoints.py` owns route registration, process-local
+  cooldown/affinity call sites, and thin compatibility re-exports. Durable key,
+  read, write, max-expiry, and DualCache-selection behavior belongs to
+  `aawm_alias_routing/durable.py`.
 - Standard LiteLLM Router `failed_calls` counters remain process-local
   telemetry and are not mirrored by the durable alias-routing Redis manager.
 - Read order: memory first, then durable cache hydrate; if durable cache is absent

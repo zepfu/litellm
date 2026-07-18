@@ -214,3 +214,158 @@ filterwarnings = [
     # Suppress pytest-asyncio event loop deprecation warning (handled automatically by pytest-asyncio)
     "ignore::DeprecationWarning:pytest_asyncio.plugin",
 ]
+
+
+[tool.pytest-classifier]
+# LiteLLM sources live under ./litellm (not ./src). Keep src_root at the
+# repository root so source keys match production paths used by RR-054 scans.
+src_root = "."
+tests_root = "tests"
+mode = "warn"
+min_lines = 50
+use_testable = false
+artifact_profile = "gating"
+
+# Explicit source→test evidence for the RR-054 extracted aawm_alias_routing
+# package. Built-in stem heuristics cannot map a multi-module package to one
+# shared test file; this map is the default discovery contract.
+[tool.pytest-classifier.test_path_map]
+"litellm/llms/anthropic/experimental_pass_through/providers/common.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_wrapper_parity.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/antigravity/adapter.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_modules.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/adapter.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_wrapper_parity.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/process_cache.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_modules.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/shaping.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/content_selection.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/content_compaction.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/error_and_schema.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/schema_and_prompt.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/anthropic_replay.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/tool_pairing.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/request_assembly.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/request_building.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/tool_aliasing.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/response_translation.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/response_streaming.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/request_preparation.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/google/persisted_output.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_google_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/grok/adapter.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_wrapper_parity.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/grok/composer_repair.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_grok_composer_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/grok/normalization.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_grok_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/nvidia/adapter.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_wrapper_parity.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/openai/adapter.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_wrapper_parity.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/opencode_zen/adapter.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_wrapper_parity.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/opencode_zen/normalization.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_opencode_provider_ownership.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/openrouter/adapter.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_wrapper_parity.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/openrouter/retry_transport.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_openrouter_retry_transport.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/openrouter/error_shape.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_openrouter_retry_transport.py",
+]
+"litellm/llms/anthropic/experimental_pass_through/providers/xai/adapter.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_wrapper_parity.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/adapter_config.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/adapter_driver.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/antigravity_oauth.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/durable.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/google_oauth.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/memory.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/oauth_token_cache.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/policy.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/provider_shaping.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/responses_finalize.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/retry.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/state.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/streaming.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/task_state.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing/types.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/aawm_alias_routing_policy.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py",
+]
+"litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py" = [
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_structural_extraction.py",
+  "test_litellm/proxy/pass_through_endpoints/test_rr054_llm_passthrough_residuals.py",
+]
