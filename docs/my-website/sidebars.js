@@ -371,6 +371,7 @@ const sidebars = {
                 "proxy/ui_project_management",
                 "proxy/ui/bulk_edit_users",
                 "proxy/ui/page_visibility",
+                "proxy/ui/ui_settings",
               ]
             },
             {

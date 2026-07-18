@@ -129,6 +129,11 @@ class UISettings(BaseModel):
         description="If enabled, the user search endpoint (/user/filter/ui) restricts results by organization. When off, any authenticated user can search all users.",
     )
 
+    disable_custom_api_keys: bool = Field(
+        default=False,
+        description="If true, users cannot specify custom API key values. All keys must be auto-generated.",
+    )
+
 
 class UISettingsResponse(SettingsResponse):
     """Response model for UI settings"""
@@ -149,6 +154,7 @@ ALLOWED_UI_SETTINGS_FIELDS = {
     "disable_vector_stores_for_internal_users",
     "allow_vector_stores_for_team_admins",
     "scope_user_search_to_org",
+    "disable_custom_api_keys",
 }
 
 # Flags that must be synced from the persisted UISettings into
@@ -1159,7 +1165,13 @@ async def update_ui_settings(
         raw = db_existing.ui_settings
         existing = json.loads(raw) if isinstance(raw, str) else dict(raw)
 
-    ui_settings = {**existing, **incoming}
+    # Merge, then keep only allowlisted fields so legacy junk keys are not
+    # re-persisted or returned from the settings surface.
+    ui_settings = {
+        k: v
+        for k, v in {**existing, **incoming}.items()
+        if k in ALLOWED_UI_SETTINGS_FIELDS
+    }
 
     await prisma_client.db.litellm_uisettings.upsert(
         where={"id": "ui_settings"},
@@ -1187,11 +1199,8 @@ async def update_ui_settings(
     # Invalidate + set DualCache so subsequent reads see the new values immediately
     from litellm.proxy.proxy_server import user_api_key_cache
 
-    sanitized = {
-        k: v for k, v in ui_settings.items() if k in ALLOWED_UI_SETTINGS_FIELDS
-    }
     await user_api_key_cache.async_set_cache(
-        key=UI_SETTINGS_CACHE_KEY, value=sanitized, ttl=UI_SETTINGS_CACHE_TTL
+        key=UI_SETTINGS_CACHE_KEY, value=ui_settings, ttl=UI_SETTINGS_CACHE_TTL
     )
 
     return {
