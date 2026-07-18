@@ -26,6 +26,10 @@ The Anthropic adapter harness is repo-local and is not currently packaged by
 - `run_anthropic_adapter_smoke.py`
 - `anthropic_adapter_config.json`
 
+Adapter case prompts use paths relative to the repository root. Run the adapter
+harness from the checkout it belongs to so fixture paths such as
+`scripts/local-ci/sequential_core_tools_fixture.txt` resolve consistently.
+
 ## Required Environment
 
 - `LANGFUSE_PUBLIC_KEY`
