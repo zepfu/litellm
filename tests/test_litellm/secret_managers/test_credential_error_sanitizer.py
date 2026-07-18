@@ -221,6 +221,62 @@ def test_sanitize_redacts_authorization_bearer_json_dict_and_quoted_assign() -> 
         assert marker in sanitized, (raw, sanitized)
 
 
+def test_sanitize_redacts_authorization_bearer_even_backslash_quoted_suffix() -> None:
+    """Quoted Authorization Bearer even-backslash early-close must not leak."""
+    cases = [
+        (
+            r'Authorization="Bearer secret\\"suffix"',
+            ("secret", "suffix"),
+            'Authorization="Bearer [REDACTED]"',
+        ),
+        (
+            r"Authorization='Bearer secret\\'suffix'",
+            ("secret", "suffix"),
+            "Authorization='Bearer [REDACTED]'",
+        ),
+        (
+            r'{"Authorization":"Bearer secret\\"suffix"}',
+            ("secret", "suffix"),
+            '"Authorization":"Bearer [REDACTED]"',
+        ),
+        (
+            r"{'Authorization': 'Bearer secret\\'suffix'}",
+            ("secret", "suffix"),
+            "'Authorization': 'Bearer [REDACTED]'",
+        ),
+        (
+            r'Authorization="Bearer secret\\\\"suffix"',
+            ("secret", "suffix"),
+            'Authorization="Bearer [REDACTED]"',
+        ),
+        (
+            r'Authorization="Bearer sec\\"ret"',
+            ("sec", "ret"),
+            'Authorization="Bearer [REDACTED]"',
+        ),
+        # Cross-quote style JSON mixes with even-backslash leak.
+        (
+            r'''{"Authorization":'Bearer mixed\\'suffix'}''',
+            ("mixed", "suffix"),
+            '"Authorization":\'Bearer [REDACTED]\'',
+        ),
+        (
+            r"""{'Authorization':"Bearer mixed\\"suffix"}""",
+            ("mixed", "suffix"),
+            "'Authorization':\"Bearer [REDACTED]\"",
+        ),
+    ]
+    for raw, secrets, marker in cases:
+        sanitized = sanitize_credential_error_message(raw)
+        for secret in secrets:
+            assert secret not in sanitized, (raw, sanitized, secret)
+        assert marker in sanitized, (raw, sanitized)
+        # No trailing partial-quote leakage of the secret suffix form.
+        assert '"suffix"' not in sanitized
+        assert "'suffix'" not in sanitized
+        assert '"ret"' not in sanitized
+
+
 def test_sanitize_query_and_form_ampersand_boundaries() -> None:
     raw = (
         "access_token=tok-amp-secret&expires=1&refresh_token=rt-amp-secret"

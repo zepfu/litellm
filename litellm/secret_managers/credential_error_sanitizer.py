@@ -15,7 +15,7 @@ substrings.
 from __future__ import annotations
 
 import re
-from typing import Callable, Iterable, Optional
+from typing import Iterable, Optional
 
 DEFAULT_SECRET_FIELD_NAMES = frozenset(
     {
@@ -131,76 +131,150 @@ def _redact_field_values(message: str, field_name: str) -> str:
     return "".join(out)
 
 
-def _authorization_bearer_replacement_header(match: re.Match[str]) -> str:
-    prefix = match.group(1)
-    sep = match.group(2)
-    return f"{prefix}{sep}Bearer {_REDACTED_VALUE}"
+def _skip_ws(message: str, start: int) -> int:
+    i = start
+    n = len(message)
+    while i < n and message[i] in " \t\r\n":
+        i += 1
+    return i
 
 
-def _authorization_bearer_replacement_quoted(match: re.Match[str]) -> str:
-    prefix = match.group(1)
-    sep = match.group(2)
-    quote = match.group(3)
-    return f"{prefix}{sep}{quote}Bearer {_REDACTED_VALUE}{quote}"
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
 
 
-def _build_authorization_bearer_rules() -> list[
-    tuple[re.Pattern[str], Callable[[re.Match[str]], str]]
-]:
-    # Build patterns without nested-quote footguns.
-    dq_body = r'(?:\\.|[^"\\])*'
-    sq_body = r"(?:\\.|[^'\\])*"
-    bare_token = r"[^\s,;&}\]]+"
-    return [
-        # Authorization: Bearer token / Authorization=Bearer token
-        (
-            re.compile(
-                rf"(?i)\b(Authorization)\b(\s*[:=]\s*)Bearer\s+{bare_token}"
-            ),
-            _authorization_bearer_replacement_header,
-        ),
-        # Authorization="Bearer …" / Authorization='Bearer …'
-        (
-            re.compile(
-                rf'(?i)\b(Authorization)\b(\s*[:=]\s*)(")Bearer\s+{dq_body}"'
-            ),
-            _authorization_bearer_replacement_quoted,
-        ),
-        (
-            re.compile(
-                rf"(?i)\b(Authorization)\b(\s*[:=]\s*)(')Bearer\s+{sq_body}'"
-            ),
-            _authorization_bearer_replacement_quoted,
-        ),
-        # JSON / dict: "Authorization": "Bearer …" and quote-style mixes
-        (
-            re.compile(
-                rf'(?i)("Authorization")(\s*:\s*)(")Bearer\s+{dq_body}"'
-            ),
-            _authorization_bearer_replacement_quoted,
-        ),
-        (
-            re.compile(
-                rf"(?i)('Authorization')(\s*:\s*)(')Bearer\s+{sq_body}'"
-            ),
-            _authorization_bearer_replacement_quoted,
-        ),
-        (
-            re.compile(
-                rf'(?i)("Authorization")(\s*:\s*)(\')Bearer\s+{sq_body}\''
-            ),
-            _authorization_bearer_replacement_quoted,
-        ),
-        (
-            re.compile(
-                rf"(?i)('Authorization')(\s*:\s*)(\")Bearer\s+{dq_body}\""
-            ),
-            _authorization_bearer_replacement_quoted,
-        ),
-    ]
+def _match_authorization_key(message: str, start: int) -> Optional[tuple[int, str]]:
+    """If ``message[start:]`` begins an Authorization key, return end index and key text."""
+    n = len(message)
+    if start >= n:
+        return None
+    if message[start] in "\"'":
+        quote = message[start]
+        expected = f"{quote}Authorization{quote}"
+        if message[start : start + len(expected)].lower() == expected.lower():
+            return start + len(expected), message[start : start + len(expected)]
+        return None
+    token = "Authorization"
+    end = start + len(token)
+    if message[start:end].lower() != token.lower():
+        return None
+    if start > 0 and _is_word_char(message[start - 1]):
+        return None
+    if end < n and _is_word_char(message[end]):
+        return None
+    return end, message[start:end]
 
 
-_AUTHORIZATION_BEARER_RULES = _build_authorization_bearer_rules()
+def _has_bearer_keyword(message: str, start: int) -> Optional[int]:
+    """If Bearer keyword begins at start (case-insensitive), return index after it."""
+    if message[start : start + 6].lower() != "bearer":
+        return None
+    after = start + 6
+    if after < len(message) and message[after] not in " \t\r\n":
+        return None
+    return after
+
+
+def _consume_bare_token(message: str, start: int) -> int:
+    i = start
+    n = len(message)
+    while i < n and message[i] not in _BARE_VALUE_DELIMS:
+        i += 1
+    return i
+
+
+def _try_redact_quoted_authorization_bearer(
+    message: str,
+    key_text: str,
+    sep_start: int,
+    value_start: int,
+) -> Optional[tuple[str, int]]:
+    """Return (replacement, value_end) for quoted Authorization Bearer values."""
+    quote = message[value_start]
+    inner = _skip_ws(message, value_start + 1)
+    if _has_bearer_keyword(message, inner) is None:
+        return None
+    value_end = _consume_quoted_value_for_redaction(message, value_start)
+    if value_end <= value_start + 1:
+        return None
+    sep = message[sep_start:value_start]
+    replacement = f"{key_text}{sep}{quote}Bearer {_REDACTED_VALUE}{quote}"
+    return replacement, value_end
+
+
+def _try_redact_bare_authorization_bearer(
+    message: str,
+    key_text: str,
+    sep_start: int,
+    bearer_start: int,
+) -> Optional[tuple[str, int]]:
+    """Return (replacement, token_end) for bare Authorization: Bearer token forms."""
+    after_bearer = _has_bearer_keyword(message, bearer_start)
+    if after_bearer is None:
+        return None
+    token_start = _skip_ws(message, after_bearer)
+    if token_start >= len(message) or message[token_start] in _BARE_VALUE_DELIMS:
+        return None
+    token_end = _consume_bare_token(message, token_start)
+    sep = message[sep_start:bearer_start]
+    replacement = f"{key_text}{sep}Bearer {_REDACTED_VALUE}"
+    return replacement, token_end
+
+
+def _redact_authorization_bearer_credentials(message: str) -> str:
+    """Redact scoped Authorization Bearer credentials, including even-backslash quotes.
+
+    Handles header/assignment bare tokens, quoted assignment values, and
+    JSON/dict quote mixes. Uses the same escape-aware quoted-value consumer as
+    field redaction so ``Bearer secret\\\\"suffix"``-style leaks are removed.
+    """
+    out: list[str] = []
+    pos = 0
+    i = 0
+    n = len(message)
+    while i < n:
+        key_match = _match_authorization_key(message, i)
+        if key_match is None:
+            i += 1
+            continue
+        key_end, key_text = key_match
+        sep_start = key_end
+        j = _skip_ws(message, sep_start)
+        if j >= n or message[j] not in ":=":
+            i = key_end
+            continue
+        j = _skip_ws(message, j + 1)
+        if j >= n:
+            break
+
+        if message[j] in "\"'":
+            quoted = _try_redact_quoted_authorization_bearer(
+                message, key_text, sep_start, j
+            )
+            if quoted is None:
+                i = key_end
+                continue
+            replacement, value_end = quoted
+            out.append(message[pos:i])
+            out.append(replacement)
+            pos = value_end
+            i = value_end
+            continue
+
+        bare = _try_redact_bare_authorization_bearer(
+            message, key_text, sep_start, j
+        )
+        if bare is None:
+            i = key_end
+            continue
+        replacement, token_end = bare
+        out.append(message[pos:i])
+        out.append(replacement)
+        pos = token_end
+        i = token_end
+
+    out.append(message[pos:])
+    return "".join(out)
 
 
 def sanitize_credential_error_message(
@@ -238,8 +312,7 @@ def sanitize_credential_error_message(
     for field_name in names:
         sanitized = _redact_field_values(sanitized, field_name)
     if redact_authorization_bearer:
-        for pattern, replacer in _AUTHORIZATION_BEARER_RULES:
-            sanitized = pattern.sub(replacer, sanitized)
+        sanitized = _redact_authorization_bearer_credentials(sanitized)
     if limit is not None and limit > 0 and len(sanitized) > limit:
         if limit <= 3:
             sanitized = sanitized[:limit]
