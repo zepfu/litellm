@@ -84,35 +84,58 @@ def _sanitize_gemini_tool_response_text(text: str) -> str:
     cleaned = _EPHEMERAL_MESSAGE_BLOCK_RE.sub("\n", cleaned)
     cleaned = _EPHEMERAL_MESSAGE_TAG_RE.sub("\n", cleaned)
     cleaned = cleaned.replace("<tool_use_error>", "")
+    cleaned = cleaned.replace("</tool_use_error>", "")
     cleaned = cleaned.strip()
     return cleaned or text.strip()
 
 
-def _coerce_gemini_tool_response_data(text: str) -> dict:
+def _coerce_gemini_tool_response_data(
+    text: str,
+    *,
+    is_error: Optional[bool] = None,
+) -> dict:
     """
     Normalize plain tool output into the response schema Gemini Code Assist uses natively.
 
     Native requests observed on the wire use:
     - {"output": "..."} for successful tool results
     - {"error": "..."} for failed tool results
+
+    Prefer structured signals over text heuristics:
+    - Structured JSON payloads are returned as-is so genuine ``{"error": ...}``
+      bodies stay errors.
+    - An explicit ``is_error`` status on the tool message forces error/output.
+    - Claude-side ``<tool_use_error>`` wrappers are treated as failures.
+
+    Arbitrary successful prose that merely begins with words like "Error"/"Exception"/
+    "Traceback" must remain successful ``output``.
     """
     cleaned_text = _sanitize_gemini_tool_response_text(text)
 
     try:
-        if cleaned_text.startswith("{") or cleaned_text.startswith("["):
+        if cleaned_text.startswith(("{", "[")):
             parsed = json.loads(cleaned_text)
             if isinstance(parsed, dict):
                 return parsed
     except (json.JSONDecodeError, ValueError):
         pass
 
-    lowered = cleaned_text.lower()
-    if lowered.startswith("error") or lowered.startswith("exception") or lowered.startswith(
-        "traceback"
-    ) or lowered.startswith("inputvalidationerror") or "failed due to the following issue" in lowered:
+    # Explicit status signal from callers that have a real success/failure bit
+    # (for example Anthropic tool_result.is_error mirrored onto the OpenAI tool
+    # message). This wins over free-text heuristics.
+    if is_error is True:
+        return {"error": cleaned_text}
+    if is_error is False:
+        return {"output": cleaned_text}
+
+    # Explicit Claude-side failure wrapper. Detect on the original text because
+    # sanitization strips the tags before the payload is returned.
+    lowered_original = text.lower()
+    if "<tool_use_error>" in lowered_original or "</tool_use_error>" in lowered_original:
         return {"error": cleaned_text}
 
     return {"output": cleaned_text}
+
 
 # used to interweave user messages, to ensure user/assistant alternating
 DEFAULT_USER_CONTINUE_MESSAGE = {
@@ -1638,10 +1661,16 @@ def convert_to_gemini_tool_call_result(  # noqa: PLR0915
 
     # Parse response data - support structured JSON while normalizing plain text
     # to the Gemini Code Assist output/error shape observed on the native wire.
-    response_data: dict = _coerce_gemini_tool_response_data(content_str)
+    # Prefer an explicit is_error status when present; otherwise use conservative
+    # structured/wrapper signals rather than guessing from free text.
+    message_is_error = message.get("is_error")  # type: ignore[attr-defined]
+    if not isinstance(message_is_error, bool):
+        message_is_error = None
+    response_data: dict = _coerce_gemini_tool_response_data(
+        content_str,
+        is_error=message_is_error,
+    )
 
-    # We can't determine from openai message format whether it's a successful or
-    # error call result so default to the successful result template
     _function_response = VertexFunctionResponse(
         name=name, response=response_data  # type: ignore
     )
@@ -2022,7 +2051,13 @@ def anthropic_process_openai_file_message(
                 data=image_chunk["data"],
             ),
         )
-        return anthropic_document_param
+        return cast(
+            AnthropicMessagesDocumentParam,
+            add_cache_control_to_content(
+                anthropic_content_element=anthropic_document_param,
+                original_content_element=dict(file_message),
+            ),
+        )
     elif file_id:
         content_block_type = (
             select_anthropic_content_block_type_for_file(format)
@@ -2067,7 +2102,17 @@ def anthropic_process_openai_file_message(
 
         if return_block_param is None:
             raise Exception(f"Unable to parse anthropic file message: {message}")
-        return return_block_param
+        return cast(
+            Union[
+                AnthropicMessagesDocumentParam,
+                AnthropicMessagesImageParam,
+                AnthropicMessagesContainerUploadParam,
+            ],
+            add_cache_control_to_content(
+                anthropic_content_element=return_block_param,
+                original_content_element=dict(file_message),
+            ),
+        )
     raise Exception(
         f"Either file_data or file_id must be present in the file message: {message}"
     )

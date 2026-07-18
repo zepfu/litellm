@@ -1781,6 +1781,8 @@ Assistant:
 
 Pass base64 encoded PDF files to Anthropic models using the `file` content type with a `file_data` field.
 
+You can also attach Anthropic prompt caching on the file content block with `"cache_control": {"type": "ephemeral"}`. LiteLLM preserves that directive when translating OpenAI-style `file` blocks into Anthropic `document` / `image` / `container_upload` content.
+
 <Tabs>
 <TabItem value="sdk" label="SDK">
 
@@ -2006,13 +2008,18 @@ file = litellm.create_file(
 )
 
 # 2. Use file_id in messages (no re-upload needed)
+# Optional: mark the file block for Anthropic prompt caching via cache_control.
 response = litellm.completion(
     model="anthropic/claude-sonnet-4-5-20250929",
     messages=[{
         "role": "user",
         "content": [
             {"type": "text", "text": "Summarize this document"},
-            {"type": "file", "file": {"file_id": file.id, "format": "application/pdf"}}
+            {
+                "type": "file",
+                "file": {"file_id": file.id, "format": "application/pdf"},
+                "cache_control": {"type": "ephemeral"},
+            },
         ]
     }]
 )

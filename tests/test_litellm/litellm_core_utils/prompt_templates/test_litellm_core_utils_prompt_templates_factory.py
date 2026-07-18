@@ -1,11 +1,9 @@
-import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 import litellm
 from litellm.litellm_core_utils.prompt_templates.factory import (
-    BAD_MESSAGE_ERROR_STR,
     BedrockConverseMessagesProcessor,
     BedrockImageProcessor,
     _convert_to_bedrock_tool_call_invoke,
@@ -149,7 +147,6 @@ def test_bedrock_validate_format_image_or_video():
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
     }
     for mime, expected in valid_document_formats.items():
-        print("testing mime", mime, "expected", expected)
         result = BedrockImageProcessor._validate_format(mime, mime.split("/")[1])
         assert result == expected, f"Expected {expected}, got {result}"
 
@@ -397,7 +394,6 @@ def test_vertex_ai_transform_empty_function_call_arguments():
         "arguments": "",
     }
     result: VertexFunctionCall = _gemini_tool_call_invoke_helper(function_call)
-    print(result)
     assert result["args"] == {
         "type": "object",
     }
@@ -414,10 +410,9 @@ async def test_bedrock_process_image_async_factory():
 
     image_url = "data:application/pdf; qs=0.001;base64,JVBERi0xLjQKJcOkw7zDtsOfCjIgMCBvYmoKPDwvTGVuZ3RoIDMgMCBSL0ZpbHRlci9GbGF0ZURlY29kZT4"
 
-    content_block = await BedrockImageProcessor.process_image_async(
+    await BedrockImageProcessor.process_image_async(
         image_url=image_url, format=None
     )
-    print(f"content_block: {content_block}")
 
 
 def test_unpack_defs_resolves_nested_ref_inside_anyof_items():
@@ -556,6 +551,144 @@ def test_convert_gemini_tool_call_result_maps_tool_use_error_to_error():
     assert result["function_response"]["name"] == "Bash"
     assert result["function_response"]["response"] == {
         "error": "InputValidationError: Bash failed due to the following issue:\nThe required parameter `command` is missing."
+    }
+
+
+def test_convert_gemini_tool_call_result_keeps_successful_errorlike_text_as_output():
+    """Successful tool text that merely begins with Error/Exception/Traceback is not an error."""
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        convert_to_gemini_tool_call_result,
+    )
+
+    cases = [
+        "Error rates dropped after the rollout completed successfully.",
+        "Exception handling path returned a cached value for this request.",
+        "Traceback analysis finished; no failures were found in the latest run.",
+        "InputValidationError was not raised for the corrected payload.",
+        "Command failed due to the following issue being fixed in a later attempt.",
+    ]
+    for idx, content in enumerate(cases):
+        message = {
+            "role": "tool",
+            "tool_call_id": f"call_success_errorlike_{idx}",
+            "content": content,
+        }
+        last_message_with_tool_calls = {
+            "tool_calls": [
+                {
+                    "id": f"call_success_errorlike_{idx}",
+                    "function": {"name": "Bash", "arguments": "{}"},
+                }
+            ]
+        }
+        result = convert_to_gemini_tool_call_result(
+            message=message,
+            last_message_with_tool_calls=last_message_with_tool_calls,
+        )
+        assert result["function_response"]["response"] == {"output": content}, content
+
+
+def test_convert_gemini_tool_call_result_preserves_structured_error_payload():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        convert_to_gemini_tool_call_result,
+    )
+
+    message = {
+        "role": "tool",
+        "tool_call_id": "call_structured_error",
+        "content": '{"error": "weather service unavailable", "code": 500}',
+    }
+    last_message_with_tool_calls = {
+        "tool_calls": [
+            {
+                "id": "call_structured_error",
+                "function": {"name": "get_weather", "arguments": "{}"},
+            }
+        ]
+    }
+
+    result = convert_to_gemini_tool_call_result(
+        message=message,
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+
+    assert result["function_response"]["name"] == "get_weather"
+    assert result["function_response"]["response"] == {
+        "error": "weather service unavailable",
+        "code": 500,
+    }
+
+
+def test_convert_gemini_tool_call_result_maps_plain_tool_use_error_wrapper_to_error():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        convert_to_gemini_tool_call_result,
+    )
+
+    message = {
+        "role": "tool",
+        "tool_call_id": "call_wrapped_error",
+        "content": "<tool_use_error>Permission denied while reading /tmp/secret</tool_use_error>",
+    }
+    last_message_with_tool_calls = {
+        "tool_calls": [
+            {
+                "id": "call_wrapped_error",
+                "function": {"name": "Read", "arguments": "{}"},
+            }
+        ]
+    }
+
+    result = convert_to_gemini_tool_call_result(
+        message=message,
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+
+    assert result["function_response"]["response"] == {
+        "error": "Permission denied while reading /tmp/secret"
+    }
+
+
+def test_convert_gemini_tool_call_result_honors_is_error_status():
+    """Explicit tool-message is_error must control Gemini error/output classification."""
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        convert_to_gemini_tool_call_result,
+    )
+
+    last_message_with_tool_calls = {
+        "tool_calls": [
+            {
+                "id": "call_status",
+                "function": {"name": "Bash", "arguments": "{}"},
+            }
+        ]
+    }
+
+    # Explicit failure even when free text does not look like an error.
+    error_result = convert_to_gemini_tool_call_result(
+        message={
+            "role": "tool",
+            "tool_call_id": "call_status",
+            "content": "Permission denied while reading /tmp/secret",
+            "is_error": True,
+        },
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+    assert error_result["function_response"]["response"] == {
+        "error": "Permission denied while reading /tmp/secret"
+    }
+
+    # Explicit success even when free text would previously have been misclassified.
+    success_result = convert_to_gemini_tool_call_result(
+        message={
+            "role": "tool",
+            "tool_call_id": "call_status",
+            "content": "Error rates dropped after the rollout completed successfully.",
+            "is_error": False,
+        },
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+    assert success_result["function_response"]["response"] == {
+        "output": "Error rates dropped after the rollout completed successfully."
     }
 
 
@@ -883,7 +1016,6 @@ def test_bedrock_image_processor_content_type_document_formats():
     """
     Test that _post_call_image_processing handles various document formats
     """
-    import base64
 
     # Create mock response
     mock_response = MagicMock()
@@ -1196,9 +1328,10 @@ def test_bedrock_create_bedrock_block_different_document_formats():
         )
 
         assert block.get("document") is not None
-        assert f"DocumentPDFmessages_" in block["document"]["name"]
+        assert "DocumentPDFmessages_" in block["document"]["name"]
         assert block["document"]["name"].endswith(f"_{format_type}")
         assert block["document"]["format"] == format_type
+
 
 def test_bedrock_nova_web_search_options_mapping():
     """
@@ -1267,6 +1400,148 @@ def test_bedrock_tools_pt_does_not_handle_system_tool():
     tool_spec = result[0].get("toolSpec")
     assert tool_spec is not None
     assert tool_spec["name"] == "get_weather"
+
+
+def test_anthropic_process_openai_file_message_preserves_cache_control_for_file_data():
+    """OpenAI file content blocks must keep cache_control through Anthropic conversion."""
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        anthropic_process_openai_file_message,
+    )
+
+    message = {
+        "type": "file",
+        "file": {
+            "file_data": "data:application/pdf;base64,JVBERi0xLjQK",
+            "format": "application/pdf",
+        },
+        "cache_control": {"type": "ephemeral"},
+    }
+
+    result = anthropic_process_openai_file_message(message)
+
+    assert result["type"] == "document"
+    assert result["source"]["type"] == "base64"
+    assert result["source"]["media_type"] == "application/pdf"
+    assert "cache_control" in result
+    assert result["cache_control"]["type"] == "ephemeral"
+
+
+def test_anthropic_process_openai_file_message_preserves_cache_control_for_file_id():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        anthropic_process_openai_file_message,
+    )
+
+    message = {
+        "type": "file",
+        "file": {
+            "file_id": "file_abc123",
+            "format": "application/pdf",
+        },
+        "cache_control": {"type": "ephemeral"},
+    }
+
+    result = anthropic_process_openai_file_message(message)
+
+    assert result["type"] == "document"
+    assert result["source"]["type"] == "file"
+    assert result["source"]["file_id"] == "file_abc123"
+    assert "cache_control" in result
+    assert result["cache_control"]["type"] == "ephemeral"
+
+
+def test_anthropic_process_openai_file_message_without_cache_control():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        anthropic_process_openai_file_message,
+    )
+
+    message = {
+        "type": "file",
+        "file": {
+            "file_id": "file_no_cache",
+            "format": "application/pdf",
+        },
+    }
+
+    result = anthropic_process_openai_file_message(message)
+
+    assert result["type"] == "document"
+    assert result.get("cache_control") is None
+
+
+def test_anthropic_process_openai_file_message_preserves_cache_control_for_image_and_url():
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        anthropic_process_openai_file_message,
+    )
+
+    image_result = anthropic_process_openai_file_message(
+        {
+            "type": "file",
+            "file": {"file_id": "file_img", "format": "image/png"},
+            "cache_control": {"type": "ephemeral"},
+        }
+    )
+    assert image_result["type"] == "image"
+    assert image_result["cache_control"]["type"] == "ephemeral"
+
+    url_result = anthropic_process_openai_file_message(
+        {
+            "type": "file",
+            "file": {"file_id": "https://example.com/doc.pdf"},
+            "cache_control": {"type": "ephemeral"},
+        }
+    )
+    assert url_result["type"] == "document"
+    assert url_result["source"]["type"] == "url"
+    assert url_result["cache_control"]["type"] == "ephemeral"
+
+    container_result = anthropic_process_openai_file_message(
+        {
+            "type": "file",
+            "file": {"file_id": "container_upload_id"},
+            "cache_control": {"type": "ephemeral"},
+        }
+    )
+    assert container_result["type"] == "container_upload"
+    assert container_result["cache_control"]["type"] == "ephemeral"
+
+
+def test_anthropic_messages_pt_preserves_file_block_cache_control():
+    """End-to-end: OpenAI file content blocks keep cache_control through anthropic_messages_pt."""
+    from litellm.litellm_core_utils.prompt_templates.factory import anthropic_messages_pt
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "file",
+                    "file": {
+                        "file_id": "file_abc123",
+                        "format": "application/pdf",
+                    },
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": "Summarize this document.",
+                },
+            ],
+        }
+    ]
+
+    result = anthropic_messages_pt(
+        messages=messages,
+        model="claude-3-5-sonnet-20241022",
+        llm_provider="anthropic",
+    )
+
+    assert len(result) == 1
+    assert result[0]["role"] == "user"
+    file_block = result[0]["content"][0]
+    assert file_block["type"] == "document"
+    assert file_block["source"]["file_id"] == "file_abc123"
+    assert file_block.get("cache_control") == {"type": "ephemeral"}
+
 
 def test_convert_to_anthropic_tool_result_image_with_cache_control():
     """
