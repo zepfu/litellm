@@ -1629,10 +1629,19 @@ def _fit_langfuse_generation_params_to_event_size(
     *,
     max_event_size_bytes: Optional[int] = None,
     input_shape_hash_only: Optional[bool] = None,
+    measured_size_bytes: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     max_bytes = max_event_size_bytes or _get_langfuse_max_event_size_bytes()
     target_bytes = _langfuse_event_fit_target_bytes(max_bytes)
-    if _json_size_bytes(generation_params) < target_bytes:
+    # Reuse a caller-provided full-payload measurement when available so the
+    # fit path and the subsequent size-audit path can share one serialization
+    # for under-limit events (the common hot path).
+    current_size_bytes = (
+        measured_size_bytes
+        if isinstance(measured_size_bytes, int)
+        else _json_size_bytes(generation_params)
+    )
+    if current_size_bytes < target_bytes:
         return generation_params, None
 
     fitted_generation_params = dict(generation_params)
@@ -1644,7 +1653,7 @@ def _fit_langfuse_generation_params_to_event_size(
     )
 
     for field_name in _langfuse_generation_field_fit_order(fitted_generation_params):
-        if _json_size_bytes(fitted_generation_params) <= target_bytes:
+        if current_size_bytes <= target_bytes:
             break
 
         field_summary = _fit_langfuse_generation_field_to_event_size(
@@ -1655,6 +1664,7 @@ def _fit_langfuse_generation_params_to_event_size(
         )
         if field_summary is not None:
             field_summaries.append(field_summary)
+            current_size_bytes = _json_size_bytes(fitted_generation_params)
 
     final_total_size_bytes = _json_size_bytes(fitted_generation_params)
     fit_summary = _build_langfuse_generation_fit_summary(
@@ -1674,10 +1684,21 @@ def _build_langfuse_payload_size_summary(
     call_type: Optional[str],
     max_event_size_bytes: Optional[int] = None,
     input_truncation_summary: Optional[Dict[str, Any]] = None,
+    measured_total_size_bytes: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     max_bytes = max_event_size_bytes or _get_langfuse_max_event_size_bytes()
     threshold_bytes = int(max_bytes * _LANGFUSE_SIZE_AUDIT_THRESHOLD_RATIO)
-    total_size_bytes = _json_size_bytes(generation_params)
+    if isinstance(measured_total_size_bytes, int):
+        total_size_bytes = measured_total_size_bytes
+    elif (
+        isinstance(input_truncation_summary, dict)
+        and isinstance(input_truncation_summary.get("final_total_size_bytes"), int)
+    ):
+        # Prefer the size already measured at the end of event fitting instead of
+        # re-serializing the full payload solely for the audit total.
+        total_size_bytes = cast(int, input_truncation_summary["final_total_size_bytes"])
+    else:
+        total_size_bytes = _json_size_bytes(generation_params)
 
     if total_size_bytes < threshold_bytes and input_truncation_summary is None:
         return None
@@ -1722,12 +1743,16 @@ def _log_langfuse_payload_size_if_needed(
     trace_id: Optional[str],
     call_type: Optional[str],
     input_truncation_summary: Optional[Dict[str, Any]] = None,
+    measured_total_size_bytes: Optional[int] = None,
+    max_event_size_bytes: Optional[int] = None,
 ) -> None:
     size_summary = _build_langfuse_payload_size_summary(
         generation_params=generation_params,
         trace_id=trace_id,
         call_type=call_type,
         input_truncation_summary=input_truncation_summary,
+        measured_total_size_bytes=measured_total_size_bytes,
+        max_event_size_bytes=max_event_size_bytes,
     )
     if size_summary is None:
         return
@@ -1753,6 +1778,51 @@ def _log_langfuse_payload_size_if_needed(
         "Langfuse event near/exceeds size limit before SDK enqueue: %s",
         json.dumps(size_summary, sort_keys=True),
     )
+
+
+def _fit_and_audit_langfuse_event_params(
+    event_params: Dict[str, Any],
+    *,
+    trace_id: Optional[str],
+    call_type: Optional[str],
+    max_event_size_bytes: Optional[int] = None,
+    input_shape_hash_only: Optional[bool] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Fit an event payload and audit size using a single shared measurement.
+
+    Hot-path calls previously paid for at least two unconditional full-payload
+    ``json.dumps`` passes: once in ``_fit_langfuse_generation_params_to_event_size``
+    and again in ``_build_langfuse_payload_size_summary``. Measure once here and
+    reuse the size for both stages when the payload is under the fit target.
+    """
+    max_bytes = max_event_size_bytes or _get_langfuse_max_event_size_bytes()
+    measured_size_bytes = _json_size_bytes(event_params)
+    fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
+        event_params,
+        max_event_size_bytes=max_bytes,
+        input_shape_hash_only=input_shape_hash_only,
+        measured_size_bytes=measured_size_bytes,
+    )
+    if fit_summary is None:
+        # Payload was under the fit target; reuse the pre-fit measurement so the
+        # audit threshold check does not re-serialize the full event.
+        audit_size_bytes = measured_size_bytes
+    else:
+        # Fitting may have mutated the payload; prefer the size captured in the
+        # fit summary (already measured once at the end of fitting).
+        final_total = fit_summary.get("final_total_size_bytes")
+        audit_size_bytes = (
+            final_total if isinstance(final_total, int) else None
+        )
+    _log_langfuse_payload_size_if_needed(
+        generation_params=fitted_params,
+        trace_id=trace_id,
+        call_type=call_type,
+        input_truncation_summary=fit_summary,
+        measured_total_size_bytes=audit_size_bytes,
+        max_event_size_bytes=max_bytes,
+    )
+    return fitted_params, fit_summary
 
 
 def _explicit_openrouter_model_for_langfuse(
@@ -2551,14 +2621,13 @@ class LangFuseLogger:
                         if key.lower() not in ["authorization", "cookie", "referer"]:
                             clean_headers[key] = value
 
-            trace_params, trace_fit_summary = (
-                _fit_langfuse_generation_params_to_event_size(trace_params)
-            )
-            _log_langfuse_payload_size_if_needed(
-                generation_params=trace_params,
+            (
+                trace_params,
+                trace_fit_summary,
+            ) = _fit_and_audit_langfuse_event_params(
+                trace_params,
                 trace_id=trace_id,
                 call_type=f"{kwargs.get('call_type', 'completion')}.trace",
-                input_truncation_summary=trace_fit_summary,
             )
 
             trace: StatefulTraceClient = self.Langfuse.trace(**trace_params)
@@ -2751,13 +2820,10 @@ class LangFuseLogger:
             (
                 generation_params,
                 input_truncation_summary,
-            ) = _fit_langfuse_generation_params_to_event_size(generation_params)
-
-            _log_langfuse_payload_size_if_needed(
-                generation_params=generation_params,
+            ) = _fit_and_audit_langfuse_event_params(
+                generation_params,
                 trace_id=trace_id,
                 call_type=cast(Optional[str], kwargs.get("call_type")),
-                input_truncation_summary=input_truncation_summary,
             )
 
             generation_client = trace.generation(**generation_params)
