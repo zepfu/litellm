@@ -11,7 +11,6 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 
-import httpx
 import pytest
 from respx import MockRouter
 
@@ -91,63 +90,31 @@ async def test_xai_oauth_managed_auth_file_refreshes_near_expiry(
     tmp_path,
     monkeypatch,
 ):
+    """Near-expiry credentials fail closed; sidecars own refresh (RR-040 #4)."""
     from litellm.llms.xai import oauth
 
+    original_payload = {
+        "key": "old-access-token",
+        "refresh_token": "old-refresh-token",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "oidc_client_id": "client-id",
+    }
     credential_path = tmp_path / "xai-oauth.json"
-    credential_path.write_text(
-        json.dumps(
-            {
-                "key": "old-access-token",
-                "refresh_token": "old-refresh-token",
-                "expires_at": (
-                    datetime.now(timezone.utc) + timedelta(seconds=30)
-                ).isoformat(),
-                "oidc_client_id": "client-id",
-            }
-        ),
-        encoding="utf-8",
-    )
+    credential_path.write_text(json.dumps(original_payload), encoding="utf-8")
     monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
     monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
-    captured = {}
 
-    class FakeAsyncClient:
+    class UnexpectedRefreshClient:
         def __init__(self, *args, **kwargs):
-            pass
+            raise AssertionError("managed xAI OAuth path must not call token refresh")
 
-        async def __aenter__(self):
-            return self
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", UnexpectedRefreshClient):
+        with pytest.raises(
+            ValueError, match="provider-status sidecar xAI OAuth refresh"
+        ):
+            await oauth.get_xai_oauth_access_token()
 
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-        async def post(self, url, data, headers):
-            captured["url"] = url
-            captured["data"] = data
-            captured["headers"] = headers
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": "new-access-token",
-                    "refresh_token": "new-refresh-token",
-                    "expires_in": 3600,
-                    "token_type": "Bearer",
-                },
-            )
-
-    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
-        assert await oauth.get_xai_oauth_access_token() == "new-access-token"
-
-    assert captured["url"] == "https://auth.test/token"
-    assert captured["data"] == {
-        "grant_type": "refresh_token",
-        "refresh_token": "old-refresh-token",
-        "client_id": "client-id",
-    }
-    refreshed = json.loads(credential_path.read_text(encoding="utf-8"))
-    assert refreshed["key"] == "new-access-token"
-    assert refreshed["access_token"] == "new-access-token"
-    assert refreshed["refresh_token"] == "new-refresh-token"
+    assert json.loads(credential_path.read_text(encoding="utf-8")) == original_payload
 
 
 def test_xai_oauth_migrate_hermes_provider_tokens(tmp_path, monkeypatch):
@@ -323,57 +290,40 @@ async def test_xai_oauth_managed_auth_file_serializes_refresh(
     tmp_path,
     monkeypatch,
 ):
+    """Concurrent near-expiry reads never mint tokens; both fail closed (RR-040)."""
     from litellm.llms.xai import oauth
 
+    original_payload = {
+        "key": "old-access-token",
+        "refresh_token": "old-refresh-token",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "oidc_client_id": "client-id",
+    }
     credential_path = tmp_path / "xai-oauth.json"
-    credential_path.write_text(
-        json.dumps(
-            {
-                "key": "old-access-token",
-                "refresh_token": "old-refresh-token",
-                "expires_at": (
-                    datetime.now(timezone.utc) + timedelta(seconds=30)
-                ).isoformat(),
-                "oidc_client_id": "client-id",
-            }
-        ),
-        encoding="utf-8",
-    )
+    credential_path.write_text(json.dumps(original_payload), encoding="utf-8")
     monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(credential_path))
     monkeypatch.setenv("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT", "https://auth.test/token")
     refresh_count = 0
 
-    class FakeAsyncClient:
+    class CountingRefreshClient:
         def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-        async def post(self, url, data, headers):
             nonlocal refresh_count
             refresh_count += 1
-            await asyncio.sleep(0)
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": "new-access-token",
-                    "refresh_token": "new-refresh-token",
-                    "expires_in": 3600,
-                },
-            )
+            raise AssertionError("managed xAI OAuth path must not call token refresh")
 
-    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", FakeAsyncClient):
-        tokens = await asyncio.gather(
+    with patch("litellm.llms.xai.oauth.httpx.AsyncClient", CountingRefreshClient):
+        results = await asyncio.gather(
             oauth.get_xai_oauth_access_token(),
             oauth.get_xai_oauth_access_token(),
+            return_exceptions=True,
         )
 
-    assert tokens == ["new-access-token", "new-access-token"]
-    assert refresh_count == 1
+    assert all(isinstance(item, ValueError) for item in results)
+    assert all(
+        "provider-status sidecar xAI OAuth refresh" in str(item) for item in results
+    )
+    assert refresh_count == 0
+    assert json.loads(credential_path.read_text(encoding="utf-8")) == original_payload
 
 
 def test_xai_oauth_model_mapping_and_metadata():
@@ -470,14 +420,22 @@ def test_xai_grok_4_stop_not_supported(model):
     assert "stop" not in supported_params
 
 
-@pytest.mark.parametrize("model", ["xai/grok-4", "xai/grok-4-0709", "xai/grok-4-latest", "xai/grok-code-fast", "xai/grok-code-fast-1"])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "xai/grok-4",
+        "xai/grok-4-0709",
+        "xai/grok-4-latest",
+        "xai/grok-code-fast",
+        "xai/grok-code-fast-1",
+    ],
+)
 def test_xai_grok_4_frequency_penalty_not_supported(model):
     """
     Test that grok-4 models do not support the frequency_penalty parameter
     """
     supported_params = XAIChatConfig().get_supported_openai_params(model=model)
     assert "frequency_penalty" not in supported_params
-
 
 
 def test_xai_message_name_filtering():
@@ -547,7 +505,7 @@ def test_xai_streaming_with_include_usage():
     """
     Test that xAI streaming correctly handles usage in the last chunk
     when stream_options={"include_usage": True} is set.
-    
+
     xAI sends usage in a chunk with empty choices array, which should be
     handled by XAIChatCompletionStreamingHandler.
     """
@@ -556,7 +514,7 @@ def test_xai_streaming_with_include_usage():
             model="xai/grok-4-1-fast-non-reasoning",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Say hello in one word"}
+                {"role": "user", "content": "Say hello in one word"},
             ],
             stream=True,
             stream_options={"include_usage": True},
@@ -565,30 +523,38 @@ def test_xai_streaming_with_include_usage():
 
         chunks = []
         usage_chunk = None
-        
+
         for chunk in response:
             chunks.append(chunk)
             if hasattr(chunk, "usage") and chunk.usage is not None:
                 usage_chunk = chunk
-        
+
         # Verify we got chunks
         assert len(chunks) > 0, "Should receive streaming chunks"
-        
+
         # Verify usage was included in one of the chunks
         assert usage_chunk is not None, "Should receive usage in streaming chunks"
-        
+
         # Verify usage has expected fields
-        assert hasattr(usage_chunk.usage, "prompt_tokens"), "Usage should have prompt_tokens"
-        assert hasattr(usage_chunk.usage, "completion_tokens"), "Usage should have completion_tokens"
-        assert hasattr(usage_chunk.usage, "total_tokens"), "Usage should have total_tokens"
-        
+        assert hasattr(
+            usage_chunk.usage, "prompt_tokens"
+        ), "Usage should have prompt_tokens"
+        assert hasattr(
+            usage_chunk.usage, "completion_tokens"
+        ), "Usage should have completion_tokens"
+        assert hasattr(
+            usage_chunk.usage, "total_tokens"
+        ), "Usage should have total_tokens"
+
         # Verify usage values are positive
         assert usage_chunk.usage.prompt_tokens > 0, "prompt_tokens should be positive"
-        assert usage_chunk.usage.completion_tokens > 0, "completion_tokens should be positive"
+        assert (
+            usage_chunk.usage.completion_tokens > 0
+        ), "completion_tokens should be positive"
         assert usage_chunk.usage.total_tokens > 0, "total_tokens should be positive"
-        
+
         print(f"✓ Successfully received usage in streaming chunk: {usage_chunk.usage}")
-        
+
     except Exception as e:
         if "API key" in str(e) or "authentication" in str(e).lower():
             pytest.skip(f"Skipping test due to API key issue: {str(e)}")

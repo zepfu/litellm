@@ -1,18 +1,26 @@
-from litellm.secret_managers.credential_file_lock import credential_file_lock
+"""xAI / Grok OAuth credential helpers for LiteLLM request paths.
+
+Production token accessors are **read-only**. In-process refresh is intentionally
+unwired: the provider-status sidecar scripts (`scripts/xai_oauth_refresh.py`,
+`scripts/grok_oidc_refresh.py`) own refresh and exclusive flock writes via the
+shared ``litellm.secret_managers.credential_file_lock`` helper (RR-040 #1/#3).
+This module keeps private-mode credential writes for Hermes migration only.
+"""
+
+from __future__ import annotations
+
 import asyncio
-from contextlib import contextmanager
 import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Optional
 
-import httpx
+import httpx  # noqa: F401  # harness patch surface; refresh path removed (RR-040)
 
 from litellm.constants import XAI_API_BASE
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str
-
 
 OA_XAI_PROVIDER_PREFIX = "oa_xai/"
 XAI_OAUTH_ROUTE_FAMILY = "xai_oauth_api"
@@ -52,9 +60,7 @@ _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA = {
     "tags": ["xai-responses-previous-response-id-decoded"],
 }
 
-_XAI_UNSUPPORTED_REASONING_INPUT_REMOVED_TAG = (
-    "codex-unsupported-input-item-removed"
-)
+_XAI_UNSUPPORTED_REASONING_INPUT_REMOVED_TAG = "codex-unsupported-input-item-removed"
 
 _refresh_locks: Dict[str, asyncio.Lock] = {}
 
@@ -76,7 +82,6 @@ def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> 
         os.chmod(path, mode)
     except OSError:
         pass
-
 
 
 def is_oa_xai_model(model: Any) -> bool:
@@ -172,9 +177,7 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
         data["metadata"] = metadata
     _merge_metadata(metadata, build_oa_xai_metadata(public_model, upstream_model))
     if decoded_previous_response_id:
-        _merge_metadata(
-            metadata, _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA
-        )
+        _merge_metadata(metadata, _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA)
     if removed_input_items:
         _merge_metadata(
             metadata,
@@ -185,7 +188,9 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
 
     litellm_metadata = data.get("litellm_metadata")
     if isinstance(litellm_metadata, dict):
-        _merge_metadata(litellm_metadata, build_oa_xai_metadata(public_model, upstream_model))
+        _merge_metadata(
+            litellm_metadata, build_oa_xai_metadata(public_model, upstream_model)
+        )
         if decoded_previous_response_id:
             _merge_metadata(
                 litellm_metadata,
@@ -207,10 +212,8 @@ def _decode_previous_response_id_in_place(data: Dict[str, Any]) -> bool:
     if not isinstance(previous_response_id, str) or not previous_response_id:
         return False
 
-    decoded = (
-        ResponsesAPIRequestUtils.decode_previous_response_id_to_original_previous_response_id(
-            previous_response_id
-        )
+    decoded = ResponsesAPIRequestUtils.decode_previous_response_id_to_original_previous_response_id(
+        previous_response_id
     )
     if decoded == previous_response_id:
         return False
@@ -450,9 +453,7 @@ def migrate_hermes_xai_oauth_credential(
         description="Hermes auth file",
     )
     credential_scope = (
-        scope
-        or get_secret_str("LITELLM_XAI_OAUTH_SCOPE")
-        or _DEFAULT_XAI_OAUTH_SCOPE
+        scope or get_secret_str("LITELLM_XAI_OAUTH_SCOPE") or _DEFAULT_XAI_OAUTH_SCOPE
     )
     credential = _build_litellm_xai_oauth_record_from_hermes(
         hermes_payload,
@@ -625,85 +626,6 @@ def _clean_oauth_string(value: Any) -> Optional[str]:
     return None
 
 
-def _oauth_credential_subject(is_grok_native_oauth: bool) -> str:
-    return (
-        "the managed xAI OAuth credential"
-        if not is_grok_native_oauth
-        else "the Grok OIDC credential"
-    )
-
-
-def _oauth_refresh_action(is_grok_native_oauth: bool) -> str:
-    return (
-        "xAI OAuth credential refresh"
-        if not is_grok_native_oauth
-        else "Grok OIDC credential refresh"
-    )
-
-
-async def _get_xai_oauth_access_token_locked(
-    *,
-    credential_path: Path,
-    scope: str,
-    lock_path: Optional[Path] = None,
-    is_grok_native_oauth: bool,
-) -> str:
-    with _credential_file_lock(lock_path):
-        raw_payload = _read_credential_payload(credential_path)
-        credential = _select_credential_record(raw_payload, scope)
-        token = _credential_access_token(credential)
-        if token and not _credential_needs_refresh(credential):
-            return token
-
-        refreshed = await _refresh_xai_oauth_credential(
-            credential,
-            is_grok_native_oauth=is_grok_native_oauth,
-        )
-        _update_credential_record(credential, refreshed)
-        _write_credential_payload(credential_path, raw_payload)
-        refreshed_token = _credential_access_token(credential)
-        if refreshed_token:
-            return refreshed_token
-    if is_grok_native_oauth:
-        raise ValueError(
-            "Grok OIDC credential refresh did not return an access token. "
-            "Reseed or relogin the Grok OIDC credential."
-        )
-    raise ValueError(
-        "xAI OAuth refresh did not return an access token. Reseed or relogin "
-        "the managed xAI OAuth credential before calling oa_xai/*."
-    )
-
-
-@contextmanager
-def _credential_file_lock(lock_path: Optional[Path]) -> Iterator[None]:
-    """Delegate to shared credential_file_lock (fcntl + warning on failure)."""
-    with credential_file_lock(lock_path):
-        yield
-
-        yield
-        return
-
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+", encoding="utf-8")
-    try:
-        try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
-        yield
-    finally:
-        try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except (ImportError, OSError):
-            pass
-        handle.close()
-
-
 def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
     try:
         with credential_path.open("r", encoding="utf-8") as handle:
@@ -746,7 +668,9 @@ def _select_credential_record(
 
 
 def _looks_like_credential_record(value: Dict[str, Any]) -> bool:
-    return bool(value.get("key") or value.get("access_token") or value.get("refresh_token"))
+    return bool(
+        value.get("key") or value.get("access_token") or value.get("refresh_token")
+    )
 
 
 def _credential_access_token(credential: Dict[str, Any]) -> Optional[str]:
@@ -757,9 +681,15 @@ def _credential_access_token(credential: Dict[str, Any]) -> Optional[str]:
 
 
 def _credential_needs_refresh(credential: Dict[str, Any]) -> bool:
+    """Return True when the credential should not be used as-is.
+
+    Missing or unparseable ``expires_at`` fails safe toward refresh (not
+    permanently fresh). Production accessors are read-only and raise a sidecar
+    refresh-required error in that case rather than minting a new token here.
+    """
     expires_at = _parse_expires_at(credential.get("expires_at"))
     if expires_at is None:
-        return False
+        return True
     buffer_seconds = _refresh_buffer_seconds()
     return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=buffer_seconds)
 
@@ -804,136 +734,13 @@ def _refresh_buffer_seconds() -> int:
         return _DEFAULT_REFRESH_BUFFER_SECONDS
 
 
-async def _refresh_xai_oauth_credential(
-    credential: Dict[str, Any],
-    *,
-    is_grok_native_oauth: bool,
-) -> Dict[str, Any]:
-    refresh_token = credential.get("refresh_token")
-    if not isinstance(refresh_token, str) or not refresh_token.strip():
-        raise ValueError(
-            "Grok OIDC credential is expired or near expiry and has no refresh_token. "
-            "Reseed or relogin the Grok OIDC credential."
-            if is_grok_native_oauth
-            else "xAI OAuth credential is expired or near expiry and has no refresh_token. "
-            "Reseed or relogin the managed xAI OAuth credential."
-        )
-
-    client_id = (
-        get_secret_str("LITELLM_XAI_OAUTH_CLIENT_ID")
-        or credential.get("oidc_client_id")
-        or credential.get("client_id")
-    )
-    if not isinstance(client_id, str) or not client_id.strip():
-        raise ValueError(
-            _oauth_refresh_action(is_grok_native_oauth)
-            + " requires oidc_client_id or LITELLM_XAI_OAUTH_CLIENT_ID. "
-            + (
-                f"Reseed {_oauth_credential_subject(is_grok_native_oauth)}."
-                if is_grok_native_oauth
-                else "Reseed the managed credential."
-            )
-        )
-
-    token_endpoint = (
-        get_secret_str("LITELLM_XAI_OAUTH_TOKEN_ENDPOINT")
-        or credential.get("token_endpoint")
-        or _DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT
-    )
-    if not isinstance(token_endpoint, str) or not token_endpoint.strip():
-        raise ValueError(
-            "xAI OAuth token endpoint is missing."
-            if not is_grok_native_oauth
-            else "Grok OIDC token endpoint is missing."
-        )
-
-    form_data = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token.strip(),
-        "client_id": client_id.strip(),
-    }
-    client_secret = get_secret_str("LITELLM_XAI_OAUTH_CLIENT_SECRET") or credential.get(
-        "client_secret"
-    )
-    if isinstance(client_secret, str) and client_secret.strip():
-        form_data["client_secret"] = client_secret.strip()
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                token_endpoint.strip(),
-                data=form_data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-    except httpx.HTTPError as exc:
-        raise ValueError(
-            f"{_oauth_refresh_action(is_grok_native_oauth)} failed while contacting "
-            "the token endpoint. "
-            f"Reseed or relogin {_oauth_credential_subject(is_grok_native_oauth)}."
-        ) from exc
-
-    if response.status_code >= 400:
-        error_hint = _extract_oauth_error_hint(response)
-        raise ValueError(
-            f"{_oauth_refresh_action(is_grok_native_oauth)} failed"
-            + (f" ({error_hint})" if error_hint else "")
-            + ". Reseed or relogin "
-            + _oauth_credential_subject(is_grok_native_oauth).rstrip(".")
-            + "."
-        )
-
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError("xAI OAuth token endpoint returned a non-object payload.")
-    return payload
-
-
-def _extract_oauth_error_hint(response: httpx.Response) -> Optional[str]:
-    try:
-        payload = response.json()
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    for key in ("error", "error_description", "message"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _update_credential_record(
-    credential: Dict[str, Any],
-    refreshed: Dict[str, Any],
-) -> None:
-    access_token = refreshed.get("access_token")
-    if isinstance(access_token, str) and access_token.strip():
-        credential["key"] = access_token.strip()
-        credential["access_token"] = access_token.strip()
-
-    refresh_token = refreshed.get("refresh_token")
-    if isinstance(refresh_token, str) and refresh_token.strip():
-        credential["refresh_token"] = refresh_token.strip()
-
-    id_token = refreshed.get("id_token")
-    if isinstance(id_token, str) and id_token.strip():
-        credential["id_token"] = id_token.strip()
-
-    expires_in = refreshed.get("expires_in")
-    if isinstance(expires_in, (int, float)):
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))
-        credential["expires_at"] = expires_at.isoformat().replace("+00:00", "Z")
-
-    token_type = refreshed.get("token_type")
-    if isinstance(token_type, str) and token_type.strip():
-        credential["token_type"] = token_type.strip()
+# NOTE (RR-040 #4): In-process locked refresh was intentionally removed.
+# Production paths use the read-only accessors above; sidecars own refresh.
 
 
 def _write_credential_payload(credential_path: Path, payload: Dict[str, Any]) -> None:
     credential_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = credential_path.with_name(
-        f".{credential_path.name}.{os.getpid()}.tmp"
-    )
+    tmp_path = credential_path.with_name(f".{credential_path.name}.{os.getpid()}.tmp")
     content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     _write_private_file_text(tmp_path, content, mode=0o600)
     os.replace(tmp_path, credential_path)
