@@ -1,5 +1,12 @@
 # What is this?
-## Translates OpenAI call to Anthropic `/v1/messages` format
+## Translates OpenAI Responses stream events to Anthropic `/v1/messages` SSE
+#
+# Anthropic event envelopes and SSE framing are shared with the Chat Completions
+# adapter tree via adapters.streaming_iterator (emit_* + encode_anthropic_sse_chunk).
+# Only Responses-event → normalized-delta mapping is local to this module.
+#
+# Stable prompt_cache_key derivation is owned by adapters.observability
+# (system+tools only); this module does not hash cache material.
 import json
 import traceback
 from collections import deque
@@ -7,6 +14,15 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 from litellm import verbose_logger
 from litellm._uuid import uuid
+from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
+    emit_content_block_delta,
+    emit_content_block_start,
+    emit_content_block_stop,
+    emit_message_delta,
+    emit_message_start,
+    emit_message_stop,
+    encode_anthropic_sse_chunk,
+)
 from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
     sanitize_anthropic_tool_use_input,
     sanitize_anthropic_tool_use_input_json_delta,
@@ -109,11 +125,10 @@ class AnthropicResponsesStreamWrapper:
         if isinstance(item_id, str) and item_id:
             self._item_id_to_block_index[item_id] = block_idx
         self._chunk_queue.append(
-            {
-                "type": "content_block_start",
-                "index": block_idx,
-                "content_block": {"type": "text", "text": ""},
-            }
+            emit_content_block_start(
+                index=block_idx,
+                content_block={"type": "text", "text": ""},
+            )
         )
         return block_idx
 
@@ -226,7 +241,11 @@ class AnthropicResponsesStreamWrapper:
             for part in content:
                 part_type = cls._get_value(part, "type")
                 text = cls._get_value(part, "text")
-                if part_type in {"output_text", "text"} and isinstance(text, str) and text.strip():
+                if (
+                    part_type in {"output_text", "text"}
+                    and isinstance(text, str)
+                    and text.strip()
+                ):
                     return True
             return False
         if item_type == "reasoning":
@@ -317,13 +336,13 @@ class AnthropicResponsesStreamWrapper:
 
     def _queue_synthetic_message_stop(self) -> None:
         self._chunk_queue.append(
-            {
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                "usage": self._build_fallback_usage_delta(),
-            }
+            emit_message_delta(
+                stop_reason="end_turn",
+                stop_sequence=None,
+                usage=self._build_fallback_usage_delta(),
+            )
         )
-        self._chunk_queue.append({"type": "message_stop"})
+        self._chunk_queue.append(emit_message_stop())
         self._sent_message_stop = True
 
     @staticmethod
@@ -344,19 +363,12 @@ class AnthropicResponsesStreamWrapper:
         return {}
 
     def _make_message_start(self) -> Dict[str, Any]:
-        return {
-            "type": "message_start",
-            "message": {
-                "id": self._message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": self.model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": self._build_message_start_usage(),
-            },
-        }
+        # Shared emitter surface with Chat Completions adapter tree (RR-031).
+        return emit_message_start(
+            model=self.model,
+            message_id=self._message_id,
+            usage=self._build_message_start_usage(),
+        )
 
     def _next_block_index(self) -> int:
         self._current_block_index += 1
@@ -398,11 +410,10 @@ class AnthropicResponsesStreamWrapper:
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx
                 self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "text", "text": ""},
-                    }
+                    emit_content_block_start(
+                        index=block_idx,
+                        content_block={"type": "text", "text": ""},
+                    )
                 )
             elif item_type == "function_call":
                 self._meaningful_output_seen = True
@@ -443,16 +454,15 @@ class AnthropicResponsesStreamWrapper:
                     if input_data:
                         self._tool_inputs_seeded.add(item_id)
                 self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {
+                    emit_content_block_start(
+                        index=block_idx,
+                        content_block={
                             "type": "tool_use",
                             "id": call_id,
                             "name": anthropic_name,
                             "input": input_data,
                         },
-                    }
+                    )
                 )
             elif item_type == "mcp_call":
                 self._meaningful_output_seen = True
@@ -481,28 +491,26 @@ class AnthropicResponsesStreamWrapper:
                     if input_data:
                         self._tool_inputs_seeded.add(item_id)
                 self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {
+                    emit_content_block_start(
+                        index=block_idx,
+                        content_block={
                             "type": "mcp_tool_use",
                             "id": call_id,
                             "name": name,
                             "server_name": server_label,
                             "input": input_data,
                         },
-                    }
+                    )
                 )
             elif item_type == "reasoning":
                 block_idx = self._next_block_index()
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx
                 self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "thinking", "thinking": ""},
-                    }
+                    emit_content_block_start(
+                        index=block_idx,
+                        content_block={"type": "thinking", "thinking": ""},
+                    )
                 )
             return
 
@@ -520,11 +528,10 @@ class AnthropicResponsesStreamWrapper:
                 self._text_delta_keys_seen.add(self._event_text_key(event))
             block_idx = self._get_or_create_text_block_index(item_id)
             self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "text_delta", "text": delta},
-                }
+                emit_content_block_delta(
+                    index=block_idx,
+                    delta={"type": "text_delta", "text": delta},
+                )
             )
             return
 
@@ -538,17 +545,20 @@ class AnthropicResponsesStreamWrapper:
                 event.get("text") if isinstance(event, dict) else None
             )
             text_key = self._event_text_key(event)
-            if not isinstance(text, str) or not text or text_key in self._text_delta_keys_seen:
+            if (
+                not isinstance(text, str)
+                or not text
+                or text_key in self._text_delta_keys_seen
+            ):
                 return
             self._meaningful_output_seen = True
             self._output_text_parts.append(text)
             block_idx = self._get_or_create_text_block_index(item_id)
             self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "text_delta", "text": text},
-                }
+                emit_content_block_delta(
+                    index=block_idx,
+                    delta={"type": "text_delta", "text": text},
+                )
             )
             return
 
@@ -568,11 +578,10 @@ class AnthropicResponsesStreamWrapper:
                 else self._current_block_index
             )
             self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "thinking_delta", "thinking": delta},
-                }
+                emit_content_block_delta(
+                    index=block_idx,
+                    delta={"type": "thinking_delta", "thinking": delta},
+                )
             )
             return
 
@@ -584,13 +593,15 @@ class AnthropicResponsesStreamWrapper:
             delta = getattr(event, "delta", "") or (
                 event.get("delta", "") if isinstance(event, dict) else ""
             )
-            tool_name = (
-                self._pending_tool_names.get(item_id, "") if item_id else ""
-            )
+            tool_name = self._pending_tool_names.get(item_id, "") if item_id else ""
             upstream_tool_name = (
                 self._pending_upstream_tool_names.get(item_id, "") if item_id else ""
             )
-            if item_id and upstream_tool_name == "exec_command" and self.use_codex_native_tools:
+            if (
+                item_id
+                and upstream_tool_name == "exec_command"
+                and self.use_codex_native_tools
+            ):
                 buffered_delta = (
                     self._codex_tool_argument_buffers.get(item_id, "") + delta
                 )
@@ -607,7 +618,9 @@ class AnthropicResponsesStreamWrapper:
                 self._codex_tool_argument_buffers.pop(item_id, None)
                 self._tool_argument_deltas_seen.add(item_id)
             elif item_id and tool_name == "Read":
-                buffered_delta = self._read_tool_argument_buffers.get(item_id, "") + delta
+                buffered_delta = (
+                    self._read_tool_argument_buffers.get(item_id, "") + delta
+                )
                 try:
                     json.loads(buffered_delta)
                 except json.JSONDecodeError:
@@ -625,17 +638,18 @@ class AnthropicResponsesStreamWrapper:
                 tool_name=tool_name,
                 partial_json=delta,
             )
+            if not isinstance(delta, str) or not delta:
+                return
             block_idx = (
                 self._item_id_to_block_index.get(item_id, self._current_block_index)
                 if item_id
                 else self._current_block_index
             )
             self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "input_json_delta", "partial_json": delta},
-                }
+                emit_content_block_delta(
+                    index=block_idx,
+                    delta={"type": "input_json_delta", "partial_json": delta},
+                )
             )
             return
 
@@ -653,10 +667,22 @@ class AnthropicResponsesStreamWrapper:
                 item_id in self._tool_argument_deltas_seen
                 or item_id in self._tool_inputs_seeded
             ):
+                # Drop any incomplete accumulation buffers once deltas already shipped.
+                self._codex_tool_argument_buffers.pop(item_id, None)
+                self._read_tool_argument_buffers.pop(item_id, None)
                 return
             arguments = getattr(event, "arguments", None) or (
                 event.get("arguments") if isinstance(event, dict) else None
             )
+            if arguments in (None, ""):
+                # Prefer flushed incomplete buffer over silent drop (code-execution /
+                # Read accumulation can end on .done without a final complete delta).
+                arguments = self._codex_tool_argument_buffers.pop(item_id, None) or (
+                    self._read_tool_argument_buffers.pop(item_id, None)
+                )
+            else:
+                self._codex_tool_argument_buffers.pop(item_id, None)
+                self._read_tool_argument_buffers.pop(item_id, None)
             if arguments in (None, ""):
                 return
             if isinstance(arguments, dict):
@@ -682,14 +708,13 @@ class AnthropicResponsesStreamWrapper:
                 self._current_block_index,
             )
             self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {
+                emit_content_block_delta(
+                    index=block_idx,
+                    delta={
                         "type": "input_json_delta",
                         "partial_json": arguments_json,
                     },
-                }
+                )
             )
             return
 
@@ -703,17 +728,18 @@ class AnthropicResponsesStreamWrapper:
             delta = getattr(event, "delta", "") or (
                 event.get("delta", "") if isinstance(event, dict) else ""
             )
+            if not isinstance(delta, str) or not delta:
+                return
             block_idx = (
                 self._item_id_to_block_index.get(item_id, self._current_block_index)
                 if item_id
                 else self._current_block_index
             )
             self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "input_json_delta", "partial_json": delta},
-                }
+                emit_content_block_delta(
+                    index=block_idx,
+                    delta={"type": "input_json_delta", "partial_json": delta},
+                )
             )
             return
 
@@ -745,14 +771,13 @@ class AnthropicResponsesStreamWrapper:
                 self._current_block_index,
             )
             self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {
+                emit_content_block_delta(
+                    index=block_idx,
+                    delta={
                         "type": "input_json_delta",
                         "partial_json": arguments_json,
                     },
-                }
+                )
             )
             return
 
@@ -772,7 +797,7 @@ class AnthropicResponsesStreamWrapper:
                 if item_id
                 else self._current_block_index
             )
-            self._chunk_queue.append({"type": "content_block_stop", "index": block_idx})
+            self._chunk_queue.append(emit_content_block_stop(index=block_idx))
 
             output = getattr(item, "output", None) or (
                 item.get("output") if isinstance(item, dict) else None
@@ -797,20 +822,17 @@ class AnthropicResponsesStreamWrapper:
 
             result_block_idx = self._next_block_index()
             self._chunk_queue.append(
-                {
-                    "type": "content_block_start",
-                    "index": result_block_idx,
-                    "content_block": {
+                emit_content_block_start(
+                    index=result_block_idx,
+                    content_block={
                         "type": "mcp_tool_result",
                         "tool_use_id": str(item_id or ""),
                         "is_error": error is not None,
                         "content": [{"type": "text", "text": output_text}],
                     },
-                }
+                )
             )
-            self._chunk_queue.append(
-                {"type": "content_block_stop", "index": result_block_idx}
-            )
+            self._chunk_queue.append(emit_content_block_stop(index=result_block_idx))
             return
 
         # ---- output item done -> content_block_stop ----
@@ -834,10 +856,17 @@ class AnthropicResponsesStreamWrapper:
             )
             if item_type in {"function_call", "mcp_call"} and item_id:
                 self._meaningful_output_seen = True
-                input_data = self._deserialize_tool_input(
-                    getattr(item, "arguments", None)
-                    or (item.get("arguments") if isinstance(item, dict) else None)
+                raw_arguments = getattr(item, "arguments", None) or (
+                    item.get("arguments") if isinstance(item, dict) else None
                 )
+                if raw_arguments in (None, "") and item_id:
+                    raw_arguments = self._codex_tool_argument_buffers.pop(
+                        item_id, None
+                    ) or (self._read_tool_argument_buffers.pop(item_id, None))
+                else:
+                    self._codex_tool_argument_buffers.pop(item_id, None)
+                    self._read_tool_argument_buffers.pop(item_id, None)
+                input_data = self._deserialize_tool_input(raw_arguments)
                 if item_type == "function_call":
                     upstream_tool_name = (
                         getattr(item, "name", None)
@@ -868,23 +897,17 @@ class AnthropicResponsesStreamWrapper:
                     and item_id not in self._tool_inputs_seeded
                 ):
                     self._chunk_queue.append(
-                        {
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": {
+                        emit_content_block_delta(
+                            index=block_idx,
+                            delta={
                                 "type": "input_json_delta",
                                 "partial_json": json.dumps(input_data),
                             },
-                        }
+                        )
                     )
             if item_type == "mcp_call":
                 return
-            self._chunk_queue.append(
-                {
-                    "type": "content_block_stop",
-                    "index": block_idx,
-                }
-            )
+            self._chunk_queue.append(emit_content_block_stop(index=block_idx))
             return
 
         # ---- response completed -> message_delta + message_stop ----
@@ -960,13 +983,13 @@ class AnthropicResponsesStreamWrapper:
             )
 
             self._chunk_queue.append(
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": usage_delta,
-                }
+                emit_message_delta(
+                    stop_reason=stop_reason,
+                    stop_sequence=None,
+                    usage=usage_delta,
+                )
             )
-            self._chunk_queue.append({"type": "message_stop"})
+            self._chunk_queue.append(emit_message_stop())
             self._sent_message_stop = True
             return
 
@@ -1026,11 +1049,10 @@ class AnthropicResponsesStreamWrapper:
         raise StopAsyncIteration
 
     async def async_anthropic_sse_wrapper(self) -> AsyncIterator[bytes]:
-        """Yield SSE-encoded bytes for each Anthropic event chunk."""
+        """Yield SSE-encoded bytes for each Anthropic event chunk.
+
+        Framing is shared with the Chat Completions adapter tree via
+        ``encode_anthropic_sse_chunk`` so Responses and Chat SSE cannot drift.
+        """
         async for chunk in self:
-            if isinstance(chunk, dict):
-                event_type: str = str(chunk.get("type", "message"))
-                payload = f"event: {event_type}\ndata: {json.dumps(chunk)}\n\n"
-                yield payload.encode()
-            else:
-                yield chunk
+            yield encode_anthropic_sse_chunk(chunk)
