@@ -1,12 +1,12 @@
 import ast
 import asyncio
 import hashlib
-import importlib
 import json
 import os
 import re
 import traceback
 from base64 import b64encode
+from collections import deque
 from datetime import datetime, timezone
 import time
 from dataclasses import dataclass
@@ -70,6 +70,10 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_get_request_headers,
 )
+from litellm.proxy.aawm_runtime_error_logging import (
+    persist_agent_terminal_error,
+)
+from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
 from litellm.proxy.litellm_pre_call_utils import clean_headers
 from litellm.proxy.utils import get_server_root_path, normalize_route_for_root_path
 from litellm.responses.function_name_sanitization import (
@@ -83,10 +87,42 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     EndpointType,
     PassthroughStandardLoggingPayload,
 )
-from litellm.types.utils import AllMessageValues, StandardLoggingUserAPIKeyMetadata
+from litellm.types.utils import (
+    AllMessageValues,
+    StandardLoggingUserAPIKeyMetadata,
+    all_litellm_params,
+)
 
 from .streaming_handler import PassThroughStreamingHandler
 from .success_handler import PassThroughEndpointLogging
+
+from .provider_failure_classifiers import (  # noqa: F401
+    PassthroughProviderFailureClassification,
+    _coerce_upstream_error_payload,
+    _extract_passthrough_exception_detail,
+    _get_known_anthropic_passthrough_failure_kind,
+    _get_passthrough_chatgpt_codex_model_not_supported_failure_kind,
+    _get_passthrough_grok_billing_timeout_failure_kind,
+    _get_passthrough_grok_build_usage_balance_exhausted_failure_kind,
+    _get_passthrough_grok_personal_team_spending_limit_failure_kind,
+    _get_passthrough_grok_replicas_update_not_owned_failure_kind,
+    _get_passthrough_grok_signals_auth_context_failure_kind,
+    _is_known_chatgpt_codex_block_page_response,
+    _is_known_chatgpt_codex_invalid_encrypted_content_response,
+    _is_known_chatgpt_codex_model_not_supported_for_account_response,
+    _is_known_google_code_assist_tos_violation_response,
+    _is_known_grok_billing_passthrough_timeout_cancel_response,
+    _is_known_grok_build_usage_balance_exhausted_response,
+    _is_known_grok_personal_team_spending_limit_response,
+    _is_known_grok_replicas_update_not_owned_response,
+    _is_known_grok_signals_auth_context_response,
+    _is_xai_passthrough_target,
+    _run_passthrough_provider_failure_classifiers,
+)
+from litellm.integrations.aawm_agent_identity import (
+    aawm_agent_identity_instance as _CANONICAL_AAWM_AGENT_IDENTITY_INSTANCE,
+)
+
 
 router = APIRouter()
 
@@ -113,14 +149,6 @@ DEFAULT_PASSTHROUGH_PRE_FIRST_BYTE_HIDDEN_RETRY_BUDGET_SECONDS = float(
 _AAWM_AGENT_IDENTITY_CALLBACK_MARKERS = (
     "aawm_agent_identity",
     "aawm_litellm_callbacks.agent_identity",
-)
-_ANTHROPIC_INVALID_AUTHENTICATION_MARKER = "invalid authentication credentials"
-_ANTHROPIC_MODEL_NOT_FOUND_PREFIX = "model:"
-_ANTHROPIC_CONTEXT_OVERFLOW_MARKERS = (
-    "prompt is too long",
-    "context length exceeded",
-    "maximum context length",
-    "too many tokens",
 )
 
 
@@ -271,6 +299,17 @@ async def _restore_responses_function_names_in_sse_chunks(
 _registered_pass_through_routes: Dict[
     str, Dict[str, Union[str, List[str], Dict[str, Any]]]
 ] = {}
+# RR-056 #10 indexes:
+# - exact: normalized route path -> [route_key, ...] (O(1) lookup)
+# - subpath: trie of path segments -> {"__keys__": [...], children...}
+#   so longest-prefix match walks segments without scanning all prefixes.
+_registered_pass_through_exact_index: Dict[str, List[str]] = {}
+_registered_pass_through_subpath_trie: Dict[str, Any] = {}
+# Compatibility alias used by older tests/helpers that still clear/read the
+# pre-trie dict name. Kept empty; rebuild populates exact + trie only.
+_registered_pass_through_subpath_index: Dict[str, List[str]] = {}
+# Max parsed upstream WS messages retained for cost/logging (RR-056 #4).
+_WEBSOCKET_PASSTHROUGH_MESSAGE_BUFFER_MAX = 256
 
 _AAWM_PASSTHROUGH_ERROR_LOG_MAX_FIELD_CHARS = 240
 _AAWM_PASSTHROUGH_ERROR_LOG_SAFE_QUERY_KEYS = frozenset(
@@ -380,28 +419,6 @@ _AAWM_PASSTHROUGH_ERROR_LOG_GROK_SIDE_CHANNEL_FIELDS = (
     "grok_side_channel_request_json_container_type",
     "grok_side_channel_request_array_length",
 )
-_GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_CODE = "the operation was cancelled"
-_GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_ERROR = "timeout expired"
-_GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS = (
-    "invalid or expired credentials",
-    "x_xai_token_auth=xai-grok-cli",
-    "no auth context",
-)
-_GROK_REPLICAS_UPDATE_NOT_OWNED_ERROR_MARKERS = ("session not found or not owned",)
-_GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER = "personal-team-blocked:spending-limit"
-_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_ERROR_MARKER = "grok build usage balance exhausted"
-_CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
-    "unable to load site",
-    "cdn-cgi/challenge-platform",
-)
-_CHATGPT_CODEX_INVALID_ENCRYPTED_CONTENT_ERROR_CODE = "invalid_encrypted_content"
-_CHATGPT_CODEX_MODEL_NOT_SUPPORTED_FOR_ACCOUNT_MARKERS = (
-    "not supported when using codex with a chatgpt account",
-    "model is not supported",
-)
-_GOOGLE_CODE_ASSIST_HOST_SUFFIX = "cloudcode-pa.googleapis.com"
-_GOOGLE_CODE_ASSIST_TOS_REASON = "TOS_VIOLATION"
-_GOOGLE_CODE_ASSIST_PERMISSION_DENIED_STATUS = "PERMISSION_DENIED"
 
 
 def get_response_body(response: httpx.Response) -> Optional[dict]:
@@ -437,6 +454,57 @@ def _sanitize_openai_object_schema_properties(schema_node: Any) -> int:
         for item in schema_node:
             fix_count += _sanitize_openai_object_schema_properties(item)
     return fix_count
+
+
+def _should_normalize_openai_function_tool_schemas(
+    *,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    endpoint_type: Optional[EndpointType] = None,
+) -> bool:
+    """Gate OpenAI tool-schema normalization to OpenAI-like targets (RR-056 #9)."""
+    provider = (custom_llm_provider or "").strip().lower()
+    if (
+        provider
+        in {
+            "openai",
+            "azure",
+            "azure_ai",
+            "text-completion-openai",
+            "openai_like",
+            "hostedaio",
+        }
+        or provider.startswith("openai")
+        or provider.startswith("azure")
+    ):
+        return True
+    if endpoint_type is not None and str(
+        getattr(endpoint_type, "value", endpoint_type)
+    ).lower() in {
+        "openai",
+        "azure",
+    }:
+        return True
+    if url is not None:
+        host = (url.host or "").lower()
+        if any(
+            marker in host
+            for marker in (
+                "openai.com",
+                "api.openai",
+                "azure.com",
+                "openai.azure",
+                "chatgpt.com",
+                "api.grok.com",  # OpenAI-compatible Grok Responses/Chat shapes
+            )
+        ):
+            return True
+        # Also when host/path looks like OpenAI Responses function tools
+        if _is_openai_responses_function_name_target(
+            url=url, custom_llm_provider=custom_llm_provider
+        ):
+            return True
+    return False
 
 
 def _normalize_openai_function_tool_schemas_in_body(body: Optional[dict]) -> int:
@@ -551,33 +619,6 @@ def _collect_invalid_openai_object_schema_nodes(
                 )
             )
     return invalid_nodes
-
-
-def _coerce_upstream_error_payload(detail: Any) -> Optional[dict[str, Any]]:
-    if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="replace")
-    elif isinstance(detail, str):
-        detail_text = detail
-        stripped_detail = detail_text.strip()
-        if stripped_detail.startswith(("b'", 'b"')):
-            try:
-                literal_detail = ast.literal_eval(stripped_detail)
-            except Exception:
-                literal_detail = None
-            if isinstance(literal_detail, bytes):
-                detail_text = literal_detail.decode("utf-8", errors="replace")
-            elif isinstance(literal_detail, str):
-                detail_text = literal_detail
-    elif isinstance(detail, dict):
-        return detail
-    else:
-        return None
-
-    try:
-        parsed = json.loads(detail_text)
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None
 
 
 def _coerce_positive_int(value: Any) -> Optional[int]:
@@ -752,8 +793,7 @@ def _detach_passthrough_body_for_kwargs(
     if not isinstance(parsed_body, dict):
         return {}, None
 
-    from litellm.types.utils import all_litellm_params
-
+    # all_litellm_params is imported at module scope (RR-056 #8).
     litellm_param_keys = [key for key in all_litellm_params if key in parsed_body]
     if not litellm_param_keys:
         return parsed_body, parsed_body
@@ -781,522 +821,6 @@ def _provider_bound_body_from_kwargs(kwargs: Optional[dict]) -> Optional[dict]:
     return None
 
 
-def _extract_passthrough_exception_detail(exc: Exception) -> Optional[str]:
-    for attr_name in ("detail", "message"):
-        value = getattr(exc, attr_name, None)
-        if value is None:
-            continue
-        if isinstance(value, (dict, list)):
-            try:
-                return safe_dumps(value)
-            except Exception:
-                continue
-        value_text = str(value).strip()
-        if value_text:
-            return value_text
-    return None
-
-
-def _extract_passthrough_grok_billing_timeout_cancel_hint(
-    detail: Optional[Any],
-) -> Optional[str]:
-    if detail is None:
-        return None
-
-    if isinstance(detail, dict):
-        code = detail.get("code")
-        error = detail.get("error")
-        if isinstance(code, str) and code.strip():
-            return code.strip()
-        if isinstance(error, str) and error.strip():
-            return error.strip()
-        return None
-
-    detail_text = str(detail).strip()
-    if not detail_text:
-        return None
-
-    try:
-        parsed_detail = json.loads(detail_text)
-    except json.JSONDecodeError:
-        return detail_text
-
-    if isinstance(parsed_detail, dict):
-        return _extract_passthrough_grok_billing_timeout_cancel_hint(parsed_detail)
-    return detail_text
-
-
-def _is_known_grok_billing_passthrough_timeout_cancel_response(
-    *,
-    request: Request,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_400_BAD_REQUEST:
-        return False
-
-    if not _is_xai_passthrough_target(
-        url=url,
-        custom_llm_provider=custom_llm_provider,
-    ):
-        return False
-
-    request_path = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
-        request
-    )
-    upstream_path = urlparse(str(url or "")).path
-    if not (
-        request_path.rstrip("/").endswith("/grok/v1/billing")
-        or upstream_path.rstrip("/").endswith("/v1/billing")
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    error_hint = _extract_passthrough_grok_billing_timeout_cancel_hint(detail)
-    if not error_hint:
-        return False
-
-    normalized_hint = error_hint.strip().lower()
-    return (
-        _GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_CODE in normalized_hint
-        or _GROK_BILLING_PASSTHROUGH_TIMEOUT_CANCEL_ERROR in normalized_hint
-    )
-
-
-def _is_grok_signals_path(path: str) -> bool:
-    normalized_path = path.rstrip("/")
-    return (
-        normalized_path.startswith("/grok/v1/sessions/")
-        and normalized_path.endswith("/signals")
-    ) or (
-        normalized_path.startswith("/v1/sessions/")
-        and normalized_path.endswith("/signals")
-    )
-
-
-def _is_grok_replicas_update_path(path: str) -> bool:
-    normalized_path = path.rstrip("/")
-    return (
-        normalized_path.startswith("/grok/v1/sessions/")
-        and normalized_path.endswith("/replicas/update")
-    ) or (
-        normalized_path.startswith("/v1/sessions/")
-        and normalized_path.endswith("/replicas/update")
-    )
-
-
-def _is_known_grok_replicas_update_not_owned_response(
-    *,
-    request: Request,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_404_NOT_FOUND:
-        return False
-
-    if not _is_xai_passthrough_target(
-        url=url,
-        custom_llm_provider=custom_llm_provider,
-    ):
-        return False
-
-    request_path = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
-        request
-    )
-    upstream_path = urlparse(str(url or "")).path
-    if not (
-        _is_grok_replicas_update_path(request_path)
-        or _is_grok_replicas_update_path(upstream_path)
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if not detail:
-        return False
-
-    normalized_detail = str(detail).strip().lower()
-    return all(
-        marker in normalized_detail
-        for marker in _GROK_REPLICAS_UPDATE_NOT_OWNED_ERROR_MARKERS
-    )
-
-
-def _get_passthrough_grok_replicas_update_not_owned_failure_kind() -> str:
-    return "degraded_grok_replicas_update_not_owned"
-
-
-def _is_known_grok_personal_team_spending_limit_response(
-    *,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_403_FORBIDDEN:
-        return False
-
-    if not _is_xai_passthrough_target(
-        url=url,
-        custom_llm_provider=custom_llm_provider,
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if not detail:
-        return False
-
-    normalized_detail = str(detail).strip().lower()
-    if _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER not in normalized_detail:
-        return False
-
-    payload = _coerce_upstream_error_payload(detail)
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if (
-            isinstance(error, str)
-            and _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in error.lower()
-        ):
-            return True
-        code = payload.get("code")
-        if (
-            isinstance(code, str)
-            and _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in code.lower()
-        ):
-            return True
-
-    return _GROK_PERSONAL_TEAM_SPENDING_LIMIT_MARKER in normalized_detail
-
-
-def _get_passthrough_grok_personal_team_spending_limit_failure_kind() -> str:
-    return "upstream_grok_account_quota_exhaustion"
-
-
-def _is_known_grok_build_usage_balance_exhausted_response(
-    *,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_402_PAYMENT_REQUIRED:
-        return False
-
-    if not _is_xai_passthrough_target(
-        url=url,
-        custom_llm_provider=custom_llm_provider,
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if not detail:
-        return False
-
-    normalized_detail = str(detail).strip().lower()
-    payload = _coerce_upstream_error_payload(detail)
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if (
-            isinstance(error, str)
-            and error.strip().lower()
-            == _GROK_BUILD_USAGE_BALANCE_EXHAUSTED_ERROR_MARKER
-        ):
-            return True
-
-    return normalized_detail == _GROK_BUILD_USAGE_BALANCE_EXHAUSTED_ERROR_MARKER
-
-
-def _get_passthrough_grok_build_usage_balance_exhausted_failure_kind() -> str:
-    return "upstream_grok_account_quota_exhaustion"
-
-
-def _is_known_grok_signals_auth_context_response(
-    *,
-    request: Request,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_401_UNAUTHORIZED:
-        return False
-
-    if not _is_xai_passthrough_target(
-        url=url,
-        custom_llm_provider=custom_llm_provider,
-    ):
-        return False
-
-    request_path = HttpPassThroughEndpointHelpers._get_passthrough_request_url_path(
-        request
-    )
-    upstream_path = urlparse(str(url or "")).path
-    if not (
-        _is_grok_signals_path(request_path) or _is_grok_signals_path(upstream_path)
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if not detail:
-        return False
-
-    normalized_detail = str(detail).strip().lower()
-    return all(
-        marker in normalized_detail
-        for marker in _GROK_SIGNALS_AUTH_CONTEXT_ERROR_MARKERS
-    )
-
-
-def _is_known_chatgpt_codex_block_page_response(
-    *,
-    url: Optional[httpx.URL],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_403_FORBIDDEN:
-        return False
-
-    parsed_url = urlparse(str(url or ""))
-    if (
-        str(parsed_url.hostname or "").lower() != "chatgpt.com"
-        or "/backend-api/codex/" not in str(parsed_url.path or "").lower()
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if not detail:
-        return False
-
-    normalized_detail = str(detail).lower()
-    return any(
-        marker in normalized_detail for marker in _CHATGPT_CODEX_BLOCK_PAGE_MARKERS
-    )
-
-
-def _is_known_chatgpt_codex_invalid_encrypted_content_response(
-    *,
-    url: Optional[httpx.URL],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_400_BAD_REQUEST:
-        return False
-
-    parsed_url = urlparse(str(url or ""))
-    if (
-        str(parsed_url.hostname or "").lower() != "chatgpt.com"
-        or "/backend-api/codex/" not in str(parsed_url.path or "").lower()
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if detail is None:
-        return False
-
-    payload = _coerce_upstream_error_payload(detail)
-    if not isinstance(payload, dict):
-        return False
-
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-
-    return (
-        str(error.get("code") or "").strip()
-        == _CHATGPT_CODEX_INVALID_ENCRYPTED_CONTENT_ERROR_CODE
-    )
-
-
-def _is_known_chatgpt_codex_model_not_supported_for_account_response(
-    *,
-    url: Optional[httpx.URL],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_400_BAD_REQUEST:
-        return False
-
-    parsed_url = urlparse(str(url or ""))
-    if (
-        str(parsed_url.hostname or "").lower() != "chatgpt.com"
-        or "/backend-api/codex/" not in str(parsed_url.path or "").lower()
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if detail is None:
-        return False
-
-    payload = _coerce_upstream_error_payload(detail)
-    if isinstance(payload, dict):
-        detail_text = str(payload.get("detail") or "")
-    else:
-        detail_text = str(detail)
-
-    normalized_detail = detail_text.lower()
-    if _CHATGPT_CODEX_MODEL_NOT_SUPPORTED_FOR_ACCOUNT_MARKERS[0] not in normalized_detail:
-        return False
-    return (
-        _CHATGPT_CODEX_MODEL_NOT_SUPPORTED_FOR_ACCOUNT_MARKERS[1] in normalized_detail
-        or "is not supported" in normalized_detail
-    )
-
-
-def _get_passthrough_chatgpt_codex_model_not_supported_failure_kind() -> str:
-    return "openai_chatgpt_codex_model_not_supported_for_account"
-
-
-def _is_google_code_assist_passthrough_target(
-    *,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-) -> bool:
-    provider = str(custom_llm_provider or "").strip().lower()
-    hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
-    return provider in {"google_code_assist", "antigravity"} or hostname.endswith(
-        _GOOGLE_CODE_ASSIST_HOST_SUFFIX
-    )
-
-
-def _is_google_code_assist_tos_violation_payload(payload: Any) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-
-    code = error.get("code")
-    status_text = str(error.get("status") or "").strip().upper()
-    if code != status.HTTP_403_FORBIDDEN and status_text != (
-        _GOOGLE_CODE_ASSIST_PERMISSION_DENIED_STATUS
-    ):
-        return False
-
-    details = error.get("details")
-    if not isinstance(details, list):
-        return False
-    for detail in details:
-        if not isinstance(detail, dict):
-            continue
-        reason = str(detail.get("reason") or "").strip().upper()
-        domain = str(detail.get("domain") or "").strip().lower()
-        if reason == _GOOGLE_CODE_ASSIST_TOS_REASON and domain.endswith(
-            _GOOGLE_CODE_ASSIST_HOST_SUFFIX
-        ):
-            return True
-    return False
-
-
-def _is_known_google_code_assist_tos_violation_response(
-    *,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-    status_code: Optional[int],
-    exc: Exception,
-) -> bool:
-    if status_code != status.HTTP_403_FORBIDDEN:
-        return False
-
-    if not _is_google_code_assist_passthrough_target(
-        url=url,
-        custom_llm_provider=custom_llm_provider,
-    ):
-        return False
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if detail is None:
-        return False
-
-    payload = _coerce_upstream_error_payload(detail)
-    return _is_google_code_assist_tos_violation_payload(payload)
-
-
-def _is_anthropic_passthrough_target(
-    *,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-) -> bool:
-    provider = str(custom_llm_provider or "").strip().lower()
-    hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
-    return provider == "anthropic" or hostname == "api.anthropic.com"
-
-
-def _is_known_anthropic_context_overflow_response(
-    *,
-    status_code: Optional[int],
-    payload: dict[str, Any],
-) -> bool:
-    if status_code != status.HTTP_400_BAD_REQUEST:
-        return False
-
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-
-    error_type = str(error.get("type") or "").strip().lower()
-    message = str(error.get("message") or "").strip().lower()
-    if error_type != "invalid_request_error":
-        return False
-
-    return any(marker in message for marker in _ANTHROPIC_CONTEXT_OVERFLOW_MARKERS)
-
-
-def _get_known_anthropic_passthrough_failure_kind(
-    *,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-    status_code: Optional[int],
-    exc: Exception,
-) -> Optional[str]:
-    if status_code not in {
-        status.HTTP_400_BAD_REQUEST,
-        status.HTTP_401_UNAUTHORIZED,
-        status.HTTP_404_NOT_FOUND,
-    }:
-        return None
-
-    if not _is_anthropic_passthrough_target(
-        url=url,
-        custom_llm_provider=custom_llm_provider,
-    ):
-        return None
-
-    detail = _extract_passthrough_exception_detail(exc)
-    if detail is None:
-        return None
-
-    payload = _coerce_upstream_error_payload(detail)
-    if not isinstance(payload, dict):
-        return None
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return None
-
-    error_type = str(error.get("type") or "").strip().lower()
-    message = str(error.get("message") or "").strip().lower()
-    if _is_known_anthropic_context_overflow_response(
-        status_code=status_code,
-        payload=payload,
-    ):
-        return "anthropic_context_overflow"
-    if (
-        status_code == status.HTTP_401_UNAUTHORIZED
-        and error_type == "authentication_error"
-        and _ANTHROPIC_INVALID_AUTHENTICATION_MARKER in message
-    ):
-        return "anthropic_client_authentication_error"
-    if (
-        status_code == status.HTTP_404_NOT_FOUND
-        and error_type == "not_found_error"
-        and message.startswith(_ANTHROPIC_MODEL_NOT_FOUND_PREFIX)
-    ):
-        return "anthropic_model_not_found"
-    return None
-
-
 def _get_case_insensitive_mapping_value(
     values: Optional[dict],
     key_name: str,
@@ -1311,25 +835,6 @@ def _get_case_insensitive_mapping_value(
         if value_text:
             return value_text
     return None
-
-
-def _is_xai_passthrough_target(
-    *,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-) -> bool:
-    provider = str(custom_llm_provider or "").strip().lower()
-    hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
-    return (
-        provider == "xai"
-        or hostname
-        in {
-            "api.x.ai",
-            "cli-chat-proxy.grok.com",
-        }
-        or hostname.endswith(".x.ai")
-        or hostname.endswith(".grok.com")
-    )
 
 
 def _enrich_passthrough_failure_request_payload(
@@ -1401,7 +906,9 @@ def _is_aawm_agent_identity_callback_entry(callback: Any) -> bool:
 
     if isinstance(callback, str):
         normalized = callback.strip().lower()
-        return any(marker in normalized for marker in _AAWM_AGENT_IDENTITY_CALLBACK_MARKERS)
+        return any(
+            marker in normalized for marker in _AAWM_AGENT_IDENTITY_CALLBACK_MARKERS
+        )
 
     module_name = str(getattr(type(callback), "__module__", "") or "").lower()
     class_name = str(getattr(type(callback), "__name__", "") or "")
@@ -1413,7 +920,10 @@ def _is_aawm_agent_identity_callback_entry(callback: Any) -> bool:
     # Match the documented module-level singleton even if it was wrapped/proxied.
     instance_module = str(getattr(callback, "__module__", "") or "").lower()
     instance_name = str(getattr(callback, "__name__", "") or "").lower()
-    if "aawm_agent_identity" in instance_module or instance_name == "aawm_agent_identity_instance":
+    if (
+        "aawm_agent_identity" in instance_module
+        or instance_name == "aawm_agent_identity_instance"
+    ):
         return True
     return False
 
@@ -1452,28 +962,10 @@ async def _direct_capture_xai_passthrough_failure(
         return
 
     try:
-        aawm_agent_identity_instance = None
-        for module_name in (
-            "litellm.integrations.aawm_agent_identity",
-            "aawm_litellm_callbacks.agent_identity",
-        ):
-            try:
-                module = importlib.import_module(module_name)
-            except ModuleNotFoundError:
-                continue
-            aawm_agent_identity_instance = getattr(
-                module,
-                "aawm_agent_identity_instance",
-                None,
-            )
-            if aawm_agent_identity_instance is not None:
-                break
-        if aawm_agent_identity_instance is None:
-            raise ModuleNotFoundError(
-                "No AAWM agent identity callback module is importable"
-            )
-
-        await aawm_agent_identity_instance.async_post_call_failure_hook(
+        # RR-056 #7 / RR-003: single canonical import. Wheel packaging force-includes
+        # litellm.integrations.aawm_agent_identity into aawm_litellm_callbacks.agent_identity
+        # at build time; checkout wheel loader re-exports the same module.
+        await _CANONICAL_AAWM_AGENT_IDENTITY_INSTANCE.async_post_call_failure_hook(
             user_api_key_dict=user_api_key_dict,
             original_exception=original_exception,
             request_data=request_payload,
@@ -1836,14 +1328,6 @@ def _get_passthrough_terminal_failure_kind(
     return "expected_upstream_capacity_or_internal"
 
 
-def _get_passthrough_grok_billing_timeout_failure_kind() -> str:
-    return "degraded_grok_billing_timeout"
-
-
-def _get_passthrough_grok_signals_auth_context_failure_kind() -> str:
-    return "degraded_grok_signals_auth_context"
-
-
 def _record_passthrough_hidden_retry_metadata(
     kwargs: Optional[dict],
     *,
@@ -1974,9 +1458,9 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 )
                 if isinstance(kwargs, dict):
                     metadata = _ensure_passthrough_metadata(kwargs)
-                    metadata["aawm_passthrough_hidden_retry_budget_seconds"] = (
-                        budget_seconds
-                    )
+                    metadata[
+                        "aawm_passthrough_hidden_retry_budget_seconds"
+                    ] = budget_seconds
                     metadata["aawm_passthrough_hidden_retry_budget_exhausted"] = True
                     metadata["aawm_passthrough_hidden_retry_elapsed_seconds"] = round(
                         elapsed_seconds, 3
@@ -3027,10 +2511,9 @@ async def chat_completion_pass_through_endpoint(  # noqa: PLR0915
     try:
         body = await request.body()
         body_str = body.decode()
-        try:
-            data = ast.literal_eval(body_str)
-        except Exception:
-            data = json.loads(body_str)
+        # Prefer JSON directly. ast.literal_eval fails for normal JSON (true/false/null)
+        # and was only ever a dead-weight first attempt (RR-056 #11).
+        data = json.loads(body_str)
 
         data["adapter_id"] = adapter_id
 
@@ -3546,11 +3029,16 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         requested_query_params: Optional[dict] = None,
         _parsed_body: Optional[dict] = None,
         raw_body: Optional[bytes] = None,
+        prefer_stream_for_unknown_content: bool = False,
     ) -> httpx.Response:
         """
         Handle non-streaming HTTP requests
 
-        Handles special cases when GET requests, multipart/form-data requests, and generic httpx requests
+        Handles special cases when GET requests, multipart/form-data requests, and generic httpx requests.
+
+        When prefer_stream_for_unknown_content is True (RR-056 #6), non-GET requests
+        are issued with stream=True so the caller can inspect content-type before
+        buffering the body (enables SSE handoff without full-body buffer).
         """
         if request.method == "GET":
             response = await async_client.request(
@@ -3560,13 +3048,23 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 params=requested_query_params,
             )
         elif raw_body is not None:
-            response = await async_client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                params=requested_query_params,
-                content=raw_body,
-            )
+            if prefer_stream_for_unknown_content:
+                req = async_client.build_request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=requested_query_params,
+                    content=raw_body,
+                )
+                response = await async_client.send(req, stream=True)
+            else:
+                response = await async_client.request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=requested_query_params,
+                    content=raw_body,
+                )
         elif (
             HttpPassThroughEndpointHelpers.is_multipart(request) is True
             and not _parsed_body
@@ -3579,19 +3077,30 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
                 url=url,
                 headers=headers,
                 requested_query_params=requested_query_params,
+                prefer_stream_for_unknown_content=prefer_stream_for_unknown_content,
             )
         else:
             # Generic httpx method
             json_headers, _removed_content_type = _headers_for_json_passthrough_egress(
                 headers
             )
-            response = await async_client.request(
-                method=request.method,
-                url=url,
-                headers=json_headers,
-                params=requested_query_params,
-                json=_parsed_body,
-            )
+            if prefer_stream_for_unknown_content:
+                req = async_client.build_request(
+                    method=request.method,
+                    url=url,
+                    headers=json_headers,
+                    params=requested_query_params,
+                    json=_parsed_body,
+                )
+                response = await async_client.send(req, stream=True)
+            else:
+                response = await async_client.request(
+                    method=request.method,
+                    url=url,
+                    headers=json_headers,
+                    params=requested_query_params,
+                    json=_parsed_body,
+                )
         return response
 
     @staticmethod
@@ -3614,8 +3123,14 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         url: httpx.URL,
         headers: dict,
         requested_query_params: Optional[dict] = None,
+        prefer_stream_for_unknown_content: bool = False,
     ) -> httpx.Response:
-        """Process multipart/form-data requests, handling both files and form fields"""
+        """Process multipart/form-data requests, handling both files and form fields.
+
+        When prefer_stream_for_unknown_content is True (RR-056 #6), the upstream
+        request uses stream=True so callers can inspect content-type before full
+        body buffering (same contract as the JSON non-stream path).
+        """
         form_data = await request.form()
         files = {}
         form_data_dict = {}
@@ -3634,6 +3149,17 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         # when it creates the multipart body from files/data parameters
         headers_copy = headers.copy()
         headers_copy.pop("content-type", None)
+
+        if prefer_stream_for_unknown_content:
+            req = async_client.build_request(
+                method=request.method,
+                url=url,
+                headers=headers_copy,
+                params=requested_query_params,
+                files=files,
+                data=form_data_dict,
+            )
+            return await async_client.send(req, stream=True)
 
         response = await async_client.request(
             method=request.method,
@@ -3657,11 +3183,8 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         """
         Filter out litellm params from the request body
         """
-        from litellm.types.utils import all_litellm_params
-
         _parsed_body = _parsed_body or {}
-        from litellm.proxy.auth.auth_utils import get_end_user_id_from_request_body
-
+        # all_litellm_params / get_end_user_id_from_request_body: module-scope (RR-056 #8).
         working_body, _provider_body = _detach_passthrough_body_for_kwargs(_parsed_body)
 
         request_headers = dict(request.headers) if request.headers is not None else None
@@ -3875,6 +3398,8 @@ async def pass_through_request(  # noqa: PLR0915
             logging body. This lets routes identify GET/raw-body requests
             without changing the upstream request body.
     """
+    # Inline imports: proxy_server imports this module at startup (circular).
+    # Logging/PassthroughGuardrailHandler kept local for the same cycle edge.
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.pass_through_endpoints.passthrough_guardrails import (
         PassthroughGuardrailHandler,
@@ -3968,9 +3493,21 @@ async def pass_through_request(  # noqa: PLR0915
                 passthrough_logging_metadata=passthrough_logging_metadata,
             )
         )
-        normalized_tool_schema_count = _normalize_openai_function_tool_schemas_in_body(
-            _parsed_body
+        # OpenAI function tool schema normalization is only relevant for OpenAI-like
+        # targets (RR-056 #9). Skip expensive recursive walks for other providers.
+        _should_normalize_openai_tools = _should_normalize_openai_function_tool_schemas(
+            url=url,
+            custom_llm_provider=custom_llm_provider,
+            endpoint_type=endpoint_type,
         )
+        normalized_tool_schema_count = 0
+        _pre_hook_tools_identity: Optional[int] = None
+        if _should_normalize_openai_tools:
+            if isinstance(_parsed_body, dict):
+                _pre_hook_tools_identity = id(_parsed_body.get("tools"))
+            normalized_tool_schema_count = (
+                _normalize_openai_function_tool_schemas_in_body(_parsed_body)
+            )
         if normalized_tool_schema_count > 0 and isinstance(_parsed_body, dict):
             metadata = _parsed_body.get("litellm_metadata")
             if isinstance(metadata, dict):
@@ -4031,25 +3568,49 @@ async def pass_through_request(  # noqa: PLR0915
             data=_parsed_body,
             call_type="pass_through_endpoint",
         )
-        normalized_tool_schema_count = _normalize_openai_function_tool_schemas_in_body(
-            _parsed_body
+        # Second normalize pass only when pre_call_hook rewrote the tools object
+        # (RR-056 #9). In-place first-pass fixes are already complete; skip when
+        # hooks left tools identity unchanged or tools are absent.
+        _tools_after_hook = (
+            _parsed_body.get("tools") if isinstance(_parsed_body, dict) else None
         )
-        if normalized_tool_schema_count > 0 and isinstance(_parsed_body, dict):
-            metadata = _parsed_body.get("litellm_metadata")
-            if isinstance(metadata, dict):
-                metadata["openai_function_tool_schema_fix_count"] = (
-                    metadata.get("openai_function_tool_schema_fix_count", 0)
-                    + normalized_tool_schema_count
-                )
-        invalid_openai_tool_schemas = _collect_invalid_openai_function_tool_schemas(
-            _parsed_body
+        _tools_rewritten_by_hook = (
+            isinstance(_tools_after_hook, list)
+            and id(_tools_after_hook) != _pre_hook_tools_identity
         )
-        if invalid_openai_tool_schemas:
-            verbose_proxy_logger.warning(
-                "Pass-through request still contains invalid OpenAI function tool schemas for target=%s invalid_tools=%s",
-                str(url),
-                invalid_openai_tool_schemas[:10],
+        if (
+            _should_normalize_openai_tools
+            and isinstance(_parsed_body, dict)
+            and isinstance(_tools_after_hook, list)
+            and _tools_rewritten_by_hook
+        ):
+            normalized_tool_schema_count = (
+                _normalize_openai_function_tool_schemas_in_body(_parsed_body)
             )
+            if normalized_tool_schema_count > 0:
+                metadata = _parsed_body.get("litellm_metadata")
+                if isinstance(metadata, dict):
+                    metadata["openai_function_tool_schema_fix_count"] = (
+                        metadata.get("openai_function_tool_schema_fix_count", 0)
+                        + normalized_tool_schema_count
+                    )
+        # Validation walk (RR-056 #9): skip when first normalization fixed zero
+        # schemas and pre_call_hook left tools identity unchanged — nothing new
+        # to re-scan. Re-check only if tools were rewritten or we applied fixes.
+        if (
+            _should_normalize_openai_tools
+            and isinstance(_tools_after_hook, list)
+            and (_tools_rewritten_by_hook or normalized_tool_schema_count > 0)
+        ):
+            invalid_openai_tool_schemas = _collect_invalid_openai_function_tool_schemas(
+                _parsed_body
+            )
+            if invalid_openai_tool_schemas:
+                verbose_proxy_logger.warning(
+                    "Pass-through request still contains invalid OpenAI function tool schemas for target=%s invalid_tools=%s",
+                    str(url),
+                    invalid_openai_tool_schemas[:10],
+                )
 
         async_client_obj = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
@@ -4339,6 +3900,9 @@ async def pass_through_request(  # noqa: PLR0915
                                 passthrough_metadata
                             )
                         )
+            # Prefer stream=True so if upstream replies with SSE we can hand off
+            # without buffering the full body first (RR-056 #6). Non-SSE bodies
+            # are still fully read later via response.aread().
             response = (
                 await HttpPassThroughEndpointHelpers.non_streaming_http_request_handler(
                     request=request,
@@ -4348,6 +3912,7 @@ async def pass_through_request(  # noqa: PLR0915
                     requested_query_params=requested_query_params,
                     _parsed_body=provider_bound_body,
                     raw_body=raw_body,
+                    prefer_stream_for_unknown_content=True,
                 )
             )
             if _is_streaming_response(response) is True:
@@ -4376,6 +3941,13 @@ async def pass_through_request(  # noqa: PLR0915
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
+                # prefer_stream_for_unknown_content uses stream=True for non-GET,
+                # so non-SSE error bodies must be drained with aread() (RR-056 #6).
+                error_content = await e.response.aread()
+                try:
+                    error_text = error_content.decode("utf-8", errors="replace")
+                except Exception:
+                    error_text = str(error_content)
                 capture_passthrough_shape(
                     mode="nonstream_error",
                     provider=custom_llm_provider or endpoint_type.value,
@@ -4384,13 +3956,13 @@ async def pass_through_request(  # noqa: PLR0915
                     request_body=_parsed_body,
                     response=e.response,
                     upstream_request=getattr(e.response, "request", None),
-                    response_content=e.response.content,
+                    response_content=error_content,
                     litellm_call_id=litellm_call_id,
                     extra_metadata={"stream": False},
                 )
                 raise _build_http_exception_from_upstream_status_error(
                     e,
-                    e.response.text,
+                    error_text,
                 ) from e
             return response
 
@@ -4446,9 +4018,15 @@ async def pass_through_request(  # noqa: PLR0915
             )
 
         if response.status_code >= 300:
+            # Streamed non-SSE responses need aread() before .text (RR-056 #6).
+            error_body = await response.aread()
+            try:
+                error_detail = error_body.decode("utf-8", errors="replace")
+            except Exception:
+                error_detail = str(error_body)
             raise HTTPException(
                 status_code=response.status_code,
-                detail=response.text,
+                detail=error_detail,
                 headers={
                     str(header_name): str(header_value)
                     for header_name, header_value in response.headers.items()
@@ -4604,8 +4182,11 @@ async def pass_through_request(  # noqa: PLR0915
         suppress_provider_rate_limit_traceback = (
             _is_passthrough_expected_provider_rate_limit(status_code=status_code)
         )
-        suppress_grok_billing_timeout_traceback = (
-            _is_known_grok_billing_passthrough_timeout_cancel_response(
+        # Provider-specific classifiers via registry-style dispatch (RR-056 #3).
+        # Logging and traceback suppression are driven from classification fields
+        # so registry failure_kind / log_message stay the single source of truth.
+        _provider_failure_classifications = (
+            _run_passthrough_provider_failure_classifiers(
                 request=request,
                 url=url,
                 custom_llm_provider=custom_llm_provider,
@@ -4613,74 +4194,19 @@ async def pass_through_request(  # noqa: PLR0915
                 exc=e,
             )
         )
-        suppress_grok_signals_auth_context_traceback = (
-            _is_known_grok_signals_auth_context_response(
-                request=request,
-                url=url,
-                custom_llm_provider=custom_llm_provider,
-                status_code=status_code,
-                exc=e,
-            )
+        # Prefer first match; registry short-circuits after first hit.
+        _provider_failure_classification = (
+            _provider_failure_classifications[0]
+            if _provider_failure_classifications
+            else None
         )
-        suppress_grok_personal_team_spending_limit_traceback = (
-            _is_known_grok_personal_team_spending_limit_response(
-                url=url,
-                custom_llm_provider=custom_llm_provider,
-                status_code=status_code,
-                exc=e,
+        _skip_post_call_failure_hook_for_provider_classification = bool(
+            _provider_failure_classification is not None
+            and getattr(
+                _provider_failure_classification,
+                "skip_post_call_failure_hook",
+                False,
             )
-        )
-        suppress_grok_build_usage_balance_exhausted_traceback = (
-            _is_known_grok_build_usage_balance_exhausted_response(
-                url=url,
-                custom_llm_provider=custom_llm_provider,
-                status_code=status_code,
-                exc=e,
-            )
-        )
-        suppress_grok_replicas_update_not_owned_traceback = (
-            _is_known_grok_replicas_update_not_owned_response(
-                request=request,
-                url=url,
-                custom_llm_provider=custom_llm_provider,
-                status_code=status_code,
-                exc=e,
-            )
-        )
-        suppress_chatgpt_codex_block_page_traceback = (
-            _is_known_chatgpt_codex_block_page_response(
-                url=url,
-                status_code=status_code,
-                exc=e,
-            )
-        )
-        suppress_chatgpt_codex_invalid_encrypted_content_traceback = (
-            _is_known_chatgpt_codex_invalid_encrypted_content_response(
-                url=url,
-                status_code=status_code,
-                exc=e,
-            )
-        )
-        suppress_chatgpt_codex_model_not_supported_traceback = (
-            _is_known_chatgpt_codex_model_not_supported_for_account_response(
-                url=url,
-                status_code=status_code,
-                exc=e,
-            )
-        )
-        suppress_google_code_assist_tos_traceback = (
-            _is_known_google_code_assist_tos_violation_response(
-                url=url,
-                custom_llm_provider=custom_llm_provider,
-                status_code=status_code,
-                exc=e,
-            )
-        )
-        known_anthropic_failure_kind = _get_known_anthropic_passthrough_failure_kind(
-            url=url,
-            custom_llm_provider=custom_llm_provider,
-            status_code=status_code,
-            exc=e,
         )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
@@ -4703,118 +4229,43 @@ async def pass_through_request(  # noqa: PLR0915
                     "failure_kind": "expected_provider_rate_limit",
                 },
             )
-        elif suppress_grok_billing_timeout_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced known Grok billing timeout/cancel status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": _get_passthrough_grok_billing_timeout_failure_kind(),
-                },
+        elif _provider_failure_classification is not None:
+            classification = _provider_failure_classification
+            log_message = (
+                classification.log_message
+                or "Pass through endpoint surfaced known provider failure status=%s error=%s"
             )
-        elif suppress_grok_signals_auth_context_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced known Grok signals auth-context status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": _get_passthrough_grok_signals_auth_context_failure_kind(),
-                },
+            log_extra = {
+                **error_log_context,
+            }
+            if classification.failure_kind:
+                log_extra["failure_kind"] = classification.failure_kind
+            log_level = (classification.log_level or "warning").lower()
+            log_fn = (
+                verbose_proxy_logger.error
+                if log_level == "error"
+                else (
+                    verbose_proxy_logger.info
+                    if log_level == "info"
+                    else (
+                        verbose_proxy_logger.debug
+                        if log_level == "debug"
+                        else verbose_proxy_logger.warning
+                    )
+                )
             )
-        elif suppress_grok_personal_team_spending_limit_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced known Grok personal-team spending-limit status=%s error=%s",
+            log_fn(
+                log_message,
                 status_code,
                 str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": _get_passthrough_grok_personal_team_spending_limit_failure_kind(),
-                },
-            )
-        elif suppress_grok_build_usage_balance_exhausted_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced known Grok Build usage balance exhaustion status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": _get_passthrough_grok_build_usage_balance_exhausted_failure_kind(),
-                },
-            )
-        elif suppress_grok_replicas_update_not_owned_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced known Grok replicas/update not-owned status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": _get_passthrough_grok_replicas_update_not_owned_failure_kind(),
-                },
-            )
-        elif suppress_chatgpt_codex_block_page_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced ChatGPT Codex block page status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": "openai_chatgpt_codex_block_page",
-                },
-            )
-        elif suppress_chatgpt_codex_invalid_encrypted_content_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced ChatGPT Codex invalid encrypted content status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": "openai_chatgpt_codex_invalid_encrypted_content",
-                },
-            )
-        elif suppress_chatgpt_codex_model_not_supported_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced ChatGPT Codex unsupported model for account status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": _get_passthrough_chatgpt_codex_model_not_supported_failure_kind(),
-                },
-            )
-        elif suppress_google_code_assist_tos_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced Google Code Assist account TOS violation status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": "google_code_assist_tos_violation",
-                },
-            )
-        elif known_anthropic_failure_kind is not None:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced Anthropic provider/client failure status=%s error=%s",
-                status_code,
-                str(e),
-                extra={
-                    **error_log_context,
-                    "failure_kind": known_anthropic_failure_kind,
-                },
+                extra=log_extra,
             )
         elif error_log_context.get("failure_kind") == (
             "request_shape_deserialization_failed"
         ):
             try:
-                from litellm.proxy.aawm_runtime_error_logging import (
-                    persist_agent_terminal_error,
-                )
-
-                agent_session_killed = (
-                    _is_passthrough_agent_terminal_error_context(
-                        error_log_context
-                    )
+                agent_session_killed = _is_passthrough_agent_terminal_error_context(
+                    error_log_context
                 )
                 if agent_session_killed:
                     persist_agent_terminal_error(
@@ -4911,20 +4362,15 @@ async def pass_through_request(  # noqa: PLR0915
             )
 
         traceback_str = None
+        provider_classification_suppresses_traceback = bool(
+            _provider_failure_classification is not None
+            and _provider_failure_classification.suppress_traceback
+        )
         if (
             not suppress_terminal_failure_traceback
             and not suppress_alias_intermediate_safety_policy_denial
             and not suppress_provider_rate_limit_traceback
-            and not suppress_grok_billing_timeout_traceback
-            and not suppress_grok_signals_auth_context_traceback
-            and not suppress_grok_replicas_update_not_owned_traceback
-            and not suppress_grok_personal_team_spending_limit_traceback
-            and not suppress_grok_build_usage_balance_exhausted_traceback
-            and not suppress_chatgpt_codex_block_page_traceback
-            and not suppress_chatgpt_codex_invalid_encrypted_content_traceback
-            and not suppress_chatgpt_codex_model_not_supported_traceback
-            and not suppress_google_code_assist_tos_traceback
-            and known_anthropic_failure_kind is None
+            and not provider_classification_suppresses_traceback
             and error_log_context.get("failure_kind")
             != "request_shape_deserialization_failed"
         ):
@@ -4934,19 +4380,22 @@ async def pass_through_request(  # noqa: PLR0915
         if (
             not suppress_retryable_failure_logging
             and not suppress_alias_intermediate_safety_policy_denial
-            and not suppress_grok_billing_timeout_traceback
-            and not suppress_grok_signals_auth_context_traceback
-            and not suppress_grok_replicas_update_not_owned_traceback
-            and not suppress_grok_personal_team_spending_limit_traceback
-            and not suppress_grok_build_usage_balance_exhausted_traceback
+            and not _skip_post_call_failure_hook_for_provider_classification
         ):
             try:
-                await proxy_logging_obj.post_call_failure_hook(
+                # Match common_request_processing / auth_exception_handler: callbacks may
+                # return a transformed HTTPException for the client-visible error (RR-056 #5).
+                transformed_exception = await proxy_logging_obj.post_call_failure_hook(
                     user_api_key_dict=user_api_key_dict,
                     original_exception=e,
                     request_data=request_payload,
                     traceback_str=traceback_str,
                 )
+                # Only apply real exceptions; AsyncMock() defaults are truthy and
+                # would otherwise clobber the upstream status_code (RR-056 #5).
+                if isinstance(transformed_exception, BaseException):
+                    e = transformed_exception
+                    status_code = _extract_exception_status_code(e) or status_code
             finally:
                 await _direct_capture_xai_passthrough_failure(
                     user_api_key_dict=user_api_key_dict,
@@ -5155,19 +4604,22 @@ def create_pass_through_route(
                 stream,
             ) = await _parse_request_data_by_content_type(request)
 
-            if not InitPassThroughEndpointHelpers.is_registered_pass_through_route(
-                route=path
-            ):
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Pass-through endpoint {endpoint} not found. This could have been deleted or not yet added to the proxy.",
-                )
-
+            # Single registered-route fetch (RR-056 #10). Prefer one index
+            # lookup for existence + params. Mapped LiteLLM routes without
+            # registry metadata use the cheap mapped-route check (no second
+            # full registry scan).
             passthrough_params = (
                 InitPassThroughEndpointHelpers.get_registered_pass_through_route(
                     route=path, method=request.method
                 )
             )
+            if passthrough_params is None and not (
+                InitPassThroughEndpointHelpers._is_mapped_pass_through_route(path)
+            ):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Pass-through endpoint {endpoint} not found. This could have been deleted or not yet added to the proxy.",
+                )
             target_params = {
                 "target": target,
                 "custom_headers": custom_headers,
@@ -5365,7 +4817,11 @@ async def websocket_passthrough_request(  # noqa: PLR0915
 
     # Initialize tracking variables
     start_time = datetime.now()
-    websocket_messages: list[dict[str, Any]] = []
+    # Bounded ring buffer for cost/logging (RR-056 #4). Unbounded append of every
+    # realtime message (esp. Vertex Live audio) is a memory-exhaustion risk.
+    websocket_messages: deque[dict[str, Any]] = deque(
+        maxlen=_WEBSOCKET_PASSTHROUGH_MESSAGE_BUFFER_MAX
+    )
     litellm_call_id = str(uuid.uuid4())
 
     verbose_proxy_logger.info(
@@ -5674,7 +5130,9 @@ async def websocket_passthrough_request(  # noqa: PLR0915
             end_time = datetime.now()
 
             # Update passthrough logging payload with response data
-            passthrough_logging_payload["response_body"] = websocket_messages  # type: ignore
+            # Materialize bounded buffer for logging/cost handlers.
+            websocket_messages_list = list(websocket_messages)
+            passthrough_logging_payload["response_body"] = websocket_messages_list  # type: ignore
             passthrough_logging_payload["end_time"] = end_time  # type: ignore
 
             # Remove logging_obj from kwargs to avoid duplicate keyword argument
@@ -5715,7 +5173,7 @@ async def websocket_passthrough_request(  # noqa: PLR0915
             asyncio.create_task(
                 pass_through_endpoint_logging.pass_through_async_success_handler(
                     httpx_response=mock_response,  # type: ignore
-                    response_body=websocket_messages,  # type: ignore
+                    response_body=websocket_messages_list,  # type: ignore
                     url_route=endpoint or "",
                     result="websocket_connection_successful",
                     start_time=start_time,
@@ -5901,6 +5359,153 @@ class SafeRouteAdder:
         return True
 
 
+def _normalize_pass_through_route_path(path: str) -> str:
+    """Normalize registered/request paths for index keys (no root prefix)."""
+    cleaned = str(path or "").strip()
+    if not cleaned:
+        return "/"
+    if not cleaned.startswith("/"):
+        cleaned = f"/{cleaned}"
+    # Collapse trailing slash except root.
+    if len(cleaned) > 1 and cleaned.endswith("/"):
+        cleaned = cleaned.rstrip("/")
+    return cleaned or "/"
+
+
+def _pass_through_path_segments(path: str) -> List[str]:
+    normalized = _normalize_pass_through_route_path(path)
+    if normalized == "/":
+        return []
+    return [segment for segment in normalized.strip("/").split("/") if segment]
+
+
+def _index_pass_through_subpath_route(route_key: str, path: str) -> None:
+    node = _registered_pass_through_subpath_trie
+    for segment in _pass_through_path_segments(path):
+        children = node.setdefault("__children__", {})
+        node = children.setdefault(segment, {})
+    keys = node.setdefault("__keys__", [])
+    if route_key not in keys:
+        keys.append(route_key)
+
+
+def _unindex_pass_through_subpath_route(route_key: str, path: str) -> None:
+    segments = _pass_through_path_segments(path)
+    stack: List[Tuple[Dict[str, Any], Optional[str]]] = [
+        (_registered_pass_through_subpath_trie, None)
+    ]
+    node = _registered_pass_through_subpath_trie
+    for segment in segments:
+        children = node.get("__children__")
+        if not isinstance(children, dict) or segment not in children:
+            return
+        node = children[segment]
+        stack.append((node, segment))
+    keys = node.get("__keys__")
+    if isinstance(keys, list):
+        try:
+            keys.remove(route_key)
+        except ValueError:
+            pass
+        if not keys:
+            node.pop("__keys__", None)
+    # Prune empty nodes bottom-up.
+    for idx in range(len(stack) - 1, 0, -1):
+        child, segment = stack[idx]
+        parent, _ = stack[idx - 1]
+        if child.get("__keys__") or child.get("__children__"):
+            break
+        children = parent.get("__children__")
+        if isinstance(children, dict) and segment in children:
+            children.pop(segment, None)
+            if not children:
+                parent.pop("__children__", None)
+
+
+def _lookup_pass_through_subpath_keys(route_path: str) -> List[str]:
+    """Longest-prefix match via segment trie; O(segments), not O(all prefixes)."""
+    node = _registered_pass_through_subpath_trie
+    best: List[str] = []
+    # Root prefix registration (path == "/")
+    root_keys = node.get("__keys__")
+    if isinstance(root_keys, list) and root_keys:
+        best = list(root_keys)
+    for segment in _pass_through_path_segments(route_path):
+        children = node.get("__children__")
+        if not isinstance(children, dict):
+            break
+        next_node = children.get(segment)
+        if not isinstance(next_node, dict):
+            break
+        node = next_node
+        keys = node.get("__keys__")
+        if isinstance(keys, list) and keys:
+            best = list(keys)
+    return best
+
+
+def _index_pass_through_route_key(route_key: str, path: str, route_type: str) -> None:
+    """Maintain exact/subpath indexes when a route is registered (RR-056 #10)."""
+    normalized = _normalize_pass_through_route_path(path)
+    if route_type == "exact":
+        bucket = _registered_pass_through_exact_index.setdefault(normalized, [])
+        if route_key not in bucket:
+            bucket.append(route_key)
+        return
+    _index_pass_through_subpath_route(route_key, normalized)
+
+
+def _unindex_pass_through_route_key(route_key: str) -> None:
+    """Remove a route key from path indexes."""
+    value = _registered_pass_through_routes.get(route_key)
+    if not isinstance(value, dict):
+        return
+    path = value.get("path")
+    route_type = value.get("type")
+    if not isinstance(path, str) or not isinstance(route_type, str):
+        # Fall back to key encoding: "{id}:{type}:{path}:{methods?}"
+        parts = str(route_key).split(":", 3)
+        if len(parts) >= 3:
+            route_type = str(parts[1])
+            path = str(parts[2])
+        else:
+            return
+    normalized = _normalize_pass_through_route_path(str(path))
+    if route_type == "exact":
+        keys = _registered_pass_through_exact_index.get(normalized)
+        if not keys:
+            return
+        try:
+            keys.remove(route_key)
+        except ValueError:
+            pass
+        if not keys:
+            _registered_pass_through_exact_index.pop(normalized, None)
+        return
+    _unindex_pass_through_subpath_route(route_key, normalized)
+
+
+def _rebuild_pass_through_route_indexes() -> None:
+    _registered_pass_through_exact_index.clear()
+    _registered_pass_through_subpath_trie.clear()
+    _registered_pass_through_subpath_index.clear()
+    for route_key, value in _registered_pass_through_routes.items():
+        path = None
+        route_type = None
+        if isinstance(value, dict):
+            if isinstance(value.get("path"), str):
+                path = value["path"]
+            if isinstance(value.get("type"), str):
+                route_type = value["type"]
+        if path is None or route_type is None:
+            parts = str(route_key).split(":", 3)
+            if len(parts) >= 3:
+                route_type = parts[1]
+                path = parts[2]
+        if isinstance(path, str) and isinstance(route_type, str):
+            _index_pass_through_route_key(route_key, path, route_type)
+
+
 class InitPassThroughEndpointHelpers:
     @staticmethod
     def add_exact_path_route(
@@ -5977,6 +5582,7 @@ class InitPassThroughEndpointHelpers:
                 "guardrails": guardrails,
             },
         }
+        _index_pass_through_route_key(route_key, path, "exact")
 
     @staticmethod
     def add_subpath_route(
@@ -6054,6 +5660,7 @@ class InitPassThroughEndpointHelpers:
                 "guardrails": guardrails,
             },
         }
+        _index_pass_through_route_key(route_key, path, "subpath")
 
     @staticmethod
     def remove_endpoint_routes(endpoint_id: str):
@@ -6064,6 +5671,7 @@ class InitPassThroughEndpointHelpers:
             if value["endpoint_id"] == endpoint_id
         ]
         for key in keys_to_remove:
+            _unindex_pass_through_route_key(key)
             del _registered_pass_through_routes[key]
             verbose_proxy_logger.debug(
                 "Removed pass-through route from registry: %s", key
@@ -6073,6 +5681,9 @@ class InitPassThroughEndpointHelpers:
     def clear_all_pass_through_routes():
         """Clear all pass-through routes from the registry"""
         _registered_pass_through_routes.clear()
+        _registered_pass_through_exact_index.clear()
+        _registered_pass_through_subpath_trie.clear()
+        _registered_pass_through_subpath_index.clear()
 
     @staticmethod
     def get_all_registered_pass_through_routes() -> List[str]:
@@ -6100,8 +5711,8 @@ class InitPassThroughEndpointHelpers:
         """
         Check if route is a registered pass-through endpoint from DB
 
-        Uses the in-memory registry to avoid additional DB queries
-        Optimized for minimal latency
+        Uses the in-memory registry to avoid additional DB queries.
+        Path indexes avoid a full linear key scan on every request (RR-056 #10).
 
         Args:
             route: The route to check
@@ -6109,65 +5720,125 @@ class InitPassThroughEndpointHelpers:
         Returns:
             bool: True if route is a registered pass-through endpoint, False otherwise
         """
-        ## CHECK IF MAPPED PASS THROUGH ENDPOINT
+        return InitPassThroughEndpointHelpers.get_registered_pass_through_route(
+            route
+        ) is not None or InitPassThroughEndpointHelpers._is_mapped_pass_through_route(
+            route
+        )
+
+    @staticmethod
+    def _is_mapped_pass_through_route(route: str) -> bool:
         normalized_route = normalize_route_for_root_path(route)
-        if normalized_route is not None:
-            for mapped_route in LiteLLMRoutes.mapped_pass_through_routes.value:
-                if normalized_route.startswith(mapped_route):
-                    return True
-
-        # Fast path: check if any registered route key contains this path
-        # Keys are in format: "{endpoint_id}:exact:{path}:{methods}" or "{endpoint_id}:subpath:{path}:{methods}"
-        # For backward compatibility, also support old format: "{endpoint_id}:exact:{path}" or "{endpoint_id}:subpath:{path}"
-        # Extract unique paths from keys for quick checking
-        for key in _registered_pass_through_routes.keys():
-            parts = key.split(":", 3)  # Split into [endpoint_id, type, path, methods?]
-            if len(parts) >= 3:
-                route_type = parts[1]
-                registered_path = (
-                    InitPassThroughEndpointHelpers._build_full_path_with_root(parts[2])
-                )
-                if route_type == "exact" and route == registered_path:
-                    return True
-                elif route_type == "subpath":
-                    if route == registered_path or route.startswith(
-                        registered_path + "/"
-                    ):
-                        return True
-
+        if normalized_route is None:
+            return False
+        for mapped_route in LiteLLMRoutes.mapped_pass_through_routes.value:
+            if normalized_route.startswith(mapped_route):
+                return True
         return False
 
     @staticmethod
     def get_registered_pass_through_route(
         route: str, method: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
-        """Get passthrough params for a given route and optionally filter by HTTP method"""
-        for key in _registered_pass_through_routes.keys():
-            parts = key.split(":", 3)  # Split into [endpoint_id, type, path, methods?]
-            if len(parts) >= 3:
-                route_type = parts[1]
-                registered_path = (
-                    InitPassThroughEndpointHelpers._build_full_path_with_root(parts[2])
+        """Get passthrough params for a given route and optionally filter by HTTP method.
+
+        RR-056 #10:
+        - Exact match is O(1) via a normalized-path dict (plus root-prefixed key).
+        - Subpath match is longest-prefix via a segment trie (O(path segments)),
+          not a per-request scan of every registered path.
+        - Lazy rebuild only when the registry has entries but indexes are empty
+          (e.g. tests that seed the flat dict directly).
+        - Full registry scan only if indexes remain empty/corrupt after rebuild;
+          normal misses never iterate all routes.
+        """
+        if _registered_pass_through_routes and not (
+            _registered_pass_through_exact_index or _registered_pass_through_subpath_trie
+        ):
+            _rebuild_pass_through_route_indexes()
+
+        def _select_from_keys(candidate_keys: List[str]) -> Optional[Dict[str, Any]]:
+            for key in candidate_keys:
+                value = _registered_pass_through_routes.get(key)
+                if not isinstance(value, dict):
+                    continue
+                route_methods = value.get("methods", [])
+                if method is None or not route_methods or method in route_methods:
+                    return value  # type: ignore[return-value]
+            return None
+
+        root_path = get_server_root_path() or "/"
+        root_normalized = (
+            "/"
+            if root_path == "/"
+            else _normalize_pass_through_route_path(root_path)
+        )
+        # Match historical contract: when a non-default server root is active,
+        # inbound routes must include that root prefix. Registered paths are
+        # stored without the root and compared via build_full_path_with_root.
+        if root_normalized != "/":
+            root_prefix = root_normalized.rstrip("/")
+            if not (
+                route == root_prefix
+                or route.startswith(root_prefix + "/")
+            ):
+                return None
+            lookup_path = _normalize_pass_through_route_path(
+                route[len(root_prefix) :] or "/"
+            )
+        else:
+            lookup_path = _normalize_pass_through_route_path(route)
+
+        exact_keys = list(_registered_pass_through_exact_index.get(lookup_path, []))
+        selected = _select_from_keys(exact_keys)
+        if selected is not None:
+            return selected
+
+        # Subpath longest-prefix via segment trie (O(segments)).
+        subpath_keys = _lookup_pass_through_subpath_keys(lookup_path)
+        selected = _select_from_keys(subpath_keys)
+        if selected is not None:
+            return selected
+
+        # Last resort only when indexes themselves are empty/corrupt after the
+        # lazy rebuild attempt. A healthy miss (indexes warm, path not present)
+        # must not scan every registry entry (RR-056 #10).
+        indexes_empty = not (
+            _registered_pass_through_exact_index or _registered_pass_through_subpath_trie
+        )
+        if _registered_pass_through_routes and indexes_empty:
+            for key, value in list(_registered_pass_through_routes.items()):
+                if not isinstance(value, dict):
+                    continue
+                parts = str(key).split(":", 3)
+                route_type = (
+                    value.get("type") if isinstance(value.get("type"), str) else None
                 )
-
-                # Get the methods for this route
-                route_methods = _registered_pass_through_routes[key].get("methods", [])
-
-                # Check if path matches
-                path_matches = False
-                if route_type == "exact" and route == registered_path:
-                    path_matches = True
+                registered_path_raw = (
+                    value.get("path") if isinstance(value.get("path"), str) else None
+                )
+                if route_type is None or registered_path_raw is None:
+                    if len(parts) < 3:
+                        continue
+                    route_type = str(parts[1])
+                    registered_path_raw = str(parts[2])
+                registered_path = (
+                    InitPassThroughEndpointHelpers._build_full_path_with_root(
+                        str(registered_path_raw)
+                    )
+                )
+                if route_type == "exact":
+                    path_matches = route == registered_path
                 elif route_type == "subpath":
-                    if route == registered_path or route.startswith(
-                        registered_path + "/"
-                    ):
-                        path_matches = True
-
-                # If path matches and method filter is provided, check if method is allowed
-                if path_matches:
-                    if method is None or not route_methods or method in route_methods:
-                        return _registered_pass_through_routes[key]
-
+                    path_matches = route == registered_path or route.startswith(
+                        str(registered_path) + "/"
+                    )
+                else:
+                    path_matches = False
+                if not path_matches:
+                    continue
+                route_methods = value.get("methods", [])
+                if method is None or not route_methods or method in route_methods:
+                    return value  # type: ignore[return-value]
         return None
 
 

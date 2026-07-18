@@ -1773,9 +1773,15 @@ async def test_pass_through_request_failure_handler():
                     return_value={"test": "data"}
                 )
 
-                # Setup mock for httpx client
+                # Setup mock for httpx client.
+                # Non-stream path uses prefer_stream_for_unknown_content (RR-056 #6),
+                # so failures surface through async_client.send, not .request.
                 mock_client = MagicMock()
                 mock_client.client = MagicMock()
+                mock_client.client.build_request = MagicMock(return_value=MagicMock())
+                mock_client.client.send = AsyncMock(
+                    side_effect=httpx.HTTPError("Request failed")
+                )
                 mock_client.client.request = AsyncMock(
                     side_effect=httpx.HTTPError("Request failed")
                 )
@@ -2530,13 +2536,13 @@ async def test_create_pass_through_route_with_cost_per_request():
     with patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_request"
     ) as mock_pass_through, patch(
-        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.is_registered_pass_through_route"
-    ) as mock_is_registered, patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.get_registered_pass_through_route"
     ) as mock_get_registered:
         mock_pass_through.return_value = MagicMock()
-        mock_is_registered.return_value = True
-        mock_get_registered.return_value = None
+        # Single-fetch contract (RR-056 #10): registry hit supplies params.
+        mock_get_registered.return_value = {
+            "passthrough_params": {},
+        }
 
         # Create mock request
         mock_request = MagicMock(spec=Request)
@@ -3580,33 +3586,19 @@ def test_record_grok_billing_passthrough_request_contract_redacts_header_values(
 
 
 @pytest.mark.asyncio
-async def test_direct_capture_xai_passthrough_failure_uses_callback_wheel_fallback():
+async def test_direct_capture_xai_passthrough_failure_uses_canonical_agent_identity():
+    """RR-056 #7: single canonical import (RR-003 packaging), no dual module probe."""
     direct_capture_mock = AsyncMock()
-
-    def fake_import_module(module_name):
-        if module_name == "litellm.integrations.aawm_agent_identity":
-            raise ModuleNotFoundError(module_name)
-        if module_name == "aawm_litellm_callbacks.agent_identity":
-            return SimpleNamespace(
-                aawm_agent_identity_instance=SimpleNamespace(
-                    async_post_call_failure_hook=direct_capture_mock,
-                )
-            )
-        # Allow incidental imports from nested patch target resolution.
-        return importlib.import_module(module_name)
-
     request_payload = {"model": "grok-build", "custom_llm_provider": "xai"}
     user_api_key_dict = MagicMock()
     original_exception = HTTPException(status_code=401, detail="xai auth failed")
 
-    # Patch registration check first so nested patch() can resolve targets
-    # without hitting the fake import_module side effect.
     with patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints._is_aawm_agent_identity_registered_in_litellm_callbacks",
         return_value=False,
     ), patch(
-        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.importlib.import_module",
-        side_effect=fake_import_module,
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints._CANONICAL_AAWM_AGENT_IDENTITY_INSTANCE",
+        new=SimpleNamespace(async_post_call_failure_hook=direct_capture_mock),
     ):
         await _direct_capture_xai_passthrough_failure(
             request_payload=request_payload,
@@ -3640,22 +3632,22 @@ async def test_direct_capture_xai_passthrough_failure_skips_when_agent_identity_
     FakeAawmAgentIdentity.__name__ = "AawmAgentIdentity"
     agent_identity_callback = FakeAawmAgentIdentity()
 
-    import_mock = MagicMock(
-        side_effect=AssertionError(
-            "direct capture must not import agent identity when already registered"
-        )
-    )
     request_payload = {"model": "grok-build", "custom_llm_provider": "xai"}
     original_exception = HTTPException(status_code=401, detail="xai auth failed")
     original_callbacks = list(getattr(litellm, "callbacks", []) or [])
     original_failure_callbacks = list(getattr(litellm, "failure_callback", []) or [])
+    canonical_hook = AsyncMock(
+        side_effect=AssertionError(
+            "canonical agent identity must not run when already registered"
+        )
+    )
 
     try:
         litellm.callbacks = [agent_identity_callback]
         litellm.failure_callback = []
         with patch(
-            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.importlib.import_module",
-            new=import_mock,
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._CANONICAL_AAWM_AGENT_IDENTITY_INSTANCE",
+            new=SimpleNamespace(async_post_call_failure_hook=canonical_hook),
         ):
             assert _is_aawm_agent_identity_registered_in_litellm_callbacks() is True
             await _direct_capture_xai_passthrough_failure(
@@ -3671,7 +3663,7 @@ async def test_direct_capture_xai_passthrough_failure_skips_when_agent_identity_
         litellm.failure_callback = original_failure_callbacks
 
     direct_capture_mock.assert_not_awaited()
-    import_mock.assert_not_called()
+    canonical_hook.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3679,13 +3671,13 @@ async def test_direct_capture_xai_passthrough_failure_skips_string_callback_regi
     """String callback entries (config form) also suppress the direct xAI path."""
     import litellm
 
-    import_mock = MagicMock(
-        side_effect=AssertionError(
-            "should not import agent identity when string callback registered"
-        )
-    )
     original_callbacks = list(getattr(litellm, "callbacks", []) or [])
     original_failure_callbacks = list(getattr(litellm, "failure_callback", []) or [])
+    canonical_hook = AsyncMock(
+        side_effect=AssertionError(
+            "canonical agent identity must not run when string callback registered"
+        )
+    )
 
     try:
         litellm.callbacks = [
@@ -3693,8 +3685,8 @@ async def test_direct_capture_xai_passthrough_failure_skips_string_callback_regi
         ]
         litellm.failure_callback = []
         with patch(
-            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.importlib.import_module",
-            new=import_mock,
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._CANONICAL_AAWM_AGENT_IDENTITY_INSTANCE",
+            new=SimpleNamespace(async_post_call_failure_hook=canonical_hook),
         ):
             await _direct_capture_xai_passthrough_failure(
                 request_payload={"model": "grok-build", "custom_llm_provider": "xai"},
@@ -3708,7 +3700,7 @@ async def test_direct_capture_xai_passthrough_failure_skips_string_callback_regi
         litellm.callbacks = original_callbacks
         litellm.failure_callback = original_failure_callbacks
 
-    import_mock.assert_not_called()
+    canonical_hook.assert_not_awaited()
 
 
 class TestGrokPersonalTeamSpendingLimitLogging:
@@ -6312,7 +6304,9 @@ class TestPassThroughHiddenRetry:
         assert metadata["aawm_passthrough_hidden_retry_count"] == 6
 
     def test_hidden_retry_budget_defaults_to_backoff_sum(self, monkeypatch):
-        monkeypatch.delenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", raising=False)
+        monkeypatch.delenv(
+            "AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", raising=False
+        )
         assert _get_passthrough_hidden_retry_budget_seconds() == 230.0
 
     def test_hidden_retry_budget_env_override(self, monkeypatch):
@@ -6790,6 +6784,9 @@ async def test_pass_through_request_full_payload_capture_uses_upstream_http_requ
         new_callable=AsyncMock,
     ):
         mock_client = MagicMock()
+        mock_client.build_request = MagicMock(return_value=MagicMock())
+        # RR-056 #6 non-stream path uses send(stream=True) then aread().
+        mock_client.send = AsyncMock(return_value=mock_response)
         mock_client.request = AsyncMock(return_value=mock_response)
         mock_client_obj = MagicMock(client=mock_client)
         mock_get_client.return_value = mock_client_obj
@@ -7368,15 +7365,14 @@ async def test_create_pass_through_route_custom_body_url_target():
     with patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_request"
     ) as mock_pass_through, patch(
-        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.is_registered_pass_through_route"
-    ) as mock_is_registered, patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.get_registered_pass_through_route"
     ) as mock_get_registered, patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints._parse_request_data_by_content_type"
     ) as mock_parse_request:
         mock_pass_through.return_value = MagicMock()
-        mock_is_registered.return_value = True
-        mock_get_registered.return_value = None
+        mock_get_registered.return_value = {
+            "passthrough_params": {},
+        }
         # Simulate the request parser returning a different body
         mock_parse_request.return_value = (
             {},  # query_params_data
@@ -7439,15 +7435,14 @@ async def test_create_pass_through_route_no_custom_body_falls_back():
     with patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_request"
     ) as mock_pass_through, patch(
-        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.is_registered_pass_through_route"
-    ) as mock_is_registered, patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.get_registered_pass_through_route"
     ) as mock_get_registered, patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints._parse_request_data_by_content_type"
     ) as mock_parse_request:
         mock_pass_through.return_value = MagicMock()
-        mock_is_registered.return_value = True
-        mock_get_registered.return_value = None
+        mock_get_registered.return_value = {
+            "passthrough_params": {},
+        }
         request_parsed_body = {"key": "from_request"}
         mock_parse_request.return_value = (
             {},  # query_params_data
@@ -7549,8 +7544,9 @@ def test_is_registered_pass_through_route_with_custom_root():
         _registered_pass_through_routes,
     )
 
-    # Clear the registry first
-    _registered_pass_through_routes.clear()
+    # Clear the registry + indexes first (lazy rebuild needs empty indexes
+    # when tests seed only the flat dict without calling _index_*).
+    InitPassThroughEndpointHelpers.clear_all_pass_through_routes()
 
     # Register a pass-through route with endpoint format: {endpoint_id}:exact:{path}
     endpoint_id = "test-endpoint-123"
@@ -7603,7 +7599,7 @@ def test_is_registered_pass_through_route_with_custom_root():
         )
 
     # Clean up
-    _registered_pass_through_routes.clear()
+    InitPassThroughEndpointHelpers.clear_all_pass_through_routes()
 
 
 def test_get_registered_pass_through_route_with_custom_root():
@@ -7618,8 +7614,9 @@ def test_get_registered_pass_through_route_with_custom_root():
         _registered_pass_through_routes,
     )
 
-    # Clear the registry first
-    _registered_pass_through_routes.clear()
+    # Clear the registry + indexes first (lazy rebuild needs empty indexes
+    # when tests seed only the flat dict without calling _index_*).
+    InitPassThroughEndpointHelpers.clear_all_pass_through_routes()
 
     # Register a pass-through route
     endpoint_id = "test-endpoint-456"
@@ -7663,7 +7660,7 @@ def test_get_registered_pass_through_route_with_custom_root():
         assert result["target"] == "http://api.example.com/v1/chat/completions"
 
     # Clean up
-    _registered_pass_through_routes.clear()
+    InitPassThroughEndpointHelpers.clear_all_pass_through_routes()
 
 
 def test_mapped_pass_through_routes_with_server_root_path():
@@ -8341,7 +8338,9 @@ async def _invoke_pass_through_request_shape_422_with_terminal_capture(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints._direct_capture_xai_passthrough_failure",
         new=AsyncMock(),
     ), patch(
-        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        # RR-056 #8 hoisted the import into pass_through_endpoints; patch the
+        # bound module symbol rather than the source module only.
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.persist_agent_terminal_error",
         side_effect=_capture_terminal,
     ) as mock_terminal, patch(
         "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
