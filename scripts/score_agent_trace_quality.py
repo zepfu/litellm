@@ -34,6 +34,24 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+_DEFAULT_AAWM_PROJECTS_ROOT = "/home/zepfu/projects"
+
+
+def _aawm_projects_root() -> Path:
+    """Portable AAWM multi-repo checkout root (override with AAWM_PROJECTS_ROOT)."""
+    raw = os.environ.get("AAWM_PROJECTS_ROOT")
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+    else:
+        cleaned = ""
+    return Path(cleaned or _DEFAULT_AAWM_PROJECTS_ROOT).expanduser()
+
+
+def _aawm_projects_root_marker() -> str:
+    """POSIX-style absolute prefix ending with '/' for projects-root path matching."""
+    return str(_aawm_projects_root()).replace("\\", "/").rstrip("/") + "/"
+
+
 from litellm.integrations.aawm_agent_quality_rules import (  # noqa: E402
     AgentQualityCommand,
     score_agent_quality_context,
@@ -1215,11 +1233,10 @@ def _iter_jsonl_events(path: Path) -> Iterator[Dict[str, Any]]:
             yield parsed
 
 
-def _extract_spawn_message_for_agent(
-    parent_transcript: Path,
-    agent_id: str,
-) -> Optional[str]:
+def _spawn_messages_by_agent_id(parent_transcript: Path) -> Dict[str, str]:
+    """Parse a parent Codex transcript once into agent_id -> spawn message."""
     spawn_calls: Dict[str, Dict[str, Any]] = {}
+    messages_by_agent: Dict[str, str] = {}
     for event in _iter_jsonl_events(parent_transcript):
         if event.get("type") != "response_item":
             continue
@@ -1240,23 +1257,39 @@ def _extract_spawn_message_for_agent(
         if payload_type != "function_call_output" or not call_id:
             continue
         output = _parse_json_value(payload.get("output"))
-        if not isinstance(output, dict) or output.get("agent_id") != agent_id:
+        if not isinstance(output, dict):
+            continue
+        agent_id = _clean(output.get("agent_id"))
+        if not agent_id or agent_id in messages_by_agent:
             continue
         arguments = spawn_calls.get(call_id)
         if not isinstance(arguments, dict):
             continue
         message = arguments.get("message")
-        return message if isinstance(message, str) and message.strip() else None
-    return None
+        if isinstance(message, str) and message.strip():
+            messages_by_agent[agent_id] = message
+    return messages_by_agent
+
+
+def _extract_spawn_message_for_agent(
+    parent_transcript: Path,
+    agent_id: str,
+    *,
+    spawn_messages_by_agent: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    if spawn_messages_by_agent is None:
+        spawn_messages_by_agent = _spawn_messages_by_agent_id(parent_transcript)
+    return spawn_messages_by_agent.get(agent_id)
 
 
 def _repository_from_cwd(cwd: Optional[str]) -> Optional[str]:
     cleaned = _clean(cwd)
     if not cleaned:
         return None
-    marker = "/home/zepfu/projects/"
-    if marker in cleaned:
-        remainder = cleaned.split(marker, 1)[1].strip("/")
+    marker = _aawm_projects_root_marker()
+    normalized = cleaned.replace("\\", "/")
+    if marker in normalized:
+        remainder = normalized.split(marker, 1)[1].strip("/")
         return remainder.split("/", 1)[0] if remainder else None
     return Path(cleaned).name or None
 
@@ -1287,6 +1320,7 @@ def _build_codex_transcript_bundle(  # noqa: PLR0915
     transcript: Path,
     *,
     parent_transcript: Optional[Path] = None,
+    parent_spawn_messages_by_agent: Optional[Dict[str, str]] = None,
 ) -> TranscriptCandidateBundle:
     events = list(_iter_jsonl_events(transcript))
     session_meta = next(
@@ -1345,7 +1379,11 @@ def _build_codex_transcript_bundle(  # noqa: PLR0915
             if isinstance(thread_spawn, dict):
                 parent_thread_id = _clean(thread_spawn.get("parent_thread_id"))
     if parent_transcript is not None:
-        parent_spawn_message = _extract_spawn_message_for_agent(parent_transcript, session_id)
+        parent_spawn_message = _extract_spawn_message_for_agent(
+            parent_transcript,
+            session_id,
+            spawn_messages_by_agent=parent_spawn_messages_by_agent,
+        )
 
     messages: List[Dict[str, Any]] = []
     if parent_spawn_message:
@@ -1544,6 +1582,7 @@ def _resolve_codex_transcript_bundles(
     parent_transcripts = [
         Path(value).expanduser() for value in (args.codex_parent_transcript or [])
     ]
+    parent_spawn_cache: Dict[str, Dict[str, str]] = {}
     bundles: List[TranscriptCandidateBundle] = []
     for index, transcript in enumerate(transcripts):
         parent_transcript = (
@@ -1553,10 +1592,20 @@ def _resolve_codex_transcript_bundles(
             if len(parent_transcripts) == 1
             else None
         )
+        parent_spawn_messages_by_agent: Optional[Dict[str, str]] = None
+        if parent_transcript is not None:
+            cache_key = str(parent_transcript.resolve())
+            parent_spawn_messages_by_agent = parent_spawn_cache.get(cache_key)
+            if parent_spawn_messages_by_agent is None:
+                parent_spawn_messages_by_agent = _spawn_messages_by_agent_id(
+                    parent_transcript
+                )
+                parent_spawn_cache[cache_key] = parent_spawn_messages_by_agent
         bundles.append(
             _build_codex_transcript_bundle(
                 transcript,
                 parent_transcript=parent_transcript,
+                parent_spawn_messages_by_agent=parent_spawn_messages_by_agent,
             )
         )
     return bundles
@@ -1794,10 +1843,16 @@ _TRIVIAL_NOOP_TEXTS = {
     "ack",
     "acknowledged",
 }
-_SHELL_PATH_RE = re.compile(
-    r"(?P<path>(?:/home/zepfu/projects/|/workspace/|\.{1,2}/|[A-Za-z0-9_.-]+/)"
-    r"[A-Za-z0-9_./-]+)"
-)
+def _shell_path_re() -> "re.Pattern[str]":
+    marker = re.escape(_aawm_projects_root_marker())
+    return re.compile(
+        rf"(?P<path>(?:{marker}|/workspace/|\.{1,2}/|[A-Za-z0-9_.-]+/)"
+        r"[A-Za-z0-9_./-]+)"
+    )
+
+
+_SHELL_PATH_RE = _shell_path_re()
+
 _PYTHON_OPEN_PATH_RE = re.compile(r"\bopen\s*\(\s*['\"](?P<path>[^'\"]+)['\"]")
 _SHELL_REDIRECT_PATH_RE = re.compile(
     r"(?:^|\s)>{1,2}\s*(?P<path>[-A-Za-z0-9_./]+)"
@@ -1851,7 +1906,7 @@ def _extract_affected_paths(tool_input: Any, command: Optional[str]) -> List[str
             paths.append(match.group("path"))
         for match in _SHELL_FILE_MUTATION_PATH_RE.finditer(command):
             paths.append(match.group("path"))
-        for match in _SHELL_PATH_RE.finditer(command):
+        for match in _shell_path_re().finditer(command):
             candidate = match.group("path").strip("\"'")
             if candidate and not candidate.startswith(("http://", "https://")):
                 paths.append(candidate)
@@ -2129,7 +2184,7 @@ def _candidate_repo_root(candidate: SessionCandidate) -> Optional[Path]:
     repository = _clean(candidate.repository) or _clean(candidate.tenant_id)
     if repository:
         repo_name = repository.rsplit("/", 1)[-1]
-        candidates.append(Path("/home/zepfu/projects") / repo_name)
+        candidates.append(_aawm_projects_root() / repo_name)
         if repo_name == REPO_ROOT.name:
             candidates.append(REPO_ROOT)
     for candidate_path in candidates:
@@ -2161,8 +2216,9 @@ def _repo_relative_path(repo_root: Path, path: str) -> Optional[str]:
 
 def _path_has_common_ignored_prefix(path: str) -> bool:
     normalized = path.strip().strip("\"'").replace("\\", "/")
-    if "/home/zepfu/projects/" in normalized:
-        parts = normalized.split("/home/zepfu/projects/", 1)[1].split("/", 1)
+    marker = _aawm_projects_root_marker()
+    if marker in normalized:
+        parts = normalized.split(marker, 1)[1].split("/", 1)
         normalized = parts[1] if len(parts) > 1 else ""
     while normalized.startswith("./"):
         normalized = normalized[2:]
@@ -2188,56 +2244,217 @@ def _run_git(
         return None
 
 
-def _git_check_ignore_match(repo_root: Path, rel_path: str) -> Optional[Dict[str, Any]]:
+def _parse_check_ignore_line(raw: str, fallback_path: str) -> Dict[str, Any]:
+    source = None
+    pattern = None
+    ignored_path = fallback_path
+    if "\t" in raw:
+        rule, matched_path = raw.split("\t", 1)
+        parts = rule.split(":", 2)
+        if len(parts) == 3:
+            source = f"{parts[0]}:{parts[1]}"
+            pattern = parts[2]
+        ignored_path = matched_path or fallback_path
+    return {
+        "ignored": True,
+        "ignored_path": ignored_path,
+        "ignore_rule_source": source,
+        "ignore_rule_pattern": pattern,
+        "ignore_rule_raw": raw[:240],
+    }
+
+
+def _git_check_ignore_match(
+    repo_root: Path,
+    rel_path: str,
+    *,
+    prefetched: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+) -> Optional[Dict[str, Any]]:
+    if prefetched is not None and rel_path in prefetched:
+        return prefetched[rel_path]
     variants = [rel_path]
     if rel_path not in {".", "./"} and not rel_path.endswith("/"):
         variants.append(f"{rel_path}/")
+    git_failed = False
     for variant in variants:
         result = _run_git(repo_root, ["check-ignore", "--no-index", "-v", "--", variant])
-        if result is None or result.returncode != 0:
+        if result is None:
+            git_failed = True
+            continue
+        if result.returncode != 0:
             continue
         output = result.stdout.strip().splitlines()
         if not output:
             continue
-        raw = output[0]
-        source = None
-        pattern = None
-        if "\t" in raw:
-            rule, _matched_path = raw.split("\t", 1)
-            parts = rule.split(":", 2)
-            if len(parts) == 3:
-                source = f"{parts[0]}:{parts[1]}"
-                pattern = parts[2]
-        return {
-            "ignored": True,
-            "ignored_path": variant,
-            "ignore_rule_source": source,
-            "ignore_rule_pattern": pattern,
-            "ignore_rule_raw": raw[:240],
-        }
+        return _parse_check_ignore_line(output[0], variant)
+    if git_failed:
+        return {"git_check_failed": True, "requested_path": rel_path}
     return None
 
 
-def _git_ignored_tracked_paths(repo_root: Path, rel_path: str) -> List[str]:
+def _git_ignored_tracked_paths(
+    repo_root: Path,
+    rel_path: str,
+    *,
+    prefetched: Optional[Dict[str, Optional[List[str]]]] = None,
+) -> Optional[List[str]]:
+    if prefetched is not None and rel_path in prefetched:
+        return prefetched[rel_path]
     result = _run_git(
         repo_root,
         ["ls-files", "--cached", "--ignored", "--exclude-standard", "-z", "--", rel_path],
     )
-    if result is None or result.returncode != 0 or not result.stdout:
+    if result is None:
+        return None
+    if result.returncode != 0 or not result.stdout:
         return []
     return [path for path in result.stdout.split("\0") if path][:10]
 
 
-def _detect_ignored_path_tracking_violations(
+def _batch_git_ignored_tracked_paths(
+    repo_root: Path,
+    rel_paths: Sequence[str],
+) -> Dict[str, Optional[List[str]]]:
+    unique_paths = list(dict.fromkeys(path for path in rel_paths if path))
+    results: Dict[str, Optional[List[str]]] = {path: [] for path in unique_paths}
+    if not unique_paths:
+        return results
+    result = _run_git(
+        repo_root,
+        [
+            "ls-files",
+            "--cached",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            *unique_paths,
+        ],
+    )
+    if result is None:
+        return {path: None for path in unique_paths}
+    if result.returncode != 0 or not result.stdout:
+        return results
+    tracked = [path for path in result.stdout.split("\0") if path]
+    for rel_path in unique_paths:
+        if rel_path in {".", "./"}:
+            matched = tracked[:10]
+        else:
+            prefix = rel_path.rstrip("/")
+            matched = [
+                path
+                for path in tracked
+                if path == prefix
+                or path.startswith(prefix + "/")
+                or path.startswith(rel_path)
+            ][:10]
+        results[rel_path] = matched
+    return results
+
+
+def _batch_git_check_ignore_matches(
+    repo_root: Path,
+    rel_paths: Sequence[str],
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    unique_paths = list(dict.fromkeys(path for path in rel_paths if path))
+    results: Dict[str, Optional[Dict[str, Any]]] = {path: None for path in unique_paths}
+    if not unique_paths:
+        return results
+    variants: List[str] = []
+    variant_to_rel: Dict[str, str] = {}
+    for rel_path in unique_paths:
+        path_variants = [rel_path]
+        if rel_path not in {".", "./"} and not rel_path.endswith("/"):
+            path_variants.append(f"{rel_path}/")
+        for variant in path_variants:
+            if variant not in variant_to_rel:
+                variant_to_rel[variant] = rel_path
+                variants.append(variant)
+    result = _run_git(
+        repo_root,
+        ["check-ignore", "--no-index", "-v", "--", *variants],
+    )
+    if result is None:
+        return {
+            path: {"git_check_failed": True, "requested_path": path}
+            for path in unique_paths
+        }
+    if result.returncode != 0 or not result.stdout:
+        return results
+    for line in result.stdout.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        parsed = _parse_check_ignore_line(raw, "")
+        ignored_path = str(parsed.get("ignored_path") or "")
+        rel_path = variant_to_rel.get(ignored_path)
+        if rel_path is None:
+            for variant, candidate_rel in variant_to_rel.items():
+                if ignored_path == variant or ignored_path.rstrip("/") == variant.rstrip(
+                    "/"
+                ):
+                    rel_path = candidate_rel
+                    break
+        if rel_path is None or results.get(rel_path):
+            continue
+        if not parsed.get("ignored_path"):
+            parsed["ignored_path"] = ignored_path or rel_path
+        results[rel_path] = parsed
+    return results
+
+
+def _git_failure_evidence_item(
+    tool_use: ToolUseEvidence,
+    raw_path: str,
+) -> Dict[str, Any]:
+    return {
+        "reason": "git_check_failed",
+        "tool_name": tool_use.name or "unknown",
+        "message_index": tool_use.message_index,
+        "sequence_index": tool_use.sequence_index,
+        "command_snippet": _snippet(tool_use.command),
+        "command_timestamp": tool_use.command_timestamp,
+        "path": raw_path,
+        "requested_path": raw_path,
+        "ignored_check": "git_check_failed",
+    }
+
+
+def _forced_tracking_evidence_item(
+    tool_use: ToolUseEvidence,
+    *,
+    path: str,
+    raw_path: str,
+    ignored_check: str,
+    ignore_match: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    item = {
+        "reason": "forced_tracking_ignored_path",
+        "tool_name": tool_use.name or "unknown",
+        "message_index": tool_use.message_index,
+        "sequence_index": tool_use.sequence_index,
+        "command_snippet": _snippet(tool_use.command),
+        "command_timestamp": tool_use.command_timestamp,
+        "path": path,
+        "requested_path": raw_path,
+        "ignored_check": ignored_check,
+    }
+    if ignore_match:
+        item.update(ignore_match)
+    return item
+
+
+def _collect_forced_tracking_work_items(
     candidate: SessionCandidate,
-    messages: Sequence[Any],
     tool_uses: Sequence[ToolUseEvidence],
-) -> Tuple[int, List[Dict[str, Any]]]:
-    if _ignored_path_tracking_authorized(messages):
-        return 0, []
+) -> Tuple[
+    Optional[Path],
+    List[Tuple[ToolUseEvidence, str, Optional[str]]],
+    Dict[str, Optional[List[str]]],
+    Dict[str, Optional[Dict[str, Any]]],
+]:
     repo_root = _candidate_repo_root(candidate)
-    evidence: List[Dict[str, Any]] = []
-    seen: set[Tuple[int, str]] = set()
+    work_items: List[Tuple[ToolUseEvidence, str, Optional[str]]] = []
     for tool_use in tool_uses:
         if not tool_use.forced_git_tracking:
             continue
@@ -2246,62 +2463,99 @@ def _detect_ignored_path_tracking_violations(
             rel_path = (
                 _repo_relative_path(repo_root, raw_path) if repo_root is not None else None
             )
-            tracked_ignored_paths = (
-                _git_ignored_tracked_paths(repo_root, rel_path)
-                if repo_root is not None and rel_path is not None
-                else []
-            )
-            if tracked_ignored_paths:
-                for tracked_path in tracked_ignored_paths:
-                    key = (tool_use.sequence_index, tracked_path)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    evidence.append(
-                        {
-                            "reason": "forced_tracking_ignored_path",
-                            "tool_name": tool_use.name or "unknown",
-                            "message_index": tool_use.message_index,
-                            "sequence_index": tool_use.sequence_index,
-                            "command_snippet": _snippet(tool_use.command),
-                            "command_timestamp": tool_use.command_timestamp,
-                            "path": tracked_path,
-                            "requested_path": raw_path,
-                            "ignored_check": "tracked_ignored",
-                        }
-                    )
+            work_items.append((tool_use, raw_path, rel_path))
+
+    tracked_cache: Dict[str, Optional[List[str]]] = {}
+    ignore_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    if repo_root is not None:
+        rel_paths = [rel for _tool, _raw, rel in work_items if rel is not None]
+        tracked_cache = _batch_git_ignored_tracked_paths(repo_root, rel_paths)
+        check_paths = [
+            rel
+            for rel in dict.fromkeys(rel_paths)
+            if not (tracked_cache.get(rel) or [])
+        ]
+        ignore_cache = _batch_git_check_ignore_matches(repo_root, check_paths)
+    return repo_root, work_items, tracked_cache, ignore_cache
+
+
+def _detect_ignored_path_tracking_violations(
+    candidate: SessionCandidate,
+    messages: Sequence[Any],
+    tool_uses: Sequence[ToolUseEvidence],
+) -> Tuple[int, List[Dict[str, Any]], List[str]]:
+    if _ignored_path_tracking_authorized(messages):
+        return 0, [], []
+
+    repo_root, work_items, tracked_cache, ignore_cache = (
+        _collect_forced_tracking_work_items(candidate, tool_uses)
+    )
+    evidence: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen: set[Tuple[int, str]] = set()
+    git_failure_recorded = False
+
+    for tool_use, raw_path, rel_path in work_items:
+        tracked_ignored_paths: Optional[List[str]] = []
+        if repo_root is not None and rel_path is not None:
+            tracked_ignored_paths = tracked_cache.get(rel_path)
+            if tracked_ignored_paths is None:
+                if not git_failure_recorded:
+                    errors.append("git_check_failed")
+                    git_failure_recorded = True
+                evidence.append(_git_failure_evidence_item(tool_use, raw_path))
                 continue
 
-            ignore_match = (
-                _git_check_ignore_match(repo_root, rel_path)
-                if repo_root is not None and rel_path is not None
-                else None
-            )
-            common_ignored_prefix = _path_has_common_ignored_prefix(raw_path)
-            if ignore_match is None and not common_ignored_prefix:
+        if tracked_ignored_paths:
+            for tracked_path in tracked_ignored_paths:
+                key = (tool_use.sequence_index, tracked_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                evidence.append(
+                    _forced_tracking_evidence_item(
+                        tool_use,
+                        path=tracked_path,
+                        raw_path=raw_path,
+                        ignored_check="tracked_ignored",
+                    )
+                )
+            continue
+
+        ignore_match = None
+        if repo_root is not None and rel_path is not None:
+            ignore_match = ignore_cache.get(rel_path)
+            if isinstance(ignore_match, dict) and ignore_match.get("git_check_failed"):
+                if not git_failure_recorded:
+                    errors.append("git_check_failed")
+                    git_failure_recorded = True
+                evidence.append(_git_failure_evidence_item(tool_use, raw_path))
                 continue
-            evidence_path = (
-                str(ignore_match.get("ignored_path")) if ignore_match else raw_path
+            if not isinstance(ignore_match, dict) or not ignore_match.get("ignored"):
+                ignore_match = None
+
+        common_ignored_prefix = _path_has_common_ignored_prefix(raw_path)
+        if ignore_match is None and not common_ignored_prefix:
+            continue
+        evidence_path = (
+            str(ignore_match.get("ignored_path")) if ignore_match else raw_path
+        )
+        key = (tool_use.sequence_index, evidence_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        evidence.append(
+            _forced_tracking_evidence_item(
+                tool_use,
+                path=evidence_path,
+                raw_path=raw_path,
+                ignored_check=(
+                    "confirmed_ignored" if ignore_match else "common_agent_state_path"
+                ),
+                ignore_match=ignore_match,
             )
-            key = (tool_use.sequence_index, evidence_path)
-            if key in seen:
-                continue
-            seen.add(key)
-            item = {
-                "reason": "forced_tracking_ignored_path",
-                "tool_name": tool_use.name or "unknown",
-                "message_index": tool_use.message_index,
-                "sequence_index": tool_use.sequence_index,
-                "command_snippet": _snippet(tool_use.command),
-                "command_timestamp": tool_use.command_timestamp,
-                "path": evidence_path,
-                "requested_path": raw_path,
-                "ignored_check": "confirmed_ignored" if ignore_match else "common_agent_state_path",
-            }
-            if ignore_match:
-                item.update(ignore_match)
-            evidence.append(item)
-    return len(evidence), evidence[:10]
+        )
+    return len(evidence), evidence[:10], errors
 
 
 def _iter_text_values(value: Any) -> Iterator[str]:
@@ -2503,7 +2757,7 @@ def _scope_control_score_and_reasons(
             if normalized.startswith("../") or "/../" in normalized:
                 reasons.append(f"path_scope_escape:{normalized[:120]}")
                 continue
-            if normalized.startswith(("/home/zepfu/projects/", "/workspace/")) and repo_names:
+            if normalized.startswith((_aawm_projects_root_marker(), "/workspace/")) and repo_names:
                 if not any(f"/{repo_name}/" in f"{normalized}/" for repo_name in repo_names):
                     reasons.append(f"outside_repository_path:{normalized[:120]}")
 
@@ -2790,9 +3044,21 @@ def score_candidate(  # noqa: PLR0915
     (
         ignored_path_tracking_violation_count,
         ignored_path_tracking_evidence,
+        ignored_path_git_errors,
     ) = _detect_ignored_path_tracking_violations(candidate, messages, tool_uses)
+    for git_error in ignored_path_git_errors:
+        if git_error not in errors:
+            errors.append(git_error)
     if ignored_path_tracking_violation_count:
-        reasons.append("ignored_path_tracking_policy_violation")
+        # git_check_failed evidence is operational, not a policy violation.
+        policy_violation_count = sum(
+            1
+            for item in ignored_path_tracking_evidence
+            if item.get("reason") == "forced_tracking_ignored_path"
+        )
+        ignored_path_tracking_violation_count = policy_violation_count
+        if policy_violation_count:
+            reasons.append("ignored_path_tracking_policy_violation")
 
     no_op_response_failure = (
         (
@@ -2960,9 +3226,17 @@ def score_candidate(  # noqa: PLR0915
     )
     if not ignored_path_tracking_violation_count and command_only_ignored_count:
         ignored_path_tracking_violation_count = command_only_ignored_count
-        ignored_path_tracking_evidence = list(
+        command_only_evidence = list(
             agent_quality_fields.get("ignored_path_tracking_evidence") or []
         )
+        # Preserve operational git-failure markers from the git-backed detector.
+        git_failure_evidence = [
+            item
+            for item in ignored_path_tracking_evidence
+            if item.get("ignored_check") == "git_check_failed"
+            or item.get("reason") == "git_check_failed"
+        ]
+        ignored_path_tracking_evidence = command_only_evidence + git_failure_evidence
         reasons.append("ignored_path_tracking_policy_violation")
     baseline_deflection_attempted_score = _coerce_float_or_none(
         agent_quality_fields.get("baseline_deflection_attempted_score")
@@ -3059,7 +3333,7 @@ def score_candidate(  # noqa: PLR0915
     )
     ignored_path_tracking_policy_score = (
         None
-        if not payload_resolved
+        if (not payload_resolved) or ("git_check_failed" in errors)
         else (0.0 if ignored_path_tracking_violation_count else 1.0)
     )
     output_contract_compliance_reasons: List[str] = []
@@ -3521,55 +3795,84 @@ class LangfuseScoreClient:
         return json.loads(payload) if payload.strip() else {}
 
 
-_SESSION_HISTORY_SCORE_ALTER_STATEMENTS = (
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_id TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS trace_quality_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS empty_completion_failure BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS large_tool_result_payload_risk BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS destructive_checkout_after_work BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS invalid_tool_call_error BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS read_only_policy_compliance_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS read_only_policy_violation_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS response_meaningfulness_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS instruction_adherence_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS answer_completeness_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS evidence_fidelity_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_result_fidelity_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS error_attribution_quality_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS repetition_loop_risk_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS context_retention_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_use_validity_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_error_recovery_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS stall_risk_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS output_contract_compliance_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS task_progress_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS scope_control_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS destructive_action_policy_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS ignored_path_tracking_policy_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS ignored_path_tracking_violation_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_attempted_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_incident_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_attempt_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_tool_call_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_input_tokens INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_elapsed_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_trigger_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_fix_attempt_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_rerun_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS sleep_wellness_interruption_attempted_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS sleep_wellness_interruption_incident_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS sleep_wellness_interruption_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS sleep_wellness_interruption_output_tokens INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS sleep_wellness_interruption_input_tokens INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS sleep_wellness_interruption_elapsed_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS sleep_wellness_interruption_after_user_pushback_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS sleep_wellness_interruption_repeated_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS terminal_completion_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS discovery_inventory_coverage_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS discovery_inventory_missing_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_score_reasons "
-    "JSONB NOT NULL DEFAULT '{}'::jsonb",
+# Score columns are owned by session_history schema management in
+# litellm.integrations.aawm_agent_identity (_AAWM_SESSION_HISTORY_* DDL) rather
+# than ad-hoc ALTER TABLE statements in this scoring script.
+_SESSION_HISTORY_SCORE_REQUIRED_COLUMNS = (
+    "agent_id",
+    "trace_quality_score",
+    "empty_completion_failure",
+    "large_tool_result_payload_risk",
+    "destructive_checkout_after_work",
+    "invalid_tool_call_error",
+    "read_only_policy_compliance_score",
+    "read_only_policy_violation_count",
+    "response_meaningfulness_score",
+    "instruction_adherence_score",
+    "answer_completeness_score",
+    "evidence_fidelity_score",
+    "tool_result_fidelity_score",
+    "error_attribution_quality_score",
+    "repetition_loop_risk_score",
+    "context_retention_score",
+    "tool_use_validity_score",
+    "tool_error_recovery_score",
+    "stall_risk_score",
+    "output_contract_compliance_score",
+    "task_progress_score",
+    "scope_control_score",
+    "destructive_action_policy_score",
+    "ignored_path_tracking_policy_score",
+    "ignored_path_tracking_violation_count",
+    "baseline_deflection_attempted_score",
+    "baseline_deflection_incident_score",
+    "baseline_deflection_attempt_count",
+    "baseline_deflection_tool_call_count",
+    "baseline_deflection_input_tokens",
+    "baseline_deflection_elapsed_ms",
+    "quality_gate_trigger_count",
+    "quality_gate_fix_attempt_count",
+    "quality_gate_rerun_count",
+    "sleep_wellness_interruption_attempted_score",
+    "sleep_wellness_interruption_incident_score",
+    "sleep_wellness_interruption_count",
+    "sleep_wellness_interruption_output_tokens",
+    "sleep_wellness_interruption_input_tokens",
+    "sleep_wellness_interruption_elapsed_ms",
+    "sleep_wellness_interruption_after_user_pushback_count",
+    "sleep_wellness_interruption_repeated_count",
+    "terminal_completion_score",
+    "discovery_inventory_coverage_score",
+    "discovery_inventory_missing_count",
+    "agent_score_reasons",
 )
+
+
+def _verify_session_history_score_schema(conn: psycopg.Connection) -> None:
+    """Fail fast when required score columns are missing from public.session_history."""
+    required = list(_SESSION_HISTORY_SCORE_REQUIRED_COLUMNS)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'session_history'
+  AND column_name = ANY(%(columns)s)
+""",
+            {"columns": required},
+        )
+        rows = cur.fetchall()
+    present = {str(row[0]) for row in rows if row and row[0] is not None}
+    missing = [column for column in required if column not in present]
+    if missing:
+        missing_list = ", ".join(missing)
+        raise RuntimeError(
+            "session_history score schema is incomplete; missing columns: "
+            f"{missing_list}. Apply the session_history schema from "
+            "litellm.integrations.aawm_agent_identity (or the owning migration) "
+            "instead of scoring-script DDL."
+        )
 
 
 def _session_history_score_values(
@@ -3861,9 +4164,7 @@ WHERE id = %(row_id)s
     with psycopg.connect(_postgres_dsn_from_args(args)) as conn:
         _verify_target_database(conn, args.require_target_database)
         if args.ensure_session_history_score_schema:
-            with conn.cursor() as cur:
-                for statement in _SESSION_HISTORY_SCORE_ALTER_STATEMENTS:
-                    cur.execute(statement)
+            _verify_session_history_score_schema(conn)
         with conn.cursor() as cur:
             param_rows: List[Dict[str, Any]] = []
             for evidence in evidences:
@@ -4272,9 +4573,7 @@ RETURNING id
     with psycopg.connect(_postgres_dsn_from_args(args)) as conn:
         _verify_target_database(conn, args.require_target_database)
         if args.ensure_session_history_score_schema:
-            with conn.cursor() as cur:
-                for statement in _SESSION_HISTORY_SCORE_ALTER_STATEMENTS:
-                    cur.execute(statement)
+            _verify_session_history_score_schema(conn)
         with conn.cursor() as cur:
             for candidate, evidence in pairs:
                 score_params, score_metadata = _session_history_score_values(evidence)
@@ -4499,7 +4798,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ensure-session-history-score-schema",
         action="store_true",
-        help="Apply additive session_history score columns before updating rows.",
+        help=(
+            "Verify required session_history score columns exist before updating "
+            "rows (fail fast; does not apply DDL)."
+        ),
     )
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--trace-id", action="append", default=[])
