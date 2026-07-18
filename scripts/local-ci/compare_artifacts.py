@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
-import sys
 from typing import Any
 
 
@@ -38,7 +37,16 @@ def _compare_family(name: str, baseline: dict[str, Any], candidate: dict[str, An
             hard.append(f"{name}: missing expected user id {user_id}")
 
     if name == "claude":
-        non_orchestrator = [trace for trace in candidate_names if trace != "claude-code.orchestrator"]
+        # Persona enrichment rewrites the default "claude-code" name to
+        # "claude-code.<agent>". The bare default and the orchestrator label
+        # alone are not evidence that subagent/persona traces exist.
+        non_persona = {
+            "claude-code",
+            "claude-code.orchestrator",
+        }
+        non_orchestrator = [
+            trace for trace in candidate_names if trace not in non_persona
+        ]
         if not non_orchestrator:
             hard.append("claude: missing persona/subagent traces")
 

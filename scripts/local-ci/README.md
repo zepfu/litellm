@@ -48,6 +48,10 @@ To compare two acceptance artifacts:
 python3 compare_artifacts.py old.json new.json
 ```
 
+Claude comparisons require at least one persona-enriched trace name such as
+`claude-code.explorer`. The bare `claude-code` default and
+`claude-code.orchestrator` do not count as subagent/persona evidence.
+
 ## Release Artifact
 
 This harness is released separately as a compressed artifact under `h-v*` tags.
