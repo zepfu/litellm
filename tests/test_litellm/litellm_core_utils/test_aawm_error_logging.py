@@ -59,6 +59,9 @@ def test_aawm_error_log_filtering(aawm_error_log_setup):
     # 5. WARNING WITHOUT exc_info should NOT be captured
     logger.warning("test warning without traceback")
 
+    # Offloaded writer: wait for disk visibility explicitly (no pytest env branch).
+    _handler.flush()
+
     if not log_file.exists():
         pytest.fail("Log file was not created")
 
@@ -144,6 +147,8 @@ def test_aawm_error_log_rotates_when_max_bytes_exceeded(monkeypatch, tmp_path):
                 "x" * 80,
             )
 
+        handler.flush()
+
         assert log_file.exists(), "active JSONL sink should exist after emits"
         assert backup_1.exists(), (
             "RotatingFileHandler should create a .1 backup once maxBytes is exceeded"
@@ -174,6 +179,7 @@ def test_aawm_error_log_uses_rotating_file_handler(aawm_error_log_setup):
     logger, log_file, handler = aawm_error_log_setup
 
     logger.error("probe rotating handler")
+    handler.flush()
 
     assert log_file.exists()
     assert handler._rotating_handler is not None

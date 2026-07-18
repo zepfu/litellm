@@ -1,9 +1,11 @@
 import ast
+import atexit
 from collections import deque
 import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import sys
 import threading
@@ -11,7 +13,7 @@ import time
 from datetime import UTC, datetime
 from logging import Formatter
 from logging.handlers import RotatingFileHandler
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import unquote
 
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
@@ -326,7 +328,10 @@ def _normalize_aawm_error_log_file_metadata(log_path: str) -> None:
         return
 
 
-_AAWM_ERROR_LOG_CONTEXT_FIELDS = (
+# Default persisted context is structural/metadata-only. Content-bearing fields that
+# may embed request body previews, prompt snippets, or raw payload digests are
+# intentionally excluded unless LITELLM_AAWM_ERROR_LOG_INCLUDE_CONTENT_FIELDS is set.
+_AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS = (
     "source",
     "container",
     "endpoint",
@@ -372,7 +377,6 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "aawm_passthrough_tool_type_counts",
     "aawm_passthrough_request_shape_error_class",
     "aawm_passthrough_request_shape_error_message_class",
-    "aawm_passthrough_request_shape_error_body_preview",
     "aawm_passthrough_request_shape_summary",
     "aawm_passthrough_request_shape_fingerprint",
     "aawm_passthrough_request_shape_error_fingerprint",
@@ -381,7 +385,6 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "grok_side_channel_endpoint_path_template",
     "grok_side_channel_request_content_type",
     "grok_side_channel_request_body_byte_length",
-    "grok_side_channel_request_body_digest_source",
     "grok_side_channel_request_json_container_type",
     "grok_side_channel_request_array_length",
     "recommended_operator_action",
@@ -408,10 +411,35 @@ _AAWM_ERROR_LOG_CONTEXT_FIELDS = (
     "aiohttp_context_resource",
 )
 
+# Opt-in only: may carry body-preview / content-bearing values that regex redaction
+# cannot guarantee are free of prompt content, PII, or non-standard credentials.
+_AAWM_ERROR_LOG_CONTENT_BEARING_CONTEXT_FIELDS = (
+    "aawm_passthrough_request_shape_error_body_preview",
+    "grok_side_channel_request_body_digest_source",
+)
+
+# Backward-compatible full set used by tests/callers that enumerate every known field.
+_AAWM_ERROR_LOG_CONTEXT_FIELDS = (
+    _AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS
+    + _AAWM_ERROR_LOG_CONTENT_BEARING_CONTEXT_FIELDS
+)
+
+
+def _aawm_error_log_include_content_fields() -> bool:
+    """Whether body-preview/content-bearing context fields may be persisted."""
+    return _env_truthy(os.getenv("LITELLM_AAWM_ERROR_LOG_INCLUDE_CONTENT_FIELDS"))
+
+
+def _get_aawm_error_log_active_context_fields() -> Tuple[str, ...]:
+    if _aawm_error_log_include_content_fields():
+        return _AAWM_ERROR_LOG_CONTEXT_FIELDS
+    return _AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS
+
 
 def _build_aawm_error_log_context(record: logging.LogRecord) -> Dict[str, Any]:
-    context: Dict[str, Any] = {field: None for field in _AAWM_ERROR_LOG_CONTEXT_FIELDS}
-    for field in _AAWM_ERROR_LOG_CONTEXT_FIELDS:
+    active_fields = _get_aawm_error_log_active_context_fields()
+    context: Dict[str, Any] = {field: None for field in active_fields}
+    for field in active_fields:
         value = getattr(record, field, None)
         if value is not None:
             context[field] = value
@@ -527,11 +555,31 @@ def _extract_aiohttp_attribution_from_asyncio_context(
     return {key: value for key, value in fields.items() if value is not None}
 
 
+_AAWM_ERROR_LOG_DEFAULT_QUEUE_MAXSIZE = 1024
+_AAWM_ERROR_LOG_QUEUE_PUT_TIMEOUT_SECONDS = 0.05
+_AAWM_ERROR_LOG_WORKER_JOIN_TIMEOUT_SECONDS = 2.0
+_AAWM_ERROR_LOG_WORKER_GET_TIMEOUT_SECONDS = 0.25
+_AAWM_ERROR_LOG_DROP_WARNING_INTERVAL_SECONDS = 60.0
+_AAWM_ERROR_LOG_SENTINEL = object()
+
+
+def _get_aawm_error_log_queue_maxsize() -> int:
+    """Bounded queue capacity for offloaded AAWM error-log writes (default 1024)."""
+    configured = _parse_aawm_error_log_non_negative_int_env(
+        "LITELLM_AAWM_ERROR_LOG_QUEUE_MAXSIZE"
+    )
+    if configured is None or configured <= 0:
+        return _AAWM_ERROR_LOG_DEFAULT_QUEUE_MAXSIZE
+    return configured
+
+
 class AawmErrorLogFileHandler(logging.Handler):
     """Append sanitized LiteLLM ERROR records to the local .analysis intake log.
 
-    Uses size-based rotation (maxBytes + backupCount) so opt-in error JSONL
-    sinks cannot grow without bound under bursty ERROR traffic (RR-004).
+    Disk I/O is offloaded from caller threads onto a single daemon writer with a
+    bounded queue so ERROR bursts do not block request handlers under a global
+    lock. Size-based rotation (maxBytes + backupCount) still caps growth of the
+    opt-in JSONL sink (RR-004).
     """
 
     _formatter = logging.Formatter(
@@ -549,6 +597,31 @@ class AawmErrorLogFileHandler(logging.Handler):
         self._rotating_handler_path: Optional[str] = None
         self._rotating_handler_max_bytes: Optional[int] = None
         self._rotating_handler_backup_count: Optional[int] = None
+        self._write_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._queue: "queue.Queue[Union[str, object]]" = queue.Queue(
+            maxsize=_get_aawm_error_log_queue_maxsize()
+        )
+        self._worker: Optional[threading.Thread] = None
+        self._closed = False
+        self._dropped_records = 0
+        self._drop_warning_lock = threading.Lock()
+        self._last_drop_warning_at = 0.0
+        self._dropped_since_last_warning = 0
+        self._ensure_worker_started()
+
+    def _ensure_worker_started(self) -> None:
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(
+                target=self._worker_main,
+                name="aawm-error-log-writer",
+                daemon=True,
+            )
+            self._worker.start()
 
     def _get_rotating_file_handler(self, log_path: str) -> RotatingFileHandler:
         max_bytes = _get_aawm_error_log_max_bytes()
@@ -585,16 +658,177 @@ class AawmErrorLogFileHandler(logging.Handler):
         self._rotating_handler_backup_count = backup_count
         return handler
 
-    def close(self) -> None:
-        if self._rotating_handler is not None:
+    def _write_line(self, line: str) -> None:
+        log_path = _get_aawm_error_log_path()
+        if not log_path:
+            return
+        with self._write_lock:
+            rotating = self._get_rotating_file_handler(log_path)
+            if rotating.stream is None:
+                rotating.stream = rotating._open()  # type: ignore[attr-defined]
+            rotating.stream.write(line)
+            rotating.stream.flush()
             try:
-                self._rotating_handler.close()
+                if rotating.maxBytes > 0 and rotating.stream.tell() >= rotating.maxBytes:
+                    rotating.doRollover()
+                    # Ensure active sink exists after rollover for subsequent emits/tests.
+                    if rotating.stream is None:
+                        rotating.stream = rotating._open()  # type: ignore[attr-defined]
             except Exception:
                 pass
-            self._rotating_handler = None
-            self._rotating_handler_path = None
-            self._rotating_handler_max_bytes = None
-            self._rotating_handler_backup_count = None
+            _normalize_aawm_error_log_file_metadata(log_path)
+
+    def _worker_main(self) -> None:
+        while True:
+            try:
+                item = self._queue.get(timeout=_AAWM_ERROR_LOG_WORKER_GET_TIMEOUT_SECONDS)
+            except queue.Empty:
+                if self._closed:
+                    break
+                continue
+            try:
+                if item is _AAWM_ERROR_LOG_SENTINEL:
+                    # Drain anything that arrived before/with the sentinel. Every
+                    # get_nowait() must pair with task_done() so unfinished_tasks
+                    # cannot stick after shutdown.
+                    while True:
+                        try:
+                            leftover = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            if leftover is _AAWM_ERROR_LOG_SENTINEL:
+                                continue
+                            if isinstance(leftover, str):
+                                try:
+                                    self._write_line(leftover)
+                                except Exception:
+                                    pass
+                        finally:
+                            try:
+                                self._queue.task_done()
+                            except Exception:
+                                pass
+                    break
+                if isinstance(item, str):
+                    self._write_line(item)
+            except Exception:
+                # Never let background intake logging crash the writer thread.
+                pass
+            finally:
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
+
+    def dropped_record_count(self) -> int:
+        """Total records dropped because the bounded write queue was full."""
+        return int(self._dropped_records)
+
+    def _note_dropped_record(self) -> None:
+        # Counter + throttle window state are updated under one lock so concurrent
+        # emitters cannot lose drops or spam warnings from torn reads/writes.
+        now = time.time()
+        emit_warning = False
+        dropped_window = 0
+        total_dropped = 0
+        with self._drop_warning_lock:
+            self._dropped_records += 1
+            self._dropped_since_last_warning += 1
+            total_dropped = self._dropped_records
+            if (
+                now - self._last_drop_warning_at
+            ) >= _AAWM_ERROR_LOG_DROP_WARNING_INTERVAL_SECONDS:
+                emit_warning = True
+                dropped_window = self._dropped_since_last_warning
+                self._dropped_since_last_warning = 0
+                self._last_drop_warning_at = now
+        if not emit_warning:
+            return
+        # Use the root LiteLLM logger when available; never re-enter this handler.
+        try:
+            logging.getLogger("LiteLLM").warning(
+                "AAWM error-log write queue full; dropped %s record(s) in the last "
+                "window (total_dropped=%s, queue_maxsize=%s). Increase "
+                "LITELLM_AAWM_ERROR_LOG_QUEUE_MAXSIZE or reduce ERROR volume.",
+                dropped_window,
+                total_dropped,
+                getattr(self._queue, "maxsize", "unknown"),
+            )
+        except Exception:
+            pass
+
+    def _enqueue_line(self, line: str) -> bool:
+        if self._closed:
+            return False
+        self._ensure_worker_started()
+        try:
+            self._queue.put(line, timeout=_AAWM_ERROR_LOG_QUEUE_PUT_TIMEOUT_SECONDS)
+            return True
+        except queue.Full:
+            self._note_dropped_record()
+            return False
+        except Exception:
+            return False
+
+    def flush(self) -> None:
+        """Best-effort wait until currently queued lines are written.
+
+        Uses a short timed poll instead of unbounded queue.join() so a stalled
+        background writer cannot hang request threads or tests forever.
+        """
+        deadline = time.time() + 1.0
+        try:
+            while time.time() < deadline:
+                if self._queue.unfinished_tasks == 0:
+                    break
+                time.sleep(0.01)
+        except Exception:
+            pass
+        super().flush()
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
+            if self._closed:
+                super().close()
+                return
+            self._closed = True
+            worker = self._worker
+        try:
+            self._queue.put(_AAWM_ERROR_LOG_SENTINEL, timeout=0.2)
+        except Exception:
+            try:
+                self._queue.put_nowait(_AAWM_ERROR_LOG_SENTINEL)
+            except Exception:
+                pass
+        if worker is not None and worker.is_alive():
+            try:
+                worker.join(timeout=_AAWM_ERROR_LOG_WORKER_JOIN_TIMEOUT_SECONDS)
+            except Exception:
+                pass
+        # Prefer not to steal work under a stuck worker that may hold the write
+        # lock; only close the rotating stream if we can acquire the lock quickly.
+        acquired = False
+        try:
+            acquired = self._write_lock.acquire(timeout=0.5)
+        except Exception:
+            acquired = False
+        if acquired:
+            try:
+                if self._rotating_handler is not None:
+                    try:
+                        self._rotating_handler.close()
+                    except Exception:
+                        pass
+                    self._rotating_handler = None
+                    self._rotating_handler_path = None
+                    self._rotating_handler_max_bytes = None
+                    self._rotating_handler_backup_count = None
+            finally:
+                try:
+                    self._write_lock.release()
+                except Exception:
+                    pass
         super().close()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -620,26 +854,16 @@ class AawmErrorLogFileHandler(logging.Handler):
             if _should_suppress_langfuse_support_string_coalesce(payload):
                 return
             line = safe_dumps(payload) + "\n"
-            with _AAWM_ERROR_LOG_LOCK:
-                rotating = self._get_rotating_file_handler(log_path)
-                if rotating.stream is None:
-                    rotating.stream = rotating._open()  # type: ignore[attr-defined]
-                rotating.stream.write(line)
-                rotating.stream.flush()
-                try:
-                    if rotating.maxBytes > 0 and rotating.stream.tell() >= rotating.maxBytes:
-                        rotating.doRollover()
-                        # Ensure active sink exists after rollover for subsequent emits/tests.
-                        if rotating.stream is None:
-                            rotating.stream = rotating._open()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                _normalize_aawm_error_log_file_metadata(log_path)
+            # Offload all filesystem work (open/write/rotate/chown) from the caller.
+            # Callers/tests that need deterministic on-disk visibility must call
+            # flush() or close() explicitly; production does not branch on test env.
+            self._enqueue_line(line)
         except Exception:
             # Never let local error-intake logging break application logging.
             return
         finally:
             self._emit_state.active = False
+
 
 _EGRESS_GUARD_ALERT_LOCK = threading.Lock()
 _EGRESS_GUARD_ALERT_STATE: Dict[str, Any] = {
@@ -1373,6 +1597,15 @@ for _logger in ALL_LOGGERS:
     _ensure_filter_on_logger(_logger, _egress_guard_alert_filter)
     _ensure_filter_on_logger(_logger, _langfuse_support_string_diagnostic_filter)
 
+# Always attach Langfuse support-string diagnostics to the SDK logger itself,
+# independent of callback/config ordering and JSON_LOGS. JSON formatter and
+# AAWM error-log emit also apply diagnostics, but plain formatters only see
+# them when this filter is present on the langfuse logger.
+_ensure_filter_on_logger(
+    logging.getLogger("langfuse"),
+    _langfuse_support_string_diagnostic_filter,
+)
+
 _ensure_filter_on_logger(
     logging.getLogger("uvicorn.access"),
     _aawm_route_access_log_replacement_filter,
@@ -1395,29 +1628,46 @@ def _get_loggers_to_initialize():
     """
     Get all loggers that should be initialized with the JSON handler.
 
-    Includes third-party integration loggers (like langfuse) if they are
-    configured as callbacks.
+    Always includes the Langfuse SDK logger so support-string diagnostics and
+    AAWM error-log intake attach independent of callback registration order and
+    independent of whether JSON logging came from JSON_LOGS env or config.
     """
     loggers = list(ALL_LOGGERS)
 
-    # Add langfuse logger if langfuse is being used as a callback
-    langfuse_callbacks = {"langfuse", "langfuse_otel"}
+    langfuse_logger = logging.getLogger("langfuse")
+    if langfuse_logger not in loggers:
+        loggers.append(langfuse_logger)
+
+    # Preserve historical callback-gated inclusion for langfuse_otel when used.
+    langfuse_otel_callbacks = {"langfuse_otel"}
     litellm_module = sys.modules.get("litellm")
     success_callbacks = getattr(litellm_module, "success_callback", []) or []
     failure_callbacks = getattr(litellm_module, "failure_callback", []) or []
     all_callbacks = set(success_callbacks + failure_callbacks)
-    if langfuse_callbacks & all_callbacks:
-        loggers.append(logging.getLogger("langfuse"))
+    if langfuse_otel_callbacks & all_callbacks:
+        otel_logger = logging.getLogger("langfuse_otel")
+        if otel_logger not in loggers:
+            loggers.append(otel_logger)
 
     return loggers
 
 
+def _ensure_langfuse_support_string_diagnostics_attached() -> None:
+    """Idempotently attach Langfuse diagnostics independent of config ordering."""
+    langfuse_logger = logging.getLogger("langfuse")
+    _ensure_filter_on_logger(langfuse_logger, _langfuse_support_string_diagnostic_filter)
+    # Also keep the filter on loggers we re-initialize for JSON, so reconfig does
+    # not drop diagnostics even when handlers are cleared and rebuilt.
+    for lg in ALL_LOGGERS:
+        _ensure_filter_on_logger(lg, _langfuse_support_string_diagnostic_filter)
+
 
 _aawm_error_log_handler: Optional[logging.Handler] = None
+_aawm_error_log_atexit_registered = False
 
 
 def _get_aawm_error_log_handler() -> Optional[logging.Handler]:
-    global _aawm_error_log_handler
+    global _aawm_error_log_handler, _aawm_error_log_atexit_registered
     if _aawm_error_log_handler is not None:
         return _aawm_error_log_handler
 
@@ -1425,6 +1675,9 @@ def _get_aawm_error_log_handler() -> Optional[logging.Handler]:
     if log_path is not None:
         _aawm_error_log_handler = AawmErrorLogFileHandler()
         _aawm_error_log_handler.name = _AAWM_ERROR_LOG_HANDLER_NAME
+        if not _aawm_error_log_atexit_registered:
+            atexit.register(shutdown_aawm_error_log_handlers)
+            _aawm_error_log_atexit_registered = True
         return _aawm_error_log_handler
     return None
 
@@ -1446,11 +1699,69 @@ def _ensure_aawm_error_log_handler_on_logger(logger: logging.Logger) -> None:
 
 
 def _configure_aawm_error_log_handlers() -> None:
+    # Diagnostics must attach even when the JSONL sink is disabled.
+    _ensure_langfuse_support_string_diagnostics_attached()
+
     if _get_aawm_error_log_path() is None:
         return
 
     for lg in _get_loggers_to_initialize():
         _ensure_aawm_error_log_handler_on_logger(lg)
+
+
+def get_aawm_error_log_dropped_record_count() -> int:
+    """Return dropped-record total for the shared AAWM error-log handler (0 if none)."""
+    handler = _aawm_error_log_handler
+    if isinstance(handler, AawmErrorLogFileHandler):
+        return handler.dropped_record_count()
+    return 0
+
+
+def flush_aawm_error_log_handlers() -> None:
+    """Flush known AAWM error-log handlers (best-effort; for tests and shutdown)."""
+    handler = _aawm_error_log_handler
+    if isinstance(handler, AawmErrorLogFileHandler):
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    # Also flush any handler instances attached only via tests/excepthook paths.
+    seen: Set[int] = set()
+    for lg in _get_loggers_to_initialize():
+        for h in list(getattr(lg, "handlers", []) or []):
+            if id(h) in seen:
+                continue
+            seen.add(id(h))
+            if isinstance(h, AawmErrorLogFileHandler):
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+
+
+def shutdown_aawm_error_log_handlers() -> None:
+    """Stop background writers and close AAWM error-log handlers."""
+    global _aawm_error_log_handler
+    handler = _aawm_error_log_handler
+    _aawm_error_log_handler = None
+    seen: Set[int] = set()
+    if handler is not None:
+        seen.add(id(handler))
+        try:
+            handler.close()
+        except Exception:
+            pass
+    for lg in list(ALL_LOGGERS) + [logging.getLogger("langfuse")]:
+        for h in list(getattr(lg, "handlers", []) or []):
+            if not isinstance(h, AawmErrorLogFileHandler):
+                continue
+            if id(h) in seen:
+                continue
+            seen.add(id(h))
+            try:
+                h.close()
+            except Exception:
+                pass
 
 
 _configure_aawm_error_log_handlers()
@@ -1470,6 +1781,9 @@ def _initialize_loggers_with_handler(handler: logging.Handler):
         _ensure_filter_on_logger(lg, _langfuse_support_string_diagnostic_filter)
         lg.addHandler(handler)  # add JSON formatter handler
         lg.propagate = False  # prevent bubbling to parent/root
+    # Re-attach diagnostics after handler rebuilds so JSON_LOGS/config ordering
+    # cannot drop the Langfuse support-string enrichment path.
+    _ensure_langfuse_support_string_diagnostics_attached()
     _configure_aawm_error_log_handlers()
 
 

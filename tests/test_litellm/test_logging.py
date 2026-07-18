@@ -246,6 +246,9 @@ def test_initialize_loggers_routes_langfuse_support_string_diagnostics(
             "langfuse_sdk_background_ingestion_upload_failure"
         )
 
+        from litellm._logging import flush_aawm_error_log_handlers
+
+        flush_aawm_error_log_handlers()
         error_log_path = tmp_path / "dev-error.jsonl"
         error_record = json.loads(error_log_path.read_text().strip())
         assert error_record["logger"] == "langfuse"
@@ -343,6 +346,7 @@ def test_aawm_error_log_includes_langfuse_support_string_context(tmp_path, monke
         exc_info=None,
     )
     handler.emit(record)
+    handler.flush()
 
     error_log_path = tmp_path / "dev-error.jsonl"
     error_record = json.loads(error_log_path.read_text().strip())
@@ -404,6 +408,7 @@ def test_aawm_error_log_coalesces_duplicate_langfuse_support_string_rows(
     )
     handler.emit(record)
     handler.emit(record)
+    handler.flush()
 
     error_log_path = tmp_path / "dev-error.jsonl"
     lines = [line for line in error_log_path.read_text().splitlines() if line.strip()]
@@ -433,6 +438,7 @@ def test_aawm_error_log_still_appends_non_langfuse_errors(tmp_path, monkeypatch)
     )
     handler.emit(record)
     handler.emit(record)
+    handler.flush()
 
     error_log_path = tmp_path / "dev-error.jsonl"
     lines = [line for line in error_log_path.read_text().splitlines() if line.strip()]
@@ -482,6 +488,7 @@ def test_aawm_error_log_reopens_langfuse_support_string_after_ttl(
 
     time.sleep(1.1)
     handler.emit(record)
+    handler.flush()
 
     error_log_path = tmp_path / "dev-error.jsonl"
     lines = [line for line in error_log_path.read_text().splitlines() if line.strip()]

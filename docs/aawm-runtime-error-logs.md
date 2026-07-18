@@ -26,6 +26,35 @@ with `LITELLM_AAWM_ERROR_LOG_DIR`. The environment name in the filename comes
 from `LITELLM_AAWM_ERROR_LOG_ENV`, then `LITELLM_LANGFUSE_TRACE_ENVIRONMENT`,
 then `LITELLM_ENV` or `ENVIRONMENT`; unsafe characters are normalized.
 
+### Writer offload, rotation, and content-field policy
+
+The generic LiteLLM ERROR sink (`AawmErrorLogFileHandler` in
+`litellm/_logging.py`) is opt-in only. When enabled:
+
+- **Offloaded writes**: caller threads build a redacted JSONL line and enqueue it
+  on a bounded background writer so ERROR bursts do not block request handlers
+  under a process-wide disk lock.
+- **Queue capacity**: `LITELLM_AAWM_ERROR_LOG_QUEUE_MAXSIZE` (default `1024`).
+  When the queue is full, additional records are **dropped** rather than
+  blocking. Dropped totals are available via
+  `AawmErrorLogFileHandler.dropped_record_count()` and
+  `get_aawm_error_log_dropped_record_count()`. A throttled `LiteLLM` warning is
+  emitted at most once per minute while drops continue.
+- **Size rotation**: `LITELLM_AAWM_ERROR_LOG_MAX_BYTES` (default `10485760`,
+  10 MiB) and `LITELLM_AAWM_ERROR_LOG_BACKUP_COUNT` (default `5`) control
+  `RotatingFileHandler` behavior for `<environment>-error.jsonl`.
+- **Default context is structural/metadata-only**. Body-preview and other
+  content-bearing fields, currently
+  `aawm_passthrough_request_shape_error_body_preview` and
+  `grok_side_channel_request_body_digest_source`, are excluded by default.
+  Set `LITELLM_AAWM_ERROR_LOG_INCLUDE_CONTENT_FIELDS=1` only when operators
+  explicitly accept those fields on local intake disks. Regex secret redaction
+  still applies, but it cannot guarantee removal of arbitrary prompt or PII
+  content from previews.
+- **Langfuse SDK support-string diagnostics** attach to the `langfuse` logger
+  independent of callback registration order and whether JSON logging came from
+  the `JSON_LOGS` environment variable or `litellm_settings.json_logs`.
+
 For example, the dev proxy writes `/app/.analysis/dev-error.jsonl` inside the
 container, mounted to this repo's `.analysis/dev-error.jsonl`. The matching
 legacy path is `/app/.analysis/dev-error.log`, mounted to
