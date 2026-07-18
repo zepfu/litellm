@@ -155,6 +155,7 @@ An org admin manages one or more organizations. They can create teams within the
 - Add users to teams in their organization
 - View spend for their organization
 - Create keys for users in their organization
+- List teams for their organization(s) via `/v2/team/list` (results are org-scoped; an explicit `organization_id` outside their orgs is rejected with 403)
 
 **What they cannot do:**
 - Create or manage other organizations

@@ -723,6 +723,7 @@ async def new_team(  # noqa: PLR0915
     - disable_global_guardrails: Optional[bool] - Whether to disable global guardrails for the key.
     - object_permission: Optional[LiteLLM_ObjectPermissionBase] - team-specific object permission. Example - {"vector_stores": ["vector_store_1", "vector_store_2"], "agents": ["agent_1", "agent_2"], "agent_access_groups": ["dev_group"]}. IF null or {} then no object permission.
     - team_member_budget: Optional[float] - The maximum budget allocated to an individual team member.
+    - team_member_budget_duration: Optional[str] - The duration of the budget for the team member. Doc [here](https://docs.litellm.ai/docs/proxy/team_budgets)
     - team_member_rpm_limit: Optional[int] - The RPM (Requests Per Minute) limit for individual team members.
     - team_member_tpm_limit: Optional[int] - The TPM (Tokens Per Minute) limit for individual team members.
     - team_member_key_duration: Optional[str] - The duration for a team member's key. e.g. "1d", "1w", "1mo"
@@ -857,7 +858,14 @@ async def new_team(  # noqa: PLR0915
 
         # Apply defaults from litellm.default_team_params for any fields
         # not explicitly provided in the request.
-        for field in ("max_budget", "budget_duration", "tpm_limit", "rpm_limit", "team_member_permissions"):
+        for field in (
+            "max_budget",
+            "budget_duration",
+            "tpm_limit",
+            "rpm_limit",
+            "team_member_permissions",
+            "team_member_budget_duration",
+        ):
             if getattr(data, field, None) is None:
                 default_value = _get_default_team_param(field)
                 if default_value is not None:
@@ -927,6 +935,7 @@ async def new_team(  # noqa: PLR0915
             team_member_budget=data.team_member_budget,
             team_member_rpm_limit=data.team_member_rpm_limit,
             team_member_tpm_limit=data.team_member_tpm_limit,
+            team_member_budget_duration=data.team_member_budget_duration,
         ):
             data_json = await TeamMemberBudgetHandler.create_team_member_budget_table(
                 data=data,
@@ -935,6 +944,7 @@ async def new_team(  # noqa: PLR0915
                 team_member_budget=data.team_member_budget,
                 team_member_rpm_limit=data.team_member_rpm_limit,
                 team_member_tpm_limit=data.team_member_tpm_limit,
+                team_member_budget_duration=data.team_member_budget_duration,
             )
 
         ## ADD TO TEAM TABLE
@@ -3206,6 +3216,51 @@ async def list_available_teams(
     return available_teams_correct_type
 
 
+async def _get_org_admin_org_ids(
+    user_id: str,
+    prisma_client: Any,
+    user_api_key_cache: Any,
+    proxy_logging_obj: Any,
+) -> Optional[List[str]]:
+    """
+    Return the list of organization IDs where the user is an org admin.
+    Returns None if the user is not an org admin of any organization or if
+    the user cannot be found.
+    """
+    try:
+        caller_user = await get_user_object(
+            user_id=user_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            user_id_upsert=False,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+    except ValueError:
+        # get_user_object raises ValueError when the user doesn't exist
+        return None
+    except Exception:
+        # Fail closed for unexpected lookup errors so we do not grant org-admin scope.
+        verbose_proxy_logger.debug(
+            "list_team_v2: failed to resolve org admin orgs for user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+        return None
+
+    if caller_user is None:
+        return None
+
+    org_ids = [
+        m.organization_id
+        for m in (caller_user.organization_memberships or [])
+        if (
+            m.user_role == LitellmUserRoles.ORG_ADMIN.value
+            and m.organization_id is not None
+        )
+    ]
+    return org_ids if org_ids else None
+
+
 async def _build_team_list_where_conditions(
     prisma_client: PrismaClient,
     team_id: Optional[str],
@@ -3213,6 +3268,7 @@ async def _build_team_list_where_conditions(
     organization_id: Optional[str],
     user_id: Optional[str],
     use_deleted_table: bool,
+    org_admin_org_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build where conditions for team list query."""
     where_conditions: Dict[str, Any] = {}
@@ -3228,6 +3284,10 @@ async def _build_team_list_where_conditions(
 
     if organization_id:
         where_conditions["organization_id"] = organization_id
+    elif org_admin_org_ids is not None:
+        # Always keep org-admin queries inside their administered orgs,
+        # including when a user_id membership filter is also applied.
+        where_conditions["organization_id"] = {"in": org_admin_org_ids}
 
     if user_id:
         try:
@@ -3347,7 +3407,11 @@ async def list_team_v2(
         status: Optional[str]
             Filter by status. Currently supports "deleted" to query deleted teams.
     """
-    from litellm.proxy.proxy_server import prisma_client
+    from litellm.proxy.proxy_server import (
+        prisma_client,
+        proxy_logging_obj,
+        user_api_key_cache,
+    )
 
     if prisma_client is None:
         raise HTTPException(
@@ -3355,20 +3419,56 @@ async def list_team_v2(
             detail={"error": f"No db connected. prisma client={prisma_client}"},
         )
 
-    if not allowed_route_check_inside_route(
-        user_api_key_dict=user_api_key_dict, requested_user_id=user_id
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error": "Only admin users can query all teams/other teams. Your user role={}".format(
-                    user_api_key_dict.user_role
-                )
-            },
-        )
+    # --- Access control ---
+    # Proxy admins and admin viewers can query any teams.
+    # Org admins can query teams within their organizations.
+    # Regular users can only query their own teams.
+    is_proxy_admin = _user_has_admin_view(user_api_key_dict)
+    org_admin_org_ids: Optional[List[str]] = None
 
-    if user_id is None and user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
-        user_id = user_api_key_dict.user_id
+    if not is_proxy_admin:
+        # Always check org admin status so org admins can list org-scoped teams
+        # even without providing their own user_id.
+        if user_api_key_dict.user_id:
+            org_admin_org_ids = await _get_org_admin_org_ids(
+                user_id=user_api_key_dict.user_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+
+        if org_admin_org_ids is not None:
+            # Org admin: reject explicit org filters outside their scope.
+            if organization_id and organization_id not in org_admin_org_ids:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "You can only view teams within your organizations."
+                    },
+                )
+            verbose_proxy_logger.debug(
+                "list_team_v2: org admin access for user=%s, org_ids=%s, user_id_filter=%s",
+                user_api_key_dict.user_id,
+                org_admin_org_ids,
+                user_id,
+            )
+        else:
+            # Not an org admin — regular users may only query their own teams.
+            # When user_id is omitted, treat it as a self-query before the route
+            # check so the omitted filter is not rejected as "list all teams".
+            if user_id is None:
+                user_id = user_api_key_dict.user_id
+            if not allowed_route_check_inside_route(
+                user_api_key_dict=user_api_key_dict, requested_user_id=user_id
+            ):
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "error": "Only admin users can query all teams/other teams. Your user role={}".format(
+                            user_api_key_dict.user_role
+                        )
+                    },
+                )
 
     if status is not None and status != "deleted":
         raise HTTPException(
@@ -3391,6 +3491,7 @@ async def list_team_v2(
         organization_id=organization_id,
         user_id=user_id,
         use_deleted_table=use_deleted_table,
+        org_admin_org_ids=org_admin_org_ids,
     )
 
     # Build order_by conditions
