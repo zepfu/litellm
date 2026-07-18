@@ -286,12 +286,19 @@ def _patch_aawm_secret_values(
     monkeypatch,
     values: dict[str, str],
 ) -> None:
+    from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
 
+    def _secret(name: str):
+        return values.get(name)
+
+    # Control-plane owns DSN/pool secrets after RR-054 #7 consolidation; patch both
+    # surfaces so historical llm_passthrough DSN tests keep working.
+    monkeypatch.setattr(llm_passthrough_endpoints, "get_secret_str", _secret)
     monkeypatch.setattr(
-        llm_passthrough_endpoints,
-        "get_secret_str",
-        lambda name: values.get(name),
+        aawm_claude_control_plane,
+        "_get_first_secret_value",
+        lambda names: next((values[n] for n in names if n in values), None),
     )
 
 
@@ -364,19 +371,37 @@ async def _assert_aawm_dynamic_injection_pool_disables_statement_cache(
             create_pool_calls.append(kwargs)
             return created_pool
 
-    monkeypatch.setattr(module, "_aawm_dynamic_injection_pool", None)
+    # RR-054: pool global always lives on aawm_claude_control_plane even when
+    # llm_passthrough_endpoints re-exports the getter/DSN helpers.
+    from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane as owner
+
+    monkeypatch.setattr(owner, "_aawm_dynamic_injection_pool", None)
+    if hasattr(module, "_aawm_dynamic_injection_pool"):
+        monkeypatch.setattr(module, "_aawm_dynamic_injection_pool", None)
     monkeypatch.setattr(
-        module,
+        owner,
         "_build_aawm_dynamic_injection_dsn",
         lambda: "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore",
     )
     monkeypatch.setattr(
-        module,
+        owner,
         "_get_aawm_dynamic_injection_application_name",
         lambda: "aawm-litellm-test-dynamic",
     )
+    # Keep re-exported names on llm module consistent when they are aliases.
+    if module is not owner:
+        monkeypatch.setattr(
+            module,
+            "_build_aawm_dynamic_injection_dsn",
+            owner._build_aawm_dynamic_injection_dsn,
+        )
+        monkeypatch.setattr(
+            module,
+            "_get_aawm_dynamic_injection_application_name",
+            owner._get_aawm_dynamic_injection_application_name,
+        )
     monkeypatch.setattr(
-        module.importlib,
+        owner.importlib,
         "import_module",
         lambda name: FakeAsyncpg() if name == "asyncpg" else None,
     )
@@ -384,7 +409,9 @@ async def _assert_aawm_dynamic_injection_pool_disables_statement_cache(
     try:
         pool = await module._get_aawm_dynamic_injection_pool()
     finally:
-        module._aawm_dynamic_injection_pool = None
+        owner._aawm_dynamic_injection_pool = None
+        if hasattr(module, "_aawm_dynamic_injection_pool"):
+            module._aawm_dynamic_injection_pool = None
 
     assert pool is created_pool
     assert create_pool_calls[0]["statement_cache_size"] == 0
@@ -392,7 +419,7 @@ async def _assert_aawm_dynamic_injection_pool_disables_statement_cache(
         "application_name": "aawm-litellm-test-dynamic"
     }
     assert create_pool_calls[0]["init"] is (
-        module._initialize_aawm_dynamic_injection_connection
+        owner._initialize_aawm_dynamic_injection_connection
     )
 
 
@@ -16654,14 +16681,19 @@ class TestClaudePersistedOutputExpansion:
     ):
         from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
 
-        mock_pool = AsyncMock()
-        mock_pool.fetch = AsyncMock(
+        mock_connection = MagicMock()
+        mock_connection.fetch = AsyncMock(
             return_value=[
                 {"content": "Primary reference"},
                 {"content": "Fallback reference"},
                 {"content": "   "},
             ]
         )
+        acquire_context = MagicMock()
+        acquire_context.__aenter__ = AsyncMock(return_value=mock_connection)
+        acquire_context.__aexit__ = AsyncMock(return_value=None)
+        mock_pool = MagicMock()
+        mock_pool.acquire = MagicMock(return_value=acquire_context)
 
         with patch(
             "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane._get_aawm_dynamic_injection_pool",
@@ -16674,7 +16706,8 @@ class TestClaudePersistedOutputExpansion:
             )
 
         assert result == "Primary reference\n\nFallback reference"
-        mock_pool.fetch.assert_awaited_once_with(
+        mock_pool.acquire.assert_called_once_with(timeout=10.0)
+        mock_connection.fetch.assert_awaited_once_with(
             "SELECT content FROM tristore_search_exact($1, $2, $3)",
             "alpha",
             "aawm",
@@ -17042,18 +17075,20 @@ class TestClaudePersistedOutputExpansion:
             )
 
         injected_text = updated_body["messages"][0]["content"][0]["text"]
+        # RR-053: bare `API` is an acronym stopword (noise), so only DAL then CLI
+        # are resolved. Order of appendix content must still follow first-seen
+        # acronym order among the non-stopword tokens (DAL before CLI).
         assert "Focus on DAL, then API, then ```text\nCLI\n```, then CLI, then DAL." in injected_text
+        assert "DAL context line" in injected_text
+        assert "CLI context line" in injected_text
+        assert "API context line" not in injected_text
         assert injected_text.index("DAL context line") < injected_text.index(
-            "API context line"
-        )
-        assert injected_text.index("API context line") < injected_text.index(
             "CLI context line"
         )
         assert "keep API hidden here" in injected_text
         litellm_metadata = updated_body["litellm_metadata"]
-        assert litellm_metadata["aawm_dynamic_injection_context_names"] == ["API", "CLI", "DAL"]
+        assert litellm_metadata["aawm_dynamic_injection_context_names"] == ["CLI", "DAL"]
         assert litellm_metadata["aawm_dynamic_injection_statuses"] == [
-            "resolved",
             "resolved",
             "resolved",
         ]
@@ -17063,11 +17098,10 @@ class TestClaudePersistedOutputExpansion:
         ] == [
             "dispatch_acronym",
             "dispatch_acronym",
-            "dispatch_acronym",
         ]
         assert [
             call.kwargs["name"] for call in mock_context_grab.await_args_list
-        ] == ["DAL", "API", "CLI"]
+        ] == ["DAL", "CLI"]
 
     @pytest.mark.asyncio
     async def test_prepare_anthropic_request_body_dispatch_backticks_are_silent_on_missing_context(

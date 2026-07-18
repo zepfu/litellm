@@ -14,9 +14,7 @@ _REPO_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
     Path(__file__).resolve().parents[3] / "context-replacement" / "claude-code"
 )
 _PACKAGED_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
-    Path(__file__).resolve().parent
-    / "aawm_claude_control_plane_data"
-    / "claude-code"
+    Path(__file__).resolve().parent / "aawm_claude_control_plane_data" / "claude-code"
 )
 _CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH = (
     "context-replacement/claude-code/2.1.110/auto-memory-replacement.md"
@@ -39,7 +37,9 @@ _CLAUDE_MEMORY_SECTION_PATTERN = re.compile(
 )
 _CLAUDE_TYPES_XML_BLOCK_PATTERN = re.compile(r"<types>\n.*?\n</types>", re.DOTALL)
 _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
-_CLAUDE_CC_VERSION_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)")
+_CLAUDE_CC_VERSION_PATTERN = re.compile(
+    r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+)
 _CLAUDE_COMMONMARK_PROMPT_SENTENCE = (
     "You can use Github-flavored markdown for formatting, and will be rendered in a "
     "monospace font using the CommonMark specification."
@@ -53,7 +53,9 @@ _CLAUDE_TOOL_DESCRIPTION_MAX_CHARS = 360
 _CLAUDE_TOOL_SCHEMA_DESCRIPTION_MAX_CHARS = 160
 _CLAUDE_TOOL_SCHEMA_DROP_KEYS = {"$schema"}
 _CLAUDE_TOOL_DESCRIPTION_PRESERVE_NAMES = {"Agent"}
-_CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_NAME = "claude-tool-advertisement-compaction"
+_CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_NAME = (
+    "claude-tool-advertisement-compaction"
+)
 _CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_POLICY_VERSION = "2026-06-23.1"
 _CLAUDE_TOOL_ADVERTISEMENT_COMPACTION_CACHE_MAX_ENTRIES = 256
 _CLAUDE_KNOWN_TOOL_DESCRIPTIONS = {
@@ -114,11 +116,10 @@ _AAWM_ESCAPED_CONTEXT_MARKER_PATTERN = re.compile(
 )
 _AAWM_ESCAPED_CONTEXT_MARKER_PLACEHOLDER = "@@AAWM_ESCAPED_CTX_MARKER_{index}@@"
 _AAWM_DISPATCH_CONTEXT_REFERENCE_PATTERN = re.compile(
-    r"(?<![\\`])`(?P<backtick>[^`\r\n]+?)`(?!`)"
-    r"|(?P<acronym>\b[A-Z][A-Z0-9]{1,}\b)"
+    r"(?<![\\`])`(?P<backtick>[^`\r\n]+?)`(?!`)" r"|(?P<acronym>\b[A-Z][A-Z0-9]{1,}\b)"
 )
 _AAWM_DYNAMIC_DIRECTIVE_ATTR_PATTERN = re.compile(
-    r'(?P<key>[A-Za-z_][A-Za-z0-9_-]*)='
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*)="
     r'(?:"(?P<double>[^"]*)"|\'(?P<single>[^\']*)\'|(?P<bare>[^\s]+))'
 )
 _AAWM_SQL_IDENTIFIER_PATTERN = re.compile(
@@ -146,9 +147,7 @@ _AAWM_DYNAMIC_INJECTION_FAILURE_TEMPLATE = (
     'AAWM "{proc_name}" failed for this session.\n'
     "Alert the user or session orchestrator.\n"
 )
-_AAWM_CONTEXT_GRAB_FAILURE_TEMPLATE = (
-    "IMPORTANT: context grab for {name} returned no results. immediately inform the opperator."
-)
+_AAWM_CONTEXT_GRAB_FAILURE_TEMPLATE = "IMPORTANT: context grab for {name} returned no results. immediately inform the opperator."
 _AAWM_SUBAGENTSTART_CONTEXT_MARKERS = (
     "SubagentStart hook additional context:",
     "SubAgentStart hook additional context:",
@@ -158,8 +157,7 @@ _AAWM_SYSTEM_REMINDER_BLOCK_PATTERN = re.compile(
     re.DOTALL,
 )
 _AAWM_NO_MEMORIES_TEMPLATE = (
-    "# Memory Injection\n"
-    "You have saved no memories as of yet.\n"
+    "# Memory Injection\n" "You have saved no memories as of yet.\n"
 )
 _AAWM_DB_HOST_ENV_VARS = (
     "AAWM_DB_HOST",
@@ -221,10 +219,66 @@ _AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS = 15.0
 _AAWM_DYNAMIC_INJECTION_POOL_MIN_SIZE = 1
 _AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE = 4
 _AAWM_DYNAMIC_INJECTION_COMMAND_TIMEOUT_SECONDS = 10
+_AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS = 10.0
 _AAWM_DYNAMIC_INJECTION_STATEMENT_CACHE_SIZE = 0
+# Cap distinct dispatch backtick/acronym lookups per text node (High/RR-053 #1).
+_AAWM_DISPATCH_CONTEXT_REFERENCE_MAX = 24
+# Cap total dispatch lookups across an entire request (all trusted text blocks).
+# Per-node caps alone still multiply when system + first user have many blocks.
+_AAWM_DISPATCH_CONTEXT_REFERENCE_REQUEST_MAX = 48
+# Common all-caps tokens that are noise for dispatch context grabs.
+_AAWM_DISPATCH_ACRONYM_STOPWORDS = frozenset(
+    {
+        "AAWM",
+        "API",
+        "AWS",
+        "CPU",
+        "CSS",
+        "CSV",
+        "DB",
+        "DNS",
+        "ENV",
+        "EOF",
+        "GET",
+        "GPU",
+        "HTML",
+        "HTTP",
+        "HTTPS",
+        "ID",
+        "JSON",
+        "JWT",
+        "LLM",
+        "OK",
+        "OS",
+        "PDF",
+        "POST",
+        "PUT",
+        "RAM",
+        "REST",
+        "SDK",
+        "SQL",
+        "SSH",
+        "SSL",
+        "TCP",
+        "TLS",
+        "TODO",
+        "TTL",
+        "UI",
+        "UID",
+        "URL",
+        "URI",
+        "UUID",
+        "UTF",
+        "XML",
+        "YAML",
+        "YML",
+    }
+)
 _aawm_dynamic_injection_pool: Optional[Any] = None
 _aawm_dynamic_injection_pool_lock = asyncio.Lock()
-_aawm_dynamic_injection_cache: dict[tuple[str, str, str, str], tuple[float, Optional[str]]] = {}
+_aawm_dynamic_injection_cache: dict[
+    tuple[str, str, str, str], tuple[float, Optional[str]]
+] = {}
 _aawm_dynamic_injection_cache_lock = asyncio.Lock()
 _aawm_context_grab_cache: dict[
     tuple[str, str, str, str, str], tuple[float, dict[str, str]]
@@ -238,7 +292,9 @@ _claude_tool_advertisement_compaction_cache: dict[
 
 
 def _get_aawm_dynamic_injection_cache_ttl_seconds() -> float:
-    raw_value = _clean_secret_string(_lp().get_secret_str("AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS"))
+    raw_value = _clean_secret_string(
+        _lp().get_secret_str("AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS")
+    )
     if not raw_value:
         return _AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS
     try:
@@ -356,7 +412,9 @@ def _candidate_context_replacement_dirs() -> tuple[Path, ...]:
     )
 
 
-def _resolve_context_replacement_file(relative_parts: tuple[str, ...]) -> Optional[Path]:
+def _resolve_context_replacement_file(
+    relative_parts: tuple[str, ...]
+) -> Optional[Path]:
     for base_dir in _candidate_context_replacement_dirs():
         candidate = base_dir.joinpath(*relative_parts)
         if candidate.exists():
@@ -364,7 +422,9 @@ def _resolve_context_replacement_file(relative_parts: tuple[str, ...]) -> Option
     return None
 
 
-def _parse_claude_code_version(cc_version: Optional[str]) -> Optional[tuple[int, int, int]]:
+def _parse_claude_code_version(
+    cc_version: Optional[str],
+) -> Optional[tuple[int, int, int]]:
     if not cc_version:
         return None
 
@@ -379,7 +439,9 @@ def _parse_claude_code_version(cc_version: Optional[str]) -> Optional[tuple[int,
     )
 
 
-def _resolve_claude_auto_memory_template_path(cc_version: Optional[str]) -> Optional[Path]:
+def _resolve_claude_auto_memory_template_path(
+    cc_version: Optional[str],
+) -> Optional[Path]:
     parsed_version = _parse_claude_code_version(cc_version)
     if parsed_version is None:
         return None
@@ -402,7 +464,9 @@ def _load_claude_context_replacement_template(template_path: Path) -> str:
 
     template_text = template_path.read_text(encoding="utf-8").strip()
     if not template_text:
-        raise ValueError(f"Claude context replacement template is empty: {template_path}")
+        raise ValueError(
+            f"Claude context replacement template is empty: {template_path}"
+        )
 
     cached_template = template_text + "\n"
     _claude_context_replacement_template_cache[template_path] = cached_template
@@ -429,7 +493,9 @@ def _load_claude_prompt_patch_manifest(template_path: Path) -> dict[str, Any]:
 
     patches = manifest.get("patches")
     if not isinstance(patches, list) or not patches:
-        raise ValueError(f"Claude prompt patch manifest has no patches: {template_path}")
+        raise ValueError(
+            f"Claude prompt patch manifest has no patches: {template_path}"
+        )
 
     normalized_patches: list[dict[str, str]] = []
     for patch_descriptor in patches:
@@ -469,9 +535,7 @@ def _load_claude_prompt_patch_manifest(template_path: Path) -> dict[str, Any]:
 
 
 def _extract_markdown_section(markdown_text: str, heading: str) -> str:
-    section_pattern = re.compile(
-        rf"(?ms)^## {re.escape(heading)}\n.*?(?=^## |\Z)"
-    )
+    section_pattern = re.compile(rf"(?ms)^## {re.escape(heading)}\n.*?(?=^## |\Z)")
     match = section_pattern.search(markdown_text)
     if match is None:
         raise ValueError(f"Missing Claude auto-memory section: {heading}")
@@ -587,7 +651,10 @@ def _replace_claude_system_prompt_override_in_value(
         combined_events: list[dict[str, Any]] = []
         changed = False
         for key, child in value.items():
-            updated_child, child_events = _replace_claude_system_prompt_override_in_value(
+            (
+                updated_child,
+                child_events,
+            ) = _replace_claude_system_prompt_override_in_value(
                 child,
                 cc_version,
             )
@@ -602,7 +669,10 @@ def _replace_claude_system_prompt_override_in_value(
         list_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
-            updated_child, child_events = _replace_claude_system_prompt_override_in_value(
+            (
+                updated_child,
+                child_events,
+            ) = _replace_claude_system_prompt_override_in_value(
                 child,
                 cc_version,
             )
@@ -805,9 +875,11 @@ def _compact_claude_tool_schema_value(
                     description_count += 1
                 continue
 
-            compacted_child, child_description_count, child_dropped_key_count = (
-                _compact_claude_tool_schema_value(child)
-            )
+            (
+                compacted_child,
+                child_description_count,
+                child_dropped_key_count,
+            ) = _compact_claude_tool_schema_value(child)
             updated_dict[key] = compacted_child
             description_count += child_description_count
             dropped_key_count += child_dropped_key_count
@@ -826,9 +898,11 @@ def _compact_claude_tool_schema_value(
         description_count = 0
         dropped_key_count = 0
         for child in value:
-            compacted_child, child_description_count, child_dropped_key_count = (
-                _compact_claude_tool_schema_value(child)
-            )
+            (
+                compacted_child,
+                child_description_count,
+                child_dropped_key_count,
+            ) = _compact_claude_tool_schema_value(child)
             updated_list.append(compacted_child)
             description_count += child_description_count
             dropped_key_count += child_dropped_key_count
@@ -864,9 +938,7 @@ def _compact_claude_tool_advertisement(
     )
     if cached_entry is not None:
         cached_tool, cached_event = cached_entry
-        _claude_tool_advertisement_compaction_cache.pop(
-            compaction_fingerprint, None
-        )
+        _claude_tool_advertisement_compaction_cache.pop(compaction_fingerprint, None)
         _claude_tool_advertisement_compaction_cache[compaction_fingerprint] = (
             cached_tool,
             cached_event,
@@ -906,9 +978,11 @@ def _compact_claude_tool_advertisement(
             top_level_description_compacted = True
 
     if isinstance(input_schema, dict):
-        compacted_schema, schema_description_count, schema_dropped_key_count = (
-            _compact_claude_tool_schema_value(input_schema)
-        )
+        (
+            compacted_schema,
+            schema_description_count,
+            schema_dropped_key_count,
+        ) = _compact_claude_tool_schema_value(input_schema)
         if compacted_schema is not input_schema:
             updated_tool["input_schema"] = compacted_schema
             changed = True
@@ -1011,9 +1085,10 @@ def _add_claude_tool_advertisement_compaction_logging_metadata(
         for event in compaction_events
         if isinstance(event.get("saved_chars"), int)
     )
-    compaction_policy_name, compaction_policy_version = (
-        _get_claude_tool_advertisement_compaction_policy()
-    )
+    (
+        compaction_policy_name,
+        compaction_policy_version,
+    ) = _get_claude_tool_advertisement_compaction_policy()
     compaction_cache_hits = sum(
         1
         for event in compaction_events
@@ -1090,11 +1165,12 @@ def _apply_claude_prompt_patch_manifest_to_text(
             match_types.append("exact")
 
         if patch_id == _CLAUDE_REPORT_FILE_PATCH_ID:
-            updated_text, pattern_occurrences = (
-                _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN.subn(
-                    after_text,
-                    updated_text,
-                )
+            (
+                updated_text,
+                pattern_occurrences,
+            ) = _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN.subn(
+                after_text,
+                updated_text,
             )
             if pattern_occurrences:
                 occurrences += pattern_occurrences
@@ -1129,9 +1205,8 @@ async def _rewrite_claude_control_plane_text(
     patch_events: list[dict[str, Any]] = []
 
     if (
-        ("# auto memory" in updated_text or "# Persistent Agent Memory" in updated_text)
-        and _resolve_claude_auto_memory_template_path(cc_version) is not None
-    ):
+        "# auto memory" in updated_text or "# Persistent Agent Memory" in updated_text
+    ) and _resolve_claude_auto_memory_template_path(cc_version) is not None:
         try:
             updated_text, override_event = _replace_claude_auto_memory_section_in_text(
                 updated_text,
@@ -1219,7 +1294,6 @@ async def _rewrite_claude_control_plane_text(
     return updated_text, override_events, patch_events
 
 
-
 async def _rewrite_claude_control_plane_in_value(
     value: Any,
     *,
@@ -1229,7 +1303,11 @@ async def _rewrite_claude_control_plane_in_value(
 ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
-            updated_text, override_events, patch_events = await _rewrite_claude_control_plane_text(
+            (
+                updated_text,
+                override_events,
+                patch_events,
+            ) = await _rewrite_claude_control_plane_text(
                 value["text"],
                 cc_version=cc_version,
                 manifest=manifest,
@@ -1246,7 +1324,11 @@ async def _rewrite_claude_control_plane_in_value(
         combined_patch_events: list[dict[str, Any]] = []
         changed = False
         for key, child in value.items():
-            updated_child, child_override_events, child_patch_events = await _rewrite_claude_control_plane_in_value(
+            (
+                updated_child,
+                child_override_events,
+                child_patch_events,
+            ) = await _rewrite_claude_control_plane_in_value(
                 child,
                 cc_version=cc_version,
                 manifest=manifest,
@@ -1269,7 +1351,11 @@ async def _rewrite_claude_control_plane_in_value(
         list_patch_events: list[dict[str, Any]] = []
         changed = False
         for child in value:
-            updated_child, child_override_events, child_patch_events = await _rewrite_claude_control_plane_in_value(
+            (
+                updated_child,
+                child_override_events,
+                child_patch_events,
+            ) = await _rewrite_claude_control_plane_in_value(
                 child,
                 cc_version=cc_version,
                 manifest=manifest,
@@ -1287,7 +1373,11 @@ async def _rewrite_claude_control_plane_in_value(
         )
 
     if isinstance(value, str):
-        updated_text, override_events, patch_events = await _rewrite_claude_control_plane_text(
+        (
+            updated_text,
+            override_events,
+            patch_events,
+        ) = await _rewrite_claude_control_plane_text(
             value,
             cc_version=cc_version,
             manifest=manifest,
@@ -1300,11 +1390,11 @@ async def _rewrite_claude_control_plane_in_value(
     return value, [], []
 
 
-
-async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
+async def apply_claude_control_plane_rewrites_to_anthropic_request_body(  # noqa: PLR0915
     request_body: dict[str, Any], billing_header_fields: dict[str, str]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    lp = _lp()
+    # Defer llm_passthrough_endpoints import until span timestamps are needed so
+    # focused control-plane tests (and partial module loads) stay isolated.
     cc_version = billing_header_fields.get("cc_version")
     if not cc_version:
         return request_body, [], []
@@ -1313,17 +1403,65 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
     manifest_path = _resolve_claude_prompt_patch_manifest_path()
     manifest = _load_claude_prompt_patch_manifest(manifest_path)
     available_context = _build_aawm_context_for_anthropic_request(request_body)
-    updated_body, override_events, patch_events = await _rewrite_claude_control_plane_in_value(
-        request_body,
-        cc_version=cc_version,
-        manifest=manifest,
-        available_context=available_context,
-    )
 
-    if not isinstance(updated_body, dict):
-        return request_body, [], []
+    # RR-053 #4: rewrites target stable control-plane surfaces (system + first
+    # user message). Full history is resent every turn; re-scanning all messages
+    # is wasted CPU once early prompts have been rewritten.
+    updated_body = dict(request_body)
+    override_events: list[dict[str, Any]] = []
+    patch_events: list[dict[str, Any]] = []
+    changed = False
 
-    updated_body, compaction_events = _compact_claude_tool_advertisements_in_request_body(
+    if "system" in request_body:
+        (
+            updated_system,
+            sys_overrides,
+            sys_patches,
+        ) = await _rewrite_claude_control_plane_in_value(
+            request_body["system"],
+            cc_version=cc_version,
+            manifest=manifest,
+            available_context=available_context,
+        )
+        if updated_system is not request_body["system"]:
+            updated_body["system"] = updated_system
+            changed = True
+        override_events.extend(sys_overrides)
+        patch_events.extend(sys_patches)
+
+    messages = request_body.get("messages")
+    if isinstance(messages, list) and messages:
+        # Prefer the first user message even if a non-user item precedes it.
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            (
+                updated_first,
+                first_overrides,
+                first_patches,
+            ) = await _rewrite_claude_control_plane_in_value(
+                message,
+                cc_version=cc_version,
+                manifest=manifest,
+                available_context=available_context,
+            )
+            if updated_first is not message:
+                updated_messages = list(messages)
+                updated_messages[message_index] = updated_first
+                updated_body["messages"] = updated_messages
+                changed = True
+            override_events.extend(first_overrides)
+            patch_events.extend(first_patches)
+            break
+
+    if not changed and not override_events and not patch_events:
+        # Still allow tool advertisement compaction below on original body.
+        updated_body = request_body
+
+    (
+        updated_body,
+        compaction_events,
+    ) = _compact_claude_tool_advertisements_in_request_body(
         updated_body,
         cc_version=cc_version,
     )
@@ -1350,6 +1488,7 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
     if isinstance(litellm_metadata, dict):
         langfuse_spans = litellm_metadata.get("langfuse_spans")
         if isinstance(langfuse_spans, list):
+            lp = None
             for span_descriptor in langfuse_spans:
                 if not isinstance(span_descriptor, dict):
                     continue
@@ -1358,6 +1497,8 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
                     "claude.prompt_patch",
                     "claude.tool_advertisement_compaction",
                 }:
+                    if lp is None:
+                        lp = _lp()
                     span_descriptor["start_time"] = lp._format_langfuse_span_timestamp(
                         span_started_at
                     )
@@ -1366,134 +1507,6 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
                     )
 
     return updated_body, override_events, patch_events
-
-
-def replace_claude_system_prompt_in_anthropic_request_body(
-    request_body: dict[str, Any], billing_header_fields: dict[str, str]
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    lp = _lp()
-    cc_version = billing_header_fields.get("cc_version")
-    template_path = _resolve_claude_auto_memory_template_path(cc_version)
-    if template_path is None or not cc_version or "system" not in request_body:
-        return request_body, []
-
-    span_started_at = datetime.now(timezone.utc)
-    updated_body = dict(request_body)
-    updated_system, override_events = _replace_claude_system_prompt_override_in_value(
-        request_body["system"],
-        cc_version,
-    )
-    if not override_events:
-        return request_body, []
-
-    updated_body["system"] = updated_system
-    updated_body = _add_claude_system_prompt_override_logging_metadata(
-        updated_body,
-        override_events,
-    )
-
-    litellm_metadata = updated_body.get("litellm_metadata")
-    if isinstance(litellm_metadata, dict):
-        langfuse_spans = litellm_metadata.get("langfuse_spans")
-        if isinstance(langfuse_spans, list):
-            for span_descriptor in langfuse_spans:
-                if (
-                    isinstance(span_descriptor, dict)
-                    and span_descriptor.get("name") == "claude.system_prompt_override"
-                ):
-                    span_descriptor["start_time"] = lp._format_langfuse_span_timestamp(
-                        span_started_at
-                    )
-                    span_descriptor["end_time"] = lp._format_langfuse_span_timestamp(
-                        datetime.now(timezone.utc)
-                    )
-    return updated_body, override_events
-
-
-def _apply_claude_prompt_patches_in_text(
-    text: str, cc_version: str
-) -> tuple[str, list[dict[str, Any]]]:
-    manifest_path = _resolve_claude_prompt_patch_manifest_path()
-    manifest = _load_claude_prompt_patch_manifest(manifest_path)
-    return _apply_claude_prompt_patch_manifest_to_text(
-        text,
-        cc_version=cc_version,
-        manifest=manifest,
-    )
-
-
-def _replace_claude_prompt_patches_in_value(
-    value: Any, cc_version: str
-) -> tuple[Any, list[dict[str, Any]]]:
-    if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
-            try:
-                updated_text, patch_events = _apply_claude_prompt_patches_in_text(
-                    value["text"], cc_version
-                )
-            except Exception as exc:
-                return value, [
-                    {
-                        "id": "manifest-load",
-                        "status": "failed",
-                        "cc_version": cc_version,
-                        "error": exc.__class__.__name__,
-                    }
-                ]
-            if not patch_events:
-                return value, []
-            updated_value = dict(value)
-            updated_value["text"] = updated_text
-            return updated_value, patch_events
-
-        updated_dict: dict[str, Any] = {}
-        combined_events: list[dict[str, Any]] = []
-        changed = False
-        for key, child in value.items():
-            updated_child, child_events = _replace_claude_prompt_patches_in_value(
-                child,
-                cc_version,
-            )
-            updated_dict[key] = updated_child
-            combined_events.extend(child_events)
-            if updated_child is not child:
-                changed = True
-        return (updated_dict if changed else value), combined_events
-
-    if isinstance(value, list):
-        updated_list = []
-        list_events: list[dict[str, Any]] = []
-        changed = False
-        for child in value:
-            updated_child, child_events = _replace_claude_prompt_patches_in_value(
-                child,
-                cc_version,
-            )
-            updated_list.append(updated_child)
-            list_events.extend(child_events)
-            if updated_child is not child:
-                changed = True
-        return (updated_list if changed else value), list_events
-
-    if isinstance(value, str):
-        try:
-            updated_text, patch_events = _apply_claude_prompt_patches_in_text(
-                value, cc_version
-            )
-        except Exception as exc:
-            return value, [
-                {
-                    "id": "manifest-load",
-                    "status": "failed",
-                    "cc_version": cc_version,
-                    "error": exc.__class__.__name__,
-                }
-            ]
-        if not patch_events:
-            return value, []
-        return updated_text, patch_events
-
-    return value, []
 
 
 def _add_claude_prompt_patch_logging_metadata(
@@ -1578,56 +1591,11 @@ def _add_claude_prompt_patch_logging_metadata(
     )
 
 
-def apply_claude_prompt_patches_to_anthropic_request_body(
-    request_body: dict[str, Any], billing_header_fields: dict[str, str]
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    lp = _lp()
-    cc_version = billing_header_fields.get("cc_version")
-    if not cc_version:
-        return request_body, []
-
-    span_started_at = datetime.now(timezone.utc)
-    updated_body, patch_events = _replace_claude_prompt_patches_in_value(
-        request_body,
-        cc_version,
-    )
-    if not patch_events:
-        return request_body, []
-
-    if not isinstance(updated_body, dict):
-        return request_body, []
-
-    updated_body = _add_claude_prompt_patch_logging_metadata(
-        updated_body,
-        patch_events,
-    )
-
-    litellm_metadata = updated_body.get("litellm_metadata")
-    if isinstance(litellm_metadata, dict):
-        langfuse_spans = litellm_metadata.get("langfuse_spans")
-        if isinstance(langfuse_spans, list):
-            for span_descriptor in langfuse_spans:
-                if (
-                    isinstance(span_descriptor, dict)
-                    and span_descriptor.get("name") == "claude.prompt_patch"
-                ):
-                    span_descriptor["start_time"] = lp._format_langfuse_span_timestamp(
-                        span_started_at
-                    )
-                    span_descriptor["end_time"] = lp._format_langfuse_span_timestamp(
-                        datetime.now(timezone.utc)
-                    )
-    return updated_body, patch_events
-
-
 def _parse_aawm_directive_attributes(attrs_text: str) -> dict[str, str]:
     parsed_attrs: dict[str, str] = {}
     for match in _AAWM_DYNAMIC_DIRECTIVE_ATTR_PATTERN.finditer(attrs_text):
         value = (
-            match.group("double")
-            or match.group("single")
-            or match.group("bare")
-            or ""
+            match.group("double") or match.group("single") or match.group("bare") or ""
         ).strip()
         if value:
             parsed_attrs[match.group("key")] = value
@@ -1867,7 +1835,9 @@ async def _get_aawm_dynamic_injection_pool() -> Any:
 
         dsn = _build_aawm_dynamic_injection_dsn()
         if not dsn:
-            raise RuntimeError("AAWM dynamic injection database configuration is missing")
+            raise RuntimeError(
+                "AAWM dynamic injection database configuration is missing"
+            )
 
         try:
             asyncpg = importlib.import_module("asyncpg")
@@ -1876,6 +1846,9 @@ async def _get_aawm_dynamic_injection_pool() -> Any:
                 "AAWM dynamic injection requires asyncpg to be installed"
             ) from exc
 
+        # Canonical AAWM dynamic-injection pool for this process (RR-053 #2).
+        # Callers in sibling modules should import this helper rather than open
+        # a second pool against the same DSN.
         _aawm_dynamic_injection_pool = await asyncpg.create_pool(
             dsn=dsn,
             min_size=_AAWM_DYNAMIC_INJECTION_POOL_MIN_SIZE,
@@ -1888,11 +1861,46 @@ async def _get_aawm_dynamic_injection_pool() -> Any:
         return _aawm_dynamic_injection_pool
 
 
+async def close_aawm_dynamic_injection_pool() -> None:
+    """Release the process-wide dynamic-injection pool (proxy shutdown hook)."""
+    global _aawm_dynamic_injection_pool
+    async with _aawm_dynamic_injection_pool_lock:
+        pool = _aawm_dynamic_injection_pool
+        _aawm_dynamic_injection_pool = None
+    if pool is not None:
+        await pool.close()
+
+
+def _aawm_dynamic_injection_acquire_timeout_seconds() -> float:
+    raw_value = _clean_secret_string(
+        _lp().get_secret_str("AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS")
+    )
+    if not raw_value:
+        return _AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS
+    try:
+        return max(0.1, float(raw_value))
+    except (TypeError, ValueError):
+        return _AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS
+
+
+async def _aawm_pool_fetch(pool: Any, query: str, *args: Any) -> Any:
+    timeout = _aawm_dynamic_injection_acquire_timeout_seconds()
+    async with pool.acquire(timeout=timeout) as connection:
+        return await connection.fetch(query, *args)
+
+
+async def _aawm_pool_fetchval(pool: Any, query: str, *args: Any) -> Any:
+    timeout = _aawm_dynamic_injection_acquire_timeout_seconds()
+    async with pool.acquire(timeout=timeout) as connection:
+        return await connection.fetchval(query, *args)
+
+
 async def _call_aawm_get_agent_memories(
     *, agent_name: str, tenant_id: str
 ) -> Optional[str]:
     pool = await _get_aawm_dynamic_injection_pool()
-    result = await pool.fetchval(
+    result = await _aawm_pool_fetchval(
+        pool,
         "SELECT get_agent_memories($1, $2)",
         agent_name,
         tenant_id,
@@ -1935,7 +1943,8 @@ async def _call_aawm_context_grab(
 ) -> Optional[str]:
     proc_name = _get_aawm_context_grab_proc_name()
     pool = await _get_aawm_dynamic_injection_pool()
-    rows = await pool.fetch(
+    rows = await _aawm_pool_fetch(
+        pool,
         f"SELECT content FROM {proc_name}($1, $2, $3)",
         name,
         tenant_id,
@@ -1961,7 +1970,8 @@ async def _call_aawm_reference_identifier_list(
     *, tenant_id: Optional[str], agent_id: Optional[str]
 ) -> Optional[str]:
     pool = await _get_aawm_dynamic_injection_pool()
-    rows = await pool.fetch(
+    rows = await _aawm_pool_fetch(
+        pool,
         _AAWM_REFERENCE_IDENTIFIER_LIST_QUERY,
         tenant_id,
         agent_id,
@@ -2050,7 +2060,9 @@ async def _resolve_aawm_dynamic_directive(
         )
         event["cache_status"] = "hit" if cache_hit else "miss"
         if not cache_hit:
-            resolver = getattr(lp, "_call_aawm_get_agent_memories", _call_aawm_get_agent_memories)
+            resolver = getattr(
+                lp, "_call_aawm_get_agent_memories", _call_aawm_get_agent_memories
+            )
             injected_text = await resolver(
                 agent_name=selected_context["agent"],
                 tenant_id=selected_context["tenant"],
@@ -2188,7 +2200,10 @@ async def _expand_aawm_context_markers_in_text(
     protected_text, escaped_markers = _protect_escaped_aawm_context_markers(text)
     matches = list(_AAWM_CONTEXT_MARKER_PATTERN.finditer(protected_text))
     if not matches:
-        return _restore_escaped_aawm_context_markers(protected_text, escaped_markers), []
+        return (
+            _restore_escaped_aawm_context_markers(protected_text, escaped_markers),
+            [],
+        )
 
     rebuilt_parts: list[str] = []
     ordered_names: list[str] = []
@@ -2196,7 +2211,7 @@ async def _expand_aawm_context_markers_in_text(
     cursor = 0
 
     for match in matches:
-        rebuilt_parts.append(protected_text[cursor:match.start()])
+        rebuilt_parts.append(protected_text[cursor : match.start()])
         name = match.group("name").strip()
         rebuilt_parts.append(name)
         if name and name not in seen_names:
@@ -2246,11 +2261,40 @@ async def _expand_aawm_context_markers_in_text(
         appendix_entries.append(appendix_entry)
         context_events.append(event)
 
-    return _append_aawm_context_entries_to_text(updated_text, appendix_entries), context_events
+    return (
+        _append_aawm_context_entries_to_text(updated_text, appendix_entries),
+        context_events,
+    )
+
+
+class _AawmDispatchLookupBudget:
+    """Request-wide budget for dispatch backtick/acronym context grabs (RR-053 #1).
+
+    Per-text-node caps alone still multiply across many trusted text blocks in a
+    single request. This counter tracks remaining lookup slots for the whole
+    request walk so fan-out stays bounded even when system + first user contain
+    many distinct references.
+    """
+
+    __slots__ = ("remaining", "seen_names")
+
+    def __init__(self, max_lookups: int = _AAWM_DISPATCH_CONTEXT_REFERENCE_REQUEST_MAX):
+        self.remaining = max(0, int(max_lookups))
+        self.seen_names: set[str] = set()
+
+    def reserve_slots(self, count: int) -> int:
+        """Consume up to ``count`` slots; return how many were granted."""
+        if count <= 0 or self.remaining <= 0:
+            return 0
+        granted = min(int(count), self.remaining)
+        self.remaining -= granted
+        return granted
 
 
 def _extract_aawm_dispatch_context_references(
     text: str,
+    *,
+    max_references: int = _AAWM_DISPATCH_CONTEXT_REFERENCE_MAX,
 ) -> list[tuple[str, str]]:
     if not isinstance(text, str):
         return []
@@ -2261,6 +2305,7 @@ def _extract_aawm_dispatch_context_references(
 
     ordered_references: list[tuple[str, str]] = []
     seen_names: set[str] = set()
+    limit = max(0, int(max_references))
     for index, segment in enumerate(scan_text.split("```")):
         if index % 2 == 1:
             continue
@@ -2271,19 +2316,56 @@ def _extract_aawm_dispatch_context_references(
             else:
                 name = (match.group("acronym") or "").strip()
                 placeholder_type = "dispatch_acronym"
+                # Skip ubiquitous all-caps tokens that would thrash the pool.
+                if name.upper() in _AAWM_DISPATCH_ACRONYM_STOPWORDS:
+                    continue
             if not name or name in seen_names:
                 continue
             seen_names.add(name)
             ordered_references.append((name, placeholder_type))
+            if len(ordered_references) >= limit:
+                return ordered_references
     return ordered_references
 
 
 async def _expand_aawm_dispatch_context_references_in_text(
-    text: str, available_context: dict[str, str]
+    text: str,
+    available_context: dict[str, str],
+    *,
+    request_lookup_budget: Optional[_AawmDispatchLookupBudget] = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    ordered_references = _extract_aawm_dispatch_context_references(text)
+    # Request-wide budget (RR-053 #1) bounds total DB fan-out across all text
+    # blocks; per-node max still applies when extracting from this node.
+    per_node_max = _AAWM_DISPATCH_CONTEXT_REFERENCE_MAX
+    if request_lookup_budget is not None:
+        if request_lookup_budget.remaining <= 0:
+            return text, []
+        per_node_max = min(per_node_max, request_lookup_budget.remaining)
+
+    ordered_references = _extract_aawm_dispatch_context_references(
+        text,
+        max_references=per_node_max,
+    )
     if not ordered_references:
         return text, []
+
+    # Deduplicate against names already resolved earlier in this request so we
+    # do not spend budget on the same identifier twice across text nodes.
+    if request_lookup_budget is not None:
+        filtered: list[tuple[str, str]] = []
+        for name, placeholder_type in ordered_references:
+            if name in request_lookup_budget.seen_names:
+                continue
+            filtered.append((name, placeholder_type))
+        ordered_references = filtered
+        if not ordered_references:
+            return text, []
+        granted = request_lookup_budget.reserve_slots(len(ordered_references))
+        if granted <= 0:
+            return text, []
+        ordered_references = ordered_references[:granted]
+        for name, _placeholder_type in ordered_references:
+            request_lookup_budget.seen_names.add(name)
 
     semaphore = asyncio.Semaphore(_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE)
 
@@ -2343,7 +2425,7 @@ async def _expand_aawm_dynamic_directives_in_text(
     cursor = 0
 
     for match in matches:
-        rebuilt_parts.append(text[cursor:match.start()])
+        rebuilt_parts.append(text[cursor : match.start()])
         directive_attrs = _parse_aawm_directive_attributes(
             _get_aawm_directive_attrs_text(match)
         )
@@ -2368,7 +2450,8 @@ async def _expand_aawm_dynamic_directives_in_text(
                 "proc": normalized_proc_name,
                 "status": "failed",
                 "error": exc.__class__.__name__,
-                "context_keys": requested_context_fields or list(available_context.keys()),
+                "context_keys": requested_context_fields
+                or list(available_context.keys()),
             }
         rebuilt_parts.append(replacement_text)
         injection_events.append(event)
@@ -2378,31 +2461,77 @@ async def _expand_aawm_dynamic_directives_in_text(
     return "".join(rebuilt_parts), injection_events
 
 
+def _aawm_surface_is_trusted_for_injection(
+    *,
+    trusted_surface: bool,
+    messages_trusted_first_user_only: bool,
+    first_user_message_seen: bool,
+    role: Optional[str],
+) -> tuple[bool, bool]:
+    """Return (surface_is_trusted, is_first_user_message)."""
+    is_first_user_message = (
+        messages_trusted_first_user_only
+        and not first_user_message_seen
+        and role == "user"
+    )
+    return bool(trusted_surface) or is_first_user_message, is_first_user_message
+
+
 async def _expand_aawm_dynamic_directives_in_value(
     value: Any,
     available_context: dict[str, str],
     *,
     enable_dispatch_backtick_context: bool = False,
+    enable_context_markers: bool = True,
+    trusted_surface: bool = False,
+    messages_trusted_first_user_only: bool = False,
+    request_lookup_budget: Optional[_AawmDispatchLookupBudget] = None,
+    _message_index: Optional[int] = None,
+    _first_user_message_seen: bool = False,
 ) -> tuple[Any, list[dict[str, Any]]]:
+    allow_untrusted_injection = bool(trusted_surface)
+
     if isinstance(value, dict):
+        # When walking messages[], only the first user message is a trusted
+        # surface for marker/dispatch expansion (tool/web later turns are not).
+        role = value.get("role") if isinstance(value.get("role"), str) else None
+        (
+            surface_is_trusted,
+            is_first_user_message,
+        ) = _aawm_surface_is_trusted_for_injection(
+            trusted_surface=allow_untrusted_injection,
+            messages_trusted_first_user_only=messages_trusted_first_user_only,
+            first_user_message_seen=_first_user_message_seen,
+            role=role,
+        )
+
         if value.get("type") == "text" and isinstance(value.get("text"), str):
             original_text = value["text"]
-            updated_text, injection_events = await _expand_aawm_dynamic_directives_in_text(
+            (
+                updated_text,
+                injection_events,
+            ) = await _expand_aawm_dynamic_directives_in_text(
                 original_text,
                 available_context,
             )
-            updated_text, context_events = await _expand_aawm_context_markers_in_text(
-                updated_text,
-                available_context,
-            )
-            combined_events = injection_events + context_events
-            if enable_dispatch_backtick_context:
+            combined_events = list(injection_events)
+            if enable_context_markers and surface_is_trusted:
+                (
+                    updated_text,
+                    context_events,
+                ) = await _expand_aawm_context_markers_in_text(
+                    updated_text,
+                    available_context,
+                )
+                combined_events.extend(context_events)
+            if enable_dispatch_backtick_context and surface_is_trusted:
                 (
                     updated_text,
                     dispatch_context_events,
                 ) = await _expand_aawm_dispatch_context_references_in_text(
                     updated_text,
                     available_context,
+                    request_lookup_budget=request_lookup_budget,
                 )
                 combined_events.extend(dispatch_context_events)
             if combined_events or updated_text != original_text:
@@ -2415,10 +2544,22 @@ async def _expand_aawm_dynamic_directives_in_value(
         dict_events: list[dict[str, Any]] = []
         changed = False
         for key, child in value.items():
-            updated_child, child_events = await _expand_aawm_dynamic_directives_in_value(
+            (
+                updated_child,
+                child_events,
+            ) = await _expand_aawm_dynamic_directives_in_value(
                 child,
                 available_context,
                 enable_dispatch_backtick_context=enable_dispatch_backtick_context,
+                enable_context_markers=enable_context_markers,
+                trusted_surface=surface_is_trusted
+                if key == "content"
+                else trusted_surface,
+                messages_trusted_first_user_only=False,
+                request_lookup_budget=request_lookup_budget,
+                _message_index=_message_index,
+                _first_user_message_seen=_first_user_message_seen
+                or is_first_user_message,
             )
             updated_dict[key] = updated_child
             dict_events.extend(child_events)
@@ -2430,17 +2571,69 @@ async def _expand_aawm_dynamic_directives_in_value(
         updated_list = []
         list_events: list[dict[str, Any]] = []
         changed = False
-        for child in value:
-            updated_child, child_events = await _expand_aawm_dynamic_directives_in_value(
+        first_user_message_seen = _first_user_message_seen
+        for index, child in enumerate(value):
+            child_role = (
+                child.get("role")
+                if isinstance(child, dict) and isinstance(child.get("role"), str)
+                else None
+            )
+            (
+                updated_child,
+                child_events,
+            ) = await _expand_aawm_dynamic_directives_in_value(
                 child,
                 available_context,
                 enable_dispatch_backtick_context=enable_dispatch_backtick_context,
+                enable_context_markers=enable_context_markers,
+                trusted_surface=trusted_surface,
+                messages_trusted_first_user_only=messages_trusted_first_user_only,
+                request_lookup_budget=request_lookup_budget,
+                _message_index=index
+                if messages_trusted_first_user_only
+                else _message_index,
+                _first_user_message_seen=first_user_message_seen,
             )
+            if (
+                messages_trusted_first_user_only
+                and not first_user_message_seen
+                and child_role == "user"
+            ):
+                first_user_message_seen = True
             updated_list.append(updated_child)
             list_events.extend(child_events)
             if updated_child is not child:
                 changed = True
         return (updated_list if changed else value), list_events
+
+    if isinstance(value, str):
+        # Plain system/user text fields (not content-block dicts).
+        surface_is_trusted = allow_untrusted_injection
+        original_text = value
+        updated_text, injection_events = await _expand_aawm_dynamic_directives_in_text(
+            original_text,
+            available_context,
+        )
+        combined_events = list(injection_events)
+        if enable_context_markers and surface_is_trusted:
+            updated_text, context_events = await _expand_aawm_context_markers_in_text(
+                updated_text,
+                available_context,
+            )
+            combined_events.extend(context_events)
+        if enable_dispatch_backtick_context and surface_is_trusted:
+            (
+                updated_text,
+                dispatch_context_events,
+            ) = await _expand_aawm_dispatch_context_references_in_text(
+                updated_text,
+                available_context,
+                request_lookup_budget=request_lookup_budget,
+            )
+            combined_events.extend(dispatch_context_events)
+        if combined_events or updated_text != original_text:
+            return updated_text, combined_events
+        return value, []
 
     return value, []
 
@@ -2547,7 +2740,9 @@ def _request_uses_aawm_dispatch_backtick_context(request_body: dict[str, Any]) -
 
     for top_level_key in ("system", "messages"):
         for fragment in _iter_anthropic_text_fragments(request_body.get(top_level_key)):
-            if any(marker in fragment for marker in _AAWM_SUBAGENTSTART_CONTEXT_MARKERS):
+            if any(
+                marker in fragment for marker in _AAWM_SUBAGENTSTART_CONTEXT_MARKERS
+            ):
                 return True
 
     return False
@@ -2556,7 +2751,7 @@ def _request_uses_aawm_dispatch_backtick_context(request_body: dict[str, Any]) -
 async def expand_aawm_dynamic_directives_in_anthropic_request_body(
     request_body: dict[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    lp = _lp()
+    # Defer llm_passthrough_endpoints import until span timestamps are needed.
     available_context = _build_aawm_context_for_anthropic_request(request_body)
     enable_dispatch_backtick_context = _request_uses_aawm_dispatch_backtick_context(
         request_body
@@ -2565,7 +2760,17 @@ async def expand_aawm_dynamic_directives_in_anthropic_request_body(
     updated_body = dict(request_body)
     injection_events: list[dict[str, Any]] = []
     changed = False
+    # Shared across all trusted text blocks so RR-053 #1 bounds total fan-out
+    # for the request, not merely per node.
+    request_lookup_budget = _AawmDispatchLookupBudget(
+        _AAWM_DISPATCH_CONTEXT_REFERENCE_REQUEST_MAX
+    )
 
+    # RR-053 #5 trust boundary:
+    # - HTML/@@@ AAWM directives may appear anywhere (explicit, operator-authored).
+    # - :#name.ctx#: markers and dispatch backtick/acronym grabs are restricted to
+    #   trusted surfaces (system + first user message) so tool/web output cannot
+    #   trigger arbitrary same-tenant content-store reads.
     for top_level_key in ("system", "messages"):
         if top_level_key not in request_body:
             continue
@@ -2573,6 +2778,10 @@ async def expand_aawm_dynamic_directives_in_anthropic_request_body(
             request_body[top_level_key],
             available_context,
             enable_dispatch_backtick_context=enable_dispatch_backtick_context,
+            enable_context_markers=True,
+            trusted_surface=(top_level_key == "system"),
+            messages_trusted_first_user_only=(top_level_key == "messages"),
+            request_lookup_budget=request_lookup_budget,
         )
         if updated_value is not request_body[top_level_key]:
             updated_body[top_level_key] = updated_value
@@ -2592,15 +2801,20 @@ async def expand_aawm_dynamic_directives_in_anthropic_request_body(
         if isinstance(litellm_metadata, dict):
             langfuse_spans = litellm_metadata.get("langfuse_spans")
             if isinstance(langfuse_spans, list):
+                lp = None
                 for span_descriptor in langfuse_spans:
                     if (
                         isinstance(span_descriptor, dict)
                         and span_descriptor.get("name") == "aawm.dynamic_injection"
                     ):
-                        span_descriptor["start_time"] = lp._format_langfuse_span_timestamp(
-                            span_started_at
-                        )
-                        span_descriptor["end_time"] = lp._format_langfuse_span_timestamp(
+                        if lp is None:
+                            lp = _lp()
+                        span_descriptor[
+                            "start_time"
+                        ] = lp._format_langfuse_span_timestamp(span_started_at)
+                        span_descriptor[
+                            "end_time"
+                        ] = lp._format_langfuse_span_timestamp(
                             datetime.now(timezone.utc)
                         )
     return updated_body, injection_events

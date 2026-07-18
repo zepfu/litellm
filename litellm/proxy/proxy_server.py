@@ -722,6 +722,17 @@ async def proxy_shutdown_event():
             e,
         )
     try:
+        from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
+            close_aawm_dynamic_injection_pool,
+        )
+
+        await close_aawm_dynamic_injection_pool()
+    except Exception as e:
+        verbose_proxy_logger.error(
+            "Error closing AAWM dynamic-injection pool during proxy shutdown: %s",
+            e,
+        )
+    try:
         await litellm.close_litellm_async_clients()
     except Exception as e:
         verbose_proxy_logger.error(

@@ -152,3 +152,51 @@ by provider routes. Operator-facing behaviors that are easy to miss:
 
 - `chat_completion_pass_through_endpoint` parses bodies with `json.loads` only
   (no `ast.literal_eval` first attempt).
+
+## AAWM Claude control-plane (fork overlay)
+
+`aawm_claude_control_plane.py` owns Claude Code request rewrites and dynamic
+injection for this fork. Operator-facing behavior that is easy to miss:
+
+### Trust boundary
+
+- Explicit AAWM HTML/`@@@` directives may appear anywhere in `system` /
+  `messages`.
+- `:#name.ctx#:` markers and SubagentStart dispatch backtick/acronym grabs run
+  only on trusted surfaces: `system` and the first user message. Later tool /
+  web / assistant text cannot trigger same-tenant content-store lookups.
+
+### Lookup fan-out budget (RR-053)
+
+Dispatch backtick/acronym expansion is intentionally bounded:
+
+- **Per text node:** at most `_AAWM_DISPATCH_CONTEXT_REFERENCE_MAX` (24)
+  distinct references.
+- **Per request:** at most `_AAWM_DISPATCH_CONTEXT_REFERENCE_REQUEST_MAX` (48)
+  distinct lookups across *all* trusted text blocks, with request-wide
+  deduplication of names already resolved earlier in the walk.
+- Common all-caps noise tokens (`SQL`, `JSON`, `API`, ...) are stopworded.
+- Pool acquire uses a finite timeout
+  (`AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS`, default 10s).
+
+Per-node caps alone are not enough: system + first-user content can contain many
+blocks; the request-wide budget is what stops unbounded DB fan-out.
+
+### Connection pool lifecycle
+
+The control-plane module owns the canonical process-wide asyncpg pool used for
+dynamic injection / context grabs **and** for sibling AAWM Postgres lookups that
+share the same DSN (for example OpenRouter free-tier durable quota reads in
+`llm_passthrough_endpoints.py`). `close_aawm_dynamic_injection_pool()` is
+invoked from `proxy_shutdown_event()` so connections are released on clean
+proxy shutdown.
+
+`llm_passthrough_endpoints` re-exports the control-plane pool/DSN helpers
+(`_get_aawm_dynamic_injection_pool`, `_build_aawm_dynamic_injection_dsn`, …)
+for stable import compatibility, but it must not create a second asyncpg pool.
+
+### Control-plane rewrite scope
+
+`apply_claude_control_plane_rewrites_to_anthropic_request_body()` rewrites only
+`system` and the first user message (auto-memory, prompt-patch manifest,
+CommonMark identifier list). Full history is not re-scanned every turn.
