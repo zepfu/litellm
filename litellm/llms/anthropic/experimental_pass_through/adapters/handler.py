@@ -1,3 +1,24 @@
+"""Anthropic Messages → OpenAI Chat Completions adapter handler.
+
+This module is the **orchestration** entrypoint for non-Anthropic models that
+are invoked through Anthropic `/v1/messages` and translated to
+``litellm.completion`` / ``litellm.acompletion`` (Chat Completions shape).
+
+Ownership boundary (RR-026):
+- ``derive_prompt_cache_key`` / prompt-cache hashing lives in
+  ``adapters/observability.py`` (stable system+tools roots). This handler does
+  not compute ``prompt_cache_key``.
+- Anthropic SSE reconstruction (``content_block_*`` emission) lives in
+  ``adapters/streaming_iterator.py`` via
+  ``AnthropicAdapter.translate_completion_output_params_streaming``. This
+  handler only prepares completion kwargs and delegates stream/non-stream
+  translation to ``ANTHROPIC_ADAPTER``.
+- The parallel ``responses_adapters/`` tree owns the OpenAI Responses API path
+  (``litellm.responses`` + Responses SSE wrapper). Cross-tree SSE emitter
+  consolidation is a multi-file concern for the streaming iterators, not a
+  defect local to this orchestration file.
+"""
+
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -211,6 +232,40 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         return completion_kwargs, tool_name_mapping
 
     @staticmethod
+    def _transform_completion_response(
+        completion_response: Any,
+        *,
+        model: str,
+        stream: Optional[bool],
+        tool_name_mapping: Dict[str, str],
+    ) -> Union[AnthropicMessagesResponse, AsyncIterator]:
+        """Delegate Chat Completions → Anthropic Messages translation.
+
+        Streaming SSE emission is owned by the adapter streaming iterator, not
+        this handler. Keep both sync and async entrypoints on this single path
+        so Chat Completions translation policy cannot drift between them.
+        """
+        if stream:
+            transformed_stream = (
+                ANTHROPIC_ADAPTER.translate_completion_output_params_streaming(
+                    completion_response,
+                    model=model,
+                    tool_name_mapping=tool_name_mapping,
+                )
+            )
+            if transformed_stream is not None:
+                return transformed_stream
+            raise ValueError("Failed to transform streaming response")
+
+        anthropic_response = ANTHROPIC_ADAPTER.translate_completion_output_params(
+            cast(ModelResponse, completion_response),
+            tool_name_mapping=tool_name_mapping,
+        )
+        if anthropic_response is not None:
+            return anthropic_response
+        raise ValueError("Failed to transform response to Anthropic format")
+
+    @staticmethod
     async def async_anthropic_messages_handler(
         max_tokens: int,
         messages: List[Dict],
@@ -254,25 +309,12 @@ class LiteLLMMessagesToCompletionTransformationHandler:
 
         completion_response = await litellm.acompletion(**completion_kwargs)
 
-        if stream:
-            transformed_stream = (
-                ANTHROPIC_ADAPTER.translate_completion_output_params_streaming(
-                    completion_response,
-                    model=model,
-                    tool_name_mapping=tool_name_mapping,
-                )
-            )
-            if transformed_stream is not None:
-                return transformed_stream
-            raise ValueError("Failed to transform streaming response")
-        else:
-            anthropic_response = ANTHROPIC_ADAPTER.translate_completion_output_params(
-                cast(ModelResponse, completion_response),
-                tool_name_mapping=tool_name_mapping,
-            )
-            if anthropic_response is not None:
-                return anthropic_response
-            raise ValueError("Failed to transform response to Anthropic format")
+        return LiteLLMMessagesToCompletionTransformationHandler._transform_completion_response(
+            completion_response,
+            model=model,
+            stream=stream,
+            tool_name_mapping=tool_name_mapping,
+        )
 
     @staticmethod
     def anthropic_messages_handler(
@@ -343,22 +385,9 @@ class LiteLLMMessagesToCompletionTransformationHandler:
 
         completion_response = litellm.completion(**completion_kwargs)
 
-        if stream:
-            transformed_stream = (
-                ANTHROPIC_ADAPTER.translate_completion_output_params_streaming(
-                    completion_response,
-                    model=model,
-                    tool_name_mapping=tool_name_mapping,
-                )
-            )
-            if transformed_stream is not None:
-                return transformed_stream
-            raise ValueError("Failed to transform streaming response")
-        else:
-            anthropic_response = ANTHROPIC_ADAPTER.translate_completion_output_params(
-                cast(ModelResponse, completion_response),
-                tool_name_mapping=tool_name_mapping,
-            )
-            if anthropic_response is not None:
-                return anthropic_response
-            raise ValueError("Failed to transform response to Anthropic format")
+        return LiteLLMMessagesToCompletionTransformationHandler._transform_completion_response(
+            completion_response,
+            model=model,
+            stream=stream,
+            tool_name_mapping=tool_name_mapping,
+        )
