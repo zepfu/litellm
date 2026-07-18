@@ -3,12 +3,8 @@
 
 from __future__ import annotations
 
-from litellm.secret_managers.credential_file_lock import credential_file_lock
-
 import json
 import os
-import re
-import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -18,18 +14,45 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+from litellm.secret_managers.credential_file_lock import credential_file_lock
+from litellm.secret_managers.credential_file_metadata import (
+    CredentialFileMetadata,
+    apply_credential_file_metadata,
+    resolve_credential_file_metadata,
+    snapshot_credential_file_metadata,
+)
+from litellm.secret_managers.credential_file_write import (
+    CredentialPathIsSymlinkError,
+    write_and_publish_private_text,
+    write_private_file_text,
+)
+
+from litellm.secret_managers.credential_error_sanitizer import (
+    DEFAULT_SECRET_FIELD_NAMES,
+    sanitize_credential_error_message,
+)
+
 DEFAULT_GROK_OIDC_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_GROK_OIDC_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 DEFAULT_GROK_OIDC_REFRESH_BUFFER_SECONDS = 300
 DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_GROK_OIDC_AUTH_FILE_MODE = 0o600
+DEFAULT_GROK_OIDC_ERROR_MESSAGE_LIMIT = 500
 
-_SECRET_FIELD_NAMES = {
-    "access_token",
-    "client_secret",
-    "id_token",
-    "key",
-    "refresh_token",
-}
+# Alias keeps existing tests/callers that construct the private name.
+_CredentialFileMetadata = CredentialFileMetadata
+
+# Keep historical module alias; redaction lives in secret_managers.
+_SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
+
+# Re-export for tests/callers that need the shared symlink refusal type.
+__all__ = (
+    "CredentialPathIsSymlinkError",
+    "GrokOidcMetadataRepairSummary",
+    "GrokOidcRefreshSummary",
+    "refresh_grok_oidc_auth_file",
+    "repair_grok_oidc_auth_file_metadata",
+)
 
 
 @dataclass(frozen=True)
@@ -75,23 +98,14 @@ class GrokOidcMetadataRepairSummary:
 
 
 def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
-    """Create/write path with restrictive mode at creation time (no umask window)."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(str(path), flags, mode)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-    except Exception:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        raise
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
-
+    """Thin wrapper over shared private write (no umask window, symlink-safe)."""
+    write_private_file_text(
+        path,
+        content,
+        mode=mode,
+        default_mode=DEFAULT_GROK_OIDC_AUTH_FILE_MODE,
+        refuse_symlink=True,
+    )
 
 
 def refresh_grok_oidc_auth_file(
@@ -226,27 +240,51 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
 
 @contextmanager
 def _credential_file_lock(lock_path: Path) -> Iterator[None]:
-    """Delegate to shared credential_file_lock (fcntl + warning on failure)."""
+    """Delegate to shared credential_file_lock (module-scoped fcntl + warnings)."""
     with credential_file_lock(lock_path):
         yield
 
-    handle = lock_path.open("a+", encoding="utf-8")
-    try:
-        try:
-            import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
-        yield
-    finally:
-        try:
-            import fcntl
+def _snapshot_credential_file_metadata(
+    credential_path: Path,
+) -> CredentialFileMetadata:
+    """Delegate to shared snapshot helper (RR-075 residual #3)."""
+    return snapshot_credential_file_metadata(
+        credential_path,
+        default_mode=DEFAULT_GROK_OIDC_AUTH_FILE_MODE,
+        refuse_symlink=True,
+    )
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except (ImportError, OSError):
-            pass
-        handle.close()
+
+def _resolve_credential_file_metadata(credential_path: Path) -> CredentialFileMetadata:
+    """Delegate to shared resolve helper with Grok env names.
+
+    Snapshot goes through ``_snapshot_credential_file_metadata`` so tests and
+    operators can monkeypatch ownership without forking the shared module.
+    Symlink targets are refused during snapshot/resolve.
+    """
+    return resolve_credential_file_metadata(
+        credential_path,
+        default_mode=DEFAULT_GROK_OIDC_AUTH_FILE_MODE,
+        mode_env="AAWM_GROK_OIDC_AUTH_FILE_MODE",
+        uid_env="AAWM_GROK_OIDC_AUTH_FILE_UID",
+        gid_env="AAWM_GROK_OIDC_AUTH_FILE_GID",
+        base_metadata=_snapshot_credential_file_metadata(credential_path),
+        refuse_symlink=True,
+    )
+
+
+def _apply_credential_file_metadata(
+    target_path: Path,
+    metadata: CredentialFileMetadata,
+) -> None:
+    """Delegate to shared apply helper (mode clamp + ownership safety)."""
+    apply_credential_file_metadata(
+        target_path,
+        metadata,
+        default_mode=DEFAULT_GROK_OIDC_AUTH_FILE_MODE,
+        refuse_symlink=True,
+    )
 
 
 def _read_credential_payload(credential_path: Path) -> Dict[str, Any]:
@@ -279,16 +317,12 @@ def _select_credential_record(payload: Mapping[str, Any], scope: str) -> Dict[st
         if isinstance(value, dict) and _looks_like_credential_record(value):
             return value
 
-    raise ValueError(
-        "Grok OIDC auth file does not contain a usable credential record."
-    )
+    raise ValueError("Grok OIDC auth file does not contain a usable credential record.")
 
 
 def _looks_like_credential_record(value: Mapping[str, Any]) -> bool:
     return bool(
-        value.get("key")
-        or value.get("access_token")
-        or value.get("refresh_token")
+        value.get("key") or value.get("access_token") or value.get("refresh_token")
     )
 
 
@@ -297,12 +331,15 @@ def _credential_needs_refresh(
     *,
     buffer_seconds: int,
 ) -> bool:
+    """Return True when the credential should not be used as-is.
+
+    Missing or unparseable ``expires_at`` fails safe toward refresh (not
+    permanently fresh).
+    """
     expires_at = _parse_expires_at(credential.get("expires_at"))
     if expires_at is None:
-        return False
-    return datetime.now(timezone.utc) >= expires_at - timedelta(
-        seconds=buffer_seconds
-    )
+        return True
+    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=buffer_seconds)
 
 
 def _parse_expires_at(value: Any) -> Optional[datetime]:
@@ -362,7 +399,10 @@ def _refresh_credential_record(
         or credential.get("token_endpoint")
         or DEFAULT_GROK_OIDC_TOKEN_ENDPOINT
     )
-    if not isinstance(resolved_token_endpoint, str) or not resolved_token_endpoint.strip():
+    if (
+        not isinstance(resolved_token_endpoint, str)
+        or not resolved_token_endpoint.strip()
+    ):
         raise ValueError("Grok OIDC token endpoint is missing.")
 
     form_data = {
@@ -390,7 +430,9 @@ def _refresh_credential_record(
         with urllib_request.urlopen(request, timeout=http_timeout_seconds) as response:
             response_body = response.read().decode("utf-8")
     except urllib_error.HTTPError as exc:
-        error_hint = _extract_oauth_error_hint(exc.read().decode("utf-8", errors="replace"))
+        error_hint = _extract_oauth_error_hint(
+            exc.read().decode("utf-8", errors="replace")
+        )
         raise ValueError(
             "Grok OIDC credential refresh failed"
             + (f" ({error_hint})" if error_hint else "")
@@ -404,9 +446,7 @@ def _refresh_credential_record(
     try:
         payload = json.loads(response_body)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            "Grok OIDC token endpoint returned invalid JSON."
-        ) from exc
+        raise ValueError("Grok OIDC token endpoint returned invalid JSON.") from exc
 
     if not isinstance(payload, dict):
         raise ValueError("Grok OIDC token endpoint returned a non-object payload.")
@@ -454,112 +494,27 @@ def _update_credential_record(
         credential["token_type"] = token_type.strip()
 
 
-DEFAULT_GROK_OIDC_AUTH_FILE_MODE = 0o600
-
-
-@dataclass(frozen=True)
-class _CredentialFileMetadata:
-    uid: Optional[int]
-    gid: Optional[int]
-    mode: int
-
-
-def _parse_optional_positive_int(value: Optional[str]) -> Optional[int]:
-    if value is None or not str(value).strip():
-        return None
-    try:
-        parsed = int(str(value).strip(), 0)
-    except ValueError:
-        return None
-    return parsed if parsed >= 0 else None
-
-
-def _resolve_credential_file_mode_override() -> Optional[int]:
-    mode = _parse_optional_positive_int(
-        os.getenv("AAWM_GROK_OIDC_AUTH_FILE_MODE")
-    )
-    if mode is None:
-        return None
-    # Keep credential files user-private; never widen beyond the default.
-    mode = mode & 0o777
-    if mode & 0o077:
-        return DEFAULT_GROK_OIDC_AUTH_FILE_MODE
-    return mode
-
-
-def _resolve_credential_file_metadata(credential_path: Path) -> _CredentialFileMetadata:
-    metadata = _snapshot_credential_file_metadata(credential_path)
-    uid_override = _parse_optional_positive_int(
-        os.getenv("AAWM_GROK_OIDC_AUTH_FILE_UID")
-    )
-    gid_override = _parse_optional_positive_int(
-        os.getenv("AAWM_GROK_OIDC_AUTH_FILE_GID")
-    )
-    mode_override = _resolve_credential_file_mode_override()
-    mode = mode_override if mode_override is not None else metadata.mode
-    if mode & 0o077:
-        mode = DEFAULT_GROK_OIDC_AUTH_FILE_MODE
-    return _CredentialFileMetadata(
-        uid=uid_override if uid_override is not None else metadata.uid,
-        gid=gid_override if gid_override is not None else metadata.gid,
-        mode=mode,
-    )
-
-
-def _snapshot_credential_file_metadata(credential_path: Path) -> _CredentialFileMetadata:
-    if not credential_path.exists():
-        return _CredentialFileMetadata(
-            uid=None,
-            gid=None,
-            mode=DEFAULT_GROK_OIDC_AUTH_FILE_MODE,
-        )
-    file_stat = credential_path.stat()
-    return _CredentialFileMetadata(
-        uid=file_stat.st_uid,
-        gid=file_stat.st_gid,
-        mode=stat.S_IMODE(file_stat.st_mode),
-    )
-
-
-def _apply_credential_file_metadata(
-    target_path: Path,
-    metadata: _CredentialFileMetadata,
+def _write_credential_payload(
+    credential_path: Path, payload: Mapping[str, Any]
 ) -> None:
-    if metadata.uid is not None or metadata.gid is not None:
-        os.chown(
-            target_path,
-            metadata.uid if metadata.uid is not None else -1,
-            metadata.gid if metadata.gid is not None else -1,
-        )
-    os.chmod(target_path, metadata.mode)
+    """Publish credential JSON via shared exclusive temp + atomic replace.
 
-
-def _write_credential_payload(credential_path: Path, payload: Mapping[str, Any]) -> None:
-    credential_path.parent.mkdir(parents=True, exist_ok=True)
+    Uses ``write_and_publish_private_text`` so temp names are not pid-only,
+    symlink targets are refused, and failed temps are cleaned up consistently.
+    """
     metadata = _resolve_credential_file_metadata(credential_path)
-    tmp_path = credential_path.with_name(
-        f".{credential_path.name}.{os.getpid()}.tmp"
+    content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    write_and_publish_private_text(
+        credential_path,
+        content,
+        metadata=metadata,
+        default_mode=DEFAULT_GROK_OIDC_AUTH_FILE_MODE,
+        mkdir_parents=True,
     )
-    try:
-        content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-        mode = metadata.mode if not (metadata.mode & 0o077) else 0o600
-        _write_private_file_text(tmp_path, content, mode=mode)
-        _apply_credential_file_metadata(tmp_path, metadata)
-        os.replace(tmp_path, credential_path)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
 
 
-def _sanitize_error_message(message: str) -> str:
-    sanitized = message
-    for field_name in _SECRET_FIELD_NAMES:
-        sanitized = re.sub(
-            rf"(?i)\b{re.escape(field_name)}\b\s*[:=]\s*\S+",
-            f"{field_name}=[REDACTED]",
-            sanitized,
-        )
-    return sanitized
+def _sanitize_error_message(
+    message: str, *, limit: int = DEFAULT_GROK_OIDC_ERROR_MESSAGE_LIMIT
+) -> str:
+    """Redact secret *values* keyed by known field names (not just the labels)."""
+    return sanitize_credential_error_message(message, limit=limit)

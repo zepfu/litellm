@@ -55,7 +55,10 @@ Relevant environment variables:
   replacement.
 - `AAWM_GROK_OIDC_AUTH_FILE_MODE`: optional private file mode applied to the
   atomic auth-file replacement. Group/other-readable or writable values are
-  rejected and fall back to `0600`.
+  rejected and fall back to `0600`. Ownership/mode snapshot, resolve, and apply
+  for this refresh path use the shared helpers in
+  `litellm/secret_managers/credential_file_metadata.py` (same clamp/ownership
+  safety as the Codex/xAI refresh scripts).
 - `AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS`: minimum seconds between attempts.
 - `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS`: near-expiry window for non-forced
   refreshes.

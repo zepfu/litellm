@@ -38,9 +38,7 @@ def test_refresh_grok_oidc_auth_file_skips_when_credential_is_still_valid(
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(
         json.dumps(
-            _scoped_payload(
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=2)
-            )
+            _scoped_payload(expires_at=datetime.now(timezone.utc) + timedelta(hours=2))
         ),
         encoding="utf-8",
     )
@@ -142,9 +140,7 @@ def test_refresh_grok_oidc_auth_file_force_true_refreshes_even_when_valid(
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(
         json.dumps(
-            _scoped_payload(
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=2)
-            )
+            _scoped_payload(expires_at=datetime.now(timezone.utc) + timedelta(hours=2))
         ),
         encoding="utf-8",
     )
@@ -164,7 +160,9 @@ def test_refresh_grok_oidc_auth_file_force_true_refreshes_even_when_valid(
         def __exit__(self, exc_type, exc, tb) -> None:
             return None
 
-    monkeypatch.setattr(refresh.urllib_request, "urlopen", lambda *_a, **_k: FakeResponse())
+    monkeypatch.setattr(
+        refresh.urllib_request, "urlopen", lambda *_a, **_k: FakeResponse()
+    )
 
     summary = refresh.refresh_grok_oidc_auth_file(auth_path, force=True)
 
@@ -186,9 +184,7 @@ def test_refresh_grok_oidc_auth_file_missing_refresh_token_does_not_leak_secrets
                 refresh.DEFAULT_GROK_OIDC_SCOPE: {
                     "key": "old-access-token",
                     "access_token": "old-access-token",
-                    "expires_at": (
-                        datetime.now(timezone.utc) + timedelta(seconds=30)
-                    )
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=30))
                     .isoformat()
                     .replace("+00:00", "Z"),
                     "oidc_client_id": "client-id",
@@ -223,9 +219,7 @@ def test_refresh_grok_oidc_auth_file_missing_client_id_does_not_leak_secrets(
                     "key": "old-access-token",
                     "access_token": "old-access-token",
                     "refresh_token": "old-refresh-token",
-                    "expires_at": (
-                        datetime.now(timezone.utc) + timedelta(seconds=30)
-                    )
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=30))
                     .isoformat()
                     .replace("+00:00", "Z"),
                 }
@@ -261,7 +255,6 @@ def test_refresh_grok_oidc_auth_file_sanitizes_http_error_payload(
         encoding="utf-8",
     )
     auth_path.chmod(0o640)
-    initial_mode = stat.S_IMODE(auth_path.stat().st_mode)
 
     class FakeHTTPError(urllib_error.HTTPError):
         def read(self) -> bytes:
@@ -310,8 +303,14 @@ def test_write_credential_payload_preserves_existing_uid_gid_and_clamps_unsafe_m
         chmod_calls.append((os.fspath(target), mode))
         real_chmod(target, mode, *args, **kwargs)
 
-    monkeypatch.setattr(refresh.os, "chown", fake_chown)
-    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chown",
+        fake_chown,
+    )
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chmod",
+        fake_chmod,
+    )
     monkeypatch.setattr(
         refresh,
         "_snapshot_credential_file_metadata",
@@ -320,13 +319,16 @@ def test_write_credential_payload_preserves_existing_uid_gid_and_clamps_unsafe_m
 
     refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
 
-    assert json.loads(auth_path.read_text(encoding="utf-8")) == {"scope": {"key": "new"}}
+    assert json.loads(auth_path.read_text(encoding="utf-8")) == {
+        "scope": {"key": "new"}
+    }
     assert len(chown_calls) == 1
     assert chown_calls[0][0] != str(auth_path)
     assert chown_calls[0][1:] == (1001, 1002)
-    assert len(chmod_calls) == 1
-    assert chmod_calls[0][0] != str(auth_path)
-    assert chmod_calls[0][1] == 0o600
+    # Shared publish may chmod temp at create and again during metadata apply.
+    assert len(chmod_calls) >= 1
+    assert all(path != str(auth_path) for path, _mode in chmod_calls)
+    assert all(mode == 0o600 for _path, mode in chmod_calls)
     if os.name != "nt":
         assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
 
@@ -345,7 +347,10 @@ def test_write_credential_payload_env_uid_gid_override_existing_bad_owner(
 
     monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_UID", "1001")
     monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_GID", "1002")
-    monkeypatch.setattr(refresh.os, "chown", fake_chown)
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chown",
+        fake_chown,
+    )
     monkeypatch.setattr(
         refresh,
         "_snapshot_credential_file_metadata",
@@ -354,7 +359,9 @@ def test_write_credential_payload_env_uid_gid_override_existing_bad_owner(
 
     refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
 
-    assert json.loads(auth_path.read_text(encoding="utf-8")) == {"scope": {"key": "new"}}
+    assert json.loads(auth_path.read_text(encoding="utf-8")) == {
+        "scope": {"key": "new"}
+    }
     assert len(chown_calls) == 1
     assert chown_calls[0][1:] == (1001, 1002)
 
@@ -375,14 +382,18 @@ def test_write_credential_payload_uses_conservative_mode_for_new_file(
     monkeypatch.delenv("AAWM_GROK_OIDC_AUTH_FILE_MODE", raising=False)
     monkeypatch.delenv("AAWM_GROK_OIDC_AUTH_FILE_UID", raising=False)
     monkeypatch.delenv("AAWM_GROK_OIDC_AUTH_FILE_GID", raising=False)
-    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chmod",
+        fake_chmod,
+    )
 
     refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
 
     assert auth_path.exists()
-    assert len(chmod_calls) == 1
-    assert chmod_calls[0][0] != str(auth_path)
-    assert chmod_calls[0][1] == 0o600
+    # Shared publish may chmod temp at create and again during metadata apply.
+    assert len(chmod_calls) >= 1
+    assert all(path != str(auth_path) for path, _mode in chmod_calls)
+    assert all(mode == 0o600 for _path, mode in chmod_calls)
     if os.name != "nt":
         assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
 
@@ -407,15 +418,21 @@ def test_write_credential_payload_honors_optional_new_file_metadata_env(
     monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_UID", "1001")
     monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_GID", "1002")
     monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_MODE", "0o600")
-    monkeypatch.setattr(refresh.os, "chown", fake_chown)
-    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chown",
+        fake_chown,
+    )
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chmod",
+        fake_chmod,
+    )
 
     refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
 
     assert len(chown_calls) == 1
     assert chown_calls[0][1:] == (1001, 1002)
-    assert len(chmod_calls) == 1
-    assert chmod_calls[0][1] == 0o600
+    assert len(chmod_calls) >= 1
+    assert all(mode == 0o600 for _path, mode in chmod_calls)
 
 
 def test_write_credential_payload_rejects_wide_env_mode(
@@ -431,12 +448,15 @@ def test_write_credential_payload_rejects_wide_env_mode(
         real_chmod(target, mode, *args, **kwargs)
 
     monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_MODE", "0o640")
-    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chmod",
+        fake_chmod,
+    )
 
     refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
 
-    assert len(chmod_calls) == 1
-    assert chmod_calls[0][1] == 0o600
+    assert len(chmod_calls) >= 1
+    assert all(mode == 0o600 for _path, mode in chmod_calls)
     if os.name != "nt":
         assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
 
@@ -456,12 +476,17 @@ def test_write_credential_payload_preserves_existing_private_mode(
         chmod_calls.append((os.fspath(target), mode))
         real_chmod(target, mode, *args, **kwargs)
 
-    monkeypatch.setattr(refresh.os, "chmod", fake_chmod)
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chmod",
+        fake_chmod,
+    )
 
     refresh._write_credential_payload(auth_path, {"scope": {"key": "new"}})
 
-    assert len(chmod_calls) == 1
-    assert chmod_calls[0][1] == 0o400
+    # Shared publish may chmod temp at create and again during metadata apply.
+    assert len(chmod_calls) >= 1
+    assert all(path != str(auth_path) for path, _mode in chmod_calls)
+    assert all(mode == 0o400 for _path, mode in chmod_calls)
     if os.name != "nt":
         assert stat.S_IMODE(auth_path.stat().st_mode) == 0o400
 
@@ -479,7 +504,10 @@ def test_repair_grok_oidc_auth_file_metadata_applies_env_overrides(
 
     monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_UID", "1001")
     monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE_GID", "1002")
-    monkeypatch.setattr(refresh.os, "chown", fake_chown)
+    monkeypatch.setattr(
+        "litellm.secret_managers.credential_file_metadata.os.chown",
+        fake_chown,
+    )
     monkeypatch.setattr(
         refresh,
         "_snapshot_credential_file_metadata",
