@@ -466,6 +466,49 @@ Console summary includes `database`, `target_db_name`, `projects_dir`,
 `memories_dir`, `session_evidence_limit_per_session`, `candidate_rows`,
 `repairable_rows`, `classified_unresolved_rows`, and `applied`.
 
+## Claude Auto-Review Permission-Check Backfill
+
+Historical Claude Code Bash/tool permission-classifier rows may have been
+stored under raw Anthropic model ids (`claude-opus-4-7`, `claude-opus-4-7[1m]`)
+instead of the logical reporting alias `claude-auto-review`.
+
+Use:
+
+```bash
+# Dry-run preview (default; no writes)
+./.venv/bin/python scripts/backfill_claude_auto_review_session_history.py \
+  [--since <iso>] [--session-limit N]
+
+# Apply updates in UPDATE batches
+./.venv/bin/python scripts/backfill_claude_auto_review_session_history.py \
+  --apply [--since <iso>] [--session-limit N] [--apply-batch-size N]
+```
+
+Operator contract:
+
+- `--session-limit` (legacy alias `--limit`) caps distinct affected
+  `session_id` values, not returned row count. For each selected session the
+  script loads every `session_history` row in a widened window
+  (`created_at >= since - 30 minutes`) so non-permission rows can supply
+  project identity.
+- Permission-check rows inherit `repository` / `tenant_id` from the
+  **nearest-in-time** non-permission row in the same `session_id` (not a single
+  last-write-wins identity for the whole session). Equidistant before/after
+  candidates prefer the earlier (at-or-before) row.
+- Project identity for non-permission source rows uses one ordered cascade
+  local to this script: `row.repository` → `claude-project:` tag →
+  `metadata.aawm_claude_project` → `metadata.repository` → `row.tenant_id` →
+  `metadata.tenant_id`. First-match selection is delegated to
+  `litellm.integrations.aawm_session_history.identity_selection.select_first_identity`
+  so sibling repair/backfill scripts share the same ordered-selection contract
+  without forcing a single field-policy cascade.
+- `--apply` issues chunked `UPDATE` batches (`--apply-batch-size`, default
+  200) so large session windows do not rely on one unbatched `executemany`
+  under the 30s command timeout.
+- Omit `--apply` for dry-run JSON stats (`selected_rows`, `repaired_rows`,
+  `session_limit`, `apply_batch_size`, identity counts). Prefer dry-run proof
+  before any live apply.
+
 ## Local CLI Transcript Backfill
 
 `scripts/backfill_local_cli_session_history.py` imports historical Claude,
