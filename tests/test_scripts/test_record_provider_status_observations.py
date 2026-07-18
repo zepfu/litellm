@@ -3229,11 +3229,12 @@ def test_refresh_codex_oauth_auth_file_reports_missing_refresh_token(
     tmp_path,
 ) -> None:
     auth_path = tmp_path / "auth.json"
+    expired_access_token = _build_test_jwt({"exp": int(time.time()) - 60})
     auth_path.write_text(
         json.dumps(
             {
                 "tokens": {
-                    "access_token": _build_test_jwt({"exp": int(time.time()) - 60}),
+                    "access_token": expired_access_token,
                 },
             }
         ),
@@ -3250,7 +3251,11 @@ def test_refresh_codex_oauth_auth_file_reports_missing_refresh_token(
     assert summary["refreshed"] is False
     assert summary["skipped"] is False
     assert summary["error_class"] == "ValueError"
-    assert "refresh_token" not in summary["error_message"]
+    # Shared sanitizer redacts secret values (access_token=...), not field
+    # labels in explanatory messages such as "has no refresh_token".
+    err = summary["error_message"] or ""
+    assert expired_access_token not in err
+    assert "does not contain a refresh_token" in err
 
 
 def test_refresh_xai_oauth_auth_file_writes_direct_response(
@@ -3350,7 +3355,11 @@ def test_refresh_xai_oauth_auth_file_reports_missing_refresh_token(tmp_path) -> 
     assert summary["refreshed"] is False
     assert summary["skipped"] is False
     assert summary["error_class"] == "ValueError"
-    assert "refresh_token" not in summary["error_message"]
+    # Shared sanitizer redacts secret *values* (access_token=...), not field
+    # labels in explanatory messages such as "has no refresh_token".
+    err = summary["error_message"] or ""
+    assert "expired-xai-token" not in err
+    assert "has no refresh_token" in err
 
 
 def _grok_oidc_auth_persist_config(**overrides):

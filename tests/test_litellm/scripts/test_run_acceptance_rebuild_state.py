@@ -199,15 +199,37 @@ def test_fingerprint_exclude_logic_skips_sample_paths() -> None:
         assert f'"{prefix}"' in block or f"'{prefix}'" in block
 
 
-def test_agent_identity_wheel_parity_script_exists() -> None:
+def test_agent_identity_wheel_single_source_packaging_guard_exists() -> None:
+    """RR-003: packaging guard asserts thin loader + hatch force-include."""
+    import subprocess
+    import sys
+
     sync = _REPO / "scripts" / "sync_aawm_agent_identity_to_wheel.py"
     assert sync.is_file()
-    wheel = (
+    loader = (
         _REPO
         / ".wheel-build"
         / "aawm_litellm_callbacks"
         / "agent_identity.py"
     )
     canonical = _REPO / "litellm" / "integrations" / "aawm_agent_identity.py"
-    assert wheel.is_file() and canonical.is_file()
-    assert wheel.read_bytes() == canonical.read_bytes()
+    pyproject = _REPO / ".wheel-build" / "pyproject.toml"
+    assert loader.is_file() and canonical.is_file() and pyproject.is_file()
+    assert loader.read_bytes() != canonical.read_bytes()
+    assert "class AawmAgentIdentity" not in loader.read_text(encoding="utf-8")
+    packaging = pyproject.read_text(encoding="utf-8")
+    assert (
+        '"../litellm/integrations/aawm_agent_identity.py" = '
+        '"aawm_litellm_callbacks/agent_identity.py"'
+    ) in packaging
+    completed = subprocess.run(
+        [sys.executable, str(sync), "--check"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO),
+    )
+    assert completed.returncode == 0, (
+        f"single-source packaging guard failed:\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )

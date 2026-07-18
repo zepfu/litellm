@@ -306,10 +306,20 @@ def test_sync_wrapper_keeps_queued_chunks_instance_scoped():
         tool_name_mapping={"read_file": "Read"},
     )
 
+    # Anthropic tool_use contract: content_block_start -> input_json_delta(s)
+    # -> content_block_stop. Skipping the delta would drop tool arguments.
     assert next(first_wrapper)["type"] == "message_start"
-    assert next(first_wrapper)["type"] == "content_block_start"
+    start_chunk = next(first_wrapper)
+    assert start_chunk["type"] == "content_block_start"
+    assert start_chunk["content_block"]["type"] == "tool_use"
+    assert start_chunk["content_block"]["name"] == "Read"
+    delta_chunk = next(first_wrapper)
+    assert delta_chunk["type"] == "content_block_delta"
+    assert delta_chunk["delta"]["type"] == "input_json_delta"
+    assert '"file_path"' in delta_chunk["delta"]["partial_json"]
     assert next(first_wrapper)["type"] == "content_block_stop"
 
+    # Instance isolation: a second wrapper must not observe first_wrapper's queue.
     second_wrapper = AnthropicStreamWrapper(
         completion_stream=MockCompletionStream(), model="claude-3"
     )

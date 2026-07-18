@@ -2662,7 +2662,9 @@ def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):
         }
     }
     assert "AAWM_DB_PASSWORD" not in captured["settings"]["env"]
-    assert captured["env"]["AAWM_DB_PASSWORD"] == "not-written-to-settings"
+    # RR-080 child-env scrubbing intentionally drops AAWM_DB_* secrets from the
+    # subprocess env; only Anthropic overlay keys land in --settings JSON.
+    assert "AAWM_DB_PASSWORD" not in captured["env"]
     assert not captured["settings_path"].exists()
     assert result["command"] == captured["command"]
 

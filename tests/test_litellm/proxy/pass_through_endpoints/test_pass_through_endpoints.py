@@ -249,18 +249,31 @@ def test_request_shape_422_classification_skips_unrelated_responses_422():
     )
 
 
-def test_aawm_error_log_context_allowlist_preserves_request_shape_fields():
-    required_fields = {
+def test_aawm_error_log_context_allowlist_preserves_request_shape_fields(monkeypatch):
+    """Structural request-shape fields persist by default; body-preview needs opt-in."""
+    from litellm._logging import (
+        _AAWM_ERROR_LOG_CONTENT_BEARING_CONTEXT_FIELDS,
+        _AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS,
+    )
+
+    structural_fields = {
         "aawm_passthrough_request_shape_error_class",
         "aawm_passthrough_request_shape_error_message_class",
-        "aawm_passthrough_request_shape_error_body_preview",
         "aawm_passthrough_request_shape_summary",
         "aawm_passthrough_request_shape_fingerprint",
         "aawm_passthrough_request_shape_error_fingerprint",
         "aawm_passthrough_input_item_shape_samples",
         "failure_kind",
     }
-    assert required_fields.issubset(set(_AAWM_ERROR_LOG_CONTEXT_FIELDS))
+    content_fields = {
+        "aawm_passthrough_request_shape_error_body_preview",
+    }
+
+    # Full catalog still names content-bearing fields for discovery/opt-in.
+    assert structural_fields.issubset(set(_AAWM_ERROR_LOG_CONTEXT_FIELDS))
+    assert content_fields.issubset(set(_AAWM_ERROR_LOG_CONTEXT_FIELDS))
+    assert content_fields.issubset(set(_AAWM_ERROR_LOG_CONTENT_BEARING_CONTEXT_FIELDS))
+    assert not content_fields.intersection(set(_AAWM_ERROR_LOG_DEFAULT_CONTEXT_FIELDS))
 
     record = logging.LogRecord(
         name="litellm.proxy",
@@ -271,12 +284,24 @@ def test_aawm_error_log_context_allowlist_preserves_request_shape_fields():
         args=(),
         exc_info=None,
     )
-    for field_name in required_fields:
+    for field_name in structural_fields | content_fields:
         setattr(record, field_name, field_name)
-    built = _build_aawm_error_log_record(record, formatter=logging.Formatter())
-    context = built["context"]
-    for field_name in required_fields:
-        assert context[field_name] == field_name
+
+    monkeypatch.delenv("LITELLM_AAWM_ERROR_LOG_INCLUDE_CONTENT_FIELDS", raising=False)
+    default_context = _build_aawm_error_log_record(
+        record, formatter=logging.Formatter()
+    )["context"]
+    for field_name in structural_fields:
+        assert default_context[field_name] == field_name
+    for field_name in content_fields:
+        assert field_name not in default_context
+
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_INCLUDE_CONTENT_FIELDS", "1")
+    opt_in_context = _build_aawm_error_log_record(
+        record, formatter=logging.Formatter()
+    )["context"]
+    for field_name in structural_fields | content_fields:
+        assert opt_in_context[field_name] == field_name
 
 
 def test_passthrough_input_item_shape_samples_capture_head_and_tail_without_values():
@@ -4178,7 +4203,27 @@ class TestPassThroughTerminalFailureLogging:
         return saved_handlers, saved_level, saved_propagate
 
     @staticmethod
+    def _flush_aawm_error_log_handlers() -> None:
+        """Drain async AAWM error-log writers before asserting on disk files."""
+        for current_handler in list(verbose_proxy_logger.handlers):
+            flush = getattr(current_handler, "flush", None)
+            if callable(flush):
+                try:
+                    flush()
+                except Exception:
+                    pass
+
+    @staticmethod
     def _restore_verbose_proxy_logger(saved_handlers, saved_level, saved_propagate):
+        # RR-004/async error log: flush before detaching so tests can read jsonl.
+        TestPassThroughTerminalFailureLogging._flush_aawm_error_log_handlers()
+        for current_handler in list(verbose_proxy_logger.handlers):
+            close = getattr(current_handler, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         verbose_proxy_logger.handlers.clear()
         for saved_handler in saved_handlers:
             verbose_proxy_logger.addHandler(saved_handler)
@@ -5963,6 +6008,8 @@ class TestPassThroughTerminalFailureLogging:
         upstream_detail = '{"error":"grok signals authorization failed"}'
         fixture = self._build_grok_signals_401_fixture(upstream_detail)
         handler = AsyncMock(return_value=fixture["upstream_response"])
+        # digest_source is content-bearing and only persisted when explicitly enabled.
+        monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_INCLUDE_CONTENT_FIELDS", "1")
         (
             saved_handlers,
             saved_level,

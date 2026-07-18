@@ -36,12 +36,35 @@ def _session_history_insert_placeholder_count() -> int:
     values_clause = sql.split("VALUES", 1)[1].split("ON CONFLICT", 1)[0]
     return max(int(match) for match in re.findall(r"\$(\d+)", values_clause))
 
-def test_aawm_agent_identity_callback_overlay_matches_source() -> None:
+def test_aawm_agent_identity_callback_overlay_is_thin_single_source_loader() -> None:
+    """RR-003: checkout overlay is a thin loader; wheel force-includes canonical.
+
+    The published callback wheel packages
+    ``litellm/integrations/aawm_agent_identity.py`` via hatch force-include.
+    ``.wheel-build/aawm_litellm_callbacks/agent_identity.py`` must not be a
+    second full source copy.
+    """
     repo_root = Path(__file__).resolve().parents[3]
     source = repo_root / "litellm/integrations/aawm_agent_identity.py"
     overlay = repo_root / ".wheel-build/aawm_litellm_callbacks/agent_identity.py"
+    pyproject = repo_root / ".wheel-build/pyproject.toml"
 
-    assert overlay.read_text() == source.read_text()
+    assert source.is_file()
+    assert overlay.is_file()
+    overlay_text = overlay.read_text(encoding="utf-8")
+    source_text = source.read_text(encoding="utf-8")
+    assert overlay_text != source_text
+    assert overlay_text.count("\n") + 1 <= 80
+    assert "class AawmAgentIdentity" not in overlay_text
+    assert "Checkout loader for aawm_litellm_callbacks" in overlay_text
+    assert "litellm.integrations.aawm_agent_identity" in overlay_text
+
+    packaging = pyproject.read_text(encoding="utf-8")
+    assert 'build-backend = "hatchling.build"' in packaging
+    assert (
+        '"../litellm/integrations/aawm_agent_identity.py" = '
+        '"aawm_litellm_callbacks/agent_identity.py"'
+    ) in packaging
 
 
 class _FakePoolAcquire:
