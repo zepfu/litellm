@@ -194,6 +194,56 @@ Route rollup headers use the exact display form
 `repo#Client[version]@host`, for example
 `aawm-infrastructure#Codex[0.142.5]@thoth /openai_passthrough/responses`.
 
+### Repairing provider-cache / reasoning / git rollups
+
+When the original proxy spend-log source is unavailable locally, use
+`scripts/repair_session_history_provider_cache.py` to re-derive observability
+fields from stored `session_history` rows plus
+`session_history_tool_activity`:
+
+- normalized `provider`
+- reasoning token source/fields
+- provider-cache status / miss token / miss cost columns and matching
+  `metadata.usage_provider_cache_*` plus `{provider_family}_provider_cache_*`
+  keys (generated from one field catalog)
+- git commit/push rollups
+
+Operator safety (RR-087):
+
+- Default is dry-run (scan + summary only; no writes and no DDL).
+- `--apply` persists repaired column/metadata values.
+- `--ensure-schema` is an **opt-in emergency bootstrap** that applies the shared
+  SQL constants from `aawm_agent_identity` (CREATE/ALTER/INDEX). Schema is
+  migration-owned; do not pass this flag against a live production database
+  unless you intentionally accept the brief ACCESS EXCLUSIVE lock windows.
+- Both `--apply` and `--ensure-schema` refuse to run unless
+  `current_database()` equals `--target-db-name` (default `aawm_tristore`).
+  Pure dry-run may still report a mismatched database name without aborting.
+- Pagination is keyset by `session_history.id` with `--batch-size` (default 500)
+  and optional `--limit` on rows updated after scanning.
+- Git counts are reconciled only when the tool-activity join is complete
+  (`has_tool_activity`). Incomplete joins leave stored counts untouched so an
+  empty join cannot zero real history; complete joins can lower previously
+  over-counted values.
+- Prefer one repair/backfill script at a time against `session_history`; this
+  path still replaces the full `metadata` JSONB document for rows it updates.
+
+```bash
+# Dry-run summary against whatever DSN AAWM_DIRECT_DATABASE_URL / AAWM env resolves
+./.venv/bin/python scripts/repair_session_history_provider_cache.py \
+  --limit 100
+
+# Apply against the exact tristore database only
+./.venv/bin/python scripts/repair_session_history_provider_cache.py \
+  --target-db-name aawm_tristore \
+  --apply \
+  --batch-size 500
+```
+
+JSON output includes `mode`, `database`, `target_db_name`, `ensure_schema`,
+`schema_bootstrapped`, `scanned_rows`, `repaired_rows`, and
+`provider_status_counts`.
+
 ## Repository And Tenant Attribution
 
 `session_history.repository` identifies the workspace or project label used for
