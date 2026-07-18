@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -17,6 +17,11 @@ SCHEMA_VERSION = "1.0.0"
 SUPPORTED_TARGETS = ("dev", "prod")
 SUPPORTED_LANES = ("target-manifest", "session-history")
 LANE_ALLOWLIST = list(SUPPORTED_LANES)
+
+# Session-history marker scan bounds (fail-closed if no match within window).
+DEFAULT_SESSION_HISTORY_ROW_LIMIT = 200
+MAX_SESSION_HISTORY_ROW_LIMIT = 5000
+DEFAULT_SESSION_HISTORY_LOOKBACK_HOURS = 168.0  # 7 days
 
 TARGET_PROFILES: Dict[str, Dict[str, Any]] = {
     "dev": {
@@ -185,10 +190,26 @@ def _marker_sources_for_row(row: Dict[str, Any], marker_id: str) -> List[str]:
     return sources
 
 
+def _release_runbook_path(raw: Optional[str]) -> Optional[Path]:
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        return None
+    return Path(cleaned).expanduser()
+
+
+def _release_runbook_is_file(raw: Optional[str]) -> bool:
+    path = _release_runbook_path(raw)
+    return path is not None and path.is_file()
+
+
 def _prod_checkpoint_missing(args: argparse.Namespace) -> List[str]:
     missing: List[str] = []
     if not (args.release_runbook or "").strip():
         missing.append("release_runbook")
+    elif not _release_runbook_is_file(args.release_runbook):
+        # Fail closed: non-empty path that is missing or not a regular file
+        # does not satisfy the prod checkpoint gate.
+        missing.append("release_runbook_file")
     if not (args.image_tag or "").strip():
         missing.append("image_tag")
     if not (args.callback_wheel or "").strip():
@@ -241,10 +262,16 @@ def _build_manifest(
             "verified_at": datetime.now(timezone.utc).isoformat(),
         },
     }
-    if (args.release_runbook or "").strip():
-        manifest["release_runbook"] = str(
-            Path(args.release_runbook).expanduser().resolve()
-        )
+    runbook_path = _release_runbook_path(args.release_runbook)
+    if runbook_path is not None:
+        # Prefer resolved path when the file exists; otherwise keep expanded path
+        # for diagnostics (prod gate rejects non-files before success paths).
+        if runbook_path.is_file():
+            manifest["release_runbook"] = str(runbook_path.resolve())
+            manifest["release_runbook_exists"] = True
+        else:
+            manifest["release_runbook"] = str(runbook_path)
+            manifest["release_runbook_exists"] = False
     if extra:
         manifest.update(extra)
     return manifest
@@ -319,18 +346,47 @@ def _emit_outputs(
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def query_session_history_row(
+def _session_history_row_limit(raw: Optional[int]) -> int:
+    if raw is None:
+        return DEFAULT_SESSION_HISTORY_ROW_LIMIT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SESSION_HISTORY_ROW_LIMIT
+    if value < 1:
+        return 1
+    if value > MAX_SESSION_HISTORY_ROW_LIMIT:
+        return MAX_SESSION_HISTORY_ROW_LIMIT
+    return value
+
+
+def _session_history_created_after(
     *,
-    dsn: str,
-    db_name: str,
-    marker_id: str,
+    created_after: Optional[str],
+    lookback_hours: Optional[float],
+) -> Optional[datetime]:
+    """Resolve a lower bound for session_history.created_at (UTC, inclusive)."""
+    cleaned = (created_after or "").strip()
+    if cleaned:
+        # Accept trailing Z for ISO-8601 UTC.
+        normalized = cleaned.replace("Z", "+00:00") if cleaned.endswith("Z") else cleaned
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    if lookback_hours is None:
+        return None
+    hours = float(lookback_hours)
+    if hours <= 0:
+        return None
+    return datetime.now(timezone.utc) - timedelta(hours=hours)
+
+
+def _session_history_lookups(
     session_id: Optional[str],
     trace_id: Optional[str],
     litellm_call_id: Optional[str],
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    import psycopg
-    import psycopg.rows
-
+) -> List[Tuple[str, str]]:
     lookups: List[Tuple[str, str]] = []
     if session_id:
         lookups.append(("session_id", session_id))
@@ -338,8 +394,20 @@ def query_session_history_row(
         lookups.append(("trace_id", trace_id))
     if litellm_call_id:
         lookups.append(("litellm_call_id", litellm_call_id))
-    if not lookups:
-        return None, db_name
+    return lookups
+
+
+def _fetch_session_history_candidates(
+    *,
+    dsn: str,
+    lookups: Sequence[Tuple[str, str]],
+    row_limit: int,
+    created_after: Optional[datetime],
+) -> List[Dict[str, Any]]:
+    import psycopg
+    import psycopg.rows
+
+    limit = _session_history_row_limit(row_limit)
     select_sql = """
         SELECT
             id,
@@ -355,37 +423,115 @@ def query_session_history_row(
             metadata
         FROM public.session_history
     """
-    order_sql = "ORDER BY created_at DESC LIMIT 10"
+    # Bound by time window (when provided) plus a configurable LIMIT so long-lived
+    # shared session_ids are not truncated by an arbitrary top-10 DESC scan.
+    order_sql = f"ORDER BY created_at DESC LIMIT {limit}"
     rows: List[Dict[str, Any]] = []
     with psycopg.connect(dsn, row_factory=psycopg.rows.dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute("SET search_path TO public")
             for field, value in lookups:
-                cur.execute(
-                    f"{select_sql} WHERE {field} = %s {order_sql}",
-                    [value],
-                )
+                if created_after is not None:
+                    cur.execute(
+                        f"{select_sql} WHERE {field} = %s AND created_at >= %s {order_sql}",
+                        [value, created_after],
+                    )
+                else:
+                    cur.execute(
+                        f"{select_sql} WHERE {field} = %s {order_sql}",
+                        [value],
+                    )
                 rows.extend(dict(row) for row in cur.fetchall())
-    selected: Optional[Dict[str, Any]] = None
-    marker_sources: List[str] = []
+    return rows
+
+
+def _select_marker_session_history_row(
+    rows: Sequence[Dict[str, Any]],
+    marker_id: str,
+    db_name: str,
+) -> Optional[Dict[str, Any]]:
     for candidate in rows:
         candidate_row = dict(candidate)
-        candidate_sources = _marker_sources_for_row(candidate_row, marker_id)
-        if candidate_sources:
-            selected = candidate_row
-            marker_sources = candidate_sources
-            break
-    if selected is None:
+        marker_sources = _marker_sources_for_row(candidate_row, marker_id)
+        if not marker_sources:
+            continue
+        candidate_row["target_db_name"] = db_name
+        candidate_row["metadata_redacted"] = True
+        candidate_row["marker_match_sources"] = marker_sources
+        meta = candidate_row.get("metadata")
+        candidate_row["route_family"] = _extract_route_family(meta)
+        candidate_row.pop("metadata", None)
+        return candidate_row
+    return None
+
+
+def query_session_history_row(
+    *,
+    dsn: str,
+    db_name: str,
+    marker_id: str,
+    session_id: Optional[str],
+    trace_id: Optional[str],
+    litellm_call_id: Optional[str],
+    row_limit: int = DEFAULT_SESSION_HISTORY_ROW_LIMIT,
+    created_after: Optional[datetime] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    lookups = _session_history_lookups(session_id, trace_id, litellm_call_id)
+    if not lookups:
         return None, db_name
-    row = selected
-    row["target_db_name"] = db_name
-    row["metadata_redacted"] = True
-    row["marker_match_sources"] = marker_sources
-    meta = row.get("metadata")
-    route_family = _extract_route_family(meta)
-    row.pop("metadata", None)
-    row["route_family"] = route_family
-    return row, db_name
+    rows = _fetch_session_history_candidates(
+        dsn=dsn,
+        lookups=lookups,
+        row_limit=row_limit,
+        created_after=created_after,
+    )
+    return _select_marker_session_history_row(rows, marker_id, db_name), db_name
+
+
+def _session_history_scan_bounds(
+    args: argparse.Namespace,
+) -> Tuple[int, Optional[datetime]]:
+    row_limit = _session_history_row_limit(
+        getattr(args, "session_history_row_limit", None)
+    )
+    created_after = _session_history_created_after(
+        created_after=getattr(args, "session_history_created_after", None),
+        lookback_hours=getattr(args, "session_history_lookback_hours", None),
+    )
+    return row_limit, created_after
+
+
+def _session_history_bound_fields(
+    *,
+    row_limit: int,
+    created_after: Optional[datetime],
+) -> Dict[str, Any]:
+    return {
+        "session_history_row_limit": row_limit,
+        "session_history_created_after": (
+            created_after.isoformat() if created_after is not None else None
+        ),
+    }
+
+
+def _collect_session_history_field_mismatches(
+    row: Dict[str, Any],
+    args: argparse.Namespace,
+) -> List[str]:
+    mismatches: List[str] = []
+    checks = (
+        ("expected_inbound_alias", "inbound_model_alias"),
+        ("expected_repository", "repository"),
+        ("expected_tenant_id", "tenant_id"),
+    )
+    for arg_name, field in checks:
+        expected_raw = (getattr(args, arg_name) or "").strip()
+        if not expected_raw:
+            continue
+        actual = row.get(field)
+        if actual != expected_raw:
+            mismatches.append(f"{field} expected {expected_raw!r} got {actual!r}")
+    return mismatches
 
 
 def _run_session_history_lane(
@@ -436,6 +582,24 @@ def _run_session_history_lane(
         return 2, ev
 
     try:
+        row_limit, created_after = _session_history_scan_bounds(args)
+    except ValueError as exc:
+        ev = _failure_evidence(
+            target=target,
+            reason=(
+                "session-history lane invalid --session-history-created-after: "
+                f"{redact_text(str(exc))}"
+            ),
+            workspace_root=workspace_root,
+            lanes_requested=lanes_requested,
+        )
+        ev["db_name"] = db_name
+        return 2, ev
+    bound_fields = _session_history_bound_fields(
+        row_limit=row_limit, created_after=created_after
+    )
+
+    try:
         row, _ = query_session_history_row(
             dsn=dsn,
             db_name=db_name,
@@ -443,6 +607,8 @@ def _run_session_history_lane(
             session_id=(args.session_id or "").strip() or None,
             trace_id=(args.trace_id or "").strip() or None,
             litellm_call_id=(args.litellm_call_id or "").strip() or None,
+            row_limit=row_limit,
+            created_after=created_after,
         )
     except Exception as exc:  # noqa: BLE001 — surface redacted DB failures only
         # Never print raw DSN (may embed password from AAWM_DB_*).
@@ -462,6 +628,7 @@ def _run_session_history_lane(
                 "dsn_source": dsn_source,
                 "marker_id": marker_id,
                 "http_success_not_accepted": True,
+                **bound_fields,
             }
         )
         return 2, ev
@@ -481,9 +648,10 @@ def _run_session_history_lane(
                 "trace_id": (args.trace_id or "").strip() or None,
                 "litellm_call_id": (args.litellm_call_id or "").strip() or None,
                 "http_success_not_accepted": True,
+                **bound_fields,
             }
         )
-        manifest = _build_manifest(
+        ev["manifest"] = _build_manifest(
             target=target,
             lanes_requested=lanes_requested,
             lanes_executed=["session-history"],
@@ -492,25 +660,9 @@ def _run_session_history_lane(
             referenced_artifacts=referenced_artifacts,
             args=args,
         )
-        ev["manifest"] = manifest
         return 3, ev
 
-    mismatches: List[str] = []
-    if (args.expected_inbound_alias or "").strip():
-        expected = args.expected_inbound_alias.strip()
-        actual = row.get("inbound_model_alias")
-        if actual != expected:
-            mismatches.append(f"inbound_model_alias expected {expected!r} got {actual!r}")
-    if (args.expected_repository or "").strip():
-        expected = args.expected_repository.strip()
-        actual = row.get("repository")
-        if actual != expected:
-            mismatches.append(f"repository expected {expected!r} got {actual!r}")
-    if (args.expected_tenant_id or "").strip():
-        expected = args.expected_tenant_id.strip()
-        actual = row.get("tenant_id")
-        if actual != expected:
-            mismatches.append(f"tenant_id expected {expected!r} got {actual!r}")
+    mismatches = _collect_session_history_field_mismatches(row, args)
     if mismatches:
         ev = _failure_evidence(
             target=target,
@@ -543,6 +695,7 @@ def _run_session_history_lane(
         "database": db_name,
         "dsn_source": dsn_source,
         "marker_id": marker_id,
+        **bound_fields,
         "marker_match_sources": row.get("marker_match_sources"),
         "persisted_row_id": row.get("id"),
         "session_id": row.get("session_id"),
@@ -626,6 +779,34 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--expected-inbound-alias", default=None)
     parser.add_argument("--expected-repository", default=None)
     parser.add_argument("--expected-tenant-id", default=None)
+    parser.add_argument(
+        "--session-history-row-limit",
+        type=int,
+        default=DEFAULT_SESSION_HISTORY_ROW_LIMIT,
+        help=(
+            "Max session_history rows to scan per correlation field "
+            f"(default {DEFAULT_SESSION_HISTORY_ROW_LIMIT}, "
+            f"hard cap {MAX_SESSION_HISTORY_ROW_LIMIT})."
+        ),
+    )
+    parser.add_argument(
+        "--session-history-lookback-hours",
+        type=float,
+        default=DEFAULT_SESSION_HISTORY_LOOKBACK_HOURS,
+        help=(
+            "Only consider session_history rows with created_at within this many "
+            f"hours (default {DEFAULT_SESSION_HISTORY_LOOKBACK_HOURS}). "
+            "Set <=0 to disable the time window."
+        ),
+    )
+    parser.add_argument(
+        "--session-history-created-after",
+        default=None,
+        help=(
+            "Absolute lower bound for session_history.created_at (ISO-8601). "
+            "Overrides --session-history-lookback-hours when set."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -648,8 +829,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # noqa: PLR0915
         if missing:
             reason = (
                 "prod target refused before probes: prod is read-only and requires "
-                "checkpoint fields: --release-runbook, --image-tag, --callback-wheel, "
-                "--db-name, and source_mode released_image"
+                "checkpoint fields: existing --release-runbook file, --image-tag, "
+                "--callback-wheel, --db-name, and source_mode released_image"
             )
             ev = _failure_evidence(
                 target=target,
