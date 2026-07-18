@@ -77,6 +77,24 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
     except urllib.error.HTTPError as exc:
         body = exc.read().decode('utf-8', errors='replace')
         raise RuntimeError(f'adapter smoke request failed with HTTP {exc.code}: {body[:400]}') from exc
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f'adapter smoke request timed out after {timeout}s for {url}: {exc}'
+        ) from exc
+    except urllib.error.URLError as exc:
+        # HTTPError is a URLError subclass and is handled above; remaining
+        # URLErrors are typically connection refused / DNS / offline targets.
+        reason = getattr(exc, 'reason', None)
+        if isinstance(reason, TimeoutError) or (
+            reason is not None and type(reason).__name__ in {'timeout', 'TimeoutError'}
+        ):
+            raise RuntimeError(
+                f'adapter smoke request timed out after {timeout}s for {url}: {reason}'
+            ) from exc
+        detail = reason if reason is not None else exc
+        raise RuntimeError(
+            f'adapter smoke request failed connecting to {url}: {detail}'
+        ) from exc
 
     try:
         parsed_body = json.loads(body)
