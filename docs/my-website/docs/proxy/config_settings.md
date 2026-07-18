@@ -20,6 +20,8 @@ litellm_settings:
   success_callback: ["langfuse"]  # list of success callbacks
   failure_callback: ["sentry"]  # list of failure callbacks
   callbacks: ["otel"]  # list of callbacks - runs on success and failure
+  # Combining `callbacks` with `success_callback` / `failure_callback` is safe:
+  # event-list reloads clear only that event surface and preserve general `callbacks` ownership (sync+async, de-duplicated).
   service_callbacks: ["datadog", "prometheus"]  # logs redis, postgres failures on datadog, prometheus
   turn_off_message_logging: boolean  # prevent the messages and responses from being logged to on your callbacks, but request metadata will still be logged. Useful for privacy/compliance when handling sensitive data.
   redact_user_api_key_info: boolean  # Redact information about the user api key (hashed token, user_id, team id, etc.), from logs. Currently supported for Langfuse, OpenTelemetry, Logfire, ArizeAI logging.
@@ -174,7 +176,7 @@ router_settings:
 |------|------|-------------|
 | success_callback | array of strings | List of success callbacks. [Doc Proxy logging callbacks](logging), [Doc Metrics](prometheus) |
 | failure_callback | array of strings | List of failure callbacks [Doc Proxy logging callbacks](logging), [Doc Metrics](prometheus) |
-| callbacks | array of strings | List of callbacks - runs on success and failure [Doc Proxy logging callbacks](logging), [Doc Metrics](prometheus) |
+| callbacks | array of strings | List of callbacks - runs on success and failure. When used together with `success_callback`/`failure_callback`, general registrations are preserved across those event-list resets (sync and async stay symmetric; manager add APIs de-dupe reloads). [Doc Proxy logging callbacks](logging), [Doc Metrics](prometheus) |
 | service_callbacks | array of strings | System health monitoring - Logs redis, postgres failures on specified services (e.g. datadog, prometheus) [Doc Metrics](prometheus) |
 | turn_off_message_logging | boolean | If true, prevents messages and responses from being logged to callbacks, but request metadata will still be logged. Useful for privacy/compliance when handling sensitive data [Proxy Logging](logging) |
 | modify_params | boolean | If true, allows modifying the parameters of the request before it is sent to the LLM provider |

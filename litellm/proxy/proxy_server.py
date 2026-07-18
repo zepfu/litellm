@@ -712,7 +712,15 @@ def cleanup_router_config_variables():
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
-    await shutdown_aawm_alias_routing_redis()
+    # Catch Exception only (not BaseException/CancelledError) so genuine
+    # asyncio cancellation still aborts the remaining shutdown sequence.
+    try:
+        await shutdown_aawm_alias_routing_redis()
+    except Exception as e:
+        verbose_proxy_logger.error(
+            "Error shutting down AAWM alias routing Redis during proxy shutdown: %s",
+            e,
+        )
     try:
         await litellm.close_litellm_async_clients()
     except Exception as e:
@@ -2400,6 +2408,65 @@ class ProxyConfig:
         self._last_semantic_filter_config: Optional[Dict[str, Any]] = None
         self._last_hashicorp_vault_config: Optional[Dict[str, Any]] = None
 
+    @staticmethod
+    def _callback_present_on_general_list(callback: Any) -> bool:
+        """Return True if callback is owned by the general `callbacks` config surface."""
+        general_callbacks = litellm.callbacks if isinstance(litellm.callbacks, list) else []
+        if callback in general_callbacks:
+            return True
+        if isinstance(callback, CustomLogger):
+            callback_key = litellm.logging_callback_manager._get_custom_logger_key(
+                callback
+            )
+            for existing in general_callbacks:
+                if (
+                    isinstance(existing, CustomLogger)
+                    and litellm.logging_callback_manager._get_custom_logger_key(
+                        existing
+                    )
+                    == callback_key
+                ):
+                    return True
+        return False
+
+    def _reset_event_callback_lists(
+        self, event_type: Literal["success", "failure"]
+    ) -> None:
+        """
+        Reset sync+async lists for one event type without destroying `callbacks`.
+
+        `success_callback` / `failure_callback` config processing must be
+        symmetric (sync and async cleared together) and idempotent under reload,
+        but must not wipe registrations that originated from the general
+        `callbacks` litellm_settings key (or that were later promoted into the
+        event lists while still living on litellm.callbacks).
+        """
+        if event_type == "success":
+            sync_list = list(litellm.success_callback)
+            async_list = list(litellm._async_success_callback)
+            litellm.success_callback = []
+            litellm._async_success_callback = []
+            add_sync = litellm.logging_callback_manager.add_litellm_success_callback
+            add_async = (
+                litellm.logging_callback_manager.add_litellm_async_success_callback
+            )
+        else:
+            sync_list = list(litellm.failure_callback)
+            async_list = list(litellm._async_failure_callback)
+            litellm.failure_callback = []
+            litellm._async_failure_callback = []
+            add_sync = litellm.logging_callback_manager.add_litellm_failure_callback
+            add_async = (
+                litellm.logging_callback_manager.add_litellm_async_failure_callback
+            )
+
+        for callback in sync_list:
+            if self._callback_present_on_general_list(callback):
+                add_sync(callback)
+        for callback in async_list:
+            if self._callback_present_on_general_list(callback):
+                add_async(callback)
+
     def is_yaml(self, config_file_path: str) -> bool:
         if not os.path.isfile(config_file_path):
             return False
@@ -3017,7 +3084,10 @@ class ProxyConfig:
 
                     custom_llm_setup()
                 elif key == "success_callback":
-                    litellm.success_callback = []
+                    # Symmetric sync+async reset that preserves general `callbacks`
+                    # registrations. Manager add APIs remain the only registration path
+                    # so reloads stay idempotent and de-duplicated.
+                    self._reset_event_callback_lists("success")
 
                     # initialize success callbacks
                     for callback in value:
@@ -3079,7 +3149,10 @@ class ProxyConfig:
                         f"{blue_color_code} Initialized Success Callbacks - {litellm.success_callback} {reset_color_code}"
                     )  # noqa
                 elif key == "failure_callback":
-                    litellm.failure_callback = []
+                    # Symmetric sync+async reset that preserves general `callbacks`
+                    # registrations. Manager add APIs remain the only registration path
+                    # so reloads stay idempotent and de-duplicated.
+                    self._reset_event_callback_lists("failure")
 
                     # initialize failure callbacks
                     for callback in value:

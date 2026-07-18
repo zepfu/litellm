@@ -256,3 +256,39 @@ async def test_proxy_shutdown_event_deduplicates_guardrail_shutdown_hooks():
         await proxy_server_module.proxy_shutdown_event()
 
     assert guardrail.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_proxy_shutdown_event_continues_after_aawm_alias_redis_shutdown_failure():
+    """AAWM alias Redis cleanup failures must not skip later proxy shutdown steps."""
+    from litellm.proxy import proxy_server as proxy_server_module
+
+    close_cached_clients = AsyncMock(name="close_litellm_async_clients")
+    shutdown_alias_redis = AsyncMock(
+        name="shutdown_aawm_alias_routing_redis",
+        side_effect=RuntimeError("alias redis cleanup failed"),
+    )
+
+    with patch.object(
+        proxy_server_module,
+        "shutdown_aawm_alias_routing_redis",
+        new=shutdown_alias_redis,
+    ), patch.object(
+        proxy_server_module.litellm,
+        "close_litellm_async_clients",
+        new=close_cached_clients,
+    ), patch.object(
+        proxy_server_module.verbose_proxy_logger,
+        "error",
+    ) as mock_error, patch.object(
+        proxy_server_module,
+        "_close_guardrail_shutdown_hooks",
+        new=AsyncMock(name="_close_guardrail_shutdown_hooks"),
+    ) as close_guardrails:
+        await proxy_server_module.proxy_shutdown_event()
+
+    shutdown_alias_redis.assert_awaited_once()
+    close_cached_clients.assert_awaited_once()
+    close_guardrails.assert_awaited_once()
+    mock_error.assert_called()
+    assert "AAWM alias routing Redis" in str(mock_error.call_args)
