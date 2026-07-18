@@ -10,7 +10,9 @@ from typing import (
     Mapping,
     Optional,
     Tuple,
+    TypeAlias,
     Union,
+    cast,
 )
 
 import httpx
@@ -26,6 +28,7 @@ from openai.lib.streaming._assistants import (
 )
 from openai.pagination import AsyncCursorPage, SyncCursorPage
 from openai.types import Batch, EmbeddingCreateParams, FileObject
+from openai.types import responses as openai_responses
 from openai.types.beta.assistant import Assistant
 from openai.types.beta.assistant_tool_param import AssistantToolParam
 from openai.types.beta.thread_create_params import (
@@ -86,6 +89,11 @@ from litellm.types.responses.main import (
     GenericResponseOutputItem,
     OutputFunctionToolCall,
     OutputImageGenerationCall,
+)
+
+ResponseCodeInterpreterToolCall: TypeAlias = cast(
+    type[Any],
+    getattr(openai_responses, "ResponseCodeInterpreterToolCall", Dict[str, Any]),
 )
 
 FileContent = Union[IO[bytes], bytes, PathLike]
@@ -669,9 +677,12 @@ class ChatCompletionFileObjectFile(TypedDict, total=False):
     ]  # For video-specific metadata (fps, start_offset, end_offset)
 
 
-class ChatCompletionFileObject(TypedDict):
-    type: Literal["file"]
-    file: ChatCompletionFileObjectFile
+class ChatCompletionFileObject(TypedDict, total=False):
+    type: Required[Literal["file"]]
+    file: Required[ChatCompletionFileObjectFile]
+    # Anthropic prompt-caching (and similar) may attach cache_control on the
+    # content block; LiteLLM preserves it when converting OpenAI file blocks.
+    cache_control: ChatCompletionCachedContent
 
 
 OpenAIMessageContentListBlock = Union[
@@ -1244,6 +1255,7 @@ class ResponsesAPIResponse(BaseLiteLLMOpenAIResponseObject):
                 GenericResponseOutputItem,
                 OutputFunctionToolCall,
                 OutputImageGenerationCall,
+                ResponseCodeInterpreterToolCall,
                 ResponseFunctionToolCall,
             ]
         ],

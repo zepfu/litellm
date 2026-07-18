@@ -1,23 +1,24 @@
-import json
 import os
 import sys
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from typing import Literal
+from unittest.mock import MagicMock, Mock, patch
 
-import httpx
 import pytest
+from typing_extensions import Required
 
 sys.path.insert(
     0, os.path.abspath("../../../../..")
 )  # Adds the parent directory to the system path
 
-import litellm
 from litellm.llms.azure.responses.transformation import AzureOpenAIResponsesAPIConfig
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.types.llms.openai import (
+    ChatCompletionCachedContent,
+    ChatCompletionFileObject,
     ImageGenerationPartialImageEvent,
     OutputTextDeltaEvent,
+    ResponseCodeInterpreterToolCall,
     ResponseCompletedEvent,
-    ResponsesAPIRequestParams,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
 )
@@ -1282,3 +1283,58 @@ class TestPhaseParameter:
         assert validated[0]["phase"] == "commentary"
         assert validated[1]["phase"] == "final_answer"
         assert "phase" not in validated[2]
+
+    def test_responses_api_response_accepts_code_interpreter_tool_call_output(self):
+        """Validate ResponsesAPIResponse parses code_interpreter_call output items."""
+        raw_json = {
+            "id": "resp_ci_1",
+            "created_at": 1700000000,
+            "model": "gpt-5.3-codex",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_rt1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "analysis"}],
+                },
+                {
+                    "type": "code_interpreter_call",
+                    "id": "srv_01ABC",
+                    "container_id": "container_123",
+                    "status": "completed",
+                    "outputs": [{"type": "logs", "logs": "ok"}],
+                },
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15},
+        }
+
+        response = ResponsesAPIResponse(**raw_json)
+
+        code_items = [
+            item
+            for item in response.output
+            if getattr(item, "type", None) == "code_interpreter_call"
+        ]
+        assert len(code_items) == 1
+
+        code_item = code_items[0]
+        # Preserve acceptance of OpenAI's native code_interpreter_call model when
+        # available; otherwise tolerate plain dict output.
+        if hasattr(ResponseCodeInterpreterToolCall, "model_fields"):
+            assert isinstance(code_item, ResponseCodeInterpreterToolCall)
+            assert code_item.id == "srv_01ABC"
+            assert code_item.container_id == "container_123"
+        else:
+            assert isinstance(code_item, dict)
+            assert code_item["id"] == "srv_01ABC"
+            assert code_item["container_id"] == "container_123"
+
+    def test_chat_completion_file_object_type_shape(self):
+        """ChatCompletionFileObject keeps required `type` + `file` and optional `cache_control`."""
+        assert ChatCompletionFileObject.__required_keys__ == frozenset({"type", "file"})
+        assert "cache_control" in ChatCompletionFileObject.__optional_keys__
+        assert ChatCompletionFileObject.__annotations__["type"] == Required[Literal["file"]]
+        assert ChatCompletionFileObject.__annotations__["cache_control"] is ChatCompletionCachedContent
