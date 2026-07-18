@@ -643,6 +643,49 @@ for dashboards and investigations. These observations are distinct from
 snapshots from request traffic.
 
 
+## Provider Error Observations From Docker Logs
+
+`public.provider_error_observations` is normally written by the live session-history
+callback. For restart windows where that path cannot yet persist normalized provider
+failures, `scripts/backfill_provider_error_observations_from_docker_logs.py` reads
+Docker's current json-file log stream (`docker logs --timestamps`, or a retained
+`--raw-log-file`) and inserts the same observation shape.
+
+Operator contract:
+
+```bash
+# Dry-run preview (default; no writes)
+./.venv/bin/python scripts/backfill_provider_error_observations_from_docker_logs.py \
+  --container litellm-dev --environment dev \
+  [--since <docker-since>] [--until <docker-until>] [--limit N]
+
+# Apply inserts after dry-run proof
+./.venv/bin/python scripts/backfill_provider_error_observations_from_docker_logs.py \
+  --container litellm-dev --environment dev --apply \
+  [--since <docker-since>] [--until <docker-until>] [--limit N] [--dsn <dsn>]
+```
+
+- Dedup key `metadata.log_signature` is `sha256(container, docker_timestamp, content)`
+  only. Stream-relative line indexes are stored as `docker_line_index` for
+  diagnostics but are **not** part of the signature, so reruns with different
+  `--since`/`--until` windows do not create duplicates for the same log line.
+- Exception matching requires a LiteLLM/proxy logger-style prefix
+  (`pass_through_endpoint():`, `litellm...():`, `router.Router::...():`, or
+  `LiteLLM.Exception`) and a 4xx/5xx status. Bare substrings such as model/tool
+  stdout that happen to contain `Exception occured - 500:` are ignored.
+- Access-log matching is line-anchored (`^\s*INFO: ...`) so mid-line echoed
+  request/response bodies that merely look like uvicorn access lines are not
+  treated as real proxy HTTP status observations.
+- Parsing retains only exception lines, 4xx/5xx access lines, and nearby-context
+  marker lines. Correlation uses per-second time buckets rather than rescanning
+  the full retained stream for every error.
+- `--limit` bounds sample runs during parse and correlation (stop after N trusted
+  exception events / candidate observations), not only at insert/print time.
+  Prefer a tight `--since`/`--until` window for full incident recovery; use
+  `--limit` for previews.
+- Omit `--apply` for dry-run counts and samples. Prefer dry-run proof before any
+  live insert. Rows are source-tagged `metadata.source=docker_log_backfill`.
+
 ## Session History Outage Spool
 
 `session_history` rows are normally written directly to

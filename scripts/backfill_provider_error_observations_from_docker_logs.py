@@ -67,15 +67,41 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 TIMESTAMP_RE = re.compile(r"^(?P<ts>\S+)\s+(?P<message>.*)$")
-EXCEPTION_RE = re.compile(r"Exception occured - (?P<status>\d{3}):\s*(?P<detail>.*)")
+# Require a LiteLLM/proxy logger-style prefix so echoed request/response bodies
+# that merely contain the substring "Exception occured - NNN:" are not treated
+# as genuine provider-error observations (RR-068 #3).
+# Status codes are restricted to 4xx/5xx; non-error statuses are ignored.
+EXCEPTION_RE = re.compile(
+    r"(?:"
+    # pass_through_endpoint() with optional fully-qualified prefix
+    r"(?:litellm\.)?[\w.]*pass_through_endpoint\(\):\s*"
+    # litellm.<module path>().  or litellm.<module>::<method>()
+    r"|litellm\.[\w.]+(?:::\w+)?\(\):\s*"
+    # router callback shapes
+    r"|litellm\.router\.Router::[\w]+\(\):\s*"
+    r"|LiteLLM\.Exception\s+"
+    r"|router\.Router::[\w]+\(\):\s*"
+    r")"
+    r"Exception occured - (?P<status>[45]\d{2}):\s*(?P<detail>.*)"
+)
+# When --limit stops accepting more exception events, keep scanning a short
+# trailing window so co-timed access/context lines still correlate (RR-068 #4).
+_LIMIT_TAIL_LINES = 200
+# Anchor at the start of the docker message so echoed request/response bodies
+# that embed an access-log-shaped substring are not treated as real proxy
+# HTTP status observations (RR-068 #3).
 ACCESS_RE = re.compile(
-    r'INFO:\s+(?P<client>\S+)\s+-\s+"(?P<method>[A-Z]+)\s+'
+    r'^\s*INFO:\s+(?P<client>\S+)\s+-\s+"(?P<method>[A-Z]+)\s+'
     r'(?P<path>\S+)\s+HTTP/[0-9.]+"\s+(?P<status>\d{3})\s+(?P<phrase>.*)$'
 )
 MODEL_RE = re.compile(r"\bmodel\s*[:=]\s*['\"]?(?P<model>[A-Za-z0-9_.:/\-\[\]]+)")
 REQUEST_ID_RE = re.compile(r"\brequest[_-]?id\s*[:=]\s*['\"](?P<request_id>[^'\"]+)")
-TRACE_ID_RE = re.compile(r"\b(?:trace_id|langfuse_trace_id)\s*[:=]\s*['\"](?P<trace_id>[^'\"]+)")
-CALL_ID_RE = re.compile(r"\b(?:litellm_call_id|call_id)\s*[:=]\s*['\"](?P<call_id>[^'\"]+)")
+TRACE_ID_RE = re.compile(
+    r"\b(?:trace_id|langfuse_trace_id)\s*[:=]\s*['\"](?P<trace_id>[^'\"]+)"
+)
+CALL_ID_RE = re.compile(
+    r"\b(?:litellm_call_id|call_id)\s*[:=]\s*['\"](?P<call_id>[^'\"]+)"
+)
 
 HTTP_ERROR_CODE_BY_STATUS = {
     400: "bad_request",
@@ -102,6 +128,16 @@ PROXY_INTERNAL_MARKERS = (
     "CannotConnectNowError",
     "ConnectionResetError",
     "connection was closed in the middle of operation",
+)
+
+CONTEXT_MARKERS = (
+    "ERROR:",
+    "Traceback",
+    "Exception",
+    "Connection",
+    "asyncpg",
+    "database system",
+    "Internal Server Error",
 )
 
 
@@ -135,6 +171,42 @@ class ParsedLogs:
     entries: List[LogEntry]
     access_logs: List[AccessLog]
     exception_logs: List[ExceptionLog]
+
+
+@dataclass
+class LogIndex:
+    """Time-bucketed index over retained log lines for nearby lookups (RR-068 #2)."""
+
+    entries_by_second: Dict[int, List[LogEntry]]
+    access_by_second: Dict[int, List[AccessLog]]
+
+
+def _epoch_second(value: datetime) -> int:
+    return int(value.timestamp())
+
+
+def _build_log_index(parsed_logs: ParsedLogs) -> LogIndex:
+    entries_by_second: Dict[int, List[LogEntry]] = {}
+    for entry in parsed_logs.entries:
+        entries_by_second.setdefault(_epoch_second(entry.observed_at), []).append(entry)
+
+    access_by_second: Dict[int, List[AccessLog]] = {}
+    for access_log in parsed_logs.access_logs:
+        access_by_second.setdefault(
+            _epoch_second(access_log.entry.observed_at), []
+        ).append(access_log)
+
+    return LogIndex(
+        entries_by_second=entries_by_second,
+        access_by_second=access_by_second,
+    )
+
+
+def _iter_second_buckets(center: datetime, seconds: float) -> Iterable[int]:
+    center_sec = _epoch_second(center)
+    radius = max(0, int(seconds) + 1)
+    for offset in range(-radius, radius + 1):
+        yield center_sec + offset
 
 
 def _clean_ansi(value: str) -> str:
@@ -199,12 +271,54 @@ def _iter_docker_log_lines(
         raise RuntimeError(f"docker logs failed with exit {process.returncode}")
 
 
-def _parse_logs(lines: Iterable[str]) -> ParsedLogs:
+def _positive_int(value: str) -> int:
+    """argparse type: require a strictly positive integer (RR-068 argument validation)."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer value: {value!r}") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be a positive integer (>= 1), got {parsed}"
+        )
+    return parsed
+
+
+def _line_has_context_marker(content: str) -> bool:
+    return any(marker in content for marker in CONTEXT_MARKERS)
+
+
+def _parse_logs(
+    lines: Iterable[str],
+    *,
+    max_exception_logs: Optional[int] = None,
+) -> ParsedLogs:
+    """Parse docker timestamped log lines into sparse, correlatable structures.
+
+    Only exception lines, 4xx/5xx access lines, and nearby-context marker lines
+    are retained in ``entries`` so large retained docker streams do not force a
+    full materialization of every idle INFO line (RR-068 #2). When
+    *max_exception_logs* is set (``--limit``), no further exception events are
+    accepted after that count, and only a short trailing window of
+    access/context lines is drained so sample runs avoid unbounded tails while
+    still correlating co-timed access logs (RR-068 #4).
+    """
     entries: List[LogEntry] = []
     access_logs: List[AccessLog] = []
     exception_logs: List[ExceptionLog] = []
+    # Treat non-positive max as "accept none" so programmatic callers cannot
+    # accidentally keep the first exception when they meant a hard stop.
+    exception_limit_reached = (
+        max_exception_logs is not None and max_exception_logs <= 0
+    )
+    tail_lines_remaining = 0
 
     for line_index, raw_line in enumerate(lines, start=1):
+        if exception_limit_reached:
+            if tail_lines_remaining <= 0:
+                break
+            tail_lines_remaining -= 1
+
         match = TIMESTAMP_RE.match(raw_line)
         if match is None:
             continue
@@ -220,10 +334,13 @@ def _parse_logs(lines: Iterable[str]) -> ParsedLogs:
             content=match.group("message"),
             clean_content=clean_content,
         )
-        entries.append(entry)
 
         exception_match = EXCEPTION_RE.search(clean_content)
         if exception_match is not None:
+            if exception_limit_reached:
+                # Do not accept more exception events after --limit.
+                continue
+            entries.append(entry)
             exception_logs.append(
                 ExceptionLog(
                     entry=entry,
@@ -231,12 +348,19 @@ def _parse_logs(lines: Iterable[str]) -> ParsedLogs:
                     detail=exception_match.group("detail").strip(),
                 )
             )
+            if (
+                max_exception_logs is not None
+                and len(exception_logs) >= max_exception_logs
+            ):
+                exception_limit_reached = True
+                tail_lines_remaining = _LIMIT_TAIL_LINES
             continue
 
         access_match = ACCESS_RE.search(clean_content)
         if access_match is not None:
             status_code = int(access_match.group("status"))
             if status_code >= 400:
+                entries.append(entry)
                 access_logs.append(
                     AccessLog(
                         entry=entry,
@@ -246,8 +370,15 @@ def _parse_logs(lines: Iterable[str]) -> ParsedLogs:
                         phrase=access_match.group("phrase").strip(),
                     )
                 )
+            continue
 
-    return ParsedLogs(entries=entries, access_logs=access_logs, exception_logs=exception_logs)
+        # Retain only marker-bearing diagnostic lines for nearby context.
+        if _line_has_context_marker(clean_content):
+            entries.append(entry)
+
+    return ParsedLogs(
+        entries=entries, access_logs=access_logs, exception_logs=exception_logs
+    )
 
 
 def _extract_first_json_object(value: str) -> Optional[Dict[str, Any]]:
@@ -302,7 +433,9 @@ def _extract_json_path(payload: Dict[str, Any], path: Sequence[str]) -> Optional
     return current
 
 
-def _extract_error_details(detail: str) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
+def _extract_error_details(
+    detail: str,
+) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
     payload = _extract_first_json_object(detail)
     request_id = None
     if payload is not None:
@@ -377,7 +510,10 @@ def _infer_provider_and_route_family(
         or "x-grok-" in normalized
     ):
         return "xai", "grok_cli_chat_proxy", "provider_exception"
-    if "cloudcode-pa.googleapis.com" in normalized or "google code assist" in normalized:
+    if (
+        "cloudcode-pa.googleapis.com" in normalized
+        or "google code assist" in normalized
+    ):
         return "gemini", "google_code_assist_generate_content", "provider_exception"
     if path and path.startswith("/anthropic"):
         return "anthropic", "anthropic_messages", "provider_exception"
@@ -385,7 +521,9 @@ def _infer_provider_and_route_family(
         return "anthropic", "anthropic_messages", "provider_exception"
     if path and path.startswith("/openai_passthrough/responses"):
         return "openai", "openai_responses", "provider_exception"
-    if path and (path.startswith("/v1/chat/completions") or path.startswith("/chat/completions")):
+    if path and (
+        path.startswith("/v1/chat/completions") or path.startswith("/chat/completions")
+    ):
         return "openai", "chat_completions", "provider_exception"
     if path and path.startswith("/v1/embeddings"):
         return "unknown", "embeddings", "provider_exception"
@@ -422,28 +560,34 @@ def _find_nearby_context(
     line_index: int,
     seconds: float,
     limit: int = 8,
+    log_index: Optional[LogIndex] = None,
 ) -> List[LogEntry]:
+    """Find nearby diagnostic lines without a full O(N) scan when indexed.
+
+    When *log_index* is provided, only entries in the per-second buckets within
+    ``seconds`` of *observed_at* are considered. Falls back to a line-windowed
+    scan over *entries* when no index is available.
+    """
     candidates: List[Tuple[float, LogEntry]] = []
-    for entry in entries:
+
+    def _consider(entry: LogEntry) -> None:
         if abs(entry.line_index - line_index) > 2000:
-            continue
+            return
         delta = abs((entry.observed_at - observed_at).total_seconds())
         if delta > seconds or entry.line_index == line_index:
-            continue
+            return
         content = entry.clean_content
-        if any(
-            marker in content
-            for marker in (
-                "ERROR:",
-                "Traceback",
-                "Exception",
-                "Connection",
-                "asyncpg",
-                "database system",
-                "Internal Server Error",
-            )
-        ):
+        if any(marker in content for marker in CONTEXT_MARKERS):
             candidates.append((delta, entry))
+
+    if log_index is not None:
+        for bucket in _iter_second_buckets(observed_at, seconds):
+            for entry in log_index.entries_by_second.get(bucket, ()):
+                _consider(entry)
+    else:
+        for entry in entries:
+            _consider(entry)
+
     candidates.sort(key=lambda item: (item[0], item[1].line_index))
     return [entry for _, entry in candidates[:limit]]
 
@@ -475,16 +619,38 @@ def _nearest_access_log(
     used_access_indexes: Set[int],
     *,
     max_delta_seconds: float,
+    log_index: Optional[LogIndex] = None,
 ) -> Optional[AccessLog]:
+    """Find nearest matching access log using time buckets when indexed.
+
+    Indexed mode only inspects access lines in the per-second buckets within
+    *max_delta_seconds* of the exception, avoiding an O(all access logs) scan.
+    """
     candidates: List[Tuple[float, AccessLog]] = []
-    for access_log in access_logs:
+
+    def _consider(access_log: AccessLog) -> None:
         if access_log.entry.line_index in used_access_indexes:
-            continue
+            return
         if access_log.status_code != exception_log.status_code:
-            continue
-        delta = abs((access_log.entry.observed_at - exception_log.entry.observed_at).total_seconds())
+            return
+        delta = abs(
+            (
+                access_log.entry.observed_at - exception_log.entry.observed_at
+            ).total_seconds()
+        )
         if delta <= max_delta_seconds:
             candidates.append((delta, access_log))
+
+    if log_index is not None:
+        for bucket in _iter_second_buckets(
+            exception_log.entry.observed_at, max_delta_seconds
+        ):
+            for access_log in log_index.access_by_second.get(bucket, ()):
+                _consider(access_log)
+    else:
+        for access_log in access_logs:
+            _consider(access_log)
+
     if not candidates:
         return None
     candidates.sort(key=lambda item: (item[0], item[1].entry.line_index))
@@ -497,28 +663,45 @@ def _build_observations(
     container: str,
     environment: str,
     max_correlation_seconds: float,
+    max_observations: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """Build candidate provider_error_observations from parsed docker logs.
+
+    *max_observations* (``--limit``) stops correlation after enough candidates
+    are produced so large windows do not pay full O(errors × lines) work when
+    the operator only wants a sample (RR-068 #4).
+    """
     observations: List[Dict[str, Any]] = []
     used_access_indexes: Set[int] = set()
+    log_index = _build_log_index(parsed_logs)
+
+    def _reached_limit() -> bool:
+        return max_observations is not None and len(observations) >= max_observations
 
     for exception_log in parsed_logs.exception_logs:
+        if _reached_limit():
+            break
         access_log = _nearest_access_log(
             exception_log,
             parsed_logs.access_logs,
             used_access_indexes,
             max_delta_seconds=max_correlation_seconds,
+            log_index=log_index,
         )
         if access_log is not None:
             used_access_indexes.add(access_log.entry.line_index)
 
         payload = _extract_first_json_object(exception_log.detail)
-        error_type, error_code, error_text, request_id = _extract_error_details(exception_log.detail)
+        error_type, error_code, error_text, request_id = _extract_error_details(
+            exception_log.detail
+        )
         path = access_log.path if access_log is not None else None
         context_lines = _find_nearby_context(
             parsed_logs.entries,
             observed_at=exception_log.entry.observed_at,
             line_index=exception_log.entry.line_index,
             seconds=3.0,
+            log_index=log_index,
         )
         provider, route_family, error_origin = _infer_provider_and_route_family(
             path=path,
@@ -569,6 +752,8 @@ def _build_observations(
         )
 
     for access_log in parsed_logs.access_logs:
+        if _reached_limit():
+            break
         if access_log.entry.line_index in used_access_indexes:
             continue
         context_lines = _find_nearby_context(
@@ -576,6 +761,7 @@ def _build_observations(
             observed_at=access_log.entry.observed_at,
             line_index=access_log.entry.line_index,
             seconds=5.0,
+            log_index=log_index,
         )
         detail = f"{access_log.method} {access_log.path} returned {access_log.status_code} {access_log.phrase}"
         if context_lines:
@@ -629,7 +815,9 @@ def _build_observations(
             }
         )
 
-    observations.sort(key=lambda row: (row["observed_at"], row["metadata"]["docker_line_index"]))
+    observations.sort(
+        key=lambda row: (row["observed_at"], row["metadata"]["docker_line_index"])
+    )
     return observations
 
 
@@ -675,7 +863,9 @@ def _build_metadata(
                 "access_docker_timestamp": access_log.entry.timestamp_text,
                 "access_line_index": access_log.entry.line_index,
                 "access_delta_seconds": round(
-                    (access_log.entry.observed_at - source_entry.observed_at).total_seconds(),
+                    (
+                        access_log.entry.observed_at - source_entry.observed_at
+                    ).total_seconds(),
                     6,
                 ),
             }
@@ -702,7 +892,10 @@ def _summarize(rows: Sequence[Dict[str, Any]]) -> List[Tuple[Any, ...]]:
             row.get("route_family"),
         )
         summary[key] = summary.get(key, 0) + 1
-    return [(*key, count) for key, count in sorted(summary.items(), key=lambda item: item[0])]
+    return [
+        (*key, count)
+        for key, count in sorted(summary.items(), key=lambda item: item[0])
+    ]
 
 
 async def _fetch_existing_signatures(conn: Any, *, container: str) -> Set[str]:
@@ -723,6 +916,33 @@ async def _fetch_existing_signatures(conn: Any, *, container: str) -> Set[str]:
     }
 
 
+def _filter_new_observations(
+    observations: Sequence[Dict[str, Any]],
+    *,
+    existing_signatures: Set[str],
+) -> List[Dict[str, Any]]:
+    """Drop already-persisted and in-batch-duplicate log_signature rows.
+
+    Docker-log rows usually lack ``litellm_call_id``, so the DB insert SQL cannot
+    dedupe them; application-side signature filtering is the primary idempotency
+    path for re-runs and identical lines within one batch (RR-068 #1).
+    """
+    new_observations: List[Dict[str, Any]] = []
+    seen_signatures: Set[str] = set()
+    for row in observations:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        signature = metadata.get("log_signature")
+        if not isinstance(signature, str) or not signature:
+            # Missing signature should not silently collapse distinct rows.
+            new_observations.append(row)
+            continue
+        if signature in existing_signatures or signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        new_observations.append(row)
+    return new_observations
+
+
 async def _run(args: argparse.Namespace) -> int:
     raw_log_file = Path(args.raw_log_file) if args.raw_log_file else None
     parsed_logs = _parse_logs(
@@ -731,28 +951,29 @@ async def _run(args: argparse.Namespace) -> int:
             since=args.since,
             until=args.until,
             raw_log_file=raw_log_file,
-        )
+        ),
+        max_exception_logs=args.limit,
     )
     observations = _build_observations(
         parsed_logs=parsed_logs,
         container=args.container,
         environment=args.environment,
         max_correlation_seconds=args.max_correlation_seconds,
+        max_observations=args.limit,
     )
-    if args.limit is not None:
-        observations = observations[: args.limit]
 
     dsn = args.dsn or _build_aawm_dsn()
     conn = await asyncpg.connect(dsn)
     try:
         if args.apply:
             await _ensure_session_history_schema(conn)
-        existing_signatures = await _fetch_existing_signatures(conn, container=args.container)
-        new_observations = [
-            row
-            for row in observations
-            if row.get("metadata", {}).get("log_signature") not in existing_signatures
-        ]
+        existing_signatures = await _fetch_existing_signatures(
+            conn, container=args.container
+        )
+        new_observations = _filter_new_observations(
+            observations,
+            existing_signatures=existing_signatures,
+        )
         print(f"container={args.container} environment={args.environment}")
         print(
             "parsed "
@@ -764,7 +985,9 @@ async def _run(args: argparse.Namespace) -> int:
             f"new_observations={len(new_observations)}"
         )
         print("summary status_code,error_class,provider,route_family,count")
-        for status_code, error_class, provider, route_family, count in _summarize(new_observations):
+        for status_code, error_class, provider, route_family, count in _summarize(
+            new_observations
+        ):
             print(f"{status_code},{error_class},{provider},{route_family},{count}")
         if args.show_samples:
             print("samples")
@@ -815,7 +1038,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-log-file")
     parser.add_argument("--dsn")
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        help=(
+            "Bound sample runs: stop accepting exception events after this many "
+            "trusted matches (then drain a short access/context tail), and stop "
+            "correlation after this many candidate observations. Applied during "
+            "parse/correlation work, not only at insert/print time."
+        ),
+    )
     parser.add_argument("--show-samples", type=int, default=3)
     parser.add_argument("--max-correlation-seconds", type=float, default=20.0)
     return parser
