@@ -3,15 +3,14 @@
 
 from __future__ import annotations
 
-from litellm.secret_managers.credential_file_lock import credential_file_lock
-
+import hashlib
 import json
+import logging
 import os
 import re
 import shutil
-import stat
 import subprocess
-import time
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -21,38 +20,65 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+from litellm.secret_managers.credential_file_lock import credential_file_lock
+from litellm.secret_managers.credential_file_metadata import (
+    CredentialFileMetadata,
+    apply_credential_file_metadata,
+    resolve_credential_file_metadata,
+    snapshot_credential_file_metadata,
+)
+from litellm.secret_managers.credential_file_write import (
+    write_and_publish_private_text,
+    write_private_file_text,
+)
+from litellm.secret_managers.credential_error_sanitizer import (
+    DEFAULT_SECRET_FIELD_NAMES,
+    sanitize_credential_error_message,
+)
+
+logger = logging.getLogger(__name__)
+
 _STAGED_HOME_DIR_MODE = 0o700
 _STAGED_AUTH_FILE_MODE = 0o600
 
-DEFAULT_ANTIGRAVITY_AUTH_FILE = (
-    "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token"
-)
-DEFAULT_ANTIGRAVITY_LOCK_FILE = (
-    "/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token.lock"
-)
+# Portable ~ defaults (expanded via Path.expanduser at use sites).
+DEFAULT_ANTIGRAVITY_AUTH_FILE = "~/.gemini/antigravity-cli/antigravity-oauth-token"
+DEFAULT_ANTIGRAVITY_LOCK_FILE = "~/.gemini/antigravity-cli/antigravity-oauth-token.lock"
 DEFAULT_ANTIGRAVITY_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 DEFAULT_ANTIGRAVITY_REFRESH_BUFFER_SECONDS = 300
 DEFAULT_ANTIGRAVITY_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_ANTIGRAVITY_CLI_REFRESH_TIMEOUT_SECONDS = 30.0
 DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE = 0o600
 
-_DEFAULT_CLI_BINARY_PATHS = (
-    "/home/zepfu/.local/bin/agy",
-    "~/.local/bin/agy",
-)
+_DEFAULT_CLI_BINARY_PATHS = ("~/.local/bin/agy",)
 _CLI_OAUTH_CLIENT_ID_VALUE_PATTERN = re.compile(
-    rb"(?P<value>\d{6,}-[A-Za-z0-9_.-]+\.apps\.googleusercontent\.com)"
+    # Length-bound the random segment so binary padding between two client
+    # IDs cannot glue them into one match.
+    rb"(?P<value>\d{6,}-[A-Za-z0-9]{8,64}\.apps\.googleusercontent\.com)"
 )
 _CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN = re.compile(
-    rb"(?P<value>GOCSPX-[A-Za-z0-9_-]+)"
+    # Non-greedy body that stops before another GOCSPX blob or a URL scheme.
+    # Real `agy` embeds two secrets back-to-back then `https://...`.
+    rb"(?P<value>GOCSPX-[A-Za-z0-9_-]{8,48}?)(?=GOCSPX-|https?://|[^A-Za-z0-9_-]|$)"
 )
-_SECRET_FIELD_NAMES = {
-    "access_token",
-    "client_secret",
-    "id_token",
-    "key",
-    "refresh_token",
-}
+# Prefer nearest id/secret adjacency; discard pairs beyond this distance when a
+# nearer pair exists for the same secret. Keeps binary scan a last-resort guess
+# with a tighter correctness surface than full id×secret cartesian products.
+_CLI_BINARY_PAIR_MAX_DISTANCE_BYTES = 2_000_000
+_CLI_BINARY_MAX_CANDIDATE_PAIRS = 4
+_CLI_BINARY_MAX_IDS_PER_SECRET = 2
+# Keep historical module alias; redaction lives in secret_managers.
+_SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
+
+
+@dataclass(frozen=True)
+class _ClientCredentialCandidate:
+    """OAuth client pair with non-secret provenance for diagnostics."""
+
+    client_id: str
+    client_secret: str
+    source: str
+    proximity_bytes: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -230,27 +256,9 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
 
 @contextmanager
 def _credential_file_lock(lock_path: Path) -> Iterator[None]:
-    """Delegate to shared credential_file_lock (fcntl + warning on failure)."""
+    """Delegate to shared credential_file_lock (module-scoped fcntl + warnings)."""
     with credential_file_lock(lock_path):
         yield
-
-    handle = lock_path.open("a+", encoding="utf-8")
-    try:
-        try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
-        yield
-    finally:
-        try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except (ImportError, OSError):
-            pass
-        handle.close()
 
 
 def _read_token_data(auth_path: Path) -> Dict[str, Any]:
@@ -274,7 +282,9 @@ def _read_token_data(auth_path: Path) -> Dict[str, Any]:
 def _get_token_block(token_data: Mapping[str, Any]) -> Mapping[str, Any]:
     token_block = token_data.get("token")
     if not isinstance(token_block, Mapping):
-        raise ValueError("Antigravity OAuth token data does not contain a token object.")
+        raise ValueError(
+            "Antigravity OAuth token data does not contain a token object."
+        )
     return token_block
 
 
@@ -365,12 +375,33 @@ def _refresh_token_data_direct(
 
     last_error: Optional[Exception] = None
     last_oauth_error: Optional[str] = None
-    for candidate_client_id, candidate_client_secret in client_candidates:
+    logger.info(
+        "antigravity oauth direct refresh: %s client_id/secret candidate pair(s)",
+        len(client_candidates),
+    )
+    for pair_index, candidate in enumerate(client_candidates, start=1):
+        pair_id = _client_pair_diagnostic_id(
+            candidate.client_id, candidate.client_secret
+        )
+        proximity = (
+            f" proximity_bytes={candidate.proximity_bytes}"
+            if candidate.proximity_bytes is not None
+            else ""
+        )
+        logger.info(
+            "antigravity oauth direct refresh: trying pair %s/%s id=%s "
+            "source=%s%s",
+            pair_index,
+            len(client_candidates),
+            pair_id,
+            candidate.source,
+            proximity,
+        )
         try:
             refreshed = _post_refresh_request(
                 token_endpoint=token_endpoint,
-                client_id=candidate_client_id,
-                client_secret=candidate_client_secret,
+                client_id=candidate.client_id,
+                client_secret=candidate.client_secret,
                 refresh_token=refresh_token,
                 http_timeout_seconds=http_timeout_seconds,
             )
@@ -382,11 +413,29 @@ def _refresh_token_data_direct(
                 "invalid_grant",
                 "unauthorized_client",
             }:
+                logger.info(
+                    "antigravity oauth direct refresh: pair id=%s source=%s "
+                    "rejected (%s); trying next candidate if any",
+                    pair_id,
+                    candidate.source,
+                    exc.oauth_error,
+                )
                 continue
             raise ValueError(
                 f"Failed to refresh Antigravity OAuth access token ({exc})."
             ) from exc
-        return _apply_refresh_payload(token_data, refreshed, refresh_token)
+        logger.info(
+            "antigravity oauth direct refresh: selected pair id=%s source=%s",
+            pair_id,
+            candidate.source,
+        )
+        return _apply_refresh_payload(
+            token_data,
+            refreshed,
+            refresh_token,
+            client_id=candidate.client_id,
+            client_secret=candidate.client_secret,
+        )
 
     if last_oauth_error in {"invalid_client", "invalid_grant", "unauthorized_client"}:
         raise _DirectRefreshNeedsCliFallback() from last_error
@@ -451,9 +500,13 @@ def _post_refresh_request(
     try:
         payload = json.loads(response_body)
     except json.JSONDecodeError as exc:
-        raise ValueError("Antigravity OAuth token endpoint returned invalid JSON.") from exc
+        raise ValueError(
+            "Antigravity OAuth token endpoint returned invalid JSON."
+        ) from exc
     if not isinstance(payload, dict):
-        raise ValueError("Antigravity OAuth token endpoint returned a non-object payload.")
+        raise ValueError(
+            "Antigravity OAuth token endpoint returned a non-object payload."
+        )
     return payload
 
 
@@ -461,6 +514,9 @@ def _apply_refresh_payload(
     token_data: Mapping[str, Any],
     refreshed: Mapping[str, Any],
     refresh_token: str,
+    *,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
 ) -> Dict[str, Any]:
     access_token = _clean_value(refreshed.get("access_token"))
     if access_token is None:
@@ -477,12 +533,20 @@ def _apply_refresh_payload(
     updated_token_block.update(refreshed)
     updated_token_block["access_token"] = access_token
     updated_token_block["refresh_token"] = refresh_token
+    # Persist the validated client pair so future refreshes prefer the
+    # token-file source over fragile CLI binary discovery (RR-065 #7).
+    if client_id and client_secret:
+        updated_token_block["client_id"] = client_id
+        updated_token_block["client_secret"] = client_secret
     updated_token_block["expiry"] = (
         datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
     ).isoformat()
 
     updated_token_data = dict(token_data)
     updated_token_data["token"] = dict(updated_token_block)
+    if client_id and client_secret:
+        updated_token_data["client_id"] = client_id
+        updated_token_data["client_secret"] = client_secret
     return updated_token_data
 
 
@@ -495,23 +559,23 @@ def _mkdir_private(path: Path, *, mode: int = _STAGED_HOME_DIR_MODE) -> None:
         pass
 
 
-def _write_private_text(path: Path, content: str, *, mode: int = _STAGED_AUTH_FILE_MODE) -> None:
-    """Write ``content`` to ``path`` with mode ``mode`` at creation time."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(str(path), flags, mode)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-    except Exception:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        raise
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+def _write_private_text(
+    path: Path, content: str, *, mode: int = _STAGED_AUTH_FILE_MODE
+) -> None:
+    """Write ``content`` to ``path`` with private mode at creation time.
+
+    Delegates to shared ``write_private_file_text`` so staged CLI auth files get
+    the same no-umask-window create, mode clamp, and symlink refusal as final
+    credential publishes (RR-065 consumer migration).
+    """
+    write_private_file_text(
+        path,
+        content,
+        mode=mode,
+        default_mode=_STAGED_AUTH_FILE_MODE,
+        exclusive=False,
+        refuse_symlink=True,
+    )
 
 
 def _stage_cli_auth_home(staged_home: Path, seed_auth_file: Path) -> Path:
@@ -542,6 +606,25 @@ def _cleanup_staged_home(staged_home: Optional[Path]) -> None:
         pass
 
 
+def _make_private_temp_dir(prefix: str) -> Path:
+    """Create an unpredictable private (0700) temp directory under TMPDIR.
+
+    ``tempfile.mkdtemp`` defaults to mode 0o700; re-chmod to the staged-home
+    constant so permission intent stays explicit across platforms.
+    """
+    path = Path(
+        tempfile.mkdtemp(
+            prefix=prefix,
+            dir=os.getenv("TMPDIR") or None,
+        )
+    )
+    try:
+        os.chmod(path, _STAGED_HOME_DIR_MODE)
+    except OSError:
+        pass
+    return path
+
+
 def _refresh_token_data_via_cli(
     auth_path: Path,
     *,
@@ -561,17 +644,21 @@ def _refresh_token_data_via_cli(
 
     staged_home: Optional[Path] = None
     staged_auth_path = cli_auth_path
+    log_path: Optional[Path] = None
     try:
         if seed_auth_file is not None and seed_auth_file != auth_path:
-            staged_home = Path(os.getenv("TMPDIR") or "/tmp") / (
-                f"litellm-antigravity-cli-home-{os.getpid()}-{time.monotonic_ns()}"
-            )
+            staged_home = _make_private_temp_dir("litellm-antigravity-cli-home-")
             staged_auth_path = _stage_cli_auth_home(staged_home, seed_auth_file)
             refresh_home = staged_home
 
-        log_path = Path(os.getenv("TMPDIR") or "/tmp") / (
-            f"litellm-antigravity-refresh-{os.getpid()}-{time.monotonic_ns()}.log"
-        )
+        # Prefer the private 0700 staged home for CLI logs; otherwise create a
+        # private temp dir solely for the log so /tmp is never world-writable
+        # host for token-adjacent diagnostics.
+        log_parent = staged_home
+        if log_parent is None:
+            log_parent = _make_private_temp_dir("litellm-antigravity-cli-log-")
+            staged_home = log_parent  # ensure unconditional cleanup
+        log_path = log_parent / "litellm-antigravity-refresh.log"
         env = dict(os.environ)
         env["HOME"] = str(refresh_home)
         try:
@@ -589,11 +676,6 @@ def _refresh_token_data_via_cli(
             raise ValueError(
                 f"AGY CLI silent auth refresh failed ({type(exc).__name__})."
             ) from exc
-        finally:
-            try:
-                log_path.unlink()
-            except OSError:
-                pass
 
         if process.returncode != 0:
             raise ValueError(
@@ -603,9 +685,8 @@ def _refresh_token_data_via_cli(
 
         refreshed_token_data = _read_token_data(staged_auth_path)
         if not _token_is_valid(refreshed_token_data, buffer_seconds=60):
-            if (
-                refreshed_token_data == original_token_data
-                and _token_is_unexpired(refreshed_token_data)
+            if refreshed_token_data == original_token_data and _token_is_unexpired(
+                refreshed_token_data
             ):
                 return refreshed_token_data
             raise ValueError(
@@ -613,8 +694,13 @@ def _refresh_token_data_via_cli(
             )
         return refreshed_token_data
     finally:
-        # Always remove staged credential dirs, including timeout / OSError /
+        # Always remove staged credential/log dirs, including timeout / OSError /
         # non-zero CLI exit paths that previously left orphan token trees.
+        if log_path is not None:
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
         _cleanup_staged_home(staged_home)
 
 
@@ -637,59 +723,129 @@ def _get_client_value_candidates(
     client_id: Optional[str],
     client_secret: Optional[str],
     cli_path: Optional[str | Path],
-) -> list[tuple[str, str]]:
-    candidates: list[tuple[str, str]] = []
+) -> list[_ClientCredentialCandidate]:
+    """Resolve client credentials with an explicit safer-first discovery chain.
+
+    Order (RR-065 #7):
+      1. explicit function args / env vars (operator-configured)
+      2. values already stored on the token file (validated prior success)
+      3. CLI binary scan only as last-resort fallback when safer sources empty
+
+    Binary scan is never preferred over configured/token sources. When a safer
+    source already produced candidates, the binary is not opened.
+    """
+    candidates: list[_ClientCredentialCandidate] = []
     seen: set[tuple[str, str]] = set()
 
+    # Explicit kwargs win over env so callers can inject one-shot credentials.
     _add_client_candidate(
         candidates,
         seen,
-        client_id or _first_env("AAWM_ANTIGRAVITY_OAUTH_CLIENT_ID", "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID", "ANTIGRAVITY_OAUTH_CLIENT_ID"),
-        client_secret or _first_env("AAWM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET", "ANTIGRAVITY_OAUTH_CLIENT_SECRET"),
+        client_id,
+        client_secret,
+        source="explicit_args",
     )
     _add_client_candidate(
         candidates,
         seen,
-        _first_mapping_value(token_data, ("client_id", "clientId")),
-        _first_mapping_value(token_data, ("client_secret", "clientSecret")),
+        _first_env(
+            "AAWM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+            "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_ID",
+            "ANTIGRAVITY_OAUTH_CLIENT_ID",
+        ),
+        _first_env(
+            "AAWM_ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+            "LITELLM_ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+            "ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+        ),
+        source="env",
     )
-    for cli_client_id, cli_client_secret in _load_cli_client_value_candidates(cli_path):
+
+    token_block = token_data.get("token")
+    token_mapping = token_block if isinstance(token_block, Mapping) else {}
+    _add_client_candidate(
+        candidates,
+        seen,
+        _first_mapping_value(token_data, ("client_id", "clientId"))
+        or _first_mapping_value(token_mapping, ("client_id", "clientId")),
+        _first_mapping_value(token_data, ("client_secret", "clientSecret"))
+        or _first_mapping_value(token_mapping, ("client_secret", "clientSecret")),
+        source="token_file",
+    )
+
+    if candidates:
+        logger.info(
+            "antigravity oauth client discovery: sources=%s pairs=%s "
+            "(skipping cli binary scan; safer source available)",
+            ",".join(sorted({c.source for c in candidates})),
+            len(candidates),
+        )
+        return candidates
+
+    logger.info(
+        "antigravity oauth client discovery: no configured/token client pair; "
+        "falling back to cli binary scan"
+    )
+    for binary_candidate in _load_cli_client_value_candidates(cli_path):
         _add_client_candidate(
             candidates,
             seen,
-            cli_client_id,
-            cli_client_secret,
+            binary_candidate.client_id,
+            binary_candidate.client_secret,
+            source=binary_candidate.source,
+            proximity_bytes=binary_candidate.proximity_bytes,
         )
     return candidates
 
 
 def _add_client_candidate(
-    candidates: list[tuple[str, str]],
+    candidates: list[_ClientCredentialCandidate],
     seen: set[tuple[str, str]],
     client_id: Optional[str],
     client_secret: Optional[str],
+    *,
+    source: str,
+    proximity_bytes: Optional[int] = None,
 ) -> None:
     if not client_id or not client_secret:
         return
-    candidate = (client_id, client_secret)
-    if candidate in seen:
+    key = (client_id, client_secret)
+    if key in seen:
         return
-    seen.add(candidate)
-    candidates.append(candidate)
+    seen.add(key)
+    candidates.append(
+        _ClientCredentialCandidate(
+            client_id=client_id,
+            client_secret=client_secret,
+            source=source,
+            proximity_bytes=proximity_bytes,
+        )
+    )
 
 
 def _load_cli_client_value_candidates(
     cli_path: Optional[str | Path],
-) -> list[tuple[str, str]]:
-    candidates: list[tuple[str, str]] = []
+) -> list[_ClientCredentialCandidate]:
+    candidates: list[_ClientCredentialCandidate] = []
     seen: set[tuple[str, str]] = set()
-    for candidate in _iter_cli_binary_candidates(cli_path):
+    for candidate_path in _iter_cli_binary_candidates(cli_path):
         try:
-            cli_bytes = candidate.read_bytes()
-        except OSError:
+            cli_bytes = candidate_path.read_bytes()
+        except OSError as exc:
+            logger.info(
+                "antigravity cli binary scan: path_unreadable reason=%s",
+                type(exc).__name__,
+            )
             continue
-        for client_id, client_secret in _extract_cli_client_value_candidates(cli_bytes):
-            _add_client_candidate(candidates, seen, client_id, client_secret)
+        for extracted in _extract_cli_client_value_candidates(cli_bytes):
+            _add_client_candidate(
+                candidates,
+                seen,
+                extracted.client_id,
+                extracted.client_secret,
+                source=extracted.source,
+                proximity_bytes=extracted.proximity_bytes,
+            )
     return candidates
 
 
@@ -699,7 +855,11 @@ def _iter_cli_binary_candidates(cli_path: Optional[str | Path]) -> list[Path]:
     explicit_paths = []
     if cli_path is not None:
         explicit_paths.append(str(cli_path))
-    env_path = _first_env("AAWM_ANTIGRAVITY_CLI_PATH", "LITELLM_ANTIGRAVITY_CLI_PATH", "ANTIGRAVITY_CLI_PATH")
+    env_path = _first_env(
+        "AAWM_ANTIGRAVITY_CLI_PATH",
+        "LITELLM_ANTIGRAVITY_CLI_PATH",
+        "ANTIGRAVITY_CLI_PATH",
+    )
     if env_path:
         explicit_paths.append(env_path)
     for raw_path in (*explicit_paths, *_DEFAULT_CLI_BINARY_PATHS):
@@ -719,26 +879,127 @@ def _first_cli_binary(cli_path: Optional[str | Path]) -> Optional[Path]:
     return candidates[0] if candidates else None
 
 
-def _extract_cli_client_value_candidates(cli_bytes: bytes) -> list[tuple[str, str]]:
-    client_secret_matches = list(_CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN.finditer(cli_bytes))
+def _client_pair_diagnostic_id(client_id: str, client_secret: str) -> str:
+    """Stable non-secret identifier for a client_id/secret pair.
+
+    Never logs full client IDs or secrets; only a short hash prefix of the pair.
+    """
+    digest = hashlib.sha256(f"{client_id}\0{client_secret}".encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def _extract_cli_client_value_candidates(
+    cli_bytes: bytes,
+) -> list[_ClientCredentialCandidate]:
+    """Recover OAuth client pairs by scanning CLI binary bytes.
+
+    Last-resort discovery only. Prefer env/token-file values via
+    `_get_client_value_candidates` so this path is skipped when safer sources
+    exist. No official AGY subcommand exposes client credentials (verified
+    against `agy --help`); config files under the CLI home do not either.
+
+    Hardening vs naive byte-proximity scrape (RR-065 #7):
+      - bounded secret regex (no adjacent-secret concatenation)
+      - nearest-id ranking per secret with a max distance budget
+      - cap ids-per-secret and total pairs to avoid combinatorial wrong pairs
+      - log counts + proximity diagnostics without secret material
+    """
+    client_secret_matches = list(
+        _CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN.finditer(cli_bytes)
+    )
     client_id_matches = list(_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN.finditer(cli_bytes))
     if not client_secret_matches or not client_id_matches:
+        logger.info(
+            "antigravity cli binary scan: secrets=%s client_ids=%s pairs=0",
+            len(client_secret_matches),
+            len(client_id_matches),
+        )
         return []
-    candidates: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+
+    ranked: list[tuple[int, str, str]] = []
     for client_secret_match in client_secret_matches:
-        client_secret = client_secret_match.group("value").decode("ascii", errors="ignore")
-        for client_id_match in sorted(
+        client_secret = client_secret_match.group("value").decode(
+            "ascii", errors="ignore"
+        )
+        if not _looks_like_oauth_client_secret(client_secret):
+            continue
+        nearest = sorted(
             client_id_matches,
             key=lambda match: abs(match.start() - client_secret_match.start()),
-        ):
-            _add_client_candidate(
-                candidates,
-                seen,
-                client_id_match.group("value").decode("ascii", errors="ignore"),
-                client_secret,
+        )
+        accepted_for_secret = 0
+        for client_id_match in nearest:
+            distance = abs(client_id_match.start() - client_secret_match.start())
+            if distance > _CLI_BINARY_PAIR_MAX_DISTANCE_BYTES:
+                break
+            client_id = client_id_match.group("value").decode(
+                "ascii", errors="ignore"
             )
+            if not _looks_like_oauth_client_id(client_id):
+                continue
+            ranked.append((distance, client_id, client_secret))
+            accepted_for_secret += 1
+            if accepted_for_secret >= _CLI_BINARY_MAX_IDS_PER_SECRET:
+                break
+
+    ranked.sort(key=lambda item: item[0])
+    candidates: list[_ClientCredentialCandidate] = []
+    seen: set[tuple[str, str]] = set()
+    for distance, client_id, client_secret in ranked:
+        if len(candidates) >= _CLI_BINARY_MAX_CANDIDATE_PAIRS:
+            break
+        _add_client_candidate(
+            candidates,
+            seen,
+            client_id,
+            client_secret,
+            source="cli_binary_scan",
+            proximity_bytes=distance,
+        )
+
+    nearest_dist = ranked[0][0] if ranked else None
+    logger.info(
+        "antigravity cli binary scan: secrets=%s client_ids=%s pairs=%s "
+        "nearest_proximity_bytes=%s max_distance=%s",
+        len(client_secret_matches),
+        len(client_id_matches),
+        len(candidates),
+        nearest_dist,
+        _CLI_BINARY_PAIR_MAX_DISTANCE_BYTES,
+    )
     return candidates
+
+
+def _looks_like_oauth_client_id(client_id: str) -> bool:
+    if not client_id or not client_id.endswith(".apps.googleusercontent.com"):
+        return False
+    if client_id.count(".apps.googleusercontent.com") != 1:
+        return False
+    prefix = client_id[: -len(".apps.googleusercontent.com")]
+    if "-" not in prefix:
+        return False
+    project, _, random_part = prefix.partition("-")
+    return (
+        project.isdigit()
+        and 6 <= len(project) <= 20
+        and random_part.isalnum()
+        and 8 <= len(random_part) <= 64
+    )
+
+
+def _looks_like_oauth_client_secret(client_secret: str) -> bool:
+    # Google OAuth client secrets are GOCSPX- plus a moderate body; reject
+    # concatenated adjacent secrets and URL fragments from binary scrapes.
+    if not client_secret or not client_secret.startswith("GOCSPX-"):
+        return False
+    if client_secret.count("GOCSPX-") != 1:
+        return False
+    body = client_secret[len("GOCSPX-") :]
+    if not (8 <= len(body) <= 48):
+        return False
+    if body.lower().endswith(("http", "https", "www")):
+        return False
+    return body.replace("-", "").replace("_", "").isalnum()
 
 
 def _first_mapping_value(
@@ -767,67 +1028,58 @@ def _clean_value(value: Any) -> Optional[str]:
     return stripped or None
 
 
-@dataclass(frozen=True)
-class _CredentialFileMetadata:
-    uid: Optional[int]
-    gid: Optional[int]
-    mode: int
+def _snapshot_credential_file_metadata(
+    credential_path: Path,
+) -> CredentialFileMetadata:
+    """Delegate to shared metadata owner (RR-065 residual #5)."""
+    return snapshot_credential_file_metadata(
+        credential_path,
+        default_mode=DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE,
+        refuse_symlink=True,
+    )
 
 
-def _snapshot_credential_file_metadata(credential_path: Path) -> _CredentialFileMetadata:
-    if not credential_path.exists():
-        return _CredentialFileMetadata(
-            uid=None,
-            gid=None,
-            mode=DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE,
-        )
-    file_stat = credential_path.stat()
-    return _CredentialFileMetadata(
-        uid=file_stat.st_uid,
-        gid=file_stat.st_gid,
-        mode=stat.S_IMODE(file_stat.st_mode),
+def _resolve_credential_file_metadata(auth_path: Path) -> CredentialFileMetadata:
+    """Snapshot path metadata and apply optional Antigravity env overrides."""
+    return resolve_credential_file_metadata(
+        auth_path,
+        default_mode=DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE,
+        mode_env="AAWM_ANTIGRAVITY_AUTH_FILE_MODE",
+        uid_env="AAWM_ANTIGRAVITY_AUTH_FILE_UID",
+        gid_env="AAWM_ANTIGRAVITY_AUTH_FILE_GID",
+        base_metadata=_snapshot_credential_file_metadata(auth_path),
+        refuse_symlink=True,
     )
 
 
 def _apply_credential_file_metadata(
     target_path: Path,
-    metadata: _CredentialFileMetadata,
+    metadata: CredentialFileMetadata,
 ) -> None:
-    if metadata.uid is not None or metadata.gid is not None:
-        os.chown(
-            target_path,
-            metadata.uid if metadata.uid is not None else -1,
-            metadata.gid if metadata.gid is not None else -1,
-        )
-    os.chmod(target_path, metadata.mode)
+    """Delegate to shared metadata owner (RR-065 residual #5)."""
+    apply_credential_file_metadata(
+        target_path,
+        metadata,
+        default_mode=DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE,
+        refuse_symlink=True,
+    )
 
 
 def _write_token_data(auth_path: Path, token_data: Mapping[str, Any]) -> None:
-    auth_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata = _snapshot_credential_file_metadata(auth_path)
-    if metadata.mode & 0o077:
-        metadata = _CredentialFileMetadata(
-            uid=metadata.uid,
-            gid=metadata.gid,
-            mode=DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE,
-        )
-    tmp_path = auth_path.with_name(f".{auth_path.name}.{os.getpid()}.tmp")
-    try:
-        payload = json.dumps(token_data, indent=2, sort_keys=True) + "\n"
-        write_mode = (
-            metadata.mode
-            if not (metadata.mode & 0o077)
-            else DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE
-        )
-        _write_private_text(tmp_path, payload, mode=write_mode)
-        _apply_credential_file_metadata(tmp_path, metadata)
-        os.replace(tmp_path, auth_path)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    """Atomically publish token JSON via shared private write helpers.
+
+    Uses unpredictable exclusive same-dir temps, refuses symlink targets, applies
+    ownership/mode metadata without following links, and cleans failed temps.
+    """
+    metadata = _resolve_credential_file_metadata(auth_path)
+    payload = json.dumps(token_data, indent=2, sort_keys=True) + "\n"
+    write_and_publish_private_text(
+        auth_path,
+        payload,
+        metadata=metadata,
+        default_mode=DEFAULT_ANTIGRAVITY_AUTH_FILE_MODE,
+        mkdir_parents=True,
+    )
 
 
 def _extract_oauth_error_hint(response_body: str) -> Optional[str]:
@@ -844,12 +1096,9 @@ def _extract_oauth_error_hint(response_body: str) -> Optional[str]:
     return None
 
 
-def _sanitize_error_message(message: str) -> str:
-    sanitized = message
-    for field_name in _SECRET_FIELD_NAMES:
-        sanitized = re.sub(
-            rf"(?i)\b{re.escape(field_name)}\b\s*[:=]\s*\S+",
-            f"{field_name}=[REDACTED]",
-            sanitized,
-        )
-    return sanitized
+def _sanitize_error_message(message: str, *, limit: int = 500) -> str:
+    """Redact secret *values* keyed by known field names (not just the labels).
+
+    Output is bounded so long upstream bodies cannot flood observations/logs.
+    """
+    return sanitize_credential_error_message(message, limit=limit)
