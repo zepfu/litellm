@@ -828,6 +828,17 @@ def _icmp_probe(
             }
         )
         return observation
+    except OSError as exc:
+        # Missing/unusable ping (FileNotFoundError, PermissionError, etc.) must
+        # degrade to a failed ICMP observation rather than abort the cycle.
+        observation.update(
+            {
+                "total_ms": round((time.perf_counter() - started) * 1000, 3),
+                "error_class": type(exc).__name__,
+                "error_message": str(exc)[-300:] if str(exc) else type(exc).__name__,
+            }
+        )
+        return observation
 
     output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
     parsed = parse_ping_output(output)
