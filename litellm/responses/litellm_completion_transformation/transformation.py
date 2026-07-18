@@ -6,6 +6,9 @@ from collections.abc import Sequence
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union, cast
 
 from openai.types.responses import ResponseFunctionToolCall
+from openai.types.responses.response_code_interpreter_tool_call import (
+    ResponseCodeInterpreterToolCall,
+)
 from openai.types.responses.response_create_params import ResponseInputParam
 from openai.types.responses.tool_param import FunctionToolParam
 from typing_extensions import TypedDict
@@ -1696,6 +1699,7 @@ class LiteLLMCompletionResponsesConfig:
     ) -> List[
         Union[
             GenericResponseOutputItem,
+            ResponseCodeInterpreterToolCall,
             OutputFunctionToolCall,
             OutputImageGenerationCall,
             ResponseFunctionToolCall,
@@ -1704,6 +1708,7 @@ class LiteLLMCompletionResponsesConfig:
         responses_output: List[
             Union[
                 GenericResponseOutputItem,
+                ResponseCodeInterpreterToolCall,
                 OutputFunctionToolCall,
                 OutputImageGenerationCall,
                 ResponseFunctionToolCall,
@@ -1725,7 +1730,210 @@ class LiteLLMCompletionResponsesConfig:
                 chat_completion_response=chat_completion_response
             )
         )
+
+        # Convert server-side tool results (e.g. Anthropic code execution)
+        # into code_interpreter_call output items, replacing the corresponding
+        # function_call placeholders so the output matches OpenAI's native shape.
+        tool_result_items = (
+            LiteLLMCompletionResponsesConfig._extract_tool_result_output_items(
+                chat_completion_response
+            )
+        )
+        if tool_result_items:
+            responses_output = LiteLLMCompletionResponsesConfig._merge_code_interpreter_output_items(
+                responses_output=responses_output,
+                tool_result_items=tool_result_items,
+            )
+
         return responses_output
+
+    @staticmethod
+    def _normalize_code_interpreter_output_item(
+        item: Any,
+    ) -> Optional[ResponseCodeInterpreterToolCall]:
+        """
+        Normalize a provider-supplied code_interpreter_results entry into an
+        OpenAI Responses code_interpreter_call item.
+
+        Accepts ResponseCodeInterpreterToolCall instances, LiteLLM-style objects
+        with matching attributes/model_dump(), or plain dicts. Returns None for
+        malformed entries so callers can skip them without failing the response.
+        """
+        if item is None:
+            return None
+
+        if isinstance(item, ResponseCodeInterpreterToolCall):
+            return item
+
+        raw: Any = item
+        if not isinstance(raw, dict):
+            if hasattr(raw, "model_dump"):
+                try:
+                    raw = raw.model_dump()
+                except Exception:
+                    raw = None
+            elif hasattr(raw, "dict"):
+                try:
+                    raw = raw.dict()
+                except Exception:
+                    raw = None
+            elif hasattr(raw, "__dict__"):
+                raw = dict(getattr(raw, "__dict__"))
+            else:
+                return None
+
+        if not isinstance(raw, dict):
+            return None
+
+        item_id = raw.get("id")
+        if item_id is None or item_id == "":
+            return None
+
+        status = raw.get("status") or "completed"
+        valid_statuses = {
+            "in_progress",
+            "completed",
+            "incomplete",
+            "interpreting",
+            "failed",
+        }
+        if status not in valid_statuses:
+            status = "completed"
+
+        container_id = raw.get("container_id")
+        if container_id is None:
+            container_id = ""
+
+        payload: Dict[str, Any] = {
+            "type": "code_interpreter_call",
+            "id": str(item_id),
+            "code": raw.get("code"),
+            "container_id": str(container_id),
+            "status": status,
+            "outputs": raw.get("outputs"),
+        }
+
+        try:
+            return ResponseCodeInterpreterToolCall(**payload)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_tool_result_output_items(
+        chat_completion_response: ModelResponse,
+    ) -> List[ResponseCodeInterpreterToolCall]:
+        """
+        Extract pre-built code_interpreter_call output items from
+        provider_specific_fields.
+
+        Provider transformers (e.g. Anthropic) convert their native tool results
+        into code_interpreter objects and store them under
+        provider_specific_fields["code_interpreter_results"]. Streaming aggregates
+        from LiteLLMCompletionStreamingIterator may place the same map on
+        ModelResponse._hidden_params instead of (or in addition to) message fields.
+
+        This method is provider-agnostic: it only reconstructs/normalizes items
+        already shaped for the Responses API.
+        """
+        output_items: List[ResponseCodeInterpreterToolCall] = []
+        seen_ids: Set[str] = set()
+
+        def _consume_results(results: Any) -> None:
+            if not isinstance(results, list):
+                return
+            for raw_item in results:
+                normalized = LiteLLMCompletionResponsesConfig._normalize_code_interpreter_output_item(
+                    raw_item
+                )
+                if normalized is None:
+                    continue
+                if normalized.id in seen_ids:
+                    continue
+                seen_ids.add(normalized.id)
+                output_items.append(normalized)
+
+        # Prefer message-level fields (non-streaming / fully hydrated messages).
+        for choice in getattr(chat_completion_response, "choices", None) or []:
+            message = getattr(choice, "message", None)
+            if not message:
+                continue
+            psf = getattr(message, "provider_specific_fields", None)
+            if isinstance(psf, dict):
+                _consume_results(psf.get("code_interpreter_results"))
+
+        # Streaming aggregate path: RR-062 merges provider_specific_fields onto
+        # ModelResponse._hidden_params for the terminal completed response.
+        hidden_params = getattr(chat_completion_response, "_hidden_params", None)
+        if isinstance(hidden_params, dict):
+            hidden_psf = hidden_params.get("provider_specific_fields")
+            if isinstance(hidden_psf, dict):
+                _consume_results(hidden_psf.get("code_interpreter_results"))
+
+        # Also accept a top-level provider_specific_fields attribute if present.
+        top_psf = getattr(chat_completion_response, "provider_specific_fields", None)
+        if isinstance(top_psf, dict):
+            _consume_results(top_psf.get("code_interpreter_results"))
+
+        return output_items
+
+    @staticmethod
+    def _merge_code_interpreter_output_items(
+        responses_output: List[Any],
+        tool_result_items: List[ResponseCodeInterpreterToolCall],
+    ) -> List[Any]:
+        """
+        Merge code_interpreter_call items into the Responses output list.
+
+        - Replace matching function_call placeholders (by call_id/id) in place so
+          ordering matches OpenAI's native shape.
+        - Skip items already present as code_interpreter_call with the same id
+          (idempotent if conversion runs more than once).
+        - Append any remaining results that had no function_call placeholder.
+        """
+        if not tool_result_items:
+            return responses_output
+
+        result_by_id: Dict[str, ResponseCodeInterpreterToolCall] = {
+            item.id: item for item in tool_result_items if getattr(item, "id", None)
+        }
+        if not result_by_id:
+            return responses_output
+
+        existing_code_ids: Set[str] = set()
+        for item in responses_output:
+            if getattr(item, "type", None) == "code_interpreter_call":
+                item_id = getattr(item, "id", None)
+                if item_id:
+                    existing_code_ids.add(str(item_id))
+
+        merged_output: List[Any] = []
+        for item in responses_output:
+            item_type = getattr(item, "type", None)
+            if item_type == "code_interpreter_call":
+                merged_output.append(item)
+                continue
+
+            if item_type == "function_call":
+                call_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+                call_id_str = str(call_id) if call_id is not None else None
+                if call_id_str and call_id_str in result_by_id:
+                    if call_id_str not in existing_code_ids:
+                        merged_output.append(result_by_id[call_id_str])
+                        existing_code_ids.add(call_id_str)
+                    continue
+
+            merged_output.append(item)
+
+        for item in tool_result_items:
+            item_id = getattr(item, "id", None)
+            if not item_id or str(item_id) in existing_code_ids:
+                continue
+            # Keep replacement-first ordering: unmatched results append after
+            # existing output items rather than reordering earlier content.
+            merged_output.append(item)
+            existing_code_ids.add(str(item_id))
+
+        return merged_output
 
     @staticmethod
     def _extract_reasoning_output_items(
