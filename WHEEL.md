@@ -112,9 +112,22 @@ Tag line:
 Current responsibilities:
 
 - Claude Code `# auto memory` system-prompt replacement
-- exact-match prompt patch manifest application
+- exact-match prompt patch manifest application on trusted early surfaces only
+  (`system` + first user message; full history is not re-scanned each turn)
 - AAWM dynamic directive expansion like `AAWM p=get_agent_memories ...`
+- `:#name.ctx#:` marker expansion and dispatch backtick/acronym context grabs,
+  restricted to trusted surfaces (`system` + first user message) so tool/web
+  output cannot trigger same-tenant content-store reads (RR-053 trust boundary)
+- dispatch context reference fan-out is capped per text node
+  (`_AAWM_DISPATCH_CONTEXT_REFERENCE_MAX`) and request-wide
+  (`_AAWM_DISPATCH_CONTEXT_REFERENCE_REQUEST_MAX`), and filters common all-caps
+  stopwords so large coding-agent transcripts cannot unbounded-fanout the
+  dynamic-injection pool
 - short-TTL caching for dynamic directive expansion results on repeated session/agent/tenant contexts
+- process-wide AAWM dynamic-injection asyncpg pool helpers
+  (`_get_aawm_dynamic_injection_pool`, `close_aawm_dynamic_injection_pool`) with
+  bounded `pool.acquire(timeout=...)` (override via
+  `AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS`)
 - post-rewrite `MEMORY.md` / `CLAUDE.md` trace tagging
 - related Langfuse metadata/span emission for the above control-plane actions
 
@@ -281,6 +294,12 @@ Notes:
 - AAWM dynamic memory injection requires the same `AAWM_DB_*` / `AAWM_DB_URL`
   database settings; otherwise the directive-expansion path will fall back to
   its failure behavior
+- untrusted later messages (tool results, web fetch text, subsequent turns) are
+  not expanded for `:#name.ctx#:` or dispatch backtick/acronym grabs; only the
+  system prompt and the first user message are trusted for those lookups
+- sibling modules that need AAWM Postgres for dynamic injection should import
+  the control-plane module's pool helpers rather than opening a second pool
+  against the same DSN
 
 ## Performance-related runtime defaults
 
@@ -300,6 +319,10 @@ Recent AAWM runtime work also changed the default performance posture:
 - Claude dynamic injection now has a small TTL cache
   - tune with:
     - `AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS`
+- Claude dynamic-injection pool acquires are time-bounded
+  - default acquire timeout: 10s
+  - override with `AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS`
+  - release with `close_aawm_dynamic_injection_pool()` on proxy shutdown
 
 Useful operator-visible instrumentation from those changes:
 

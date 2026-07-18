@@ -10,12 +10,16 @@ During the migration window, agents should also inspect legacy
 `.analysis/*-error.log` files. Those plain-text files are retained for discovery
 only until all writers and intake instructions have moved to JSONL.
 
-The provider-status observations sidecar can also append
-structured anomaly rows to the same `<environment>-error.jsonl` convention when
+The provider-status observations sidecar can also write structured anomaly
+rows to the same `<environment>-error.jsonl` convention when
 `AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED=1`. Those rows come from the scheduled
 session-history/rate-limit anomaly scan in
 `scripts/run_provider_status_observations_loop.py`, not from LiteLLM `ERROR`
-logging. See `docs/aawm-provider-status-observations.md` for the sidecar env vars
+logging. Unlike the generic ERROR append sink, the sidecar performs a standing-anomaly
+dedupe check before appending, preserves unrelated active intake by never
+rewriting the shared file, and bounds growth with projected-size refusal against
+`LITELLM_AAWM_ERROR_LOG_MAX_BYTES` (it does not rotate or delete the shared
+JSONL). See `docs/aawm-provider-status-observations.md` for the sidecar env vars
 and scan behavior.
 
 ## Enablement
@@ -232,9 +236,12 @@ Practical `context` fields to inspect are:
 - `aiohttp_context_keys`
 - `aiohttp_context_resource`
 
-Sidecar anomaly intake lines use the same append-safe JSONL file convention but a
-different event shape. Each detected anomaly class is written as one line with
-`event=aawm_observability_anomaly`. Practical fields to inspect are:
+Sidecar anomaly intake lines share the `<environment>-error.jsonl` path and
+JSONL line format but use a different event shape and write policy. Each
+detected anomaly class is represented with `event=aawm_observability_anomaly`.
+Standing identical classes are not re-appended every hour; material changes
+append a fresh durable line rather than rewriting the shared file. Practical
+fields to inspect are:
 
 - `anomaly_class`
 - `anomaly_source`

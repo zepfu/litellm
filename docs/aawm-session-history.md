@@ -196,10 +196,67 @@ Omit `--apply` for a dry run. JSON output includes `scanned_rows`,
 `--repair-anthropic-context-window` is used without `--repair-costs` or
 `--repair-tenant-ids`. Combine flags to run multiple repair passes in one scan.
 
+The multi-purpose repair command above paginates by
+`(start_time ASC NULLS LAST, litellm_call_id ASC)` rather than `LIMIT/OFFSET`.
+Its apply paths reuse one pool connection per page and batch matched updates
+with `executemany` (Gemini control-plane repair reuses the same page connection
+inside one transaction). The provider-cache repair below has its own
+`session_history.id` keyset cursor.
+
 `unknown` / `unavailable` on repaired historical rows means retained evidence in
 stored metadata (and `inbound_model_alias` when present) was insufficient to
 classify extended context; it does not mean LiteLLM inferred a window from
 observed token counts.
+
+### Repairing provider-cache / reasoning / git rollups
+
+When the original proxy spend-log source is unavailable locally, use
+`scripts/repair_session_history_provider_cache.py` to re-derive observability
+fields from stored `session_history` rows plus
+`session_history_tool_activity`:
+
+- normalized `provider`
+- reasoning token source/fields
+- provider-cache status / miss token / miss cost columns and matching
+  `metadata.usage_provider_cache_*` plus `{provider_family}_provider_cache_*`
+  keys (generated from one field catalog)
+- git commit/push rollups
+
+Operator safety (RR-087):
+
+- Default is dry-run (scan + summary only; no writes and no DDL).
+- `--apply` persists repaired column/metadata values.
+- `--ensure-schema` is an **opt-in emergency bootstrap** that applies the shared
+  SQL constants from `aawm_agent_identity` (CREATE/ALTER/INDEX). Schema is
+  migration-owned; do not pass this flag against a live production database
+  unless you intentionally accept the brief ACCESS EXCLUSIVE lock windows.
+- Both `--apply` and `--ensure-schema` refuse to run unless
+  `current_database()` equals `--target-db-name` (default `aawm_tristore`).
+  Pure dry-run may still report a mismatched database name without aborting.
+- Pagination is keyset by `session_history.id` with `--batch-size` (default 500)
+  and optional `--limit` on rows updated after scanning.
+- Git counts are reconciled only when the tool-activity join is complete
+  (`has_tool_activity`). Incomplete joins leave stored counts untouched so an
+  empty join cannot zero real history; complete joins can lower previously
+  over-counted values.
+- Prefer one repair/backfill script at a time against `session_history`; this
+  path still replaces the full `metadata` JSONB document for rows it updates.
+
+```bash
+# Dry-run summary against whatever DSN AAWM_DIRECT_DATABASE_URL / AAWM env resolves
+./.venv/bin/python scripts/repair_session_history_provider_cache.py \
+  --limit 100
+
+# Apply against the exact tristore database only
+./.venv/bin/python scripts/repair_session_history_provider_cache.py \
+  --target-db-name aawm_tristore \
+  --apply \
+  --batch-size 500
+```
+
+JSON output includes `mode`, `database`, `target_db_name`, `ensure_schema`,
+`schema_bootstrapped`, `scanned_rows`, `repaired_rows`, and
+`provider_status_counts`.
 
 ## Runtime / Client Identity Backfill
 
@@ -291,56 +348,6 @@ display host used by AAWM route logging.
 Route rollup headers use the exact display form
 `repo#Client[version]@host`, for example
 `aawm-infrastructure#Codex[0.142.5]@thoth /openai_passthrough/responses`.
-
-### Repairing provider-cache / reasoning / git rollups
-
-When the original proxy spend-log source is unavailable locally, use
-`scripts/repair_session_history_provider_cache.py` to re-derive observability
-fields from stored `session_history` rows plus
-`session_history_tool_activity`:
-
-- normalized `provider`
-- reasoning token source/fields
-- provider-cache status / miss token / miss cost columns and matching
-  `metadata.usage_provider_cache_*` plus `{provider_family}_provider_cache_*`
-  keys (generated from one field catalog)
-- git commit/push rollups
-
-Operator safety (RR-087):
-
-- Default is dry-run (scan + summary only; no writes and no DDL).
-- `--apply` persists repaired column/metadata values.
-- `--ensure-schema` is an **opt-in emergency bootstrap** that applies the shared
-  SQL constants from `aawm_agent_identity` (CREATE/ALTER/INDEX). Schema is
-  migration-owned; do not pass this flag against a live production database
-  unless you intentionally accept the brief ACCESS EXCLUSIVE lock windows.
-- Both `--apply` and `--ensure-schema` refuse to run unless
-  `current_database()` equals `--target-db-name` (default `aawm_tristore`).
-  Pure dry-run may still report a mismatched database name without aborting.
-- Pagination is keyset by `session_history.id` with `--batch-size` (default 500)
-  and optional `--limit` on rows updated after scanning.
-- Git counts are reconciled only when the tool-activity join is complete
-  (`has_tool_activity`). Incomplete joins leave stored counts untouched so an
-  empty join cannot zero real history; complete joins can lower previously
-  over-counted values.
-- Prefer one repair/backfill script at a time against `session_history`; this
-  path still replaces the full `metadata` JSONB document for rows it updates.
-
-```bash
-# Dry-run summary against whatever DSN AAWM_DIRECT_DATABASE_URL / AAWM env resolves
-./.venv/bin/python scripts/repair_session_history_provider_cache.py \
-  --limit 100
-
-# Apply against the exact tristore database only
-./.venv/bin/python scripts/repair_session_history_provider_cache.py \
-  --target-db-name aawm_tristore \
-  --apply \
-  --batch-size 500
-```
-
-JSON output includes `mode`, `database`, `target_db_name`, `ensure_schema`,
-`schema_bootstrapped`, `scanned_rows`, `repaired_rows`, and
-`provider_status_counts`.
 
 ## Repository And Tenant Attribution
 
@@ -1414,11 +1421,12 @@ Antigravity Code Assist routes use OAuth token files on the host. In prod,
 LiteLLM should be configured with `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` for
 the refreshed token copy and `LITELLM_ANTIGRAVITY_SEED_AUTH_FILE` for the
 read-only Antigravity CLI login seed, normally
-`/home/zepfu/.gemini/antigravity-cli/antigravity-oauth-token`. LiteLLM is a
-read-only consumer of those files. During request handling it loads the first
-valid candidate token and never attempts a direct OAuth refresh or invokes
-`agy`. If all candidate tokens are expired or invalid, LiteLLM fails the
-Antigravity candidate with a clear refresh-required message.
+`~/.gemini/antigravity-cli/antigravity-oauth-token` (expanded with
+`Path.expanduser()`). LiteLLM is a read-only consumer of those files. During
+request handling it loads the first valid candidate token and never attempts a
+direct OAuth refresh or invokes `agy`. If all candidate tokens are expired or
+invalid, LiteLLM fails the Antigravity candidate with a clear refresh-required
+message.
 
 For AAWM auto-agent aliases, stale or missing Antigravity token data is treated
 as provider-auth degradation during candidate selection. The selector records the
@@ -1432,24 +1440,56 @@ The provider-status sidecar does not schedule Antigravity OAuth refresh, persist
 Antigravity auth telemetry, or probe Google/Gemini front-door endpoints.
 Antigravity token maintenance remains outside provider-status ownership (for
 example `scripts/antigravity_oauth_refresh.py` for manual or non-sidecar use).
+That script defaults to `~`-relative auth/lock/CLI paths, stages CLI fallback
+credentials and `--log-file` output under an unpredictable private `0700`
+`tempfile.mkdtemp` directory with unconditional cleanup, writes credential temps
+at mode `0600` (no umask window), reuses shared credential lock/metadata helpers
+(`credential_file_lock` plus `credential_file_metadata` with optional
+`AAWM_ANTIGRAVITY_AUTH_FILE_UID` / `AAWM_ANTIGRAVITY_AUTH_FILE_GID` /
+`AAWM_ANTIGRAVITY_AUTH_FILE_MODE` overrides, group/other bits clamped to `0600`),
+and logs only non-secret client-pair diagnostic ids when scanning CLI binary
+candidates.
 Historical `provider_auth_observations` rows for Antigravity may still exist in
 the database.
 
 ## Codex OAuth Credentials
 
 Codex/OpenAI adapter routes that use ChatGPT-account OAuth read the Codex auth
-JSON file, normally `/home/zepfu/.codex/auth.json`, through
-`LITELLM_CODEX_AUTH_FILE`. LiteLLM is a read-only consumer of that file. During
-request handling it loads headers only when the access token is still valid. If
-the token is expired or invalid, LiteLLM fails with a clear sidecar-refresh
-message instead of attempting OAuth refresh or writing the auth JSON.
+JSON file, normally `~/.codex/auth.json` (expanded with `Path.expanduser()`),
+through `LITELLM_CODEX_AUTH_FILE`. LiteLLM is a read-only consumer of that file.
+During request handling it loads headers only when the access token is still
+valid. If the token is expired or invalid, LiteLLM fails with a clear
+sidecar-refresh message instead of attempting OAuth refresh or writing the auth
+JSON.
 
-The provider-status sidecar is the scheduled Codex OAuth writer. It mounts
-`/home/zepfu/.codex` writable, locks the configured auth file, refreshes with
+The provider-status sidecar is the scheduled Codex OAuth writer. It mounts the
+configured host Codex directory writable, locks the auth file, refreshes with
 the Codex OAuth refresh token, and writes the updated access token, refresh
 token, optional ID token, account ID, expiry, and top-level `last_refresh`
-timestamp atomically. The dev LiteLLM container mounts the same host directory
-read-only. In dev compose the sidecar runs with
+timestamp atomically. `scripts/codex_oauth_refresh.py` defaults to portable
+`~`-relative auth and lock paths (`~/.codex/auth.json` and
+`~/.codex/auth.json.lock`, expanded with `Path.expanduser()` at use sites—not a
+hardcoded operator home). It reuses the shared
+`credential_file_lock` helper (module-scoped `fcntl` with flock-failure
+warnings, never silent) and publishes via
+`litellm/secret_managers/credential_file_write.write_and_publish_private_text`:
+exclusive same-dir private temp at mode `0600` (no umask window), metadata
+apply on the temp, atomic `os.replace`, and best-effort failed-temp cleanup.
+Symlink credential targets are refused at metadata snapshot/resolve/apply and
+publish (`CredentialPathIsSymlinkError`; no-follow / `O_NOFOLLOW` when
+available). Ownership/mode snapshot, resolve, and apply use
+`litellm/secret_managers/credential_file_metadata.py`; group/other-readable or
+writable modes are clamped back to `0600`, and optional
+`AAWM_CODEX_AUTH_FILE_UID` / `AAWM_CODEX_AUTH_FILE_GID` /
+`AAWM_CODEX_AUTH_FILE_MODE` overrides are honored when set. A present but
+non-object `tokens` field is rejected as a schema error rather than silently
+falling back to the top-level payload. Upstream refresh error bodies pass
+through the shared bounded sanitizer
+`litellm/secret_managers/credential_error_sanitizer.sanitize_credential_error_message`
+(default 500-character cap) so secret *values* are redacted—not only field-name
+labels—before they enter the returned summary or sidecar telemetry. The dev
+LiteLLM container mounts the same host directory read-only. In dev compose the
+sidecar runs with
 `AAWM_CODEX_OAUTH_REFRESH_ENABLED=1`,
 `AAWM_CODEX_AUTH_FILE=/home/zepfu/.codex/auth.json`, host-user ownership
 defaults `AAWM_CODEX_AUTH_FILE_UID=1000` and

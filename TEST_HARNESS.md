@@ -378,11 +378,14 @@ Telemetry expectation:
   `claude_adapter_peeromega_fanout`: at least one Anthropic child row must have
   `provider_cache_attempted=true` and `provider_cache_status` equal to `hit` or
   `write`
-- session-history writer changes must stay synced between the in-repo dev
-  callback (`litellm.integrations.aawm_agent_identity`) and the callback overlay
-  wheel source (`.wheel-build/aawm_litellm_callbacks/agent_identity.py`), because
-  the port-4000 `aawm-litellm` image imports the wheel module rather than the
-  in-repo dev module
+- session-history writer changes edit only the canonical callback
+  (`litellm.integrations.aawm_agent_identity`). The checkout path
+  `.wheel-build/aawm_litellm_callbacks/agent_identity.py` is a thin re-export
+  loader; hatch force-includes the canonical module into the published
+  `aawm-litellm-callbacks` wheel. The port-4000 `aawm-litellm` image imports the
+  installed wheel module (`aawm_litellm_callbacks.agent_identity`), so rebuild
+  and publish the callback wheel after writer changes—do not dual-maintain a
+  full source copy under `.wheel-build/`
 - `scripts/repair_session_history_provider_cache.py` is the local repair path
   for existing rows when source spend logs are not available; despite its
   historical name it now repairs inferred provider, reasoning source/count

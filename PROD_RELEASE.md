@@ -167,7 +167,12 @@ GitHub-created artifact tags may not trigger the tag-based release workflows
 because GitHub suppresses recursive workflow triggers from the workflow token.
 If the autobump job creates `cb-v*`, `cp-v*`, `cfg-v*`, or `h-v*` tags but the
 matching GitHub Releases are missing, build and upload the missing assets before
-the infrastructure rebuild. Example recovery flow:
+the infrastructure rebuild. Callback agent identity is single-source: edit only
+`litellm/integrations/aawm_agent_identity.py`; hatch force-includes it into the
+wheel built from `.wheel-build/` (checkout `agent_identity.py` is a thin loader).
+Guard with
+`./.venv/bin/python scripts/sync_aawm_agent_identity_to_wheel.py --check`
+before publishing. Example recovery flow:
 
 ```bash
 ./.venv/bin/python -m build --wheel --outdir /tmp/aawm-cb-dist .wheel-build
@@ -601,10 +606,12 @@ gaps, and session-history gaps remain hard failures.
 2026-04-28 aawm.37 / `cb-v0.0.12` / `cp-v0.0.6` / `h-v0.0.21` prod cutover notes:
 
 - Callback behavior in prod comes from the overlay wheel, not only the in-repo
-  `litellm/integrations` source. When fixing callback behavior, keep
-  `.wheel-build/aawm_litellm_callbacks/` in parity, publish the callback wheel,
-  rebuild the infrastructure image, and verify installed package versions inside
-  the built/running container before relying on prod harness evidence.
+  `litellm/integrations` import path. When fixing callback behavior, edit the
+  canonical `litellm/integrations/aawm_agent_identity.py` (hatch force-includes
+  it into the published callback wheel; do not maintain a full second copy under
+  `.wheel-build/`), publish the callback wheel, rebuild the infrastructure
+  image, and verify installed package versions inside the built/running
+  container before relying on prod harness evidence.
 - GitHub release workflows require the tagged commit to be reachable from
   `main`. Tags created from `develop` can publish git refs but fail asset
   publication at the "tagged commit is on main" gate; fast-forward `main` first
