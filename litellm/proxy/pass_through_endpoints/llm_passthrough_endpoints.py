@@ -53,7 +53,7 @@ from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
 )
 from litellm.proxy.aawm_runtime_error_logging import (
-    persist_malformed_tool_call_detection,
+    schedule_persist_malformed_tool_call_detection,
 )
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_API_BASE,
@@ -17866,7 +17866,10 @@ def _raise_codex_auto_agent_malformed_tool_call_text_payload(
     stream_event_summaries: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     try:
-        persist_malformed_tool_call_detection(
+        # Offload synchronous JSONL intake when called under a running loop so
+        # async request handlers do not block on disk I/O while rejecting
+        # malformed tool-call text. Sync callers still persist inline.
+        schedule_persist_malformed_tool_call_detection(
             response_body=response_body,
             adapter_model=adapter_model,
             adapter=adapter,

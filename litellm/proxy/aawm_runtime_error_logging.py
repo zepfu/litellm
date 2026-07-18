@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import threading
@@ -30,6 +31,14 @@ AGENT_TERMINAL_ERROR_SCHEMA_VERSION = 1
 
 _DEFAULT_MAX_TEXT_CHARS = 8_192
 _DEFAULT_MAX_PAYLOAD_CHARS = 16_384
+# Bound per-response malformed evidence writes so adversarial/malformed
+# upstream payloads cannot amplify into unbounded synchronous disk I/O.
+_DEFAULT_MAX_MALFORMED_EVIDENCE_ITEMS = 8
+# Hard upper clamp for env-configured evidence limits (RR-044).
+# Operators may lower the default, but cannot raise past this ceiling.
+_HARD_MAX_MALFORMED_EVIDENCE_ITEMS = 64
+# Conservative non-None default size cap for opt-in JSONL intake sinks.
+_DEFAULT_MAX_ERROR_LOG_FILE_BYTES = 10 * 1024 * 1024
 _MALFORMED_ERROR_LOG_LOCK = threading.Lock()
 _AGENT_TERMINAL_ERROR_LOG_LOCK = threading.Lock()
 
@@ -181,12 +190,27 @@ def _get_malformed_error_log_path() -> Optional[str]:
     return os.path.join(log_dir, MALFORMED_ERROR_JSONL_FILENAME)
 
 
-def _max_malformed_error_log_file_bytes() -> Optional[int]:
+def _max_malformed_evidence_items() -> int:
+    """Return the per-response evidence item cap with a hard upper clamp.
+
+    ``LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_ITEMS`` may lower the default, but
+    values above ``_HARD_MAX_MALFORMED_EVIDENCE_ITEMS`` are clamped so a
+    misconfigured env cannot reintroduce unbounded intake amplification.
+    """
+    configured = _parse_aawm_error_log_non_negative_int_env(
+        "LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_ITEMS"
+    )
+    if configured is None or configured <= 0:
+        return _DEFAULT_MAX_MALFORMED_EVIDENCE_ITEMS
+    return min(configured, _HARD_MAX_MALFORMED_EVIDENCE_ITEMS)
+
+
+def _max_malformed_error_log_file_bytes() -> int:
     configured = _parse_aawm_error_log_non_negative_int_env(
         "LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES"
     )
     if configured is None or configured <= 0:
-        return None
+        return _DEFAULT_MAX_ERROR_LOG_FILE_BYTES
     return configured
 
 
@@ -241,6 +265,19 @@ def extract_malformed_tool_call_evidence(
     output = response_body.get("output")
     if not isinstance(output, list):
         return []
+
+    # Always enforce the hard upper clamp, even for direct callers that pass an
+    # explicit max_items (or None). None defaults to the env-resolved cap.
+    if max_items is None:
+        max_items = _max_malformed_evidence_items()
+    else:
+        try:
+            max_items = int(max_items)
+        except (TypeError, ValueError):
+            max_items = _max_malformed_evidence_items()
+        if max_items < 0:
+            max_items = 0
+        max_items = min(max_items, _HARD_MAX_MALFORMED_EVIDENCE_ITEMS)
 
     evidence: List[Dict[str, Any]] = []
     for item in output:
@@ -401,24 +438,52 @@ def build_malformed_tool_call_intake_record(
 
 def append_malformed_tool_call_detection(record: Dict[str, Any]) -> bool:
     """Best-effort append of one malformed-tool-call JSON object. Never raises."""
+    return append_malformed_tool_call_detections([record])
+
+
+def _encode_jsonl_record_line(record: Dict[str, Any]) -> str:
+    return safe_dumps(record) + "\n"
+
+
+def _jsonl_record_line_bytes(record: Dict[str, Any]) -> int:
+    return len(_encode_jsonl_record_line(record).encode("utf-8"))
+
+
+def _projected_jsonl_batch_bytes(records: List[Dict[str, Any]]) -> int:
+    return sum(_jsonl_record_line_bytes(record) for record in records)
+
+
+def append_malformed_tool_call_detections(records: List[Dict[str, Any]]) -> bool:
+    """Best-effort append of one or more malformed-tool-call JSON objects.
+
+    Writes all records under a single lock acquisition and file open so a
+    multi-evidence response cannot amplify into N independent open/stat cycles.
+    Enforces a strict max-bytes ceiling against current file size plus the
+    projected encoded size of the entire pending batch.
+    Never raises.
+    """
+    if not records:
+        return False
     log_path = _get_malformed_error_log_path()
     if not log_path:
         return False
 
     try:
+        encoded_lines = [_encode_jsonl_record_line(record) for record in records]
+        pending_bytes = sum(len(line.encode("utf-8")) for line in encoded_lines)
         with _MALFORMED_ERROR_LOG_LOCK:
             with _AAWM_ERROR_LOG_LOCK:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 max_file_bytes = _max_malformed_error_log_file_bytes()
-                if os.path.exists(log_path):
-                    if (
-                        max_file_bytes is not None
-                        and os.path.getsize(log_path) >= max_file_bytes
-                    ):
-                        return False
+                current_size = (
+                    os.path.getsize(log_path) if os.path.exists(log_path) else 0
+                )
+                # Strict ceiling: refuse the whole batch if it would cross max.
+                if current_size + pending_bytes > max_file_bytes:
+                    return False
                 with open(log_path, "a", encoding="utf-8") as intake_file:
-                    intake_file.write(safe_dumps(record))
-                    intake_file.write("\n")
+                    for line in encoded_lines:
+                        intake_file.write(line)
                 _normalize_aawm_error_log_file_metadata(log_path)
         return True
     except Exception:
@@ -434,7 +499,11 @@ def persist_malformed_tool_call_detection(
     intake_context: Optional[Dict[str, Any]] = None,
     stream_event_summaries: Optional[list[dict[str, Any]]] = None,
 ) -> bool:
-    evidence = extract_malformed_tool_call_evidence(response_body)
+    max_items = _max_malformed_evidence_items()
+    evidence = extract_malformed_tool_call_evidence(
+        response_body,
+        max_items=max_items,
+    )
     if not evidence:
         record = build_malformed_tool_call_intake_record(
             response_body=response_body,
@@ -444,9 +513,10 @@ def persist_malformed_tool_call_detection(
             intake_context=intake_context,
             stream_event_summaries=stream_event_summaries,
         )
-        return append_malformed_tool_call_detection(record)
+        return append_malformed_tool_call_detections([record])
 
-    wrote_any = False
+    records: List[Dict[str, Any]] = []
+    evidence_count = len(evidence)
     for index, item in enumerate(evidence):
         record = build_malformed_tool_call_intake_record(
             response_body=response_body,
@@ -457,10 +527,67 @@ def persist_malformed_tool_call_detection(
             stream_event_summaries=stream_event_summaries,
             evidence_item=item,
             evidence_index=index,
-            evidence_count=len(evidence),
+            evidence_count=evidence_count,
         )
-        wrote_any = append_malformed_tool_call_detection(record) or wrote_any
-    return wrote_any
+        records.append(record)
+    return append_malformed_tool_call_detections(records)
+
+
+def schedule_persist_malformed_tool_call_detection(
+    *,
+    response_body: dict[str, Any],
+    adapter_model: str,
+    adapter: str,
+    adapter_label: str,
+    intake_context: Optional[Dict[str, Any]] = None,
+    stream_event_summaries: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    """Offload malformed-tool-call intake writes off the async request path.
+
+    When an event loop is running, schedules ``asyncio.to_thread`` so async
+    request handlers do not block on synchronous disk I/O. Without a running
+    loop (sync callers / unit tests), persists inline so behavior stays
+    deterministic. Best-effort: never raises.
+    """
+
+    def _run() -> None:
+        try:
+            persist_malformed_tool_call_detection(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+                intake_context=intake_context,
+                stream_event_summaries=stream_event_summaries,
+            )
+        except Exception:
+            # Best-effort intake must never surface to request handlers.
+            return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _run()
+        return
+
+    async def _offload() -> None:
+        try:
+            await asyncio.to_thread(
+                persist_malformed_tool_call_detection,
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter=adapter,
+                adapter_label=adapter_label,
+                intake_context=intake_context,
+                stream_event_summaries=stream_event_summaries,
+            )
+        except Exception:
+            return
+
+    try:
+        loop.create_task(_offload())
+    except Exception:
+        _run()
 
 
 def _agent_terminal_error_log_enabled() -> bool:
@@ -509,10 +636,10 @@ def _get_agent_terminal_error_log_path() -> Optional[str]:
     )
 
 
-def _max_agent_terminal_error_log_file_bytes() -> Optional[int]:
+def _max_agent_terminal_error_log_file_bytes() -> int:
     configured = _parse_aawm_error_log_non_negative_int_env("LITELLM_AAWM_ERROR_LOG_MAX_BYTES")
     if configured is None or configured <= 0:
-        return None
+        return _DEFAULT_MAX_ERROR_LOG_FILE_BYTES
     return configured
 
 
@@ -655,11 +782,15 @@ def append_agent_terminal_error(record: Dict[str, Any]) -> bool:
             with _AAWM_ERROR_LOG_LOCK:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 max_file_bytes = _max_agent_terminal_error_log_file_bytes()
-                if os.path.exists(log_path):
-                    if max_file_bytes is not None and os.path.getsize(log_path) >= max_file_bytes:
-                        return False
+                encoded_line = _encode_jsonl_record_line(record)
+                pending_bytes = len(encoded_line.encode("utf-8"))
+                current_size = (
+                    os.path.getsize(log_path) if os.path.exists(log_path) else 0
+                )
+                if current_size + pending_bytes > max_file_bytes:
+                    return False
                 with open(log_path, "a", encoding="utf-8") as intake_file:
-                    intake_file.write(safe_dumps(record) + "\n")
+                    intake_file.write(encoded_line)
                 _normalize_aawm_error_log_file_metadata(log_path)
         return True
     except Exception:

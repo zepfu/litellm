@@ -79,10 +79,11 @@ explicitly with `LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED=1` (or
 `LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED=0` (or `false`/`no`/`off`)
 disables terminal-agent intake even when the generic sink remains enabled.
 Terminal agent rows honor the shared
-`LITELLM_AAWM_ERROR_LOG_MAX_BYTES` ceiling (when set to a positive integer) and
-stop appending once the target file reaches that size. Malformed-tool rows keep
-their separate optional ceiling via
-`LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES`.
+`LITELLM_AAWM_ERROR_LOG_MAX_BYTES` ceiling (default `10485760` / 10 MiB when
+unset or non-positive) and refuse an append when the projected encoded line
+would cross that size. Malformed-tool rows use a separate ceiling via
+`LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES` with the same 10 MiB default.
+Neither writer truncates or rewrites existing intake to make room.
 
 When the proxy or provider-status sidecar runs as root inside a container, a
 plain bind-mount append would create root-owned active intake files on the host.
@@ -135,16 +136,30 @@ as `composer_call` markers or `Tool label:` / `Input payload:` output, as
 malformed when they appear in an assistant final response instead of an
 executable tool call. Individual text and payload fields are truncated to
 bounded previews, including string-style `message.content` and list-style
-`message.content[].text` Responses outputs; the file keeps appending by
-default. Operators can set
-`LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES` as an explicit safety ceiling if a
-runtime needs to stop appending after a known size. When these literal tool-call
-blocks are in the explicit grok pattern and arguments validate against the
-advertised tool schema, LiteLLM now repairs them into executable `function_call`
-items instead of immediately logging a malformed-tool-call failure. The repair
-also strips provider tool-end markers such as `<|tool_call_end|>` and the
-fullwidth Grok marker variants before emitting the tool call, so repaired rows
-no longer emit `aawm_auto_agent_malformed_tool_call_text`.
+`message.content[].text` Responses outputs.
+
+Malformed-tool intake bounds:
+
+- `LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_ITEMS` defaults to `8`.
+  `persist_malformed_tool_call_detection()` always applies this per-response
+  evidence bound, and configured or direct-call values are hard-clamped to `64`.
+- Multi-evidence responses are encoded and appended under one lock/file open
+  through `append_malformed_tool_call_detections()`, rather than one filesystem
+  cycle per evidence item.
+- `LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES` defaults to 10 MiB. The entire
+  pending batch is refused when it would cross the ceiling, preserving existing
+  unresolved rows.
+- Async request paths use
+  `schedule_persist_malformed_tool_call_detection()`, which schedules
+  `asyncio.to_thread(...)`; synchronous callers persist inline.
+
+When literal tool-call blocks match the explicit Grok repair pattern and their
+arguments validate against the advertised tool schema, LiteLLM repairs them into
+executable `function_call` items instead of immediately logging a malformed
+tool-call failure. The repair also strips provider tool-end markers such as
+`<|tool_call_end|>` and fullwidth Grok marker variants before emitting the tool
+call, so repaired rows no longer emit
+`aawm_auto_agent_malformed_tool_call_text`.
 
 Each event should include at least:
 
