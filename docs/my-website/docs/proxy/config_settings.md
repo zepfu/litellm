@@ -427,7 +427,7 @@ router_settings:
 | AUTH_STRATEGY | Strategy used for authentication (e.g., OAuth, API key)
 | AUTO_REDIRECT_UI_LOGIN_TO_SSO | Flag to enable automatic redirect of UI login page to SSO when SSO is configured. Default is **false**
 | AUDIO_SPEECH_CHUNK_SIZE | Chunk size for audio speech processing. Default is 1024
-| AAWM_GEMINI_ROUTE_DEBUG | Enables AAWM Gemini route debug logging.
+| AAWM_GEMINI_ROUTE_DEBUG | When `1`, enables per-chunk Gemini route diagnostics on the Anthropic Chat stream wrapper (`adapters/streaming_iterator`). Flag is read once per stream; logs use `verbose_logger.debug` (not warning).
 | AAWM_GOOGLE_ADAPTER_AUXILIARY_CONTEXT_CHAR_CAP | Character cap for auxiliary context in the AAWM Google adapter.
 | AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL | Default thinking level sent by the AAWM Google adapter when applicable.
 | AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG | If true, disables the AAWM Google adapter default thinking configuration.

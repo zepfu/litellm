@@ -49,3 +49,64 @@ sequenceDiagram
     Adapter->>Handler: translate_openai_response_to_anthropic()
     Handler->>User: Anthropic Messages Response
 ```
+
+## Shared Anthropic SSE emission (Chat + Responses)
+
+There are two parallel adapter trees that reconstruct Anthropic `/v1/messages`
+SSE for non-native backends:
+
+| Tree | Upstream shape | Streaming wrapper |
+|---|---|---|
+| `adapters/` | OpenAI Chat Completions chunks | `adapters/streaming_iterator.py` (`AnthropicStreamWrapper`) |
+| `responses_adapters/` | OpenAI Responses API events | `responses_adapters/streaming_iterator.py` (`AnthropicResponsesStreamWrapper`) |
+
+**Input normalization stays tree-local** (Chat chunk → normalized delta vs
+Responses event → normalized delta). **Anthropic-side event envelopes and SSE
+framing are shared** so Chat and Responses cannot drift on
+`content_block_*` / `message_*` shapes:
+
+- Shared helpers live in `adapters/streaming_iterator.py`:
+  - `emit_message_start`
+  - `emit_content_block_start`
+  - `emit_content_block_delta`
+  - `emit_content_block_stop`
+  - `emit_message_delta`
+  - `emit_message_stop`
+  - `encode_anthropic_sse_chunk`
+- `responses_adapters/streaming_iterator.py` imports those helpers and must not
+  hand-build `{"type": "content_block_delta", ...}` (or sibling) envelopes, and
+  must frame SSE via `encode_anthropic_sse_chunk` in
+  `async_anthropic_sse_wrapper()`.
+
+### Stable `prompt_cache_key` (shared observability helper)
+
+When Anthropic-shaped requests are relayed to OpenAI backends, outbound
+`prompt_cache_key` is derived by
+`adapters/observability.derive_prompt_cache_key()`. It hashes **stable**
+`system` + `tools` material only (including `cache_control` breakpoints under
+those roots). Per-turn / moving `cache_control` on user/assistant message
+blocks is intentionally excluded so multi-turn Claude Code traffic reuses the
+same server-side prompt-cache key across turns.
+
+Neither streaming iterator reimplements cache hashing; request-path adapters
+call the shared helper.
+
+## Gemini route debug (`AAWM_GEMINI_ROUTE_DEBUG`)
+
+When `AAWM_GEMINI_ROUTE_DEBUG=1`, the Chat stream wrapper dumps per-chunk
+Gemini raw/translated diagnostics. The flag is resolved once in
+`AnthropicStreamWrapper.__init__` (not per chunk) and is logged via
+`verbose_logger.debug` so production WARNING-level pipelines and alerting stay
+quiet. This is intentional debug tracing, not a warning condition.
+
+## Responses streaming event map (summary)
+
+| Responses API event | Anthropic SSE event(s) |
+|---|---|
+| `response.created` | `message_start` |
+| `response.output_item.added` (message / function_call / reasoning / mcp_call) | `content_block_start` |
+| `response.output_text.delta` | `content_block_delta` (`text_delta`) |
+| `response.reasoning_summary_text.delta` | `content_block_delta` (`thinking_delta`) |
+| `response.function_call_arguments.delta` / `.done` | `content_block_delta` (`input_json_delta`; empty deltas skipped) |
+| `response.output_item.done` | `content_block_stop` (+ late `input_json_delta` if needed) |
+| `response.completed` | `message_delta` + `message_stop` |
