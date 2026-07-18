@@ -108,7 +108,7 @@
     "command": [
       "claude",
       "-p",
-      "@/home/zepfu/projects/litellm/scripts/local-ci/claude_acceptance_prompt.txt",
+      "@{config_dir}/claude_acceptance_prompt.txt",
       "--output-format",
       "json"
     ],
@@ -125,7 +125,7 @@
         "command": [
           "claude",
           "-p",
-          "@/home/zepfu/projects/litellm/scripts/local-ci/claude_acceptance_prompt.txt",
+          "@{config_dir}/claude_acceptance_prompt.txt",
           "--output-format",
           "json"
         ],
@@ -140,7 +140,7 @@
         "command": [
           "claude",
           "-p",
-          "@/home/zepfu/projects/litellm/scripts/local-ci/claude_acceptance_prompt_full_fanout.txt",
+          "@{config_dir}/claude_acceptance_prompt_full_fanout.txt",
           "--output-format",
           "json"
         ],
@@ -288,8 +288,8 @@
         "verbosity"
       ]
     },
-    "minimum_trace_count": 3,
     "streaming_checked": true,
-    "timeout_seconds": 180
+    "timeout_seconds": 180,
+    "minimum_trace_count": 3
   }
 }
