@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.client import RemoteDisconnected
 from pathlib import Path
+import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.error import HTTPError, URLError
@@ -150,6 +151,134 @@ def _clickhouse_datetime64_literal_value(value: datetime) -> str:
     return value.isoformat(sep=" ")
 
 
+class ClickHouseQuery(str):
+    """SQL string that also carries ClickHouse HTTP query parameters."""
+
+    params: Dict[str, str]
+
+    def __new__(cls, query: str, params: Optional[Dict[str, str]] = None):
+        obj = str.__new__(cls, query)
+        obj.params = dict(params or {})
+        return obj
+
+
+def _clickhouse_param_datetime64_value(value: datetime) -> str:
+    """ClickHouse HTTP param value for DateTime64(3) comparisons."""
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    # ClickHouse HTTP query params accept ISO-like datetime strings.
+    return value.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(value.microsecond / 1000):03d}"
+
+
+def _parse_resume_cursor(raw: Optional[str]) -> Dict[str, Any]:
+    """Parse operator --resume-cursor JSON into typed cursor fields."""
+    if raw is None:
+        return {}
+    cleaned = raw.strip()
+    if not cleaned:
+        return {}
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid --resume-cursor JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("--resume-cursor must be a JSON object")
+
+    cursor: Dict[str, Any] = {}
+    if "skip" in payload and payload["skip"] is not None:
+        cursor["skip"] = int(payload["skip"])
+    if "page" in payload and payload["page"] is not None:
+        cursor["page"] = int(payload["page"])
+    if "trace_page" in payload and payload["trace_page"] is not None:
+        cursor["trace_page"] = int(payload["trace_page"])
+    if "cursor_id" in payload and payload["cursor_id"] is not None:
+        cursor["cursor_id"] = str(payload["cursor_id"])
+    if "cursor_start_time" in payload and payload["cursor_start_time"] is not None:
+        value = payload["cursor_start_time"]
+        if isinstance(value, datetime):
+            cursor["cursor_start_time"] = value
+        else:
+            parsed = _parse_optional_datetime(str(value))
+            if parsed is None:
+                raise ValueError(
+                    "resume cursor cursor_start_time is not a valid datetime"
+                )
+            cursor["cursor_start_time"] = parsed
+
+    has_cursor_id = "cursor_id" in cursor
+    has_cursor_start_time = "cursor_start_time" in cursor
+    if has_cursor_id != has_cursor_start_time:
+        raise ValueError(
+            "resume cursor keyset fields must be provided together: "
+            "cursor_start_time and cursor_id"
+        )
+    return cursor
+
+
+def _resume_cursor_from_args(args: argparse.Namespace) -> Dict[str, Any]:
+    return _parse_resume_cursor(getattr(args, "resume_cursor", None))
+
+
+def _serialize_resume_cursor(
+    cursor: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    if not cursor:
+        return None
+    out: Dict[str, Any] = {}
+    for key in ("skip", "page", "trace_page", "cursor_id"):
+        if key in cursor and cursor[key] is not None:
+            out[key] = cursor[key]
+    if cursor.get("cursor_start_time") is not None:
+        value = cursor["cursor_start_time"]
+        if isinstance(value, datetime):
+            out["cursor_start_time"] = value.isoformat().replace("+00:00", "Z")
+        else:
+            out["cursor_start_time"] = value
+    return out or None
+
+
+def _attach_resume_cursor(
+    result: Dict[str, Any], cursor: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    serialized = _serialize_resume_cursor(cursor)
+    if serialized is not None:
+        result["resume_cursor"] = serialized
+    return result
+
+
+def _normalize_observation_cursor_start_time(value: Any) -> Optional[datetime]:
+    """Normalize source observation start_time values for keyset resume cursors."""
+    if isinstance(value, datetime):
+        return _as_utc_aware_datetime(value)
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    return _parse_optional_datetime(text_value.replace(" ", "T", 1))
+
+
+def _keyset_resume_cursor_from_observation_row(
+    row: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build an exclusive DESC keyset resume cursor from one observation row."""
+    cursor_id = row.get("observation_id")
+    if cursor_id is None:
+        return None
+    cursor_id_text = str(cursor_id).strip()
+    if not cursor_id_text:
+        return None
+    cursor_start_time = _normalize_observation_cursor_start_time(
+        row.get("observation_start_time")
+    )
+    if cursor_start_time is None:
+        return None
+    return {
+        "cursor_start_time": cursor_start_time,
+        "cursor_id": cursor_id_text,
+    }
+
+
 def _normalize_langfuse_host(host: Optional[str]) -> str:
     cleaned = _clean_secret(host) or "http://127.0.0.1:3000"
     normalized = cleaned.rstrip("/")
@@ -176,7 +305,9 @@ def _derive_langfuse_database_url(
     parsed = urlsplit(target_dsn)
     if not parsed.scheme or not parsed.netloc:
         return None
-    return urlunsplit((parsed.scheme, parsed.netloc, "/langfuse", parsed.query, parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, "/langfuse", parsed.query, parsed.fragment)
+    )
 
 
 def _maybe_decimal_to_float(value: Any) -> Any:
@@ -194,7 +325,10 @@ def _normalize_clickhouse_http_url(url: Optional[str]) -> str:
     hostname = (parsed.hostname or "127.0.0.1").replace("clickhouse", "127.0.0.1")
     port = f":{parsed.port}" if parsed.port else ""
     netloc = f"{hostname}{port}"
-    return urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
 
 def _redact_clickhouse_url_userinfo(url: Optional[str]) -> Optional[str]:
     if url is None:
@@ -211,7 +345,9 @@ def _redact_clickhouse_url_userinfo(url: Optional[str]) -> Optional[str]:
             userinfo = f"{userinfo}:***"
         userinfo = f"{userinfo}@"
     redacted_netloc = f"{userinfo}{hostname}{port}"
-    return urlunsplit((parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 def _build_clickhouse_auth_diagnostics(auth: Dict[str, str]) -> Dict[str, Any]:
@@ -224,13 +360,13 @@ def _build_clickhouse_auth_diagnostics(auth: Dict[str, str]) -> Dict[str, Any]:
         "url_source": auth["url_source"],
         "user_source": auth["user_source"],
         "password_source": auth["password_source"],
-        "using_builtin_local_url_default": auth["url_source"] == "default:local_http_8123",
+        "using_builtin_local_url_default": auth["url_source"]
+        == "default:local_http_8123",
         "using_builtin_clickhouse_credentials": (
             auth["user_source"] == "default:clickhouse_builtin"
             and auth["password_source"] == "default:clickhouse_builtin"
         ),
     }
-
 
 
 def _first_env_var_with_secret(names: Sequence[str]) -> Optional[str]:
@@ -298,7 +434,9 @@ def _should_preflight_clickhouse_for_source_mode(source_mode: str) -> bool:
     return source_mode == "langfuse_clickhouse"
 
 
-def _preflight_clickhouse_connection(auth: Dict[str, str], *, timeout_seconds: int = 15) -> None:
+def _preflight_clickhouse_connection(
+    auth: Dict[str, str], *, timeout_seconds: int = 15
+) -> None:
     client = LangfuseClickHouseSource(
         url=auth["url"],
         user=auth["user"],
@@ -337,9 +475,7 @@ def _coerce_row_to_dict(row: Any) -> Dict[str, Any]:
         return row.dict()
     if hasattr(row, "__dict__"):
         return {
-            key: value
-            for key, value in vars(row).items()
-            if not key.startswith("_")
+            key: value for key, value in vars(row).items() if not key.startswith("_")
         }
     raise TypeError(f"Unsupported spend log row type: {type(row)!r}")
 
@@ -403,9 +539,10 @@ async def _iter_spend_logs(
     where: Dict[str, Any],
     batch_size: int,
     limit: Optional[int],
-) -> AsyncGenerator[List[Dict[str, Any]], None]:
+    skip_start: int = 0,
+) -> AsyncGenerator[Tuple[List[Dict[str, Any]], int], None]:
     fetched = 0
-    skip = 0
+    skip = max(0, int(skip_start or 0))
 
     while True:
         take = batch_size
@@ -427,15 +564,20 @@ async def _iter_spend_logs(
         batch = [_coerce_row_to_dict(row) for row in rows]
         fetched += len(batch)
         skip += len(batch)
-        yield batch
+        yield batch, skip
 
 
 async def _get_existing_call_ids(call_ids: Sequence[str]) -> Set[str]:
     if not call_ids:
         return set()
 
+    # Dry-run previews still want real insert/update counts, but source-only
+    # invocations without a target DSN must not hard-fail.
+    if not _build_aawm_admin_dsn():
+        return set()
+
     pool = await _get_session_history_pool()
-    await _ensure_session_history_schema_with_pool(pool)
+    # Read-only lookup: do not run schema DDL just to count existing rows.
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT litellm_call_id FROM public.session_history WHERE litellm_call_id = ANY($1::text[])",
@@ -518,7 +660,8 @@ class LangfuseTraceTagBackfiller:
             method="GET",
         )
         last_error: Optional[Exception] = None
-        for _attempt in range(3):
+        payload: Any = None
+        for attempt in range(3):
             try:
                 with urlopen(request, timeout=10) as response:
                     payload = json.loads(response.read().decode("utf-8"))
@@ -527,8 +670,14 @@ class LangfuseTraceTagBackfiller:
                 if exc.code == 404:
                     return None
                 last_error = exc
+                if attempt == 2:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
             except (URLError, RemoteDisconnected) as exc:
                 last_error = exc
+                if attempt == 2:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
         else:
             if last_error is not None:
                 raise last_error
@@ -617,13 +766,13 @@ class LangfuseTraceSource:
                 last_error = exc
                 if attempt == 2:
                     raise
-                import time
-
                 time.sleep(0.5 * (attempt + 1))
         else:
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(f"Langfuse request failed without a captured error for {url}")
+            raise RuntimeError(
+                f"Langfuse request failed without a captured error for {url}"
+            )
         if not isinstance(payload, dict):
             raise RuntimeError(f"Unexpected Langfuse payload type for {url}")
         return payload
@@ -634,11 +783,17 @@ class LangfuseTraceSource:
         page: int,
         limit: int,
         fields: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         return await asyncio.to_thread(
             self._request_json,
             "/api/public/traces",
-            {"page": page, "limit": limit, "fields": fields},
+            {
+                "page": page,
+                "limit": limit,
+                "fields": fields,
+                "sessionId": session_id,
+            },
         )
 
     async def fetch_trace_by_id(self, trace_id: str) -> Dict[str, Any]:
@@ -891,16 +1046,14 @@ def _build_langfuse_observation_from_db_row(row: asyncpg.Record) -> Dict[str, An
         "internalModelId": row["observation_internal_model_id"],
     }
 
+
 def _clickhouse_observation_payload_select_sql(*, include_payloads: bool) -> str:
     if include_payloads:
         return (
             "o.input AS observation_input,\n"
             "                o.output AS observation_output,"
         )
-    return (
-        "NULL AS observation_input,\n"
-        "                NULL AS observation_output,"
-    )
+    return "NULL AS observation_input,\n" "                NULL AS observation_output,"
 
 
 def build_langfuse_clickhouse_generation_batch_query(
@@ -915,46 +1068,47 @@ def build_langfuse_clickhouse_generation_batch_query(
     to_start_time: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
-) -> str:
-    """Build the ClickHouse observation batch query used by session-history backfill."""
+) -> ClickHouseQuery:
+    """Build ClickHouse observation SQL with HTTP query parameters.
+
+    Returns a ClickHouseQuery (str subclass) carrying HTTP `param_*` values.
+    """
 
     predicates = ["o.type = 'GENERATION'", "o.is_deleted = 0"]
-
-    def q(value: str) -> str:
-        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    params: Dict[str, str] = {}
 
     if trace_id:
-        predicates.append(f"o.trace_id = {q(trace_id)}")
+        predicates.append("o.trace_id = {trace_id:String}")
+        params["trace_id"] = str(trace_id)
     if session_id:
         predicates.append(
             "o.trace_id IN ("
             "SELECT id FROM traces "
-            f"WHERE is_deleted = 0 AND session_id = {q(session_id)}"
+            "WHERE is_deleted = 0 AND session_id = {session_id:String}"
             ")"
         )
+        params["session_id"] = str(session_id)
 
     from_dt = _parse_optional_datetime(from_start_time)
     to_dt = _parse_optional_datetime(to_start_time)
     if from_dt is not None:
-        predicates.append(
-            f"o.start_time >= toDateTime64({q(_clickhouse_datetime64_literal_value(from_dt))}, 3)"
-        )
+        predicates.append("o.start_time >= toDateTime64({from_start_time:String}, 3)")
+        params["from_start_time"] = _clickhouse_param_datetime64_value(from_dt)
     if to_dt is not None:
-        predicates.append(
-            f"o.start_time <= toDateTime64({q(_clickhouse_datetime64_literal_value(to_dt))}, 3)"
-        )
+        predicates.append("o.start_time <= toDateTime64({to_start_time:String}, 3)")
+        params["to_start_time"] = _clickhouse_param_datetime64_value(to_dt)
 
     if model and model.strip():
-        model_literal = q(model.strip())
         predicates.append(
             "("
-            f"o.provided_model_name = {model_literal}"
-            f" OR o.metadata['model'] = {model_literal}"
-            f" OR o.metadata['anthropic_adapter_original_model'] = {model_literal}"
-            f" OR o.metadata['codex_adapter_original_model'] = {model_literal}"
-            f" OR o.metadata['codex_auto_agent_selected_model'] = {model_literal}"
+            "o.provided_model_name = {model:String}"
+            " OR o.metadata['model'] = {model:String}"
+            " OR o.metadata['anthropic_adapter_original_model'] = {model:String}"
+            " OR o.metadata['codex_adapter_original_model'] = {model:String}"
+            " OR o.metadata['codex_auto_agent_selected_model'] = {model:String}"
             ")"
         )
+        params["model"] = model.strip()
 
     if provider and provider.strip().lower() == "openrouter":
         predicates.append(
@@ -969,19 +1123,22 @@ def build_langfuse_clickhouse_generation_batch_query(
         )
 
     if cursor_start_time is not None and cursor_id is not None:
-        cursor_literal = _clickhouse_datetime64_literal_value(cursor_start_time)
         predicates.append(
             "("
-            f"o.start_time < toDateTime64({q(cursor_literal)}, 3)"
-            f" OR (o.start_time = toDateTime64({q(cursor_literal)}, 3)"
-            f" AND o.id < {q(cursor_id)}))"
+            "o.start_time < toDateTime64({cursor_start_time:String}, 3)"
+            " OR (o.start_time = toDateTime64({cursor_start_time:String}, 3)"
+            " AND o.id < {cursor_id:String}))"
         )
+        params["cursor_start_time"] = _clickhouse_param_datetime64_value(
+            cursor_start_time
+        )
+        params["cursor_id"] = str(cursor_id)
 
     payload_select = _clickhouse_observation_payload_select_sql(
         include_payloads=include_payloads
     )
 
-    return f"""
+    query = f"""
             SELECT
                 o.id AS observation_id,
                 o.trace_id AS observation_trace_id,
@@ -1019,6 +1176,7 @@ def build_langfuse_clickhouse_generation_batch_query(
             LIMIT {int(limit)}
             FORMAT JSONEachRow
         """
+    return ClickHouseQuery(query, params)
 
 
 class LangfuseClickHouseSource:
@@ -1030,9 +1188,18 @@ class LangfuseClickHouseSource:
             f"{self.user}:{self.password}".encode("utf-8")
         ).decode("ascii")
 
-    def _request_rows(self, query: str) -> List[Dict[str, Any]]:
+    def _request_rows(
+        self,
+        query: str,
+        params: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        query_pairs = [("default_format", "JSONEachRow")]
+        if params:
+            for key, value in params.items():
+                query_pairs.append((f"param_{key}", value))
+        url = f"{self.url}/?{urlencode(query_pairs)}"
         request = Request(
-            url=f"{self.url}/?default_format=JSONEachRow",
+            url=url,
             headers={
                 "Authorization": self._auth_header,
                 "Content-Type": "text/plain; charset=utf-8",
@@ -1078,7 +1245,9 @@ class LangfuseClickHouseSource:
             provider=provider,
             model=model,
         )
-        observation_rows = await asyncio.to_thread(self._request_rows, observation_query)
+        observation_rows = await asyncio.to_thread(
+            self._request_rows, str(observation_query), observation_query.params
+        )
         if not observation_rows:
             return []
 
@@ -1093,8 +1262,13 @@ class LangfuseClickHouseSource:
         if not trace_ids:
             return observation_rows
 
-        def q(value: str) -> str:
-            return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        # Bind each trace id as a named ClickHouse HTTP parameter.
+        trace_param_names: List[str] = []
+        trace_params: Dict[str, str] = {}
+        for index, trace_id_value in enumerate(trace_ids):
+            name = f"trace_id_{index}"
+            trace_param_names.append(f"{{{name}:String}}")
+            trace_params[name] = trace_id_value
 
         trace_query = f"""
             SELECT
@@ -1115,25 +1289,33 @@ class LangfuseClickHouseSource:
                 updated_at AS trace_updated_at
             FROM traces
             WHERE is_deleted = 0
-              AND id IN ({', '.join(q(trace_id_value) for trace_id_value in trace_ids)})
+              AND id IN ({', '.join(trace_param_names)})
             FORMAT JSONEachRow
         """
-        trace_rows = await asyncio.to_thread(self._request_rows, trace_query)
+        trace_rows = await asyncio.to_thread(
+            self._request_rows, trace_query, trace_params
+        )
         trace_by_id = {
-            str(trace_row["trace_id"]): trace_row for trace_row in trace_rows if trace_row.get("trace_id")
+            str(trace_row["trace_id"]): trace_row
+            for trace_row in trace_rows
+            if trace_row.get("trace_id")
         }
 
         if session_id:
             observation_rows = [
                 row
                 for row in observation_rows
-                if trace_by_id.get(str(row.get("observation_trace_id")), {}).get("trace_session_id")
+                if trace_by_id.get(str(row.get("observation_trace_id")), {}).get(
+                    "trace_session_id"
+                )
                 == session_id
             ]
 
         merged_rows: List[Dict[str, Any]] = []
         for observation_row in observation_rows:
-            trace_row = trace_by_id.get(str(observation_row.get("observation_trace_id")))
+            trace_row = trace_by_id.get(
+                str(observation_row.get("observation_trace_id"))
+            )
             if trace_row is None:
                 trace_row = {
                     "trace_id": observation_row.get("observation_trace_id"),
@@ -1181,7 +1363,9 @@ def _build_langfuse_trace_from_clickhouse_row(row: Dict[str, Any]) -> Dict[str, 
     }
 
 
-def _build_langfuse_observation_from_clickhouse_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def _build_langfuse_observation_from_clickhouse_row(
+    row: Dict[str, Any]
+) -> Dict[str, Any]:
     usage_details = {
         key: int(value)
         for key, value in (row.get("observation_usage_details") or {}).items()
@@ -1233,11 +1417,15 @@ def _build_langfuse_observation_from_clickhouse_row(row: Dict[str, Any]) -> Dict
         "output": output_payload,
         "model": row.get("observation_model"),
         "internalModelId": row.get("observation_internal_model_id"),
-        "modelParameters": _parse_clickhouse_value(row.get("observation_model_parameters")),
+        "modelParameters": _parse_clickhouse_value(
+            row.get("observation_model_parameters")
+        ),
         "usage": provided_usage_details or usage_details,
         "usageDetails": usage_details or provided_usage_details,
         "costDetails": cost_details or provided_cost_details,
-        "calculatedTotalCost": _maybe_decimal_to_float(row.get("observation_total_cost")),
+        "calculatedTotalCost": _maybe_decimal_to_float(
+            row.get("observation_total_cost")
+        ),
         "completionStartTime": row.get("observation_completion_start_time"),
         "promptId": row.get("observation_prompt_id"),
         "promptName": row.get("observation_prompt_name"),
@@ -1293,7 +1481,8 @@ async def _create_source_prisma_client(database_url: str) -> PrismaClient:
 
 def _resolve_langfuse_credentials(args: argparse.Namespace) -> Dict[str, str]:
     host = _normalize_langfuse_host(
-        _clean_secret(args.langfuse_host) or _clean_secret(get_secret_str("LANGFUSE_HOST"))
+        _clean_secret(args.langfuse_host)
+        or _clean_secret(get_secret_str("LANGFUSE_HOST"))
     )
     public_key = _clean_secret(args.langfuse_public_key) or _clean_secret(
         get_secret_str("LANGFUSE_PUBLIC_KEY")
@@ -1302,7 +1491,9 @@ def _resolve_langfuse_credentials(args: argparse.Namespace) -> Dict[str, str]:
         get_secret_str("LANGFUSE_SECRET_KEY")
     )
     if not public_key or not secret_key:
-        raise RuntimeError("Langfuse public/secret keys are required for Langfuse backfill")
+        raise RuntimeError(
+            "Langfuse public/secret keys are required for Langfuse backfill"
+        )
     return {
         "host": host,
         "public_key": public_key,
@@ -1360,13 +1551,19 @@ async def _run_spend_log_backfill(  # noqa: PLR0915
     session_source_counts: Counter[str] = Counter()
     trace_source_counts: Counter[str] = Counter()
 
+    resume = _resume_cursor_from_args(args)
+    skip_start = int(resume.get("skip") or 0)
+    resume_cursor: Dict[str, Any] = {"skip": skip_start}
+
     try:
-        async for batch in _iter_spend_logs(
+        async for batch, skip in _iter_spend_logs(
             prisma_client,
             where=where,
             batch_size=args.batch_size,
             limit=args.limit,
+            skip_start=skip_start,
         ):
+            resume_cursor = {"skip": skip}
             stats.scanned_rows += len(batch)
 
             records: List[Dict[str, Any]] = []
@@ -1389,23 +1586,27 @@ async def _run_spend_log_backfill(  # noqa: PLR0915
                 if isinstance(trace_source, str):
                     trace_source_counts[trace_source] += 1
 
-                trace_id, trace_tags = _derive_langfuse_trace_tags_from_spend_log_row(row)
+                trace_id, trace_tags = _derive_langfuse_trace_tags_from_spend_log_row(
+                    row
+                )
                 if trace_id:
                     trace_tag_map[trace_id].update(trace_tags)
 
-            if args.apply:
-                existing_ids = await _get_existing_call_ids(
-                    [record["litellm_call_id"] for record in records]
-                )
-                stats.existing_rows += len(existing_ids)
-            else:
-                existing_ids = set()
+            # Always resolve existing ids so dry-run previews insert vs upsert scale.
+            existing_ids = await _get_existing_call_ids(
+                [record["litellm_call_id"] for record in records]
+            )
+            stats.existing_rows += len(existing_ids)
 
             new_records = [
-                record for record in records if record["litellm_call_id"] not in existing_ids
+                record
+                for record in records
+                if record["litellm_call_id"] not in existing_ids
             ]
             existing_records = [
-                record for record in records if record["litellm_call_id"] in existing_ids
+                record
+                for record in records
+                if record["litellm_call_id"] in existing_ids
             ]
 
             if args.apply and records:
@@ -1413,6 +1614,10 @@ async def _run_spend_log_backfill(  # noqa: PLR0915
                 stats.created_at_aligned_rows += (
                     await _align_session_history_created_at_to_event_time(records)
                 )
+                stats.inserted_rows += len(new_records)
+                stats.updated_rows += len(existing_records)
+            else:
+                # Dry-run: report what would be inserted vs already present.
                 stats.inserted_rows += len(new_records)
                 stats.updated_rows += len(existing_records)
 
@@ -1435,28 +1640,33 @@ async def _run_spend_log_backfill(  # noqa: PLR0915
     if langfuse_backfiller is not None and args.apply:
         langfuse_backfiller.flush()
 
-    return {
-        "source_mode": "spendlogs",
-        "source_where": where,
-        "target_dsn_redacted": target_dsn.split("@", 1)[-1] if "@" in target_dsn else target_dsn,
-        "stats": {
-            "scanned_rows": stats.scanned_rows,
-            "reconstructable_rows": stats.reconstructable_rows,
-            "inserted_rows": stats.inserted_rows,
-            "updated_rows": stats.updated_rows,
-            "existing_rows": stats.existing_rows,
-            "skipped_rows": stats.skipped_rows,
-            "created_at_aligned_rows": stats.created_at_aligned_rows,
-            "trace_tag_candidates": stats.trace_tag_candidates,
-            "traces_patched": stats.traces_patched,
-            "traces_unchanged": stats.traces_unchanged,
-            "traces_missing": stats.traces_missing,
-            "trace_tags_added": stats.trace_tags_added,
-            "trace_write_errors": stats.trace_write_errors,
+    return _attach_resume_cursor(
+        {
+            "source_mode": "spendlogs",
+            "source_where": where,
+            "target_dsn_redacted": target_dsn.split("@", 1)[-1]
+            if "@" in target_dsn
+            else target_dsn,
+            "stats": {
+                "scanned_rows": stats.scanned_rows,
+                "reconstructable_rows": stats.reconstructable_rows,
+                "inserted_rows": stats.inserted_rows,
+                "updated_rows": stats.updated_rows,
+                "existing_rows": stats.existing_rows,
+                "skipped_rows": stats.skipped_rows,
+                "created_at_aligned_rows": stats.created_at_aligned_rows,
+                "trace_tag_candidates": stats.trace_tag_candidates,
+                "traces_patched": stats.traces_patched,
+                "traces_unchanged": stats.traces_unchanged,
+                "traces_missing": stats.traces_missing,
+                "trace_tags_added": stats.trace_tags_added,
+                "trace_write_errors": stats.trace_write_errors,
+            },
+            "session_id_sources": dict(session_source_counts),
+            "trace_id_sources": dict(trace_source_counts),
         },
-        "session_id_sources": dict(session_source_counts),
-        "trace_id_sources": dict(trace_source_counts),
-    }
+        resume_cursor,
+    )
 
 
 async def _run_langfuse_trace_backfill(  # noqa: PLR0915
@@ -1478,46 +1688,52 @@ async def _run_langfuse_trace_backfill(  # noqa: PLR0915
     stats = BackfillStats()
     session_source_counts: Counter[str] = Counter()
     trace_source_counts: Counter[str] = Counter()
+    # Prefer on-demand fetch_trace_by_id for full history; only prefetch when a
+    # session_id can be pushed server-side (or a single trace_id is requested).
     trace_core_lookup: Dict[str, Dict[str, Any]] = {}
-    trace_page = 1
-    total_trace_pages: Optional[int] = None
+    resume = _resume_cursor_from_args(args)
     processed_records = 0
 
-    trace_page_size = max(50, min(args.batch_size * 4, 200))
-    while True:
-        response = await langfuse_source.fetch_trace_page(
-            page=trace_page,
-            limit=trace_page_size,
-            fields="core",
-        )
-        traces = response.get("data")
-        meta = response.get("meta") or {}
-        if not isinstance(traces, list) or not traces:
-            break
-        if total_trace_pages is None and isinstance(meta, dict):
-            total_trace_pages = _safe_int(meta.get("totalPages"))
+    if args.session_id or args.trace_id:
+        trace_page = max(1, int(resume.get("trace_page") or 1))
+        total_trace_pages: Optional[int] = None
+        trace_page_size = max(50, min(args.batch_size * 4, 200))
+        while True:
+            response = await langfuse_source.fetch_trace_page(
+                page=trace_page,
+                limit=trace_page_size,
+                fields="core",
+                session_id=args.session_id,
+            )
+            traces = response.get("data")
+            meta = response.get("meta") or {}
+            if not isinstance(traces, list) or not traces:
+                break
+            if total_trace_pages is None and isinstance(meta, dict):
+                total_trace_pages = _safe_int(meta.get("totalPages"))
 
-        for trace in traces:
-            if not isinstance(trace, dict):
-                continue
-            trace_id = trace.get("id")
-            if not isinstance(trace_id, str) or not trace_id.strip():
-                continue
-            if args.trace_id and trace_id != args.trace_id:
-                continue
-            if args.session_id and trace.get("sessionId") != args.session_id:
-                continue
-            trace_core_lookup[trace_id] = trace
+            for trace in traces:
+                if not isinstance(trace, dict):
+                    continue
+                trace_id = trace.get("id")
+                if not isinstance(trace_id, str) or not trace_id.strip():
+                    continue
+                if args.trace_id and trace_id != args.trace_id:
+                    continue
+                if args.session_id and trace.get("sessionId") != args.session_id:
+                    continue
+                trace_core_lookup[trace_id] = trace
 
-        if args.trace_id and args.trace_id in trace_core_lookup:
-            break
-        if total_trace_pages is not None and trace_page >= total_trace_pages:
-            break
-        trace_page += 1
+            if args.trace_id and args.trace_id in trace_core_lookup:
+                break
+            if total_trace_pages is not None and trace_page >= total_trace_pages:
+                break
+            trace_page += 1
 
-    page = 1
+    page = max(1, int(resume.get("page") or 1))
     total_pages: Optional[int] = None
     observation_page_size = max(25, min(args.batch_size * 5, 100))
+    resume_cursor: Dict[str, Any] = {"page": page}
     while True:
         response = await langfuse_source.fetch_observation_page(
             page=page,
@@ -1590,16 +1806,15 @@ async def _run_langfuse_trace_backfill(  # noqa: PLR0915
             if args.limit is not None and processed_records >= args.limit:
                 break
 
-        if args.apply:
-            existing_ids = await _get_existing_call_ids(
-                [record["litellm_call_id"] for record in records]
-            )
-            stats.existing_rows += len(existing_ids)
-        else:
-            existing_ids = set()
+        existing_ids = await _get_existing_call_ids(
+            [record["litellm_call_id"] for record in records]
+        )
+        stats.existing_rows += len(existing_ids)
 
         new_records = [
-            record for record in records if record["litellm_call_id"] not in existing_ids
+            record
+            for record in records
+            if record["litellm_call_id"] not in existing_ids
         ]
         existing_records = [
             record for record in records if record["litellm_call_id"] in existing_ids
@@ -1610,6 +1825,9 @@ async def _run_langfuse_trace_backfill(  # noqa: PLR0915
             stats.created_at_aligned_rows += (
                 await _align_session_history_created_at_to_event_time(records)
             )
+            stats.inserted_rows += len(new_records)
+            stats.updated_rows += len(existing_records)
+        else:
             stats.inserted_rows += len(new_records)
             stats.updated_rows += len(existing_records)
 
@@ -1625,46 +1843,53 @@ async def _run_langfuse_trace_backfill(  # noqa: PLR0915
                     continue
                 _record_trace_tag_patch_result(stats, result)
 
+        resume_cursor = {"page": page}
         if args.limit is not None and processed_records >= args.limit:
             break
 
         if total_pages is not None and page >= total_pages:
             break
         page += 1
+        resume_cursor = {"page": page}
 
     if langfuse_backfiller is not None and args.apply:
         langfuse_backfiller.flush()
 
-    return {
-        "source_mode": "langfuse",
-        "source_where": {
-            "trace_id": args.trace_id,
-            "session_id": args.session_id,
-            "provider": args.provider,
-            "status": args.status,
-            "from_start_time": args.from_start_time,
-            "to_start_time": args.to_start_time,
-            "request_id": args.request_id,
+    return _attach_resume_cursor(
+        {
+            "source_mode": "langfuse",
+            "source_where": {
+                "trace_id": args.trace_id,
+                "session_id": args.session_id,
+                "provider": args.provider,
+                "status": args.status,
+                "from_start_time": args.from_start_time,
+                "to_start_time": args.to_start_time,
+                "request_id": args.request_id,
+            },
+            "target_dsn_redacted": target_dsn.split("@", 1)[-1]
+            if "@" in target_dsn
+            else target_dsn,
+            "stats": {
+                "scanned_rows": stats.scanned_rows,
+                "reconstructable_rows": stats.reconstructable_rows,
+                "inserted_rows": stats.inserted_rows,
+                "updated_rows": stats.updated_rows,
+                "existing_rows": stats.existing_rows,
+                "skipped_rows": stats.skipped_rows,
+                "created_at_aligned_rows": stats.created_at_aligned_rows,
+                "trace_tag_candidates": stats.trace_tag_candidates,
+                "traces_patched": stats.traces_patched,
+                "traces_unchanged": stats.traces_unchanged,
+                "traces_missing": stats.traces_missing,
+                "trace_tags_added": stats.trace_tags_added,
+                "trace_write_errors": stats.trace_write_errors,
+            },
+            "session_id_sources": dict(session_source_counts),
+            "trace_id_sources": dict(trace_source_counts),
         },
-        "target_dsn_redacted": target_dsn.split("@", 1)[-1] if "@" in target_dsn else target_dsn,
-        "stats": {
-            "scanned_rows": stats.scanned_rows,
-            "reconstructable_rows": stats.reconstructable_rows,
-            "inserted_rows": stats.inserted_rows,
-            "updated_rows": stats.updated_rows,
-            "existing_rows": stats.existing_rows,
-            "skipped_rows": stats.skipped_rows,
-            "created_at_aligned_rows": stats.created_at_aligned_rows,
-            "trace_tag_candidates": stats.trace_tag_candidates,
-            "traces_patched": stats.traces_patched,
-            "traces_unchanged": stats.traces_unchanged,
-            "traces_missing": stats.traces_missing,
-            "trace_tags_added": stats.trace_tags_added,
-            "trace_write_errors": stats.trace_write_errors,
-        },
-        "session_id_sources": dict(session_source_counts),
-        "trace_id_sources": dict(trace_source_counts),
-    }
+        resume_cursor,
+    )
 
 
 async def _run_langfuse_db_backfill(  # noqa: PLR0915
@@ -1685,9 +1910,16 @@ async def _run_langfuse_db_backfill(  # noqa: PLR0915
     stats = BackfillStats()
     session_source_counts: Counter[str] = Counter()
     trace_source_counts: Counter[str] = Counter()
-    cursor_start_time: Optional[datetime] = None
-    cursor_id: Optional[str] = None
+    resume = _resume_cursor_from_args(args)
+    cursor_start_time: Optional[datetime] = resume.get("cursor_start_time")
+    cursor_id: Optional[str] = resume.get("cursor_id")
     processed_records = 0
+    resume_cursor: Dict[str, Any] = (
+        _serialize_resume_cursor(
+            {"cursor_start_time": cursor_start_time, "cursor_id": cursor_id}
+        )
+        or {}
+    )
 
     langfuse_source = LangfuseDatabaseSource(database_url=langfuse_database_url)
     await langfuse_source.connect()
@@ -1707,9 +1939,15 @@ async def _run_langfuse_db_backfill(  # noqa: PLR0915
 
             records: List[Dict[str, Any]] = []
             trace_tag_map: Dict[str, Set[str]] = defaultdict(set)
+            last_scanned_row: Optional[Dict[str, Any]] = None
+            hit_limit = False
 
             for row in rows:
                 stats.scanned_rows += 1
+                last_scanned_row = row
+                # Coerce asyncpg.Record / mapping rows into a plain dict for cursor helpers.
+                if not isinstance(last_scanned_row, dict):
+                    last_scanned_row = dict(last_scanned_row)
                 trace = _build_langfuse_trace_from_db_row(row)
                 observation = _build_langfuse_observation_from_db_row(row)
 
@@ -1742,21 +1980,23 @@ async def _run_langfuse_db_backfill(  # noqa: PLR0915
 
                 processed_records += 1
                 if args.limit is not None and processed_records >= args.limit:
+                    hit_limit = True
                     break
 
-            if args.apply:
-                existing_ids = await _get_existing_call_ids(
-                    [record["litellm_call_id"] for record in records]
-                )
-                stats.existing_rows += len(existing_ids)
-            else:
-                existing_ids = set()
+            existing_ids = await _get_existing_call_ids(
+                [record["litellm_call_id"] for record in records]
+            )
+            stats.existing_rows += len(existing_ids)
 
             new_records = [
-                record for record in records if record["litellm_call_id"] not in existing_ids
+                record
+                for record in records
+                if record["litellm_call_id"] not in existing_ids
             ]
             existing_records = [
-                record for record in records if record["litellm_call_id"] in existing_ids
+                record
+                for record in records
+                if record["litellm_call_id"] in existing_ids
             ]
 
             if args.apply and records:
@@ -1764,6 +2004,9 @@ async def _run_langfuse_db_backfill(  # noqa: PLR0915
                 stats.created_at_aligned_rows += (
                     await _align_session_history_created_at_to_event_time(records)
                 )
+                stats.inserted_rows += len(new_records)
+                stats.updated_rows += len(existing_records)
+            else:
                 stats.inserted_rows += len(new_records)
                 stats.updated_rows += len(existing_records)
 
@@ -1781,49 +2024,67 @@ async def _run_langfuse_db_backfill(  # noqa: PLR0915
                         continue
                     _record_trace_tag_patch_result(stats, result)
 
-            if args.limit is not None and processed_records >= args.limit:
-                break
+            # Advance exclusive DESC keyset from the last scanned source row,
+            # including mid-batch --limit stops (not the unprocessed batch tail).
+            cursor_row = last_scanned_row
+            if cursor_row is None and rows:
+                cursor_row = rows[-1] if isinstance(rows[-1], dict) else dict(rows[-1])
+            advanced = (
+                _keyset_resume_cursor_from_observation_row(cursor_row)
+                if cursor_row is not None
+                else None
+            )
+            if advanced is not None:
+                cursor_start_time = advanced["cursor_start_time"]
+                cursor_id = advanced["cursor_id"]
+                resume_cursor = advanced
 
-            last_row = rows[-1]
-            cursor_start_time = last_row["observation_start_time"]
-            cursor_id = last_row["observation_id"]
+            if hit_limit or (
+                args.limit is not None and processed_records >= args.limit
+            ):
+                break
 
     finally:
         await langfuse_source.close()
 
-    return {
-        "source_mode": "langfuse_db",
-        "source_where": {
-            "trace_id": args.trace_id,
-            "session_id": args.session_id,
-            "provider": args.provider,
-            "status": args.status,
-            "from_start_time": args.from_start_time,
-            "to_start_time": args.to_start_time,
-            "request_id": args.request_id,
+    return _attach_resume_cursor(
+        {
+            "source_mode": "langfuse_db",
+            "source_where": {
+                "trace_id": args.trace_id,
+                "session_id": args.session_id,
+                "provider": args.provider,
+                "status": args.status,
+                "from_start_time": args.from_start_time,
+                "to_start_time": args.to_start_time,
+                "request_id": args.request_id,
+            },
+            "target_dsn_redacted": target_dsn.split("@", 1)[-1]
+            if "@" in target_dsn
+            else target_dsn,
+            "langfuse_database_url_redacted": langfuse_database_url.split("@", 1)[-1]
+            if "@" in langfuse_database_url
+            else langfuse_database_url,
+            "stats": {
+                "scanned_rows": stats.scanned_rows,
+                "reconstructable_rows": stats.reconstructable_rows,
+                "inserted_rows": stats.inserted_rows,
+                "updated_rows": stats.updated_rows,
+                "existing_rows": stats.existing_rows,
+                "skipped_rows": stats.skipped_rows,
+                "created_at_aligned_rows": stats.created_at_aligned_rows,
+                "trace_tag_candidates": stats.trace_tag_candidates,
+                "traces_patched": stats.traces_patched,
+                "traces_unchanged": stats.traces_unchanged,
+                "traces_missing": stats.traces_missing,
+                "trace_tags_added": stats.trace_tags_added,
+                "trace_write_errors": stats.trace_write_errors,
+            },
+            "session_id_sources": dict(session_source_counts),
+            "trace_id_sources": dict(trace_source_counts),
         },
-        "target_dsn_redacted": target_dsn.split("@", 1)[-1] if "@" in target_dsn else target_dsn,
-        "langfuse_database_url_redacted": langfuse_database_url.split("@", 1)[-1]
-        if "@" in langfuse_database_url
-        else langfuse_database_url,
-        "stats": {
-            "scanned_rows": stats.scanned_rows,
-            "reconstructable_rows": stats.reconstructable_rows,
-            "inserted_rows": stats.inserted_rows,
-            "updated_rows": stats.updated_rows,
-            "existing_rows": stats.existing_rows,
-            "skipped_rows": stats.skipped_rows,
-            "created_at_aligned_rows": stats.created_at_aligned_rows,
-            "trace_tag_candidates": stats.trace_tag_candidates,
-            "traces_patched": stats.traces_patched,
-            "traces_unchanged": stats.traces_unchanged,
-            "traces_missing": stats.traces_missing,
-            "trace_tags_added": stats.trace_tags_added,
-            "trace_write_errors": stats.trace_write_errors,
-        },
-        "session_id_sources": dict(session_source_counts),
-        "trace_id_sources": dict(trace_source_counts),
-    }
+        resume_cursor,
+    )
 
 
 async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
@@ -1845,9 +2106,16 @@ async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
     stats = BackfillStats()
     session_source_counts: Counter[str] = Counter()
     trace_source_counts: Counter[str] = Counter()
-    cursor_start_time: Optional[datetime] = None
-    cursor_id: Optional[str] = None
+    resume = _resume_cursor_from_args(args)
+    cursor_start_time: Optional[datetime] = resume.get("cursor_start_time")
+    cursor_id: Optional[str] = resume.get("cursor_id")
     processed_records = 0
+    resume_cursor: Dict[str, Any] = (
+        _serialize_resume_cursor(
+            {"cursor_start_time": cursor_start_time, "cursor_id": cursor_id}
+        )
+        or {}
+    )
 
     clickhouse_source = LangfuseClickHouseSource(**clickhouse_config)
 
@@ -1869,9 +2137,12 @@ async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
 
         records: List[Dict[str, Any]] = []
         trace_tag_map: Dict[str, Set[str]] = defaultdict(set)
+        last_scanned_row: Optional[Dict[str, Any]] = None
+        hit_limit = False
 
         for row in rows:
             stats.scanned_rows += 1
+            last_scanned_row = row if isinstance(row, dict) else dict(row)
             trace = _build_langfuse_trace_from_clickhouse_row(row)
             observation = _build_langfuse_observation_from_clickhouse_row(row)
 
@@ -1904,18 +2175,18 @@ async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
 
             processed_records += 1
             if args.limit is not None and processed_records >= args.limit:
+                hit_limit = True
                 break
 
-        if args.apply:
-            existing_ids = await _get_existing_call_ids(
-                [record["litellm_call_id"] for record in records]
-            )
-            stats.existing_rows += len(existing_ids)
-        else:
-            existing_ids = set()
+        existing_ids = await _get_existing_call_ids(
+            [record["litellm_call_id"] for record in records]
+        )
+        stats.existing_rows += len(existing_ids)
 
         new_records = [
-            record for record in records if record["litellm_call_id"] not in existing_ids
+            record
+            for record in records
+            if record["litellm_call_id"] not in existing_ids
         ]
         existing_records = [
             record for record in records if record["litellm_call_id"] in existing_ids
@@ -1926,6 +2197,9 @@ async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
             stats.created_at_aligned_rows += (
                 await _align_session_history_created_at_to_event_time(records)
             )
+            stats.inserted_rows += len(new_records)
+            stats.updated_rows += len(existing_records)
+        else:
             stats.inserted_rows += len(new_records)
             stats.updated_rows += len(existing_records)
 
@@ -1941,52 +2215,63 @@ async def _run_langfuse_clickhouse_backfill(  # noqa: PLR0915
                     continue
                 _record_trace_tag_patch_result(stats, result)
 
-        if args.limit is not None and processed_records >= args.limit:
-            break
-
-        last_row = rows[-1]
-        last_start_time = last_row.get("observation_start_time")
-        cursor_start_time = (
-            _parse_optional_datetime(str(last_start_time).replace(" ", "T"))
-            if isinstance(last_start_time, str)
-            else last_start_time
+        # Advance exclusive DESC keyset from the last scanned source row,
+        # including mid-batch --limit stops (not the unprocessed batch tail).
+        cursor_row = last_scanned_row
+        if cursor_row is None and rows:
+            cursor_row = rows[-1] if isinstance(rows[-1], dict) else dict(rows[-1])
+        advanced = (
+            _keyset_resume_cursor_from_observation_row(cursor_row)
+            if cursor_row is not None
+            else None
         )
-        cursor_id = last_row.get("observation_id")
+        if advanced is not None:
+            cursor_start_time = advanced["cursor_start_time"]
+            cursor_id = advanced["cursor_id"]
+            resume_cursor = advanced
+
+        if hit_limit or (args.limit is not None and processed_records >= args.limit):
+            break
 
     if langfuse_backfiller is not None and args.apply:
         langfuse_backfiller.flush()
 
-    return {
-        "source_mode": "langfuse_clickhouse",
-        "source_where": {
-            "trace_id": args.trace_id,
-            "session_id": args.session_id,
-            "provider": args.provider,
-            "status": args.status,
-            "from_start_time": args.from_start_time,
-            "to_start_time": args.to_start_time,
-            "request_id": args.request_id,
+    return _attach_resume_cursor(
+        {
+            "source_mode": "langfuse_clickhouse",
+            "source_where": {
+                "trace_id": args.trace_id,
+                "session_id": args.session_id,
+                "provider": args.provider,
+                "status": args.status,
+                "from_start_time": args.from_start_time,
+                "to_start_time": args.to_start_time,
+                "request_id": args.request_id,
+            },
+            "target_dsn_redacted": target_dsn.split("@", 1)[-1]
+            if "@" in target_dsn
+            else target_dsn,
+            "clickhouse_url": clickhouse_config["url"],
+            "stats": {
+                "scanned_rows": stats.scanned_rows,
+                "reconstructable_rows": stats.reconstructable_rows,
+                "inserted_rows": stats.inserted_rows,
+                "updated_rows": stats.updated_rows,
+                "existing_rows": stats.existing_rows,
+                "skipped_rows": stats.skipped_rows,
+                "created_at_aligned_rows": stats.created_at_aligned_rows,
+                "trace_tag_candidates": stats.trace_tag_candidates,
+                "traces_patched": stats.traces_patched,
+                "traces_unchanged": stats.traces_unchanged,
+                "traces_missing": stats.traces_missing,
+                "trace_tags_added": stats.trace_tags_added,
+                "trace_write_errors": stats.trace_write_errors,
+            },
+            "session_id_sources": dict(session_source_counts),
+            "trace_id_sources": dict(trace_source_counts),
         },
-        "target_dsn_redacted": target_dsn.split("@", 1)[-1] if "@" in target_dsn else target_dsn,
-        "clickhouse_url": clickhouse_config["url"],
-        "stats": {
-            "scanned_rows": stats.scanned_rows,
-            "reconstructable_rows": stats.reconstructable_rows,
-            "inserted_rows": stats.inserted_rows,
-            "updated_rows": stats.updated_rows,
-            "existing_rows": stats.existing_rows,
-            "skipped_rows": stats.skipped_rows,
-            "created_at_aligned_rows": stats.created_at_aligned_rows,
-            "trace_tag_candidates": stats.trace_tag_candidates,
-            "traces_patched": stats.traces_patched,
-            "traces_unchanged": stats.traces_unchanged,
-            "traces_missing": stats.traces_missing,
-            "trace_tags_added": stats.trace_tags_added,
-            "trace_write_errors": stats.trace_write_errors,
-        },
-        "session_id_sources": dict(session_source_counts),
-        "trace_id_sources": dict(trace_source_counts),
-    }
+        resume_cursor,
+    )
 
 
 async def _load_trace_tag_candidates_from_session_history(
@@ -2041,7 +2326,9 @@ async def _run_trace_tag_writeback_from_session_history(
 
     if args.apply:
         if langfuse_backfiller is None:
-            raise RuntimeError("Langfuse tag writeback requires Langfuse API credentials")
+            raise RuntimeError(
+                "Langfuse tag writeback requires Langfuse API credentials"
+            )
         for trace_id, tag_set in trace_tag_map.items():
             if not tag_set:
                 continue
@@ -2109,9 +2396,8 @@ def _recalculate_session_history_response_cost(row: Dict[str, Any]) -> Optional[
 
         usage_object = None
         if (
-            (cost_provider or "").lower() == "anthropic"
-            and cache_creation_input_tokens > 0
-        ):
+            cost_provider or ""
+        ).lower() == "anthropic" and cache_creation_input_tokens > 0:
             # Claude Code cache writes use Anthropic's 1-hour ephemeral cache tier.
             # session_history only stores aggregate creation tokens, so rebuild the
             # detail object needed for LiteLLM to price the same way live logging did.
@@ -2176,7 +2462,10 @@ def _derive_session_history_tenant_identity(
     if str(row.get("tenant_id") or "").strip():
         return None, None
 
-    repository, repository_source = _extract_repository_identity_from_metadata_sources_with_source(
+    (
+        repository,
+        repository_source,
+    ) = _extract_repository_identity_from_metadata_sources_with_source(
         ("session_history.metadata", metadata),
     )
     if repository:
@@ -2239,8 +2528,7 @@ def _is_gemini_control_plane_session_history_row(
         metadata.get("litellm_provider"),
     )
     provider_is_gemini = any(
-        isinstance(candidate, str)
-        and candidate.strip().lower() in {"gemini", "google"}
+        isinstance(candidate, str) and candidate.strip().lower() in {"gemini", "google"}
         for candidate in provider_candidates
     )
 
@@ -2345,37 +2633,47 @@ async def _run_gemini_control_plane_session_history_repair(  # noqa: PLR0915
         """
         async with pool.acquire() as connection:
             rows = await connection.fetch(query, *page_params)
-        if not rows:
-            break
-
-        for row in rows:
-            cursor_id = max(cursor_id, int(row["id"]))
-            if limit is not None and scanned_rows >= limit:
+            if not rows:
                 break
-            scanned_rows += 1
-            row_dict = dict(row)
-            is_match, control_plane_method = (
-                _is_gemini_control_plane_session_history_row(row_dict)
-            )
-            if not is_match or control_plane_method is None:
-                continue
-            matched_rows += 1
-            matched_methods[control_plane_method] += 1
 
-            if not args.apply:
-                continue
+            matched_page: List[Dict[str, Any]] = []
+            for row in rows:
+                cursor_id = max(cursor_id, int(row["id"]))
+                if limit is not None and scanned_rows >= limit:
+                    break
+                scanned_rows += 1
+                row_dict = dict(row)
+                (
+                    is_match,
+                    control_plane_method,
+                ) = _is_gemini_control_plane_session_history_row(row_dict)
+                if not is_match or control_plane_method is None:
+                    continue
+                matched_rows += 1
+                matched_methods[control_plane_method] += 1
+                matched_page.append(
+                    {**row_dict, "_control_plane_method": control_plane_method}
+                )
 
-            async with pool.acquire() as connection:
+            if not args.apply or not matched_page:
+                # still need to advance pagination when dry-run
+                pass
+            else:
+                # Reuse the page connection for all matched writes (no per-row acquire).
                 async with connection.transaction():
                     if action == "delete":
-                        litellm_call_id = row_dict.get("litellm_call_id")
-                        if litellm_call_id:
+                        tool_call_ids = [
+                            str(row_dict.get("litellm_call_id"))
+                            for row_dict in matched_page
+                            if row_dict.get("litellm_call_id")
+                        ]
+                        if tool_call_ids:
                             tool_result = await connection.execute(
                                 """
                                 DELETE FROM public.session_history_tool_activity
-                                WHERE litellm_call_id = $1
+                                WHERE litellm_call_id = ANY($1::text[])
                                 """,
-                                litellm_call_id,
+                                tool_call_ids,
                             )
                             try:
                                 deleted_tool_activity_rows += int(
@@ -2383,43 +2681,47 @@ async def _run_gemini_control_plane_session_history_repair(  # noqa: PLR0915
                                 )
                             except Exception:
                                 pass
+                        ids = [row_dict["id"] for row_dict in matched_page]
                         result = await connection.execute(
-                            "DELETE FROM public.session_history WHERE id = $1",
-                            row_dict["id"],
+                            "DELETE FROM public.session_history WHERE id = ANY($1::bigint[])",
+                            ids,
                         )
                         try:
                             deleted_rows += int(result.rsplit(" ", 1)[-1])
                         except Exception:
-                            deleted_rows += 1
+                            deleted_rows += len(ids)
                     elif action == "mark":
-                        metadata = row_dict.get("metadata")
-                        if not isinstance(metadata, dict):
-                            metadata = _parse_clickhouse_value(metadata)
-                        if not isinstance(metadata, dict):
-                            metadata = {}
-                        metadata.update(
-                            {
-                                "session_history_repair": "gemini_control_plane",
-                                "gemini_control_plane_repair_action": "mark",
-                                "gemini_control_plane_excluded": True,
-                                "gemini_control_plane_method": method,
-                            }
-                        )
-                        result = await connection.execute(
-                            """
-                            UPDATE public.session_history
-                            SET metadata = $1::jsonb
-                            WHERE id = $2
-                            """,
-                            json.dumps(metadata),
-                            row_dict["id"],
-                        )
-                        try:
-                            updated_rows += int(result.rsplit(" ", 1)[-1])
-                        except Exception:
-                            updated_rows += 1
+                        mark_updates: List[Tuple[str, Any]] = []
+                        for row_dict in matched_page:
+                            metadata = row_dict.get("metadata")
+                            if not isinstance(metadata, dict):
+                                metadata = _parse_clickhouse_value(metadata)
+                            if not isinstance(metadata, dict):
+                                metadata = {}
+                            method = row_dict.get("_control_plane_method")
+                            metadata.update(
+                                {
+                                    "session_history_repair": "gemini_control_plane",
+                                    "gemini_control_plane_repair_action": "mark",
+                                    "gemini_control_plane_excluded": True,
+                                    "gemini_control_plane_method": method,
+                                }
+                            )
+                            mark_updates.append((json.dumps(metadata), row_dict["id"]))
+                        if mark_updates:
+                            await connection.executemany(
+                                """
+                                UPDATE public.session_history
+                                SET metadata = $1::jsonb
+                                WHERE id = $2
+                                """,
+                                mark_updates,
+                            )
+                            updated_rows += len(mark_updates)
                     else:
-                        raise RuntimeError(f"Unsupported Gemini repair action: {action}")
+                        raise RuntimeError(
+                            f"Unsupported Gemini repair action: {action}"
+                        )
 
         if limit is not None and scanned_rows >= limit:
             break
@@ -2448,7 +2750,6 @@ async def _run_gemini_control_plane_session_history_repair(  # noqa: PLR0915
             "matched_methods": dict(sorted(matched_methods.items())),
         },
     }
-
 
 
 _ANTHROPIC_CONTEXT_WINDOW_METADATA_KEYS_FOR_REPAIR = (
@@ -2488,7 +2789,9 @@ def _resolve_session_history_repair_modes(
     }
 
 
-def _anthropic_context_window_metadata_slice(metadata: Dict[str, Any]) -> Dict[str, Any]:
+def _anthropic_context_window_metadata_slice(
+    metadata: Dict[str, Any]
+) -> Dict[str, Any]:
     return {
         key: metadata.get(key)
         for key in _ANTHROPIC_CONTEXT_WINDOW_METADATA_KEYS_FOR_REPAIR
@@ -2513,7 +2816,9 @@ def _session_history_row_needs_anthropic_context_window_metadata_repair(
     row_dict: Dict[str, Any],
     metadata: Dict[str, Any],
 ) -> bool:
-    if not _session_history_row_is_anthropic_context_window_candidate(row_dict, metadata):
+    if not _session_history_row_is_anthropic_context_window_candidate(
+        row_dict, metadata
+    ):
         return False
     before = _anthropic_context_window_metadata_slice(metadata)
     record = {
@@ -2528,7 +2833,9 @@ def _session_history_row_needs_anthropic_context_window_metadata_repair(
     return before != after
 
 
-async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any]:  # noqa: PLR0915
+async def _run_session_history_repair(  # noqa: PLR0915
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
     if args.repair_gemini_control_plane:
         return await _run_gemini_control_plane_session_history_repair(args)
 
@@ -2575,10 +2882,33 @@ async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any
     cost_candidates = 0
     cost_updates = 0
     cost_repair_errors = 0
-    offset = 0
+    # Keyset pagination matching ORDER BY start_time ASC NULLS LAST, litellm_call_id ASC.
+    cursor_start_time: Optional[datetime] = None
+    cursor_call_id: Optional[str] = None
+    cursor_start_is_null = False
 
     while True:
-        page_params = [*params, batch_size, offset]
+        keyset_clauses = list(where_clauses)
+        page_params: List[Any] = list(params)
+        if cursor_call_id is not None:
+            if cursor_start_is_null:
+                # Already in the NULLS LAST partition: only later call ids with NULL start_time.
+                page_params.append(cursor_call_id)
+                keyset_clauses.append(
+                    f"(start_time IS NULL AND litellm_call_id > ${len(params) + 1})"
+                )
+            else:
+                # After a non-null start_time: later non-null times, later ids at the same
+                # time, then the entire NULL start_time partition (NULLS LAST).
+                page_params.extend([cursor_start_time, cursor_call_id])
+                keyset_clauses.append(
+                    "("
+                    f"start_time > ${len(params) + 1}"
+                    f" OR (start_time = ${len(params) + 1} AND litellm_call_id > ${len(params) + 2})"
+                    f" OR start_time IS NULL"
+                    f")"
+                )
+        page_params.append(batch_size)
         query = f"""
             SELECT
                 litellm_call_id,
@@ -2592,105 +2922,131 @@ async def _run_session_history_repair(args: argparse.Namespace) -> Dict[str, Any
                 cache_creation_input_tokens,
                 response_cost_usd,
                 repository,
-                metadata
+                metadata,
+                start_time
             FROM public.session_history
-            WHERE {' AND '.join(where_clauses)}
+            WHERE {' AND '.join(keyset_clauses)}
             ORDER BY start_time ASC NULLS LAST, litellm_call_id ASC
-            LIMIT ${len(params) + 1}
-            OFFSET ${len(params) + 2}
+            LIMIT ${len(page_params)}
         """
         async with pool.acquire() as connection:
             rows = await connection.fetch(query, *page_params)
-        if not rows:
-            break
-
-        for row in rows:
-            if limit is not None and scanned_rows >= limit:
+            if not rows:
                 break
-            scanned_rows += 1
 
-            row_dict = dict(row)
-            metadata = row_dict.get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = _parse_clickhouse_value(metadata)
-            if not isinstance(metadata, dict):
-                metadata = {}
+            updates: List[Tuple[Any, Any, str, str]] = []
+            for row in rows:
+                if limit is not None and scanned_rows >= limit:
+                    break
+                scanned_rows += 1
 
-            next_tenant_id = row_dict.get("tenant_id")
-            next_cost = _safe_float(row_dict.get("response_cost_usd"))
-            should_update = False
+                row_dict = dict(row)
+                metadata = row_dict.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = _parse_clickhouse_value(metadata)
+                if not isinstance(metadata, dict):
+                    metadata = {}
 
-            if repair_tenant_ids:
-                tenant_id, tenant_source = _derive_session_history_tenant_identity(
-                    {**row_dict, "metadata": metadata}
-                )
-                if tenant_id:
-                    if str(next_tenant_id or "").strip() != tenant_id:
-                        next_tenant_id = tenant_id
-                        tenant_updates += 1
-                        should_update = True
-                    if metadata.get("tenant_id") != tenant_id:
-                        metadata["tenant_id"] = tenant_id
-                        should_update = True
-                    if tenant_source and metadata.get("tenant_id_source") != tenant_source:
-                        metadata["tenant_id_source"] = tenant_source
-                        should_update = True
-                elif next_tenant_id and metadata.get("tenant_id") != next_tenant_id:
-                    metadata["tenant_id"] = next_tenant_id
-                    metadata.setdefault("tenant_id_source", "session_history.tenant_id")
-                    should_update = True
+                next_tenant_id = row_dict.get("tenant_id")
+                next_cost = _safe_float(row_dict.get("response_cost_usd"))
+                should_update = False
 
-            if repair_costs:
-                recalculated_cost = _recalculate_session_history_response_cost(row_dict)
-                if recalculated_cost is None:
-                    cost_repair_errors += 1
-                else:
-                    cost_candidates += 1
-                    if (
-                        next_cost is None
-                        or abs(float(next_cost) - recalculated_cost) > 0.000000001
-                    ):
-                        next_cost = recalculated_cost
-                        metadata["response_cost_source"] = "session_history_repair"
-                        cost_updates += 1
-                        should_update = True
-
-            if repair_anthropic_context_window:
-                if _session_history_row_needs_anthropic_context_window_metadata_repair(
-                    row_dict, metadata
-                ):
-                    repair_record = {**row_dict, "metadata": metadata}
-                    _enrich_backfill_anthropic_context_window_metadata(repair_record)
-                    repaired_meta = repair_record.get("metadata")
-                    if isinstance(repaired_meta, dict):
-                        metadata = repaired_meta
-                        anthropic_context_window_updates += 1
-                        should_update = True
-
-            if should_update:
-                rows_with_updates += 1
-                if args.apply:
-                    async with pool.acquire() as connection:
-                        await connection.execute(
-                            """
-                            UPDATE public.session_history
-                            SET
-                                tenant_id = $1,
-                                response_cost_usd = $2,
-                                metadata = $3::jsonb
-                            WHERE litellm_call_id = $4
-                            """,
-                            next_tenant_id,
-                            next_cost,
-                            json.dumps(metadata),
-                            row_dict["litellm_call_id"],
+                if repair_tenant_ids:
+                    tenant_id, tenant_source = _derive_session_history_tenant_identity(
+                        {**row_dict, "metadata": metadata}
+                    )
+                    if tenant_id:
+                        if str(next_tenant_id or "").strip() != tenant_id:
+                            next_tenant_id = tenant_id
+                            tenant_updates += 1
+                            should_update = True
+                        if metadata.get("tenant_id") != tenant_id:
+                            metadata["tenant_id"] = tenant_id
+                            should_update = True
+                        if (
+                            tenant_source
+                            and metadata.get("tenant_id_source") != tenant_source
+                        ):
+                            metadata["tenant_id_source"] = tenant_source
+                            should_update = True
+                    elif next_tenant_id and metadata.get("tenant_id") != next_tenant_id:
+                        metadata["tenant_id"] = next_tenant_id
+                        metadata.setdefault(
+                            "tenant_id_source", "session_history.tenant_id"
                         )
+                        should_update = True
+
+                if repair_costs:
+                    recalculated_cost = _recalculate_session_history_response_cost(
+                        row_dict
+                    )
+                    if recalculated_cost is None:
+                        cost_repair_errors += 1
+                    else:
+                        cost_candidates += 1
+                        if (
+                            next_cost is None
+                            or abs(float(next_cost) - recalculated_cost) > 0.000000001
+                        ):
+                            next_cost = recalculated_cost
+                            metadata["response_cost_source"] = "session_history_repair"
+                            cost_updates += 1
+                            should_update = True
+
+                if repair_anthropic_context_window:
+                    if _session_history_row_needs_anthropic_context_window_metadata_repair(
+                        row_dict, metadata
+                    ):
+                        repair_record = {**row_dict, "metadata": metadata}
+                        _enrich_backfill_anthropic_context_window_metadata(
+                            repair_record
+                        )
+                        repaired_meta = repair_record.get("metadata")
+                        if isinstance(repaired_meta, dict):
+                            metadata = repaired_meta
+                            anthropic_context_window_updates += 1
+                            should_update = True
+
+                if should_update:
+                    rows_with_updates += 1
+                    if args.apply:
+                        updates.append(
+                            (
+                                next_tenant_id,
+                                next_cost,
+                                json.dumps(metadata),
+                                row_dict["litellm_call_id"],
+                            )
+                        )
+
+            if updates:
+                await connection.executemany(
+                    """
+                    UPDATE public.session_history
+                    SET
+                        tenant_id = $1,
+                        response_cost_usd = $2,
+                        metadata = $3::jsonb
+                    WHERE litellm_call_id = $4
+                    """,
+                    updates,
+                )
 
         if limit is not None and scanned_rows >= limit:
             break
         if len(rows) < batch_size:
             break
-        offset += len(rows)
+        last_row = dict(rows[-1])
+        last_start = last_row.get("start_time")
+        if isinstance(last_start, datetime):
+            cursor_start_time = _as_utc_aware_datetime(last_start)
+            cursor_start_is_null = False
+        else:
+            cursor_start_time = None
+            cursor_start_is_null = True
+        cursor_call_id = str(last_row.get("litellm_call_id") or "")
+        if not cursor_call_id:
+            break
 
     return {
         "source_mode": "session_history_repair",
@@ -2741,11 +3097,15 @@ async def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
         args.source_mode in {"auto", "langfuse", "langfuse_clickhouse", "langfuse_db"}
         or (args.source_mode == "spendlogs")
     )
-    use_langfuse_http = bool(args.source_mode == "langfuse") or (
-        args.source_mode == "auto"
-        and not source_database_url
-        and not langfuse_database_url
-    ) or needs_langfuse_writeback
+    use_langfuse_http = (
+        bool(args.source_mode == "langfuse")
+        or (
+            args.source_mode == "auto"
+            and not source_database_url
+            and not langfuse_database_url
+        )
+        or needs_langfuse_writeback
+    )
 
     if use_langfuse_http:
         langfuse_creds = _resolve_langfuse_credentials(args)
@@ -2801,7 +3161,10 @@ async def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
             run_id=run_id,
         )
         result["clickhouse_auth"] = _clickhouse_auth_diagnostics(clickhouse_auth)
-        result["clickhouse_preflight"] = {"ran": True, "reason": "langfuse_clickhouse_source"}
+        result["clickhouse_preflight"] = {
+            "ran": True,
+            "reason": "langfuse_clickhouse_source",
+        }
     elif source_mode == "langfuse":
         if langfuse_creds is None:
             raise RuntimeError("Langfuse API credentials are missing")
@@ -2884,14 +3247,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Patch historical Langfuse trace tags from derived request tags.",
     )
-    parser.add_argument("--request-id", help="Restrict to a single spend-log request_id.")
+    parser.add_argument(
+        "--request-id", help="Restrict to a single spend-log request_id."
+    )
     parser.add_argument(
         "--trace-id",
         help="Restrict to a single trace id.",
     )
     parser.add_argument("--session-id", help="Restrict to a single session id.")
     parser.add_argument("--provider", help="Restrict to a custom_llm_provider value.")
-    parser.add_argument("--model", help="Restrict to a single session_history model value.")
+    parser.add_argument(
+        "--model", help="Restrict to a single session_history model value."
+    )
     parser.add_argument(
         "--status",
         choices=("success", "failure"),
@@ -2936,11 +3303,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--langfuse-database-url",
         help="Override the Langfuse Postgres DATABASE_URL used for direct historical reads.",
     )
+    parser.add_argument("--langfuse-public-key", help="Override LANGFUSE_PUBLIC_KEY.")
+    parser.add_argument("--langfuse-secret-key", help="Override LANGFUSE_SECRET_KEY.")
     parser.add_argument(
-        "--langfuse-public-key", help="Override LANGFUSE_PUBLIC_KEY."
-    )
-    parser.add_argument(
-        "--langfuse-secret-key", help="Override LANGFUSE_SECRET_KEY."
+        "--resume-cursor",
+        help=(
+            "JSON resume cursor from a previous run's resume_cursor field. "
+            "Supported keys: skip (spendlogs), page/trace_page (langfuse API), "
+            "cursor_start_time + cursor_id (langfuse_db / langfuse_clickhouse)."
+        ),
     )
     return parser
 
@@ -2957,6 +3328,10 @@ def main() -> None:
             "--repair-gemini-control-plane cannot be combined with --repair-costs "
             "or --repair-tenant-ids"
         )
+    try:
+        _resume_cursor_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     result = asyncio.run(_run_backfill(args))
     sys.stdout.write(json.dumps(result, indent=2, default=str) + "\n")
 

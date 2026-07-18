@@ -40,6 +40,9 @@ def test_should_preserve_clickhouse_cursor_predicate_and_ordering() -> None:
     assert "o.start_time < toDateTime64" in query
     assert "AND o.id <" in query
     assert "LIMIT 5" in query
+    assert "{cursor_id:String}" in query
+    assert "obs-cursor-1" not in str(query)
+    assert query.params["cursor_id"] == "obs-cursor-1"
 
 
 def test_should_filter_clickhouse_session_id_with_trace_subquery() -> None:
@@ -51,28 +54,39 @@ def test_should_filter_clickhouse_session_id_with_trace_subquery() -> None:
     assert "t.session_id" not in query
     assert "o.trace_id IN (" in query
     assert "SELECT id FROM traces" in query
-    assert "session_id = 'session-123'" in query
+    assert "session_id = {session_id:String}" in query
+    assert query.params["session_id"] == "session-123"
+    assert "session-123" not in str(query)  # bound via params, not SQL text
 
 
 class _CapturingClickHouseSource(backfill.LangfuseClickHouseSource):
     def __init__(self) -> None:
         super().__init__(url="http://127.0.0.1:8123", user="u", password="p")
         self.queries: list[str] = []
+        self.params_seen: list = []
 
-    def _request_rows(self, query: str):  # type: ignore[override]
+    def _request_rows(self, query: str, params=None):  # type: ignore[override]
         self.queries.append(query)
+        self.params_seen.append(params)
         return []
 
 
 async def test_should_pass_include_payloads_flag_through_fetch_generation_batch() -> None:
     source = _CapturingClickHouseSource()
 
-    await source.fetch_generation_batch(limit=3, include_payloads=False)
-    await source.fetch_generation_batch(limit=3, include_payloads=True)
+    # Avoid asyncio.to_thread under restrictive sandboxes; exercise the same
+    # query construction path fetch_generation_batch uses.
+    async def immediate_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    with patch.object(backfill.asyncio, "to_thread", side_effect=immediate_to_thread):
+        await source.fetch_generation_batch(limit=3, include_payloads=False)
+        await source.fetch_generation_batch(limit=3, include_payloads=True)
 
     assert len(source.queries) == 2
     assert "NULL AS observation_input" in source.queries[0]
     assert "o.input AS observation_input" in source.queries[1]
+    assert source.params_seen[0] is not None or source.params_seen[0] == {}
 
 
 def test_should_report_builtin_clickhouse_auth_sources_when_unconfigured() -> None:

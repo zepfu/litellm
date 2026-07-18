@@ -1389,6 +1389,21 @@ windows. Reconstruction still uses trace fields, observation metadata, usage/cos
 columns, and `tool_calls` / `tool_call_names`. Pass `--clickhouse-include-payloads`
 when you explicitly need full input/output hydration from ClickHouse.
 
+Operator controls shared by historical backfill source modes (`spendlogs`,
+`langfuse`, `langfuse_db`, `langfuse_clickhouse`):
+
+- Default is dry-run (no writes). Dry-run still resolves existing
+  `litellm_call_id` values when a target DSN is available so
+  `inserted_rows` / `updated_rows` / `existing_rows` preview real scale.
+- JSON results include a `resume_cursor` object when the run advanced a source
+  cursor. Pass it back with `--resume-cursor '<json>'` after an interruption
+  instead of restarting from page 1 / skip 0 / empty keyset. Supported keys:
+  `skip` (spendlogs), `page` / `trace_page` (langfuse API; trace-core prefetch
+  only runs when `--session-id` or `--trace-id` is set), and
+  `cursor_start_time` + `cursor_id` (`langfuse_db` / `langfuse_clickhouse`).
+- ClickHouse SQL uses HTTP `{name:Type}` parameters (`param_*` query string)
+  for operator filters and cursors rather than string-interpolated literals.
+
 ## Langfuse Metadata Compaction
 
 Langfuse generation metadata is intentionally more compact than
