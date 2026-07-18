@@ -10,12 +10,87 @@ CONFIG_PATH="${ACCEPTANCE_CONFIG_PATH:-scripts/local-ci/config.json}"
 
 cd "$ROOT"
 
-if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-fi
+# RR-081 Medium #3: do NOT `set -a; source .env` (that re-exports every secret
+# into the process environment inherited by provider CLIs). Load only the keys
+# the harness parent process needs; run_acceptance.py further scrubs child CLI
+# envs via `_scrubbed_child_env`.
+load_harness_dotenv() {
+  local env_file="${1:-.env}"
+  [[ -f "$env_file" ]] || return 0
+
+  local line key value
+  # Prefixes required by the Python harness for Langfuse polling / URLs.
+  local -a allow_prefixes=(
+    "LANGFUSE_"
+  )
+  # Exact keys that may legitimately configure the harness wrapper / overrides.
+  local -a allow_keys=(
+    "LITELLM_BASE_URL"
+    "LITELLM_PORT"
+    "ACCEPTANCE_CONFIG_PATH"
+    "ACCEPTANCE_CLI_OUTPUT_MAX_CHARS"
+    "CLAUDE_FANOUT_MODE"
+    "REBUILD_LITELLM_DEV"
+    "BUILD_STATE_PATH"
+    "PYTHON_BIN"
+    "AAWM_HARNESS_RUN_ID"
+    "AAWM_HARNESS_USER_ID"
+    "AAWM_CLAUDE_HARNESS_USER_ID"
+    "AAWM_OBSERVE_SERVICE_NAME"
+    "PYTEST_CLASSIFIER_HARNESS_USER_ID"
+    "PYTEST_CLASSIFIER_ENABLE_OBSERVABILITY"
+  )
+
+  is_harness_env_key() {
+    local candidate="$1"
+    local allowed prefix
+    for allowed in "${allow_keys[@]}"; do
+      if [[ "$candidate" == "$allowed" ]]; then
+        return 0
+      fi
+    done
+    for prefix in "${allow_prefixes[@]}"; do
+      if [[ "$candidate" == "$prefix"* ]]; then
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Strip CR (Windows line endings) and leading/trailing whitespace.
+    line="${line//$''/}"
+    # Trim leading whitespace.
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == export[[:space:]]* ]]; then
+      line="${line#export}"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+    # Only KEY=VALUE assignments; skip shell syntax we do not evaluate.
+    [[ "$line" == *"="* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    # Trim whitespace around key.
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    is_harness_env_key "$key" || continue
+
+    # Strip matching single/double quotes around the value.
+    if [[ ${#value} -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    # Export only allowlisted keys (no `set -a` / full-file source).
+    export "$key=$value"
+  done < "$env_file"
+}
+
+load_harness_dotenv "$ROOT/.env"
 
 export LANGFUSE_QUERY_URL="${LANGFUSE_QUERY_URL:-http://127.0.0.1:3000}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"

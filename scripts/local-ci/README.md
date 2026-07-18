@@ -46,6 +46,10 @@ through, but Langfuse, database, PostgreSQL, and LiteLLM admin secrets such as
 `LITELLM_MASTER_KEY` are excluded. Only explicit non-secret LiteLLM routing
 keys, including `LITELLM_BASE_URL`, are inherited.
 
+The shell wrapper does not source `.env`. It parses the file and exports only
+Langfuse settings plus named harness overrides to the parent Python process;
+database and unrelated provider secrets in `.env` are ignored.
+
 CLI stdout and stderr stored in the JSON artifact are capped at 200,000
 characters per stream by default. Set `ACCEPTANCE_CLI_OUTPUT_MAX_CHARS` to tune
 the cap. Artifact fields record whether truncation occurred and the original
