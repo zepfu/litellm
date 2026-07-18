@@ -16,7 +16,7 @@ import sys
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 import psycopg
 import psycopg.rows
@@ -60,6 +60,9 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
     _build_aawm_dsn,
     _extract_repository_identity_from_metadata_sources,
     _normalize_repository_identity,
+)
+from litellm.integrations.aawm_session_history.identity_selection import (  # noqa: E402
+    select_first_identity,
 )
 
 
@@ -464,19 +467,23 @@ def _row_repository_candidate_extractors(
     ``_build_repaired_row`` consume this shared list so priority order cannot
     drift between same-session evidence ranking and per-row repair resolution.
     """
-    session_repositories = session_repositories or {}
-    rollout_repository_map = rollout_repository_map or {}
+    resolved_session_repositories: Dict[str, Dict[str, Any]] = (
+        session_repositories or {}
+    )
+    resolved_rollout_repository_map: Dict[str, str] = rollout_repository_map or {}
 
     extractors: list[
         Tuple[str, Callable[[Dict[str, Any], Dict[str, Any]], Optional[str]]]
     ] = []
 
     if grok_repository:
+        resolved_grok_repository: str = grok_repository
+
         def _from_grok_override(
             row: Dict[str, Any],
             metadata: Dict[str, Any],
             *,
-            _repo: str = grok_repository,
+            _repo: str = resolved_grok_repository,
         ) -> Optional[str]:
             if _is_grok_row(row):
                 return _repo
@@ -484,12 +491,12 @@ def _row_repository_candidate_extractors(
 
         extractors.append(("grok_repository_override", _from_grok_override))
 
-    if rollout_repository_map:
+    if resolved_rollout_repository_map:
         def _from_rollout_row_repository(
             row: Dict[str, Any],
             metadata: Dict[str, Any],
             *,
-            _map: Dict[str, str] = rollout_repository_map,
+            _map: Dict[str, str] = resolved_rollout_repository_map,
         ) -> Optional[str]:
             return _rollout_repository_candidate(row.get("repository"), _map)
 
@@ -497,7 +504,7 @@ def _row_repository_candidate_extractors(
             row: Dict[str, Any],
             metadata: Dict[str, Any],
             *,
-            _map: Dict[str, str] = rollout_repository_map,
+            _map: Dict[str, str] = resolved_rollout_repository_map,
         ) -> Optional[str]:
             return _rollout_repository_candidate(metadata.get("repository"), _map)
 
@@ -505,7 +512,7 @@ def _row_repository_candidate_extractors(
             row: Dict[str, Any],
             metadata: Dict[str, Any],
             *,
-            _map: Dict[str, str] = rollout_repository_map,
+            _map: Dict[str, str] = resolved_rollout_repository_map,
         ) -> Optional[str]:
             return _rollout_repository_candidate(
                 metadata.get("source_repository"),
@@ -559,12 +566,12 @@ def _row_repository_candidate_extractors(
 
     extractors.append(("session_history.repository", _from_row_repository))
 
-    if session_repositories:
+    if resolved_session_repositories:
         def _from_same_session(
             row: Dict[str, Any],
             metadata: Dict[str, Any],
             *,
-            _sessions: Dict[str, Dict[str, Any]] = session_repositories,
+            _sessions: Dict[str, Dict[str, Any]] = resolved_session_repositories,
         ) -> Optional[str]:
             session_identity = _sessions.get(str(row.get("session_id")))
             if session_identity is None:
@@ -633,39 +640,60 @@ def _resolve_repository_candidate(
             ):
                 return repository, "row_identity_normalization", -1
 
+    # Shared ordered first-match contract (aawm_session_history.identity_selection).
+    # Policy extractors and post-select label rewrites remain local to this script.
+    # Encode priority into a unique selection key so repeated source labels
+    # (e.g. multiple rollout extractors) keep their enumerate priority.
+    ordered_sources = []
+    source_by_key: Dict[str, Tuple[str, int]] = {}
     for priority, (source_name, extractor) in enumerate(extractors):
         if source_name == "grok_repository_override":
             # Already handled above for stable priority/label behavior.
             continue
-        repository = extractor(row, metadata)
-        if not repository:
-            continue
-        if source_name == "same_session":
-            session_identity = (session_repositories or {}).get(
-                str(row.get("session_id"))
+        selection_key = f"{priority}:{source_name}"
+        source_by_key[selection_key] = (source_name, priority)
+        ordered_sources.append(
+            (
+                selection_key,
+                (
+                    lambda _extractor=extractor, _row=row, _metadata=metadata: (
+                        _extractor(_row, _metadata)
+                    )
+                ),
             )
-            if session_identity is not None:
-                return (
-                    repository,
-                    f"same_session.{session_identity['source']}",
-                    priority,
-                )
-            continue
-        if source_name == "session_history.tenant_id":
-            if _normalize_repository_identity(row.get("tenant_id")) == repository:
-                return repository, "row_tenant_id", priority
-            return repository, "row_tenant_id_noisy", priority
-        if prefer_row_normalization and source_name.startswith("session_metadata."):
-            # Repair path historically labels direct metadata keys as row_metadata.*.
-            key = source_name.removeprefix("session_metadata.")
-            if key in {
-                "aawm_d1_452_referenced_artifact_owner",
-                "repository",
-                "source_repository",
-            }:
-                return repository, f"row_metadata.{key}", priority
-        return repository, source_name, priority
-    return None
+        )
+
+    selected = select_first_identity(ordered_sources)
+    if selected is None:
+        return None
+
+    selection_key, repository = selected
+    source_name, priority = source_by_key[selection_key]
+    if source_name == "same_session":
+        session_identity = (session_repositories or {}).get(
+            str(row.get("session_id"))
+        )
+        if session_identity is not None:
+            return (
+                repository,
+                f"same_session.{session_identity['source']}",
+                priority,
+            )
+        return None
+    if source_name == "session_history.tenant_id":
+        if _normalize_repository_identity(row.get("tenant_id")) == repository:
+            return repository, "row_tenant_id", priority
+        return repository, "row_tenant_id_noisy", priority
+    if prefer_row_normalization and source_name.startswith("session_metadata."):
+        # Repair path historically labels direct metadata keys as row_metadata.*.
+        key = source_name.removeprefix("session_metadata.")
+        if key in {
+            "aawm_d1_452_referenced_artifact_owner",
+            "repository",
+            "source_repository",
+        }:
+            return repository, f"row_metadata.{key}", priority
+    return repository, source_name, priority
 
 
 def _best_row_repository_candidate(
@@ -1299,7 +1327,7 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT current_database()")
-            database_name = cur.fetchone()[0]
+            database_name = cast(Tuple[Any, ...], cur.fetchone())[0]
             if args.apply and database_name != args.target_db_name:
                 raise SystemExit(
                     f"Refusing to apply against {database_name!r}; "

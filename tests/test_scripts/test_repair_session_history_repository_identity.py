@@ -668,6 +668,115 @@ def test_should_use_shared_priority_list_for_best_and_build() -> None:
     assert best[1] == "session_metadata.aawm_d1_452_referenced_artifact_owner"
 
 
+def test_should_preserve_rollout_memory_registry_priority_for_repeated_extractors() -> None:
+    resolved = repair._resolve_repository_candidate(
+        {
+            "id": 10,
+            "session_id": "session-1",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "repository": "rollout-alpha.json",
+            "tenant_id": "agent-ac357ffbc895e51d4",
+            "metadata": {
+                "repository": "rollout-beta.json",
+                "source_repository": "rollout-gamma.json",
+            },
+        },
+        {"litellm", "aawm-tap"},
+        rollout_repository_map={
+            "rollout-alpha.json": "litellm",
+            "rollout-beta.json": "aawm-tap",
+            "rollout-gamma.json": "dashboard-shell",
+        },
+    )
+    assert resolved is not None
+    assert resolved[0] == "litellm"
+    assert resolved[1] == "rollout_memory_registry"
+    assert resolved[2] == 0
+
+
+def test_should_not_evaluate_following_rollout_extractors_after_first_hit(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_rollout_candidate(
+        value: object,
+        _rollout_map: dict[str, str],
+    ) -> str | None:
+        calls.append(str(value))
+        if value == "rollout-alpha.json":
+            return "litellm"
+        raise AssertionError(f"unexpected rollout extractor call after first hit: {value!r}")
+
+    monkeypatch.setattr(repair, "_rollout_repository_candidate", fake_rollout_candidate)
+
+    resolved = repair._resolve_repository_candidate(
+        {
+            "id": 11,
+            "session_id": "session-1",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "repository": "rollout-alpha.json",
+            "tenant_id": "agent-ac357ffbc895e51d4",
+            "metadata": {
+                "repository": "rollout-beta.json",
+                "source_repository": "rollout-gamma.json",
+            },
+        },
+        {"litellm", "aawm-tap"},
+        rollout_repository_map={
+            "rollout-alpha.json": "litellm",
+            "rollout-beta.json": "aawm-tap",
+            "rollout-gamma.json": "dashboard-shell",
+        },
+    )
+    assert resolved is not None
+    assert resolved[1] == "rollout_memory_registry"
+    assert calls == ["rollout-alpha.json"]
+
+
+def test_should_report_same_session_and_tenant_id_source_labels_through_selector() -> None:
+    same_session = repair._resolve_repository_candidate(
+        {
+            "id": 12,
+            "session_id": "session-1",
+            "provider": "anthropic",
+            "model": "claude-opus-4-7",
+            "repository": "agent-unknown",
+            "tenant_id": "agent-unknown",
+            "metadata": {},
+        },
+        {"litellm", "aawm-tap"},
+        session_repositories={
+            "session-1": {
+                "repository": "litellm",
+                "source": "session_metadata.aawm_claude_project",
+                "priority": 0,
+                "source_row_id": 1,
+            },
+        },
+    )
+    assert same_session is not None
+    assert same_session[1] == "same_session.session_metadata.aawm_claude_project"
+
+    tenant_id = repair._resolve_repository_candidate(
+        {
+            "id": 13,
+            "session_id": "session-2",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "repository": "agent-unknown",
+            "tenant_id": "aawm-tap",
+            "metadata": {},
+        },
+        {"aawm-tap"},
+    )
+    assert tenant_id is not None
+    assert tenant_id[0] == "aawm-tap"
+    assert tenant_id[1] == "row_tenant_id"
+
+
 def test_should_merge_only_owned_metadata_keys_on_apply() -> None:
     class _Cursor:
         def __init__(self) -> None:
