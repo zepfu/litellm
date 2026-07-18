@@ -37,6 +37,28 @@ _FORCE_INCLUDE_SNIPPET = (
     '"../litellm/integrations/aawm_agent_identity.py" = '
     '"aawm_litellm_callbacks/agent_identity.py"'
 )
+# RR-006: wheel must also ship package-owned session_history modules so the
+# force-included agent_identity import path resolves inside the wheel.
+_SESSION_HISTORY_FORCE_INCLUDE_SNIPPETS = (
+    '"../litellm/integrations/aawm_session_history/__init__.py" = '
+    '"litellm/integrations/aawm_session_history/__init__.py"',
+    '"../litellm/integrations/aawm_session_history/runtime.py" = '
+    '"litellm/integrations/aawm_session_history/runtime.py"',
+    '"../litellm/integrations/aawm_session_history/writer.py" = '
+    '"litellm/integrations/aawm_session_history/writer.py"',
+    '"../litellm/integrations/aawm_session_history/spool.py" = '
+    '"litellm/integrations/aawm_session_history/spool.py"',
+    '"../litellm/integrations/aawm_session_history/retry.py" = '
+    '"litellm/integrations/aawm_session_history/retry.py"',
+    '"../litellm/integrations/aawm_session_history/record.py" = '
+    '"litellm/integrations/aawm_session_history/record.py"',
+    '"../litellm/integrations/aawm_session_history/sql.py" = '
+    '"litellm/integrations/aawm_session_history/sql.py"',
+    '"../litellm/integrations/aawm_session_history/identity_selection.py" = '
+    '"litellm/integrations/aawm_session_history/identity_selection.py"',
+    '"../litellm/integrations/aawm_session_history_sql.py" = '
+    '"litellm/integrations/aawm_session_history_sql.py"',
+)
 _REQUIRED_LOADER_MARKERS = (
     "Checkout loader for aawm_litellm_callbacks",
     "litellm.integrations.aawm_agent_identity",
@@ -103,6 +125,12 @@ def _validate() -> list[str]:
             ".wheel-build/pyproject.toml missing force-include mapping of "
             "canonical agent_identity into the callback package"
         )
+    for snippet in _SESSION_HISTORY_FORCE_INCLUDE_SNIPPETS:
+        if snippet not in pyproject_text:
+            errors.append(
+                ".wheel-build/pyproject.toml missing session_history "
+                f"force-include mapping: {snippet}"
+            )
     # Reject accidental setuptools dual-copy package layouts that drop force-include.
     if (
         re.search(
@@ -142,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(  # noqa: T201
-        "ok: thin checkout loader + hatch force-include single-source packaging"
+        "ok: thin checkout loader + hatch force-include single-source packaging (agent_identity + aawm_session_history)"
     )
     print(f"  canonical: {CANONICAL}")  # noqa: T201
     print(f"  loader:    {LOADER} ({_line_count(LOADER)} lines)")  # noqa: T201

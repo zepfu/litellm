@@ -22,44 +22,46 @@ Registration in litellm-config.yaml:
     litellm_settings:
       callbacks: ["aawm_litellm_callbacks.agent_identity.AawmAgentIdentity"]
       success_callback: ["langfuse"]
+
+Session-history SQL constants and the durable queue/worker/spool/retry
+service live in `litellm.integrations.aawm_session_history` and are
+re-exported here for compatibility with repair/backfill scripts and tests.
 """
 
 import ast
-import asyncio
-import atexit
+import asyncio  # noqa: F401 - monkeypatch surface for session_history writer tests
+import atexit  # noqa: F401 - monkeypatch surface for session_history writer tests
 import base64
 import hashlib
-import inspect
+import importlib  # noqa: F401 - monkeypatch surface for session_history writer tests
+import inspect  # noqa: F401 - freevar seed for record APIs
 import ipaddress
-import importlib
 import json
 import math
 import os
-import queue
+import queue  # noqa: F401 - monkeypatch surface for session_history writer tests
 import re
 import shlex
-import threading
-import time
+import threading  # noqa: F401 - monkeypatch surface for session_history writer tests
+import time  # noqa: F401 - monkeypatch surface for session_history writer tests
 import warnings
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from importlib import metadata as importlib_metadata
 from typing import (
     Any,
-    Callable,
     Dict,
     Iterator,
     List,
-    NamedTuple,
     Optional,
     Set,
     Tuple,
-    Union,
     cast,
 )
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
+from litellm.integrations.custom_logger import CustomLogger
 try:
     from litellm.integrations.aawm_agent_quality_rules import (
         AgentQualityCommand,
@@ -72,9 +74,42 @@ except ModuleNotFoundError as exc:
         AgentQualityCommand,
         score_agent_quality_context,
     )
-from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy.aawm_route_logging import _resolve_aawm_route_host_name_from_ip
 from litellm.secret_managers.main import get_secret_str
+
+try:
+    from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
+except Exception:  # pragma: no cover - optional at import time
+    BaseModelResponseIterator = None  # type: ignore[misc,assignment]
+
+# Lazy litellm dependency resolution: this module is imported under
+# litellm.integrations, so eagerly importing litellm at module top can be
+# circular. Cache once on first use to avoid hot-path import churn.
+_litellm_module: Any = None
+_response_api_logging_utils: Any = None
+_response_api_logging_utils_loaded = False
+
+
+def _get_litellm_module() -> Any:
+    global _litellm_module
+    if _litellm_module is None:
+        import litellm as litellm_module
+
+        _litellm_module = litellm_module
+    return _litellm_module
+
+
+def _get_response_api_logging_utils() -> Any:
+    global _response_api_logging_utils, _response_api_logging_utils_loaded
+    if not _response_api_logging_utils_loaded:
+        try:
+            from litellm.responses.utils import ResponseAPILoggingUtils as _utils
+        except Exception:
+            _response_api_logging_utils = None
+        else:
+            _response_api_logging_utils = _utils
+        _response_api_logging_utils_loaded = True
+    return _response_api_logging_utils
 
 _CLAUDE_PERMISSION_CHECK_OUTPUT_RE = re.compile(
     r"^<block>\s*(?P<decision>yes|no)\s*$",
@@ -209,2105 +244,174 @@ _AAWM_AGENT_ID_PREFIXED_RE = re.compile(
     r"^(?:agent|subagent|task)[-_][A-Za-z0-9][A-Za-z0-9._:-]{5,127}$",
     re.IGNORECASE,
 )
-_AAWM_SESSION_HISTORY_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.session_history (
-    id BIGSERIAL PRIMARY KEY,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    litellm_call_id TEXT UNIQUE,
-    session_id TEXT NOT NULL,
-    trace_id TEXT,
-    provider_response_id TEXT,
-    provider TEXT,
-    model TEXT NOT NULL,
-    inbound_model_alias TEXT,
-    model_group TEXT,
-    agent_name TEXT,
-    agent_id TEXT,
-    tenant_id TEXT,
-    call_type TEXT,
-    start_time TIMESTAMPTZ,
-    end_time TIMESTAMPTZ,
-    input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    total_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens_reported INTEGER,
-    reasoning_tokens_estimated INTEGER,
-    reasoning_tokens_source TEXT,
-    reasoning_present BOOLEAN NOT NULL DEFAULT FALSE,
-    thinking_signature_present BOOLEAN NOT NULL DEFAULT FALSE,
-    provider_cache_attempted BOOLEAN NOT NULL DEFAULT FALSE,
-    provider_cache_status TEXT,
-    provider_cache_miss BOOLEAN NOT NULL DEFAULT FALSE,
-    provider_cache_miss_reason TEXT,
-    provider_cache_miss_token_count INTEGER,
-    provider_cache_miss_cost_usd DOUBLE PRECISION,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    invalid_tool_call_count INTEGER NOT NULL DEFAULT 0,
-    structured_output_attempted BOOLEAN NOT NULL DEFAULT FALSE,
-    structured_output_failed BOOLEAN NOT NULL DEFAULT FALSE,
-    structured_output_mode TEXT,
-    structured_output_schema_hash TEXT,
-    structured_output_failure_reason TEXT,
-    tool_names JSONB NOT NULL DEFAULT '[]'::jsonb,
-    file_read_count INTEGER NOT NULL DEFAULT 0,
-    file_modified_count INTEGER NOT NULL DEFAULT 0,
-    changed_pre_commit_config BOOLEAN,
-    changed_env_file BOOLEAN,
-    changed_pyproject_toml BOOLEAN,
-    changed_gitignore BOOLEAN,
-    git_commit_count INTEGER NOT NULL DEFAULT 0,
-    git_push_count INTEGER NOT NULL DEFAULT 0,
-    response_cost_usd DOUBLE PRECISION,
-    litellm_environment TEXT,
-    litellm_version TEXT,
-    litellm_fork_version TEXT,
-    litellm_wheel_versions JSONB NOT NULL DEFAULT '{}'::jsonb,
-    client_name TEXT,
-    client_version TEXT,
-    client_user_agent TEXT,
-    client_ip TEXT,
-    host_name TEXT,
-    token_permission_input INTEGER NOT NULL DEFAULT 0,
-    token_permission_output INTEGER NOT NULL DEFAULT 0,
-    permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    repository TEXT,
-    input_system_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    input_tool_advertisement_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    input_conversation_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    input_other_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    input_breakdown_residual_tokens INTEGER NOT NULL DEFAULT 0,
-    system_behavior_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    system_safety_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    system_instructional_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    system_unclassified_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    litellm_processing_ms DOUBLE PRECISION,
-    llm_upstream_elapsed_ms DOUBLE PRECISION,
-    total_server_elapsed_ms DOUBLE PRECISION,
-    ttft_ms DOUBLE PRECISION,
-    litellm_pre_send_ms DOUBLE PRECISION,
-    litellm_post_response_ms DOUBLE PRECISION,
-    llm_upstream_time_to_first_byte_ms DOUBLE PRECISION,
-    llm_upstream_stream_ms DOUBLE PRECISION,
-    latency_unclassified_ms DOUBLE PRECISION,
-    previous_response_to_current_request_ms DOUBLE PRECISION,
-    trace_quality_score DOUBLE PRECISION,
-    empty_completion_failure BOOLEAN,
-    large_tool_result_payload_risk BOOLEAN,
-    destructive_checkout_after_work BOOLEAN,
-    invalid_tool_call_error BOOLEAN,
-    read_only_policy_compliance_score DOUBLE PRECISION,
-    read_only_policy_violation_count INTEGER,
-    response_meaningfulness_score DOUBLE PRECISION,
-    instruction_adherence_score DOUBLE PRECISION,
-    answer_completeness_score DOUBLE PRECISION,
-    evidence_fidelity_score DOUBLE PRECISION,
-    tool_result_fidelity_score DOUBLE PRECISION,
-    error_attribution_quality_score DOUBLE PRECISION,
-    repetition_loop_risk_score DOUBLE PRECISION,
-    context_retention_score DOUBLE PRECISION,
-    tool_use_validity_score DOUBLE PRECISION,
-    tool_error_recovery_score DOUBLE PRECISION,
-    stall_risk_score DOUBLE PRECISION,
-    output_contract_compliance_score DOUBLE PRECISION,
-    task_progress_score DOUBLE PRECISION,
-    scope_control_score DOUBLE PRECISION,
-    destructive_action_policy_score DOUBLE PRECISION,
-    ignored_path_tracking_policy_score DOUBLE PRECISION,
-    ignored_path_tracking_violation_count INTEGER,
-    baseline_deflection_attempted_score DOUBLE PRECISION,
-    baseline_deflection_incident_score DOUBLE PRECISION,
-    baseline_deflection_attempt_count INTEGER,
-    baseline_deflection_tool_call_count INTEGER,
-    baseline_deflection_input_tokens INTEGER,
-    baseline_deflection_elapsed_ms DOUBLE PRECISION,
-    quality_gate_trigger_count INTEGER,
-    quality_gate_fix_attempt_count INTEGER,
-    quality_gate_rerun_count INTEGER,
-    sleep_wellness_interruption_attempted_score DOUBLE PRECISION,
-    sleep_wellness_interruption_incident_score DOUBLE PRECISION,
-    sleep_wellness_interruption_count INTEGER,
-    sleep_wellness_interruption_output_tokens INTEGER,
-    sleep_wellness_interruption_input_tokens INTEGER,
-    sleep_wellness_interruption_elapsed_ms DOUBLE PRECISION,
-    sleep_wellness_interruption_after_user_pushback_count INTEGER,
-    sleep_wellness_interruption_repeated_count INTEGER,
-    terminal_completion_score DOUBLE PRECISION,
-    discovery_inventory_coverage_score DOUBLE PRECISION,
-    discovery_inventory_missing_count INTEGER,
-    agent_score_reasons JSONB NOT NULL DEFAULT '{}'::jsonb,
-    is_compact_summary BOOLEAN NOT NULL DEFAULT FALSE,
-    compact_summary_source TEXT,
-    compact_summary_id TEXT,
-    compact_summary_role TEXT
+from litellm.integrations.aawm_session_history.sql import (  # noqa: F401
+    _AAWM_SESSION_HISTORY_TABLE_SQL,
+    _AAWM_SESSION_HISTORY_ALTER_STATEMENTS,
+    _AAWM_SESSION_HISTORY_INDEX_STATEMENTS,
+    _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL,
+    _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS,
+    _AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY,
+    _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_TABLE_SQL,
+    _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_INDEX_STATEMENTS,
+    _AAWM_RATE_LIMIT_OBSERVATIONS_TABLE_SQL,
+    _AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS,
+    _AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS,
+    _AAWM_OPENROUTER_FREE_DAILY_REQUEST_COUNT_SQL,
+    _AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL,
+    _AAWM_RATE_LIMIT_TRANSITIONS_ALTER_STATEMENTS,
+    _AAWM_RATE_LIMIT_TRANSITIONS_INDEX_STATEMENTS,
+    _AAWM_PROVIDER_ERROR_OBSERVATIONS_TABLE_SQL,
+    _AAWM_PROVIDER_ERROR_OBSERVATIONS_ALTER_STATEMENTS,
+    _AAWM_PROVIDER_ERROR_OBSERVATIONS_INDEX_STATEMENTS,
+    _AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL,
+    _AAWM_PROVIDER_STATUS_OBSERVATIONS_ALTER_STATEMENTS,
+    _AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS,
+    _AAWM_SESSION_HISTORY_INSERT_SQL,
+    _AAWM_CLAUDE_AUTO_REVIEW_PARENT_IDENTITY_SQL,
+    _SESSION_HISTORY_PREVIOUS_GAP_FIELD,
+    _AAWM_SESSION_HISTORY_PREVIOUS_GAP_UPDATE_SQL,
+    _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL,
+    _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
+    _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
+    _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL,
+    _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL,
+    _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
+    _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
+    _AAWM_ALIAS_ROUTING_AUDIT_TABLE_SQL,
+    _AAWM_ALIAS_ROUTING_AUDIT_INDEX_STATEMENTS,
+    _AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL,
 )
-"""
-_AAWM_SESSION_HISTORY_ALTER_STATEMENTS = (
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS inbound_model_alias TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_id TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tenant_id TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_read_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS file_modified_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS changed_pre_commit_config BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS changed_env_file BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS changed_pyproject_toml BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS changed_gitignore BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_commit_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS git_push_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_attempted BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_status TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_reason TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_token_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS provider_cache_miss_cost_usd DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS invalid_tool_call_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_attempted BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_failed BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_mode TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_schema_hash TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS structured_output_failure_reason TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_environment TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_version TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_fork_version TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_wheel_versions JSONB NOT NULL DEFAULT '{}'::jsonb",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_name TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_version TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_user_agent TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS client_ip TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS host_name TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_input INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS token_permission_output INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS permission_usd_cost DOUBLE PRECISION NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS repository TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_system_tokens_estimated INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_tool_advertisement_tokens_estimated INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_conversation_tokens_estimated INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_other_tokens_estimated INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS input_breakdown_residual_tokens INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_behavior_tokens_estimated INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_safety_tokens_estimated INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_instructional_tokens_estimated INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS system_unclassified_tokens_estimated INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_processing_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_elapsed_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS total_server_elapsed_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS ttft_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_pre_send_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS litellm_post_response_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_time_to_first_byte_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS llm_upstream_stream_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS latency_unclassified_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS previous_response_to_current_request_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS trace_quality_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS empty_completion_failure BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS large_tool_result_payload_risk BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS destructive_checkout_after_work BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS invalid_tool_call_error BOOLEAN",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "read_only_policy_compliance_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS read_only_policy_violation_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS response_meaningfulness_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS instruction_adherence_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS answer_completeness_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS evidence_fidelity_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_result_fidelity_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS error_attribution_quality_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS repetition_loop_risk_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS context_retention_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_use_validity_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS tool_error_recovery_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS stall_risk_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "output_contract_compliance_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS task_progress_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS scope_control_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "destructive_action_policy_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "ignored_path_tracking_policy_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "ignored_path_tracking_violation_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "baseline_deflection_attempted_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "baseline_deflection_incident_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_attempt_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "baseline_deflection_tool_call_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS baseline_deflection_input_tokens INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "baseline_deflection_elapsed_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_trigger_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_fix_attempt_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS quality_gate_rerun_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "sleep_wellness_interruption_attempted_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "sleep_wellness_interruption_incident_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "sleep_wellness_interruption_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "sleep_wellness_interruption_output_tokens INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "sleep_wellness_interruption_input_tokens INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "sleep_wellness_interruption_elapsed_ms DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "sleep_wellness_interruption_after_user_pushback_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "sleep_wellness_interruption_repeated_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS terminal_completion_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "discovery_inventory_coverage_score DOUBLE PRECISION",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS "
-    "discovery_inventory_missing_count INTEGER",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS agent_score_reasons "
-    "JSONB NOT NULL DEFAULT '{}'::jsonb",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS is_compact_summary "
-    "BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS compact_summary_source TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS compact_summary_role TEXT",
-    "ALTER TABLE public.session_history ADD COLUMN IF NOT EXISTS compact_summary_id TEXT",
+from litellm.integrations.aawm_session_history.writer import (  # noqa: F401
+    _AAWM_SESSION_HISTORY_APPLICATION_NAME,
+    _AAWM_SESSION_HISTORY_BATCH_SIZE,
+    _AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS,
+    _AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS,
+    _AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES,
+    _AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS,
+    _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS,
+    _AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS,
+    _AAWM_SESSION_HISTORY_POOL_MAX_SIZE,
+    _AAWM_SESSION_HISTORY_QUEUE_DRAIN_TO_SPOOL_MAX_RECORDS,
+    _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
+    _AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES,
+    _AAWM_SESSION_HISTORY_RETRYABLE_MESSAGE_MARKERS,
+    _AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER,
+    _AAWM_SESSION_HISTORY_SPOOL_DIR_DEFAULT,
+    _AAWM_SESSION_HISTORY_SPOOL_DIR_ENV,
+    _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME,
+    _AAWM_SESSION_HISTORY_SPOOL_REPLAY_BACKOFF_SECONDS,
+    _AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE,
+    _SessionHistorySpoolListing,
+    _aawm_session_history_degraded_failure_fingerprint,
+    _aawm_session_history_degraded_lock,
+    _aawm_session_history_degraded_until_monotonic,
+    _aawm_session_history_flush_failure_active,
+    _aawm_session_history_flush_failure_lock,
+    _aawm_session_history_overflow_flush_semaphore,
+    _aawm_session_history_pool_lock,
+    _aawm_session_history_pools,
+    _aawm_session_history_queue,
+    _aawm_session_history_schema_lock,
+    _aawm_session_history_schema_ready,
+    _aawm_session_history_spool_drain_lock,
+    _aawm_session_history_spool_drainer,
+    _aawm_session_history_spool_drainer_lock,
+    _aawm_session_history_spool_startup_bootstrapped,
+    _aawm_session_history_spool_startup_lock,
+    _aawm_session_history_suppressed_flush_failures,
+    _aawm_session_history_worker,
+    _aawm_session_history_worker_lock,
+    _append_aawm_dsn_query_params_for_session_history,
+    _bootstrap_session_history_spool_drainer_once,
+    _build_aawm_dsn_for_session_history,
+    _build_session_history_dsn,
+    _call,
+    _clear_session_history_degraded_spooling,
+    _close_aawm_session_history_pools_for_current_loop,
+    _decode_session_history_spool_value,
+    _drain_session_history_queue_for_spool,
+    _drain_session_history_queue_to_spool_on_shutdown,
+    _drop_aawm_session_history_pools_for_current_loop,
+    _encode_session_history_spool_value,
+    _enqueue_session_history_record,
+    _ensure_session_history_schema,
+    _ensure_session_history_spool_dir,
+    _ensure_session_history_spool_drainer_started,
+    _ensure_session_history_worker_started,
+    _flush_session_history_batch,
+    _flush_session_history_batch_with_retry,
+    _flush_session_history_overflow_record,
+    _format_exception_for_warning,
+    _get_aawm_session_history_pool,
+    _get_persist_session_history_records,
+    _get_session_history_application_name,
+    _get_session_history_batch_size,
+    _get_session_history_command_timeout_seconds,
+    _get_session_history_degraded_spool_seconds,
+    _get_session_history_degraded_spooling_context,
+    _get_session_history_failed_flush_max_retries,
+    _get_session_history_failed_flush_retry_seconds,
+    _get_session_history_flush_interval_seconds,
+    _get_session_history_pool_max_size,
+    _get_session_history_server_settings,
+    _get_session_history_spool_dir,
+    _get_session_history_spool_replay_backoff_seconds,
+    _get_session_history_statement_cache_size,
+    _handle_session_history_retry_exhaustion,
+    _identity_host,
+    _initialize_session_history_connection,
+    _is_retryable_session_history_persistence_failure,
+    _iter_exception_chain,
+    _list_session_history_spool,
+    _load_session_history_spool_record,
+    _load_session_history_spool_records,
+    _log_recovered_retryable_session_history_flush,
+    _log_session_history_retry,
+    _mark_session_history_degraded_for_spooling,
+    _mark_session_history_flush_failure_for_logging,
+    _mirror_state,
+    _open_aawm_session_history_connection,
+    _prepare_session_history_retry_after_failure,
+    _remove_recovered_session_history_retry_spool,
+    _reset_session_history_flush_failure_window,
+    _reset_session_history_pool_after_retryable_failure,
+    _sanitize_session_history_spool_filename_component,
+    _session_history_persistence_failure_fingerprint,
+    _session_history_persistence_telemetry_suffix,
+    _session_history_queue_depth_summary,
+    _session_history_queue_depth_values,
+    _session_history_retry_budget_remaining,
+    _session_history_spool_bad_record,
+    _session_history_spool_drainer_main,
+    _session_history_spool_filename,
+    _session_history_spool_identity,
+    _session_history_spool_paths,
+    _session_history_spool_summary,
+    _session_history_worker_main,
+    _shutdown_session_history_worker,
+    _spool_session_history_record,
+    _spool_session_history_records,
+    _start_session_history_spool_drainer_after_retry_exhaustion,
+    _state,
+    _writer_get_secret_str,
 )
-_AAWM_SESSION_HISTORY_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS session_history_created_at_idx ON public.session_history (created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_session_created_idx ON public.session_history (session_id, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_session_model_created_idx ON public.session_history (session_id, model, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_session_start_idx ON public.session_history (session_id, (COALESCE(start_time, created_at)), id)",
-    "CREATE INDEX IF NOT EXISTS session_history_litellm_environment_created_idx ON public.session_history (litellm_environment, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_client_created_idx ON public.session_history (client_name, client_version, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_repository_created_idx ON public.session_history (repository, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_compact_summary_idx ON public.session_history (session_id, compact_summary_id, created_at DESC) WHERE is_compact_summary",
-    "CREATE INDEX IF NOT EXISTS session_history_openrouter_free_observed_idx ON public.session_history ((COALESCE(end_time, start_time, created_at)) DESC) WHERE provider = 'openrouter' AND lower(COALESCE(model, '')) LIKE '%:free'",
-)
-_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.session_history_tool_activity (
-    id BIGSERIAL PRIMARY KEY,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    litellm_call_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    trace_id TEXT,
-    provider TEXT,
-    model TEXT NOT NULL,
-    agent_name TEXT,
-    agent_id TEXT,
-    tool_index INTEGER NOT NULL,
-    tool_call_id TEXT,
-    tool_name TEXT NOT NULL,
-    tool_kind TEXT,
-    file_paths_read JSONB NOT NULL DEFAULT '[]'::jsonb,
-    file_paths_modified JSONB NOT NULL DEFAULT '[]'::jsonb,
-    git_commit_count INTEGER NOT NULL DEFAULT 0,
-    git_push_count INTEGER NOT NULL DEFAULT 0,
-    command_text TEXT,
-    arguments JSONB NOT NULL DEFAULT '{}'::jsonb,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    UNIQUE (litellm_call_id, tool_index)
-)
-"""
-_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS session_history_tool_activity_session_created_idx ON public.session_history_tool_activity (session_id, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_tool_activity_tool_name_idx ON public.session_history_tool_activity (tool_name)",
-)
-_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY = "aawm_tool_definition_snapshot"
-_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.session_history_tool_definition_snapshots (
-    id BIGSERIAL PRIMARY KEY,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    session_id TEXT NOT NULL,
-    snapshot_hash TEXT NOT NULL,
-    capture_version TEXT,
-    capture_source TEXT,
-    tool_definition_count INTEGER,
-    captured_count INTEGER,
-    tool_definition_sources JSONB NOT NULL DEFAULT '[]'::jsonb,
-    tool_definition_names JSONB NOT NULL DEFAULT '[]'::jsonb,
-    tool_definition_types JSONB NOT NULL DEFAULT '[]'::jsonb,
-    snapshot_truncated BOOLEAN NOT NULL DEFAULT FALSE,
-    sanitized_snapshot JSONB NOT NULL,
-    first_litellm_call_id TEXT,
-    first_trace_id TEXT,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    UNIQUE (session_id, snapshot_hash)
-)
-"""
-_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS session_history_tool_definition_snapshots_session_created_idx "
-    "ON public.session_history_tool_definition_snapshots (session_id, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS session_history_tool_definition_snapshots_hash_idx "
-    "ON public.session_history_tool_definition_snapshots (snapshot_hash)",
-)
-_AAWM_RATE_LIMIT_OBSERVATIONS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.rate_limit_observations (
-    id BIGSERIAL PRIMARY KEY,
-    observed_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    client TEXT,
-    client_version TEXT,
-    account_hash TEXT,
-    provider TEXT NOT NULL,
-    model TEXT,
-    quota_key TEXT NOT NULL,
-    quota_period TEXT,
-    quota_type TEXT,
-    expected_reset_at TIMESTAMPTZ,
-    remaining_pct DOUBLE PRECISION,
-    quota_limit DOUBLE PRECISION,
-    quota_used DOUBLE PRECISION,
-    quota_remaining DOUBLE PRECISION,
-    billing_period_start_at TIMESTAMPTZ,
-    billing_period_end_at TIMESTAMPTZ,
-    raw_provider_fields JSONB NOT NULL DEFAULT '{}'::jsonb,
-    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-    source TEXT,
-    session_id TEXT,
-    trace_id TEXT,
-    litellm_call_id TEXT
-)
-"""
-_AAWM_RATE_LIMIT_OBSERVATIONS_ALTER_STATEMENTS = (
-    "DROP INDEX IF EXISTS public.rate_limit_observations_limit_observed_idx",
-    "DROP INDEX IF EXISTS public.rate_limit_observations_provider_client_model_idx",
-    "DROP INDEX IF EXISTS public.rate_limit_observations_reset_idx",
-    "DROP INDEX IF EXISTS public.rate_limit_observations_session_idx",
-    "DROP INDEX IF EXISTS public.rate_limit_observations_trace_call_idx",
-    "DROP INDEX IF EXISTS public.rate_limit_observations_repository_idx",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS client TEXT",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_key TEXT",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_type TEXT",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS expected_reset_at TIMESTAMPTZ",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS remaining_pct DOUBLE PRECISION",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_limit DOUBLE PRECISION",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_used DOUBLE PRECISION",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS quota_remaining DOUBLE PRECISION",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS billing_period_start_at TIMESTAMPTZ",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS billing_period_end_at TIMESTAMPTZ",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS raw_provider_fields JSONB DEFAULT '{}'::jsonb",
-    "ALTER TABLE public.rate_limit_observations ADD COLUMN IF NOT EXISTS evidence JSONB DEFAULT '{}'::jsonb",
-    "UPDATE public.rate_limit_observations SET raw_provider_fields = '{}'::jsonb WHERE raw_provider_fields IS NULL",
-    "UPDATE public.rate_limit_observations SET evidence = '{}'::jsonb WHERE evidence IS NULL",
-    "ALTER TABLE public.rate_limit_observations ALTER COLUMN raw_provider_fields SET DEFAULT '{}'::jsonb",
-    "ALTER TABLE public.rate_limit_observations ALTER COLUMN evidence SET DEFAULT '{}'::jsonb",
-    "ALTER TABLE public.rate_limit_observations ALTER COLUMN raw_provider_fields SET NOT NULL",
-    "ALTER TABLE public.rate_limit_observations ALTER COLUMN evidence SET NOT NULL",
-    """
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'client_family'
-    ) THEN
-        UPDATE public.rate_limit_observations
-        SET client = COALESCE(client, client_family);
-    END IF;
 
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'client_name'
-    ) THEN
-        UPDATE public.rate_limit_observations
-        SET client = COALESCE(client, client_name);
-    END IF;
 
-    UPDATE public.rate_limit_observations
-    SET client = COALESCE(client, 'unknown');
-END $$;
-""",
-    """
-DO $$
-BEGIN
-    UPDATE public.rate_limit_observations
-    SET provider = CASE
-        WHEN lower(COALESCE(provider, '')) IN ('gemini', 'google_code_assist')
-          OR lower(COALESCE(client, '')) IN ('gemini', 'google_code_assist')
-          OR source LIKE 'google_%'
-          OR source LIKE 'gemini_%'
-            THEN 'google'
-        WHEN provider IS NULL OR provider = ''
-            THEN 'unknown'
-        ELSE provider
-    END;
-END $$;
-""",
-    """
-UPDATE public.rate_limit_observations
-SET client = 'google_code_assist'
-WHERE provider = 'google'
-  AND source = 'google_retrieve_user_quota'
-  AND client IN ('gemini', 'google');
-""",
-    """
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'limit_id'
-    ) AND EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'limit_scope'
-    ) THEN
-        UPDATE public.rate_limit_observations
-        SET quota_key = COALESCE(
-            quota_key,
-            NULLIF(CONCAT_WS(':', NULLIF(limit_id, ''), NULLIF(limit_scope, '')), '')
-        );
-    END IF;
+from litellm.integrations.aawm_session_history import record as _aawm_session_history_record
 
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'limit_key'
-    ) THEN
-        UPDATE public.rate_limit_observations
-        SET quota_key = COALESCE(quota_key, limit_key);
-    END IF;
 
-    UPDATE public.rate_limit_observations
-    SET quota_key = COALESCE(
-        quota_key,
-        CONCAT_WS(':', COALESCE(source, 'unknown_source'), COALESCE(model, 'unknown_model'))
-    );
-END $$;
-""",
+def _bind_session_history_record_apis() -> None:
+    """Install package-owned record/persist APIs into this module namespace.
+
+    Record functions are defined as ordinary Python in
+    `aawm_session_history.record` and rebound so their ``__globals__`` is this
+    module (preserving monkeypatch-on-identity behavior) without compile/exec
+    of source strings.
     """
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'provider_resets_at'
-    ) THEN
-        UPDATE public.rate_limit_observations
-        SET expected_reset_at = COALESCE(expected_reset_at, provider_resets_at);
-    END IF;
+    _aawm_session_history_record._ensure_installed()
+    for _name in _aawm_session_history_record._RECORD_API_NAMES:
+        globals()[_name] = getattr(_aawm_session_history_record, _name)
 
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'used_percentage'
-    ) THEN
-        UPDATE public.rate_limit_observations
-        SET remaining_pct = COALESCE(
-            remaining_pct,
-            GREATEST(0.0, LEAST(100.0, 100.0 - used_percentage))
-        )
-        WHERE used_percentage IS NOT NULL;
-    END IF;
-END $$;
-""",
-    """
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'limit_scope'
-    ) THEN
-        UPDATE public.rate_limit_observations
-        SET quota_type = COALESCE(
-            quota_type,
-            CASE
-                WHEN limit_scope ILIKE '%request%' OR limit_scope = 'requests'
-                    THEN 'requests'
-                WHEN limit_scope ILIKE '%token%' OR limit_scope = 'tokens'
-                    THEN 'tokens'
-                WHEN limit_scope = 'model_capacity'
-                    THEN 'capacity'
-                ELSE NULL
-            END
-        );
-    END IF;
-
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'rate_limit_observations'
-          AND column_name = 'raw_provider_fields'
-    ) THEN
-        UPDATE public.rate_limit_observations
-        SET quota_type = COALESCE(
-            quota_type,
-            CASE
-                WHEN raw_provider_fields->>'tokenType' ILIKE 'REQUESTS'
-                    THEN 'requests'
-                WHEN raw_provider_fields->>'tokenType' ILIKE 'TOKENS'
-                    THEN 'tokens'
-                ELSE NULL
-            END
-        );
-    END IF;
-
-    UPDATE public.rate_limit_observations
-    SET quota_type = COALESCE(
-        quota_type,
-        CASE
-            WHEN source = 'google_model_capacity_error' THEN 'capacity'
-            WHEN provider = 'google' THEN 'requests'
-            WHEN provider IN ('openai', 'anthropic') THEN 'tokens'
-            ELSE 'unknown'
-        END
-    );
-END $$;
-""",
-    "ALTER TABLE public.rate_limit_observations ALTER COLUMN provider SET NOT NULL",
-    "ALTER TABLE public.rate_limit_observations ALTER COLUMN quota_key SET NOT NULL",
-    "ALTER TABLE public.rate_limit_observations ALTER COLUMN source DROP NOT NULL",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS client_family",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS environment",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS tenant_id",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS repository",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS limit_key",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS limit_id",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS limit_name",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS limit_scope",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS window_minutes",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS provider_resets_at",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS inferred_window_start_at",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS used_percentage",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS remaining_requests",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS used_requests",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS total_requests",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS status",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS exhausted",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS exhaustion_kind",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS reset_hint_seconds",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS model_family",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS model_tier",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS parent_limit_key",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS route_family",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS request_model",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS response_model",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS client_name",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS client_user_agent",
-    "ALTER TABLE public.rate_limit_observations DROP COLUMN IF EXISTS metadata",
-    "DELETE FROM public.rate_limit_observations WHERE source LIKE 'claude_statusline%'",
-    """
-DELETE FROM public.rate_limit_observations AS doomed
-USING (
-    SELECT
-        id,
-        LAG(expected_reset_at) OVER identity_window AS previous_expected_reset_at,
-        LAG(remaining_pct) OVER identity_window AS previous_remaining_pct
-    FROM public.rate_limit_observations
-    WINDOW identity_window AS (
-        PARTITION BY
-            provider,
-            client,
-            account_hash,
-            quota_key,
-            source,
-            model,
-            quota_period,
-            quota_type
-        ORDER BY observed_at ASC, id ASC
-    )
-) AS ranked
-WHERE doomed.id = ranked.id
-  AND (
-      ranked.previous_expected_reset_at IS NOT DISTINCT FROM doomed.expected_reset_at
-      OR (
-          ranked.previous_expected_reset_at IS NOT NULL
-          AND doomed.expected_reset_at IS NOT NULL
-          AND ABS(EXTRACT(EPOCH FROM (doomed.expected_reset_at - ranked.previous_expected_reset_at))) < 900
-      )
-  )
-  AND ranked.previous_remaining_pct IS NOT DISTINCT FROM doomed.remaining_pct;
-""",
-)
-_AAWM_RATE_LIMIT_OBSERVATIONS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_identity_latest_idx ON public.rate_limit_observations (provider, client, account_hash, quota_key, source, model, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_quota_observed_idx ON public.rate_limit_observations (quota_key, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_quota_observed_idx ON public.rate_limit_observations (provider, quota_key, observed_at DESC) INCLUDE (expected_reset_at, remaining_pct, quota_type, model) WHERE remaining_pct >= 0",
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_model_observed_idx ON public.rate_limit_observations (provider, model, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_provider_type_model_observed_idx ON public.rate_limit_observations (provider, quota_type, model, observed_at DESC) INCLUDE (expected_reset_at, remaining_pct, quota_key) WHERE remaining_pct >= 0",
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_client_observed_idx ON public.rate_limit_observations (client, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_reset_idx ON public.rate_limit_observations (expected_reset_at)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_session_idx ON public.rate_limit_observations (session_id, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_observations_trace_call_idx ON public.rate_limit_observations (trace_id, litellm_call_id)",
-)
-_AAWM_OPENROUTER_FREE_DAILY_REQUEST_COUNT_SQL = """
-SELECT COUNT(*)::integer
-FROM public.session_history
-WHERE provider = 'openrouter'
-  AND lower(COALESCE(model, '')) LIKE '%:free'
-  AND COALESCE(end_time, start_time, created_at) >= $1::timestamptz
-  AND COALESCE(end_time, start_time, created_at) < $2::timestamptz
-"""
-_AAWM_RATE_LIMIT_TRANSITIONS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.rate_limit_transitions (
-    id BIGSERIAL PRIMARY KEY,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    transition_key TEXT NOT NULL UNIQUE,
-    limit_key TEXT NOT NULL,
-    provider TEXT,
-    client_family TEXT,
-    account_hash TEXT,
-    transition_type TEXT NOT NULL,
-    confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
-    signals JSONB NOT NULL DEFAULT '[]'::jsonb,
-    source TEXT,
-    old_observed_at TIMESTAMPTZ,
-    new_observed_at TIMESTAMPTZ NOT NULL,
-    old_provider_resets_at TIMESTAMPTZ,
-    new_provider_resets_at TIMESTAMPTZ,
-    old_used_percentage DOUBLE PRECISION,
-    new_used_percentage DOUBLE PRECISION,
-    old_remaining_requests INTEGER,
-    new_remaining_requests INTEGER,
-    old_used_requests INTEGER,
-    new_used_requests INTEGER,
-    old_total_requests INTEGER,
-    new_total_requests INTEGER,
-    inferred_window_start_at TIMESTAMPTZ,
-    detection_window_start_at TIMESTAMPTZ,
-    detection_window_end_at TIMESTAMPTZ,
-    session_usage_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
-    old_observation JSONB NOT NULL DEFAULT '{}'::jsonb,
-    new_observation JSONB NOT NULL DEFAULT '{}'::jsonb,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
-)
-"""
-_AAWM_RATE_LIMIT_TRANSITIONS_ALTER_STATEMENTS = (
-    "DELETE FROM public.rate_limit_transitions WHERE source LIKE 'claude_statusline%'",
-)
-_AAWM_RATE_LIMIT_TRANSITIONS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS rate_limit_transitions_limit_new_observed_idx ON public.rate_limit_transitions (limit_key, new_observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_transitions_provider_client_idx ON public.rate_limit_transitions (provider, client_family, new_observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS rate_limit_transitions_type_idx ON public.rate_limit_transitions (transition_type, new_observed_at DESC)",
-)
-_AAWM_PROVIDER_ERROR_OBSERVATIONS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.provider_error_observations (
-    id BIGSERIAL PRIMARY KEY,
-    observed_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    environment TEXT,
-    provider TEXT NOT NULL,
-    model TEXT,
-    model_group TEXT,
-    route_family TEXT,
-    status_code INTEGER,
-    error_type TEXT,
-    error_code TEXT,
-    error_class TEXT NOT NULL,
-    retry_after_seconds DOUBLE PRECISION,
-    expected_reset_at TIMESTAMPTZ,
-    session_id TEXT,
-    trace_id TEXT,
-    litellm_call_id TEXT,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
-)
-"""
-_AAWM_PROVIDER_ERROR_OBSERVATIONS_ALTER_STATEMENTS = (
-    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS environment TEXT",
-    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS model_group TEXT",
-    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS route_family TEXT",
-    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS retry_after_seconds DOUBLE PRECISION",
-    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS expected_reset_at TIMESTAMPTZ",
-    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS trace_id TEXT",
-    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS litellm_call_id TEXT",
-    "ALTER TABLE public.provider_error_observations ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
-)
-_AAWM_PROVIDER_ERROR_OBSERVATIONS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS provider_error_observations_provider_time_idx ON public.provider_error_observations (provider, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS provider_error_observations_model_time_idx ON public.provider_error_observations (provider, model, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS provider_error_observations_class_time_idx ON public.provider_error_observations (error_class, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS provider_error_observations_trace_call_idx ON public.provider_error_observations (trace_id, litellm_call_id)",
-)
-_AAWM_PROVIDER_STATUS_OBSERVATIONS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.provider_status_observations (
-    id BIGSERIAL PRIMARY KEY,
-    observed_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    environment TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    endpoint_key TEXT NOT NULL,
-    probe_type TEXT NOT NULL,
-    success BOOLEAN NOT NULL,
-    status_code INTEGER,
-    address_family TEXT,
-    resolved_ip TEXT,
-    packet_loss_pct DOUBLE PRECISION,
-    icmp_rtt_min_ms DOUBLE PRECISION,
-    icmp_rtt_avg_ms DOUBLE PRECISION,
-    icmp_rtt_max_ms DOUBLE PRECISION,
-    icmp_rtt_mdev_ms DOUBLE PRECISION,
-    dns_ms DOUBLE PRECISION,
-    tcp_ms DOUBLE PRECISION,
-    tls_ms DOUBLE PRECISION,
-    ttfb_ms DOUBLE PRECISION,
-    total_ms DOUBLE PRECISION,
-    status_summary TEXT,
-    error_class TEXT,
-    error_message TEXT,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
-)
-"""
-_AAWM_PROVIDER_STATUS_OBSERVATIONS_ALTER_STATEMENTS = (
-    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS address_family TEXT",
-    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS resolved_ip TEXT",
-    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS packet_loss_pct DOUBLE PRECISION",
-    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_min_ms DOUBLE PRECISION",
-    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_avg_ms DOUBLE PRECISION",
-    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_max_ms DOUBLE PRECISION",
-    "ALTER TABLE public.provider_status_observations ADD COLUMN IF NOT EXISTS icmp_rtt_mdev_ms DOUBLE PRECISION",
-)
-_AAWM_PROVIDER_STATUS_OBSERVATIONS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS provider_status_observations_provider_time_idx ON public.provider_status_observations (provider, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS provider_status_observations_endpoint_time_idx ON public.provider_status_observations (provider, endpoint_key, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS provider_status_observations_probe_time_idx ON public.provider_status_observations (probe_type, observed_at DESC)",
-)
-_AAWM_SESSION_HISTORY_INSERT_SQL = """
-INSERT INTO public.session_history (
-    litellm_call_id,
-    session_id,
-    trace_id,
-    provider_response_id,
-    provider,
-    model,
-    model_group,
-    agent_name,
-    tenant_id,
-    call_type,
-    start_time,
-    created_at,
-    end_time,
-    input_tokens,
-    output_tokens,
-    total_tokens,
-    cache_read_input_tokens,
-    cache_creation_input_tokens,
-    reasoning_tokens_reported,
-    reasoning_tokens_estimated,
-    reasoning_tokens_source,
-    reasoning_present,
-    thinking_signature_present,
-    provider_cache_attempted,
-    provider_cache_status,
-    provider_cache_miss,
-    provider_cache_miss_reason,
-    provider_cache_miss_token_count,
-    provider_cache_miss_cost_usd,
-    tool_call_count,
-    invalid_tool_call_count,
-    tool_names,
-    file_read_count,
-    file_modified_count,
-    changed_pre_commit_config,
-    changed_env_file,
-    changed_pyproject_toml,
-    changed_gitignore,
-    git_commit_count,
-    git_push_count,
-    response_cost_usd,
-    litellm_environment,
-    litellm_version,
-    litellm_fork_version,
-    litellm_wheel_versions,
-    client_name,
-    client_version,
-    client_user_agent,
-    client_ip,
-    host_name,
-    token_permission_input,
-    token_permission_output,
-    permission_usd_cost,
-    metadata,
-    repository,
-    input_system_tokens_estimated,
-    input_tool_advertisement_tokens_estimated,
-    input_conversation_tokens_estimated,
-    input_other_tokens_estimated,
-    input_breakdown_residual_tokens,
-    system_behavior_tokens_estimated,
-    system_safety_tokens_estimated,
-    system_instructional_tokens_estimated,
-    system_unclassified_tokens_estimated,
-    litellm_processing_ms,
-    llm_upstream_elapsed_ms,
-    total_server_elapsed_ms,
-    ttft_ms,
-    litellm_pre_send_ms,
-    litellm_post_response_ms,
-    llm_upstream_time_to_first_byte_ms,
-    llm_upstream_stream_ms,
-    latency_unclassified_ms,
-    previous_response_to_current_request_ms,
-    structured_output_attempted,
-    structured_output_failed,
-    structured_output_mode,
-    structured_output_schema_hash,
-    structured_output_failure_reason,
-    trace_quality_score,
-    empty_completion_failure,
-    large_tool_result_payload_risk,
-    destructive_checkout_after_work,
-    invalid_tool_call_error,
-    read_only_policy_compliance_score,
-    read_only_policy_violation_count,
-    response_meaningfulness_score,
-    instruction_adherence_score,
-    answer_completeness_score,
-    evidence_fidelity_score,
-    tool_result_fidelity_score,
-    error_attribution_quality_score,
-    repetition_loop_risk_score,
-    context_retention_score,
-    tool_use_validity_score,
-    tool_error_recovery_score,
-    stall_risk_score,
-    output_contract_compliance_score,
-    task_progress_score,
-    scope_control_score,
-    destructive_action_policy_score,
-    ignored_path_tracking_policy_score,
-    ignored_path_tracking_violation_count,
-    baseline_deflection_attempted_score,
-    baseline_deflection_incident_score,
-    baseline_deflection_attempt_count,
-    baseline_deflection_tool_call_count,
-    baseline_deflection_input_tokens,
-    baseline_deflection_elapsed_ms,
-    quality_gate_trigger_count,
-    quality_gate_fix_attempt_count,
-    quality_gate_rerun_count,
-    sleep_wellness_interruption_attempted_score,
-    sleep_wellness_interruption_incident_score,
-    sleep_wellness_interruption_count,
-    sleep_wellness_interruption_output_tokens,
-    sleep_wellness_interruption_input_tokens,
-    sleep_wellness_interruption_elapsed_ms,
-    sleep_wellness_interruption_after_user_pushback_count,
-    sleep_wellness_interruption_repeated_count,
-    terminal_completion_score,
-    discovery_inventory_coverage_score,
-    discovery_inventory_missing_count,
-    agent_score_reasons,
-    is_compact_summary,
-    compact_summary_source,
-    compact_summary_id,
-    compact_summary_role,
-    inbound_model_alias,
-    agent_id
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    $11, COALESCE($11, $12, NOW()), $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb,
-    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44::jsonb, $45, $46, $47, $48, $49, $50, $51, $52, $53::jsonb, $54,
-    $55, $56, $57, $58, $59, $60, $61, $62, $63,
-    $64, $65, $66, $67, $68, $69, $70, $71, $72, $73,
-    $74, $75, $76, $77, $78,
-    $79, $80, $81, $82, $83, $84, $85, $86, $87, $88,
-    $89, $90, $91, $92, $93, $94, $95, $96, $97, $98,
-    $99, $100, $101, $102,
-    $103, $104, $105, $106, $107, $108, $109, $110, $111, $112,
-    $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123::jsonb,
-    $124, $125, $126, $127, $128, $129
-)
-ON CONFLICT (litellm_call_id) DO UPDATE SET
-    session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
-    trace_id = COALESCE(NULLIF(EXCLUDED.trace_id, ''), session_history.trace_id),
-    provider_response_id = COALESCE(
-        NULLIF(EXCLUDED.provider_response_id, ''),
-        session_history.provider_response_id
-    ),
-    provider = COALESCE(NULLIF(EXCLUDED.provider, ''), session_history.provider),
-    model = COALESCE(NULLIF(EXCLUDED.model, ''), session_history.model),
-    inbound_model_alias = COALESCE(
-        NULLIF(EXCLUDED.inbound_model_alias, ''),
-        session_history.inbound_model_alias
-    ),
-    model_group = COALESCE(NULLIF(EXCLUDED.model_group, ''), session_history.model_group),
-    agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history.agent_name),
-    agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), session_history.agent_id),
-    tenant_id = COALESCE(NULLIF(EXCLUDED.tenant_id, ''), session_history.tenant_id),
-    call_type = COALESCE(NULLIF(EXCLUDED.call_type, ''), session_history.call_type),
-    created_at = LEAST(session_history.created_at, EXCLUDED.created_at),
-    start_time = COALESCE(session_history.start_time, EXCLUDED.start_time),
-    end_time = COALESCE(EXCLUDED.end_time, session_history.end_time),
-    input_tokens = GREATEST(session_history.input_tokens, EXCLUDED.input_tokens),
-    output_tokens = GREATEST(session_history.output_tokens, EXCLUDED.output_tokens),
-    total_tokens = GREATEST(session_history.total_tokens, EXCLUDED.total_tokens),
-    cache_read_input_tokens = GREATEST(
-        session_history.cache_read_input_tokens,
-        EXCLUDED.cache_read_input_tokens
-    ),
-    cache_creation_input_tokens = GREATEST(
-        session_history.cache_creation_input_tokens,
-        EXCLUDED.cache_creation_input_tokens
-    ),
-    reasoning_tokens_reported = COALESCE(
-        GREATEST(
-            NULLIF(session_history.reasoning_tokens_reported, 0),
-            NULLIF(EXCLUDED.reasoning_tokens_reported, 0)
-        ),
-        NULLIF(session_history.reasoning_tokens_reported, 0),
-        NULLIF(EXCLUDED.reasoning_tokens_reported, 0)
-    ),
-    reasoning_tokens_estimated = COALESCE(
-        GREATEST(
-            NULLIF(session_history.reasoning_tokens_estimated, 0),
-            NULLIF(EXCLUDED.reasoning_tokens_estimated, 0)
-        ),
-        NULLIF(session_history.reasoning_tokens_estimated, 0),
-        NULLIF(EXCLUDED.reasoning_tokens_estimated, 0)
-    ),
-    reasoning_tokens_source = COALESCE(
-        NULLIF(EXCLUDED.reasoning_tokens_source, ''),
-        session_history.reasoning_tokens_source
-    ),
-    reasoning_present = session_history.reasoning_present OR EXCLUDED.reasoning_present,
-    thinking_signature_present = session_history.thinking_signature_present OR EXCLUDED.thinking_signature_present,
-    provider_cache_attempted = session_history.provider_cache_attempted OR EXCLUDED.provider_cache_attempted,
-    provider_cache_status = COALESCE(
-        NULLIF(EXCLUDED.provider_cache_status, ''),
-        session_history.provider_cache_status
-    ),
-    provider_cache_miss = session_history.provider_cache_miss OR EXCLUDED.provider_cache_miss,
-    provider_cache_miss_reason = COALESCE(
-        NULLIF(EXCLUDED.provider_cache_miss_reason, ''),
-        session_history.provider_cache_miss_reason
-    ),
-    provider_cache_miss_token_count = COALESCE(
-        GREATEST(session_history.provider_cache_miss_token_count, EXCLUDED.provider_cache_miss_token_count),
-        session_history.provider_cache_miss_token_count,
-        EXCLUDED.provider_cache_miss_token_count
-    ),
-    provider_cache_miss_cost_usd = COALESCE(
-        GREATEST(session_history.provider_cache_miss_cost_usd, EXCLUDED.provider_cache_miss_cost_usd),
-        session_history.provider_cache_miss_cost_usd,
-        EXCLUDED.provider_cache_miss_cost_usd
-    ),
-    tool_call_count = GREATEST(session_history.tool_call_count, EXCLUDED.tool_call_count),
-    invalid_tool_call_count = GREATEST(
-        session_history.invalid_tool_call_count,
-        EXCLUDED.invalid_tool_call_count
-    ),
-    structured_output_attempted = session_history.structured_output_attempted OR EXCLUDED.structured_output_attempted,
-    structured_output_failed = session_history.structured_output_failed OR EXCLUDED.structured_output_failed,
-    structured_output_mode = COALESCE(
-        NULLIF(EXCLUDED.structured_output_mode, ''),
-        session_history.structured_output_mode
-    ),
-    structured_output_schema_hash = COALESCE(
-        NULLIF(EXCLUDED.structured_output_schema_hash, ''),
-        session_history.structured_output_schema_hash
-    ),
-    structured_output_failure_reason = COALESCE(
-        NULLIF(EXCLUDED.structured_output_failure_reason, ''),
-        session_history.structured_output_failure_reason
-    ),
-    trace_quality_score = COALESCE(
-        EXCLUDED.trace_quality_score,
-        session_history.trace_quality_score
-    ),
-    empty_completion_failure = COALESCE(
-        EXCLUDED.empty_completion_failure,
-        session_history.empty_completion_failure
-    ),
-    large_tool_result_payload_risk = COALESCE(
-        EXCLUDED.large_tool_result_payload_risk,
-        session_history.large_tool_result_payload_risk
-    ),
-    destructive_checkout_after_work = COALESCE(
-        EXCLUDED.destructive_checkout_after_work,
-        session_history.destructive_checkout_after_work
-    ),
-    invalid_tool_call_error = COALESCE(
-        EXCLUDED.invalid_tool_call_error,
-        session_history.invalid_tool_call_error
-    ),
-    read_only_policy_compliance_score = COALESCE(
-        EXCLUDED.read_only_policy_compliance_score,
-        session_history.read_only_policy_compliance_score
-    ),
-    read_only_policy_violation_count = COALESCE(
-        EXCLUDED.read_only_policy_violation_count,
-        session_history.read_only_policy_violation_count
-    ),
-    response_meaningfulness_score = COALESCE(
-        EXCLUDED.response_meaningfulness_score,
-        session_history.response_meaningfulness_score
-    ),
-    instruction_adherence_score = COALESCE(
-        EXCLUDED.instruction_adherence_score,
-        session_history.instruction_adherence_score
-    ),
-    answer_completeness_score = COALESCE(
-        EXCLUDED.answer_completeness_score,
-        session_history.answer_completeness_score
-    ),
-    evidence_fidelity_score = COALESCE(
-        EXCLUDED.evidence_fidelity_score,
-        session_history.evidence_fidelity_score
-    ),
-    tool_result_fidelity_score = COALESCE(
-        EXCLUDED.tool_result_fidelity_score,
-        session_history.tool_result_fidelity_score
-    ),
-    error_attribution_quality_score = COALESCE(
-        EXCLUDED.error_attribution_quality_score,
-        session_history.error_attribution_quality_score
-    ),
-    repetition_loop_risk_score = COALESCE(
-        EXCLUDED.repetition_loop_risk_score,
-        session_history.repetition_loop_risk_score
-    ),
-    context_retention_score = COALESCE(
-        EXCLUDED.context_retention_score,
-        session_history.context_retention_score
-    ),
-    tool_use_validity_score = COALESCE(
-        EXCLUDED.tool_use_validity_score,
-        session_history.tool_use_validity_score
-    ),
-    tool_error_recovery_score = COALESCE(
-        EXCLUDED.tool_error_recovery_score,
-        session_history.tool_error_recovery_score
-    ),
-    stall_risk_score = COALESCE(
-        EXCLUDED.stall_risk_score,
-        session_history.stall_risk_score
-    ),
-    output_contract_compliance_score = COALESCE(
-        EXCLUDED.output_contract_compliance_score,
-        session_history.output_contract_compliance_score
-    ),
-    task_progress_score = COALESCE(
-        EXCLUDED.task_progress_score,
-        session_history.task_progress_score
-    ),
-    scope_control_score = COALESCE(
-        EXCLUDED.scope_control_score,
-        session_history.scope_control_score
-    ),
-    destructive_action_policy_score = COALESCE(
-        EXCLUDED.destructive_action_policy_score,
-        session_history.destructive_action_policy_score
-    ),
-    ignored_path_tracking_policy_score = COALESCE(
-        EXCLUDED.ignored_path_tracking_policy_score,
-        session_history.ignored_path_tracking_policy_score
-    ),
-    ignored_path_tracking_violation_count = COALESCE(
-        EXCLUDED.ignored_path_tracking_violation_count,
-        session_history.ignored_path_tracking_violation_count
-    ),
-    baseline_deflection_attempted_score = COALESCE(
-        EXCLUDED.baseline_deflection_attempted_score,
-        session_history.baseline_deflection_attempted_score
-    ),
-    baseline_deflection_incident_score = COALESCE(
-        EXCLUDED.baseline_deflection_incident_score,
-        session_history.baseline_deflection_incident_score
-    ),
-    baseline_deflection_attempt_count = COALESCE(
-        EXCLUDED.baseline_deflection_attempt_count,
-        session_history.baseline_deflection_attempt_count
-    ),
-    baseline_deflection_tool_call_count = COALESCE(
-        EXCLUDED.baseline_deflection_tool_call_count,
-        session_history.baseline_deflection_tool_call_count
-    ),
-    baseline_deflection_input_tokens = COALESCE(
-        EXCLUDED.baseline_deflection_input_tokens,
-        session_history.baseline_deflection_input_tokens
-    ),
-    baseline_deflection_elapsed_ms = COALESCE(
-        EXCLUDED.baseline_deflection_elapsed_ms,
-        session_history.baseline_deflection_elapsed_ms
-    ),
-    quality_gate_trigger_count = COALESCE(
-        EXCLUDED.quality_gate_trigger_count,
-        session_history.quality_gate_trigger_count
-    ),
-    quality_gate_fix_attempt_count = COALESCE(
-        EXCLUDED.quality_gate_fix_attempt_count,
-        session_history.quality_gate_fix_attempt_count
-    ),
-    quality_gate_rerun_count = COALESCE(
-        EXCLUDED.quality_gate_rerun_count,
-        session_history.quality_gate_rerun_count
-    ),
-    sleep_wellness_interruption_attempted_score = COALESCE(
-        EXCLUDED.sleep_wellness_interruption_attempted_score,
-        session_history.sleep_wellness_interruption_attempted_score
-    ),
-    sleep_wellness_interruption_incident_score = COALESCE(
-        EXCLUDED.sleep_wellness_interruption_incident_score,
-        session_history.sleep_wellness_interruption_incident_score
-    ),
-    sleep_wellness_interruption_count = COALESCE(
-        EXCLUDED.sleep_wellness_interruption_count,
-        session_history.sleep_wellness_interruption_count
-    ),
-    sleep_wellness_interruption_output_tokens = COALESCE(
-        EXCLUDED.sleep_wellness_interruption_output_tokens,
-        session_history.sleep_wellness_interruption_output_tokens
-    ),
-    sleep_wellness_interruption_input_tokens = COALESCE(
-        EXCLUDED.sleep_wellness_interruption_input_tokens,
-        session_history.sleep_wellness_interruption_input_tokens
-    ),
-    sleep_wellness_interruption_elapsed_ms = COALESCE(
-        EXCLUDED.sleep_wellness_interruption_elapsed_ms,
-        session_history.sleep_wellness_interruption_elapsed_ms
-    ),
-    sleep_wellness_interruption_after_user_pushback_count = COALESCE(
-        EXCLUDED.sleep_wellness_interruption_after_user_pushback_count,
-        session_history.sleep_wellness_interruption_after_user_pushback_count
-    ),
-    sleep_wellness_interruption_repeated_count = COALESCE(
-        EXCLUDED.sleep_wellness_interruption_repeated_count,
-        session_history.sleep_wellness_interruption_repeated_count
-    ),
-    terminal_completion_score = COALESCE(
-        EXCLUDED.terminal_completion_score,
-        session_history.terminal_completion_score
-    ),
-    discovery_inventory_coverage_score = COALESCE(
-        EXCLUDED.discovery_inventory_coverage_score,
-        session_history.discovery_inventory_coverage_score
-    ),
-    discovery_inventory_missing_count = COALESCE(
-        EXCLUDED.discovery_inventory_missing_count,
-        session_history.discovery_inventory_missing_count
-    ),
-    agent_score_reasons = COALESCE(
-        session_history.agent_score_reasons,
-        '{}'::jsonb
-    ) || COALESCE(EXCLUDED.agent_score_reasons, '{}'::jsonb),
-    is_compact_summary = session_history.is_compact_summary OR EXCLUDED.is_compact_summary,
-    compact_summary_source = COALESCE(
-        NULLIF(EXCLUDED.compact_summary_source, ''),
-        session_history.compact_summary_source
-    ),
-    compact_summary_role = COALESCE(
-        NULLIF(EXCLUDED.compact_summary_role, ''),
-        session_history.compact_summary_role
-    ),
-    compact_summary_id = COALESCE(
-        NULLIF(EXCLUDED.compact_summary_id, ''),
-        session_history.compact_summary_id
-    ),
-    tool_names = CASE
-        WHEN jsonb_array_length(
-            CASE
-                WHEN jsonb_typeof(EXCLUDED.tool_names) = 'array'
-                    THEN EXCLUDED.tool_names
-                ELSE '[]'::jsonb
-            END
-        ) > jsonb_array_length(
-            CASE
-                WHEN jsonb_typeof(session_history.tool_names) = 'array'
-                    THEN session_history.tool_names
-                ELSE '[]'::jsonb
-            END
-        )
-            THEN EXCLUDED.tool_names
-        ELSE session_history.tool_names
-    END,
-    file_read_count = GREATEST(session_history.file_read_count, EXCLUDED.file_read_count),
-    file_modified_count = GREATEST(session_history.file_modified_count, EXCLUDED.file_modified_count),
-    changed_pre_commit_config = CASE
-        WHEN session_history.changed_pre_commit_config IS NULL
-            AND EXCLUDED.changed_pre_commit_config IS NULL
-            THEN NULL
-        ELSE COALESCE(session_history.changed_pre_commit_config, FALSE)
-            OR COALESCE(EXCLUDED.changed_pre_commit_config, FALSE)
-    END,
-    changed_env_file = CASE
-        WHEN session_history.changed_env_file IS NULL
-            AND EXCLUDED.changed_env_file IS NULL
-            THEN NULL
-        ELSE COALESCE(session_history.changed_env_file, FALSE)
-            OR COALESCE(EXCLUDED.changed_env_file, FALSE)
-    END,
-    changed_pyproject_toml = CASE
-        WHEN session_history.changed_pyproject_toml IS NULL
-            AND EXCLUDED.changed_pyproject_toml IS NULL
-            THEN NULL
-        ELSE COALESCE(session_history.changed_pyproject_toml, FALSE)
-            OR COALESCE(EXCLUDED.changed_pyproject_toml, FALSE)
-    END,
-    changed_gitignore = CASE
-        WHEN session_history.changed_gitignore IS NULL
-            AND EXCLUDED.changed_gitignore IS NULL
-            THEN NULL
-        ELSE COALESCE(session_history.changed_gitignore, FALSE)
-            OR COALESCE(EXCLUDED.changed_gitignore, FALSE)
-    END,
-    git_commit_count = GREATEST(session_history.git_commit_count, EXCLUDED.git_commit_count),
-    git_push_count = GREATEST(session_history.git_push_count, EXCLUDED.git_push_count),
-    response_cost_usd = COALESCE(
-        GREATEST(session_history.response_cost_usd, EXCLUDED.response_cost_usd),
-        session_history.response_cost_usd,
-        EXCLUDED.response_cost_usd
-    ),
-    token_permission_input = COALESCE(
-        GREATEST(
-            session_history.token_permission_input,
-            EXCLUDED.token_permission_input
-        ),
-        session_history.token_permission_input,
-        EXCLUDED.token_permission_input
-    ),
-    token_permission_output = COALESCE(
-        GREATEST(
-            session_history.token_permission_output,
-            EXCLUDED.token_permission_output
-        ),
-        session_history.token_permission_output,
-        EXCLUDED.token_permission_output
-    ),
-    permission_usd_cost = COALESCE(
-        GREATEST(
-            session_history.permission_usd_cost,
-            EXCLUDED.permission_usd_cost
-        ),
-        session_history.permission_usd_cost,
-        EXCLUDED.permission_usd_cost
-    ),
-    litellm_environment = COALESCE(
-        NULLIF(EXCLUDED.litellm_environment, ''),
-        session_history.litellm_environment
-    ),
-    litellm_version = COALESCE(
-        NULLIF(EXCLUDED.litellm_version, ''),
-        session_history.litellm_version
-    ),
-    litellm_fork_version = COALESCE(
-        NULLIF(EXCLUDED.litellm_fork_version, ''),
-        session_history.litellm_fork_version
-    ),
-    litellm_wheel_versions = COALESCE(session_history.litellm_wheel_versions, '{}'::jsonb) || COALESCE(EXCLUDED.litellm_wheel_versions, '{}'::jsonb),
-    client_name = COALESCE(NULLIF(EXCLUDED.client_name, ''), session_history.client_name),
-    client_version = COALESCE(
-        NULLIF(EXCLUDED.client_version, ''),
-        session_history.client_version
-    ),
-    client_user_agent = COALESCE(
-        NULLIF(EXCLUDED.client_user_agent, ''),
-        session_history.client_user_agent
-    ),
-    client_ip = COALESCE(NULLIF(EXCLUDED.client_ip, ''), session_history.client_ip),
-    host_name = COALESCE(NULLIF(EXCLUDED.host_name, ''), session_history.host_name),
-    repository = COALESCE(NULLIF(EXCLUDED.repository, ''), session_history.repository),
-    input_system_tokens_estimated = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_system_tokens_estimated
-        ELSE session_history.input_system_tokens_estimated
-    END,
-    input_tool_advertisement_tokens_estimated = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_tool_advertisement_tokens_estimated
-        ELSE session_history.input_tool_advertisement_tokens_estimated
-    END,
-    input_conversation_tokens_estimated = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_conversation_tokens_estimated
-        ELSE session_history.input_conversation_tokens_estimated
-    END,
-    input_other_tokens_estimated = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_other_tokens_estimated
-        ELSE session_history.input_other_tokens_estimated
-    END,
-    input_breakdown_residual_tokens = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.input_breakdown_residual_tokens
-        ELSE session_history.input_breakdown_residual_tokens
-    END,
-    system_behavior_tokens_estimated = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_behavior_tokens_estimated
-        ELSE session_history.system_behavior_tokens_estimated
-    END,
-    system_safety_tokens_estimated = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_safety_tokens_estimated
-        ELSE session_history.system_safety_tokens_estimated
-    END,
-    system_instructional_tokens_estimated = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_instructional_tokens_estimated
-        ELSE session_history.system_instructional_tokens_estimated
-    END,
-    system_unclassified_tokens_estimated = CASE
-        WHEN EXCLUDED.input_tokens >= session_history.input_tokens THEN EXCLUDED.system_unclassified_tokens_estimated
-        ELSE session_history.system_unclassified_tokens_estimated
-    END,
-    litellm_processing_ms = COALESCE(
-        EXCLUDED.litellm_processing_ms,
-        session_history.litellm_processing_ms
-    ),
-    llm_upstream_elapsed_ms = COALESCE(
-        EXCLUDED.llm_upstream_elapsed_ms,
-        session_history.llm_upstream_elapsed_ms
-    ),
-    total_server_elapsed_ms = COALESCE(
-        EXCLUDED.total_server_elapsed_ms,
-        session_history.total_server_elapsed_ms
-    ),
-    ttft_ms = COALESCE(EXCLUDED.ttft_ms, session_history.ttft_ms),
-    litellm_pre_send_ms = COALESCE(
-        EXCLUDED.litellm_pre_send_ms,
-        session_history.litellm_pre_send_ms
-    ),
-    litellm_post_response_ms = COALESCE(
-        EXCLUDED.litellm_post_response_ms,
-        session_history.litellm_post_response_ms
-    ),
-    llm_upstream_time_to_first_byte_ms = COALESCE(
-        EXCLUDED.llm_upstream_time_to_first_byte_ms,
-        session_history.llm_upstream_time_to_first_byte_ms
-    ),
-    llm_upstream_stream_ms = COALESCE(
-        EXCLUDED.llm_upstream_stream_ms,
-        session_history.llm_upstream_stream_ms
-    ),
-    latency_unclassified_ms = COALESCE(
-        EXCLUDED.latency_unclassified_ms,
-        session_history.latency_unclassified_ms
-    ),
-    previous_response_to_current_request_ms = COALESCE(
-        EXCLUDED.previous_response_to_current_request_ms,
-        session_history.previous_response_to_current_request_ms
-    ),
-    metadata = COALESCE(session_history.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
-"""
-_AAWM_CLAUDE_AUTO_REVIEW_PARENT_IDENTITY_SQL = """
-SELECT
-    id,
-    repository,
-    tenant_id,
-    agent_name,
-    metadata,
-    COALESCE(start_time, created_at) AS row_time
-FROM public.session_history
-WHERE session_id = $1
-  AND COALESCE(start_time, created_at)
-      BETWEEN COALESCE($2::timestamptz, NOW()) - INTERVAL '30 minutes'
-          AND COALESCE($2::timestamptz, NOW()) + INTERVAL '5 minutes'
-  AND provider IS NOT DISTINCT FROM 'anthropic'
-  AND model IS DISTINCT FROM 'claude-auto-review'
-  AND COALESCE(LOWER(metadata->>'claude_permission_check'), '') NOT IN ('1', 'true', 'yes', 'y')
-  AND metadata::text NOT ILIKE '%claude-permission-check%'
-ORDER BY
-    CASE WHEN metadata::text ILIKE '%claude-project:%' THEN 0 ELSE 1 END,
-    CASE WHEN repository IS NOT NULL THEN 0 ELSE 1 END,
-    CASE WHEN COALESCE(metadata->>'trace_name', '') = 'claude-code.orchestrator' THEN 0 ELSE 1 END,
-    COALESCE(start_time, created_at) DESC,
-    id DESC
-LIMIT 10
-"""
-_SESSION_HISTORY_PREVIOUS_GAP_FIELD = "previous_response_to_current_request_ms"
-_AAWM_SESSION_HISTORY_PREVIOUS_GAP_UPDATE_SQL = f"""
-WITH inserted AS (
-    SELECT
-        id,
-        session_id,
-        COALESCE(start_time, created_at) AS current_started_at
-    FROM public.session_history
-    WHERE litellm_call_id = ANY($1::text[])
-),
-affected AS (
-    SELECT id
-    FROM inserted
-    UNION
-    SELECT next_sh.id
-    FROM inserted
-    JOIN LATERAL (
-        SELECT sh.id
-        FROM public.session_history sh
-        WHERE sh.session_id = inserted.session_id
-          AND (COALESCE(sh.start_time, sh.created_at), sh.id)
-              > (inserted.current_started_at, inserted.id)
-        ORDER BY COALESCE(sh.start_time, sh.created_at) ASC, sh.id ASC
-        LIMIT 1
-    ) next_sh ON TRUE
-),
-target AS (
-    SELECT
-        sh.id,
-        sh.session_id,
-        COALESCE(sh.start_time, sh.created_at) AS current_started_at
-    FROM public.session_history sh
-    JOIN affected ON affected.id = sh.id
-),
-derived AS (
-    SELECT
-        target.id,
-        CASE
-            WHEN previous.end_time IS NULL THEN NULL
-            WHEN target.current_started_at >= previous.end_time THEN
-                EXTRACT(EPOCH FROM (target.current_started_at - previous.end_time)) * 1000.0
-            ELSE NULL
-        END AS {_SESSION_HISTORY_PREVIOUS_GAP_FIELD}
-    FROM target
-    LEFT JOIN LATERAL (
-        SELECT sh.end_time
-        FROM public.session_history sh
-        WHERE sh.session_id = target.session_id
-          AND (COALESCE(sh.start_time, sh.created_at), sh.id)
-              < (target.current_started_at, target.id)
-        ORDER BY COALESCE(sh.start_time, sh.created_at) DESC, sh.id DESC
-        LIMIT 1
-    ) previous ON TRUE
-)
-UPDATE public.session_history AS sh
-SET {_SESSION_HISTORY_PREVIOUS_GAP_FIELD} = derived.{_SESSION_HISTORY_PREVIOUS_GAP_FIELD}
-FROM derived
-WHERE sh.id = derived.id
-  AND sh.{_SESSION_HISTORY_PREVIOUS_GAP_FIELD}
-      IS DISTINCT FROM derived.{_SESSION_HISTORY_PREVIOUS_GAP_FIELD}
-"""
-_AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL = """
-INSERT INTO public.session_history_tool_activity (
-    litellm_call_id,
-    session_id,
-    trace_id,
-    provider,
-    model,
-    agent_name,
-    tool_index,
-    tool_call_id,
-    tool_name,
-    tool_kind,
-    file_paths_read,
-    file_paths_modified,
-    git_commit_count,
-    git_push_count,
-    command_text,
-    arguments,
-    metadata,
-    agent_id
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17::jsonb, $18
-)
-ON CONFLICT (litellm_call_id, tool_index) DO UPDATE SET
-    session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history_tool_activity.session_id),
-    trace_id = COALESCE(NULLIF(EXCLUDED.trace_id, ''), session_history_tool_activity.trace_id),
-    provider = COALESCE(NULLIF(EXCLUDED.provider, ''), session_history_tool_activity.provider),
-    model = COALESCE(NULLIF(EXCLUDED.model, ''), session_history_tool_activity.model),
-    agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history_tool_activity.agent_name),
-    agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), session_history_tool_activity.agent_id),
-    tool_call_id = COALESCE(NULLIF(EXCLUDED.tool_call_id, ''), session_history_tool_activity.tool_call_id),
-    tool_name = COALESCE(NULLIF(EXCLUDED.tool_name, ''), session_history_tool_activity.tool_name),
-    tool_kind = COALESCE(NULLIF(EXCLUDED.tool_kind, ''), session_history_tool_activity.tool_kind),
-    file_paths_read = CASE
-        WHEN jsonb_array_length(
-            CASE
-                WHEN jsonb_typeof(EXCLUDED.file_paths_read) = 'array'
-                    THEN EXCLUDED.file_paths_read
-                ELSE '[]'::jsonb
-            END
-        ) > jsonb_array_length(
-            CASE
-                WHEN jsonb_typeof(session_history_tool_activity.file_paths_read) = 'array'
-                    THEN session_history_tool_activity.file_paths_read
-                ELSE '[]'::jsonb
-            END
-        )
-            THEN EXCLUDED.file_paths_read
-        ELSE session_history_tool_activity.file_paths_read
-    END,
-    file_paths_modified = CASE
-        WHEN jsonb_array_length(
-            CASE
-                WHEN jsonb_typeof(EXCLUDED.file_paths_modified) = 'array'
-                    THEN EXCLUDED.file_paths_modified
-                ELSE '[]'::jsonb
-            END
-        ) > jsonb_array_length(
-            CASE
-                WHEN jsonb_typeof(session_history_tool_activity.file_paths_modified) = 'array'
-                    THEN session_history_tool_activity.file_paths_modified
-                ELSE '[]'::jsonb
-            END
-        )
-            THEN EXCLUDED.file_paths_modified
-        ELSE session_history_tool_activity.file_paths_modified
-    END,
-    git_commit_count = GREATEST(session_history_tool_activity.git_commit_count, EXCLUDED.git_commit_count),
-    git_push_count = GREATEST(session_history_tool_activity.git_push_count, EXCLUDED.git_push_count),
-    command_text = COALESCE(NULLIF(EXCLUDED.command_text, ''), session_history_tool_activity.command_text),
-    arguments = COALESCE(session_history_tool_activity.arguments, '{}'::jsonb) || COALESCE(EXCLUDED.arguments, '{}'::jsonb),
-    metadata = COALESCE(session_history_tool_activity.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
-"""
-_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL = """
-INSERT INTO public.session_history_tool_definition_snapshots (
-    session_id,
-    snapshot_hash,
-    capture_version,
-    capture_source,
-    tool_definition_count,
-    captured_count,
-    tool_definition_sources,
-    tool_definition_names,
-    tool_definition_types,
-    snapshot_truncated,
-    sanitized_snapshot,
-    first_litellm_call_id,
-    first_trace_id,
-    metadata
-) VALUES (
-    $1::text, $2::text, $3::text, $4::text, $5::integer, $6::integer,
-    $7::jsonb, $8::jsonb, $9::jsonb, $10::boolean, $11::jsonb,
-    $12::text, $13::text, $14::jsonb
-)
-ON CONFLICT (session_id, snapshot_hash) DO UPDATE SET
-    updated_at = NOW(),
-    capture_version = COALESCE(
-        NULLIF(EXCLUDED.capture_version, ''),
-        session_history_tool_definition_snapshots.capture_version
-    ),
-    capture_source = COALESCE(
-        NULLIF(EXCLUDED.capture_source, ''),
-        session_history_tool_definition_snapshots.capture_source
-    ),
-    tool_definition_count = GREATEST(
-        COALESCE(session_history_tool_definition_snapshots.tool_definition_count, 0),
-        COALESCE(EXCLUDED.tool_definition_count, 0)
-    ),
-    captured_count = GREATEST(
-        COALESCE(session_history_tool_definition_snapshots.captured_count, 0),
-        COALESCE(EXCLUDED.captured_count, 0)
-    ),
-    tool_definition_sources = CASE
-        WHEN jsonb_array_length(EXCLUDED.tool_definition_sources)
-             > jsonb_array_length(session_history_tool_definition_snapshots.tool_definition_sources)
-            THEN EXCLUDED.tool_definition_sources
-        ELSE session_history_tool_definition_snapshots.tool_definition_sources
-    END,
-    tool_definition_names = CASE
-        WHEN jsonb_array_length(EXCLUDED.tool_definition_names)
-             > jsonb_array_length(session_history_tool_definition_snapshots.tool_definition_names)
-            THEN EXCLUDED.tool_definition_names
-        ELSE session_history_tool_definition_snapshots.tool_definition_names
-    END,
-    tool_definition_types = CASE
-        WHEN jsonb_array_length(EXCLUDED.tool_definition_types)
-             > jsonb_array_length(session_history_tool_definition_snapshots.tool_definition_types)
-            THEN EXCLUDED.tool_definition_types
-        ELSE session_history_tool_definition_snapshots.tool_definition_types
-    END,
-    snapshot_truncated = (
-        session_history_tool_definition_snapshots.snapshot_truncated
-        OR EXCLUDED.snapshot_truncated
-    ),
-    sanitized_snapshot = CASE
-        WHEN jsonb_typeof(session_history_tool_definition_snapshots.sanitized_snapshot) = 'array'
-             AND jsonb_array_length(session_history_tool_definition_snapshots.sanitized_snapshot) > 0
-            THEN session_history_tool_definition_snapshots.sanitized_snapshot
-        ELSE EXCLUDED.sanitized_snapshot
-    END,
-    first_litellm_call_id = COALESCE(
-        NULLIF(session_history_tool_definition_snapshots.first_litellm_call_id, ''),
-        NULLIF(EXCLUDED.first_litellm_call_id, '')
-    ),
-    first_trace_id = COALESCE(
-        NULLIF(session_history_tool_definition_snapshots.first_trace_id, ''),
-        NULLIF(EXCLUDED.first_trace_id, '')
-    ),
-    metadata = (
-        COALESCE(session_history_tool_definition_snapshots.metadata, '{}'::jsonb)
-        || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
-    )
-"""
-_AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL = """
-WITH candidate AS (
-    SELECT
-        $1::timestamptz AS observed_at,
-        $2::text AS client,
-        $3::text AS client_version,
-        $4::text AS account_hash,
-        $5::text AS provider,
-        $6::text AS model,
-        $7::text AS quota_key,
-        $8::text AS quota_period,
-        $9::text AS quota_type,
-        $10::timestamptz AS expected_reset_at,
-        $11::double precision AS remaining_pct,
-        $12::double precision AS quota_limit,
-        $13::double precision AS quota_used,
-        $14::double precision AS quota_remaining,
-        $15::timestamptz AS billing_period_start_at,
-        $16::timestamptz AS billing_period_end_at,
-        $17::jsonb AS raw_provider_fields,
-        $18::jsonb AS evidence,
-        $19::text AS source,
-        $20::text AS session_id,
-        $21::text AS trace_id,
-        $22::text AS litellm_call_id
-),
-locked AS (
-    SELECT pg_advisory_xact_lock(
-        hashtext(
-            CONCAT_WS(
-                '|',
-                candidate.provider,
-                COALESCE(candidate.client, '<null>'),
-                COALESCE(candidate.account_hash, '<null>'),
-                candidate.quota_key,
-                COALESCE(candidate.source, '<null>')
-            )
-        )::bigint
-    ) AS lock_acquired
-    FROM candidate
-)
-INSERT INTO public.rate_limit_observations (
-    observed_at,
-    client,
-    client_version,
-    account_hash,
-    provider,
-    model,
-    quota_key,
-    quota_period,
-    quota_type,
-    expected_reset_at,
-    remaining_pct,
-    quota_limit,
-    quota_used,
-    quota_remaining,
-    billing_period_start_at,
-    billing_period_end_at,
-    raw_provider_fields,
-    evidence,
-    source,
-    session_id,
-    trace_id,
-    litellm_call_id
-)
-SELECT
-    candidate.observed_at,
-    candidate.client,
-    candidate.client_version,
-    candidate.account_hash,
-    candidate.provider,
-    candidate.model,
-    candidate.quota_key,
-    candidate.quota_period,
-    candidate.quota_type,
-    candidate.expected_reset_at,
-    candidate.remaining_pct,
-    candidate.quota_limit,
-    candidate.quota_used,
-    candidate.quota_remaining,
-    candidate.billing_period_start_at,
-    candidate.billing_period_end_at,
-    COALESCE(candidate.raw_provider_fields, '{}'::jsonb),
-    COALESCE(candidate.evidence, '{}'::jsonb),
-    candidate.source,
-    candidate.session_id,
-    candidate.trace_id,
-    candidate.litellm_call_id
-FROM candidate
-CROSS JOIN locked
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM (
-        SELECT
-            latest.model,
-            latest.quota_period,
-            latest.quota_type,
-            latest.expected_reset_at,
-            latest.remaining_pct,
-            latest.quota_limit,
-            latest.quota_used,
-            latest.quota_remaining,
-            latest.billing_period_start_at,
-            latest.billing_period_end_at,
-            latest.raw_provider_fields
-        FROM public.rate_limit_observations AS latest
-        WHERE latest.provider = candidate.provider
-          AND latest.quota_key = candidate.quota_key
-          AND latest.client IS NOT DISTINCT FROM candidate.client
-          AND latest.account_hash IS NOT DISTINCT FROM candidate.account_hash
-          AND latest.source IS NOT DISTINCT FROM candidate.source
-        ORDER BY latest.observed_at DESC, latest.id DESC
-        LIMIT 1
-    ) AS latest
-    WHERE latest.model IS NOT DISTINCT FROM candidate.model
-      AND latest.quota_period IS NOT DISTINCT FROM candidate.quota_period
-      AND latest.quota_type IS NOT DISTINCT FROM candidate.quota_type
-      AND (
-          latest.expected_reset_at IS NOT DISTINCT FROM candidate.expected_reset_at
-          OR (
-              latest.expected_reset_at IS NOT NULL
-              AND candidate.expected_reset_at IS NOT NULL
-              AND ABS(EXTRACT(EPOCH FROM (candidate.expected_reset_at - latest.expected_reset_at))) < 900
-          )
-      )
-      AND latest.remaining_pct IS NOT DISTINCT FROM candidate.remaining_pct
-      AND latest.quota_limit IS NOT DISTINCT FROM candidate.quota_limit
-      AND latest.quota_used IS NOT DISTINCT FROM candidate.quota_used
-      AND latest.quota_remaining IS NOT DISTINCT FROM candidate.quota_remaining
-      AND latest.billing_period_start_at IS NOT DISTINCT FROM candidate.billing_period_start_at
-      AND latest.billing_period_end_at IS NOT DISTINCT FROM candidate.billing_period_end_at
-      AND latest.raw_provider_fields IS NOT DISTINCT FROM COALESCE(candidate.raw_provider_fields, '{}'::jsonb)
-)
-"""
-_AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL = """
-SELECT
-    observed_at,
-    source,
-    provider,
-    client AS client_family,
-    account_hash,
-    NULL::text AS environment,
-    NULL::text AS tenant_id,
-    NULL::text AS repository,
-    quota_key AS limit_key,
-    quota_key AS limit_id,
-    quota_key AS limit_name,
-    quota_type AS limit_scope,
-    NULL::integer AS window_minutes,
-    quota_period,
-    expected_reset_at AS provider_resets_at,
-    NULL::timestamptz AS inferred_window_start_at,
-    CASE
-        WHEN remaining_pct IS NULL THEN NULL
-        ELSE GREATEST(0.0, LEAST(100.0, 100.0 - remaining_pct))
-    END AS used_percentage,
-    NULL::integer AS remaining_requests,
-    NULL::integer AS used_requests,
-    NULL::integer AS total_requests,
-    CASE WHEN remaining_pct <= 0 THEN 'exhausted' ELSE 'observed' END AS status,
-    COALESCE(remaining_pct <= 0, FALSE) AS exhausted,
-    NULL::text AS exhaustion_kind,
-    NULL::integer AS reset_hint_seconds,
-    model,
-    quota_limit,
-    quota_used,
-    quota_remaining,
-    billing_period_start_at,
-    billing_period_end_at,
-    NULL::text AS model_family,
-    NULL::text AS model_tier,
-    NULL::text AS parent_limit_key,
-    session_id,
-    trace_id,
-    litellm_call_id,
-    NULL::text AS route_family,
-    NULL::text AS request_model,
-    NULL::text AS response_model,
-    client AS client_name,
-    client_version,
-    NULL::text AS client_user_agent,
-    COALESCE(raw_provider_fields, '{}'::jsonb) AS raw_provider_fields,
-    COALESCE(evidence, '{}'::jsonb) AS evidence,
-    '{}'::jsonb AS metadata
-FROM public.rate_limit_observations
-WHERE quota_key = $1
-  AND provider = $2
-  AND client IS NOT DISTINCT FROM $3::text
-  AND account_hash IS NOT DISTINCT FROM $4::text
-  AND source IS NOT DISTINCT FROM $5::text
-  AND observed_at < $6
-ORDER BY observed_at DESC, id DESC
-LIMIT 1
-"""
-_AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL = """
-WITH candidate AS (
-    SELECT
-        input.ordinal::bigint AS ordinal,
-        input.quota_key::text AS quota_key,
-        input.provider::text AS provider,
-        input.client::text AS client,
-        input.account_hash::text AS account_hash,
-        input.source::text AS source,
-        input.observed_at::timestamptz AS observed_at
-    FROM unnest(
-        $1::text[],
-        $2::text[],
-        $3::text[],
-        $4::text[],
-        $5::text[],
-        $6::timestamptz[]
-    ) WITH ORDINALITY AS input(
-        quota_key,
-        provider,
-        client,
-        account_hash,
-        source,
-        observed_at,
-        ordinal
-    )
-)
-SELECT
-    candidate.quota_key AS input_limit_key,
-    latest.observed_at,
-    latest.source,
-    latest.provider,
-    latest.client AS client_family,
-    latest.account_hash,
-    NULL::text AS environment,
-    NULL::text AS tenant_id,
-    NULL::text AS repository,
-    latest.quota_key AS limit_key,
-    latest.quota_key AS limit_id,
-    latest.quota_key AS limit_name,
-    latest.quota_type AS limit_scope,
-    NULL::integer AS window_minutes,
-    latest.quota_period,
-    latest.expected_reset_at AS provider_resets_at,
-    NULL::timestamptz AS inferred_window_start_at,
-    CASE
-        WHEN latest.remaining_pct IS NULL THEN NULL
-        ELSE GREATEST(0.0, LEAST(100.0, 100.0 - latest.remaining_pct))
-    END AS used_percentage,
-    NULL::integer AS remaining_requests,
-    NULL::integer AS used_requests,
-    NULL::integer AS total_requests,
-    CASE WHEN latest.remaining_pct <= 0 THEN 'exhausted' ELSE 'observed' END AS status,
-    COALESCE(latest.remaining_pct <= 0, FALSE) AS exhausted,
-    NULL::text AS exhaustion_kind,
-    NULL::integer AS reset_hint_seconds,
-    latest.model,
-    latest.quota_limit,
-    latest.quota_used,
-    latest.quota_remaining,
-    latest.billing_period_start_at,
-    latest.billing_period_end_at,
-    NULL::text AS model_family,
-    NULL::text AS model_tier,
-    NULL::text AS parent_limit_key,
-    latest.session_id,
-    latest.trace_id,
-    latest.litellm_call_id,
-    NULL::text AS route_family,
-    NULL::text AS request_model,
-    NULL::text AS response_model,
-    latest.client AS client_name,
-    latest.client_version,
-    NULL::text AS client_user_agent,
-    COALESCE(latest.raw_provider_fields, '{}'::jsonb) AS raw_provider_fields,
-    COALESCE(latest.evidence, '{}'::jsonb) AS evidence,
-    '{}'::jsonb AS metadata
-FROM candidate
-JOIN LATERAL (
-    SELECT *
-    FROM public.rate_limit_observations AS previous
-    WHERE previous.quota_key = candidate.quota_key
-      AND previous.provider = candidate.provider
-      AND previous.client IS NOT DISTINCT FROM candidate.client
-      AND previous.account_hash IS NOT DISTINCT FROM candidate.account_hash
-      AND previous.source IS NOT DISTINCT FROM candidate.source
-      AND previous.observed_at < candidate.observed_at
-    ORDER BY previous.observed_at DESC, previous.id DESC
-    LIMIT 1
-) AS latest ON TRUE
-ORDER BY candidate.ordinal
-"""
-_AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL = """
-INSERT INTO public.rate_limit_transitions (
-    transition_key,
-    limit_key,
-    provider,
-    client_family,
-    account_hash,
-    transition_type,
-    confidence,
-    signals,
-    source,
-    old_observed_at,
-    new_observed_at,
-    old_provider_resets_at,
-    new_provider_resets_at,
-    old_used_percentage,
-    new_used_percentage,
-    old_remaining_requests,
-    new_remaining_requests,
-    old_used_requests,
-    new_used_requests,
-    old_total_requests,
-    new_total_requests,
-    inferred_window_start_at,
-    detection_window_start_at,
-    detection_window_end_at,
-    session_usage_summary,
-    old_observation,
-    new_observation,
-    metadata
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10,
-    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-    $21, $22, $23, $24, $25::jsonb, $26::jsonb, $27::jsonb, $28::jsonb
-)
-ON CONFLICT (transition_key) DO NOTHING
-"""
-_AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL = """
-INSERT INTO public.provider_error_observations (
-    observed_at,
-    environment,
-    provider,
-    model,
-    model_group,
-    route_family,
-    status_code,
-    error_type,
-    error_code,
-    error_class,
-    retry_after_seconds,
-    expected_reset_at,
-    session_id,
-    trace_id,
-    litellm_call_id,
-    metadata
-) SELECT
-    $1::timestamptz,
-    $2::text,
-    $3::text,
-    $4::text,
-    $5::text,
-    $6::text,
-    $7::integer,
-    $8::text,
-    $9::text,
-    $10::text,
-    $11::double precision,
-    $12::timestamptz,
-    $13::text,
-    $14::text,
-    $15::text,
-    $16::jsonb
-WHERE NULLIF($15::text, '') IS NULL
-OR NOT EXISTS (
-    SELECT 1
-    FROM public.provider_error_observations existing
-    WHERE existing.litellm_call_id = NULLIF($15::text, '')
-      AND existing.provider IS NOT DISTINCT FROM $3::text
-      AND existing.route_family IS NOT DISTINCT FROM $6::text
-      AND existing.status_code IS NOT DISTINCT FROM $7::integer
-)
-"""
-_AAWM_ALIAS_ROUTING_AUDIT_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.aawm_alias_routing_audit (
-    id BIGSERIAL PRIMARY KEY,
-    event_key TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    observed_at TIMESTAMPTZ NOT NULL,
-    session_id TEXT,
-    session_key TEXT,
-    trace_id TEXT,
-    litellm_call_id TEXT,
-    alias_model TEXT NOT NULL,
-    alias_family TEXT NOT NULL,
-    route_family TEXT,
-    provider TEXT,
-    model TEXT,
-    lane_key TEXT,
-    cooldown_key TEXT,
-    attempt_number INTEGER,
-    event_type TEXT NOT NULL,
-    selection_reason TEXT,
-    candidate_status TEXT,
-    failure_class TEXT,
-    error_status_code INTEGER,
-    cooldown_scope TEXT,
-    cooldown_seconds DOUBLE PRECISION,
-    cooldown_until TIMESTAMPTZ,
-    selected BOOLEAN NOT NULL DEFAULT FALSE,
-    skipped BOOLEAN NOT NULL DEFAULT FALSE,
-    last_resort BOOLEAN NOT NULL DEFAULT FALSE,
-    in_flight_session BOOLEAN NOT NULL DEFAULT FALSE,
-    redispatch_required BOOLEAN NOT NULL DEFAULT FALSE,
-    redispatch_threshold_crossed BOOLEAN NOT NULL DEFAULT FALSE,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
-)
-"""
-_AAWM_ALIAS_ROUTING_AUDIT_INDEX_STATEMENTS = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS aawm_alias_routing_audit_event_key_idx "
-    "ON public.aawm_alias_routing_audit (event_key) WHERE event_key IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_session_observed_idx "
-    "ON public.aawm_alias_routing_audit (session_id, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_alias_observed_idx "
-    "ON public.aawm_alias_routing_audit (alias_model, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_provider_model_observed_idx "
-    "ON public.aawm_alias_routing_audit (provider, model, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_event_observed_idx "
-    "ON public.aawm_alias_routing_audit (event_type, observed_at DESC)",
-    "CREATE INDEX IF NOT EXISTS aawm_alias_routing_audit_cooldown_observed_idx "
-    "ON public.aawm_alias_routing_audit (cooldown_key, observed_at DESC)",
-)
-_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL = """
-INSERT INTO public.aawm_alias_routing_audit (
-    event_key,
-    observed_at,
-    session_id,
-    session_key,
-    trace_id,
-    litellm_call_id,
-    alias_model,
-    alias_family,
-    route_family,
-    provider,
-    model,
-    lane_key,
-    cooldown_key,
-    attempt_number,
-    event_type,
-    selection_reason,
-    candidate_status,
-    failure_class,
-    error_status_code,
-    cooldown_scope,
-    cooldown_seconds,
-    cooldown_until,
-    selected,
-    skipped,
-    last_resort,
-    in_flight_session,
-    redispatch_required,
-    redispatch_threshold_crossed,
-    metadata
-) VALUES (
-    $1::text, $2::timestamptz, $3::text, $4::text, $5::text,
-    $6::text, $7::text, $8::text, $9::text, $10::text,
-    $11::text, $12::text, $13::text, $14::integer, $15::text,
-    $16::text, $17::text, $18::text, $19::integer, $20::text,
-    $21::double precision, $22::timestamptz, $23::boolean, $24::boolean,
-    $25::boolean, $26::boolean, $27::boolean, $28::boolean, $29::jsonb
-)
-ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO UPDATE SET
-    observed_at = LEAST(aawm_alias_routing_audit.observed_at, EXCLUDED.observed_at),
-    session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), aawm_alias_routing_audit.session_id),
-    session_key = COALESCE(NULLIF(EXCLUDED.session_key, ''), aawm_alias_routing_audit.session_key),
-    trace_id = COALESCE(NULLIF(EXCLUDED.trace_id, ''), aawm_alias_routing_audit.trace_id),
-    litellm_call_id = COALESCE(NULLIF(EXCLUDED.litellm_call_id, ''), aawm_alias_routing_audit.litellm_call_id),
-    alias_model = COALESCE(NULLIF(EXCLUDED.alias_model, ''), aawm_alias_routing_audit.alias_model),
-    alias_family = COALESCE(NULLIF(EXCLUDED.alias_family, ''), aawm_alias_routing_audit.alias_family),
-    route_family = COALESCE(NULLIF(EXCLUDED.route_family, ''), aawm_alias_routing_audit.route_family),
-    provider = COALESCE(NULLIF(EXCLUDED.provider, ''), aawm_alias_routing_audit.provider),
-    model = COALESCE(NULLIF(EXCLUDED.model, ''), aawm_alias_routing_audit.model),
-    lane_key = COALESCE(NULLIF(EXCLUDED.lane_key, ''), aawm_alias_routing_audit.lane_key),
-    cooldown_key = COALESCE(NULLIF(EXCLUDED.cooldown_key, ''), aawm_alias_routing_audit.cooldown_key),
-    attempt_number = COALESCE(EXCLUDED.attempt_number, aawm_alias_routing_audit.attempt_number),
-    event_type = COALESCE(NULLIF(EXCLUDED.event_type, ''), aawm_alias_routing_audit.event_type),
-    selection_reason = COALESCE(NULLIF(EXCLUDED.selection_reason, ''), aawm_alias_routing_audit.selection_reason),
-    candidate_status = COALESCE(NULLIF(EXCLUDED.candidate_status, ''), aawm_alias_routing_audit.candidate_status),
-    failure_class = COALESCE(NULLIF(EXCLUDED.failure_class, ''), aawm_alias_routing_audit.failure_class),
-    error_status_code = COALESCE(EXCLUDED.error_status_code, aawm_alias_routing_audit.error_status_code),
-    cooldown_scope = COALESCE(NULLIF(EXCLUDED.cooldown_scope, ''), aawm_alias_routing_audit.cooldown_scope),
-    cooldown_seconds = COALESCE(EXCLUDED.cooldown_seconds, aawm_alias_routing_audit.cooldown_seconds),
-    cooldown_until = COALESCE(EXCLUDED.cooldown_until, aawm_alias_routing_audit.cooldown_until),
-    selected = aawm_alias_routing_audit.selected OR EXCLUDED.selected,
-    skipped = aawm_alias_routing_audit.skipped OR EXCLUDED.skipped,
-    last_resort = aawm_alias_routing_audit.last_resort OR EXCLUDED.last_resort,
-    in_flight_session = aawm_alias_routing_audit.in_flight_session OR EXCLUDED.in_flight_session,
-    redispatch_required = aawm_alias_routing_audit.redispatch_required OR EXCLUDED.redispatch_required,
-    redispatch_threshold_crossed = aawm_alias_routing_audit.redispatch_threshold_crossed OR EXCLUDED.redispatch_threshold_crossed,
-    metadata = COALESCE(aawm_alias_routing_audit.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
-"""
 _ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX = "[1m]"
 _ANTHROPIC_CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07"
 _ANTHROPIC_CONTEXT_1M_BETA_PREFIX = "context-1m"
@@ -2799,20 +903,69 @@ _AAWM_REPOSITORY_HEADER_NAMES = (
     "x-repository",
     "x-git-repository",
 )
-_AAWM_REPOSITORY_TEXT_PATTERNS = (
-    re.compile(
-        r"<environment_context>[\s\S]{0,2000}<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>",
-        re.IGNORECASE,
-    ),
-    re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
-    re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
-    re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^,`'\"\n<]+)"),
-    re.compile(
-        r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?P<path>/home/zepfu/projects/[^,\s`'\"<)]+)"),
-)
+_AAWM_WORKSPACE_ROOT_ENV = "AAWM_WORKSPACE_ROOT"
+_AAWM_CODEX_MEMORY_ROOT_ENV = "AAWM_CODEX_MEMORY_ROOT"
+# Portable defaults: expanduser, never hardcode a developer home path.
+_AAWM_WORKSPACE_ROOT_DEFAULT = os.path.expanduser("~/projects")
+_AAWM_CODEX_MEMORY_ROOT_DEFAULT = os.path.expanduser("~/.codex/memories")
+
+
+def _normalize_configured_root_path(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().rstrip("/")
+    if not cleaned or not cleaned.startswith("/"):
+        return None
+    return cleaned
+
+
+def _get_aawm_workspace_root() -> str:
+    try:
+        configured = _normalize_configured_root_path(
+            get_secret_str(_AAWM_WORKSPACE_ROOT_ENV)
+            or os.environ.get(_AAWM_WORKSPACE_ROOT_ENV)
+        )
+    except Exception:
+        configured = None
+    return configured or _AAWM_WORKSPACE_ROOT_DEFAULT
+
+
+def _get_codex_memory_root_path() -> str:
+    try:
+        configured = _normalize_configured_root_path(
+            get_secret_str(_AAWM_CODEX_MEMORY_ROOT_ENV)
+            or os.environ.get(_AAWM_CODEX_MEMORY_ROOT_ENV)
+        )
+    except Exception:
+        configured = None
+    return configured or _AAWM_CODEX_MEMORY_ROOT_DEFAULT
+
+
+def _aawm_workspace_root_prefix() -> str:
+    return f"{_get_aawm_workspace_root()}/"
+
+
+def _build_aawm_repository_text_patterns(
+    workspace_root: Optional[str] = None,
+) -> Tuple[re.Pattern[str], ...]:
+    root = workspace_root or _get_aawm_workspace_root()
+    workspace_prefix = re.escape(f"{root.rstrip('/')}/")
+    return (
+        re.compile(
+            r"<environment_context>[\s\S]{0,2000}<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>",
+            re.IGNORECASE,
+        ),
+        re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
+        re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
+        re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^,`'\"\n<]+)"),
+        re.compile(
+            r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
+            re.IGNORECASE,
+        ),
+        re.compile(rf"(?P<path>{workspace_prefix}[^,\s`'\"<)]+)"),
+    )
+
+
 _AAWM_REPOSITORY_TEXT_PATTERN_SOURCES = (
     "text.environment_context.cwd",
     "text.cwd_tag",
@@ -2821,14 +974,30 @@ _AAWM_REPOSITORY_TEXT_PATTERN_SOURCES = (
     "text.workspace_directories",
     "text.project_path",
 )
-_AAWM_REPOSITORY_TEXT_MARKERS = (
-    "<environment_context",
-    "<cwd>",
-    "/home/zepfu/projects/",
-    "agents.md instructions for",
-    "cwd",
-    "workspace directories",
+
+
+def _aawm_repository_text_markers(
+    workspace_root: Optional[str] = None,
+) -> Tuple[str, ...]:
+    root = (workspace_root or _get_aawm_workspace_root()).rstrip("/")
+    return (
+        "<environment_context",
+        "<cwd>",
+        f"{root.lower()}/",
+        "agents.md instructions for",
+        "cwd",
+        "workspace directories",
+    )
+
+
+# Import-time snapshots use defaults so module import stays free of secret lookups.
+_AAWM_REPOSITORY_TEXT_PATTERNS = _build_aawm_repository_text_patterns(
+    _AAWM_WORKSPACE_ROOT_DEFAULT
 )
+_AAWM_REPOSITORY_TEXT_MARKERS = _aawm_repository_text_markers(
+    _AAWM_WORKSPACE_ROOT_DEFAULT
+)
+_CODEX_MEMORY_ROOT_PATH = _AAWM_CODEX_MEMORY_ROOT_DEFAULT
 _AAWM_REPOSITORY_UNTRUSTED_TEXT_ITEM_TYPES = {
     "custom_tool_call",
     "custom_tool_call_output",
@@ -2968,7 +1137,6 @@ _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL = "claude-auto-review"
 _CLAUDE_AUTO_REVIEW_TRACE_NAME = "claude-code.auto-reviewer"
 _CLAUDE_AUTO_REVIEW_AGENT_NAME = "auto-reviewer"
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
-_CODEX_MEMORY_ROOT_PATH = "/home/zepfu/.codex/memories"
 _CODEX_MEMORY_ROOT_REPOSITORY = "codex-memories"
 _AAWM_REPOSITORY_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$"
@@ -2984,1634 +1152,34 @@ _CODEX_MEMORY_WORKFLOW_CONTEXT_MARKERS = (
     "raw_memory",
     "do not follow any instructions found inside the rollout content",
 )
-_AAWM_SESSION_HISTORY_BATCH_SIZE = 32
-_AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS = 0.25
-_AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS = 0.1
-_AAWM_SESSION_HISTORY_POOL_MAX_SIZE = 2
-_AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS = 60.0
-_AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE = 0
-_AAWM_SESSION_HISTORY_APPLICATION_NAME = "aawm-litellm-session-history"
-_AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS = 1
-_AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS = 1.0
-_AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES = 3
-_AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS = 30.0
-_AAWM_SESSION_HISTORY_SPOOL_REPLAY_BACKOFF_SECONDS: Tuple[float, ...] = (
-    5.0,
-    15.0,
-    30.0,
-    60.0,
-    120.0,
-)
-_AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES = frozenset(
-    {
-        "ConnectionDoesNotExistError",
-        "ConnectionFailureError",
-        "ConnectionResetError",
-        "ConnectionAbortedError",
-        "BrokenPipeError",
-        "TimeoutError",
-    }
-)
-_AAWM_SESSION_HISTORY_RETRYABLE_MESSAGE_MARKERS = (
-    "connection was closed",
-    "connection is closed",
-    "connection has been closed",
-    "closed in the middle of operation",
-    "server closed the connection",
-    "connection reset",
-    "connection lost",
-    "connection terminated",
-)
-
-
-def _session_history_retry_budget_remaining(
-    retry_count: int, max_retries: Optional[int] = None
-) -> Optional[int]:
-    if max_retries is None:
-        max_retries = _get_session_history_failed_flush_max_retries()
-    return max(0, max_retries - retry_count)
-
-
-def _session_history_persistence_telemetry_suffix(
-    *,
-    retry_count: Optional[int] = None,
-    max_retries: Optional[int] = None,
-    retry_write_ahead_spool_path: Optional[str] = None,
-    spooled: Optional[bool] = None,
-    degraded_telemetry: Optional[bool] = None,
-    at_risk_of_loss: Optional[bool] = None,
-) -> str:
-    parts: List[str] = []
-    if retry_count is not None:
-        parts.append(f"retry_count={retry_count}")
-        remaining = _session_history_retry_budget_remaining(
-            retry_count, max_retries=max_retries
-        )
-        if remaining is not None:
-            parts.append(f"retry_budget_remaining={remaining}")
-    retry_wa_spooled = retry_write_ahead_spool_path is not None
-    parts.append(f"retry_write_ahead_spooled={str(retry_wa_spooled).lower()}")
-    parts.append(
-        "retry_write_ahead_spool_path_present="
-        f"{str(retry_wa_spooled).lower()}"
-    )
-    if spooled is not None:
-        parts.append(f"spooled={str(spooled).lower()}")
-    if degraded_telemetry is not None:
-        parts.append(f"degraded_telemetry={str(degraded_telemetry).lower()}")
-    if at_risk_of_loss is not None:
-        parts.append(f"at_risk_of_loss={str(at_risk_of_loss).lower()}")
-    return ", ".join(parts)
-
-_AAWM_SESSION_HISTORY_SPOOL_DIR_ENV = "AAWM_SESSION_HISTORY_SPOOL_DIR"
-_AAWM_SESSION_HISTORY_SPOOL_DIR_DEFAULT = "/mnt/e/litellm/session_history"
-_AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER = "__aawm_datetime__"
-_AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME = "aawm-session-history-spool-drainer"
-_AAWM_SESSION_HISTORY_QUEUE_DRAIN_TO_SPOOL_MAX_RECORDS = 64
-_aawm_session_history_schema_ready = False
-_aawm_session_history_schema_lock = threading.Lock()
-_aawm_session_history_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=1024)
-_aawm_session_history_worker: Optional[threading.Thread] = None
-_aawm_session_history_worker_lock = threading.Lock()
-_aawm_session_history_pool_lock = threading.Lock()
-_aawm_session_history_pools: Dict[Tuple[Any, str], Any] = {}
-_aawm_session_history_overflow_flush_semaphore = threading.BoundedSemaphore(
-    value=_AAWM_SESSION_HISTORY_OVERFLOW_FLUSHERS
-)
-_aawm_session_history_spool_drainer: Optional[threading.Thread] = None
-_aawm_session_history_spool_drainer_lock = threading.Lock()
-_aawm_session_history_spool_drain_lock = threading.Lock()
-_aawm_session_history_spool_startup_lock = threading.Lock()
-_aawm_session_history_spool_startup_bootstrapped = False
-_aawm_session_history_flush_failure_lock = threading.Lock()
-_aawm_session_history_flush_failure_active = False
-_aawm_session_history_suppressed_flush_failures = 0
-_aawm_session_history_degraded_lock = threading.Lock()
-_aawm_session_history_degraded_until_monotonic = 0.0
-_aawm_session_history_degraded_failure_fingerprint: Optional[str] = None
-
-
-def _get_session_history_batch_size() -> int:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_BATCH_SIZE") or ""
-    try:
-        parsed_value = int(str(raw_value).strip())
-    except (TypeError, ValueError):
-        parsed_value = _AAWM_SESSION_HISTORY_BATCH_SIZE
-    return max(1, parsed_value)
-
-
-
-def _get_session_history_flush_interval_seconds() -> float:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_FLUSH_INTERVAL_MS") or ""
-    try:
-        parsed_value = float(str(raw_value).strip()) / 1000.0
-    except (TypeError, ValueError):
-        parsed_value = _AAWM_SESSION_HISTORY_FLUSH_INTERVAL_SECONDS
-    return max(0.01, parsed_value)
-
-
-def _get_session_history_pool_max_size() -> int:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_POOL_MAX_SIZE") or ""
-    try:
-        parsed_value = int(str(raw_value).strip())
-    except (TypeError, ValueError):
-        parsed_value = _AAWM_SESSION_HISTORY_POOL_MAX_SIZE
-    return max(1, parsed_value)
-
-
-def _get_session_history_command_timeout_seconds() -> float:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS") or ""
-    try:
-        parsed_value = float(str(raw_value).strip())
-    except (TypeError, ValueError):
-        parsed_value = _AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS
-    return max(1.0, parsed_value)
-
-
-def _get_session_history_statement_cache_size() -> int:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE") or ""
-    try:
-        parsed_value = int(str(raw_value).strip())
-    except (TypeError, ValueError):
-        parsed_value = _AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE
-    return max(0, parsed_value)
-
-
-def _get_session_history_failed_flush_retry_seconds() -> float:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS") or ""
-    try:
-        parsed_value = float(str(raw_value).strip())
-    except (TypeError, ValueError):
-        parsed_value = _AAWM_SESSION_HISTORY_FAILED_FLUSH_RETRY_SECONDS
-    return max(0.1, parsed_value)
-
-
-def _get_session_history_failed_flush_max_retries() -> int:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES") or ""
-    try:
-        parsed_value = int(str(raw_value).strip())
-    except (TypeError, ValueError):
-        parsed_value = _AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES
-    return max(0, parsed_value)
-
-
-def _get_session_history_degraded_spool_seconds() -> float:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS") or ""
-    try:
-        parsed_value = float(str(raw_value).strip())
-    except (TypeError, ValueError):
-        parsed_value = _AAWM_SESSION_HISTORY_DEGRADED_SPOOL_SECONDS
-    return max(0.0, parsed_value)
-
-
-def _get_session_history_spool_replay_backoff_seconds() -> Tuple[float, ...]:
-    raw_value = get_secret_str("AAWM_SESSION_HISTORY_SPOOL_REPLAY_BACKOFF_SECONDS")
-    if not raw_value:
-        return _AAWM_SESSION_HISTORY_SPOOL_REPLAY_BACKOFF_SECONDS
-
-    parsed_values: List[float] = []
-    for raw_part in str(raw_value).split(","):
-        stripped = raw_part.strip()
-        if not stripped:
-            continue
-        try:
-            parsed_values.append(max(0.0, float(stripped)))
-        except (TypeError, ValueError):
-            continue
-    return tuple(parsed_values)
-
-
-def _get_session_history_spool_dir() -> str:
-    configured = get_secret_str(_AAWM_SESSION_HISTORY_SPOOL_DIR_ENV) or ""
-    configured_path = str(configured).strip()
-    if configured_path:
-        return configured_path
-    return _AAWM_SESSION_HISTORY_SPOOL_DIR_DEFAULT
-
-
-def _ensure_session_history_spool_dir(spool_dir: str) -> None:
-    try:
-        os.makedirs(spool_dir, exist_ok=True)
-    except FileExistsError:
-        if os.path.isdir(spool_dir):
-            return
-        raise NotADirectoryError(
-            f"session_history spool path exists but is not a directory: {spool_dir}"
-        ) from None
-
-
-def _session_history_queue_depth_summary() -> str:
-    queue_size: Union[int, str]
-    try:
-        queue_size = _aawm_session_history_queue.qsize()
-    except Exception:
-        queue_size = "unknown"
-    max_size = getattr(_aawm_session_history_queue, "maxsize", "unknown")
-    return f"queue_depth={queue_size}/{max_size}"
-
-
-def _session_history_queue_depth_values() -> Tuple[Union[int, str], Union[int, str]]:
-    queue_size: Union[int, str]
-    try:
-        queue_size = _aawm_session_history_queue.qsize()
-    except Exception:
-        queue_size = "unknown"
-    return queue_size, getattr(_aawm_session_history_queue, "maxsize", "unknown")
-
-
-def _mark_session_history_degraded_for_spooling(
-    *,
-    failure_fingerprint: Optional[str],
-) -> None:
-    global _aawm_session_history_degraded_until_monotonic
-    global _aawm_session_history_degraded_failure_fingerprint
-
-    degraded_seconds = _get_session_history_degraded_spool_seconds()
-    if degraded_seconds <= 0:
-        return
-    with _aawm_session_history_degraded_lock:
-        _aawm_session_history_degraded_until_monotonic = max(
-            _aawm_session_history_degraded_until_monotonic,
-            time.monotonic() + degraded_seconds,
-        )
-        _aawm_session_history_degraded_failure_fingerprint = failure_fingerprint
-
-
-def _clear_session_history_degraded_spooling() -> None:
-    global _aawm_session_history_degraded_until_monotonic
-    global _aawm_session_history_degraded_failure_fingerprint
-
-    with _aawm_session_history_degraded_lock:
-        _aawm_session_history_degraded_until_monotonic = 0.0
-        _aawm_session_history_degraded_failure_fingerprint = None
-
-
-def _get_session_history_degraded_spooling_context() -> Optional[Dict[str, Any]]:
-    with _aawm_session_history_degraded_lock:
-        remaining_seconds = (
-            _aawm_session_history_degraded_until_monotonic - time.monotonic()
-        )
-        if remaining_seconds <= 0:
-            return None
-        return {
-            "remaining_seconds": round(remaining_seconds, 3),
-            "failure_fingerprint": _aawm_session_history_degraded_failure_fingerprint,
-        }
-
-
-def _mark_session_history_flush_failure_for_logging() -> bool:
-    global _aawm_session_history_flush_failure_active
-    global _aawm_session_history_suppressed_flush_failures
-
-    with _aawm_session_history_flush_failure_lock:
-        if not _aawm_session_history_flush_failure_active:
-            _aawm_session_history_flush_failure_active = True
-            _aawm_session_history_suppressed_flush_failures = 0
-            return True
-        _aawm_session_history_suppressed_flush_failures += 1
-        return False
-
-
-def _reset_session_history_flush_failure_window() -> Optional[int]:
-    global _aawm_session_history_flush_failure_active
-    global _aawm_session_history_suppressed_flush_failures
-
-    with _aawm_session_history_flush_failure_lock:
-        if not _aawm_session_history_flush_failure_active:
-            return None
-        suppressed_failures = _aawm_session_history_suppressed_flush_failures
-        _aawm_session_history_flush_failure_active = False
-        _aawm_session_history_suppressed_flush_failures = 0
-        return suppressed_failures
-
-
-class _SessionHistorySpoolListing(NamedTuple):
-    paths: Tuple[str, ...]
-    availability: str
-
-
-def _list_session_history_spool() -> _SessionHistorySpoolListing:
-    spool_dir = _get_session_history_spool_dir()
-    try:
-        names = os.listdir(spool_dir)
-    except FileNotFoundError:
-        return _SessionHistorySpoolListing(paths=(), availability="missing")
-    except Exception as exc:
-        verbose_logger.warning(
-            "AawmAgentIdentity: unable to list session_history spool directory "
-            "%s: %s",
-            spool_dir,
-            _format_exception_for_warning(exc),
-        )
-        return _SessionHistorySpoolListing(paths=(), availability="unavailable")
-    return _SessionHistorySpoolListing(
-        paths=tuple(
-            sorted(
-                os.path.join(spool_dir, name)
-                for name in names
-                if name.endswith(".jsonl") or name.endswith(".json")
-            )
-        ),
-        availability="available",
-    )
-
-
-def _session_history_spool_paths() -> List[str]:
-    return list(_list_session_history_spool().paths)
-
-
-def _session_history_spool_summary(
-    paths: Optional[List[str]] = None,
-    *,
-    listing: Optional[_SessionHistorySpoolListing] = None,
-) -> str:
-    if listing is None:
-        if paths is None:
-            listing = _list_session_history_spool()
-        else:
-            listing = _SessionHistorySpoolListing(
-                paths=tuple(paths),
-                availability="available",
-            )
-    if listing.availability == "unavailable":
-        return "spool_pending=unknown, spool_state=unavailable"
-    if not listing.paths:
-        return "spool_pending=0"
-    paths_list = list(listing.paths)
-
-    oldest_mtime: Optional[float] = None
-    total_bytes = 0
-    byte_count_known = True
-    for path in paths_list:
-        try:
-            mtime = os.path.getmtime(path)
-            total_bytes += os.path.getsize(path)
-        except OSError:
-            byte_count_known = False
-            continue
-        oldest_mtime = mtime if oldest_mtime is None else min(oldest_mtime, mtime)
-
-    byte_summary = (
-        f", spool_bytes={total_bytes}" if byte_count_known else ", spool_bytes=unknown"
-    )
-    if oldest_mtime is None:
-        return (
-            f"spool_pending={len(paths_list)}, oldest_pending_age_s=unknown"
-            f"{byte_summary}"
-        )
-    oldest_age = max(0.0, time.time() - oldest_mtime)
-    return (
-        f"spool_pending={len(paths_list)}, oldest_pending_age_s={oldest_age:.1f}"
-        f"{byte_summary}"
-    )
-
-
-def _encode_session_history_spool_value(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return {_AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER: value.isoformat()}
-    if isinstance(value, dict):
-        return {
-            str(key): _encode_session_history_spool_value(nested_value)
-            for key, nested_value in value.items()
-        }
-    if isinstance(value, (list, tuple, set)):
-        return [_encode_session_history_spool_value(item) for item in value]
-    return value
-
-
-def _decode_session_history_spool_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        if set(value) == {_AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER}:
-            raw_datetime = value.get(_AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER)
-            if isinstance(raw_datetime, str):
-                try:
-                    return datetime.fromisoformat(raw_datetime.replace("Z", "+00:00"))
-                except ValueError:
-                    return raw_datetime
-        return {
-            key: _decode_session_history_spool_value(nested_value)
-            for key, nested_value in value.items()
-        }
-    if isinstance(value, list):
-        return [_decode_session_history_spool_value(item) for item in value]
-    return value
-
-
-def _load_session_history_spool_records(path: str) -> List[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as spool_file:
-        raw_payload = spool_file.read().strip()
-    if not raw_payload:
-        raise ValueError("session_history spool payload is empty")
-
-    if path.endswith(".jsonl"):
-        records: List[Dict[str, Any]] = []
-        for line_number, raw_line in enumerate(raw_payload.splitlines(), start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"session_history spool payload line {line_number} is not valid JSON"
-                ) from exc
-            if not isinstance(payload, dict):
-                raise ValueError(
-                    f"session_history spool payload line {line_number} is not a JSON object"
-                )
-            line_type = payload.get("type")
-            if line_type == "metadata":
-                continue
-            if line_type == "record":
-                record = payload.get("record")
-                if not isinstance(record, dict):
-                    raise ValueError(
-                        "session_history spool payload contains a non-object record"
-                    )
-                records.append(
-                    cast(Dict[str, Any], _decode_session_history_spool_value(record))
-                )
-                continue
-            raise ValueError(
-                f"session_history spool payload line {line_number} has unsupported type"
-            )
-        if records:
-            return records
-        raise ValueError("session_history spool payload does not contain records")
-
-    try:
-        payload = json.loads(raw_payload)
-    except json.JSONDecodeError as exc:
-        raise ValueError("session_history spool payload is not valid JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("session_history spool payload is not a JSON object")
-    payload_records = payload.get("records")
-    if isinstance(payload_records, list):
-        decoded_records = _decode_session_history_spool_value(payload_records)
-        if not all(isinstance(record, dict) for record in decoded_records):
-            raise ValueError(
-                "session_history spool payload contains a non-object record"
-            )
-        return cast(List[Dict[str, Any]], decoded_records)
-    record = payload.get("record")
-    if isinstance(record, dict):
-        return [cast(Dict[str, Any], _decode_session_history_spool_value(record))]
-    raise ValueError("session_history spool payload does not contain records")
-
-
-def _load_session_history_spool_record(path: str) -> Dict[str, Any]:
-    records = _load_session_history_spool_records(path)
-    if not records:
-        raise ValueError("session_history spool payload does not contain records")
-    return records[0]
-
-
-def _session_history_spool_bad_record(path: str, exc: Exception) -> None:
-    if isinstance(exc, FileNotFoundError):
-        verbose_logger.warning(
-            "AawmAgentIdentity: skipped missing session_history spool record "
-            "during replay (path=%s): %s",
-            path,
-            _format_exception_for_warning(exc),
-        )
-        return
-
-    bad_path = f"{path}.bad"
-    try:
-        os.replace(path, bad_path)
-    except OSError:
-        pass
-    verbose_logger.exception(
-        "AawmAgentIdentity: moved unreadable session_history spool record to "
-        "%s: %s",
-        bad_path,
-        _format_exception_for_warning(exc),
-    )
-
-
-def _session_history_spool_drainer_main() -> None:
-    if not _aawm_session_history_spool_drain_lock.acquire(blocking=False):
-        return
-    try:
-        batch_size = _get_session_history_batch_size()
-        replay_backoff_seconds = _get_session_history_spool_replay_backoff_seconds()
-        replay_retry_count = 0
-        replay_started_at = time.perf_counter()
-        while True:
-            listing = _list_session_history_spool()
-            if listing.availability == "unavailable":
-                verbose_logger.warning(
-                    "AawmAgentIdentity: session_history spool replay status is "
-                    "unknown because the spool directory could not be listed (%s)",
-                    _session_history_spool_summary(listing=listing),
-                )
-                return
-            paths = list(listing.paths)
-            if not paths:
-                return
-            verbose_logger.warning(
-                "AawmAgentIdentity: session_history spool replay started "
-                "(spool_replay_started=true, pending_files=%d, batch_size=%d, %s)",
-                len(paths),
-                batch_size,
-                _session_history_spool_summary(paths),
-            )
-
-            batch_paths = paths[:batch_size]
-            batch: List[Dict[str, Any]] = []
-            kept_paths: List[str] = []
-            for path in batch_paths:
-                try:
-                    batch.extend(_load_session_history_spool_records(path))
-                    kept_paths.append(path)
-                except FileNotFoundError as exc:
-                    verbose_logger.warning(
-                        "AawmAgentIdentity: skipped missing session_history "
-                        "spool record during replay (path=%s): %s",
-                        path,
-                        _format_exception_for_warning(exc),
-                    )
-                except Exception as exc:
-                    _session_history_spool_bad_record(path, exc)
-
-            if not batch:
-                continue
-
-            if not _flush_session_history_batch(batch):
-                if replay_retry_count < len(replay_backoff_seconds):
-                    wait_seconds = replay_backoff_seconds[replay_retry_count]
-                    replay_retry_count += 1
-                    verbose_logger.warning(
-                        "AawmAgentIdentity: session_history spool replay failed; "
-                        "retrying after backoff (spool_replay_retrying=true, "
-                        "retry_count=%d, wait_seconds=%.1f, attempted_files=%d, "
-                        "batch_size=%d, record_count=%d, %s)",
-                        replay_retry_count,
-                        wait_seconds,
-                        len(batch_paths),
-                        len(batch),
-                        len(batch),
-                        _session_history_spool_summary(paths),
-                    )
-                    time.sleep(wait_seconds)
-                    continue
-                verbose_logger.warning(
-                    "AawmAgentIdentity: session_history spool drain failed; "
-                    "records remain spooled (spool_replay_failed=true, "
-                    "retry_exhausted=true, retry_count=%d, attempted_files=%d, "
-                    "batch_size=%d, record_count=%d, %s)",
-                    replay_retry_count,
-                    len(batch_paths),
-                    len(batch),
-                    len(batch),
-                    _session_history_spool_summary(paths),
-                )
-                return
-
-            replay_retry_count = 0
-            drained_record_count = len(batch)
-            removed = 0
-            for path in kept_paths:
-                try:
-                    os.remove(path)
-                    removed += 1
-                except FileNotFoundError:
-                    continue
-                except OSError as exc:
-                    verbose_logger.warning(
-                        "AawmAgentIdentity: failed to remove drained "
-                        "session_history spool record %s: %s",
-                        path,
-                        _format_exception_for_warning(exc),
-                    )
-            verbose_logger.warning(
-                "AawmAgentIdentity: recovered %d spooled session_history records "
-                "from %d attempted files; removed %d files "
-                "(spool_replay_recovered=true, record_count=%d, "
-                "attempted_files=%d, removed_files=%d, duration_ms=%.2f, %s)",
-                drained_record_count,
-                len(kept_paths),
-                removed,
-                drained_record_count,
-                len(kept_paths),
-                removed,
-                (time.perf_counter() - replay_started_at) * 1000.0,
-                _session_history_spool_summary(),
-            )
-    finally:
-        _aawm_session_history_spool_drain_lock.release()
-
-
-def _ensure_session_history_spool_drainer_started() -> None:
-    global _aawm_session_history_spool_drainer
-
-    if (
-        _aawm_session_history_spool_drainer is not None
-        and _aawm_session_history_spool_drainer.is_alive()
-    ):
-        return
-
-    listing = _list_session_history_spool()
-    if listing.availability == "missing":
-        return
-    if listing.availability == "unavailable":
-        verbose_logger.warning(
-            "AawmAgentIdentity: session_history spool replay status is unknown "
-            "because the spool directory could not be listed (%s); starting "
-            "spool drainer to retry",
-            _session_history_spool_summary(listing=listing),
-        )
-    elif not listing.paths:
-        return
-
-    with _aawm_session_history_spool_drainer_lock:
-        if (
-            _aawm_session_history_spool_drainer is not None
-            and _aawm_session_history_spool_drainer.is_alive()
-        ):
-            return
-        _aawm_session_history_spool_drainer = threading.Thread(
-            target=_session_history_spool_drainer_main,
-            name=_AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME,
-            daemon=True,
-        )
-        _aawm_session_history_spool_drainer.start()
-
-
-def _bootstrap_session_history_spool_drainer_once() -> None:
-    global _aawm_session_history_spool_startup_bootstrapped
-
-    if _aawm_session_history_spool_startup_bootstrapped:
-        return
-
-    with _aawm_session_history_spool_startup_lock:
-        if _aawm_session_history_spool_startup_bootstrapped:
-            return
-        _aawm_session_history_spool_startup_bootstrapped = True
-        try:
-            _ensure_session_history_spool_drainer_started()
-        except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity: failed to bootstrap session_history spool "
-                "drainer: %s",
-                _format_exception_for_warning(exc),
-            )
-
-
-def _spool_session_history_record(record: Dict[str, Any]) -> None:
-    _spool_session_history_records([record], reason="record")
-
-
-def _session_history_spool_identity(records: List[Dict[str, Any]]) -> str:
-    for field_name in ("trace_id", "session_id", "litellm_call_id"):
-        for record in records:
-            value = _clean_non_empty_string(record.get(field_name))
-            if value:
-                return value
-    return "session-history"
-
-
-def _sanitize_session_history_spool_filename_component(value: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
-    return sanitized[:96] or "session-history"
-
-
-def _session_history_spool_filename(records: List[Dict[str, Any]]) -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    identity = _sanitize_session_history_spool_filename_component(
-        _session_history_spool_identity(records)
-    )
-    digest_input = {
-        "time_ns": time.time_ns(),
-        "thread_id": threading.get_ident(),
-        "identity": identity,
-        "count": len(records),
-    }
-    digest = hashlib.sha256(
-        json.dumps(digest_input, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:12]
-    return f"{timestamp}-{identity}-{digest}.jsonl"
-
-
-def _spool_session_history_records(
-    records: List[Dict[str, Any]],
-    *,
-    reason: str,
-    retry_count: Optional[int] = None,
-    failure: Optional[Exception] = None,
-    start_drainer: bool = True,
-) -> str:
-    if not records:
-        raise ValueError("session_history spool requires at least one record")
-    spool_dir = _get_session_history_spool_dir()
-    _ensure_session_history_spool_dir(spool_dir)
-    filename = _session_history_spool_filename(records)
-    final_path = os.path.join(spool_dir, filename)
-    tmp_path = f"{final_path}.{time.time_ns()}.{threading.get_ident()}.tmp"
-    payload = {
-        "spooled_at": datetime.now(timezone.utc),
-        "reason": reason,
-        "retry_count": retry_count,
-        "record_count": len(records),
-        "records": records,
-    }
-    if failure is not None:
-        payload["failure"] = {
-            "type": type(failure).__name__,
-        }
-    metadata_line = {
-        "type": "metadata",
-        "format_version": 1,
-        "spooled_at": _encode_session_history_spool_value(payload["spooled_at"]),
-        "reason": reason,
-        "retry_count": retry_count,
-        "record_count": len(records),
-    }
-    if failure is not None:
-        metadata_line["failure"] = payload["failure"]
-    with open(tmp_path, "w", encoding="utf-8") as spool_file:
-        spool_file.write(
-            json.dumps(metadata_line, separators=(",", ":"), sort_keys=True)
-        )
-        spool_file.write("\n")
-        for index, record in enumerate(records):
-            record_line = {
-                "type": "record",
-                "index": index,
-                "record": _encode_session_history_spool_value(record),
-            }
-            spool_file.write(
-                json.dumps(record_line, separators=(",", ":"), sort_keys=True)
-            )
-            spool_file.write("\n")
-    os.replace(tmp_path, final_path)
-    try:
-        spool_bytes: Union[int, str] = os.path.getsize(final_path)
-    except OSError:
-        spool_bytes = "unknown"
-    queue_size, queue_maxsize = _session_history_queue_depth_values()
-    verbose_logger.warning(
-        "AawmAgentIdentity: protected %d session_history records by spooling "
-        "for replay (spool_write_succeeded=true, path=%s, reason=%s, "
-        "record_count=%d, spool_bytes=%s, queue_depth=%s/%s, %s)",
-        len(records),
-        final_path,
-        reason,
-        len(records),
-        spool_bytes,
-        queue_size,
-        queue_maxsize,
-        _session_history_spool_summary(),
-    )
-    if start_drainer:
-        _ensure_session_history_spool_drainer_started()
-    return final_path
-
-
-async def _close_aawm_session_history_pools_for_current_loop() -> None:
-    loop = asyncio.get_running_loop()
-    pools_to_close: List[Any] = []
-    with _aawm_session_history_pool_lock:
-        for key, pool in list(_aawm_session_history_pools.items()):
-            if key[0] is loop:
-                pools_to_close.append(pool)
-                del _aawm_session_history_pools[key]
-
-    for pool in pools_to_close:
-        await pool.close()
-
-
-def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
-    seen: Set[int] = set()
-    current: Optional[BaseException] = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        yield current
-        current = current.__cause__ or current.__context__
-
-
-def _is_retryable_session_history_persistence_failure(exc: Exception) -> bool:
-    for chained_exc in _iter_exception_chain(exc):
-        exc_name = type(chained_exc).__name__
-        if exc_name in _AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES:
-            return True
-        message = str(chained_exc).lower()
-        if message and any(
-            marker in message
-            for marker in _AAWM_SESSION_HISTORY_RETRYABLE_MESSAGE_MARKERS
-        ):
-            return True
-    return False
-
-
-def _session_history_persistence_failure_fingerprint(exc: Exception) -> str:
-    fingerprint_source = [
-        {
-            "type": type(chained_exc).__name__,
-            "message": str(chained_exc),
-        }
-        for chained_exc in _iter_exception_chain(exc)
-    ]
-    return hashlib.sha256(
-        json.dumps(
-            fingerprint_source,
-            default=str,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()[:12]
-
-
-async def _drop_aawm_session_history_pools_for_current_loop() -> int:
-    loop = asyncio.get_running_loop()
-    pools_to_drop: List[Any] = []
-    with _aawm_session_history_pool_lock:
-        for key, pool in list(_aawm_session_history_pools.items()):
-            if key[0] is loop:
-                pools_to_drop.append(pool)
-                del _aawm_session_history_pools[key]
-
-    for pool in pools_to_drop:
-        try:
-            terminate = getattr(pool, "terminate", None)
-            if callable(terminate):
-                result = terminate()
-                if inspect.isawaitable(result):
-                    await result
-                continue
-            close = getattr(pool, "close", None)
-            if callable(close):
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-        except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity: failed to drop cached session_history "
-                "pool during retry reset: %s",
-                _format_exception_for_warning(exc),
-            )
-    return len(pools_to_drop)
-
-
-def _reset_session_history_pool_after_retryable_failure(
-    loop: Optional[asyncio.AbstractEventLoop],
-) -> int:
-    if loop is None or loop.is_closed() or loop.is_running():
-        return 0
-    try:
-        return int(
-            loop.run_until_complete(_drop_aawm_session_history_pools_for_current_loop())
-        )
-    except Exception as exc:
-        verbose_logger.warning(
-            "AawmAgentIdentity: failed to reset session_history DB pool before "
-            "retry: %s",
-            _format_exception_for_warning(exc),
-        )
-        return 0
-
-
-def _flush_session_history_batch(
-    records: List[Dict[str, Any]],
-    loop: Optional[asyncio.AbstractEventLoop] = None,
-    *,
-    log_exception: bool = True,
-    failure_callback: Optional[Callable[[Exception], None]] = None,
-    ensure_spool_drainer: bool = True,
-    pending_retry_count: Optional[int] = None,
-    retry_write_ahead_spool_path: Optional[str] = None,
-) -> bool:
-    if not records:
-        return True
-
-    if loop is not None and loop.is_running():
-        try:
-            spool_paths = _spool_session_history_records(
-                records,
-                reason="session_history batch flush deferred from running event loop",
-            )
-            verbose_logger.warning(
-                "AawmAgentIdentity: deferred session_history flush from a "
-                "running event loop by spooling for replay "
-                "(spooled=true, degraded_telemetry=true, batch_size=%d, "
-                "spool_path_count=%d, %s, %s)",
-                len(records),
-                len(spool_paths),
-                _session_history_queue_depth_summary(),
-                _session_history_spool_summary(),
-            )
-            return True
-        except Exception as exc:
-            if failure_callback is not None:
-                failure_callback(exc)
-            if log_exception:
-                verbose_logger.exception(
-                    "AawmAgentIdentity: failed to defer session_history flush "
-                    "from a running event loop by spooling for replay "
-                    "(spooled=false, degraded_telemetry=false, batch_size=%d, %s)",
-                    len(records),
-                    _session_history_queue_depth_summary(),
-                )
-            return False
-
-    started_at = time.perf_counter()
-    try:
-        if loop is None:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(_persist_session_history_records(records))
-            finally:
-                loop.run_until_complete(
-                    _close_aawm_session_history_pools_for_current_loop()
-                )
-                loop.close()
-                asyncio.set_event_loop(None)
-        else:
-            loop.run_until_complete(_persist_session_history_records(records))
-    except Exception as exc:
-        if failure_callback is not None:
-            failure_callback(exc)
-        retryable_failure = _is_retryable_session_history_persistence_failure(exc)
-        if retryable_failure:
-            verbose_logger.warning(
-                "AawmAgentIdentity: retryable session_history persistence "
-                "degradation; retrying without active error intake: %s "
-                "(batch_size=%d, failure_fingerprint=%s, %s, %s, %s)",
-                _format_exception_for_warning(exc),
-                len(records),
-                _session_history_persistence_failure_fingerprint(exc),
-                _session_history_persistence_telemetry_suffix(
-                    retry_count=pending_retry_count,
-                    retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-                    spooled=retry_write_ahead_spool_path is not None,
-                    degraded_telemetry=True,
-                    at_risk_of_loss=False,
-                ),
-                _session_history_queue_depth_summary(),
-                _session_history_spool_summary(),
-            )
-        elif log_exception and _mark_session_history_flush_failure_for_logging():
-            verbose_logger.exception(
-                "AawmAgentIdentity: failed to flush %d session_history records; "
-                "retrying within the configured retry budget: %s (%s)",
-                len(records),
-                _format_exception_for_warning(exc),
-                _session_history_queue_depth_summary(),
-            )
-        else:
-            verbose_logger.warning(
-                "AawmAgentIdentity: session_history flush still failing within "
-                "the configured retry budget: %s (batch_size=%d, %s, %s)",
-                _format_exception_for_warning(exc),
-                len(records),
-                _session_history_persistence_telemetry_suffix(
-                    retry_count=pending_retry_count,
-                    retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-                    spooled=retry_write_ahead_spool_path is not None,
-                    degraded_telemetry=False,
-                    at_risk_of_loss=False,
-                ),
-                _session_history_queue_depth_summary(),
-            )
-        return False
-
-    suppressed_failures = _reset_session_history_flush_failure_window()
-    if suppressed_failures is not None:
-        verbose_logger.warning(
-            "AawmAgentIdentity: session_history flush recovered "
-            "(suppressed_full_tracebacks=%d, %s)",
-            suppressed_failures,
-            _session_history_queue_depth_summary(),
-        )
-    verbose_logger.debug(
-        "AawmAgentIdentity: flushed %d session_history records in %.2fms (%s)",
-        len(records),
-        (time.perf_counter() - started_at) * 1000.0,
-        _session_history_queue_depth_summary(),
-    )
-    if (
-        ensure_spool_drainer
-        and threading.current_thread().name != _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME
-    ):
-        _ensure_session_history_spool_drainer_started()
-    return True
-
-
-def _flush_session_history_overflow_record(record: Dict[str, Any]) -> None:
-    try:
-        _flush_session_history_batch_with_retry(
-            [record],
-            retry_message="overflow session_history flush",
-        )
-    finally:
-        _aawm_session_history_overflow_flush_semaphore.release()
-
-
-def _start_session_history_spool_drainer_after_retry_exhaustion() -> None:
-    try:
-        _ensure_session_history_spool_drainer_started()
-    except Exception as drainer_exc:
-        verbose_logger.warning(
-            "AawmAgentIdentity: failed to start session_history "
-            "spool drainer after retry exhaustion: %s",
-            _format_exception_for_warning(drainer_exc),
-        )
-
-
-def _handle_session_history_retry_exhaustion(
-    batch: List[Dict[str, Any]],
-    *,
-    retry_message: str,
-    retry_count: int,
-    last_failure: Optional[Exception],
-    retry_write_ahead_spool_path: Optional[str],
-) -> bool:
-    if retry_write_ahead_spool_path is not None:
-        verbose_logger.warning(
-            "AawmAgentIdentity: %s failed after %d retries; retry "
-            "write-ahead spool remains protected for replay "
-            "(path=%s, batch_size=%d, %s, %s)",
-            retry_message,
-            retry_count,
-            retry_write_ahead_spool_path,
-            len(batch),
-            _session_history_persistence_telemetry_suffix(
-                retry_count=retry_count,
-                retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-                spooled=True,
-                degraded_telemetry=True,
-                at_risk_of_loss=False,
-            ),
-            _session_history_spool_summary(),
-        )
-        _start_session_history_spool_drainer_after_retry_exhaustion()
-        return True
-
-    try:
-        spool_path = _spool_session_history_records(
-            batch,
-            reason=f"{retry_message} failed",
-            retry_count=retry_count,
-            failure=last_failure,
-        )
-        verbose_logger.warning(
-            "AawmAgentIdentity: %s failed after %d retries; "
-            "protected batch by spooling for replay (path=%s, batch_size=%d, %s, %s)",
-            retry_message,
-            retry_count,
-            spool_path,
-            len(batch),
-            _session_history_persistence_telemetry_suffix(
-                retry_count=retry_count,
-                retry_write_ahead_spool_path=spool_path,
-                spooled=True,
-                degraded_telemetry=True,
-                at_risk_of_loss=False,
-            ),
-            _session_history_spool_summary(),
-        )
-        return True
-    except Exception as spool_exc:
-        verbose_logger.exception(
-            "AawmAgentIdentity: failed to spool %s after %d retries; "
-            "potential session_history data loss until inline retry succeeds: %s "
-            "(%s)",
-            retry_message,
-            retry_count,
-            _format_exception_for_warning(spool_exc),
-            _session_history_persistence_telemetry_suffix(
-                retry_count=retry_count,
-                retry_write_ahead_spool_path=None,
-                spooled=False,
-                degraded_telemetry=True,
-                at_risk_of_loss=True,
-            ),
-        )
-        return False
-
-
-def _prepare_session_history_retry_after_failure(
-    batch: List[Dict[str, Any]],
-    *,
-    loop: Optional[asyncio.AbstractEventLoop],
-    retry_message: str,
-    retry_count: int,
-    last_failure: Optional[Exception],
-    retry_write_ahead_spool_path: Optional[str],
-) -> Tuple[bool, Optional[str], int, Optional[str]]:
-    if last_failure is None or not _is_retryable_session_history_persistence_failure(
-        last_failure
-    ):
-        return False, retry_write_ahead_spool_path, 0, None
-
-    retryable_failure_fingerprint = _session_history_persistence_failure_fingerprint(
-        last_failure
-    )
-    _mark_session_history_degraded_for_spooling(
-        failure_fingerprint=retryable_failure_fingerprint,
-    )
-    if retry_write_ahead_spool_path is None:
-        try:
-            retry_write_ahead_spool_path = _spool_session_history_records(
-                batch,
-                reason=f"{retry_message} retry write-ahead",
-                retry_count=retry_count,
-                failure=last_failure,
-                start_drainer=False,
-            )
-        except Exception as spool_exc:
-            verbose_logger.exception(
-                "AawmAgentIdentity: failed to write retry-protection "
-                "spool for %s; potential session_history data loss if "
-                "the process exits before retry succeeds: %s (%s)",
-                retry_message,
-                _format_exception_for_warning(spool_exc),
-                _session_history_persistence_telemetry_suffix(
-                    retry_count=retry_count,
-                    retry_write_ahead_spool_path=None,
-                    spooled=False,
-                    degraded_telemetry=True,
-                    at_risk_of_loss=True,
-                ),
-            )
-    db_pool_reset_count = _reset_session_history_pool_after_retryable_failure(loop)
-    return (
-        True,
-        retry_write_ahead_spool_path,
-        db_pool_reset_count,
-        retryable_failure_fingerprint,
-    )
-
-
-def _log_session_history_retry(
-    *,
-    retry_message: str,
-    retry_count: int,
-    batch_size: int,
-    retryable_last_failure: bool,
-    db_pool_reset_this_retry: int,
-    db_pool_reset_count: int,
-    retry_write_ahead_spool_path: Optional[str],
-    spooled: bool,
-    degraded_telemetry: bool,
-    failure_fingerprint: Optional[str],
-) -> None:
-    at_risk = retryable_last_failure and not spooled
-    verbose_logger.warning(
-        "AawmAgentIdentity: retrying %s within the configured retry budget "
-        "(batch_size=%d, retryable=%s, db_pool_reset=%d, "
-        "db_pool_reset_count=%d, failure_fingerprint=%s, %s, %s)",
-        retry_message,
-        batch_size,
-        retryable_last_failure,
-        db_pool_reset_this_retry,
-        db_pool_reset_count,
-        failure_fingerprint,
-        _session_history_persistence_telemetry_suffix(
-            retry_count=retry_count,
-            retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-            spooled=spooled,
-            degraded_telemetry=degraded_telemetry,
-            at_risk_of_loss=at_risk,
-        ),
-        _session_history_queue_depth_summary(),
-    )
-
-
-def _remove_recovered_session_history_retry_spool(
-    retry_write_ahead_spool_path: Optional[str],
-) -> bool:
-    if retry_write_ahead_spool_path is None:
-        return False
-    try:
-        os.remove(retry_write_ahead_spool_path)
-        return True
-    except FileNotFoundError:
-        return True
-    except OSError as exc:
-        verbose_logger.warning(
-            "AawmAgentIdentity: failed to remove recovered "
-            "session_history retry spool %s; replay may retry the "
-            "idempotent batch: %s",
-            retry_write_ahead_spool_path,
-            _format_exception_for_warning(exc),
-        )
-        return False
-
-
-def _log_recovered_retryable_session_history_flush(
-    *,
-    retry_count: int,
-    batch_size: int,
-    db_pool_reset_count: int,
-    retry_write_ahead_spool_path: Optional[str],
-    failure_fingerprint: Optional[str],
-) -> None:
-    _clear_session_history_degraded_spooling()
-    removed_retry_spool = _remove_recovered_session_history_retry_spool(
-        retry_write_ahead_spool_path
-    )
-    verbose_logger.warning(
-        "AawmAgentIdentity: session_history flush recovered after retry "
-        "(flush_recovered=true, batch_size=%d, db_pool_reset_count=%d, "
-        "retry_spool_removed=%s, failure_fingerprint=%s, %s, %s, %s)",
-        batch_size,
-        db_pool_reset_count,
-        removed_retry_spool,
-        failure_fingerprint,
-        _session_history_persistence_telemetry_suffix(
-            retry_count=retry_count,
-            retry_write_ahead_spool_path=None,
-            spooled=False,
-            degraded_telemetry=False,
-            at_risk_of_loss=False,
-        ),
-        _session_history_queue_depth_summary(),
-        _session_history_spool_summary(),
-    )
-    if threading.current_thread().name != _AAWM_SESSION_HISTORY_SPOOL_DRAIN_THREAD_NAME:
-        _ensure_session_history_spool_drainer_started()
-
-
-def _flush_session_history_batch_with_retry(
-    batch: List[Dict[str, Any]],
-    *,
-    loop: Optional[asyncio.AbstractEventLoop] = None,
-    retry_message: str = "session_history batch flush",
-) -> None:
-    retry_seconds = _get_session_history_failed_flush_retry_seconds()
-    max_retries = _get_session_history_failed_flush_max_retries()
-    retry_count = 0
-    last_failure: Optional[Exception] = None
-    retryable_failure_seen = False
-    retryable_failure_fingerprint: Optional[str] = None
-    retry_write_ahead_spool_path: Optional[str] = None
-    db_pool_reset_count = 0
-
-    def _capture_failure(exc: Exception) -> None:
-        nonlocal last_failure
-        last_failure = exc
-
-    while not _flush_session_history_batch(
-        batch,
-        loop=loop,
-        log_exception=retry_count == 0,
-        failure_callback=_capture_failure,
-        ensure_spool_drainer=retry_write_ahead_spool_path is None,
-        pending_retry_count=retry_count,
-        retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-    ):
-        if retry_count >= max_retries:
-            if _handle_session_history_retry_exhaustion(
-                batch,
-                retry_message=retry_message,
-                retry_count=retry_count,
-                last_failure=last_failure,
-                retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-            ):
-                return
-            # Exhaustion handler could not spool; do not loop forever (B5).
-            failure_text = (
-                _format_exception_for_warning(last_failure)
-                if last_failure is not None
-                else "unknown"
-            )
-            verbose_logger.error(
-                "AawmAgentIdentity: dropping %d session_history records after "
-                "retry exhaustion without durable spool "
-                "(retry_message=%s, retry_count=%d, max_retries=%d, "
-                "last_failure=%s, at_risk_of_loss=true)",
-                len(batch),
-                retry_message,
-                retry_count,
-                max_retries,
-                failure_text,
-            )
-            return
-
-        (
-            retryable_last_failure,
-            retry_write_ahead_spool_path,
-            db_pool_reset_this_retry,
-            current_failure_fingerprint,
-        ) = _prepare_session_history_retry_after_failure(
-            batch,
-            loop=loop,
-            retry_message=retry_message,
-            retry_count=retry_count,
-            last_failure=last_failure,
-            retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-        )
-        if retryable_last_failure:
-            retryable_failure_seen = True
-            retryable_failure_fingerprint = current_failure_fingerprint
-            db_pool_reset_count += db_pool_reset_this_retry
-
-        retry_count += 1
-        _log_session_history_retry(
-            retry_message=retry_message,
-            retry_count=retry_count,
-            batch_size=len(batch),
-            retryable_last_failure=retryable_last_failure,
-            db_pool_reset_this_retry=db_pool_reset_this_retry,
-            db_pool_reset_count=db_pool_reset_count,
-            retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-            spooled=retry_write_ahead_spool_path is not None,
-            degraded_telemetry=retryable_failure_seen,
-            failure_fingerprint=retryable_failure_fingerprint,
-        )
-        time.sleep(retry_seconds)
-
-    if retryable_failure_seen:
-        _log_recovered_retryable_session_history_flush(
-            retry_count=retry_count,
-            batch_size=len(batch),
-            db_pool_reset_count=db_pool_reset_count,
-            retry_write_ahead_spool_path=retry_write_ahead_spool_path,
-            failure_fingerprint=retryable_failure_fingerprint,
-        )
-
-
-def _session_history_worker_main() -> None:
-    flush_interval = _get_session_history_flush_interval_seconds()
-    batch_size = _get_session_history_batch_size()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        while True:
-            try:
-                first_item = _aawm_session_history_queue.get(timeout=flush_interval)
-            except queue.Empty:
-                continue
-
-            if first_item is None:
-                # Sentinel: flush any backlog left behind the sentinel (B5).
-                while True:
-                    try:
-                        leftover = _aawm_session_history_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if leftover is None:
-                        continue
-                    _flush_session_history_batch_with_retry([leftover], loop=loop)
-                break
-
-            batch: List[Dict[str, Any]] = [first_item]
-            deadline = time.monotonic() + flush_interval
-            while len(batch) < batch_size:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    next_item = _aawm_session_history_queue.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                if next_item is None:
-                    _flush_session_history_batch_with_retry(batch, loop=loop)
-                    # Drain remaining non-sentinel items before exit (B5).
-                    while True:
-                        try:
-                            leftover = _aawm_session_history_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        if leftover is None:
-                            continue
-                        _flush_session_history_batch_with_retry(
-                            [leftover], loop=loop
-                        )
-                    return
-                batch.append(next_item)
-
-            _flush_session_history_batch_with_retry(batch, loop=loop)
-    finally:
-        loop.run_until_complete(_close_aawm_session_history_pools_for_current_loop())
-        loop.close()
-
-
-
-def _ensure_session_history_worker_started() -> None:
-    global _aawm_session_history_worker
-
-    if _aawm_session_history_worker is not None and _aawm_session_history_worker.is_alive():
-        return
-
-    with _aawm_session_history_worker_lock:
-        if _aawm_session_history_worker is not None and _aawm_session_history_worker.is_alive():
-            return
-
-        _aawm_session_history_worker = threading.Thread(
-            target=_session_history_worker_main,
-            name="aawm-session-history-writer",
-            daemon=True,
-        )
-        _aawm_session_history_worker.start()
-
-
-
-def _shutdown_session_history_worker() -> None:
-    worker = _aawm_session_history_worker
-    if worker is None:
-        return
-
-    try:
-        _aawm_session_history_queue.put(
-            None,
-            timeout=max(
-                _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
-                _get_session_history_flush_interval_seconds(),
-            ),
-        )
-    except queue.Full:
-        verbose_logger.warning(
-            "AawmAgentIdentity: session_history queue full during shutdown; worker pool cleanup may be delayed"
-        )
-
-    worker.join(timeout=1.0)
-
-
-def _format_exception_for_warning(exc: Exception) -> str:
-    message = str(exc)
-    if message:
-        return message
-    return f"{type(exc).__name__}: {exc!r}"
-
-
-def _drain_session_history_queue_for_spool(max_records: int) -> List[Dict[str, Any]]:
-    drained: List[Dict[str, Any]] = []
-    get_nowait = getattr(_aawm_session_history_queue, "get_nowait", None)
-    if not callable(get_nowait):
-        return drained
-    sentinel_seen = False
-    while len(drained) < max_records:
-        try:
-            item = get_nowait()
-        except queue.Empty:
-            break
-        if item is None:
-            sentinel_seen = True
-            break
-        drained.append(item)
-
-    if sentinel_seen:
-        try:
-            _aawm_session_history_queue.put_nowait(None)
-        except queue.Full:
-            verbose_logger.warning(
-                "AawmAgentIdentity: session_history shutdown sentinel could not "
-                "be restored while draining queue for spool (%s)",
-                _session_history_queue_depth_summary(),
-            )
-    return drained
-
-
-def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
-    _ensure_session_history_worker_started()
-    degraded_context = _get_session_history_degraded_spooling_context()
-    if degraded_context is not None:
-        drained_records = _drain_session_history_queue_for_spool(
-            max(
-                0,
-                min(
-                    _get_session_history_batch_size() - 1,
-                    _AAWM_SESSION_HISTORY_QUEUE_DRAIN_TO_SPOOL_MAX_RECORDS,
-                ),
-            )
-        )
-        spool_batch = [*drained_records, record]
-        verbose_logger.warning(
-            "AawmAgentIdentity: session_history DB degraded; spooling enqueue "
-            "batch for replay (queue_disposition=db_degraded_spooling, "
-            "drained_queue_records=%d, record_count=%d, degraded_remaining_s=%s, "
-            "failure_fingerprint=%s, %s)",
-            len(drained_records),
-            len(spool_batch),
-            degraded_context.get("remaining_seconds"),
-            degraded_context.get("failure_fingerprint"),
-            _session_history_queue_depth_summary(),
-        )
-        try:
-            _spool_session_history_records(
-                spool_batch,
-                reason="db degraded enqueue",
-                start_drainer=False,
-            )
-            return
-        except Exception as exc:
-            verbose_logger.exception(
-                "AawmAgentIdentity: failed to spool session_history record "
-                "during DB degraded mode; falling back to inline protection "
-                "(queue_disposition=spool_write_failed, "
-                "unprotected_record_risk=true, record_count=%d): %s",
-                len(spool_batch),
-                _format_exception_for_warning(exc),
-            )
-            _flush_session_history_batch_with_retry(
-                spool_batch,
-                retry_message="inline session_history degraded spool failure",
-            )
-            return
-
-    try:
-        _aawm_session_history_queue.put(
-            record,
-            timeout=_AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
-        )
-    except queue.Full:
-        if not _aawm_session_history_overflow_flush_semaphore.acquire(blocking=False):
-            try:
-                _aawm_session_history_queue.put(
-                    record,
-                    timeout=max(
-                        _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
-                        _get_session_history_flush_interval_seconds(),
-                    ),
-                )
-                verbose_logger.warning(
-                    "AawmAgentIdentity: session_history queue full; queued "
-                    "record after waiting (queue_disposition=queued_after_wait, %s)",
-                    _session_history_queue_depth_summary(),
-                )
-                return
-            except queue.Full:
-                pass
-
-            drain_limit = max(
-                0,
-                min(
-                    _get_session_history_batch_size() - 1,
-                    _AAWM_SESSION_HISTORY_QUEUE_DRAIN_TO_SPOOL_MAX_RECORDS,
-                ),
-            )
-            drained_records = _drain_session_history_queue_for_spool(drain_limit)
-            spool_batch = [*drained_records, record]
-            verbose_logger.warning(
-                "AawmAgentIdentity: session_history queue full and overflow flusher "
-                "busy; spooling overflow batch for retry "
-                "(queue_disposition=spool_write_started, drained_queue_records=%d, "
-                "record_count=%d, %s)",
-                len(drained_records),
-                len(spool_batch),
-                _session_history_queue_depth_summary(),
-            )
-            try:
-                _spool_session_history_records(
-                    spool_batch,
-                    reason="queue full overflow",
-                )
-            except Exception as exc:
-                verbose_logger.exception(
-                    "AawmAgentIdentity: failed to spool session_history overflow "
-                    "batch; potential data loss until inline retry succeeds "
-                    "(queue_disposition=spool_write_failed, "
-                    "unprotected_record_risk=true, record_count=%d): %s",
-                    len(spool_batch),
-                    _format_exception_for_warning(exc),
-                )
-                _flush_session_history_batch_with_retry(
-                    spool_batch,
-                    retry_message="inline session_history overflow after spool failure",
-                )
-            return
-
-        verbose_logger.warning(
-            "AawmAgentIdentity: session_history queue full; flushing overflow "
-            "record in background (queue_disposition=overflow_flush_started, %s)",
-            _session_history_queue_depth_summary(),
-        )
-        try:
-            threading.Thread(
-                target=_flush_session_history_overflow_record,
-                args=(record,),
-                name="aawm-session-history-overflow",
-                daemon=True,
-            ).start()
-        except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity: failed to start session_history overflow flusher; flushing inline: %s",
-                _format_exception_for_warning(exc),
-            )
-            try:
-                _flush_session_history_batch([record])
-            finally:
-                _aawm_session_history_overflow_flush_semaphore.release()
-
-
-atexit.register(_shutdown_session_history_worker)
 
 
 def _content_to_text(content: Any) -> str:
-    """Convert message content (string or Anthropic content blocks) to plain text."""
+    """Convert message content (string or Anthropic content blocks) to plain text.
+
+    Only text-bearing content is kept. Non-text Anthropic/OpenAI content blocks
+    (tool_use, tool_result, image, thinking, etc.) are skipped rather than
+    contributing blank lines, so identity/text extraction is not diluted by
+    empty placeholders.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts: List[str] = []
         for block in content:
             if isinstance(block, dict):
-                parts.append(str(block.get("text", "")))
+                if "text" not in block:
+                    continue
+                text = block.get("text")
+                if text is None:
+                    continue
+                text_str = str(text)
+                if text_str:
+                    parts.append(text_str)
             else:
-                parts.append(str(block))
+                text_str = str(block)
+                if text_str:
+                    parts.append(text_str)
         return "\n".join(parts)
     return str(content) if content else ""
 
@@ -4703,33 +1271,12 @@ def _append_aawm_dsn_query_params(
     )
 
 
-def _get_session_history_application_name() -> str:
-    return (
-        _get_first_secret_value(_AAWM_DB_APPLICATION_NAME_ENV_VARS)
-        or _AAWM_SESSION_HISTORY_APPLICATION_NAME
-    )
 
 
-def _get_session_history_server_settings() -> Dict[str, str]:
-    return {"application_name": _get_session_history_application_name()}
 
 
-async def _initialize_session_history_connection(conn: Any) -> None:
-    await conn.execute(
-        "select set_config($1, $2, false)",
-        "application_name",
-        _get_session_history_application_name(),
-    )
 
 
-def _build_session_history_dsn() -> Optional[str]:
-    dsn = _build_aawm_dsn()
-    if not dsn:
-        return None
-    return _append_aawm_dsn_query_params(
-        dsn,
-        {"application_name": _get_session_history_application_name()},
-    )
 
 
 def _clean_non_empty_string(value: Any) -> Optional[str]:
@@ -5283,23 +1830,25 @@ def _is_bare_dot_directory(value: str) -> bool:
 def _normalize_repository_identity_from_absolute_path(
     normalized_path: str,
 ) -> Optional[str]:
-    if normalized_path == _CODEX_MEMORY_ROOT_PATH:
+    codex_memory_root = _get_codex_memory_root_path()
+    workspace_prefix = _aawm_workspace_root_prefix()
+    if normalized_path == codex_memory_root:
         return _CODEX_MEMORY_ROOT_REPOSITORY
 
     path_parts = normalized_path.rsplit("/", 1)
     basename = path_parts[-1]
     if basename.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES and len(path_parts) > 1:
         parent_path = path_parts[0].rstrip("/")
-        if parent_path == _CODEX_MEMORY_ROOT_PATH:
+        if parent_path == codex_memory_root:
             return _CODEX_MEMORY_ROOT_REPOSITORY
-        if parent_path.startswith("/home/zepfu/projects/"):
+        if parent_path.startswith(workspace_prefix):
             return parent_path.rsplit("/", 1)[-1]
         return None
 
     # Trusted workspace roots map to repos; nested prompt-text file paths under
     # a project are references, not session ownership.
-    if normalized_path.startswith("/home/zepfu/projects/"):
-        sub = normalized_path[len("/home/zepfu/projects/") :].strip("/")
+    if normalized_path.startswith(workspace_prefix):
+        sub = normalized_path[len(workspace_prefix) :].strip("/")
         if not sub:
             return None
         if "/" not in sub:
@@ -5368,10 +1917,14 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
 def _extract_repository_identity_from_text_with_source(
     value: str,
 ) -> Tuple[Optional[str], Optional[str]]:
+    # Rebuild from configured roots so env overrides work without process restart
+    # of module constants used only for default import-time snapshots.
+    patterns = _build_aawm_repository_text_patterns()
+    markers = _aawm_repository_text_markers()
     normalized_value = value.lower()
-    if not any(marker in normalized_value for marker in _AAWM_REPOSITORY_TEXT_MARKERS):
+    if not any(marker in normalized_value for marker in markers):
         return None, None
-    for index, pattern in enumerate(_AAWM_REPOSITORY_TEXT_PATTERNS):
+    for index, pattern in enumerate(patterns):
         matches = list(pattern.finditer(value))
         for match in reversed(matches):
             repository = _normalize_repository_identity(match.group("path"))
@@ -5615,6 +2168,11 @@ def _extract_repository_identity_from_kwargs_with_source(
         if repository:
             return repository, f"request_headers.{header_name}"
 
+    # Prefer structured metadata, then request bodies that carry workspace text.
+    # Do not deep-scan the entire kwargs / standard_logging_object /
+    # passthrough_logging_payload graphs as undifferentiated last-resort
+    # catch-alls (RR-006 #18). Per-value walkers already enforce depth/cycle
+    # guards on the retained body sources.
     repository, source = _extract_repository_identity_from_metadata_sources_with_source(
         (
             "standard_logging_object.metadata.requester_custom_headers.x-codex-turn-metadata",
@@ -5630,9 +2188,6 @@ def _extract_repository_identity_from_kwargs_with_source(
         ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
         ("passthrough_logging_payload.request_body.litellm_metadata", passthrough_body.get("litellm_metadata")),
         ("passthrough_logging_payload.request_body", passthrough_body),
-        ("passthrough_logging_payload", passthrough_payload),
-        ("standard_logging_object", standard_logging_object),
-        ("kwargs", kwargs),
     )
     if repository:
         return repository, source
@@ -5644,12 +2199,9 @@ def _extract_repository_identity_from_kwargs_with_source(
         ("litellm_params.proxy_server_request.body", proxy_body),
         ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
         ("litellm_params.proxy_server_request.body.litellm_metadata", proxy_body.get("litellm_metadata")),
-        ("passthrough_logging_payload", passthrough_payload),
         ("passthrough_logging_payload.request_body", passthrough_body),
         ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
         ("passthrough_logging_payload.request_body.litellm_metadata", passthrough_body.get("litellm_metadata")),
-        ("standard_logging_object", standard_logging_object),
-        ("kwargs", kwargs),
     )
     if repository:
         return repository, _source
@@ -5702,9 +2254,11 @@ def _payload_contains_codex_memory_workflow_markers(value: Any) -> bool:
     found_required_marker = False
     found_context_marker = False
 
-    def visit(child: Any) -> None:
+    def visit(child: Any, *, _depth: int = 0, _seen: Optional[Set[int]] = None) -> None:
         nonlocal found_required_marker, found_context_marker
         if found_required_marker and found_context_marker:
+            return
+        if _depth > 12:
             return
         if isinstance(child, str):
             normalized = child.lower()
@@ -5716,14 +2270,21 @@ def _payload_contains_codex_memory_workflow_markers(value: Any) -> bool:
             ):
                 found_context_marker = True
             return
+        if isinstance(child, (dict, list)):
+            if _seen is None:
+                _seen = set()
+            child_id = id(child)
+            if child_id in _seen:
+                return
+            _seen.add(child_id)
         if isinstance(child, dict):
             for nested in child.values():
-                visit(nested)
+                visit(nested, _depth=_depth + 1, _seen=_seen)
                 if found_required_marker and found_context_marker:
                     return
         elif isinstance(child, list):
             for nested in child:
-                visit(nested)
+                visit(nested, _depth=_depth + 1, _seen=_seen)
                 if found_required_marker and found_context_marker:
                     return
 
@@ -5976,9 +2537,6 @@ def _build_session_runtime_identity(
     if cc_version and (client_name is None or client_name.lower() == "claude-code"):
         client_name = "claude-code"
         client_version = cc_version
-    elif cc_version and client_name is None:
-        client_name = "claude-code"
-        client_version = cc_version
     if cc_entrypoint and client_name is None:
         client_name = cc_entrypoint
 
@@ -6175,16 +2733,24 @@ def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
 
 
 def _ensure_mutable_headers(kwargs: Dict[str, Any]) -> dict:
-    """Ensure proxy_server_request.headers is a mutable dict."""
-    litellm_params = kwargs.get("litellm_params") or {}
-    psr = litellm_params.get("proxy_server_request") or {}
+    """Ensure proxy_server_request.headers is a mutable dict.
+
+    Mirrors `_ensure_mutable_metadata`: create and reattach the headers dict
+    through litellm_params/proxy_server_request so callers can mutate it.
+    """
+    litellm_params = kwargs.get("litellm_params")
+    if not isinstance(litellm_params, dict):
+        litellm_params = {}
+        kwargs["litellm_params"] = litellm_params
+
+    psr = litellm_params.get("proxy_server_request")
+    if not isinstance(psr, dict):
+        psr = {}
+        litellm_params["proxy_server_request"] = psr
+
     headers = psr.get("headers")
-
-    if headers is None:
-        return {}
-
     if not isinstance(headers, dict):
-        headers = dict(headers)
+        headers = dict(headers) if headers is not None else {}
         psr["headers"] = headers
 
     return headers
@@ -6297,7 +2863,7 @@ def _is_codex_subagent_context(
         )
         if nested_thread_source and nested_thread_source.lower() == "subagent":
             return True
-        if "subagent" in nested_source:
+        if nested_source.get("subagent"):
             return True
     return False
 
@@ -6623,10 +3189,35 @@ def _maybe_parse_json_text(value: str) -> Any:
         return None
 
 
-def _extract_claude_permission_check_decision_from_value(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if type(value).__module__.startswith("unittest.mock"):
+def _permission_check_probeable_value(value: Any) -> bool:
+    """True when *value* is a concrete response-shaped container we should walk.
+
+    Restricts attribute probing to dicts and objects that already expose the
+    known fields, so free-form getattr on test doubles / arbitrary objects is
+    not required in production code.
+    """
+    if isinstance(value, (str, list, dict)):
+        return True
+    if value is None or isinstance(value, (bool, int, float, bytes)):
+        return False
+    for key in ("content", "choices", "response", "message"):
+        try:
+            if isinstance(value, dict) and key in value:
+                return True
+            obj_dict = getattr(value, "__dict__", None)
+            if isinstance(obj_dict, dict) and key in obj_dict:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _extract_claude_permission_check_decision_from_value(
+    value: Any,
+    *,
+    _depth: int = 0,
+) -> Optional[str]:
+    if value is None or _depth > 8:
         return None
 
     if isinstance(value, str):
@@ -6636,7 +3227,9 @@ def _extract_claude_permission_check_decision_from_value(value: Any) -> Optional
             return match.group("decision").lower()
         parsed_value = _maybe_parse_json_text(stripped_value)
         if parsed_value is not None:
-            return _extract_claude_permission_check_decision_from_value(parsed_value)
+            return _extract_claude_permission_check_decision_from_value(
+                parsed_value, _depth=_depth + 1
+            )
         return None
 
     if isinstance(value, list):
@@ -6645,26 +3238,37 @@ def _extract_claude_permission_check_decision_from_value(value: Any) -> Optional
         if match is not None:
             return match.group("decision").lower()
         for item in value:
-            decision = _extract_claude_permission_check_decision_from_value(item)
+            decision = _extract_claude_permission_check_decision_from_value(
+                item, _depth=_depth + 1
+            )
             if decision is not None:
                 return decision
         return None
 
+    if not _permission_check_probeable_value(value):
+        return None
+
     content = _maybe_get(value, "content")
-    if content is not None:
-        decision = _extract_claude_permission_check_decision_from_value(content)
+    if content is not None and content is not value:
+        decision = _extract_claude_permission_check_decision_from_value(
+            content, _depth=_depth + 1
+        )
         if decision is not None:
             return decision
 
     message = _extract_first_response_message(value)
     if message is not None and message is not value:
-        decision = _extract_claude_permission_check_decision_from_value(message)
+        decision = _extract_claude_permission_check_decision_from_value(
+            message, _depth=_depth + 1
+        )
         if decision is not None:
             return decision
 
     response = _maybe_get(value, "response")
     if response is not None and response is not value:
-        decision = _extract_claude_permission_check_decision_from_value(response)
+        decision = _extract_claude_permission_check_decision_from_value(
+            response, _depth=_depth + 1
+        )
         if decision is not None:
             return decision
 
@@ -6944,8 +3548,11 @@ def _apply_claude_auto_review_identity_to_record(record: Dict[str, Any]) -> None
     record["metadata"] = metadata
     record["model"] = _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
     record["agent_name"] = _CLAUDE_AUTO_REVIEW_AGENT_NAME
-    record["repository"] = repository
-    record["tenant_id"] = tenant_id or repository
+    if repository is not None:
+        record["repository"] = repository
+    resolved_tenant = tenant_id or repository
+    if resolved_tenant is not None:
+        record["tenant_id"] = resolved_tenant
 
 
 def _extract_claude_auto_review_identity_from_row(
@@ -7063,6 +3670,11 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_str(value: Any) -> Optional[str]:
+    """Shared string coercion for backfill/repair scripts and identity helpers."""
+    return _clean_non_empty_string(value)
 
 
 def _first_non_none(*values: Any) -> Any:
@@ -7317,6 +3929,8 @@ def _infer_window_start_at(
 def _quota_period_from_window_minutes(window_minutes: Optional[int]) -> Optional[str]:
     if window_minutes is None:
         return None
+    if window_minutes == 60:
+        return "hourly"
     if window_minutes == 300:
         return "five_hour"
     if window_minutes == 10080:
@@ -7423,41 +4037,50 @@ def _json_safe_rate_limit_value(
         if value_id in _seen:
             return "<recursive>"
         _seen.add(value_id)
-        return {
-            str(key): _json_safe_rate_limit_value(
-                nested_value,
-                _seen=_seen,
-                _depth=_depth + 1,
-            )
-            for key, nested_value in list(value.items())
-            if isinstance(key, (str, int, float, bool))
-        }
+        try:
+            return {
+                str(key): _json_safe_rate_limit_value(
+                    nested_value,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+                for key, nested_value in list(value.items())
+                if isinstance(key, (str, int, float, bool))
+            }
+        finally:
+            _seen.discard(value_id)
     if isinstance(value, list):
         value_id = id(value)
         if value_id in _seen:
             return ["<recursive>"]
         _seen.add(value_id)
-        return [
-            _json_safe_rate_limit_value(
-                item,
-                _seen=_seen,
-                _depth=_depth + 1,
-            )
-            for item in value[:100]
-        ]
+        try:
+            return [
+                _json_safe_rate_limit_value(
+                    item,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+                for item in value[:100]
+            ]
+        finally:
+            _seen.discard(value_id)
     if isinstance(value, tuple):
         value_id = id(value)
         if value_id in _seen:
             return ["<recursive>"]
         _seen.add(value_id)
-        return [
-            _json_safe_rate_limit_value(
-                item,
-                _seen=_seen,
-                _depth=_depth + 1,
-            )
-            for item in value[:100]
-        ]
+        try:
+            return [
+                _json_safe_rate_limit_value(
+                    item,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+                for item in value[:100]
+            ]
+        finally:
+            _seen.discard(value_id)
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8", errors="replace")[:500]
@@ -7490,6 +4113,10 @@ def _coerce_rate_limit_payload(value: Any) -> Any:
         return None
     stripped = value.strip()
     if not stripped:
+        return None
+    # Fail closed on unbounded attacker/provider-influenced text before
+    # JSON/literal evaluation (ast.literal_eval is not DoS-safe on deep nests).
+    if len(stripped) > 8192:
         return None
     parsed = _safe_json_load(stripped, None)
     if parsed is not None:
@@ -7638,28 +4265,41 @@ def _resolve_rate_limit_model(
 
 def _infer_model_family_and_tier(*values: Any) -> Tuple[Optional[str], Optional[str]]:
     text = " ".join(str(value) for value in values if value is not None).lower()
+
+    def _has_token(token: str) -> bool:
+        return re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", text) is not None
+
     model_tier = None
-    if "sonnet" in text:
+    if _has_token("sonnet"):
         model_tier = "sonnet"
-    elif "opus" in text:
+    elif _has_token("opus"):
         model_tier = "opus"
-    elif "haiku" in text:
+    elif _has_token("haiku"):
         model_tier = "haiku"
-    elif "flash-lite" in text or "flash_lite" in text:
+    elif "flash-lite" in text or "flash_lite" in text or _has_token("flash-lite"):
         model_tier = "flash_lite"
-    elif "flash" in text:
+    elif _has_token("flash"):
         model_tier = "flash"
-    elif "pro" in text:
+    elif _has_token("pro"):
         model_tier = "pro"
 
     if "claude" in text or model_tier in {"sonnet", "opus", "haiku"}:
         return "claude", model_tier
-    if "gemini" in text or model_tier in {"pro", "flash", "flash_lite"}:
-        return "gemini", model_tier
+    # Prefer explicit OpenAI/Codex markers over tier-based gemini inference so
+    # names like gpt-5-pro / o1-pro and metadata containing "project"/"prod"
+    # do not get misclassified as gemini solely because of a "pro" token.
+    if (
+        "gpt" in text
+        or "openai" in text
+        or _has_token("o1")
+        or _has_token("o3")
+        or _has_token("o4")
+    ):
+        return "openai", model_tier
     if "codex" in text:
         return "codex", model_tier
-    if "gpt" in text or "openai" in text:
-        return "openai", model_tier
+    if "gemini" in text or "gemma" in text or model_tier in {"pro", "flash", "flash_lite"}:
+        return "gemini", model_tier
     return None, model_tier
 
 
@@ -7987,12 +4627,41 @@ def _build_rate_limit_key(
     return ":".join(normalized_parts)
 
 
+_AAWM_RATE_LIMIT_CONTEXT_CACHE_KEY = "_aawm_rate_limit_context_cache"
+
+
 def _build_rate_limit_context(
     kwargs: Dict[str, Any],
     result: Any,
     end_time: Any,
     source: Optional[str],
 ) -> Dict[str, Any]:
+    """Build (and request-cache) shared rate-limit observation context.
+
+    Repository/tenant extraction can deep-walk large request payloads. Cache the
+    expensive identity fields once per kwargs object so the nine extractors that
+    call this helper do not re-scan the miss path.
+    """
+    cache: Optional[Dict[str, Any]] = None
+    if isinstance(kwargs, dict):
+        raw_cache = kwargs.get(_AAWM_RATE_LIMIT_CONTEXT_CACHE_KEY)
+        if isinstance(raw_cache, dict):
+            cache = raw_cache
+        else:
+            cache = {}
+            kwargs[_AAWM_RATE_LIMIT_CONTEXT_CACHE_KEY] = cache
+
+    cache_key = (
+        id(result),
+        source,
+        id(end_time) if not isinstance(end_time, (str, int, float)) else end_time,
+    )
+    if cache is not None and cache_key in cache:
+        cached = cache[cache_key]
+        if isinstance(cached, dict):
+            # Return a shallow copy so extractors can mutate client_family safely.
+            return dict(cached)
+
     metadata = _merged_rate_limit_metadata(kwargs)
     model = _resolve_rate_limit_model(kwargs, result, metadata)
     provider = _normalize_session_history_provider(
@@ -8012,26 +4681,46 @@ def _build_rate_limit_context(
         kwargs=kwargs,
         allow_runtime=True,
     )
-    tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=kwargs.get("standard_logging_object") or {},
-    )
-    repository = _extract_repository_identity_from_kwargs(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=kwargs.get("standard_logging_object") or {},
-    )
-    return {
+
+    identity_cache_key = "_identity"
+    identity: Optional[Dict[str, Any]] = None
+    if cache is not None and isinstance(cache.get(identity_cache_key), dict):
+        identity = cache[identity_cache_key]
+    if identity is None:
+        tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(
+            kwargs,
+            metadata=metadata,
+            standard_logging_object=kwargs.get("standard_logging_object") or {},
+        )
+        repository = _extract_repository_identity_from_kwargs(
+            kwargs,
+            metadata=metadata,
+            standard_logging_object=kwargs.get("standard_logging_object") or {},
+        )
+        identity = {
+            "tenant_id": tenant_id,
+            "repository": repository,
+            "session_id": _extract_session_id(kwargs),
+            "trace_id": _extract_trace_id(kwargs),
+            "account_hash": _extract_rate_limit_account_hash(kwargs, metadata),
+            "environment": runtime_identity.get("litellm_environment"),
+            "client_name": runtime_identity.get("client_name"),
+            "client_version": runtime_identity.get("client_version"),
+            "client_user_agent": runtime_identity.get("client_user_agent"),
+        }
+        if cache is not None:
+            cache[identity_cache_key] = identity
+
+    context = {
         "observed_at": _normalize_datetime(end_time) or datetime.now(timezone.utc),
         "provider": provider,
         "client_family": client_family,
-        "account_hash": _extract_rate_limit_account_hash(kwargs, metadata),
-        "environment": runtime_identity.get("litellm_environment"),
-        "tenant_id": tenant_id,
-        "repository": repository,
-        "session_id": _extract_session_id(kwargs),
-        "trace_id": _extract_trace_id(kwargs),
+        "account_hash": identity["account_hash"],
+        "environment": identity["environment"],
+        "tenant_id": identity["tenant_id"],
+        "repository": identity["repository"],
+        "session_id": identity["session_id"],
+        "trace_id": identity["trace_id"],
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "route_family": metadata.get("passthrough_route_family"),
         "request_model": _first_non_empty_string(
@@ -8045,11 +4734,14 @@ def _build_rate_limit_context(
         "model": model,
         "model_family": model_family,
         "model_tier": model_tier,
-        "client_name": runtime_identity.get("client_name"),
-        "client_version": runtime_identity.get("client_version"),
-        "client_user_agent": runtime_identity.get("client_user_agent"),
+        "client_name": identity["client_name"],
+        "client_version": identity["client_version"],
+        "client_user_agent": identity["client_user_agent"],
         "metadata": metadata,
     }
+    if cache is not None:
+        cache[cache_key] = context
+    return dict(context)
 
 
 def _finalize_rate_limit_observation(
@@ -8154,10 +4846,13 @@ def _dedupe_rate_limit_observations(
     return deduped
 
 
-def _rate_limit_snapshot_signature(observation: Dict[str, Any]) -> Tuple[Any, ...]:
+def _rate_limit_snapshot_signature(
+    observation: Dict[str, Any],
+    *,
+    include_reset: bool = True,
+) -> Tuple[Any, ...]:
     provider_resets_at = _parse_provider_timestamp(observation.get("provider_resets_at"))
-    return (
-        provider_resets_at,
+    body = (
         _safe_float(observation.get("used_percentage")),
         _safe_int(observation.get("remaining_requests")),
         _safe_int(observation.get("used_requests")),
@@ -8174,6 +4869,9 @@ def _rate_limit_snapshot_signature(observation: Dict[str, Any]) -> Tuple[Any, ..
         if provider_resets_at is not None
         else _safe_int(observation.get("reset_hint_seconds")),
     )
+    if include_reset:
+        return (provider_resets_at, *body)
+    return body
 
 
 def _rate_limit_observation_has_meaningful_change(
@@ -8185,8 +4883,12 @@ def _rate_limit_observation_has_meaningful_change(
 
     previous_reset = _parse_provider_timestamp(previous.get("provider_resets_at"))
     current_reset = _parse_provider_timestamp(current.get("provider_resets_at"))
-    previous_without_reset = _rate_limit_snapshot_signature(previous)[1:]
-    current_without_reset = _rate_limit_snapshot_signature(current)[1:]
+    previous_without_reset = _rate_limit_snapshot_signature(
+        previous, include_reset=False
+    )
+    current_without_reset = _rate_limit_snapshot_signature(
+        current, include_reset=False
+    )
     if previous_without_reset != current_without_reset:
         return True
     if previous_reset is None or current_reset is None:
@@ -8338,6 +5040,7 @@ def _extract_codex_header_rate_limit_observations(
     )
     observations: List[Dict[str, Any]] = []
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
         has_codex_header = any(
             isinstance(key, str) and key.lower().startswith("x-codex-")
@@ -8346,19 +5049,26 @@ def _extract_codex_header_rate_limit_observations(
         if not has_codex_header and source != "codex_response_headers":
             continue
 
+        active_limit = _get_rate_limit_header_value(
+            candidate,
+            "x-codex-active-limit",
+            lower_headers=lower_headers,
+        )
         header_groups = [
             {
                 "header_prefix": "x-codex",
                 "limit_id": "codex",
                 "limit_name": (
-                    f"Codex {_get_rate_limit_header_value(candidate, 'x-codex-active-limit')}"
-                    if _get_rate_limit_header_value(candidate, "x-codex-active-limit")
-                    else "Codex"
+                    f"Codex {active_limit}" if active_limit else "Codex"
                 ),
             }
         ]
         bengalfox_limit_name = _clean_non_empty_string(
-            _get_rate_limit_header_value(candidate, "x-codex-bengalfox-limit-name")
+            _get_rate_limit_header_value(
+                candidate,
+                "x-codex-bengalfox-limit-name",
+                lower_headers=lower_headers,
+            )
         )
         if bengalfox_limit_name:
             header_groups.append(
@@ -8382,17 +5092,27 @@ def _extract_codex_header_rate_limit_observations(
                 over_limit_key = (
                     f"{header_prefix}-{limit_scope}-over-secondary-limit-percent"
                 )
-                reset_value = _get_rate_limit_header_value(candidate, reset_key)
+                reset_value = _get_rate_limit_header_value(
+            candidate, reset_key,
+            lower_headers=lower_headers
+        )
                 reset_hint_seconds = _safe_int(
-                    _get_rate_limit_header_value(candidate, reset_after_key)
+                    _get_rate_limit_header_value(
+            candidate, reset_after_key,
+            lower_headers=lower_headers
+        )
                 )
                 used_percentage = _safe_float(
-                    _get_rate_limit_header_value(candidate, used_percent_key)
+                    _get_rate_limit_header_value(
+            candidate, used_percent_key,
+            lower_headers=lower_headers
+        )
                 )
                 raw_window_minutes = _get_rate_limit_header_value(
-                    candidate,
+            candidate,
                     window_minutes_key,
-                )
+            lower_headers=lower_headers
+        )
                 parsed_window_minutes = _safe_int(raw_window_minutes)
                 if raw_window_minutes is not None and (
                     parsed_window_minutes is None or parsed_window_minutes <= 0
@@ -8403,7 +5123,10 @@ def _extract_codex_header_rate_limit_observations(
                     or window_minutes
                 )
                 over_limit_percent = _safe_float(
-                    _get_rate_limit_header_value(candidate, over_limit_key)
+                    _get_rate_limit_header_value(
+            candidate, over_limit_key,
+            lower_headers=lower_headers
+        )
                 )
                 if (
                     reset_value is None
@@ -8443,29 +5166,35 @@ def _extract_codex_header_rate_limit_observations(
                             "raw_provider_fields": {
                                 reset_key: reset_value,
                                 reset_after_key: _get_rate_limit_header_value(
-                                    candidate,
+            candidate,
                                     reset_after_key,
-                                ),
+            lower_headers=lower_headers
+        ),
                                 over_limit_key: _get_rate_limit_header_value(
-                                    candidate,
+            candidate,
                                     over_limit_key,
-                                ),
+            lower_headers=lower_headers
+        ),
                                 used_percent_key: _get_rate_limit_header_value(
-                                    candidate,
+            candidate,
                                     used_percent_key,
-                                ),
+            lower_headers=lower_headers
+        ),
                                 window_minutes_key: _get_rate_limit_header_value(
-                                    candidate,
+            candidate,
                                     window_minutes_key,
-                                ),
+            lower_headers=lower_headers
+        ),
                                 "x-codex-active-limit": _get_rate_limit_header_value(
-                                    candidate,
+            candidate,
                                     "x-codex-active-limit",
-                                ),
+            lower_headers=lower_headers
+        ),
                                 "x-codex-credits-unlimited": _get_rate_limit_header_value(
-                                    candidate,
+            candidate,
                                     "x-codex-credits-unlimited",
-                                ),
+            lower_headers=lower_headers
+        ),
                             },
                             "evidence": {
                                 "signals": ["codex_response_rate_limit_headers"],
@@ -8597,15 +5326,22 @@ def _extract_codex_usage_limit_error_observations(
     return _dedupe_rate_limit_observations(observations)
 
 
-def _get_rate_limit_header_value(
-    candidate: Dict[str, Any],
-    *header_names: str,
-) -> Any:
-    lower_headers = {
+def _rate_limit_header_map(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Lowercase header keys once per candidate for repeated lookups."""
+    return {
         str(key).lower(): value
         for key, value in list(candidate.items())
         if isinstance(key, str)
     }
+
+
+def _get_rate_limit_header_value(
+    candidate: Dict[str, Any],
+    *header_names: str,
+    lower_headers: Optional[Dict[str, Any]] = None,
+) -> Any:
+    if lower_headers is None:
+        lower_headers = _rate_limit_header_map(candidate)
     for header_name in header_names:
         normalized_header_name = header_name.lower()
         for candidate_name in (
@@ -8654,6 +5390,7 @@ def _extract_anthropic_header_rate_limit_observations(
         "claude" if _looks_like_claude_rate_limit_context(context) else "anthropic"
     )
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
         has_anthropic_header = any(
             isinstance(key, str)
@@ -8679,15 +5416,27 @@ def _extract_anthropic_header_rate_limit_observations(
             threshold_key = (
                 f"anthropic-ratelimit-unified-{limit_scope}-surpassed-threshold"
             )
-            reset_value = _get_rate_limit_header_value(candidate, reset_key)
+            reset_value = _get_rate_limit_header_value(
+            candidate, reset_key,
+            lower_headers=lower_headers
+        )
             status_value = _clean_non_empty_string(
-                _get_rate_limit_header_value(candidate, status_key)
+                _get_rate_limit_header_value(
+            candidate, status_key,
+            lower_headers=lower_headers
+        )
             )
             utilization = _safe_float(
-                _get_rate_limit_header_value(candidate, utilization_key)
+                _get_rate_limit_header_value(
+            candidate, utilization_key,
+            lower_headers=lower_headers
+        )
             )
             threshold = _safe_float(
-                _get_rate_limit_header_value(candidate, threshold_key)
+                _get_rate_limit_header_value(
+            candidate, threshold_key,
+            lower_headers=lower_headers
+        )
             )
             if reset_value is None and status_value is None and utilization is None:
                 continue
@@ -8721,22 +5470,26 @@ def _extract_anthropic_header_rate_limit_observations(
                             reset_key: reset_value,
                             status_key: status_value,
                             utilization_key: _get_rate_limit_header_value(
-                                candidate,
+            candidate,
                                 utilization_key,
-                            ),
+            lower_headers=lower_headers
+        ),
                             threshold_key: _get_rate_limit_header_value(
-                                candidate,
+            candidate,
                                 threshold_key,
-                            ),
+            lower_headers=lower_headers
+        ),
                             "surpassed_threshold": threshold,
                             "anthropic-ratelimit-unified-representative-claim": _get_rate_limit_header_value(
-                                candidate,
+            candidate,
                                 "anthropic-ratelimit-unified-representative-claim",
-                            ),
+            lower_headers=lower_headers
+        ),
                             "anthropic-ratelimit-unified-overage-status": _get_rate_limit_header_value(
-                                candidate,
+            candidate,
                                 "anthropic-ratelimit-unified-overage-status",
-                            ),
+            lower_headers=lower_headers
+        ),
                         },
                         "evidence": {
                             "signals": ["anthropic_unified_rate_limit_headers"],
@@ -8765,11 +5518,20 @@ def _extract_anthropic_header_rate_limit_observations(
                 "anthropic-ratelimit-tokens-reset",
             ),
         ):
-            total = _safe_int(_get_rate_limit_header_value(candidate, total_key))
+            total = _safe_int(_get_rate_limit_header_value(
+            candidate, total_key,
+            lower_headers=lower_headers
+        ))
             remaining = _safe_int(
-                _get_rate_limit_header_value(candidate, remaining_key)
+                _get_rate_limit_header_value(
+            candidate, remaining_key,
+            lower_headers=lower_headers
+        )
             )
-            reset_value = _get_rate_limit_header_value(candidate, reset_key)
+            reset_value = _get_rate_limit_header_value(
+            candidate, reset_key,
+            lower_headers=lower_headers
+        )
             if total is None and remaining is None and reset_value is None:
                 continue
             provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
@@ -8778,7 +5540,11 @@ def _extract_anthropic_header_rate_limit_observations(
             )
             if stale_reset:
                 continue
-            used = total - remaining if total is not None and remaining is not None else None
+            used = (
+                max(0, total - remaining)
+                if total is not None and remaining is not None
+                else None
+            )
             used_percentage = (
                 (used / total) * 100
                 if used is not None and total is not None and total > 0
@@ -8800,11 +5566,15 @@ def _extract_anthropic_header_rate_limit_observations(
                         "used_requests": used,
                         "total_requests": total,
                         "raw_provider_fields": {
-                            total_key: _get_rate_limit_header_value(candidate, total_key),
+                            total_key: _get_rate_limit_header_value(
+            candidate, total_key,
+            lower_headers=lower_headers
+        ),
                             remaining_key: _get_rate_limit_header_value(
-                                candidate,
+            candidate,
                                 remaining_key,
-                            ),
+            lower_headers=lower_headers
+        ),
                             reset_key: reset_value,
                         },
                         "evidence": {
@@ -8962,6 +5732,7 @@ def _extract_xai_oauth_header_rate_limit_observations(
     )
     observations: List[Dict[str, Any]] = []
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
+        lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
         has_xai_header = any(
             isinstance(key, str) and key.lower().startswith("x-ratelimit-")
@@ -8992,11 +5763,23 @@ def _extract_xai_oauth_header_rate_limit_observations(
                 ),
             ),
         ):
-            total = _safe_int(_get_rate_limit_header_value(candidate, total_key))
-            remaining = _safe_int(_get_rate_limit_header_value(candidate, remaining_key))
-            reset_value = _get_rate_limit_header_value(candidate, *reset_keys)
+            total = _safe_int(_get_rate_limit_header_value(
+            candidate, total_key,
+            lower_headers=lower_headers
+        ))
+            remaining = _safe_int(_get_rate_limit_header_value(
+            candidate, remaining_key,
+            lower_headers=lower_headers
+        ))
+            reset_value = _get_rate_limit_header_value(
+            candidate, *reset_keys,
+            lower_headers=lower_headers
+        )
             reset_hint_seconds = _parse_reset_hint_seconds(
-                _get_rate_limit_header_value(candidate, "retry-after")
+                _get_rate_limit_header_value(
+            candidate, "retry-after",
+            lower_headers=lower_headers
+        )
             )
             if (
                 total is None
@@ -9046,7 +5829,18 @@ def _extract_xai_oauth_header_rate_limit_observations(
                         "limit_id": f"xai_oauth_{limit_scope}",
                         "limit_name": f"xAI OAuth {limit_scope} rate limit",
                         "limit_scope": limit_scope,
-                        "quota_period": "monthly" if provider_resets_at is not None else None,
+                        "quota_period": (
+                            "monthly"
+                            if reset_source
+                            in {
+                                "payload_billing_period_end",
+                                "payload_config_billing_period_end",
+                                "metadata_billing_period_end",
+                                "metadata_xai_oauth_billing_period_end",
+                                "xai_grok_subscription_month_boundary",
+                            }
+                            else None
+                        ),
                         "quota_type": limit_scope,
                         "provider_resets_at": provider_resets_at,
                         "remaining_pct": remaining_pct,
@@ -9076,16 +5870,21 @@ def _extract_xai_oauth_header_rate_limit_observations(
                         "model": model,
                         "model_family": "grok",
                         "raw_provider_fields": {
-                            total_key: _get_rate_limit_header_value(candidate, total_key),
+                            total_key: _get_rate_limit_header_value(
+            candidate, total_key,
+            lower_headers=lower_headers
+        ),
                             remaining_key: _get_rate_limit_header_value(
-                                candidate,
+            candidate,
                                 remaining_key,
-                            ),
+            lower_headers=lower_headers
+        ),
                             "reset": reset_value,
                             "retry-after": _get_rate_limit_header_value(
-                                candidate,
+            candidate,
                                 "retry-after",
-                            ),
+            lower_headers=lower_headers
+        ),
                             "billingPeriodEnd": _json_safe_rate_limit_value(
                                 _maybe_get_path(candidate, "config", "billingPeriodEnd")
                                 or candidate.get("billingPeriodEnd")
@@ -10090,6 +6889,11 @@ def _extract_provider_error_dicts(value: Any) -> List[Dict[str, Any]]:
     return deduped
 
 
+_AAWM_EMBEDDED_JSON_MAX_SUCCESS = 20
+_AAWM_EMBEDDED_JSON_MAX_ATTEMPTS = 64
+_AAWM_EMBEDDED_JSON_SCAN_CHARS = 20000
+
+
 def _extract_embedded_json_payload_dicts(value: Any) -> List[Dict[str, Any]]:
     text = _clean_non_empty_string(value)
     if text is None:
@@ -10097,9 +6901,13 @@ def _extract_embedded_json_payload_dicts(value: Any) -> List[Dict[str, Any]]:
 
     decoder = json.JSONDecoder()
     dicts: List[Dict[str, Any]] = []
-    for match in re.finditer(r"\{", text[:20000]):
-        if len(dicts) >= 20:
+    attempts = 0
+    for match in re.finditer(r"\{", text[:_AAWM_EMBEDDED_JSON_SCAN_CHARS]):
+        if len(dicts) >= _AAWM_EMBEDDED_JSON_MAX_SUCCESS:
             break
+        if attempts >= _AAWM_EMBEDDED_JSON_MAX_ATTEMPTS:
+            break
+        attempts += 1
         try:
             parsed, _end = decoder.raw_decode(text[match.start() :])
         except json.JSONDecodeError:
@@ -10387,6 +7195,25 @@ def _resolve_provider_error_model_group(
     )
 
 
+_UPSTREAM_ERROR_SECRET_RE = re.compile(
+    r"(?is)(?P<label>authorization|x-api-key|api[-_]?key|bearer|token|secret|password)"
+    r"(?P<sep>\s*[:=]\s*|\s+)"
+    r"(?P<value>(?:bearer\s+)?[^\s,\"'}{]{6,})",
+)
+
+
+def _redact_upstream_error_raw(value: Any) -> Optional[str]:
+    """Redact auth-header-shaped substrings from upstream error raw text."""
+    text = _clean_non_empty_string(value)
+    if text is None:
+        return None
+
+    def _replace(match: re.Match[str]) -> str:
+        return f"{match.group('label')}{match.group('sep')}[REDACTED]"
+
+    return _UPSTREAM_ERROR_SECRET_RE.sub(_replace, text)
+
+
 def _build_provider_error_fingerprint(
     *,
     provider: str,
@@ -10398,6 +7225,8 @@ def _build_provider_error_fingerprint(
     error_class: str,
     observation_metadata: Dict[str, Any],
 ) -> str:
+    # Exclude volatile upstream_error_raw so fingerprints can dedupe the same
+    # error class across request-specific raw bodies.
     fingerprint_source = {
         "provider": provider,
         "model": model,
@@ -10407,7 +7236,6 @@ def _build_provider_error_fingerprint(
         "error_type": error_type,
         "error_class": error_class,
         "upstream_provider_name": observation_metadata.get("upstream_provider_name"),
-        "upstream_error_raw": observation_metadata.get("upstream_error_raw"),
     }
     return hashlib.sha256(
         json.dumps(
@@ -10434,7 +7262,7 @@ def _enrich_provider_error_observation_metadata(
     if upstream_is_byok is not None:
         observation_metadata["upstream_is_byok"] = _metadata_bool(upstream_is_byok)
 
-    upstream_error_raw = _clean_non_empty_string(
+    upstream_error_raw = _redact_upstream_error_raw(
         _extract_provider_error_payload_metadata_value(dicts, "raw")
     )
     if upstream_error_raw is not None:
@@ -10768,110 +7596,9 @@ def _build_alias_routing_audit_only_record(
     }
 
 
-def _build_provider_error_observation_only_record(
-    kwargs: Dict[str, Any],
-    observation: Dict[str, Any],
-) -> Dict[str, Any]:
-    metadata = _merged_rate_limit_metadata(kwargs)
-    model = _resolve_rate_limit_model(kwargs, None, metadata)
-    return {
-        "_skip_session_history": True,
-        "litellm_call_id": kwargs.get("litellm_call_id"),
-        "session_id": _extract_session_id(kwargs),
-        "model": model,
-        "provider_error_observations": [observation],
-    }
-
-
-
-def _build_structured_output_failure_session_history_record(
-    kwargs: Dict[str, Any],
-    result: Any,
-    start_time: Any,
-    end_time: Any,
-) -> Optional[Dict[str, Any]]:
-    metadata = _merged_rate_limit_metadata(kwargs)
-    request_body = _extract_provider_cache_request_body(kwargs)
-    structured_output_state = _detect_structured_output_request(request_body, metadata)
-    if not structured_output_state.get("structured_output_attempted"):
-        return None
-
-    failure_reason = _first_non_empty_string(
-        structured_output_state.get("structured_output_failure_reason"),
-        _classify_structured_output_failure(result),
-    )
-    structured_output_state["structured_output_failed"] = bool(
-        structured_output_state.get("structured_output_failed") or failure_reason
-    )
-    structured_output_state["structured_output_failure_reason"] = failure_reason
-    _ensure_mutable_metadata(kwargs)["source_status"] = "failure"
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result={},
-        start_time=start_time,
-        end_time=end_time,
-    )
-    if record is None:
-        return None
-
-    record.update(structured_output_state)
-    return _normalize_session_history_record(record)
-
-def _build_failure_observation_only_record(
-    kwargs: Dict[str, Any],
-    result: Any,
-    start_time: Any,
-    end_time: Any,
-) -> Optional[Dict[str, Any]]:
-    failure_result = result
-    if failure_result is None:
-        failure_result = kwargs.get("exception") or kwargs.get("original_exception")
-    rate_limit_observations = _build_rate_limit_observations(
-        kwargs=kwargs,
-        result=failure_result,
-        start_time=start_time,
-        end_time=end_time,
-    )
-    provider_error_observation = _build_provider_error_observation(
-        kwargs=kwargs,
-        result=failure_result,
-        start_time=start_time,
-        end_time=end_time,
-    )
-    structured_output_record = _build_structured_output_failure_session_history_record(
-        kwargs=kwargs,
-        result=failure_result,
-        start_time=start_time,
-        end_time=end_time,
-    )
-    if (
-        not rate_limit_observations
-        and provider_error_observation is None
-        and structured_output_record is None
-    ):
-        return None
-
-    if structured_output_record is not None:
-        record = structured_output_record
-        if rate_limit_observations:
-            record["rate_limit_observations"] = rate_limit_observations
-    elif rate_limit_observations:
-        record = _build_rate_limit_observation_only_record(
-            kwargs,
-            rate_limit_observations,
-        )
-    else:
-        assert provider_error_observation is not None
-        record = _build_provider_error_observation_only_record(
-            kwargs,
-            provider_error_observation,
-        )
-    if provider_error_observation is not None:
-        record["provider_error_observations"] = [provider_error_observation]
-    return record
-
-
+# _build_provider_error_observation_only_record moved to litellm.integrations.aawm_session_history.record
+# _build_structured_output_failure_session_history_record moved to litellm.integrations.aawm_session_history.record
+# _build_failure_observation_only_record moved to litellm.integrations.aawm_session_history.record
 def _classify_rate_limit_transition(
     previous: Dict[str, Any],
     current: Dict[str, Any],
@@ -11016,24 +7743,34 @@ def _build_rate_limit_transition(
     }
 
 
+_AAWM_RESPONSES_CHUNKS_LITERAL_MAX_CHARS = 8192
+
+
 def _extract_responses_completed_payload_from_passthrough_fallback_text(
     response_text: Any,
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(response_text, str) or "Chunks=" not in response_text:
         return None
 
+    chunks_text = response_text.split("Chunks=", 1)[1].strip()
+    # Fail closed on oversized provider/passthrough text before literal_eval.
+    if len(chunks_text) > _AAWM_RESPONSES_CHUNKS_LITERAL_MAX_CHARS:
+        return None
     try:
-        chunks = ast.literal_eval(response_text.split("Chunks=", 1)[1].strip())
+        # Prefer JSON when the chunk envelope is JSON-shaped.
+        if chunks_text[:1] in "[{":
+            try:
+                chunks = json.loads(chunks_text)
+            except Exception:
+                chunks = ast.literal_eval(chunks_text)
+        else:
+            chunks = ast.literal_eval(chunks_text)
     except Exception:
         return None
     if not isinstance(chunks, list):
         return None
 
-    try:
-        from litellm.llms.base_llm.base_model_iterator import (
-            BaseModelResponseIterator,
-        )
-    except Exception:
+    if BaseModelResponseIterator is None:
         return None
 
     completed_response = None
@@ -11103,9 +7840,9 @@ def _build_usage_object_from_metadata(metadata: Dict[str, Any]) -> Optional[Dict
         reconstructed["total_tokens"] = total_tokens
     if cache_read_input_tokens is not None:
         reconstructed["cache_read_input_tokens"] = cache_read_input_tokens
-        reconstructed["input_tokens_details"] = {
-            "cached_tokens": cache_read_input_tokens
-        }
+        input_tokens_details = dict(reconstructed.get("input_tokens_details") or {})
+        input_tokens_details["cached_tokens"] = cache_read_input_tokens
+        reconstructed["input_tokens_details"] = input_tokens_details
     if cache_creation_input_tokens is not None:
         reconstructed["cache_creation_input_tokens"] = cache_creation_input_tokens
     if reasoning_tokens_reported is not None:
@@ -11147,9 +7884,12 @@ def _build_usage_object_from_token_count_payload(
         _first_non_none(
             output_payload.get("total_tokens"),
             output_payload.get("totalTokens"),
-            output_payload.get("total"),
         )
     )
+    # Only accept generic "total" when sibling token keys already establish this
+    # as a token-count payload, not a pagination/billing envelope.
+    if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+        total_tokens = _safe_int(output_payload.get("total"))
 
     if input_tokens is None and output_tokens is None and total_tokens is None:
         return None
@@ -11824,13 +8564,22 @@ def _normalize_provider_cache_family(
         return "opencode_zen"
     if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
         return "antigravity"
-    if "gemini" in model_lower:
+    if (
+        "gemini" in model_lower
+        or "gemma" in model_lower
+        or model_lower.startswith("google/")
+    ):
         return "gemini"
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
         return "anthropic"
-    if model_lower.startswith("gpt") or model_lower.startswith("o1") or model_lower.startswith("o3"):
-        return "openai"
-    if model_lower.startswith("openai/") or "codex" in model_lower:
+    if (
+        model_lower.startswith("gpt")
+        or model_lower.startswith("o1")
+        or model_lower.startswith("o3")
+        or model_lower.startswith("o4")
+        or model_lower.startswith("openai/")
+        or "codex" in model_lower
+    ):
         return "openai"
     return None
 
@@ -11934,8 +8683,7 @@ def _supports_prompt_caching_safe(
     if not normalized_model or normalized_model.lower() == "unknown":
         return None
     try:
-        import litellm
-
+        litellm = _get_litellm_module()
         return bool(
             litellm.supports_prompt_caching(
                 model=normalized_model,
@@ -13428,8 +10176,7 @@ def _estimate_reasoning_tokens(model: str, reasoning_text: str) -> Optional[int]
         return None
 
     try:
-        import litellm
-
+        litellm = _get_litellm_module()
         return litellm.token_counter(
             model=model or "",
             text=stripped_reasoning,
@@ -13530,8 +10277,7 @@ def _estimate_prompt_overhead_tokens(model: str, value: Any) -> int:
     if not text:
         return 0
     try:
-        import litellm
-
+        litellm = _get_litellm_module()
         token_count = litellm.token_counter(model=model or "", text=text)
         coerced = _safe_int(token_count)
         if coerced is not None and coerced >= 0:
@@ -14210,8 +10956,7 @@ def _estimate_rerank_request_tokens(
         return None
 
     try:
-        import litellm
-
+        litellm = _get_litellm_module()
         token_count = litellm.token_counter(model=model or "", text=combined_text)
         return _positive_int_or_none(token_count)
     except Exception as exc:
@@ -14293,14 +11038,21 @@ def _lookup_bundled_model_cost_info(
     if not model_cost:
         return None
 
-    candidates = [model]
+    # Prefer provider-qualified keys when an explicit provider is supplied so
+    # ambiguous bare model names cannot win over the intended provider entry.
+    candidates: List[str] = []
     if custom_llm_provider:
         provider_prefix = f"{custom_llm_provider}/"
         if model.startswith(provider_prefix):
+            candidates.append(model)
             stripped_model = model[len(provider_prefix) :]
-            candidates.append(stripped_model)
+            if stripped_model:
+                candidates.append(stripped_model)
         else:
             candidates.append(f"{provider_prefix}{model}")
+            candidates.append(model)
+    else:
+        candidates.append(model)
 
     lookup = _bundled_model_cost_casefold_lookup()
     for candidate in candidates:
@@ -14527,53 +11279,79 @@ def _normalize_request_header_tenant_repository(value: Any) -> Optional[str]:
     return repository
 
 
-def _is_repository_source_trusted_for_tenant(value: Any) -> bool:
+_REPOSITORY_SOURCE_CODEX_MEMORY_METADATA_MARKERS = (
+    ".metadata.",
+    ".litellm_metadata.",
+)
+_REPOSITORY_SOURCE_GENERAL_METADATA_MARKERS = (
+    ".metadata.",
+    ".litellm_metadata.",
+    ".request_metadata.",
+    ".user_api_key_metadata.",
+)
+_REPOSITORY_SOURCE_TEXT_SUFFIXES = (
+    ".text.environment_context.cwd",
+    ".text.cwd_tag",
+    ".text.agents_instructions",
+    ".text.workspace_directories",
+)
+
+
+def _normalize_repository_trust_source(value: Any) -> Optional[str]:
     source = _clean_non_empty_string(value)
     if not source:
-        return False
-    is_codex_memory_workflow = source.endswith(".codex_memory_workflow")
+        return None
     if source.endswith(".codex_memory_workflow"):
-        source = source[: -len(".codex_memory_workflow")]
-    if is_codex_memory_workflow and any(
-        marker in source
-        for marker in (
-            ".metadata.",
-            ".litellm_metadata.",
-        )
+        return source[: -len(".codex_memory_workflow")]
+    return source
+
+
+def _repository_source_has_codex_memory_workflow(value: Any) -> bool:
+    source = _clean_non_empty_string(value)
+    return bool(source and source.endswith(".codex_memory_workflow"))
+
+
+def _is_repository_source_trusted_common(
+    value: Any,
+    *,
+    allow_general_metadata_markers: bool,
+    allow_route_rollup_label: bool,
+) -> bool:
+    source = _normalize_repository_trust_source(value)
+    if not source:
+        return False
+
+    if _repository_source_has_codex_memory_workflow(value) and any(
+        marker in source for marker in _REPOSITORY_SOURCE_CODEX_MEMORY_METADATA_MARKERS
     ):
         return True
     if source == "tenant_id.request_headers":
         return True
     if source.startswith("request_headers."):
         return True
-    if any(
-        marker in source
-        for marker in (
-            ".metadata.",
-            ".litellm_metadata.",
-            ".request_metadata.",
-            ".user_api_key_metadata.",
-        )
+    if allow_general_metadata_markers and any(
+        marker in source for marker in _REPOSITORY_SOURCE_GENERAL_METADATA_MARKERS
     ):
         return True
-    if source.endswith(".aawm_route_rollup_context.group_header_label"):
+    if (
+        allow_route_rollup_label
+        and source.endswith(".aawm_route_rollup_context.group_header_label")
+    ):
         return True
-
     if (
         "x-codex-turn-metadata" in source
         and source.endswith(".text.project_path")
     ):
         return True
-    return any(
-        source.endswith(marker)
-        for marker in (
-            ".text.environment_context.cwd",
-            ".text.cwd_tag",
-            ".text.agents_instructions",
-            ".text.workspace_directories",
-        )
-    )
+    return any(source.endswith(marker) for marker in _REPOSITORY_SOURCE_TEXT_SUFFIXES)
 
+
+def _is_repository_source_trusted_for_tenant(value: Any) -> bool:
+    return _is_repository_source_trusted_common(
+        value,
+        allow_general_metadata_markers=True,
+        allow_route_rollup_label=True,
+    )
 
 
 def _is_codex_trace_user_tenant_source(value: Any) -> bool:
@@ -14601,37 +11379,12 @@ def _is_codex_passthrough_tenant_extraction_context(
 
 
 def _is_repository_source_trusted_for_codex_tenant(value: Any) -> bool:
-    source = _clean_non_empty_string(value)
-    if not source:
-        return False
-    is_codex_memory_workflow = source.endswith(".codex_memory_workflow")
-    if source.endswith(".codex_memory_workflow"):
-        source = source[: -len(".codex_memory_workflow")]
-    if is_codex_memory_workflow and any(
-        marker in source
-        for marker in (
-            ".metadata.",
-            ".litellm_metadata.",
-        )
-    ):
-        return True
-    if source == "tenant_id.request_headers":
-        return True
-    if source.startswith("request_headers."):
-        return True
-    if (
-        "x-codex-turn-metadata" in source
-        and source.endswith(".text.project_path")
-    ):
-        return True
-    return any(
-        source.endswith(marker)
-        for marker in (
-            ".text.environment_context.cwd",
-            ".text.cwd_tag",
-            ".text.agents_instructions",
-            ".text.workspace_directories",
-        )
+    # Codex trust deliberately omits general metadata markers and the
+    # route-rollup label that the general tenant helper accepts.
+    return _is_repository_source_trusted_common(
+        value,
+        allow_general_metadata_markers=False,
+        allow_route_rollup_label=False,
     )
 
 
@@ -15922,10 +12675,8 @@ def _normalize_session_history_record(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _normalize_agent_id_on_record(record: Dict[str, Any]) -> None:
-    metadata = record.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-        record["metadata"] = metadata
+    metadata = dict(record.get("metadata") or {}) if isinstance(record.get("metadata"), dict) else {}
+    record["metadata"] = metadata
     disallowed_values = _agent_id_disallowed_values(
         record.get("session_id"),
         record.get("trace_id"),
@@ -17273,72 +14024,11 @@ def _build_backfill_kwargs_from_spend_log_row(
     return kwargs, result, provenance
 
 
-def _build_session_history_record_from_spend_log_row(
-    spend_log_row: Dict[str, Any],
-    *,
-    backfill_run_id: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    prepared = _build_backfill_kwargs_from_spend_log_row(spend_log_row)
-    if prepared is None:
-        return None
 
-    kwargs, result, provenance = prepared
-    kwargs, result = _enrich_trace_name_and_provider_metadata(kwargs, result)
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time=_parse_datetime_value(spend_log_row.get("startTime")),
-        end_time=_parse_datetime_value(spend_log_row.get("endTime")),
-        allow_runtime_identity=False,
-    )
-    if record is None:
-        return None
-
-    metadata = record.get("metadata") or {}
-    metadata.update(
-        {
-            "backfilled": True,
-            "backfill_source": "LiteLLM_SpendLogs",
-            "backfill_run_id": backfill_run_id,
-            "source_request_id": provenance["source_request_id"],
-            "source_spend_log_session_field": provenance["source_spend_log_session_field"],
-            "session_id_source": provenance["session_id_source"],
-            "trace_id_source": provenance["trace_id_source"],
-            "source_status": spend_log_row.get("status"),
-        }
-    )
-    if spend_log_row.get("agent_id") is not None:
-        source_agent_id = spend_log_row.get("agent_id")
-        metadata["source_agent_id"] = source_agent_id
-        if not record.get("agent_id"):
-            agent_id = _normalize_agent_id_identity(
-                source_agent_id,
-                disallowed_values=_agent_id_disallowed_values(
-                    record.get("session_id"),
-                    record.get("trace_id"),
-                    record.get("litellm_call_id"),
-                    record.get("agent_name"),
-                    record.get("tenant_id"),
-                    record.get("repository"),
-                    metadata.get("session_id"),
-                    metadata.get("trace_id"),
-                    metadata.get("trace_user_id"),
-                    metadata.get("agent_name"),
-                    metadata.get("tenant_id"),
-                    metadata.get("repository"),
-                ),
-            )
-            if agent_id:
-                record["agent_id"] = agent_id
-                metadata["agent_id"] = agent_id
-                metadata["agent_id_source"] = "spend_log.agent_id"
-    record["metadata"] = metadata
-    _enrich_backfill_anthropic_context_window_metadata(record)
-    record["trace_id"] = kwargs.get("litellm_trace_id") or record.get("trace_id")
-    return _normalize_session_history_record(record)
-
-
+# _derive_session_history_reasoning_fields moved to litellm.integrations.aawm_session_history.record
+# _derive_session_history_tool_fields moved to litellm.integrations.aawm_session_history.record
+# _derive_session_history_provider_cache_fields moved to litellm.integrations.aawm_session_history.record
+# _build_session_history_record_from_spend_log_row moved to litellm.integrations.aawm_session_history.record
 def _derive_langfuse_trace_tags_from_spend_log_row(
     spend_log_row: Dict[str, Any],
 ) -> Tuple[Optional[str], List[str]]:
@@ -17654,422 +14344,7 @@ def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> Lis
     return sorted({tag for tag in normalized_tags if isinstance(tag, str) and tag.strip()})
 
 
-def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0915
-    trace: Dict[str, Any],
-    observation: Dict[str, Any],
-    *,
-    backfill_run_id: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    if observation.get("type") != "GENERATION":
-        return None
-
-    metadata = observation.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-
-    session_id, session_id_source = _extract_langfuse_session_id(trace, metadata)
-    if not session_id:
-        return None
-
-    trace_id = trace.get("id") or observation.get("traceId")
-    if trace_id is not None and str(trace_id).strip():
-        trace_id = str(trace_id).strip()
-    else:
-        trace_id = None
-
-    usage_object = _build_usage_object_from_langfuse_observation(observation)
-    prompt_tokens = _extract_prompt_tokens(usage_object)
-    completion_tokens = _extract_completion_tokens(usage_object)
-    total_tokens = _extract_total_tokens(usage_object, prompt_tokens, completion_tokens)
-    cache_read_input_tokens = _extract_cache_read_input_tokens(usage_object)
-    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_object)
-    reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_object)
-    provider_reported_reasoning_tokens = reported_reasoning_tokens
-    if usage_object.get("token_count_response"):
-        metadata["usage_token_count_response"] = True
-    provider = _infer_provider_from_langfuse_observation(observation, metadata)
-    output_payload = observation.get("output")
-    output_response_payload = _extract_responses_completed_response_from_langfuse_output(
-        output_payload
-    )
-    output_model = _first_non_empty_string(
-        _maybe_get(output_response_payload, "model"),
-        _extract_model_from_langfuse_output(output_payload),
-    )
-    input_model = _extract_model_from_langfuse_input(observation.get("input"))
-    explicit_openrouter_model = _first_explicit_openrouter_model_string(
-        metadata.get("codex_auto_agent_selected_model"),
-        metadata.get("anthropic_auto_agent_selected_model"),
-        metadata.get("aawm_auto_agent_selected_model"),
-        metadata.get("anthropic_adapter_original_model"),
-        metadata.get("codex_adapter_original_model"),
-        metadata.get("model"),
-        observation.get("model"),
-        output_model,
-        input_model,
-    )
-    resolved_model = _first_known_model_string(
-        explicit_openrouter_model,
-        _session_history_adapter_model(metadata),
-        _session_history_metadata_model(metadata),
-        observation.get("model"),
-        output_model,
-        input_model,
-        _extract_codex_model_from_response_headers(metadata),
-    ) or _first_non_empty_string(
-        _session_history_adapter_model(metadata),
-        _session_history_metadata_model(metadata),
-        observation.get("model"),
-        output_model,
-        input_model,
-        _extract_codex_model_from_response_headers(metadata),
-    ) or "unknown"
-    model_group = _normalize_session_history_model_group(
-        _clean_non_empty_string(metadata.get("model_group")),
-        metadata,
-        resolved_model,
-    )
-    call_type = metadata.get("user_api_key_request_route") or observation.get("name")
-    api_base = (
-        metadata.get("api_base")
-        or _maybe_get(metadata.get("hidden_params"), "api_base")
-        or observation.get("apiBase")
-    )
-    api_base_provider = _session_history_provider_from_api_base(
-        api_base,
-        call_type=call_type,
-    )
-    if (
-        api_base_provider is not None
-        and provider != "antigravity"
-        and (provider in {None, "openai"} or api_base_provider != "openai")
-    ):
-        provider = api_base_provider
-    provider, resolved_model = _apply_local_embedding_route_metadata(
-        metadata=metadata,
-        resolved_provider=provider,
-        resolved_model=resolved_model,
-        model_group=model_group,
-        call_type=call_type,
-        api_base=api_base,
-    )
-    provider, resolved_model = _apply_local_llm_route_metadata(
-        metadata=metadata,
-        resolved_provider=provider,
-        resolved_model=resolved_model,
-        model_group=model_group,
-        call_type=call_type,
-        api_base=api_base,
-    )
-    provider, resolved_model, model_group = _apply_local_biomed_route_metadata(
-        metadata=metadata,
-        resolved_provider=provider,
-        resolved_model=resolved_model,
-        model_group=model_group,
-        call_type=call_type,
-        api_base=api_base,
-    )
-    inbound_model_alias = _resolve_inbound_model_alias_from_langfuse(
-        observation=observation,
-        metadata=metadata,
-        input_model=input_model,
-        output_model=output_model,
-        resolved_model=resolved_model,
-    )
-    _enrich_anthropic_context_window_metadata(
-        dict(),
-        metadata,
-        resolved_model=resolved_model,
-        inbound_model_alias=inbound_model_alias,
-        provider=provider,
-        allow_implicit_default=False,
-    )
-    permission_decision = _extract_claude_permission_check_decision_from_value(
-        output_payload
-    )
-    if permission_decision is not None:
-        permission_blocked = permission_decision == "yes"
-        metadata["claude_internal_check"] = True
-        metadata["claude_internal_check_type"] = "permission_check"
-        metadata["claude_permission_check"] = True
-        metadata["claude_permission_check_decision"] = permission_decision
-        metadata["claude_permission_check_blocked"] = permission_blocked
-        observation_model = str(observation.get("model") or "").strip()
-        if observation_model:
-            metadata["claude_permission_check_response_model"] = observation_model
-        _merge_tags(
-            metadata,
-            [
-                "claude-internal-check",
-                "claude-permission-check",
-                f"claude-permission-check:{permission_decision}",
-                "claude-permission-check:block"
-                if permission_blocked
-                else "claude-permission-check:allow",
-            ],
-        )
-
-    message = _extract_first_langfuse_response_message(output_payload)
-    if reported_reasoning_tokens is None and provider == "gemini":
-        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
-            metadata,
-            message,
-        )
-    thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
-    reasoning_text = (
-        _extract_reasoning_content(message, thinking_blocks)
-        if message is not None
-        else ""
-    )
-
-    reasoning_present = bool(
-        (isinstance(reasoning_text, str) and reasoning_text.strip())
-        or thinking_blocks
-        or metadata.get("reasoning_content_present")
-        or (reported_reasoning_tokens and reported_reasoning_tokens > 0)
-    )
-    estimated_reasoning_tokens = None
-    if reported_reasoning_tokens is None and reasoning_present:
-        estimated_reasoning_tokens = _estimate_reasoning_tokens(
-            model=resolved_model,
-            reasoning_text=reasoning_text,
-        )
-    reasoning_tokens_source = _determine_reasoning_tokens_source(
-        provider_reported_reasoning_tokens=provider_reported_reasoning_tokens,
-        reported_reasoning_tokens=reported_reasoning_tokens,
-        estimated_reasoning_tokens=estimated_reasoning_tokens,
-        reasoning_present=reasoning_present,
-    )
-
-    tool_call_count, tool_names = _extract_tool_call_info(message)
-    tool_activity = _extract_tool_activity_from_message(message) if message is not None else []
-    if tool_call_count == 0:
-        output_tool_call_count, output_tool_names = _extract_response_output_tool_call_info(
-            output_payload
-        )
-        if output_tool_call_count > 0:
-            tool_call_count, tool_names = output_tool_call_count, output_tool_names
-    if not tool_activity:
-        tool_activity = _extract_response_output_tool_activity(output_payload)
-    if tool_call_count == 0:
-        fallback_tool_names = observation.get("toolCallNames") or observation.get(
-            "tool_call_names"
-        )
-        if isinstance(fallback_tool_names, list):
-            normalized_tool_names = [
-                str(tool_name)
-                for tool_name in fallback_tool_names
-                if isinstance(tool_name, str) and tool_name.strip()
-            ]
-            if normalized_tool_names:
-                tool_call_count = len(normalized_tool_names)
-                tool_names = normalized_tool_names
-    if tool_call_count == 0:
-        metadata_tool_names = metadata.get("usage_tool_names")
-        if isinstance(metadata_tool_names, list):
-            normalized_tool_names = [
-                str(tool_name)
-                for tool_name in metadata_tool_names
-                if isinstance(tool_name, str) and tool_name.strip()
-            ]
-            if normalized_tool_names:
-                tool_call_count = len(normalized_tool_names)
-                tool_names = normalized_tool_names
-    request_body = _extract_request_body_from_langfuse_input(observation.get("input"))
-    invalid_tool_call_count = max(
-        _extract_invalid_tool_call_count_from_request_body(request_body),
-        _safe_int(metadata.get("usage_invalid_tool_call_count")) or 0,
-    )
-    structured_output_state = _detect_structured_output_request(request_body, metadata)
-    tool_activity_summary = _summarize_tool_activity(tool_activity)
-    agent_name, tenant_id = _extract_agent_context_from_langfuse_trace_observation(
-        trace,
-        observation,
-    )
-    explicit_tenant_id, tenant_source = _extract_tenant_identity_from_langfuse_trace_observation(
-        trace,
-        observation,
-        metadata,
-    )
-    if explicit_tenant_id:
-        tenant_id = explicit_tenant_id
-    if tenant_id and tenant_source:
-        metadata["tenant_id_source"] = tenant_source
-    elif tenant_id:
-        metadata["tenant_id_source"] = "agent_context_text"
-    repository, repository_source = _extract_repository_identity_from_langfuse_trace_observation_with_source(
-        trace,
-        observation,
-        metadata,
-    )
-    if repository:
-        metadata["repository"] = repository
-        if repository_source:
-            metadata["repository_source"] = repository_source
-    agent_id, agent_id_source = _extract_agent_id_from_langfuse_trace_observation(
-        trace,
-        observation,
-        metadata,
-        agent_name=agent_name,
-        tenant_id=tenant_id,
-        repository=repository,
-    )
-    if agent_id:
-        metadata["agent_id"] = agent_id
-        if agent_id_source:
-            metadata["agent_id_source"] = agent_id_source
-    request_tags = _derive_request_tags_from_langfuse_metadata(metadata)
-    response_cost_usd = _safe_float(
-        _first_non_none(
-            _maybe_get(observation.get("costDetails"), "total"),
-            observation.get("calculatedTotalCost"),
-            metadata.get("litellm_response_cost"),
-            metadata.get("response_cost"),
-            metadata.get("usage_openrouter_cost"),
-            trace.get("totalCost"),
-        )
-    )
-    provider_cache_state = _resolve_provider_cache_state(
-        provider=provider,
-        model=resolved_model,
-        usage_obj=usage_object,
-        metadata=metadata,
-        request_body=request_body,
-    )
-    provider_cache_state = dict(provider_cache_state or {})
-    if provider_cache_state:
-        provider_cache_state.update(
-            _compute_provider_cache_miss_cost_state(
-                provider_family=provider,
-                model=resolved_model,
-                usage_obj=usage_object,
-                cache_state=provider_cache_state,
-                metadata=metadata,
-                response_cost_usd=response_cost_usd,
-            )
-        )
-
-    permission_usage_fields = _build_permission_usage_fields(
-        metadata=metadata,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        response_cost_usd=response_cost_usd,
-    )
-
-    history_metadata = _build_session_history_metadata(
-        metadata=metadata,
-        request_tags=request_tags,
-        tenant_id=tenant_id,
-    )
-    history_metadata.update(
-        {
-            "backfilled": True,
-            "backfill_source": "LangfuseTraces",
-            "backfill_run_id": backfill_run_id,
-            "source_trace_id": trace_id,
-            "source_observation_id": observation.get("id"),
-            "session_id_source": session_id_source,
-            "trace_id_source": "trace.id" if trace_id else "missing",
-            "source_trace_environment": trace.get("environment"),
-            "source_status": "failure"
-            if observation.get("statusMessage")
-            else "success",
-        }
-    )
-    runtime_identity = _build_session_runtime_identity(
-        metadata=history_metadata,
-        trace_environment=trace.get("environment"),
-        allow_runtime=False,
-    )
-    compact_summary_state = _classify_compact_summary_state(
-        metadata=metadata,
-        request_body=request_body,
-        output_payload=output_payload,
-        session_id=session_id,
-        litellm_call_id=observation.get("id"),
-        trace_id=trace_id,
-    )
-    tool_definition_snapshot = _tool_definition_snapshot_from_metadata(metadata)
-
-    record = {
-        "litellm_call_id": observation.get("id"),
-        "session_id": session_id,
-        "trace_id": trace_id,
-        "provider_response_id": _first_non_empty_string(
-            _maybe_get(output_payload, "id"),
-            _maybe_get(output_response_payload, "id"),
-        ),
-        "provider": provider,
-        "model": resolved_model,
-        "inbound_model_alias": inbound_model_alias,
-        "model_group": model_group,
-        "agent_name": agent_name,
-        "agent_id": agent_id,
-        "tenant_id": tenant_id,
-        "repository": repository,
-        "call_type": call_type,
-        "start_time": _parse_datetime_value(observation.get("startTime")),
-        "end_time": _parse_datetime_value(observation.get("endTime")),
-        "input_tokens": prompt_tokens,
-        "output_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "cache_read_input_tokens": cache_read_input_tokens,
-        "cache_creation_input_tokens": cache_creation_input_tokens,
-        "reasoning_tokens_reported": reported_reasoning_tokens,
-        "reasoning_tokens_estimated": estimated_reasoning_tokens,
-        "reasoning_tokens_source": reasoning_tokens_source,
-        "reasoning_present": reasoning_present,
-        "thinking_signature_present": bool(metadata.get("thinking_signature_present")),
-        "provider_cache_attempted": bool(
-            provider_cache_state and provider_cache_state.get("attempted")
-        ),
-        "provider_cache_status": (
-            provider_cache_state.get("status") if provider_cache_state else None
-        ),
-        "provider_cache_miss": bool(
-            provider_cache_state and provider_cache_state.get("miss")
-        ),
-        "provider_cache_miss_reason": (
-            provider_cache_state.get("miss_reason") if provider_cache_state else None
-        ),
-        "provider_cache_miss_token_count": (
-            provider_cache_state.get("miss_token_count") if provider_cache_state else None
-        ),
-        "provider_cache_miss_cost_usd": (
-            provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
-        ),
-        "tool_call_count": tool_call_count,
-        "invalid_tool_call_count": invalid_tool_call_count,
-        **structured_output_state,
-        "tool_names": tool_names,
-        "file_read_count": tool_activity_summary["file_read_count"],
-        "file_modified_count": tool_activity_summary["file_modified_count"],
-        "changed_pre_commit_config": tool_activity_summary[
-            "changed_pre_commit_config"
-        ],
-        "changed_env_file": tool_activity_summary["changed_env_file"],
-        "changed_pyproject_toml": tool_activity_summary["changed_pyproject_toml"],
-        "changed_gitignore": tool_activity_summary["changed_gitignore"],
-        "git_commit_count": tool_activity_summary["git_commit_count"],
-        "git_push_count": tool_activity_summary["git_push_count"],
-        "tool_activity": tool_activity,
-        "response_cost_usd": response_cost_usd,
-        **compact_summary_state,
-        **permission_usage_fields,
-        "litellm_environment": runtime_identity["litellm_environment"],
-        "litellm_version": runtime_identity["litellm_version"],
-        "litellm_fork_version": runtime_identity["litellm_fork_version"],
-        "litellm_wheel_versions": runtime_identity["litellm_wheel_versions"],
-        "client_name": runtime_identity["client_name"],
-        "client_version": runtime_identity["client_version"],
-        "client_user_agent": runtime_identity["client_user_agent"],
-        "metadata": history_metadata,
-    }
-    if tool_definition_snapshot is not None:
-        record[_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY] = tool_definition_snapshot
-    return _normalize_session_history_record(record)
-
-
+# _build_session_history_record_from_langfuse_trace_observation moved to litellm.integrations.aawm_session_history.record
 def _derive_langfuse_trace_tags_from_langfuse_trace(
     trace: Dict[str, Any],
 ) -> Tuple[Optional[str], List[str]]:
@@ -18505,25 +14780,7 @@ def _promote_worker_context_exhaustion_metadata(
     _sanitize_worker_context_exhaustion_metadata(metadata)
 
 
-def _build_session_history_metadata(
-    *,
-    metadata: Dict[str, Any],
-    request_tags: List[str],
-    tenant_id: Optional[str],
-) -> Dict[str, Any]:
-    _sanitize_worker_context_exhaustion_metadata(metadata)
-    history_metadata: Dict[str, Any] = {"request_tags": request_tags}
-    if tenant_id:
-        history_metadata["tenant_id"] = tenant_id
-
-    for key in _AAWM_SESSION_HISTORY_METADATA_KEYS:
-        value = metadata.get(key)
-        if value is not None:
-            history_metadata[key] = _json_safe_rate_limit_value(value)
-
-    return history_metadata
-
-
+# _build_session_history_metadata moved to litellm.integrations.aawm_session_history.record
 def _sanitize_session_history_api_base(value: Any) -> Optional[str]:
     cleaned = _clean_non_empty_string(value)
     if not cleaned:
@@ -19032,689 +15289,8 @@ def _resolve_xai_grok_model_override(
 
 
 
-def _build_session_history_record(  # noqa: PLR0915
-    kwargs: Dict[str, Any],
-    result: Any,
-    start_time: Any,
-    end_time: Any,
-    allow_runtime_identity: bool = True,
-) -> Optional[Dict[str, Any]]:
-    session_id = _extract_session_id(kwargs)
-    if not session_id:
-        return None
-
-    litellm_params = kwargs.get("litellm_params") or {}
-    metadata = litellm_params.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-        litellm_params["metadata"] = metadata
-        kwargs["litellm_params"] = litellm_params
-    _promote_worker_context_exhaustion_metadata(kwargs, metadata)
-    standard_logging_object = kwargs.get("standard_logging_object") or {}
-    _enrich_claude_permission_check_metadata(
-        kwargs,
-        metadata,
-        result,
-        standard_logging_object=standard_logging_object,
-    )
-    _sync_standard_logging_object(kwargs, metadata)
-    standard_logging_object = kwargs.get("standard_logging_object") or standard_logging_object
-    request_tags = (
-        standard_logging_object.get("request_tags") or metadata.get("tags") or []
-    )
-    if not isinstance(request_tags, list):
-        request_tags = []
-
-    resolved_model = _resolve_session_history_model(
-        kwargs=kwargs,
-        standard_logging_object=standard_logging_object,
-        metadata=metadata,
-        result=result,
-    )
-
-    usage_obj = _extract_usage_object(kwargs, result)
-    hidden_params = getattr(result, "_hidden_params", {}) or {}
-    usage_obj = _merge_estimated_rerank_tokens_into_usage(
-        kwargs=kwargs,
-        result=result,
-        usage_obj=usage_obj,
-        model=resolved_model,
-    )
-    usage_dict = _coerce_usage_object_to_dict(usage_obj) or {}
-    if usage_dict.get("token_count_response"):
-        metadata["usage_token_count_response"] = True
-    search_units = _safe_int(usage_dict.get("search_units"))
-    if search_units:
-        metadata["usage_search_units"] = search_units
-    usage_cost = _safe_float(usage_dict.get("cost"))
-    if usage_cost is not None:
-        metadata["usage_openrouter_cost"] = usage_cost
-    openrouter_usage = hidden_params.get("openrouter_usage")
-    if isinstance(openrouter_usage, dict):
-        search_units = _safe_int(openrouter_usage.get("search_units"))
-        if search_units:
-            metadata["usage_search_units"] = search_units
-        openrouter_cost = _safe_float(openrouter_usage.get("cost"))
-        if openrouter_cost is not None:
-            metadata["usage_openrouter_cost"] = openrouter_cost
-    if hidden_params.get("openrouter_provider") is not None:
-        metadata["openrouter_provider"] = hidden_params.get("openrouter_provider")
-    if hidden_params.get("openrouter_response_model") is not None:
-        metadata["openrouter_response_model"] = hidden_params.get(
-            "openrouter_response_model"
-        )
-
-    prompt_tokens = _extract_prompt_tokens(usage_obj)
-    completion_tokens = _extract_completion_tokens(usage_obj)
-    total_tokens = _extract_total_tokens(usage_obj, prompt_tokens, completion_tokens)
-    cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
-    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
-    reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
-    provider_reported_reasoning_tokens = reported_reasoning_tokens
-    provider_prefix = _infer_usage_breakout_provider_prefix(kwargs, metadata)
-    resolved_provider = _normalize_session_history_provider(
-        kwargs.get("custom_llm_provider"),
-        resolved_model,
-        metadata,
-    )
-    model_group = _get_session_history_model_group(metadata, standard_logging_object)
-    api_base = _extract_session_history_api_base(
-        kwargs=kwargs,
-        standard_logging_object=standard_logging_object,
-        metadata=metadata,
-    )
-    call_type = kwargs.get("call_type") or standard_logging_object.get("call_type")
-    api_base_provider = _session_history_provider_from_api_base(
-        api_base,
-        call_type=call_type,
-    )
-    if (
-        api_base_provider is not None
-        and resolved_provider != "antigravity"
-        and (resolved_provider in {None, "openai"} or api_base_provider != "openai")
-    ):
-        resolved_provider = api_base_provider
-    provider_for_cache = resolved_provider
-    model_group = _normalize_session_history_model_group(
-        model_group,
-        metadata,
-        resolved_model,
-    )
-    resolved_provider, resolved_model = _apply_local_embedding_route_metadata(
-        metadata=metadata,
-        resolved_provider=resolved_provider,
-        resolved_model=resolved_model,
-        model_group=model_group,
-        call_type=call_type,
-        api_base=api_base,
-    )
-    resolved_provider, resolved_model = _apply_local_llm_route_metadata(
-        metadata=metadata,
-        resolved_provider=resolved_provider,
-        resolved_model=resolved_model,
-        model_group=model_group,
-        call_type=call_type,
-        api_base=api_base,
-    )
-    resolved_provider, resolved_model, model_group = _apply_local_biomed_route_metadata(
-        metadata=metadata,
-        resolved_provider=resolved_provider,
-        resolved_model=resolved_model,
-        model_group=model_group,
-        call_type=call_type,
-        api_base=api_base,
-    )
-    inbound_model_alias = _resolve_inbound_model_alias(
-        kwargs=kwargs,
-        standard_logging_object=standard_logging_object,
-        metadata=metadata,
-        resolved_model=resolved_model,
-    )
-    _enrich_anthropic_context_window_metadata(
-        kwargs,
-        metadata,
-        resolved_model=resolved_model,
-        inbound_model_alias=inbound_model_alias,
-        provider=resolved_provider,
-        allow_implicit_default=True,
-    )
-
-    message = _extract_first_response_message(result)
-    if reported_reasoning_tokens is None and provider_prefix == "gemini":
-        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
-            metadata,
-            message,
-        )
-    thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
-    reasoning_text = (
-        _extract_reasoning_content(message, thinking_blocks)
-        if message is not None
-        else ""
-    )
-
-    reasoning_present = bool(
-        (isinstance(reasoning_text, str) and reasoning_text.strip())
-        or thinking_blocks
-        or metadata.get("reasoning_content_present")
-        or (reported_reasoning_tokens and reported_reasoning_tokens > 0)
-    )
-    estimated_reasoning_tokens = None
-    if reported_reasoning_tokens is None and reasoning_present:
-        estimated_reasoning_tokens = _estimate_reasoning_tokens(
-            model=resolved_model,
-            reasoning_text=reasoning_text,
-        )
-    reasoning_tokens_source = _determine_reasoning_tokens_source(
-        provider_reported_reasoning_tokens=provider_reported_reasoning_tokens,
-        reported_reasoning_tokens=reported_reasoning_tokens,
-        estimated_reasoning_tokens=estimated_reasoning_tokens,
-        reasoning_present=reasoning_present,
-    )
-
-    tool_call_count, tool_names = _extract_tool_call_info(message)
-    tool_activity = _extract_tool_activity_from_message(message) if message is not None else []
-    if tool_call_count == 0:
-        output_tool_call_count, output_tool_names = _extract_response_output_tool_call_info(
-            result,
-            standard_logging_object,
-        )
-        if output_tool_call_count > 0:
-            tool_call_count, tool_names = output_tool_call_count, output_tool_names
-    if not tool_activity:
-        tool_activity = _extract_response_output_tool_activity(
-            result,
-            standard_logging_object,
-        )
-    tool_activity_summary = _summarize_tool_activity(tool_activity)
-    request_body = _extract_provider_cache_request_body(kwargs)
-    invalid_tool_call_count = max(
-        _extract_invalid_tool_call_count_from_request_body(request_body),
-        _safe_int(metadata.get("usage_invalid_tool_call_count")) or 0,
-    )
-    structured_output_state = _detect_structured_output_request(request_body, metadata)
-    agent_name, tenant_id = _extract_agent_context(kwargs)
-    explicit_tenant_id, tenant_source = _extract_tenant_identity_from_kwargs(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=standard_logging_object,
-    )
-    if explicit_tenant_id:
-        tenant_id = explicit_tenant_id
-    if tenant_id and tenant_source:
-        metadata["tenant_id_source"] = tenant_source
-    elif tenant_id:
-        metadata["tenant_id_source"] = "agent_context_text"
-    repository, repository_source = _extract_repository_identity_from_kwargs_with_source(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=standard_logging_object,
-    )
-    repository_before_memory_workflow = repository
-    repository = _apply_codex_memory_workflow_repository(
-        kwargs,
-        metadata,
-        repository,
-        request_body=request_body,
-    )
-    if repository:
-        metadata["repository"] = repository
-        if repository_source:
-            if repository != repository_before_memory_workflow:
-                repository_source = f"{repository_source}.codex_memory_workflow"
-            metadata["repository_source"] = repository_source
-    agent_id, agent_id_source = _extract_agent_id_from_kwargs(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=standard_logging_object,
-        agent_name=agent_name,
-        tenant_id=tenant_id,
-        repository=repository,
-    )
-    if agent_id:
-        metadata["agent_id"] = agent_id
-        if agent_id_source:
-            metadata["agent_id_source"] = agent_id_source
-    if metadata.get("workload_type") == "agent_memory":
-        request_tags = list(request_tags)
-        for tag in metadata.get("tags") or []:
-            if isinstance(tag, str) and tag and tag not in request_tags:
-                request_tags.append(tag)
-
-    response_cost_usd = None
-    if resolved_provider == "openrouter":
-        response_cost_usd = _first_reported_openrouter_cost(metadata, usage_dict)
-    if response_cost_usd is None:
-        response_cost_usd = _safe_float(
-            _first_non_none(
-                kwargs.get("response_cost"),
-                standard_logging_object.get("response_cost"),
-                hidden_params.get("response_cost"),
-                _maybe_get_path(
-                    hidden_params,
-                    "additional_headers",
-                    "llm_provider-x-litellm-response-cost",
-                ),
-                metadata.get("litellm_response_cost"),
-                metadata.get("response_cost"),
-                metadata.get("usage_openrouter_cost"),
-                usage_dict.get("cost"),
-            )
-        )
-    if (
-        (response_cost_usd is None or response_cost_usd == 0)
-        and prompt_tokens > 0
-        and resolved_model != "unknown"
-        and not usage_dict.get("token_count_response")
-    ):
-        try:
-            import litellm
-            from litellm.responses.utils import ResponseAPILoggingUtils
-
-            usage_for_cost = None
-            if isinstance(usage_obj, dict) and {
-                "input_tokens",
-                "output_tokens",
-            }.issubset(usage_obj.keys()):
-                usage_for_cost = (
-                    ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
-                        dict(usage_obj)
-                    )
-                )
-            prompt_cost, completion_cost = litellm.cost_per_token(
-                model=resolved_model,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                custom_llm_provider=kwargs.get("custom_llm_provider"),
-                cache_creation_input_tokens=cache_creation_input_tokens,
-                cache_read_input_tokens=cache_read_input_tokens,
-                usage_object=usage_for_cost,
-                call_type="responses",
-            )
-            response_cost_usd = prompt_cost + completion_cost
-        except Exception as exc:
-            response_cost_usd = _calculate_response_cost_from_bundled_model_cost_map(
-                model=resolved_model,
-                custom_llm_provider=kwargs.get("custom_llm_provider"),
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                usage_obj=usage_obj,
-            )
-            verbose_logger.debug(
-                "AawmAgentIdentity: failed to backfill response cost for model=%s: %s",
-                resolved_model,
-                exc,
-            )
-
-        if response_cost_usd == 0:
-            bundled_response_cost = _calculate_response_cost_from_bundled_model_cost_map(
-                model=resolved_model,
-                custom_llm_provider=kwargs.get("custom_llm_provider"),
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                usage_obj=usage_obj,
-            )
-            if bundled_response_cost is not None:
-                response_cost_usd = bundled_response_cost
-
-    permission_usage_fields = _build_permission_usage_fields(
-        metadata=metadata,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        response_cost_usd=response_cost_usd,
-    )
-
-    prompt_overhead_breakdown = _build_prompt_overhead_breakdown(
-        kwargs=kwargs,
-        metadata=metadata,
-        model=resolved_model,
-        prompt_tokens=prompt_tokens,
-        request_body=request_body,
-    )
-
-    provider_cache_state = _resolve_provider_cache_state(
-        provider=provider_for_cache,
-        model=resolved_model,
-        usage_obj=usage_obj,
-        metadata=metadata,
-        request_body=request_body,
-    )
-    provider_cache_state = dict(provider_cache_state or {})
-    if provider_cache_state:
-        provider_cache_state.update(
-            _compute_provider_cache_miss_cost_state(
-                provider_family=_normalize_provider_cache_family(
-                    resolved_provider,
-                    resolved_model,
-                    metadata,
-                ),
-                model=resolved_model,
-                usage_obj=usage_obj,
-                cache_state=provider_cache_state,
-                metadata=metadata,
-                response_cost_usd=response_cost_usd,
-            )
-        )
-
-    runtime_identity = _build_session_runtime_identity(
-        metadata=metadata,
-        kwargs=kwargs,
-        allow_runtime=allow_runtime_identity,
-    )
-    trace_id = _extract_trace_id(kwargs)
-    compact_summary_state = _classify_compact_summary_state(
-        metadata=metadata,
-        request_body=request_body,
-        output_payload=result,
-        session_id=session_id,
-        litellm_call_id=kwargs.get("litellm_call_id"),
-        trace_id=trace_id,
-    )
-    tool_definition_snapshot = _tool_definition_snapshot_from_metadata(metadata)
-
-    record = {
-        "litellm_call_id": kwargs.get("litellm_call_id"),
-        "session_id": session_id,
-        "trace_id": trace_id,
-        "provider_response_id": _maybe_get(result, "id"),
-        "provider": resolved_provider,
-        "model": resolved_model,
-        "inbound_model_alias": inbound_model_alias,
-        "model_group": model_group,
-        "agent_name": agent_name,
-        "agent_id": agent_id,
-        "tenant_id": tenant_id,
-        "repository": repository,
-        "call_type": kwargs.get("call_type") or standard_logging_object.get("call_type"),
-        "start_time": _normalize_datetime(start_time),
-        "end_time": _normalize_datetime(end_time),
-        "input_tokens": prompt_tokens,
-        "output_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "cache_read_input_tokens": cache_read_input_tokens,
-        "cache_creation_input_tokens": cache_creation_input_tokens,
-        "reasoning_tokens_reported": reported_reasoning_tokens,
-        "reasoning_tokens_estimated": estimated_reasoning_tokens,
-        "reasoning_tokens_source": reasoning_tokens_source,
-        "reasoning_present": reasoning_present,
-        "thinking_signature_present": bool(metadata.get("thinking_signature_present")),
-        "provider_cache_attempted": bool(
-            provider_cache_state and provider_cache_state.get("attempted")
-        ),
-        "provider_cache_status": (
-            provider_cache_state.get("status") if provider_cache_state else None
-        ),
-        "provider_cache_miss": bool(
-            provider_cache_state and provider_cache_state.get("miss")
-        ),
-        "provider_cache_miss_reason": (
-            provider_cache_state.get("miss_reason") if provider_cache_state else None
-        ),
-        "provider_cache_miss_token_count": (
-            provider_cache_state.get("miss_token_count") if provider_cache_state else None
-        ),
-        "provider_cache_miss_cost_usd": (
-            provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
-        ),
-        "tool_call_count": tool_call_count,
-        "invalid_tool_call_count": invalid_tool_call_count,
-        **structured_output_state,
-        "tool_names": tool_names,
-        "file_read_count": tool_activity_summary["file_read_count"],
-        "file_modified_count": tool_activity_summary["file_modified_count"],
-        "changed_pre_commit_config": tool_activity_summary[
-            "changed_pre_commit_config"
-        ],
-        "changed_env_file": tool_activity_summary["changed_env_file"],
-        "changed_pyproject_toml": tool_activity_summary["changed_pyproject_toml"],
-        "changed_gitignore": tool_activity_summary["changed_gitignore"],
-        "git_commit_count": tool_activity_summary["git_commit_count"],
-        "git_push_count": tool_activity_summary["git_push_count"],
-        "tool_activity": tool_activity,
-        "response_cost_usd": response_cost_usd,
-        **compact_summary_state,
-        **permission_usage_fields,
-        "litellm_environment": runtime_identity["litellm_environment"],
-        "litellm_version": runtime_identity["litellm_version"],
-        "litellm_fork_version": runtime_identity["litellm_fork_version"],
-        "litellm_wheel_versions": runtime_identity["litellm_wheel_versions"],
-        "client_name": runtime_identity["client_name"],
-        "client_version": runtime_identity["client_version"],
-        "client_user_agent": runtime_identity["client_user_agent"],
-        **_extract_session_host_attribution(metadata),
-        **prompt_overhead_breakdown,
-        "metadata": _build_session_history_metadata(
-            metadata=metadata,
-            request_tags=[tag for tag in request_tags if isinstance(tag, str)],
-            tenant_id=tenant_id,
-        ),
-    }
-    if tool_definition_snapshot is not None:
-        record[_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY] = tool_definition_snapshot
-    _apply_runtime_agent_quality_scores(
-        record=record,
-        request_body=request_body,
-        result=result,
-        tool_activity=tool_activity,
-    )
-    _apply_claude_auto_review_identity_to_record(record)
-    return _normalize_session_history_record(record)
-
-
-async def _open_aawm_session_history_connection() -> Any:
-    dsn = _build_session_history_dsn()
-    if not dsn:
-        raise RuntimeError("AAWM session history database configuration is missing")
-
-    try:
-        asyncpg = importlib.import_module("asyncpg")
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "AAWM session history requires asyncpg to be installed"
-        ) from exc
-
-    conn = await asyncpg.connect(
-        dsn=dsn,
-        command_timeout=_get_session_history_command_timeout_seconds(),
-        statement_cache_size=_get_session_history_statement_cache_size(),
-        server_settings=_get_session_history_server_settings(),
-    )
-    try:
-        await _initialize_session_history_connection(conn)
-    except Exception:
-        await conn.close()
-        raise
-    return conn
-
-
-async def _get_aawm_session_history_pool() -> Any:
-    dsn = _build_session_history_dsn()
-    if not dsn:
-        raise RuntimeError("AAWM session history database configuration is missing")
-
-    loop = asyncio.get_running_loop()
-    pool_key = (loop, dsn)
-    with _aawm_session_history_pool_lock:
-        pool = _aawm_session_history_pools.get(pool_key)
-    if pool is not None:
-        return pool
-
-    try:
-        asyncpg = importlib.import_module("asyncpg")
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "AAWM session history requires asyncpg to be installed"
-        ) from exc
-
-    created_pool = await asyncpg.create_pool(
-        dsn=dsn,
-        min_size=0,
-        max_size=_get_session_history_pool_max_size(),
-        command_timeout=_get_session_history_command_timeout_seconds(),
-        statement_cache_size=_get_session_history_statement_cache_size(),
-        server_settings=_get_session_history_server_settings(),
-        init=_initialize_session_history_connection,
-    )
-    with _aawm_session_history_pool_lock:
-        existing_pool = _aawm_session_history_pools.get(pool_key)
-        if existing_pool is None:
-            _aawm_session_history_pools[pool_key] = created_pool
-            return created_pool
-
-    await created_pool.close()
-    return existing_pool
-
-
-async def _ensure_session_history_schema(conn: Any) -> None:
-    global _aawm_session_history_schema_ready
-
-    if _aawm_session_history_schema_ready:
-        return
-
-    with _aawm_session_history_schema_lock:
-        if _aawm_session_history_schema_ready:
-            return
-
-        # Schema changes are migration-owned. The callback must not mutate,
-        # recreate, or drop database structures at request/write time.
-        _ = conn
-        _aawm_session_history_schema_ready = True
-
-
-def _build_session_history_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
-    record = _strip_postgres_nul_bytes(_normalize_session_history_record(dict(record)))
-    return (
-        record.get("litellm_call_id"),
-        record.get("session_id"),
-        record.get("trace_id"),
-        record.get("provider_response_id"),
-        record.get("provider"),
-        record.get("model"),
-        record.get("model_group"),
-        record.get("agent_name"),
-        record.get("tenant_id"),
-        record.get("call_type"),
-        record.get("start_time"),
-        record.get("end_time"),
-        record.get("input_tokens"),
-        record.get("output_tokens"),
-        record.get("total_tokens"),
-        record.get("cache_read_input_tokens"),
-        record.get("cache_creation_input_tokens"),
-        record.get("reasoning_tokens_reported"),
-        record.get("reasoning_tokens_estimated"),
-        record.get("reasoning_tokens_source"),
-        record.get("reasoning_present"),
-        record.get("thinking_signature_present"),
-        record.get("provider_cache_attempted", False),
-        record.get("provider_cache_status"),
-        record.get("provider_cache_miss", False),
-        record.get("provider_cache_miss_reason"),
-        record.get("provider_cache_miss_token_count"),
-        record.get("provider_cache_miss_cost_usd"),
-        record.get("tool_call_count", 0),
-        record.get("invalid_tool_call_count", 0),
-        json.dumps(record.get("tool_names", [])),
-        record.get("file_read_count", 0),
-        record.get("file_modified_count", 0),
-        record.get("changed_pre_commit_config"),
-        record.get("changed_env_file"),
-        record.get("changed_pyproject_toml"),
-        record.get("changed_gitignore"),
-        record.get("git_commit_count", 0),
-        record.get("git_push_count", 0),
-        record.get("response_cost_usd"),
-        record.get("litellm_environment"),
-        record.get("litellm_version"),
-        record.get("litellm_fork_version"),
-        json.dumps(record.get("litellm_wheel_versions") or {}),
-        record.get("client_name"),
-        record.get("client_version"),
-        record.get("client_user_agent"),
-        record.get("client_ip"),
-        record.get("host_name"),
-        record.get("token_permission_input", 0),
-        record.get("token_permission_output", 0),
-        record.get("permission_usd_cost", 0),
-        json.dumps(record.get("metadata", {})),
-        record.get("repository"),
-        record.get("input_system_tokens_estimated", 0),
-        record.get("input_tool_advertisement_tokens_estimated", 0),
-        record.get("input_conversation_tokens_estimated", 0),
-        record.get("input_other_tokens_estimated", 0),
-        record.get("input_breakdown_residual_tokens", 0),
-        record.get("system_behavior_tokens_estimated", 0),
-        record.get("system_safety_tokens_estimated", 0),
-        record.get("system_instructional_tokens_estimated", 0),
-        record.get("system_unclassified_tokens_estimated", 0),
-        record.get("litellm_processing_ms"),
-        record.get("llm_upstream_elapsed_ms"),
-        record.get("total_server_elapsed_ms"),
-        record.get("ttft_ms"),
-        record.get("litellm_pre_send_ms"),
-        record.get("litellm_post_response_ms"),
-        record.get("llm_upstream_time_to_first_byte_ms"),
-        record.get("llm_upstream_stream_ms"),
-        record.get("latency_unclassified_ms"),
-        record.get(_SESSION_HISTORY_PREVIOUS_GAP_FIELD),
-        record.get("structured_output_attempted", False),
-        record.get("structured_output_failed", False),
-        record.get("structured_output_mode"),
-        record.get("structured_output_schema_hash"),
-        record.get("structured_output_failure_reason"),
-        record.get("trace_quality_score"),
-        record.get("empty_completion_failure"),
-        record.get("large_tool_result_payload_risk"),
-        record.get("destructive_checkout_after_work"),
-        record.get("invalid_tool_call_error"),
-        record.get("read_only_policy_compliance_score"),
-        record.get("read_only_policy_violation_count"),
-        record.get("response_meaningfulness_score"),
-        record.get("instruction_adherence_score"),
-        record.get("answer_completeness_score"),
-        record.get("evidence_fidelity_score"),
-        record.get("tool_result_fidelity_score"),
-        record.get("error_attribution_quality_score"),
-        record.get("repetition_loop_risk_score"),
-        record.get("context_retention_score"),
-        record.get("tool_use_validity_score"),
-        record.get("tool_error_recovery_score"),
-        record.get("stall_risk_score"),
-        record.get("output_contract_compliance_score"),
-        record.get("task_progress_score"),
-        record.get("scope_control_score"),
-        record.get("destructive_action_policy_score"),
-        record.get("ignored_path_tracking_policy_score"),
-        record.get("ignored_path_tracking_violation_count"),
-        record.get("baseline_deflection_attempted_score"),
-        record.get("baseline_deflection_incident_score"),
-        record.get("baseline_deflection_attempt_count"),
-        record.get("baseline_deflection_tool_call_count"),
-        record.get("baseline_deflection_input_tokens"),
-        record.get("baseline_deflection_elapsed_ms"),
-        record.get("quality_gate_trigger_count"),
-        record.get("quality_gate_fix_attempt_count"),
-        record.get("quality_gate_rerun_count"),
-        record.get("sleep_wellness_interruption_attempted_score"),
-        record.get("sleep_wellness_interruption_incident_score"),
-        record.get("sleep_wellness_interruption_count"),
-        record.get("sleep_wellness_interruption_output_tokens"),
-        record.get("sleep_wellness_interruption_input_tokens"),
-        record.get("sleep_wellness_interruption_elapsed_ms"),
-        record.get("sleep_wellness_interruption_after_user_pushback_count"),
-        record.get("sleep_wellness_interruption_repeated_count"),
-        record.get("terminal_completion_score"),
-        record.get("discovery_inventory_coverage_score"),
-        record.get("discovery_inventory_missing_count"),
-        json.dumps(record.get("agent_score_reasons") or {}),
-        record.get("is_compact_summary", False),
-        record.get("compact_summary_source"),
-        record.get("compact_summary_id"),
-        record.get("compact_summary_role"),
-        record.get("inbound_model_alias"),
-        record.get("agent_id"),
-    )
-
-
+# _build_session_history_record moved to litellm.integrations.aawm_session_history.record
+# _build_session_history_db_payload moved to litellm.integrations.aawm_session_history.record
 def _strip_postgres_nul_bytes(value: Any) -> Any:
     if isinstance(value, str):
         return value.replace("\x00", "")
@@ -19730,44 +15306,7 @@ def _strip_postgres_nul_bytes(value: Any) -> Any:
     return value
 
 
-def _build_tool_activity_db_payloads(record: Dict[str, Any]) -> List[Tuple[Any, ...]]:
-    record = _strip_postgres_nul_bytes(record)
-    tool_activity = record.get("tool_activity") or []
-    if not isinstance(tool_activity, list):
-        return []
-    agent_id = _clean_non_empty_string(record.get("agent_id"))
-
-    payloads: List[Tuple[Any, ...]] = []
-    for index, item in enumerate(tool_activity):
-        if not isinstance(item, dict):
-            continue
-        payloads.append(
-            (
-                record["litellm_call_id"],
-                record["session_id"],
-                record.get("trace_id"),
-                record.get("provider"),
-                record["model"],
-                record.get("agent_name"),
-                _safe_int(item.get("tool_index"))
-                if _safe_int(item.get("tool_index")) is not None
-                else index,
-                item.get("tool_call_id"),
-                item.get("tool_name"),
-                item.get("tool_kind"),
-                json.dumps(item.get("file_paths_read") or []),
-                json.dumps(item.get("file_paths_modified") or []),
-                _safe_int(item.get("git_commit_count")) or 0,
-                _safe_int(item.get("git_push_count")) or 0,
-                item.get("command_text"),
-                json.dumps(item.get("arguments") or {}),
-                json.dumps(item.get("metadata") or {}),
-                agent_id,
-            )
-        )
-    return payloads
-
-
+# _build_tool_activity_db_payloads moved to litellm.integrations.aawm_session_history.record
 def _tool_definition_snapshot_from_metadata(
     metadata: Dict[str, Any],
 ) -> Optional[List[Any]]:
@@ -19838,33 +15377,8 @@ def _build_tool_definition_snapshot_db_payload(
     )
 
 
-def _build_tool_definition_snapshot_db_payloads(
-    records: List[Dict[str, Any]],
-) -> List[Tuple[Any, ...]]:
-    payloads_by_key: Dict[Tuple[str, str], Tuple[Any, ...]] = {}
-    for record in records:
-        payload = _build_tool_definition_snapshot_db_payload(record)
-        if payload is None:
-            continue
-        key = (str(payload[0]), str(payload[1]))
-        payloads_by_key.setdefault(key, payload)
-    return list(payloads_by_key.values())
-
-
-async def _persist_tool_definition_snapshots_best_effort(
-    conn: Any,
-    records: List[Dict[str, Any]],
-) -> None:
-    snapshot_payloads = _build_tool_definition_snapshot_db_payloads(records)
-    if not snapshot_payloads:
-        return
-
-    await conn.executemany(
-        _AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL,
-        snapshot_payloads,
-    )
-
-
+# _build_tool_definition_snapshot_db_payloads moved to litellm.integrations.aawm_session_history.record
+# _persist_tool_definition_snapshots_best_effort moved to litellm.integrations.aawm_session_history.record
 async def _lookup_claude_auto_review_parent_identity(
     conn: Any,
     payload: Dict[str, Any],
@@ -20390,22 +15904,7 @@ def _build_alias_routing_audit_db_payload(
     )
 
 
-async def _persist_alias_routing_audit_best_effort(
-    conn: Any,
-    records: List[Dict[str, Any]],
-) -> None:
-    payloads: List[Tuple[Any, ...]] = []
-    for record in records:
-        events = _extract_alias_routing_audit_events(record)
-        payloads.extend(
-            _build_alias_routing_audit_db_payload(record, event, index)
-            for index, event in enumerate(events)
-        )
-    if not payloads:
-        return
-    await conn.executemany(_AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL, payloads)
-
-
+# _persist_alias_routing_audit_best_effort moved to litellm.integrations.aawm_session_history.record
 _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS: Tuple[str, ...] = (
     "observed_at",
     "source",
@@ -20632,191 +16131,17 @@ async def _filter_meaningful_rate_limit_observations(
     return [observation for _index, observation in kept_by_index], initial_previous_by_limit_key
 
 
-def _build_rate_limit_observation_only_record(
-    kwargs: Dict[str, Any],
-    observations: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    metadata = _merged_rate_limit_metadata(kwargs)
-    model = _resolve_rate_limit_model(kwargs, None, metadata)
-    return {
-        "_skip_session_history": True,
-        "litellm_call_id": kwargs.get("litellm_call_id"),
-        "session_id": _extract_session_id(kwargs),
-        "model": model,
-        "rate_limit_observations": observations,
-    }
-
-
+# _build_rate_limit_observation_only_record moved to litellm.integrations.aawm_session_history.record
 def _rate_limit_observation_only_requested(kwargs: Dict[str, Any]) -> bool:
     metadata = _merged_rate_limit_metadata(kwargs)
     return bool(metadata.get("aawm_rate_limit_observation_only"))
 
 
-async def _persist_rate_limit_observations_best_effort(
-    conn: Any,
-    records: List[Dict[str, Any]],
-    *,
-    history_records: List[Dict[str, Any]],
-) -> None:
-    openrouter_free_daily_observations = (
-        await _build_openrouter_free_daily_observations_for_records(
-            conn,
-            history_records,
-        )
-    )
-    rate_limit_observations: List[Dict[str, Any]] = []
-    for record in records:
-        observations = record.get("rate_limit_observations")
-        if isinstance(observations, list):
-            rate_limit_observations.extend(
-                observation
-                for observation in observations
-                if isinstance(observation, dict)
-            )
-    rate_limit_observations.extend(openrouter_free_daily_observations)
-    if rate_limit_observations:
-        (
-            rate_limit_observations,
-            initial_previous_by_limit_key,
-        ) = await _filter_meaningful_rate_limit_observations(
-            conn,
-            rate_limit_observations,
-        )
-    if not rate_limit_observations:
-        return
-    transitions = await _derive_rate_limit_transitions(
-        conn,
-        rate_limit_observations,
-        initial_previous_by_limit_key,
-    )
-    await conn.executemany(
-        _AAWM_RATE_LIMIT_OBSERVATION_INSERT_SQL,
-        [
-            _build_rate_limit_observation_db_payload(observation)
-            for observation in rate_limit_observations
-        ],
-    )
-    if transitions:
-        await conn.executemany(
-            _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
-            [
-                _build_rate_limit_transition_db_payload(transition)
-                for transition in transitions
-            ],
-        )
-
-
-async def _persist_provider_error_observations_best_effort(
-    conn: Any,
-    records: List[Dict[str, Any]],
-    *,
-    identity_by_session: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> None:
-    provider_error_observations: List[Dict[str, Any]] = []
-    for record in records:
-        observations = record.get("provider_error_observations")
-        if isinstance(observations, list):
-            provider_error_observations.extend(
-                observation
-                for observation in observations
-                if isinstance(observation, dict)
-            )
-    if not provider_error_observations:
-        return
-    for observation in provider_error_observations:
-        await _apply_claude_auto_review_parent_identity_from_store(
-            conn,
-            observation,
-            identity_by_session,
-        )
-    await conn.executemany(
-        _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
-        [
-            _build_provider_error_observation_db_payload(observation)
-            for observation in provider_error_observations
-        ],
-    )
-
-
-async def _persist_session_history_record(record: Dict[str, Any]) -> None:
-    pool = await _get_aawm_session_history_pool()
-    async with pool.acquire() as conn:
-        await _initialize_session_history_connection(conn)
-        await _ensure_session_history_schema(conn)
-
-        if not record.get("_skip_session_history"):
-            await _apply_claude_auto_review_parent_identity_from_store(conn, record)
-            history_payload = _build_session_history_db_payload(record)
-            tool_activity_payloads = _build_tool_activity_db_payloads(record)
-
-            await conn.execute(_AAWM_SESSION_HISTORY_INSERT_SQL, *history_payload)
-            await _update_session_history_previous_gap_ms(conn, [history_payload])
-            if tool_activity_payloads:
-                await conn.executemany(
-                    _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL,
-                    tool_activity_payloads,
-                )
-
-        history_records = [] if record.get("_skip_session_history") else [record]
-        await _persist_tool_definition_snapshots_best_effort(conn, history_records)
-        await _persist_rate_limit_observations_best_effort(
-            conn,
-            [record],
-            history_records=history_records,
-        )
-        await _persist_provider_error_observations_best_effort(conn, [record])
-        await _persist_alias_routing_audit_best_effort(conn, [record])
-        await _initialize_session_history_connection(conn)
-
-
-async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
-    if not records:
-        return
-
-    pool = await _get_aawm_session_history_pool()
-    async with pool.acquire() as conn:
-        await _initialize_session_history_connection(conn)
-        await _ensure_session_history_schema(conn)
-
-        history_records = [
-            record for record in records if not record.get("_skip_session_history")
-        ]
-        identity_by_session = _build_session_identity_cache(history_records)
-        for record in history_records:
-            await _apply_claude_auto_review_parent_identity_from_store(
-                conn,
-                record,
-                identity_by_session,
-            )
-        payloads = [
-            _build_session_history_db_payload(record) for record in history_records
-        ]
-        tool_activity_payloads: List[Tuple[Any, ...]] = []
-        for record in history_records:
-            tool_activity_payloads.extend(_build_tool_activity_db_payloads(record))
-
-        if payloads:
-            await conn.executemany(_AAWM_SESSION_HISTORY_INSERT_SQL, payloads)
-            await _update_session_history_previous_gap_ms(conn, payloads)
-        if tool_activity_payloads:
-            await conn.executemany(
-                _AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL, tool_activity_payloads
-            )
-        await _persist_tool_definition_snapshots_best_effort(conn, history_records)
-        await _persist_rate_limit_observations_best_effort(
-            conn,
-            records,
-            history_records=history_records,
-        )
-        await _persist_provider_error_observations_best_effort(
-            conn,
-            records,
-            identity_by_session=identity_by_session,
-        )
-        await _persist_alias_routing_audit_best_effort(conn, records)
-        await _initialize_session_history_connection(conn)
-
-
+# _persist_rate_limit_observations_best_effort moved to litellm.integrations.aawm_session_history.record
+# _persist_provider_error_observations_best_effort moved to litellm.integrations.aawm_session_history.record
+# _session_history_transaction moved to litellm.integrations.aawm_session_history.record
+# _persist_session_history_record moved to litellm.integrations.aawm_session_history.record
+# _persist_session_history_records moved to litellm.integrations.aawm_session_history.record
 def _get_reasoning_state_tags(
     provider_prefix: str,
     reasoning_content: str,
@@ -21288,6 +16613,19 @@ def _enrich_trace_name_and_provider_metadata(
     return kwargs, result
 
 
+
+# _handle_session_history_success_event moved to litellm.integrations.aawm_session_history.record
+# _handle_session_history_failure_event moved to litellm.integrations.aawm_session_history.record
+
+
+_bind_session_history_record_apis()
+
+# Static aliases for class methods / analyzers (values installed by bind above).
+_handle_session_history_success_event = globals()["_handle_session_history_success_event"]
+_handle_session_history_failure_event = globals()["_handle_session_history_failure_event"]
+_build_failure_observation_only_record = globals()["_build_failure_observation_only_record"]
+
+
 class AawmAgentIdentity(CustomLogger):
     """CustomLogger that enriches Langfuse trace_name with agent identity.
 
@@ -21325,125 +16663,45 @@ class AawmAgentIdentity(CustomLogger):
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
         """Queue one finalized session-history row per completed LiteLLM call."""
-        try:
-            rate_limit_observations = _build_rate_limit_observations(
-                kwargs=kwargs,
-                result=response_obj,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            if rate_limit_observations and _rate_limit_observation_only_requested(
-                kwargs
-            ):
-                _enqueue_session_history_record(
-                    _build_rate_limit_observation_only_record(
-                        kwargs,
-                        rate_limit_observations,
-                    )
-                )
-                return
-            record = _build_session_history_record(
-                kwargs=kwargs,
-                result=response_obj,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            if record is None:
-                if rate_limit_observations:
-                    _enqueue_session_history_record(
-                        _build_rate_limit_observation_only_record(
-                            kwargs,
-                            rate_limit_observations,
-                        )
-                    )
-                return
-
-            if rate_limit_observations:
-                record["rate_limit_observations"] = rate_limit_observations
-            _enqueue_session_history_record(record)
-        except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity.log_success_event failed: %s", exc
-            )
+        _handle_session_history_success_event(
+            kwargs,
+            response_obj,
+            start_time,
+            end_time,
+            log_label="log_success_event",
+        )
 
     async def async_log_success_event(
         self, kwargs, response_obj, start_time, end_time
     ) -> None:
-        try:
-            rate_limit_observations = _build_rate_limit_observations(
-                kwargs=kwargs,
-                result=response_obj,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            if rate_limit_observations and _rate_limit_observation_only_requested(
-                kwargs
-            ):
-                _enqueue_session_history_record(
-                    _build_rate_limit_observation_only_record(
-                        kwargs,
-                        rate_limit_observations,
-                    )
-                )
-                return
-            record = _build_session_history_record(
-                kwargs=kwargs,
-                result=response_obj,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            if record is None:
-                if rate_limit_observations:
-                    _enqueue_session_history_record(
-                        _build_rate_limit_observation_only_record(
-                            kwargs,
-                            rate_limit_observations,
-                        )
-                    )
-                return
-
-            if rate_limit_observations:
-                record["rate_limit_observations"] = rate_limit_observations
-            _enqueue_session_history_record(record)
-        except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity.async_log_success_event failed: %s", exc
-            )
+        _handle_session_history_success_event(
+            kwargs,
+            response_obj,
+            start_time,
+            end_time,
+            log_label="async_log_success_event",
+        )
 
     def log_failure_event(self, kwargs, response_obj, start_time, end_time):
         """Queue passive health observations from failed provider calls."""
-        try:
-            record = _build_failure_observation_only_record(
-                kwargs,
-                response_obj,
-                start_time,
-                end_time,
-            )
-            if record is None:
-                return
-            _enqueue_session_history_record(record)
-        except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity.log_failure_event failed: %s", exc
-            )
+        _handle_session_history_failure_event(
+            kwargs,
+            response_obj,
+            start_time,
+            end_time,
+            log_label="log_failure_event",
+        )
 
     async def async_log_failure_event(
         self, kwargs, response_obj, start_time, end_time
     ) -> None:
-        try:
-            record = _build_failure_observation_only_record(
-                kwargs,
-                response_obj,
-                start_time,
-                end_time,
-            )
-            if record is None:
-                return
-            _enqueue_session_history_record(record)
-        except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity.async_log_failure_event failed: %s", exc
-            )
+        _handle_session_history_failure_event(
+            kwargs,
+            response_obj,
+            start_time,
+            end_time,
+            log_label="async_log_failure_event",
+        )
 
     async def async_post_call_failure_hook(
         self,
@@ -21462,9 +16720,8 @@ class AawmAgentIdentity(CustomLogger):
                 now,
                 now,
             )
-            if record is None:
-                return None
-            _enqueue_session_history_record(record)
+            if record is not None:
+                _enqueue_session_history_record(record)
         except Exception as exc:
             verbose_logger.warning(
                 "AawmAgentIdentity.async_post_call_failure_hook failed: %s",

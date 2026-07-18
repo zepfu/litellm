@@ -30,17 +30,22 @@ their own cadence.
 
 Published source / packaging:
 
-- `.wheel-build/pyproject.toml` (hatchling; force-includes canonical agent identity)
+- `.wheel-build/pyproject.toml` (hatchling; force-includes canonical agent identity
+  **and** the `aawm_session_history` package modules + sql shim)
 - `.wheel-build/aawm_litellm_callbacks/__init__.py`
 - `.wheel-build/aawm_litellm_callbacks/agent_identity.py` (thin checkout re-export
   loader only; **not** a second maintained implementation)
-- `litellm/integrations/aawm_agent_identity.py` (canonical agent-identity /
-  session-history implementation; single source of truth)
+- `litellm/integrations/aawm_agent_identity.py` (canonical agent-identity host;
+  re-exports package-owned session_history surfaces)
+- `litellm/integrations/aawm_session_history/` (package-owned durable writer,
+  spool, retry, record builders, SQL constants)
+- `litellm/integrations/aawm_session_history_sql.py` (compat re-export of SQL)
 
-Build packaging (RR-003): hatch `force-include` maps the canonical file into
-`aawm_litellm_callbacks/agent_identity.py` inside the published wheel/sdist so
-production installs the full module without dual-maintaining a full copy under
-`.wheel-build/`. Guard with
+Build packaging (RR-003 + RR-006): hatch `force-include` maps the canonical
+agent-identity file into `aawm_litellm_callbacks/agent_identity.py` and maps
+`aawm_session_history` (+ sql shim) under `litellm/integrations/` inside the
+published wheel/sdist so production installs resolve package imports without
+dual-maintaining full copies under `.wheel-build/`. Guard with
 `python scripts/sync_aawm_agent_identity_to_wheel.py --check` (read-only;
 does not copy sources).
 
@@ -424,8 +429,10 @@ When rebasing this fork:
 - keep the overlay module boundaries stable unless there is a clear reason to move them
 - treat published callback/control-plane wheel contents as part of the production
   acceptance bar (agent identity is single-source via hatch force-include, not a
-  byte-synced full tree under `.wheel-build/`)
+  byte-synced full tree under `.wheel-build/`; session_history package modules
+  are also force-included so wheel agent_identity imports resolve)
 - bump the relevant wheel version whenever wheel-visible behavior changes
-- after editing the canonical agent-identity module, run
-  `python scripts/sync_aawm_agent_identity_to_wheel.py --check` (loader + packaging
-  guard only) and rebuild the callback wheel; do not reintroduce a full source copy
+- after editing the canonical agent-identity module or `aawm_session_history`,
+  run `python scripts/sync_aawm_agent_identity_to_wheel.py --check` (loader +
+  packaging guard only) and rebuild the callback wheel; do not reintroduce a
+  full source copy under `.wheel-build/`

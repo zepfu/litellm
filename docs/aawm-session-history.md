@@ -1,5 +1,59 @@
 # AAWM Session History Metadata
 
+## Module layout (maintainers)
+
+Session-history concerns are intentionally split so the identity callback is not
+the sole owner of every persistence artifact:
+
+- `litellm/integrations/aawm_session_history/` — durable session-history package
+  with disjoint modules for independent reuse/testing:
+  - `runtime.py` — process-local queue/pool/spool/retry control state and the
+    identity-host bridge used by tests (`_state` / `_call` / `_set_state`).
+  - `writer.py` — bounded queue, daemon worker, batch flush, asyncpg pool cache,
+    and process-exit drain hook. Re-exports spool/retry for historical imports.
+  - `spool.py` — filesystem degraded-mode spool, encode/decode, and spool
+    drainer thread.
+  - `retry.py` — flush retry/backoff, exhaustion handling, and retry telemetry.
+  - `record.py` — live/Langfuse/spend-log record builders, shared
+    `_derive_session_history_*` field helpers, DB payloads, and persist
+    entrypoints (primary txn + best-effort side tables). Functions are
+    ordinary Python source in this file (not compile/exec of relocated
+    strings). At install they are rebound onto
+    `aawm_agent_identity` with that module's globals so historical
+    monkeypatches on the identity host still apply; `inspect.getsource`
+    and tracebacks point at `record.py`.
+  - `sql.py` — DDL/DML string constants for `session_history` and related
+    observation tables.
+  - `identity_selection.py` — ordered first-match identity selection for
+    repair/backfill scripts (`select_first_identity`). Field policy stays in
+    each script; only the selection contract is shared.
+  - Compatibility shims:
+    - `litellm.integrations.aawm_session_history_sql` re-exports `sql.py`.
+    - `litellm.integrations.aawm_agent_identity` re-exports SQL, writer/spool/
+      retry, and record APIs for scripts/tests that historically imported them
+      from the identity callback module.
+    - Package root (`litellm.integrations.aawm_session_history`) re-exports
+      underscore SQL/writer APIs via explicit `__all__` (not bare `import *`).
+    - The `aawm-litellm-callbacks` wheel force-includes this package under
+      `litellm/integrations/aawm_session_history/` plus the sql shim so the
+      wheel-shipped agent_identity module can import package-owned surfaces.
+- `litellm/integrations/aawm_agent_identity.py` — request-time identity
+  extraction, Langfuse enrichment, and alias/routing helpers. Session-history
+  record builders and durable writer services are package-owned and re-exported
+  for compatibility.
+- Primary history + tool-activity rows are written inside one transaction when
+  asyncpg transactions are available. Optional side tables (rate limits,
+  provider errors, alias routing audit, tool-definition snapshots) remain
+  best-effort and must not roll back primary history.
+
+Schema bootstrap at request time is migration-owned: the callback marks schema
+ready without issuing DDL on the hot path (DDL/DML strings remain in `sql.py`
+for operators/migrations). The writer owns queue/spool lifecycle and process-exit
+drain-to-spool behavior; the identity callback only enqueues built records.
+Session-history durable service concurrency is threading-only (queue + locks);
+asyncio is used only for asyncpg I/O on the worker thread event loop.
+
+
 This fork stores AAWM-specific routing and observability details in
 `aawm_tristore.public.session_history.metadata`. These keys are intended for
 maintainer diagnostics and downstream reporting surfaces. They should not be
@@ -264,6 +318,15 @@ context in
 `session_history.metadata` may require Langfuse observation metadata during
 backfill or `repair_session_history_repository_identity.py` repair passes.
 
+Trusted workspace absolute roots used for path→repository mapping are
+configurable for non-developer hosts:
+
+- `AAWM_WORKSPACE_ROOT` (default `~/projects`) — trusted projects
+  prefix for absolute path extraction from cwd/workspace text and instruction
+  files.
+- `AAWM_CODEX_MEMORY_ROOT` (default `~/.codex/memories`) — Codex
+  memory root that maps to the synthetic `codex-memories` repository label.
+
 Trusted repository sources include explicit repository headers, explicit
 metadata or `litellm_metadata` keys, and current workspace context such as
 `<environment_context><cwd>...</cwd></environment_context>`,
@@ -353,6 +416,13 @@ diagnostic artifact context without promoting stale prompt references into route
 grouping.
 
 ### Repairing repository / tenant identity
+
+Repository candidate resolution in `repair_session_history_repository_identity.py`
+and project identity in `backfill_claude_auto_review_session_history.py` both use
+`aawm_session_history.identity_selection.select_first_identity` for ordered
+first-match selection. Each script still owns its source list and normalization
+policy; only the selection contract is shared.
+
 
 Use `scripts/repair_session_history_repository_identity.py` to repair malformed
 or missing `session_history.repository` / `tenant_id` values and the owned

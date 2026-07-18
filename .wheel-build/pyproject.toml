@@ -12,16 +12,36 @@ dependencies = ["litellm"]
 [project.optional-dependencies]
 dev = ["build"]
 
-# Single-source packaging for agent_identity (RR-003):
-# the published wheel force-includes the canonical integration module so the
-# package tree does not maintain a second full copy of the ~21k-line file.
+# Single-source packaging (RR-003 + RR-006):
+# - force-include canonical agent_identity into the callback package
+# - force-include aawm_session_history package modules + sql shim under the
+#   litellm.integrations namespace so the wheel-installed agent_identity
+#   can import package-owned writer/sql/record without a dual-maintained copy
 # The thin checkout loader under aawm_litellm_callbacks/agent_identity.py is
-# overwritten at wheel build time by this mapping.
+# overwritten at wheel build time by the agent_identity mapping.
 [tool.hatch.build.targets.wheel]
 packages = ["aawm_litellm_callbacks"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "../litellm/integrations/aawm_agent_identity.py" = "aawm_litellm_callbacks/agent_identity.py"
+"../litellm/integrations/aawm_session_history/__init__.py" = "litellm/integrations/aawm_session_history/__init__.py"
+"../litellm/integrations/aawm_session_history/runtime.py" = "litellm/integrations/aawm_session_history/runtime.py"
+"../litellm/integrations/aawm_session_history/writer.py" = "litellm/integrations/aawm_session_history/writer.py"
+"../litellm/integrations/aawm_session_history/spool.py" = "litellm/integrations/aawm_session_history/spool.py"
+"../litellm/integrations/aawm_session_history/retry.py" = "litellm/integrations/aawm_session_history/retry.py"
+"../litellm/integrations/aawm_session_history/record.py" = "litellm/integrations/aawm_session_history/record.py"
+"../litellm/integrations/aawm_session_history/sql.py" = "litellm/integrations/aawm_session_history/sql.py"
+"../litellm/integrations/aawm_session_history/identity_selection.py" = "litellm/integrations/aawm_session_history/identity_selection.py"
+"../litellm/integrations/aawm_session_history_sql.py" = "litellm/integrations/aawm_session_history_sql.py"
 
 [tool.hatch.build.targets.sdist.force-include]
 "../litellm/integrations/aawm_agent_identity.py" = "aawm_litellm_callbacks/agent_identity.py"
+"../litellm/integrations/aawm_session_history/__init__.py" = "litellm/integrations/aawm_session_history/__init__.py"
+"../litellm/integrations/aawm_session_history/runtime.py" = "litellm/integrations/aawm_session_history/runtime.py"
+"../litellm/integrations/aawm_session_history/writer.py" = "litellm/integrations/aawm_session_history/writer.py"
+"../litellm/integrations/aawm_session_history/spool.py" = "litellm/integrations/aawm_session_history/spool.py"
+"../litellm/integrations/aawm_session_history/retry.py" = "litellm/integrations/aawm_session_history/retry.py"
+"../litellm/integrations/aawm_session_history/record.py" = "litellm/integrations/aawm_session_history/record.py"
+"../litellm/integrations/aawm_session_history/sql.py" = "litellm/integrations/aawm_session_history/sql.py"
+"../litellm/integrations/aawm_session_history/identity_selection.py" = "litellm/integrations/aawm_session_history/identity_selection.py"
+"../litellm/integrations/aawm_session_history_sql.py" = "litellm/integrations/aawm_session_history_sql.py"

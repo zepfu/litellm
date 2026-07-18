@@ -10686,9 +10686,8 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
     assert create_pool_calls[0]["server_settings"] == {
         "application_name": "aawm-litellm-test"
     }
-    assert create_pool_calls[0]["init"] is (
-        aawm_agent_identity._initialize_session_history_connection
-    )
+    # application_name is set via server_settings only; pool init= was removed.
+    assert "init" not in create_pool_calls[0]
 
     await aawm_agent_identity._close_aawm_session_history_pools_for_current_loop()
     created_pool.close.assert_awaited_once()
@@ -12182,19 +12181,20 @@ def test_failed_session_history_traceback_is_suppressed_across_batches(
     assert exception_mock.call_count == 2
 
 
-def test_failed_session_history_batch_keeps_retrying_when_spool_fails(
+def test_failed_session_history_batch_stops_when_spool_fails_after_retry_budget(
     monkeypatch,
 ) -> None:
     records = [{"litellm_call_id": "call-spool-failure"}]
     attempts = []
     spool_attempts = []
+    error_mock = MagicMock()
 
     def fake_flush(batch, **kwargs):
         attempts.append((batch, kwargs))
         failure_callback = kwargs.get("failure_callback")
         if failure_callback is not None:
             failure_callback(OSError("pgbouncer unavailable"))
-        return len(attempts) >= 2
+        return False
 
     def failing_spool(*args, **kwargs):
         spool_attempts.append((args, kwargs))
@@ -12214,13 +12214,16 @@ def test_failed_session_history_batch_keeps_retrying_when_spool_fails(
     monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", MagicMock())
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", MagicMock())
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "error", error_mock)
 
     aawm_agent_identity._flush_session_history_batch_with_retry(records)
 
-    assert len(attempts) == 2
+    # max_retries=0 => single attempt, then exhaustion + drop if spool fails.
+    assert len(attempts) == 1
     assert len(spool_attempts) == 1
     assert attempts[0][1]["log_exception"] is True
-    assert attempts[1][1]["log_exception"] is False
+    assert error_mock.called
+    assert "dropping" in error_mock.call_args.args[0]
 
 
 def test_session_history_spool_drainer_flushes_and_removes_records(
@@ -12426,6 +12429,7 @@ def test_failed_session_history_batch_logs_spool_failure_severity(
 ) -> None:
     records = [{"litellm_call_id": "call-spool-failure-log"}]
     exception_mock = MagicMock()
+    error_mock = MagicMock()
     attempts = []
 
     def fake_flush(batch, **kwargs):
@@ -12433,7 +12437,7 @@ def test_failed_session_history_batch_logs_spool_failure_severity(
         failure_callback = kwargs.get("failure_callback")
         if failure_callback is not None:
             failure_callback(OSError("pgbouncer unavailable"))
-        return len(attempts) >= 2
+        return False
 
     def failing_spool(*args, **kwargs):
         raise OSError("spool unwritable")
@@ -12452,15 +12456,18 @@ def test_failed_session_history_batch_logs_spool_failure_severity(
     monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", MagicMock())
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "error", error_mock)
 
     aawm_agent_identity._flush_session_history_batch_with_retry(records)
 
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert exception_mock.call_count == 1
     assert (
         "potential session_history data loss until inline retry succeeds"
         in exception_mock.call_args.args[0]
     )
+    assert error_mock.called
+    assert "dropping" in error_mock.call_args.args[0]
 
 
 def test_session_history_spool_drainer_logs_recovery_and_retention(
@@ -12871,12 +12878,9 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
 
     await _persist_session_history_record(record)
 
-    assert mock_conn.execute.await_count == 4
-    app_name_args = mock_conn.execute.await_args_list[0].args
-    assert app_name_args[0] == "select set_config($1, $2, false)"
-    assert app_name_args[1] == "application_name"
-    assert app_name_args[2]
-    executed_args = mock_conn.execute.await_args_list[1].args
+    # Primary path: INSERT + previous-gap update. No per-write set_config.
+    assert mock_conn.execute.await_count == 2
+    executed_args = mock_conn.execute.await_args_list[0].args
     assert "INSERT INTO public.session_history" in executed_args[0]
     assert len(executed_args[1:]) == _session_history_insert_placeholder_count()
     assert executed_args[1] == "call-123"
@@ -12884,13 +12888,9 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
     assert executed_args[6] == "anthropic/claude-sonnet-4-6"
     assert executed_args[128] == "anthropic/claude-sonnet-4-6"
     assert executed_args[129] is None
-    gap_args = mock_conn.execute.await_args_list[2].args
+    gap_args = mock_conn.execute.await_args_list[1].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-123"]
-    final_app_name_args = mock_conn.execute.await_args_list[3].args
-    assert final_app_name_args[0] == "select set_config($1, $2, false)"
-    assert final_app_name_args[1] == "application_name"
-    assert final_app_name_args[2]
     mock_conn.executemany.assert_awaited_once()
     tool_args = mock_conn.executemany.await_args.args
     assert "INSERT INTO public.session_history_tool_activity" in tool_args[0]
@@ -12970,7 +12970,7 @@ async def test_persist_session_history_record_strips_postgres_nul_bytes(
 
     await _persist_session_history_record(record)
 
-    executed_args = mock_conn.execute.await_args_list[1].args
+    executed_args = mock_conn.execute.await_args_list[0].args
     assert "INSERT INTO public.session_history" in executed_args[0]
     _assert_no_postgres_nul_bytes(executed_args[1:])
     assert json.loads(executed_args[31]) == ["Read"]
@@ -15693,18 +15693,11 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
 
     await _persist_session_history_records(records)
 
-    assert mock_conn.execute.await_count == 3
-    app_name_args = mock_conn.execute.await_args_list[0].args
-    assert app_name_args[0] == "select set_config($1, $2, false)"
-    assert app_name_args[1] == "application_name"
-    assert app_name_args[2]
-    gap_args = mock_conn.execute.await_args_list[1].args
+    # Primary path: gap update via execute; history+tool activity via executemany.
+    assert mock_conn.execute.await_count == 1
+    gap_args = mock_conn.execute.await_args_list[0].args
     assert "previous_response_to_current_request_ms" in gap_args[0]
     assert gap_args[1] == ["call-1"]
-    final_app_name_args = mock_conn.execute.await_args_list[2].args
-    assert final_app_name_args[0] == "select set_config($1, $2, false)"
-    assert final_app_name_args[1] == "application_name"
-    assert final_app_name_args[2]
     assert mock_conn.executemany.await_count == 2
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
@@ -15768,7 +15761,6 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
 
     mock_conn = AsyncMock()
     fake_pool = _FakePool(mock_conn)
-    exception_mock = MagicMock()
     rate_limit_observation = records[0]["rate_limit_observations"][0]
     mock_conn.executemany.side_effect = [
         None,
@@ -15794,22 +15786,28 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
         "litellm.integrations.aawm_agent_identity._derive_rate_limit_transitions",
         AsyncMock(return_value=[]),
     )
-    with pytest.raises(RuntimeError, match="rate-limit insert unavailable"):
-        await _persist_session_history_records(records)
+    warning_mock = MagicMock()
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
+
+    # Best-effort side writes must not fail primary session_history persistence.
+    await _persist_session_history_records(records)
 
     history_args = mock_conn.executemany.await_args_list[0].args
     assert "INSERT INTO public.session_history" in history_args[0]
     assert history_args[1][0][0] == "call-side-write-fails"
     side_write_args = mock_conn.executemany.await_args_list[1].args
     assert "INSERT INTO public.rate_limit_observations" in side_write_args[0]
-    exception_mock.assert_not_called()
+    assert warning_mock.called
+    assert any(
+        "best-effort rate limit observation persist failed" in str(call.args[0])
+        for call in warning_mock.call_args_list
+    )
 
 
 @pytest.mark.parametrize(
-    "helper_name,record,expected_match",
+    "record,warning_fragment,setup_name",
     [
         (
-            "_persist_tool_definition_snapshots_best_effort",
             {
                 "litellm_call_id": "call-tool-snapshot-side-write-fails",
                 "session_id": "session-tool-snapshot-side-write-fails",
@@ -15827,15 +15825,15 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
                     "aawm_tool_definition_types": ["function"],
                     "aawm_tool_definition_snapshot_hash": "hash-tool-snapshot-side-write-fails",
                     "aawm_tool_definition_snapshot_truncated": False,
+                    "aawm_tool_definition_snapshot": [
+                        {"source": "tools", "index": 0, "name": "spawn_agent"}
+                    ],
                 },
-                "aawm_tool_definition_snapshot": [
-                    {"source": "tools", "index": 0, "name": "spawn_agent"}
-                ],
             },
-            "tool-definition snapshot insert unavailable",
+            "best-effort tool definition snapshot persist failed",
+            "tool_snapshot",
         ),
         (
-            "_persist_provider_error_observations_best_effort",
             {
                 "provider_error_observations": [
                     {
@@ -15858,10 +15856,10 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
                     }
                 ]
             },
-            "provider-error insert unavailable",
+            "best-effort provider error observation persist failed",
+            "provider_error",
         ),
         (
-            "_persist_alias_routing_audit_best_effort",
             {
                 "litellm_call_id": "call-alias-side-write-fails",
                 "session_id": "session-alias-side-write-fails",
@@ -15881,22 +15879,24 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
                     ]
                 },
             },
-            "alias-routing audit insert unavailable",
+            "best-effort alias routing audit persist failed",
+            "alias_audit",
         ),
     ],
 )
 @pytest.mark.asyncio
-async def test_persist_session_history_records_propagates_side_write_helper_failures(
+async def test_persist_session_history_records_swallows_best_effort_side_write_failures(
     monkeypatch,
-    helper_name: str,
     record: dict[str, Any],
-    expected_match: str,
+    warning_fragment: str,
+    setup_name: str,
 ) -> None:
     records = [{**record, "_skip_session_history": True}]
 
     mock_conn = AsyncMock()
     fake_pool = _FakePool(mock_conn)
-    helper_mock = AsyncMock(side_effect=RuntimeError(expected_match))
+    mock_conn.executemany.side_effect = RuntimeError("side-write unavailable")
+    warning_mock = MagicMock()
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
         AsyncMock(return_value=fake_pool),
@@ -15906,15 +15906,36 @@ async def test_persist_session_history_records_propagates_side_write_helper_fail
         AsyncMock(),
     )
     monkeypatch.setattr(
-        f"litellm.integrations.aawm_agent_identity.{helper_name}",
-        helper_mock,
+        "litellm.integrations.aawm_agent_identity._apply_claude_auto_review_parent_identity_from_store",
+        AsyncMock(),
     )
+    if setup_name == "tool_snapshot":
+        monkeypatch.setattr(
+            "litellm.integrations.aawm_agent_identity._build_tool_definition_snapshot_db_payloads",
+            lambda _records: [("session", "hash")],
+        )
+    if setup_name == "provider_error":
+        monkeypatch.setattr(
+            "litellm.integrations.aawm_agent_identity._build_provider_error_observation_db_payload",
+            lambda observation: (observation,),
+        )
+    if setup_name == "alias_audit":
+        monkeypatch.setattr(
+            "litellm.integrations.aawm_agent_identity._build_alias_routing_audit_db_payload",
+            lambda record, event, index: ("event-key",),
+        )
+        monkeypatch.setattr(
+            "litellm.integrations.aawm_agent_identity._extract_alias_routing_audit_events",
+            lambda record: [{"event_type": "candidate_selected"}],
+        )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
 
-    with pytest.raises(RuntimeError, match=expected_match):
-        await _persist_session_history_records(records)
+    await _persist_session_history_records(records)
 
-    helper_mock.assert_awaited_once()
-    mock_conn.executemany.assert_not_awaited()
+    assert mock_conn.executemany.await_count >= 1
+    assert any(
+        warning_fragment in str(call.args[0]) for call in warning_mock.call_args_list
+    )
 
 
 @pytest.mark.asyncio
