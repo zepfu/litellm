@@ -1664,6 +1664,9 @@ class NewTeamRequest(TeamBase):
     team_member_budget: Optional[
         float
     ] = None  # allow user to set a budget for all team members
+    team_member_budget_duration: Optional[
+        str
+    ] = None  # allow user to set a budget duration for all team members
     team_member_rpm_limit: Optional[
         int
     ] = None  # allow user to set RPM limit for all team members

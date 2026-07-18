@@ -86,6 +86,27 @@ Possible values for `budget_duration`
 | `budget_duration="30d"` | every 1 month |
 
 
+### Team Member Budgets on `/team/new`
+
+To budget individual members within a team, pass team-member fields on `/team/new` (or `/team/update`):
+
+- `team_member_budget` — max spend for each member
+- `team_member_budget_duration` — reset cadence for that member budget (same duration values as `budget_duration`)
+- `team_member_rpm_limit` / `team_member_tpm_limit` — optional per-member rate limits
+
+`team_member_budget_duration` alone is enough to create the team-member budget row on team creation. Example:
+
+```shell
+curl -X POST 'http://0.0.0.0:4000/team/new' \
+     -H 'Authorization: Bearer sk-1234' \
+     -H 'Content-Type: application/json' \
+     -d '{
+            "team_alias": "QA Prod Bot",
+            "team_member_budget": 10,
+            "team_member_budget_duration": "30d"
+        }'
+```
+
 ### 2. Create a key for the `team`
 
 Create a key for Team=`QA Prod Bot` and `team_id="de35b29e-6ca8-4f47-b804-2b79d07aa99a"` from Step 1 

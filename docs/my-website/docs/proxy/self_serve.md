@@ -291,6 +291,8 @@ Set a max budget for a team member.
 
 You can do this when creating a new team, or by updating an existing team. 
 
+`team_member_budget_duration` sets how often each team member's budget resets. You can set duration as seconds (`"30s"`), minutes (`"30m"`), hours (`"30h"`), or days (`"30d"`). On `/team/new`, providing only `team_member_budget_duration` is enough to create the team-member budget row; `/team/update` accepts the same field. You can also set a default via `litellm.default_team_params.team_member_budget_duration`.
+
 <Tabs>
 <TabItem value="ui" label="UI">
 
@@ -303,10 +305,11 @@ You can do this when creating a new team, or by updating an existing team.
 curl -X POST '<PROXY_BASE_URL>/team/new' \
 -H 'Authorization: Bearer <PROXY_MASTER_KEY>' \
 -H 'Content-Type: application/json' \
--D '{
+-d '{
     "team_alias": "team_1",
     "budget_duration": "10d",
-    "team_member_budget": 10
+    "team_member_budget": 10,
+    "team_member_budget_duration": "30d"
 }'
 ```
 
