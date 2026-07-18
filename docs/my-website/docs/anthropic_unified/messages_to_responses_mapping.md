@@ -4,6 +4,15 @@ When you send a request to `/v1/messages` targeting an OpenAI or Azure model, Li
 
 The transformation lives in `litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py`.
 
+Streaming Anthropic SSE reconstruction (`event: content_block_*`, `message_start` / `message_delta` / `message_stop`) is **not** part of this module. That path is owned by `responses_adapters/streaming_iterator.py`, which reuses shared emitter helpers from `adapters/streaming_iterator.py`. This mapping page only covers request/response **body** conversion.
+
+### Prompt cache routing (`cache_control` → `prompt_cache_key`)
+
+Anthropic `cache_control` markers (including Claude Code's moving per-turn breakpoints on recent messages) are translated into OpenAI Responses `prompt_cache_key` **only from the stable surface**: `system` and `tools`. Message-level `cache_control` is recognized for cache-intent metadata but does **not** change the key across turns. If only volatile message-level markers are present, LiteLLM omits `prompt_cache_key` rather than emitting a per-turn key that would defeat OpenAI cache affinity. An explicit request `prompt_cache_key` (when provided) is bounded to ≤ 64 characters by hashing when needed; it is not re-derived via the system/tools helper.
+
+Shared derivation lives in `adapters/observability.derive_prompt_cache_key`; this Responses adapter resolves and bounds the outbound key in `_resolve_responses_prompt_cache_key` / `_bound_prompt_cache_key`.
+
+
 
 ## Request: Anthropic → Responses API
 
@@ -24,6 +33,8 @@ The transformation lives in `litellm/llms/anthropic/experimental_pass_through/re
 | `output_format` or `output_config.format` | `text` | Wrapped as `{"format": {"type": "json_schema", "name": "structured_output", "schema": ..., "strict": true}}` |
 | `context_management` | `context_management` | Converted from Anthropic dict to OpenAI array format — see the context_management section below |
 | `metadata.user_id` | `user` | Extracted from the metadata object and truncated to 64 characters |
+| `cache_control` (on `system` / `tools` / content blocks) | `prompt_cache_key` (+ litellm metadata) | Stable key from system/tools only; message-only markers omit the key — see prompt cache section above |
+| `prompt_cache_key` (explicit) | `prompt_cache_key` | Passed through when ≤ 64 chars; longer values are hashed to an OpenAI-safe key |
 | `stop_sequences` | ❌ Not mapped | Dropped silently |
 | `top_k` | ❌ Not mapped | Dropped silently |
 | `speed` | ❌ Not mapped | Only used to set Anthropic beta headers on the native path |
@@ -118,3 +129,41 @@ When the Responses API reply comes back, LiteLLM converts it into an Anthropic `
 | *(hardcoded)* | `type: "message"` | Always set |
 | *(hardcoded)* | `role: "assistant"` | Always set |
 | *(hardcoded)* | `stop_sequence: null` | Always null on this path |
+
+## Streaming: Responses events → Anthropic SSE
+
+Streaming reconstruction lives in
+`litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py`
+(`AnthropicResponsesStreamWrapper`).
+
+Anthropic event envelopes and byte framing are **not** duplicated here. The
+Responses wrapper imports the shared emitter surface from
+`litellm/llms/anthropic/experimental_pass_through/adapters/streaming_iterator.py`
+(the same helpers used by the Chat Completions adapter tree):
+
+- `emit_message_start` / `emit_message_delta` / `emit_message_stop`
+- `emit_content_block_start` / `emit_content_block_delta` / `emit_content_block_stop`
+- `encode_anthropic_sse_chunk` (used by `async_anthropic_sse_wrapper()`)
+
+| Responses API event | Anthropic SSE |
+|---|---|
+| `response.created` | `message_start` |
+| `response.output_item.added` (`message`, `function_call`, `reasoning`, `mcp_call`) | `content_block_start` |
+| `response.output_text.delta` | `content_block_delta` with `text_delta` |
+| `response.reasoning_summary_text.delta` | `content_block_delta` with `thinking_delta` |
+| `response.function_call_arguments.delta` / `.done` | `content_block_delta` with `input_json_delta` (empty argument deltas are not framed) |
+| `response.output_item.done` | `content_block_stop` (and a late `input_json_delta` when arguments never streamed) |
+| `response.completed` | `message_delta` + `message_stop` |
+
+Only the **Responses → normalized delta** mapping is tree-local. Client-visible
+Anthropic SSE shapes and framing stay on the shared emitter so Chat vs Responses
+lanes cannot diverge.
+
+### `prompt_cache_key` stability
+
+When this adapter sets OpenAI `prompt_cache_key` for Anthropic-shaped traffic,
+the key is produced by `adapters/observability.derive_prompt_cache_key()`. The
+helper hashes stable `system` + `tools` roots only. Moving / per-turn
+`cache_control` breakpoints on conversation turns are excluded so multi-turn
+sessions reuse the same key instead of missing the server-side prompt cache on
+every turn.

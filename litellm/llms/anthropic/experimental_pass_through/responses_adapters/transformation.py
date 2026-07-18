@@ -1,10 +1,19 @@
 """
 Transformation layer: Anthropic /v1/messages <-> OpenAI Responses API.
 
-This module owns all format conversions for the direct v1/messages -> Responses API
-path used for OpenAI and Azure models.
+This module owns all *request/response body* conversions for the direct
+v1/messages -> Responses API path used for OpenAI and Azure models.
+
+Streaming Anthropic SSE reconstruction (``event: content_block_*``) lives in
+``responses_adapters/streaming_iterator.py`` and the parallel Chat Completions
+tree under ``adapters/streaming_iterator.py``. This transformation module is
+not an SSE emitter; shared streaming-emitter consolidation belongs there, not
+here. Shared request helpers already come from ``adapters.observability`` and
+``adapters.transformation`` (e.g. ``derive_prompt_cache_key``,
+``sanitize_anthropic_tool_use_input``).
 """
 
+import hashlib
 import json
 from typing import Any, Dict, List, Optional, Union, cast
 
@@ -36,7 +45,10 @@ from ..adapters.observability import (
     provider_cache_intent_metadata,
     request_contains_cache_control,
 )
-from ..adapters.transformation import sanitize_anthropic_tool_use_input
+from ..adapters.transformation import (
+    sanitize_anthropic_tool_use_id,
+    sanitize_anthropic_tool_use_input,
+)
 
 
 class AnthropicResponsesProviderError(RuntimeError):
@@ -61,9 +73,7 @@ def summarize_failed_responses_response(response: Any) -> Dict[str, Any]:
         "error": _response_attr(response, "error"),
         "incomplete_details": _response_attr(response, "incomplete_details"),
         "output_count": len(output) if isinstance(output, list) else 0,
-        "output_types": [
-            _response_attr(item, "type") for item in output[:20]
-        ]
+        "output_types": [_response_attr(item, "type") for item in output[:20]]
         if isinstance(output, list)
         else [],
     }
@@ -86,6 +96,51 @@ def raise_for_failed_responses_response(
         f"{context} returned a failed response: "
         + json.dumps(diagnostic, default=str, ensure_ascii=False, sort_keys=True)
     )
+
+
+def _bound_prompt_cache_key(value: str, *, prefix: str = "anthropic-cache") -> str:
+    """Return an OpenAI-safe prompt_cache_key (<= 64 chars).
+
+    Caller-supplied keys may exceed OpenAI's length limit. Re-deriving via
+    ``derive_prompt_cache_key({"prompt_cache_key": ...})`` is incorrect because
+    that helper only hashes stable system/tools roots (RR-026/RR-032). Hash the
+    raw key string instead when truncation is required.
+    """
+    cleaned = value.strip()
+    if len(cleaned) <= 64:
+        return cleaned
+    cleaned_prefix = prefix.strip()[:23] or "cache"
+    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:40]
+    return f"{cleaned_prefix}-{digest}"[:64]
+
+
+def _resolve_responses_prompt_cache_key(anthropic_request: Any) -> Optional[str]:
+    """Derive a *stable* OpenAI prompt_cache_key for Responses adaptation.
+
+    Preference order:
+    1. Explicit request ``prompt_cache_key`` (bounded).
+    2. Shared ``derive_prompt_cache_key`` over system/tools only — never
+       message/turn content — so multi-turn Claude Code cache breakpoints do
+       not churn the key every request.
+
+    Returns None when only volatile (message-level) cache_control is present.
+    Omitting the key is preferred over a per-turn volatile key, which can
+    shard cache affinity worse than OpenAI's default prefix routing.
+    """
+    if isinstance(anthropic_request, dict):
+        explicit = anthropic_request.get("prompt_cache_key")
+    else:
+        explicit = getattr(anthropic_request, "get", lambda *_a, **_k: None)(
+            "prompt_cache_key"
+        )
+        if explicit is None and hasattr(anthropic_request, "prompt_cache_key"):
+            explicit = getattr(anthropic_request, "prompt_cache_key", None)
+    if isinstance(explicit, str) and explicit.strip():
+        return _bound_prompt_cache_key(explicit)
+    derived = derive_prompt_cache_key(anthropic_request)
+    if isinstance(derived, str) and derived.strip():
+        return _bound_prompt_cache_key(derived)
+    return None
 
 
 class LiteLLMAnthropicToResponsesAPIAdapter:
@@ -161,7 +216,9 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             return None
 
         thinking_text = block.get("thinking", "")
-        encrypted_content = block.get("data", "") if block_type == "redacted_thinking" else ""
+        encrypted_content = (
+            block.get("data", "") if block_type == "redacted_thinking" else ""
+        )
 
         if not thinking_text and not encrypted_content:
             return None
@@ -351,7 +408,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         )
         return AnthropicResponseContentBlockToolUse(
             type="tool_use",
-            id=call_id or fallback_id or "",
+            id=sanitize_anthropic_tool_use_id(call_id or fallback_id or ""),
             name=anthropic_tool_name,
             input=input_data,
         ).model_dump()
@@ -404,7 +461,9 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                 if isinstance(tool, dict) and tool.get("type") == "mcp_toolset":
                     server_name = tool.get("mcp_server_name")
                     if isinstance(server_name, str) and server_name:
-                        toolsets_by_server[server_name] = cast(AnthropicMcpToolset, tool)
+                        toolsets_by_server[server_name] = cast(
+                            AnthropicMcpToolset, tool
+                        )
 
         for server in mcp_servers:
             server_name = server.get("name")
@@ -557,9 +616,11 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         elif btype == "tool_use":
                             flush_assistant_parts()
                             tool_name = block.get("name", "")
-                            responses_tool_name = self._codex_native_tool_name_to_responses(
-                                tool_name,
-                                use_codex_native_tools=use_codex_native_tools,
+                            responses_tool_name = (
+                                self._codex_native_tool_name_to_responses(
+                                    tool_name,
+                                    use_codex_native_tools=use_codex_native_tools,
+                                )
                             )
                             tool_input = self._codex_native_tool_input_to_responses(
                                 tool_name,
@@ -585,15 +646,15 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                 )
                         elif btype in ("thinking", "redacted_thinking"):
                             reasoning_id = (
-                                self._responses_reasoning_id_from_anthropic_block(
-                                    block
-                                )
+                                self._responses_reasoning_id_from_anthropic_block(block)
                             )
                             if reasoning_id is None:
                                 continue
-                            reasoning_item = self._anthropic_thinking_block_to_reasoning_item(
-                                block,
-                                reasoning_id=reasoning_id,
+                            reasoning_item = (
+                                self._anthropic_thinking_block_to_reasoning_item(
+                                    block,
+                                    reasoning_id=reasoning_id,
+                                )
                             )
                             if reasoning_item is not None:
                                 flush_assistant_parts()
@@ -625,7 +686,10 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                 tool_name,
                 use_codex_native_tools=use_codex_native_tools,
             )
-            func_tool: Dict[str, Any] = {"type": "function", "name": responses_tool_name}
+            func_tool: Dict[str, Any] = {
+                "type": "function",
+                "name": responses_tool_name,
+            }
             if "description" in tool_dict:
                 func_tool["description"] = tool_dict["description"]
             if "input_schema" in tool_dict:
@@ -856,7 +920,9 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                 cast(AnthropicMessagesToolChoice, tool_choice),
                 use_codex_native_tools=use_codex_native_tools,
             )
-            tool_choice_type = cast(AnthropicMessagesToolChoice, tool_choice).get("type")
+            tool_choice_type = cast(AnthropicMessagesToolChoice, tool_choice).get(
+                "type"
+            )
             if not (tool_choice_type == "none" and not translated_tools):
                 responses_kwargs["tool_choice"] = translated_tool_choice
 
@@ -908,31 +974,35 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             if openai_cm is not None:
                 responses_kwargs["context_management"] = openai_cm
 
+        # Anthropic cache_control -> OpenAI prompt_cache_key + cache intent.
+        # Key derivation is shared (system/tools only) so moving per-turn
+        # breakpoints do not invalidate the key (RR-032 #1).
         cache_requested = request_contains_cache_control(anthropic_request)
-        if cache_requested:
-            prompt_cache_key = cast(Dict[str, Any], anthropic_request).get(
-                "prompt_cache_key"
-            )
-            if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
-                prompt_cache_key = derive_prompt_cache_key(anthropic_request)
-            if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
-                if len(prompt_cache_key) > 64:
-                    prompt_cache_key = derive_prompt_cache_key(
-                        {"prompt_cache_key": prompt_cache_key},
-                        prefix="anthropic-cache-key",
-                    )
-                responses_kwargs["prompt_cache_key"] = prompt_cache_key
-                litellm_metadata = dict(responses_kwargs.get("litellm_metadata") or {})
-                litellm_metadata.update(
-                    provider_cache_intent_metadata(
-                        provider="openai",
-                        attempted=True,
-                        native_supported=True,
-                    )
+        prompt_cache_key = _resolve_responses_prompt_cache_key(anthropic_request)
+        if cache_requested or prompt_cache_key is not None:
+            litellm_metadata = dict(responses_kwargs.get("litellm_metadata") or {})
+            litellm_metadata.update(
+                provider_cache_intent_metadata(
+                    provider="openai",
+                    attempted=True,
+                    native_supported=True,
                 )
+            )
+            litellm_metadata[
+                "anthropic_adapter_cache_control_present"
+            ] = cache_requested
+            if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
+                responses_kwargs["prompt_cache_key"] = prompt_cache_key
                 litellm_metadata["openai_prompt_cache_key_present"] = True
-                litellm_metadata["anthropic_adapter_cache_control_present"] = True
-                responses_kwargs["litellm_metadata"] = litellm_metadata
+                litellm_metadata["openai_prompt_cache_key_omitted_reason"] = None
+            else:
+                # Volatile-only cache_control (messages) — omit key rather than
+                # emit a per-turn value that defeats cache affinity.
+                litellm_metadata["openai_prompt_cache_key_present"] = False
+                litellm_metadata[
+                    "openai_prompt_cache_key_omitted_reason"
+                ] = "no_stable_system_or_tools_cache_surface"
+            responses_kwargs["litellm_metadata"] = litellm_metadata
 
         # metadata user_id -> user
         metadata = anthropic_request.get("metadata")

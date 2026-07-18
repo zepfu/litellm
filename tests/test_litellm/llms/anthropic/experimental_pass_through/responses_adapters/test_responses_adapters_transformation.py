@@ -183,6 +183,7 @@ class TestOutputConfigStructuredOutput:
 # translate_messages_to_responses_input
 # ---------------------------------------------------------------------------
 
+
 # Helper: cast plain dicts to the expected type so call sites stay clean.
 def _translate_messages(messages: List[Any]) -> List[Dict[str, Any]]:
     return _ADAPTER.translate_messages_to_responses_input(messages)  # type: ignore[arg-type]
@@ -287,7 +288,11 @@ class TestTranslateMessagesToResponsesInput:
                 "content": [
                     {
                         "type": "image",
-                        "source": {"type": "base64", "media_type": "image/jpeg", "data": ""},
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": "",
+                        },
                     }
                 ],
             }
@@ -539,7 +544,9 @@ class TestTranslateMessagesToResponsesInput:
         result = _translate_messages(messages)
         assert result == []
 
-    def test_assistant_redacted_thinking_block_with_responses_id_becomes_reasoning_item(self):
+    def test_assistant_redacted_thinking_block_with_responses_id_becomes_reasoning_item(
+        self,
+    ):
         """Responses encrypted reasoning with native rs IDs is preserved."""
         messages = [
             {
@@ -638,7 +645,10 @@ class TestTranslateMessagesToResponsesInput:
         ]
         result = _translate_messages(messages)
         assert len(result) == 1
-        assert result[0]["content"][0] == {"type": "input_text", "text": "Describe this image:"}
+        assert result[0]["content"][0] == {
+            "type": "input_text",
+            "text": "Describe this image:",
+        }
         assert result[0]["content"][1] == {
             "type": "input_image",
             "image_url": "https://example.com/cat.jpg",
@@ -801,7 +811,9 @@ class TestTranslateMessagesToResponsesInput:
                 model=candidate,
             )
         )
-        tool_use_blocks = [item for item in returned["content"] if item["type"] == "tool_use"]
+        tool_use_blocks = [
+            item for item in returned["content"] if item["type"] == "tool_use"
+        ]
         assert len(tool_use_blocks) == 1
         tool_use = tool_use_blocks[0]
         assert tool_use["type"] == "tool_use"
@@ -815,7 +827,10 @@ class TestTranslateMessagesToResponsesInput:
             assert tool_use["input"][key] == tool_input[key]
 
         # Tools are preserved with their declared required argument lists
-        assert translated["tools"][0]["parameters"]["required"] == expected_tool_schema_required
+        assert (
+            translated["tools"][0]["parameters"]["required"]
+            == expected_tool_schema_required
+        )
 
     @pytest.mark.parametrize(
         (
@@ -961,6 +976,7 @@ class TestTranslateMessagesToResponsesInput:
         # End-to-end Claude Code tool loop markers remain stable.
         assert translated["tools"][0]["name"] == "exec_command"
         assert translated["tools"][0]["parameters"]["required"] == ["cmd"]
+
 
 # ---------------------------------------------------------------------------
 # translate_tools_to_responses_api
@@ -1197,10 +1213,15 @@ class TestTranslateToolChoiceToResponsesAPI:
     """Anthropic tool_choice -> Responses API tool_choice."""
 
     def test_auto_maps_to_auto(self):
-        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "auto"}) == "auto"
+        assert (
+            _ADAPTER.translate_tool_choice_to_responses_api({"type": "auto"}) == "auto"
+        )
 
     def test_any_maps_to_required(self):
-        assert _ADAPTER.translate_tool_choice_to_responses_api({"type": "any"}) == "required"
+        assert (
+            _ADAPTER.translate_tool_choice_to_responses_api({"type": "any"})
+            == "required"
+        )
 
     def test_specific_tool_maps_to_function(self):
         result = _ADAPTER.translate_tool_choice_to_responses_api(
@@ -1458,7 +1479,9 @@ class TestTranslateRequestBroaderCoverage:
 
     def test_tools_translated(self):
         req = _make_request(
-            tools=[{"name": "calculator", "description": "Does math.", "input_schema": {}}]
+            tools=[
+                {"name": "calculator", "description": "Does math.", "input_schema": {}}
+            ]
         )
         kwargs = _ADAPTER.translate_request(req)
         assert len(kwargs["tools"]) == 1
@@ -1546,7 +1569,9 @@ class TestTranslateRequestBroaderCoverage:
         assert "parallel_tool_calls" not in kwargs
 
     def test_thinking_translated_to_reasoning(self):
-        req = _make_request(model="gpt-5.4", thinking={"type": "enabled", "budget_tokens": 12000})
+        req = _make_request(
+            model="gpt-5.4", thinking={"type": "enabled", "budget_tokens": 12000}
+        )
         kwargs = _ADAPTER.translate_request(req, custom_llm_provider="openai")
         assert kwargs["reasoning"] == {"effort": "high", "summary": "detailed"}
 
@@ -1591,7 +1616,8 @@ class TestTranslateRequestBroaderCoverage:
         assert len(kwargs["user"]) == 64
 
     def test_cache_control_adds_prompt_cache_key_and_logging_metadata(self):
-        req = _make_request(
+        # Message-only cache_control is volatile: set intent metadata but omit key.
+        req_volatile = _make_request(
             messages=[
                 {
                     "role": "user",
@@ -1605,7 +1631,54 @@ class TestTranslateRequestBroaderCoverage:
                 }
             ]
         )
-        kwargs = _ADAPTER.translate_request(req, custom_llm_provider="openai")
+        kwargs_volatile = _ADAPTER.translate_request(
+            req_volatile, custom_llm_provider="openai"
+        )
+        assert "prompt_cache_key" not in kwargs_volatile
+        meta_v = kwargs_volatile["litellm_metadata"]
+        assert meta_v["usage_provider_cache_attempted"] is True
+        assert (
+            meta_v["usage_provider_cache_source"] == "anthropic_adapter.cache_control"
+        )
+        assert meta_v["openai_provider_cache_attempted"] is True
+        assert meta_v["openai_prompt_cache_key_present"] is False
+        assert (
+            meta_v["openai_prompt_cache_key_omitted_reason"]
+            == "no_stable_system_or_tools_cache_surface"
+        )
+        assert meta_v["anthropic_adapter_cache_control_present"] is True
+
+        # Stable system/tools surface yields a bounded, non-volatile key.
+        req_stable = _make_request(
+            system=[
+                {
+                    "type": "text",
+                    "text": "You are helpful.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=[
+                {
+                    "name": "Bash",
+                    "description": "run shell",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cache me",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+        )
+        kwargs = _ADAPTER.translate_request(req_stable, custom_llm_provider="openai")
 
         assert kwargs["prompt_cache_key"].startswith("anthropic-cache-")
         assert len(kwargs["prompt_cache_key"]) <= 64
@@ -1622,6 +1695,13 @@ class TestTranslateRequestBroaderCoverage:
     def test_cache_metadata_merges_existing_litellm_metadata(self):
         kwargs = _build_responses_kwargs(
             max_tokens=1024,
+            system=[
+                {
+                    "type": "text",
+                    "text": "stable",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             messages=[
                 {
                     "role": "user",
@@ -1648,13 +1728,23 @@ class TestTranslateRequestBroaderCoverage:
         assert litellm_metadata["trace_environment"] == "dev"
         assert litellm_metadata["openai_prompt_cache_key_present"] is True
         assert litellm_metadata["anthropic_adapter_cache_control_present"] is True
+        assert "prompt_cache_key" in kwargs
 
     def test_no_optional_fields_does_not_add_spurious_keys(self):
         req = _make_request()
         kwargs = _ADAPTER.translate_request(req)
-        for key in ("instructions", "temperature", "top_p", "tools", "tool_choice",
-                    "reasoning", "text", "context_management", "user",
-                    "parallel_tool_calls"):
+        for key in (
+            "instructions",
+            "temperature",
+            "top_p",
+            "tools",
+            "tool_choice",
+            "reasoning",
+            "text",
+            "context_management",
+            "user",
+            "parallel_tool_calls",
+        ):
             assert key not in kwargs, f"unexpected key: {key}"
 
 
@@ -1701,9 +1791,7 @@ def _make_output_message(texts: List[str]) -> MagicMock:
     return msg
 
 
-def _make_function_call_item(
-    call_id: str, name: str, arguments: Any
-) -> MagicMock:
+def _make_function_call_item(call_id: str, name: str, arguments: Any) -> MagicMock:
     """Build a mock ResponseFunctionToolCall."""
     from openai.types.responses import ResponseFunctionToolCall  # type: ignore[import]
 
