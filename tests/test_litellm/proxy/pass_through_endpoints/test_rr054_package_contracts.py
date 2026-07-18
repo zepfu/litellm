@@ -1,16 +1,7 @@
-"""RR-054 package contract + classifier discovery metadata.
+"""RR-054 package contract coverage for ``aawm_alias_routing``.
 
-Target: extracted ``aawm_alias_routing`` package modules that the changed-scope
-classifier reports as R1/missing-tests (and documents residual TS1 type_shape
-rows that require production typing, not tests).
-
-This file is intentionally the single ordinary-test surface for the package
-under the pass_through_endpoints test tree. Built-in stem heuristics cannot map
-one multi-module package to one shared test file, so this module also exports a
-source→test map that can be wired into ``[tool.pytest-classifier.test_path_map]``
-(or a ``test_file_evidence_hook``) without inventing per-stem test files.
-
-Does not edit production code.
+This file is the ordinary test surface for package contracts and runtime behavior
+covered under the extracted package scope.
 """
 
 from __future__ import annotations
@@ -55,150 +46,11 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
 )
 
 PACKAGE_DIR = Path(package.__file__).resolve().parent
-THIS_TEST_REL = (
-    "test_litellm/proxy/pass_through_endpoints/test_rr054_package_contracts.py"
-)
-
-# Source paths as reported when classifier ``src_root`` is the repo root.
-# Values are tests_root-relative paths for configured discovery evidence.
-RR054_PACKAGE_TEST_PATH_MAP: dict[str, list[str]] = {
-    # Extracted package modules (src_root = repository root).
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/adapter_config.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/adapter_driver.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/antigravity_oauth.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/durable.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/google_oauth.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/memory.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/oauth_token_cache.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/policy.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/provider_shaping.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/responses_finalize.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/retry.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/state.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/streaming.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/task_state.py": [
-        THIS_TEST_REL
-    ],
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing/types.py": [
-        THIS_TEST_REL
-    ],
-    # Compatibility re-export shim (same package contracts surface).
-    "litellm/proxy/pass_through_endpoints/aawm_alias_routing_policy.py": [
-        THIS_TEST_REL
-    ],
-}
-
-# Package-module keys only (excludes the policy shim).
-RR054_PACKAGE_MODULE_SOURCES: tuple[str, ...] = tuple(
-    source
-    for source in RR054_PACKAGE_TEST_PATH_MAP
-    if source.startswith(
-        "litellm/proxy/pass_through_endpoints/aawm_alias_routing/"
-    )
-)
-
-# Residual type_shape symbols observed in the RR-054 changed-scope scan.
-# Clearing these requires production TypedDict/Protocol work, not ordinary tests.
-RR054_PACKAGE_TS1_RESIDUALS: tuple[str, ...] = (
-    "adapter_config.responses_finalize_kwargs",
-    "adapter_driver.run_responses_adapter_route",
-    "adapter_driver.run_completion_adapter_route",
-    "antigravity_oauth.* token/payload helpers",
-    "durable.configure_durable_runtime / dual_cache / read / write",
-    "google_oauth.* token/payload helpers",
-    "memory.bound_memory_map / hydrate_affinity_memory",
-    "responses_finalize.finalize_anthropic_responses_adapter_upstream_response",
-    "retry.wait_for_monotonic_cooldown_map",
-    "state.AliasFamilyState affinity get/set/hydrate",
-    "task_state.message_has_structured_task_state_flag / select_task_state_source",
-)
-
 PACKAGE_MODULES = tuple(
     sorted(
-        {
-            Path(source).stem
-            for source in RR054_PACKAGE_MODULE_SOURCES
-            if Path(source).stem != "__init__"
-        }
+        {path.stem for path in PACKAGE_DIR.glob("*.py") if path.name != "__init__.py"}
     )
 )
-
-
-# ---------------------------------------------------------------------------
-# Classifier discovery metadata contracts
-# ---------------------------------------------------------------------------
-
-
-def test_rr054_classifier_discovery_map_covers_on_disk_package_modules() -> None:
-    """Every non-init package module is listed for configured discovery evidence."""
-    on_disk = {
-        path.stem
-        for path in PACKAGE_DIR.glob("*.py")
-        if path.name != "__init__.py" and path.stem != "__init__"
-    }
-    mapped_modules = {Path(source).stem for source in RR054_PACKAGE_MODULE_SOURCES}
-    assert mapped_modules == on_disk, (
-        f"discovery map drift: mapped={mapped_modules} on_disk={on_disk}"
-    )
-    assert (
-        "litellm/proxy/pass_through_endpoints/aawm_alias_routing_policy.py"
-        in RR054_PACKAGE_TEST_PATH_MAP
-    )
-
-    this_file = Path(__file__).resolve()
-    assert this_file.name == "test_rr054_package_contracts.py"
-    for targets in RR054_PACKAGE_TEST_PATH_MAP.values():
-        assert targets == [THIS_TEST_REL]
-
-
-def test_rr054_classifier_discovery_map_paths_are_repo_relative_and_stable() -> None:
-    for source, targets in RR054_PACKAGE_TEST_PATH_MAP.items():
-        assert source.endswith(".py")
-        assert targets == [THIS_TEST_REL]
-        if source.endswith("aawm_alias_routing_policy.py"):
-            assert (
-                source
-                == "litellm/proxy/pass_through_endpoints/aawm_alias_routing_policy.py"
-            )
-            assert (PACKAGE_DIR.parent / "aawm_alias_routing_policy.py").is_file()
-            continue
-        assert source.startswith(
-            "litellm/proxy/pass_through_endpoints/aawm_alias_routing/"
-        )
-        assert (PACKAGE_DIR / Path(source).name).is_file()
-
-
-def test_rr054_ts1_residuals_are_documented_for_production_followup() -> None:
-    """TS1 is production typing work; keep an explicit residual inventory."""
-    assert RR054_PACKAGE_TS1_RESIDUALS
-    assert any("durable" in row for row in RR054_PACKAGE_TS1_RESIDUALS)
-    assert any("state.AliasFamilyState" in row for row in RR054_PACKAGE_TS1_RESIDUALS)
 
 
 # ---------------------------------------------------------------------------
