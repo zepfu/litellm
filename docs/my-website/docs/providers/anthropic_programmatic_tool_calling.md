@@ -140,11 +140,11 @@ Every tool use block includes a `caller` field indicating how it was invoked:
 
 The `tool_id` references the code execution tool that made the programmatic call.
 
-When Anthropic streams a `bash_code_execution_tool_result` through LiteLLM's
+When Anthropic returns a `bash_code_execution_tool_result` through LiteLLM's
 Responses API, LiteLLM also emits a provider-neutral
 `code_interpreter_call` output item. The item includes the executed command,
 container ID when Anthropic supplies one, completion status, and combined
-stdout/stderr logs.
+stdout/stderr logs for both streaming and non-streaming responses.
 
 ## Container Lifecycle
 

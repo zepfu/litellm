@@ -4,6 +4,9 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 
 import httpx
+from openai.types.responses.response_code_interpreter_tool_call import (
+    ResponseCodeInterpreterToolCall,
+)
 
 import litellm
 from litellm.constants import (
@@ -1693,6 +1696,135 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         )
         return usage
 
+    def _build_code_by_id_map(
+        self, tool_calls: List[ChatCompletionToolCallChunk]
+    ) -> Dict[str, str]:
+        """Map tool call ids to bash command strings from OpenAI-shaped tool calls."""
+        code_by_id: Dict[str, str] = {}
+        for tc in tool_calls:
+            try:
+                function = tc.get("function") or {}
+                args = json.loads(function.get("arguments", "{}") or "{}")
+                call_id = tc.get("id")
+                command = args.get("command", "") if isinstance(args, dict) else ""
+                if isinstance(call_id, str) and call_id:
+                    code_by_id[call_id] = (
+                        command if isinstance(command, str) else ""
+                    )
+            except Exception:
+                continue
+        return code_by_id
+
+    @staticmethod
+    def _build_code_interpreter_log_outputs(
+        content: Any,
+    ) -> Optional[List[Dict[str, str]]]:
+        """Convert Anthropic bash_code_execution stdout/stderr into log outputs.
+
+        Matches upstream build_code_interpreter_log_outputs semantics while
+        remaining compatible with ResponseCodeInterpreterToolCall / RR-063.
+        """
+        if not isinstance(content, dict):
+            return None
+        parts: List[str] = []
+        stdout = content.get("stdout")
+        stderr = content.get("stderr")
+        if stdout:
+            parts.append(str(stdout))
+        if stderr:
+            parts.append(f"STDERR: {stderr}")
+        logs = "".join(parts)
+        if not logs:
+            return None
+        return [{"type": "logs", "logs": logs}]
+
+    def _build_code_interpreter_results(
+        self,
+        tool_results: List[Any],
+        code_by_id: Dict[str, str],
+        container_id: Optional[str],
+    ) -> List[ResponseCodeInterpreterToolCall]:
+        """Convert bash_code_execution_tool_result blocks only.
+
+        Non-bash tool results (e.g. text_editor_code_execution_tool_result) are
+        intentionally skipped so Responses API code_interpreter_call items are
+        not fabricated for unrelated server tools.
+        """
+        code_interpreter_results: List[ResponseCodeInterpreterToolCall] = []
+        # ResponseCodeInterpreterToolCall requires a string container_id.
+        resolved_container_id = container_id if isinstance(container_id, str) else ""
+        for tr in tool_results:
+            if not isinstance(tr, dict):
+                continue
+            if tr.get("type") != "bash_code_execution_tool_result":
+                continue
+            call_id = tr.get("tool_use_id") or ""
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            content = tr.get("content", {})
+            log_outputs = self._build_code_interpreter_log_outputs(content)
+            code_interpreter_results.append(
+                ResponseCodeInterpreterToolCall(
+                    type="code_interpreter_call",
+                    id=call_id,
+                    code=code_by_id.get(call_id, ""),
+                    container_id=resolved_container_id,
+                    status="completed",
+                    outputs=log_outputs,
+                )
+            )
+        return code_interpreter_results
+
+    def _build_provider_specific_fields(
+        self,
+        completion_response: dict,
+        citations: Optional[List[Any]],
+        thinking_blocks: Optional[
+            List[
+                Union[ChatCompletionThinkingBlock, ChatCompletionRedactedThinkingBlock]
+            ]
+        ],
+        web_search_results: Optional[List[Any]],
+        tool_results: Optional[List[Any]],
+        compaction_blocks: Optional[List[Any]],
+        tool_calls: List[ChatCompletionToolCallChunk],
+    ) -> Dict[str, Any]:
+        provider_specific_fields: Dict[str, Any] = {
+            "citations": citations,
+            "thinking_blocks": thinking_blocks,
+        }
+
+        context_management = completion_response.get("context_management")
+        if context_management is not None:
+            provider_specific_fields["context_management"] = context_management
+
+        if web_search_results is not None:
+            provider_specific_fields["web_search_results"] = web_search_results
+
+        if tool_results is not None:
+            provider_specific_fields["tool_results"] = tool_results
+            container = completion_response.get("container")
+            container_id = (
+                container.get("id") if isinstance(container, dict) else None
+            )
+            if container_id is not None and not isinstance(container_id, str):
+                container_id = str(container_id)
+            code_by_id = self._build_code_by_id_map(tool_calls)
+            provider_specific_fields["code_interpreter_results"] = (
+                self._build_code_interpreter_results(
+                    tool_results, code_by_id, container_id
+                )
+            )
+
+        container = completion_response.get("container")
+        if container is not None:
+            provider_specific_fields["container"] = container
+
+        if compaction_blocks is not None:
+            provider_specific_fields["compaction_blocks"] = compaction_blocks
+
+        return provider_specific_fields
+
     def transform_parsed_response(
         self,
         completion_response: dict,
@@ -1744,26 +1876,15 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             ):
                 text_content = prefix_prompt + text_content
 
-            context_management: Optional[Dict] = completion_response.get(
-                "context_management"
+            provider_specific_fields = self._build_provider_specific_fields(
+                completion_response=completion_response,
+                citations=citations,
+                thinking_blocks=thinking_blocks,
+                web_search_results=web_search_results,
+                tool_results=tool_results,
+                compaction_blocks=compaction_blocks,
+                tool_calls=tool_calls,
             )
-
-            container: Optional[Dict] = completion_response.get("container")
-
-            provider_specific_fields: Dict[str, Any] = {
-                "citations": citations,
-                "thinking_blocks": thinking_blocks,
-            }
-            if context_management is not None:
-                provider_specific_fields["context_management"] = context_management
-            if web_search_results is not None:
-                provider_specific_fields["web_search_results"] = web_search_results
-            if tool_results is not None:
-                provider_specific_fields["tool_results"] = tool_results
-            if container is not None:
-                provider_specific_fields["container"] = container
-            if compaction_blocks is not None:
-                provider_specific_fields["compaction_blocks"] = compaction_blocks
 
             _message = litellm.Message(
                 tool_calls=tool_calls,
@@ -1805,6 +1926,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         model_response.created = int(time.time())
         model_response.model = completion_response["model"]
 
+        _hidden_params["provider_specific_fields"] = provider_specific_fields
         model_response._hidden_params = _hidden_params
         return model_response
 
