@@ -28,11 +28,21 @@ their own cadence.
 
 ### Callback wheel
 
-Published source:
+Published source / packaging:
 
-- `.wheel-build/pyproject.toml`
+- `.wheel-build/pyproject.toml` (hatchling; force-includes canonical agent identity)
 - `.wheel-build/aawm_litellm_callbacks/__init__.py`
-- `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+- `.wheel-build/aawm_litellm_callbacks/agent_identity.py` (thin checkout re-export
+  loader only; **not** a second maintained implementation)
+- `litellm/integrations/aawm_agent_identity.py` (canonical agent-identity /
+  session-history implementation; single source of truth)
+
+Build packaging (RR-003): hatch `force-include` maps the canonical file into
+`aawm_litellm_callbacks/agent_identity.py` inside the published wheel/sdist so
+production installs the full module without dual-maintaining a full copy under
+`.wheel-build/`. Guard with
+`python scripts/sync_aawm_agent_identity_to_wheel.py --check` (read-only;
+does not copy sources).
 
 Release workflow:
 
@@ -221,6 +231,8 @@ litellm_settings:
 Notes:
 
 - use the wheel module path above, not the in-repo development import path
+- the installed wheel module body is the same canonical implementation as
+  `litellm.integrations.aawm_agent_identity` (hatch force-include at package build)
 - keep `langfuse` enabled if you want the overlay trace tags, spans, and
   metadata to actually be emitted upstream
 - `session_history` persistence requires AAWM DB connectivity through either:
@@ -410,5 +422,10 @@ When rebasing this fork:
 
 - keep both wheel build directories and both wheel workflows
 - keep the overlay module boundaries stable unless there is a clear reason to move them
-- treat overlay wheel parity as part of the production acceptance bar
+- treat published callback/control-plane wheel contents as part of the production
+  acceptance bar (agent identity is single-source via hatch force-include, not a
+  byte-synced full tree under `.wheel-build/`)
 - bump the relevant wheel version whenever wheel-visible behavior changes
+- after editing the canonical agent-identity module, run
+  `python scripts/sync_aawm_agent_identity_to_wheel.py --check` (loader + packaging
+  guard only) and rebuild the callback wheel; do not reintroduce a full source copy

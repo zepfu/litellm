@@ -9,9 +9,14 @@ upstream releases with AAWM-specific patches applied on top.
 
 **Callback wheel:** production callback changes are published separately from
 `.wheel-build/` and consumed as a GitHub release wheel by the production image.
-The in-repo callback at `litellm/integrations/aawm_agent_identity.py` and the
-published wheel source under `.wheel-build/` must stay behaviorally aligned.
-See `WHEEL.md` for the production wheel workflow and release path.
+Canonical agent-identity implementation is only
+`litellm/integrations/aawm_agent_identity.py`. The checkout path
+`.wheel-build/aawm_litellm_callbacks/agent_identity.py` is a thin re-export
+loader; hatch force-includes the canonical module into the published
+`aawm-litellm-callbacks` wheel so production does not dual-maintain a full
+source copy (RR-003). Guard with
+`python scripts/sync_aawm_agent_identity_to_wheel.py --check`. See
+`WHEEL.md` for the production wheel workflow and release path.
 
 **Note:** aawm.1 (OAuth token preservation in `clean_headers` and
 `_get_forwardable_headers`) was absorbed by upstream in PR #19912 (v1.81.13)
@@ -975,8 +980,11 @@ upstream feature.
 **Note:** Includes the unused-import fix (removal of `Union` import) that was
 previously a separate `chore` commit — squashed into this patch.
 Production callback behavior is shipped from the overlay wheel, so changes here
-must stay in parity with `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
-and the published `cb-v*` artifact.
+must be made in the canonical module
+`litellm/integrations/aawm_agent_identity.py`. Checkout
+`.wheel-build/aawm_litellm_callbacks/agent_identity.py` is a thin loader only;
+hatch force-includes the canonical module into the published `cb-v*` wheel
+(RR-003). Guard with `python scripts/sync_aawm_agent_identity_to_wheel.py --check`.
 
 **Upstream watch:** v1.82.2+ adds `x-litellm-agent-id` / `x-litellm-trace-id`
 agent tracing headers. These are header-based (not system-prompt-based) and
@@ -3362,6 +3370,18 @@ container restart boundary. The final release evidence should include focused
 tests for changed code paths, the default dev adapter harness artifact,
 overlapping `litellm-dev` log inspection, a clean tracked worktree, and a
 published fork image tag `v1.82.3-aawm.72` from current `main`.
+
+---
+
+### Packaging note (RR-003 current)
+
+As of RR-003, the checkout path `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
+is a thin re-export loader only. Canonical source is solely
+`litellm/integrations/aawm_agent_identity.py`, and hatch force-includes that file into
+the published `aawm-litellm-callbacks` wheel. Historical `cb-v*` entries below that
+describe byte-syncing a full source copy under `.wheel-build/` refer to the older dual-copy
+workflow and are not the current packaging model. Guard with
+`python scripts/sync_aawm_agent_identity_to_wheel.py --check`.
 
 ---
 

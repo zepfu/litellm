@@ -1,36 +1,121 @@
 #!/usr/bin/env python3
-"""Sync canonical aawm_agent_identity.py into the callback wheel package.
+"""Guard single-source packaging for callback-wheel agent_identity (RR-003).
 
-Stop-gap (RR-003): keep
-``.wheel-build/aawm_litellm_callbacks/agent_identity.py`` byte-identical
-to ``litellm/integrations/aawm_agent_identity.py`` until Wave I extraction.
+Canonical implementation lives only at::
+
+    litellm/integrations/aawm_agent_identity.py
+
+``.wheel-build/aawm_litellm_callbacks/agent_identity.py`` must remain a thin
+checkout loader that re-exports that module. The published
+``aawm-litellm-callbacks`` wheel force-includes the canonical file via hatch
+(see ``.wheel-build/pyproject.toml``); do **not** reintroduce a full maintained
+source copy under ``.wheel-build/``.
 
 Usage::
 
     python scripts/sync_aawm_agent_identity_to_wheel.py
     python scripts/sync_aawm_agent_identity_to_wheel.py --check
+
+Both modes are read-only checks. There is nothing to copy: packaging pulls the
+canonical module at wheel build time.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import shutil
+import re
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL = REPO_ROOT / "litellm" / "integrations" / "aawm_agent_identity.py"
-WHEEL_COPY = (
-    REPO_ROOT
-    / ".wheel-build"
-    / "aawm_litellm_callbacks"
-    / "agent_identity.py"
+LOADER = REPO_ROOT / ".wheel-build" / "aawm_litellm_callbacks" / "agent_identity.py"
+PYPROJECT = REPO_ROOT / ".wheel-build" / "pyproject.toml"
+
+_MAX_LOADER_LINES = 80
+_FORCE_INCLUDE_SNIPPET = (
+    '"../litellm/integrations/aawm_agent_identity.py" = '
+    '"aawm_litellm_callbacks/agent_identity.py"'
+)
+_REQUIRED_LOADER_MARKERS = (
+    "Checkout loader for aawm_litellm_callbacks",
+    "litellm.integrations.aawm_agent_identity",
+    "force-includes the canonical file",
+)
+_FORBIDDEN_LOADER_MARKERS = (
+    "class AawmAgentIdentity",
+    "def _enqueue_session_history_record",
+    "def _spool_session_history_records",
 )
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _line_count(path: Path) -> int:
+    return path.read_text(encoding="utf-8").count("\n") + 1
+
+
+def _validate() -> list[str]:
+    errors: list[str] = []
+    if not CANONICAL.is_file():
+        errors.append(f"missing canonical {CANONICAL}")
+        return errors
+    if not LOADER.is_file():
+        errors.append(f"missing checkout loader {LOADER}")
+        return errors
+    if not PYPROJECT.is_file():
+        errors.append(f"missing {PYPROJECT}")
+        return errors
+
+    loader_text = LOADER.read_text(encoding="utf-8")
+    loader_lines = _line_count(LOADER)
+    if loader_lines > _MAX_LOADER_LINES:
+        errors.append(
+            f"checkout loader too large ({loader_lines} lines > "
+            f"{_MAX_LOADER_LINES}); full source copy is not allowed"
+        )
+    for marker in _REQUIRED_LOADER_MARKERS:
+        if marker not in loader_text:
+            errors.append(f"checkout loader missing required marker: {marker!r}")
+    for marker in _FORBIDDEN_LOADER_MARKERS:
+        if marker in loader_text:
+            errors.append(
+                f"checkout loader looks like a full implementation "
+                f"(found {marker!r}); use thin re-export only"
+            )
+    if loader_text == CANONICAL.read_text(encoding="utf-8"):
+        errors.append(
+            "checkout loader is byte-identical to canonical; dual-maintained "
+            "full source copy is forbidden"
+        )
+
+    pyproject_text = PYPROJECT.read_text(encoding="utf-8")
+    if 'build-backend = "hatchling.build"' not in pyproject_text:
+        errors.append(
+            ".wheel-build/pyproject.toml must use hatchling.build for "
+            "force-include packaging"
+        )
+    if "[tool.hatch.build.targets.wheel.force-include]" not in pyproject_text:
+        errors.append(
+            ".wheel-build/pyproject.toml missing "
+            "[tool.hatch.build.targets.wheel.force-include]"
+        )
+    if _FORCE_INCLUDE_SNIPPET not in pyproject_text:
+        errors.append(
+            ".wheel-build/pyproject.toml missing force-include mapping of "
+            "canonical agent_identity into the callback package"
+        )
+    # Reject accidental setuptools dual-copy package layouts that drop force-include.
+    if (
+        re.search(
+            r"(?m)^\[tool\.setuptools",
+            pyproject_text,
+        )
+        and "force-include" not in pyproject_text
+    ):
+        errors.append(
+            ".wheel-build/pyproject.toml appears to use setuptools without "
+            "force-include; single-source packaging requires hatch force-include"
+        )
+    return errors
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,27 +123,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Exit 1 if wheel copy differs from canonical (no write).",
+        help="Exit 1 when single-source packaging guards fail (default behavior).",
     )
-    args = parser.parse_args(argv)
-    if not CANONICAL.is_file():
-        print(f"missing canonical {CANONICAL}", file=sys.stderr)
-        return 2
-    WHEEL_COPY.parent.mkdir(parents=True, exist_ok=True)
-    if args.check:
-        if not WHEEL_COPY.is_file():
-            print(f"missing wheel copy {WHEEL_COPY}", file=sys.stderr)
-            return 1
-        if _sha256(CANONICAL) != _sha256(WHEEL_COPY):
-            print(
-                f"drift: {WHEEL_COPY} != {CANONICAL}",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"ok {_sha256(CANONICAL)}")
-        return 0
-    shutil.copy2(CANONICAL, WHEEL_COPY)
-    print(f"synced {CANONICAL} -> {WHEEL_COPY} (sha256={_sha256(WHEEL_COPY)})")
+    # --check is accepted for historical callers; both modes validate only.
+    parser.parse_args(argv)
+
+    errors = _validate()
+    if errors:
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)  # noqa: T201
+        print(  # noqa: T201
+            "RR-003 single-source packaging check failed.\n"
+            "Canonical source: litellm/integrations/aawm_agent_identity.py\n"
+            "Checkout path must stay a thin loader; hatch force-includes "
+            "the canonical module into the published wheel.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(  # noqa: T201
+        "ok: thin checkout loader + hatch force-include single-source packaging"
+    )
+    print(f"  canonical: {CANONICAL}")  # noqa: T201
+    print(f"  loader:    {LOADER} ({_line_count(LOADER)} lines)")  # noqa: T201
+    print(f"  packaging: {PYPROJECT}")  # noqa: T201
     return 0
 
 
