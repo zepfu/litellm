@@ -23,6 +23,117 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "scripts" / "local-ci" / "config.json"
+# Cap CLI stdout/stderr persisted into acceptance artifacts (RR-080 #3).
+_DEFAULT_CLI_OUTPUT_MAX_CHARS = 200_000
+# Child CLI env policy (RR-080 #1): never inherit harness/DB/Langfuse secrets.
+_CHILD_ENV_BASE_KEYS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "COLORTERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SSH_AUTH_SOCK",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_OPTIONS",
+        "ELECTRON_RUN_AS_NODE",
+    }
+)
+# Provider CLI prefixes intentionally may carry auth tokens/keys when the CLI
+# uses env-based credentials rather than a local credential file. That is not
+# the same as LiteLLM *proxy admin* secrets (master key, salt, etc.), which must
+# never be inherited by agentic child processes.
+_CHILD_ENV_ALLOW_PREFIXES = (
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "CODEX_",
+    "OPENAI_",
+    "GEMINI_",
+    "GOOGLE_",
+    "GOOGLE_GENAI_",
+    "GCLOUD_",
+    "CLOUDSDK_",
+    "XAI_",
+)
+# Narrow non-secret LiteLLM routing / logging knobs only. Do NOT add a broad
+# LITELLM_ prefix here: LITELLM_MASTER_KEY and similar bypassed substring denylists
+# when the prefix was treated as fully trusted.
+_CHILD_ENV_ALLOW_KEYS = frozenset(
+    {
+        "LITELLM_BASE_URL",
+        "LITELLM_API_BASE",
+        "LITELLM_LOG",
+        "LITELLM_MODE",
+        "LITELLM_LOCAL_MODEL_COST_MAP",
+    }
+)
+_CHILD_ENV_DENY_KEYS = frozenset(
+    {
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_QUERY_URL",
+        "LANGFUSE_HOST",
+        "LANGFUSE_BASE_URL",
+        "DATABASE_URL",
+        "DIRECT_URL",
+        "PRISMA_DATABASE_URL",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_USER",
+        "POSTGRES_DB",
+        "PGPASSWORD",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SESSION_TOKEN",
+        "LITELLM_MASTER_KEY",
+        "LITELLM_SALT_KEY",
+        "LITELLM_SALT",
+    }
+)
+_CHILD_ENV_DENY_PREFIXES = (
+    "LANGFUSE_",
+    "AAWM_DB_",
+    "DATABASE_",
+    "POSTGRES_",
+    "PG",
+)
+_CHILD_ENV_DENY_SUBSTRINGS = (
+    "SECRET",
+    "PASSWORD",
+    "TOKEN",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
+)
 _CLAUDE_AGENT_NAME_RE = re.compile(r"You are '([^']+)' and you are working")
 _CLAUDE_HARNESS_HEADER_KEYS = {
     "x-litellm-end-user-id",
@@ -48,6 +159,165 @@ def _isoformat(value: dt.datetime) -> str:
 def _load_json(path: pathlib.Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _cli_output_max_chars() -> int:
+    raw = os.environ.get("ACCEPTANCE_CLI_OUTPUT_MAX_CHARS")
+    if raw is None or not str(raw).strip():
+        return _DEFAULT_CLI_OUTPUT_MAX_CHARS
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return _DEFAULT_CLI_OUTPUT_MAX_CHARS
+    return max(0, value)
+
+
+def _truncate_captured_text(text: str, max_chars: int | None = None) -> tuple[str, bool]:
+    """Return (possibly truncated text, was_truncated)."""
+    if max_chars is None:
+        max_chars = _cli_output_max_chars()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    omitted = len(text) - max_chars
+    marker = f"\n...[truncated {omitted} chars; original_len={len(text)}]...\n"
+    # Prefer keeping the head of the stream (session ids / JSON often appear early).
+    keep = max_chars - len(marker)
+    if keep <= 0:
+        return marker[:max_chars], True
+    return text[:keep] + marker, True
+
+
+def _is_denied_child_env_key(key: str) -> bool:
+    """Deny harness/Langfuse/DB/LiteLLM-admin secrets; provider CLI auth may pass.
+
+    Distinction:
+    - Provider prefixes (ANTHROPIC_/OPENAI_/CODEX_/…): intentional allow of
+      env-based CLI credentials (API keys/tokens) so codex/claude/gemini can
+      authenticate without a file-based login when the operator has only env auth.
+    - LITELLM_*: default-deny except the narrow non-secret routing allowlist in
+      ``_CHILD_ENV_ALLOW_KEYS``. ``LITELLM_MASTER_KEY`` and other proxy admin
+      material must never reach agentic child CLIs (tools can dump ``env``).
+    - Langfuse/DB/Postgres and generic SECRET/PASSWORD/TOKEN names: always deny.
+    """
+    if key in _CHILD_ENV_DENY_KEYS:
+        return True
+    for prefix in _CHILD_ENV_DENY_PREFIXES:
+        if key.startswith(prefix):
+            return True
+    # Default-deny all LiteLLM proxy vars except the explicit non-secret set.
+    if key.startswith("LITELLM_"):
+        return key not in _CHILD_ENV_ALLOW_KEYS
+    # Provider-prefixed vars may include API keys/tokens required by CLIs.
+    for prefix in _CHILD_ENV_ALLOW_PREFIXES:
+        if key.startswith(prefix):
+            return False
+    upper = key.upper()
+    for fragment in _CHILD_ENV_DENY_SUBSTRINGS:
+        if fragment in upper:
+            return True
+    return False
+
+
+def _is_allowed_child_env_key(key: str) -> bool:
+    if _is_denied_child_env_key(key):
+        return False
+    if key in _CHILD_ENV_BASE_KEYS or key in _CHILD_ENV_ALLOW_KEYS:
+        return True
+    for prefix in _CHILD_ENV_ALLOW_PREFIXES:
+        if key.startswith(prefix):
+            return True
+    return False
+
+
+def _scrubbed_child_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a minimal env for provider CLIs without harness/DB/Langfuse secrets."""
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if value is None:
+            continue
+        if _is_allowed_child_env_key(key):
+            env[key] = value
+    if extra_env:
+        for key, value in extra_env.items():
+            if value is None:
+                continue
+            key_str = str(key)
+            if _is_denied_child_env_key(key_str):
+                continue
+            env[key_str] = str(value)
+    return env
+
+
+def _expand_at_path_token(token: str, config_dir: pathlib.Path) -> str:
+    """Expand ``@{config_dir}/...`` and relative ``@path`` against config_dir.
+
+    Absolute ``@/path`` tokens are left unchanged. Coordinates with the portable
+    harness bundle packaging (RR-077/RR-079).
+    """
+    if not isinstance(token, str) or not token.startswith("@"):
+        return token
+    path_part = token[1:]
+    if not path_part:
+        return token
+    if path_part.startswith("{config_dir}/") or path_part.startswith("{config_dir}\\"):
+        relative = path_part[len("{config_dir}/") :]
+        return "@" + str((config_dir / relative).resolve())
+    candidate = pathlib.Path(path_part)
+    if candidate.is_absolute():
+        return token
+    # Relative @path → resolve against the config file directory.
+    return "@" + str((config_dir / path_part).resolve())
+
+
+def _rewrite_config_path_tokens(value: Any, config_dir: pathlib.Path) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_config_path_tokens(item, config_dir)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_rewrite_config_path_tokens(item, config_dir) for item in value]
+    if isinstance(value, str):
+        return _expand_at_path_token(value, config_dir)
+    return value
+
+
+def _load_suite_config(path: pathlib.Path) -> dict[str, Any]:
+    config = _load_json(path)
+    return _rewrite_config_path_tokens(config, path.resolve().parent)
+
+
+def _generation_quality_flags(config: dict[str, Any]) -> tuple[bool, bool]:
+    """Return (skip_quality_checks, allow_zero_cost) from per-family config."""
+    skip_quality = bool(
+        config.get("skip_generation_quality_checks")
+        or config.get("skip_quality_checks")
+    )
+    allow_zero_cost = bool(config.get("allow_zero_cost"))
+    return skip_quality, allow_zero_cost
+
+
+def _enforce_minimum_trace_count(
+    *,
+    family: str,
+    traces: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> list[str]:
+    raw = config.get("minimum_trace_count")
+    if raw is None:
+        return []
+    try:
+        minimum = int(raw)
+    except (TypeError, ValueError):
+        return [f"{family} minimum_trace_count is not an integer: {raw!r}"]
+    if minimum <= 0:
+        return []
+    actual = len(traces)
+    if actual < minimum:
+        return [
+            f"{family} trace count {actual} < minimum_trace_count {minimum}"
+        ]
+    return []
 
 
 def _resolve_litellm_base_url(config: dict[str, Any]) -> str:
@@ -1528,10 +1798,9 @@ def _run_command(
     *,
     extra_env: dict[str, str] | None = None,
     timeout_seconds: int = 300,
+    output_max_chars: int | None = None,
 ) -> dict[str, Any]:
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
+    env = _scrubbed_child_env(extra_env)
     effective_command, settings_overlay_path = _append_claude_settings_overlay(
         command,
         extra_env=extra_env,
@@ -1554,8 +1823,13 @@ def _run_command(
             except FileNotFoundError:
                 pass
     duration = round(time.time() - started, 3)
-    stdout = completed.stdout.strip()
-    stderr = completed.stderr.strip()
+    raw_stdout = (completed.stdout or "").strip()
+    raw_stderr = (completed.stderr or "").strip()
+    max_chars = (
+        _cli_output_max_chars() if output_max_chars is None else max(0, int(output_max_chars))
+    )
+    stdout, stdout_truncated = _truncate_captured_text(raw_stdout, max_chars)
+    stderr, stderr_truncated = _truncate_captured_text(raw_stderr, max_chars)
     return {
         "command": effective_command,
         "command_string": " ".join(shlex.quote(part) for part in effective_command),
@@ -1563,6 +1837,11 @@ def _run_command(
         "duration_seconds": duration,
         "stdout": stdout,
         "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "stdout_original_chars": len(raw_stdout),
+        "stderr_original_chars": len(raw_stderr),
+        "output_max_chars": max_chars,
         "response_excerpt": _response_excerpt(stdout, stderr),
     }
 
@@ -1673,6 +1952,9 @@ def _validate_codex(
     warnings: list[str] = []
     if run["exit_code"] != 0:
         failures.append("codex command failed")
+    failures.extend(
+        _enforce_minimum_trace_count(family="codex", traces=traces, config=config)
+    )
     for name in expected_trace_names:
         if name not in actual_trace_names:
             failures.append(f"missing Codex trace name: {name}")
@@ -1681,6 +1963,7 @@ def _validate_codex(
             failures.append(f"missing Codex user id: {user_id}")
     if bool(config.get("require_trace_user_id")) and traces and not actual_user_ids:
         failures.append("Codex traces did not include a Langfuse userId")
+    skip_quality_checks, allow_zero_cost = _generation_quality_flags(config)
     (
         _raw_generation_observations,
         generation_observations,
@@ -1693,6 +1976,8 @@ def _validate_codex(
         trace_ids=trace_ids,
         start_time=started,
         allowed_request_routes=config.get("allowed_generation_routes"),
+        skip_quality_checks=skip_quality_checks,
+        allow_zero_cost=allow_zero_cost,
     )
     failures.extend(generation_failures)
     trace_enrichment_summary, trace_enrichment_failures, trace_enrichment_warnings = _validate_trace_enrichment(
@@ -1787,12 +2072,16 @@ def _validate_gemini(
     warnings: list[str] = []
     if run["exit_code"] != 0:
         failures.append("gemini command failed")
+    failures.extend(
+        _enforce_minimum_trace_count(family="gemini", traces=traces, config=config)
+    )
     for name in expected_trace_names:
         if name not in actual_trace_names:
             failures.append(f"missing Gemini trace name: {name}")
     for user_id in expected_user_ids:
         if user_id not in actual_user_ids:
             failures.append(f"missing Gemini user id: {user_id}")
+    skip_quality_checks, allow_zero_cost = _generation_quality_flags(config)
     (
         raw_generation_observations,
         generation_observations,
@@ -1805,6 +2094,8 @@ def _validate_gemini(
         trace_ids=trace_ids,
         start_time=started,
         allowed_request_routes=config.get("allowed_generation_routes"),
+        skip_quality_checks=skip_quality_checks,
+        allow_zero_cost=allow_zero_cost,
     )
     failures.extend(generation_failures)
     filtered_trace_ids = sorted(
@@ -1952,6 +2243,13 @@ def _validate_claude(
     warnings: list[str] = []
     if run["exit_code"] != 0:
         failures.append("claude command failed")
+    failures.extend(
+        _enforce_minimum_trace_count(
+            family="claude",
+            traces=traces,
+            config=effective_config,
+        )
+    )
     if lookup_error:
         warnings.append(f"Claude Langfuse lookup warning: {lookup_error}")
     for user_id in expected_user_ids:
@@ -1959,6 +2257,7 @@ def _validate_claude(
             failures.append(f"missing Claude user id: {user_id}")
     if bool(effective_config.get("require_trace_user_id")) and traces and not actual_user_ids:
         failures.append("Claude traces did not include a Langfuse userId")
+    skip_quality_checks, allow_zero_cost = _generation_quality_flags(effective_config)
     (
         raw_generation_observations,
         generation_observations,
@@ -1971,6 +2270,8 @@ def _validate_claude(
         trace_ids=trace_ids,
         start_time=started,
         allowed_request_routes=effective_config.get("allowed_generation_routes"),
+        skip_quality_checks=skip_quality_checks,
+        allow_zero_cost=allow_zero_cost,
     )
     failures.extend(generation_failures)
     observed_agents = sorted(
@@ -2201,7 +2502,7 @@ def main() -> int:
     config_path = pathlib.Path(args.config)
     artifact_path = pathlib.Path(args.write_artifact)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    config = _load_json(config_path)
+    config = _load_suite_config(config_path)
 
     public_key_env = config.get("langfuse_public_key_env", "LANGFUSE_PUBLIC_KEY")
     secret_key_env = config.get("langfuse_secret_key_env", "LANGFUSE_SECRET_KEY")
