@@ -150,6 +150,104 @@ def sanitize_anthropic_tool_use_id(tool_use_id: Any) -> str:
     return tool_use_id
 
 
+
+# ---------------------------------------------------------------------------
+# Shared Anthropic SSE event builders
+#
+# Both adapter trees (Chat Completions -> Anthropic SSE and Responses API ->
+# Anthropic SSE) must emit the same client-visible event shapes. Centralize
+# the dict/TypedDict construction here so content_block_* / message_* payloads
+# cannot drift between lanes. Streaming iterators still own input-normalization
+# (OpenAI-Chat chunk vs Responses event); only the Anthropic-side event envelope
+# is shared.
+# ---------------------------------------------------------------------------
+
+
+def build_anthropic_content_block_start(
+    *,
+    index: int,
+    content_block: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build an Anthropic `content_block_start` event payload."""
+    return {
+        "type": "content_block_start",
+        "index": index,
+        "content_block": content_block,
+    }
+
+
+def build_anthropic_content_block_delta(
+    *,
+    index: int,
+    delta: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build an Anthropic `content_block_delta` event payload."""
+    return {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": delta,
+    }
+
+
+def build_anthropic_content_block_stop(*, index: int) -> Dict[str, Any]:
+    """Build an Anthropic `content_block_stop` event payload."""
+    return {
+        "type": "content_block_stop",
+        "index": index,
+    }
+
+
+def build_anthropic_text_delta(*, text: str) -> Dict[str, Any]:
+    return {"type": "text_delta", "text": text}
+
+
+def build_anthropic_input_json_delta(*, partial_json: str) -> Dict[str, Any]:
+    return {"type": "input_json_delta", "partial_json": partial_json}
+
+
+def build_anthropic_thinking_delta(*, thinking: str) -> Dict[str, Any]:
+    return {"type": "thinking_delta", "thinking": thinking}
+
+
+def build_anthropic_signature_delta(*, signature: str) -> Dict[str, Any]:
+    return {"type": "signature_delta", "signature": signature}
+
+
+def build_anthropic_message_delta(
+    *,
+    stop_reason: Optional[str] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    stop_sequence: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build an Anthropic `message_delta` event payload.
+
+    `usage` is optional so callers that only have a stop_reason (synthetic
+    end_turn) can still emit a consistent envelope.
+    """
+    delta: Dict[str, Any] = {}
+    if stop_reason is not None:
+        delta["stop_reason"] = stop_reason
+    if stop_sequence is not None:
+        delta["stop_sequence"] = stop_sequence
+    payload: Dict[str, Any] = {"type": "message_delta", "delta": delta}
+    if usage is not None:
+        payload["usage"] = usage
+    return payload
+
+
+def build_anthropic_message_stop() -> Dict[str, Any]:
+    return {"type": "message_stop"}
+
+
+def encode_anthropic_sse_event(chunk: Dict[str, Any]) -> bytes:
+    """Encode an Anthropic event dict as an SSE frame.
+
+    Shared by Chat and Responses streaming wrappers so framing cannot diverge.
+    """
+    event_type = str(chunk.get("type", "message"))
+    return f"event: {event_type}\ndata: {json.dumps(chunk)}\n\n".encode()
+
+
 def _strip_anthropic_only_tool_metadata(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -1848,19 +1946,24 @@ class LiteLLMAnthropicMessagesAdapter:
             )
 
         if partial_json is not None:
-            return "input_json_delta", ContentJsonBlockDelta(
-                type="input_json_delta", partial_json=partial_json
+            return "input_json_delta", cast(
+                ContentJsonBlockDelta,
+                build_anthropic_input_json_delta(partial_json=partial_json),
             )
         elif reasoning_content:
-            return "thinking_delta", ContentThinkingBlockDelta(
-                type="thinking_delta", thinking=reasoning_content
+            return "thinking_delta", cast(
+                ContentThinkingBlockDelta,
+                build_anthropic_thinking_delta(thinking=reasoning_content),
             )
         elif reasoning_signature:
-            return "signature_delta", ContentThinkingSignatureBlockDelta(
-                type="signature_delta", signature=reasoning_signature
+            return "signature_delta", cast(
+                ContentThinkingSignatureBlockDelta,
+                build_anthropic_signature_delta(signature=reasoning_signature),
             )
         else:
-            return "text_delta", ContentTextBlockDelta(type="text_delta", text=text)
+            return "text_delta", cast(
+                ContentTextBlockDelta, build_anthropic_text_delta(text=text)
+            )
 
     def translate_streaming_openai_response_to_anthropic(
         self, response: ModelResponse, current_content_block_index: int
@@ -1922,8 +2025,11 @@ class LiteLLMAnthropicMessagesAdapter:
         ) = self._translate_streaming_openai_chunk_to_anthropic(
             choices=response.choices  # type: ignore
         )
-        return ContentBlockDelta(
-            type="content_block_delta",
-            index=current_content_block_index,
-            delta=content_block_delta,
+        # Shared emitter: keep Chat lane on the same envelope shape as Responses.
+        return cast(
+            ContentBlockDelta,
+            build_anthropic_content_block_delta(
+                index=current_content_block_index,
+                delta=cast(Dict[str, Any], content_block_delta),
+            ),
         )
