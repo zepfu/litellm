@@ -24,6 +24,8 @@ HARNESS_FILES = [
     "claude_acceptance_prompt.txt",
     "claude_acceptance_prompt_full_fanout.txt",
 ]
+CONFIG_FILE_NAME = "config.json"
+CONFIG_DIR_PLACEHOLDER = "{config_dir}"
 
 
 def _read_version() -> str:
@@ -33,8 +35,8 @@ def _read_version() -> str:
     return version
 
 
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _add_bytes_to_tar(
@@ -48,9 +50,78 @@ def _add_bytes_to_tar(
     tar.addfile(info, io.BytesIO(payload))
 
 
+def _rewrite_at_path_token(token: str, source_config_dir: Path) -> str:
+    """Rewrite a single @-prefixed path token for a portable harness bundle.
+
+    Absolute paths under *source_config_dir* become ``@{config_dir}/<rel>`` so
+    the shipped artifact does not embed a machine-local home path. Relative
+    ``@`` tokens are normalized onto the same placeholder form. Non-local
+    absolute ``@`` paths are left unchanged.
+    """
+    if not token.startswith("@"):
+        return token
+
+    path_part = token[1:]
+    if not path_part or path_part.startswith(f"{CONFIG_DIR_PLACEHOLDER}/"):
+        return token
+
+    candidate = Path(path_part)
+    source_config_dir = source_config_dir.resolve()
+
+    if candidate.is_absolute():
+        try:
+            relative = candidate.resolve().relative_to(source_config_dir)
+        except ValueError:
+            return token
+        return f"@{CONFIG_DIR_PLACEHOLDER}/{relative.as_posix()}"
+
+    # Relative @path (or @./path) → @{config_dir}/path
+    relative = Path(path_part)
+    # Drop a leading "./" for stable portable form.
+    relative_posix = relative.as_posix()
+    if relative_posix.startswith("./"):
+        relative_posix = relative_posix[2:]
+    return f"@{CONFIG_DIR_PLACEHOLDER}/{relative_posix}"
+
+
+def rewrite_config_paths_for_bundle(
+    config: Any,
+    source_config_dir: Path | None = None,
+) -> Any:
+    """Deep-copy config data, rewriting Claude prompt @-paths for standalone use."""
+    config_dir = (source_config_dir or LOCAL_CI_DIR).resolve()
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, str):
+            return _rewrite_at_path_token(value, config_dir)
+        return value
+
+    return walk(config)
+
+
+def render_portable_config_bytes(
+    source_config_path: Path | None = None,
+    source_config_dir: Path | None = None,
+) -> bytes:
+    """Load config.json and return portable JSON bytes for the release bundle."""
+    config_path = source_config_path or (LOCAL_CI_DIR / CONFIG_FILE_NAME)
+    config_dir = source_config_dir or config_path.parent
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    portable = rewrite_config_paths_for_bundle(raw, source_config_dir=config_dir)
+    return (json.dumps(portable, indent=2, sort_keys=False) + "\n").encode("utf-8")
+
+
 def build_bundle(version: str, outdir: Path) -> Path:
-    config = json.loads((LOCAL_CI_DIR / "config.json").read_text(encoding="utf-8"))
-    suite_version = config.get("suite_version")
+    config_path = LOCAL_CI_DIR / CONFIG_FILE_NAME
+    config_bytes = render_portable_config_bytes(
+        source_config_path=config_path,
+        source_config_dir=LOCAL_CI_DIR,
+    )
+    suite_version = json.loads(config_bytes.decode("utf-8")).get("suite_version")
     prefix = f"litellm-local-ci-harness-{version}"
     artifact_path = outdir / f"{prefix}.tar.gz"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -70,11 +141,17 @@ def build_bundle(version: str, outdir: Path) -> Path:
                 raise FileNotFoundError(f"Missing harness file: {source_path}")
 
             arcname = f"{prefix}/local-ci/{relative_name}"
-            tar.add(source_path, arcname=arcname)
+            if relative_name == CONFIG_FILE_NAME:
+                payload = config_bytes
+            else:
+                payload = source_path.read_bytes()
+            digest = _sha256_bytes(payload)
+            _add_bytes_to_tar(tar, arcname, payload)
+
             manifest["files"].append(
                 {
                     "path": f"local-ci/{relative_name}",
-                    "sha256": _sha256_file(source_path),
+                    "sha256": digest,
                 }
             )
 
