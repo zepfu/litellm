@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Repair malformed repository identity values in public.session_history."""
+"""Repair malformed repository identity values in public.session_history.
+
+Apply mode refuses to write unless ``current_database()`` matches
+``--target-db-name`` (default ``aawm_tristore``). Metadata updates merge only
+the identity keys this script owns via JSONB concat so concurrent sibling
+repair/backfill jobs cannot clobber unrelated metadata fields.
+"""
 
 import argparse
 from collections import Counter
@@ -7,9 +13,10 @@ import json
 import os
 import re
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import psycopg
 import psycopg.rows
@@ -138,6 +145,39 @@ _REPOSITORY_UNRESOLVED_KEYS = (
     "trace_user_tenant_fallback_skipped",
 )
 
+# Metadata keys this script owns and may set/clear on apply. Other keys are left
+# intact via JSONB concat merge so concurrent sibling scripts cannot be clobbered.
+_OWNED_METADATA_SET_KEYS = (
+    "repository",
+    "source_repository",
+    "tenant_id",
+    "tenant_id_source",
+    "trace_user_id",
+    "workload_type",
+    "workload_subtype",
+    "memory_workload_label",
+    "session_history_repository_status",
+    "session_history_repository_status_source",
+    "session_history_repository_unresolved",
+    "session_history_repository_unresolved_reason",
+    "repository_identity_classified_at",
+    "repository_identity_classification_source",
+    "repository_identity_repaired_at",
+    "repository_identity_repair_source",
+    "repository_identity_previous_repository",
+    "repository_identity_previous_tenant_id",
+)
+# Union of set-able identity keys and unresolved markers; order preserved, no
+# duplicates so JSONB key-delete arrays stay small and deterministic.
+_OWNED_METADATA_CLEAR_KEYS = tuple(
+    dict.fromkeys(_OWNED_METADATA_SET_KEYS + _REPOSITORY_UNRESOLVED_KEYS)
+)
+
+DEFAULT_TARGET_DB_NAME = "aawm_tristore"
+DEFAULT_PROJECTS_DIR = str(Path.home() / "projects")
+DEFAULT_MEMORIES_DIR = str(Path.home() / ".codex" / "memories")
+DEFAULT_SESSION_EVIDENCE_LIMIT_PER_SESSION = 50
+
 
 def _safe_json_metadata(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
@@ -152,14 +192,60 @@ def _safe_json_metadata(value: Any) -> Dict[str, Any]:
     return {}
 
 
-def _load_known_repositories(projects_dir: Path) -> set[str]:
+def _load_known_repositories(
+    projects_dir: Path,
+    *,
+    warn_on_fallback: bool = True,
+) -> set[str]:
+    """Load known repository names from a projects directory.
+
+    When the directory is missing or unreadable, fall back to the local repo
+    name only and optionally emit a visible warning so reduced coverage is not
+    silent.
+    """
+    fallback = {REPO_ROOT.name}
     if not projects_dir.exists():
-        return {REPO_ROOT.name}
-    return {
-        path.name
-        for path in projects_dir.iterdir()
-        if path.is_dir() and not path.name.startswith(".")
-    }
+        if warn_on_fallback:
+            warnings.warn(
+                (
+                    f"--projects-dir {projects_dir} does not exist; "
+                    f"falling back to known repositories {sorted(fallback)!r}. "
+                    "Repair coverage is reduced until a real projects directory "
+                    "is provided."
+                ),
+                UserWarning,
+                stacklevel=2,
+            )
+        return fallback
+    try:
+        names = {
+            path.name
+            for path in projects_dir.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+        }
+    except OSError as exc:
+        if warn_on_fallback:
+            warnings.warn(
+                (
+                    f"--projects-dir {projects_dir} is unreadable ({exc}); "
+                    f"falling back to known repositories {sorted(fallback)!r}."
+                ),
+                UserWarning,
+                stacklevel=2,
+            )
+        return fallback
+    if not names:
+        if warn_on_fallback:
+            warnings.warn(
+                (
+                    f"--projects-dir {projects_dir} contains no project directories; "
+                    f"falling back to known repositories {sorted(fallback)!r}."
+                ),
+                UserWarning,
+                stacklevel=2,
+            )
+        return fallback
+    return names
 
 
 def _repository_from_cwd(cwd: str, known_repositories: set[str]) -> Optional[str]:
@@ -365,37 +451,232 @@ def _known_repository_candidate(
     return None
 
 
+def _row_repository_candidate_extractors(
+    *,
+    known_repositories: set[str],
+    session_repositories: Optional[Dict[str, Dict[str, Any]]] = None,
+    grok_repository: Optional[str] = None,
+    rollout_repository_map: Optional[Dict[str, str]] = None,
+) -> list[Tuple[str, Callable[[Dict[str, Any], Dict[str, Any]], Optional[str]]]]:
+    """Return ordered (source_name, extractor) pairs for repository identity.
+
+    Lower index = higher priority. Both ``_best_row_repository_candidate`` and
+    ``_build_repaired_row`` consume this shared list so priority order cannot
+    drift between same-session evidence ranking and per-row repair resolution.
+    """
+    session_repositories = session_repositories or {}
+    rollout_repository_map = rollout_repository_map or {}
+
+    extractors: list[
+        Tuple[str, Callable[[Dict[str, Any], Dict[str, Any]], Optional[str]]]
+    ] = []
+
+    if grok_repository:
+        def _from_grok_override(
+            row: Dict[str, Any],
+            metadata: Dict[str, Any],
+            *,
+            _repo: str = grok_repository,
+        ) -> Optional[str]:
+            if _is_grok_row(row):
+                return _repo
+            return None
+
+        extractors.append(("grok_repository_override", _from_grok_override))
+
+    if rollout_repository_map:
+        def _from_rollout_row_repository(
+            row: Dict[str, Any],
+            metadata: Dict[str, Any],
+            *,
+            _map: Dict[str, str] = rollout_repository_map,
+        ) -> Optional[str]:
+            return _rollout_repository_candidate(row.get("repository"), _map)
+
+        def _from_rollout_metadata_repository(
+            row: Dict[str, Any],
+            metadata: Dict[str, Any],
+            *,
+            _map: Dict[str, str] = rollout_repository_map,
+        ) -> Optional[str]:
+            return _rollout_repository_candidate(metadata.get("repository"), _map)
+
+        def _from_rollout_source_repository(
+            row: Dict[str, Any],
+            metadata: Dict[str, Any],
+            *,
+            _map: Dict[str, str] = rollout_repository_map,
+        ) -> Optional[str]:
+            return _rollout_repository_candidate(
+                metadata.get("source_repository"),
+                _map,
+            )
+
+        extractors.extend(
+            [
+                ("rollout_memory_registry", _from_rollout_row_repository),
+                ("rollout_memory_registry", _from_rollout_metadata_repository),
+                ("rollout_memory_registry", _from_rollout_source_repository),
+            ]
+        )
+
+    for key in _ROW_METADATA_REPOSITORY_PRIORITY:
+        def _from_metadata_key(
+            row: Dict[str, Any],
+            metadata: Dict[str, Any],
+            *,
+            _key: str = key,
+            _known: set[str] = known_repositories,
+        ) -> Optional[str]:
+            return _known_repository_candidate(metadata.get(_key), _known)
+
+        extractors.append((f"session_metadata.{key}", _from_metadata_key))
+
+    def _from_recursive_metadata(
+        row: Dict[str, Any],
+        metadata: Dict[str, Any],
+        *,
+        _known: set[str] = known_repositories,
+    ) -> Optional[str]:
+        repository = _extract_repository_identity_from_metadata_sources(
+            ("session_history.metadata", metadata)
+        )
+        if _is_known_repository(repository, _known):
+            return repository
+        return None
+
+    extractors.append(
+        ("session_metadata.recursive_repository", _from_recursive_metadata)
+    )
+
+    def _from_row_repository(
+        row: Dict[str, Any],
+        metadata: Dict[str, Any],
+        *,
+        _known: set[str] = known_repositories,
+    ) -> Optional[str]:
+        return _known_repository_candidate(row.get("repository"), _known)
+
+    extractors.append(("session_history.repository", _from_row_repository))
+
+    if session_repositories:
+        def _from_same_session(
+            row: Dict[str, Any],
+            metadata: Dict[str, Any],
+            *,
+            _sessions: Dict[str, Dict[str, Any]] = session_repositories,
+        ) -> Optional[str]:
+            session_identity = _sessions.get(str(row.get("session_id")))
+            if session_identity is None:
+                return None
+            return str(session_identity["repository"])
+
+        extractors.append(("same_session", _from_same_session))
+
+    for key in _ROW_METADATA_TENANT_PRIORITY:
+        def _from_tenant_metadata_key(
+            row: Dict[str, Any],
+            metadata: Dict[str, Any],
+            *,
+            _key: str = key,
+            _known: set[str] = known_repositories,
+        ) -> Optional[str]:
+            return _known_repository_candidate(metadata.get(_key), _known)
+
+        extractors.append((f"session_metadata.{key}", _from_tenant_metadata_key))
+
+    def _from_row_tenant_id(
+        row: Dict[str, Any],
+        metadata: Dict[str, Any],
+        *,
+        _known: set[str] = known_repositories,
+    ) -> Optional[str]:
+        return _known_repository_candidate(row.get("tenant_id"), _known)
+
+    extractors.append(("session_history.tenant_id", _from_row_tenant_id))
+    return extractors
+
+
+def _resolve_repository_candidate(
+    row: Dict[str, Any],
+    known_repositories: set[str],
+    *,
+    session_repositories: Optional[Dict[str, Dict[str, Any]]] = None,
+    grok_repository: Optional[str] = None,
+    rollout_repository_map: Optional[Dict[str, str]] = None,
+    prefer_row_normalization: bool = False,
+) -> Optional[Tuple[str, str, int]]:
+    """Resolve the best repository identity using the shared priority cascade."""
+    metadata = _safe_json_metadata(row.get("metadata"))
+    extractors = _row_repository_candidate_extractors(
+        known_repositories=known_repositories,
+        session_repositories=session_repositories,
+        grok_repository=grok_repository,
+        rollout_repository_map=rollout_repository_map,
+    )
+
+    # Grok override always wins over an existing row identity (legacy behavior).
+    if grok_repository and _is_grok_row(row):
+        return grok_repository, "grok_repository_override", -2
+
+    # When repairing a row, keep a normalized known row.repository before other
+    # fallbacks so valid identities are not replaced by weaker session evidence.
+    if prefer_row_normalization:
+        original_repository = row.get("repository")
+        if not _is_truncated_repository_label(original_repository):
+            repository = _repair_noisy_identity(
+                original_repository,
+                known_repositories,
+            )
+            if repository is not None and _is_known_repository(
+                repository, known_repositories
+            ):
+                return repository, "row_identity_normalization", -1
+
+    for priority, (source_name, extractor) in enumerate(extractors):
+        if source_name == "grok_repository_override":
+            # Already handled above for stable priority/label behavior.
+            continue
+        repository = extractor(row, metadata)
+        if not repository:
+            continue
+        if source_name == "same_session":
+            session_identity = (session_repositories or {}).get(
+                str(row.get("session_id"))
+            )
+            if session_identity is not None:
+                return (
+                    repository,
+                    f"same_session.{session_identity['source']}",
+                    priority,
+                )
+            continue
+        if source_name == "session_history.tenant_id":
+            if _normalize_repository_identity(row.get("tenant_id")) == repository:
+                return repository, "row_tenant_id", priority
+            return repository, "row_tenant_id_noisy", priority
+        if prefer_row_normalization and source_name.startswith("session_metadata."):
+            # Repair path historically labels direct metadata keys as row_metadata.*.
+            key = source_name.removeprefix("session_metadata.")
+            if key in {
+                "aawm_d1_452_referenced_artifact_owner",
+                "repository",
+                "source_repository",
+            }:
+                return repository, f"row_metadata.{key}", priority
+        return repository, source_name, priority
+    return None
+
+
 def _best_row_repository_candidate(
     row: Dict[str, Any],
     known_repositories: set[str],
 ) -> Optional[Tuple[str, str, int]]:
-    metadata = _safe_json_metadata(row.get("metadata"))
-
-    for priority, key in enumerate(_ROW_METADATA_REPOSITORY_PRIORITY):
-        repository = _known_repository_candidate(metadata.get(key), known_repositories)
-        if repository:
-            return repository, f"session_metadata.{key}", priority
-
-    repository = _extract_repository_identity_from_metadata_sources(
-        ("session_history.metadata", metadata)
+    return _resolve_repository_candidate(
+        row,
+        known_repositories,
+        prefer_row_normalization=False,
     )
-    if _is_known_repository(repository, known_repositories):
-        return repository, "session_metadata.recursive_repository", 40
-
-    repository = _known_repository_candidate(row.get("repository"), known_repositories)
-    if repository:
-        return repository, "session_history.repository", 50
-
-    for offset, key in enumerate(_ROW_METADATA_TENANT_PRIORITY):
-        repository = _known_repository_candidate(metadata.get(key), known_repositories)
-        if repository:
-            return repository, f"session_metadata.{key}", 60 + offset
-
-    repository = _known_repository_candidate(row.get("tenant_id"), known_repositories)
-    if repository:
-        return repository, "session_history.tenant_id", 70
-
-    return None
 
 
 def _is_grok_row(row: Dict[str, Any]) -> bool:
@@ -476,71 +757,31 @@ def _build_repaired_row(  # noqa: PLR0915
     original_repository = row.get("repository")
     original_tenant_id = row.get("tenant_id")
 
-    repository = _repair_noisy_identity(original_repository, known_repositories)
-    if _is_truncated_repository_label(original_repository):
-        repository = None
-    metadata_repository = _repair_noisy_identity(
-        metadata.get("repository"), known_repositories
-    )
-    referenced_artifact_owner = _repair_noisy_identity(
-        metadata.get("aawm_d1_452_referenced_artifact_owner"),
-        known_repositories,
-    )
-    source_repository = _repair_noisy_identity(
-        metadata.get("source_repository"), known_repositories
-    )
     tenant_id = _repair_noisy_identity(original_tenant_id, known_repositories)
     repaired_tenant_id = tenant_id
     repair_source = "row_identity_normalization"
 
-    if grok_repository and _is_grok_row(row):
-        repository = grok_repository
-        repair_source = "grok_repository_override"
-    elif repository is None and (
-        rollout_repository := _rollout_repository_candidate(
-            original_repository,
-            rollout_repository_map,
-        )
-    ) is not None:
-        repository = rollout_repository
-        repair_source = "rollout_memory_registry"
-    elif repository is None and (
-        rollout_repository := _rollout_repository_candidate(
-            metadata.get("repository"),
-            rollout_repository_map,
-        )
-    ) is not None:
-        repository = rollout_repository
-        repair_source = "rollout_memory_registry"
-    elif repository is None and (
-        rollout_repository := _rollout_repository_candidate(
-            metadata.get("source_repository"),
-            rollout_repository_map,
-        )
-    ) is not None:
-        repository = rollout_repository
-        repair_source = "rollout_memory_registry"
-    elif repository is None:
-        if referenced_artifact_owner is not None:
-            repository = referenced_artifact_owner
-            repair_source = "row_metadata.aawm_d1_452_referenced_artifact_owner"
-        elif metadata_repository is not None:
-            repository = metadata_repository
-            repair_source = "row_metadata.repository"
-        elif source_repository is not None:
-            repository = source_repository
-            repair_source = "row_metadata.source_repository"
-        elif (
-            session_identity := session_repositories.get(str(row.get("session_id")))
-        ) is not None:
-            repository = str(session_identity["repository"])
-            repair_source = f"same_session.{session_identity['source']}"
-        elif _is_known_repository(tenant_id, known_repositories):
-            repository = tenant_id
-            repair_source = "row_tenant_id"
-        elif _is_known_repository(repaired_tenant_id, known_repositories):
-            repository = repaired_tenant_id
-            repair_source = "row_tenant_id_noisy"
+    resolved = _resolve_repository_candidate(
+        row,
+        known_repositories,
+        session_repositories=session_repositories,
+        grok_repository=grok_repository,
+        rollout_repository_map=rollout_repository_map,
+        prefer_row_normalization=True,
+    )
+    if resolved is not None:
+        repository, repair_source, _priority = resolved
+    else:
+        repository = None
+        if _is_truncated_repository_label(original_repository):
+            repository = None
+        else:
+            # Preserve non-known normalized forms only when no candidate won;
+            # dashboard grouping / unresolved stamping still clean them up.
+            repository = _repair_noisy_identity(
+                original_repository,
+                known_repositories,
+            )
 
     if tenant_id is None:
         tenant_id = repaired_tenant_id or repository
@@ -913,51 +1154,109 @@ def _fetch_candidate_rows(
 def _fetch_session_identity_rows(
     conn: psycopg.Connection,
     session_ids: set[str],
+    *,
+    limit_per_session: int = DEFAULT_SESSION_EVIDENCE_LIMIT_PER_SESSION,
 ) -> list[Dict[str, Any]]:
+    """Fetch bounded same-session identity evidence for candidate session_ids.
+
+    Caps rows per session (most recent by id) so a single long-running session
+    cannot return an unbounded result set for the batch.
+    """
     if not session_ids:
         return []
+    if limit_per_session < 1:
+        raise ValueError("limit_per_session must be >= 1")
 
     with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(
             """
             SELECT id, session_id, repository, tenant_id, metadata
-            FROM public.session_history
-            WHERE session_id = ANY(%s::text[])
-              AND (
-                    repository IS NOT NULL
-                 OR tenant_id IS NOT NULL
-                 OR (
-                        jsonb_typeof(metadata) = 'object'
-                    AND metadata ?| %s::text[]
-                    )
-              )
+            FROM (
+                SELECT
+                    id,
+                    session_id,
+                    repository,
+                    tenant_id,
+                    metadata,
+                    row_number() OVER (
+                        PARTITION BY session_id
+                        ORDER BY id DESC
+                    ) AS session_row_rank
+                FROM public.session_history
+                WHERE session_id = ANY(%s::text[])
+                  AND (
+                        repository IS NOT NULL
+                     OR tenant_id IS NOT NULL
+                     OR (
+                            jsonb_typeof(metadata) = 'object'
+                        AND metadata ?| %s::text[]
+                        )
+                  )
+            ) ranked
+            WHERE session_row_rank <= %s
+            ORDER BY session_id ASC, id DESC
             """,
             (
                 list(session_ids),
                 list(_METADATA_IDENTITY_KEYS),
+                int(limit_per_session),
             ),
         )
         return [dict(row) for row in cur.fetchall()]
+
+
+def _owned_metadata_patch(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only the metadata keys this script owns for JSONB merge."""
+    patch: Dict[str, Any] = {}
+    for key in _OWNED_METADATA_SET_KEYS:
+        if key in metadata:
+            patch[key] = metadata[key]
+    return patch
+
+
+def _owned_metadata_null_clear_keys(metadata: Dict[str, Any]) -> list[str]:
+    """Owned keys intentionally absent from the repair payload.
+
+    Repair/classification builders start from a full metadata snapshot and only
+    ``pop`` keys they mean to clear. Those absences are deleted from the live
+    JSONB document before owned keys are merged back in. Keys this script does
+    not own are never listed here, so concurrent sibling writers keep their
+    fields.
+    """
+    return [key for key in _OWNED_METADATA_CLEAR_KEYS if key not in metadata]
 
 
 def _apply_repairs(
     conn: psycopg.Connection,
     repairs: list[Dict[str, Any]],
 ) -> None:
+    """Apply identity repairs without whole-document metadata overwrite.
+
+    Uses Postgres JSONB concat to merge owned keys onto the live row metadata
+    and nulls only the owned keys this repair intentionally clears. Unrelated
+    metadata written by concurrent sibling scripts is preserved.
+    """
     with conn.cursor() as cur:
         cur.executemany(
             """
-            UPDATE public.session_history
+            UPDATE public.session_history AS sh
             SET repository = %s,
                 tenant_id = %s,
-                metadata = %s::jsonb
-            WHERE id = %s
+                metadata = (
+                    COALESCE(sh.metadata, '{}'::jsonb)
+                    - COALESCE(%s::text[], ARRAY[]::text[])
+                ) || COALESCE(%s::jsonb, '{}'::jsonb)
+            WHERE sh.id = %s
             """,
             [
                 (
                     repair["repository"],
                     repair["tenant_id"],
-                    json.dumps(repair["metadata"], sort_keys=True),
+                    _owned_metadata_null_clear_keys(repair["metadata"]),
+                    json.dumps(
+                        _owned_metadata_patch(repair["metadata"]),
+                        sort_keys=True,
+                    ),
                     repair["id"],
                 )
                 for repair in repairs
@@ -969,6 +1268,9 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
     dsn = args.dsn or _build_aawm_admin_dsn()
     if not dsn:
         raise SystemExit("No database DSN found. Set AAWM_DB_* or pass --dsn.")
+
+    if int(getattr(args, "session_evidence_limit_per_session", 1) or 0) < 1:
+        raise SystemExit("--session-evidence-limit-per-session must be >= 1")
 
     known_repositories = _load_known_repositories(Path(args.projects_dir))
     rollout_repository_map = _load_rollout_repository_map(
@@ -998,6 +1300,11 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
         with conn.cursor() as cur:
             cur.execute("SELECT current_database()")
             database_name = cur.fetchone()[0]
+            if args.apply and database_name != args.target_db_name:
+                raise SystemExit(
+                    f"Refusing to apply against {database_name!r}; "
+                    f"expected {args.target_db_name!r}."
+                )
 
         while True:
             rows = _fetch_candidate_rows(
@@ -1021,7 +1328,11 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
             session_identity_rows = (
                 []
                 if args.skip_session_evidence
-                else _fetch_session_identity_rows(conn, session_ids)
+                else _fetch_session_identity_rows(
+                    conn,
+                    session_ids,
+                    limit_per_session=int(args.session_evidence_limit_per_session),
+                )
             )
             if args.null_repository_since:
                 session_repositories = _build_unique_session_repository_map(
@@ -1097,6 +1408,14 @@ def repair_repository_identities(args: argparse.Namespace) -> int:  # noqa: PLR0
             conn.rollback()
 
     print(f"database={database_name}")  # noqa: T201
+    print(f"target_db_name={args.target_db_name}")  # noqa: T201
+    print(f"known_repositories={len(known_repositories)}")  # noqa: T201
+    print(f"projects_dir={args.projects_dir}")  # noqa: T201
+    print(f"memories_dir={args.memories_dir}")  # noqa: T201
+    print(  # noqa: T201
+        "session_evidence_limit_per_session="
+        f"{int(args.session_evidence_limit_per_session)}"
+    )
     print(f"candidate_rows={total_seen}")  # noqa: T201
     print(f"repairable_rows={total_repaired}")  # noqa: T201
     print(f"classified_unresolved_rows={total_classified_unresolved}")  # noqa: T201
@@ -1143,8 +1462,33 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--preview-limit", type=int, default=20)
-    parser.add_argument("--projects-dir", default="/home/zepfu/projects")
-    parser.add_argument("--memories-dir", default="/home/zepfu/.codex/memories")
+    parser.add_argument(
+        "--target-db-name",
+        default=DEFAULT_TARGET_DB_NAME,
+        help=(
+            "Database name that must match current_database() before --apply. "
+            "Dry-run may scan other databases but will not write."
+        ),
+    )
+    parser.add_argument(
+        "--projects-dir",
+        default=DEFAULT_PROJECTS_DIR,
+        help="Directory of known project checkouts (default: ~/projects).",
+    )
+    parser.add_argument(
+        "--memories-dir",
+        default=DEFAULT_MEMORIES_DIR,
+        help="Codex memories directory for rollout registry mapping (default: ~/.codex/memories).",
+    )
+    parser.add_argument(
+        "--session-evidence-limit-per-session",
+        type=int,
+        default=DEFAULT_SESSION_EVIDENCE_LIMIT_PER_SESSION,
+        help=(
+            "Max same-session identity evidence rows to fetch per session_id "
+            f"(default: {DEFAULT_SESSION_EVIDENCE_LIMIT_PER_SESSION}, most recent by id)."
+        ),
+    )
     parser.add_argument(
         "--repository-value",
         action="append",

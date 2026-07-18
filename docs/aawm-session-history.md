@@ -302,6 +302,50 @@ tenant/header/trace signals. That split keeps historical drill-down honest:
 diagnostic artifact context without promoting stale prompt references into route
 grouping.
 
+### Repairing repository / tenant identity
+
+Use `scripts/repair_session_history_repository_identity.py` to repair malformed
+or missing `session_history.repository` / `tenant_id` values and the owned
+identity metadata keys that accompany them.
+
+Operator safety (RR-088):
+
+- Default is dry-run (scan + preview only; no writes).
+- `--apply` persists repairs and optional unresolved classifications.
+- `--apply` refuses to write unless `current_database()` equals
+  `--target-db-name` (default `aawm_tristore`). Dry-run may still report a
+  mismatched database name without aborting.
+- Defaults for discovery directories are portable `Path.home()` paths
+  (`~/projects`, `~/.codex/memories`). Missing or empty `--projects-dir` falls
+  back to the local checkout name only and emits a `UserWarning` so reduced
+  coverage is not silent.
+- Same-session identity evidence is bounded with
+  `--session-evidence-limit-per-session` (default 50, most recent by `id`) so a
+  long-running session cannot load an unbounded evidence set.
+- Metadata writes merge only the identity keys this script owns via Postgres
+  JSONB concat (`metadata - clear_keys || owned_patch`). Unrelated keys written
+  by concurrent sibling repair/backfill jobs are preserved. Prefer one
+  repair/backfill script at a time against `session_history` when possible;
+  repository and tenant columns are still replaced for updated rows.
+- Candidate pagination is keyset by `session_history.id` with `--batch-size`
+  (default 1000), optional `--cursor-id`, and optional `--max-id`.
+
+```bash
+# Dry-run against whatever DSN AAWM_DIRECT_DATABASE_URL / AAWM env resolves
+./.venv/bin/python scripts/repair_session_history_repository_identity.py \
+  --preview-limit 20
+
+# Apply only against the exact tristore database
+./.venv/bin/python scripts/repair_session_history_repository_identity.py \
+  --target-db-name aawm_tristore \
+  --apply \
+  --batch-size 1000
+```
+
+Console summary includes `database`, `target_db_name`, `projects_dir`,
+`memories_dir`, `session_evidence_limit_per_session`, `candidate_rows`,
+`repairable_rows`, `classified_unresolved_rows`, and `applied`.
+
 ## Rate Limit And Billing Observations
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from scripts import repair_session_history_repository_identity as repair
 
 
@@ -602,3 +604,346 @@ def test_should_include_max_id_in_default_candidate_fetch() -> None:
     assert "trace_user_untrusted" in statement
     assert "repository LIKE '%% (memory)'" in statement
     assert "tenant_id LIKE '%% (memory)'" in statement
+
+def test_should_default_projects_and_memories_dirs_to_home(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["repair_session_history_repository_identity.py"])
+    parsed = repair._parse_args()
+    assert parsed.projects_dir == str(Path.home() / "projects")
+    assert parsed.memories_dir == str(Path.home() / ".codex" / "memories")
+    assert parsed.target_db_name == "aawm_tristore"
+    assert parsed.session_evidence_limit_per_session == 50
+    # Defaults must be portable Path.home()-relative, not a hardcoded operator path.
+    assert parsed.projects_dir == repair.DEFAULT_PROJECTS_DIR
+    assert parsed.memories_dir == repair.DEFAULT_MEMORIES_DIR
+    assert not parsed.projects_dir.startswith("/home/zepfu/") or Path.home() == Path(
+        "/home/zepfu"
+    )
+
+
+def test_should_warn_when_projects_dir_missing(tmp_path) -> None:
+    missing = tmp_path / "does-not-exist"
+    with __import__("pytest").warns(UserWarning, match="does not exist"):
+        known = repair._load_known_repositories(missing)
+    assert known == {repair.REPO_ROOT.name}
+
+
+def test_should_use_shared_priority_list_for_best_and_build() -> None:
+    extractors = repair._row_repository_candidate_extractors(
+        known_repositories={"litellm", "aawm-tap"},
+        session_repositories={
+            "s1": {
+                "repository": "litellm",
+                "source": "session_metadata.repository",
+                "priority": 0,
+            }
+        },
+        rollout_repository_map={"rollout.json": "litellm"},
+        grok_repository="aawm-tap",
+    )
+    source_names = [name for name, _ in extractors]
+    assert source_names[0] == "grok_repository_override"
+    assert "rollout_memory_registry" in source_names
+    assert "session_metadata.aawm_d1_452_referenced_artifact_owner" in source_names
+    assert "same_session" in source_names
+    assert "session_history.tenant_id" in source_names
+
+    # Best-candidate ranking uses the same helper without repair-only overrides.
+    best = repair._best_row_repository_candidate(
+        {
+            "id": 1,
+            "session_id": "s1",
+            "repository": None,
+            "tenant_id": None,
+            "metadata": {
+                "aawm_d1_452_referenced_artifact_owner": "aawm-tap",
+                "repository": "litellm",
+            },
+        },
+        {"litellm", "aawm-tap"},
+    )
+    assert best is not None
+    assert best[0] == "aawm-tap"
+    assert best[1] == "session_metadata.aawm_d1_452_referenced_artifact_owner"
+
+
+def test_should_merge_only_owned_metadata_keys_on_apply() -> None:
+    class _Cursor:
+        def __init__(self) -> None:
+            self.params = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def executemany(self, statement, params):
+            self.statement = statement
+            self.params = list(params)
+
+    class _Conn:
+        def __init__(self):
+            self.cursor_instance = _Cursor()
+
+        def cursor(self):
+            return self.cursor_instance
+
+    metadata = {
+        "repository": "litellm",
+        "tenant_id": "litellm",
+        "tenant_id_source": "repository_repair",
+        "session_history_repository_status": "repaired",
+        "session_history_repository_status_source": "row_identity_normalization",
+        "repository_identity_repaired_at": "2026-07-17T00:00:00+00:00",
+        "repository_identity_repair_source": "row_identity_normalization",
+        "unrelated_sibling_key": "must-not-be-written",
+        "provider_cache_marker": "leave-me",
+    }
+    # Build repaired metadata without the keys that should be cleared.
+    patch = repair._owned_metadata_patch(metadata)
+    assert "unrelated_sibling_key" not in patch
+    assert "provider_cache_marker" not in patch
+    assert patch["repository"] == "litellm"
+
+    clear_keys = repair._owned_metadata_null_clear_keys(
+        {
+            "repository": "litellm",
+            "tenant_id": "litellm",
+            "session_history_repository_status": "repaired",
+            "session_history_repository_status_source": "row_identity_normalization",
+            "repository_identity_repaired_at": "t",
+            "repository_identity_repair_source": "row_identity_normalization",
+            "tenant_id_source": "repository_repair",
+        }
+    )
+    # Unresolved keys not present in the repair payload should be cleared.
+    assert "session_history_repository_unresolved" in clear_keys
+    assert "repository_tenant_fallback_skipped" in clear_keys
+    # Clear list must be unique (no duplicated key deletes).
+    assert len(repair._OWNED_METADATA_CLEAR_KEYS) == len(
+        set(repair._OWNED_METADATA_CLEAR_KEYS)
+    )
+    # Intentional absence of optional owned keys (e.g. previous_*) is clearable,
+    # but unrelated sibling keys are never listed for deletion.
+    assert "repository_identity_previous_repository" in clear_keys
+    assert "provider_cache_marker" not in clear_keys
+
+    conn = _Conn()
+    repair._apply_repairs(
+        conn,
+        [
+            {
+                "id": 9,
+                "repository": "litellm",
+                "tenant_id": "litellm",
+                "metadata": {
+                    "repository": "litellm",
+                    "tenant_id": "litellm",
+                    "tenant_id_source": "repository_repair",
+                    "session_history_repository_status": "repaired",
+                    "session_history_repository_status_source": "x",
+                    "repository_identity_repaired_at": "t",
+                    "repository_identity_repair_source": "x",
+                },
+            }
+        ],
+    )
+    statement = conn.cursor_instance.statement
+    assert "||" in statement
+    assert "%s::jsonb" in statement
+    assert "metadata = %s::jsonb" not in statement.replace(
+        "|| COALESCE(%s::jsonb, '{}'::jsonb)", ""
+    )
+    params = conn.cursor_instance.params[0]
+    assert params[0] == "litellm"
+    assert params[1] == "litellm"
+    assert isinstance(params[2], list)
+    assert "session_history_repository_unresolved" in params[2]
+    assert '"repository": "litellm"' in params[3]
+    assert "unrelated_sibling_key" not in params[3]
+    assert params[4] == 9
+
+
+def test_should_bound_session_identity_fetch_per_session() -> None:
+    conn = repair._FakeRepairConnection() if hasattr(repair, "_FakeRepairConnection") else None
+    # Use the local fake classes from this module via duck typing recreation.
+    class _Cursor:
+        def __init__(self):
+            self.execute_calls = []
+            self._rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def execute(self, statement, params=None):
+            self.execute_calls.append((statement, params))
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        def __init__(self):
+            self.cursor_instance = _Cursor()
+
+        def cursor(self, *, row_factory=None):
+            return self.cursor_instance
+
+    conn = _Conn()
+    repair._fetch_session_identity_rows(
+        conn,
+        {"sess-a", "sess-b"},
+        limit_per_session=7,
+    )
+    statement, params = conn.cursor_instance.execute_calls[0]
+    assert "row_number()" in statement
+    assert "PARTITION BY session_id" in statement
+    assert "session_row_rank <=" in statement
+    assert params[2] == 7
+    assert set(params[0]) == {"sess-a", "sess-b"}
+
+
+def test_should_refuse_apply_when_current_database_mismatches_target(monkeypatch) -> None:
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def execute(self, statement, params=None):
+            self.statement = statement
+
+        def fetchone(self):
+            return ("wrong_db",)
+
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def cursor(self, *, row_factory=None):
+            return _Cursor()
+
+        def rollback(self):
+            return None
+
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(repair.psycopg, "connect", lambda dsn: _Conn())
+    monkeypatch.setattr(repair, "_load_known_repositories", lambda path: {"litellm"})
+    monkeypatch.setattr(
+        repair,
+        "_load_rollout_repository_map",
+        lambda memories_dir, known: {},
+    )
+    monkeypatch.setattr(repair, "_fetch_candidate_rows", lambda *a, **k: [])
+    args = repair.argparse.Namespace(
+        dsn="postgresql://unused",
+        apply=True,
+        target_db_name="aawm_tristore",
+        projects_dir="/tmp",
+        memories_dir="/tmp",
+        grok_repository=None,
+        batch_size=10,
+        cursor_id=0,
+        null_repository_since=None,
+        repository_value=None,
+        max_id=None,
+        skip_session_evidence=True,
+        session_evidence_limit_per_session=50,
+        classify_unresolved=False,
+        preview_limit=5,
+    )
+    import pytest
+
+    with pytest.raises(SystemExit, match="Refusing to apply"):
+        repair.repair_repository_identities(args)
+
+
+def test_should_allow_dry_run_when_current_database_mismatches_target(
+    monkeypatch, capsys
+) -> None:
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def execute(self, statement, params=None):
+            return None
+
+        def fetchone(self):
+            return ("wrong_db",)
+
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def cursor(self, *, row_factory=None):
+            return _Cursor()
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(repair.psycopg, "connect", lambda dsn: _Conn())
+    monkeypatch.setattr(repair, "_load_known_repositories", lambda path: {"litellm"})
+    monkeypatch.setattr(
+        repair,
+        "_load_rollout_repository_map",
+        lambda memories_dir, known: {},
+    )
+    monkeypatch.setattr(repair, "_fetch_candidate_rows", lambda *a, **k: [])
+    args = repair.argparse.Namespace(
+        dsn="postgresql://unused",
+        apply=False,
+        target_db_name="aawm_tristore",
+        projects_dir="/tmp",
+        memories_dir="/tmp",
+        grok_repository=None,
+        batch_size=10,
+        cursor_id=0,
+        null_repository_since=None,
+        repository_value=None,
+        max_id=None,
+        skip_session_evidence=True,
+        session_evidence_limit_per_session=50,
+        classify_unresolved=False,
+        preview_limit=5,
+    )
+    assert repair.repair_repository_identities(args) == 0
+    out = capsys.readouterr().out
+    assert "database=wrong_db" in out
+    assert "target_db_name=aawm_tristore" in out
+    assert "applied=false" in out
+
+
+def test_should_reject_non_positive_session_evidence_limit() -> None:
+    import pytest
+
+    class _Conn:
+        def cursor(self, *, row_factory=None):
+            raise AssertionError("cursor should not be opened")
+
+    with pytest.raises(ValueError, match="limit_per_session"):
+        repair._fetch_session_identity_rows(_Conn(), {"s"}, limit_per_session=0)
