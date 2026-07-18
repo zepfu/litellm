@@ -4,12 +4,28 @@ Backfill public.session_history from local CLI transcript history.
 
 The importer is dry-run first. It streams historical records from local Claude,
 Codex, Gemini, and Grok CLI state, derives aggregate session_history-compatible
-rows, and skips any transcript day that already has rows in public.session_history.
+rows, and skips any transcript day that already has *this* client's
+``source_import`` rows in public.session_history (scoped by client_name +
+metadata.source_import, not global calendar days).
+Use ``--rescan-existing-days`` after a mid-day crash or parser fix so already-
+marked days are reprocessed; apply writes merge on ``litellm_call_id`` rather
+than freezing first-insert values.
 
 Raw transcript text, auth files, and unbounded tool output are intentionally not
 stored. Tool arguments are redacted/truncated before they are included in
-session_history_tool_activity metadata.
+session_history_tool_activity metadata. Persisted metadata stores
+``source_path_hash`` / basename only (not absolute home paths).
+
+Apply writes use ON CONFLICT (litellm_call_id) DO UPDATE merge semantics so a
+re-run after a parser fix can repair incomplete local-CLI rows.
+
+Grok chat_history.jsonl lines typically lack per-message wall-clock times; row
+timestamps are synthesized from the session summary anchor plus a small line
+offset and are approximate for day-bucketing (see metadata.timestamp_source /
+timestamp_precision).
 """
+
+# ruff: noqa: T201, PLR0915  # CLI operator script: intentional prints + long main/parsers
 
 from __future__ import annotations
 
@@ -20,12 +36,13 @@ import re
 import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from hashlib import sha1
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import quote, unquote
+
 from zoneinfo import ZoneInfo
 
 try:
@@ -51,9 +68,11 @@ SENSITIVE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 SECRET_VALUE_RE = re.compile(
-    r"(bearer\s+)[A-Za-z0-9._~+/=-]+|"
-    r"(api[_-]?key\s*[=:]\s*)[A-Za-z0-9._~+/=-]+|"
-    r"(token\s*[=:]\s*)[A-Za-z0-9._~+/=-]+",
+    r"(?P<prefix>"
+    r"bearer\s+|"
+    r"api[_-]?key\s*[=:]\s*|"
+    r"token\s*[=:]\s*"
+    r")[A-Za-z0-9._~+/=-]+",
     re.IGNORECASE,
 )
 GIT_COMMAND_RE = re.compile(r"(?<!\S)git\s+(?P<verb>commit|push)\b", re.IGNORECASE)
@@ -169,8 +188,13 @@ class DryRunSummary:
     git_commit_count: int = 0
     git_push_count: int = 0
     no_token_records: int = 0
-    by_client: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
-    by_date: dict[date, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
+    approximate_timestamp_records: int = 0
+    by_client: dict[str, Counter[str]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
+    by_date: dict[date, Counter[str]] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
     by_model: Counter[str] = field(default_factory=Counter)
     by_tool: Counter[str] = field(default_factory=Counter)
     samples: list[dict[str, Any]] = field(default_factory=list)
@@ -191,7 +215,9 @@ class DryRunSummary:
         )
         response_cost = _safe_float(record.get("response_cost_usd"))
         cache_miss = bool(record.get("provider_cache_miss"))
-        cache_miss_tokens = _safe_int(record.get("provider_cache_miss_token_count")) or 0
+        cache_miss_tokens = (
+            _safe_int(record.get("provider_cache_miss_token_count")) or 0
+        )
         cache_miss_cost = _safe_float(record.get("provider_cache_miss_cost_usd"))
         file_read_count = _safe_int(record.get("file_read_count")) or 0
         file_modified_count = _safe_int(record.get("file_modified_count")) or 0
@@ -220,6 +246,15 @@ class DryRunSummary:
         if input_tokens + output_tokens + cache_read + cache_creation + reasoning == 0:
             self.no_token_records += 1
 
+        metadata = (
+            record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        )
+        timestamp_precision = str(metadata.get("timestamp_precision") or "")
+        if timestamp_precision.startswith("approximate"):
+            self.approximate_timestamp_records += 1
+            self.by_client[client]["approximate_timestamp_records"] += 1
+            self.by_date[day]["approximate_timestamp_records"] += 1
+
         self.by_client[client]["records"] += 1
         self.by_client[client]["tool_rows"] += tool_rows
         self.by_client[client]["input_tokens"] += input_tokens
@@ -232,9 +267,13 @@ class DryRunSummary:
             self.by_client[client]["response_cost_usd"] += response_cost
         if cache_miss:
             self.by_client[client]["provider_cache_miss_rows"] += 1
-            self.by_client[client]["provider_cache_miss_token_count"] += cache_miss_tokens
+            self.by_client[client][
+                "provider_cache_miss_token_count"
+            ] += cache_miss_tokens
             if cache_miss_cost is not None:
-                self.by_client[client]["provider_cache_miss_cost_usd"] += cache_miss_cost
+                self.by_client[client][
+                    "provider_cache_miss_cost_usd"
+                ] += cache_miss_cost
         self.by_client[client]["file_read_count"] += file_read_count
         self.by_client[client]["file_modified_count"] += file_modified_count
         self.by_client[client]["git_commit_count"] += git_commit_count
@@ -273,22 +312,33 @@ class DryRunSummary:
 
 
 def _safe_int(value: Any) -> Optional[int]:
-    if value is None or value == "":
-        return None
+    """Coerce integers using the shared AAWM helper (no float-truncation path)."""
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        from litellm.integrations.aawm_agent_identity import (
+            _safe_int as _shared_safe_int,
+        )
+    except Exception:  # pragma: no cover - thin hosts without litellm installed
+        if value is None or value == "":
+            return None
         try:
-            return int(float(value))
+            return int(value)
         except (TypeError, ValueError):
             return None
+    return _shared_safe_int(value)
 
 
 def _safe_str(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
+    """Coerce non-empty strings using the shared AAWM helper when available."""
+    try:
+        from litellm.integrations.aawm_agent_identity import (
+            _safe_str as _shared_safe_str,
+        )
+    except Exception:  # pragma: no cover - thin hosts without litellm installed
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+    return _shared_safe_str(value)
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -330,7 +380,9 @@ def _sha(value: str, length: int = 12) -> str:
     return sha1(value.encode("utf-8", errors="replace")).hexdigest()[:length]
 
 
-def _iter_jsonl(path: Path, stats: ScanStats, client: str) -> Iterator[tuple[int, dict[str, Any]]]:
+def _iter_jsonl(
+    path: Path, stats: ScanStats, client: str
+) -> Iterator[tuple[int, dict[str, Any]]]:
     stats.files_seen[client] += 1
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -350,7 +402,11 @@ def _iter_jsonl(path: Path, stats: ScanStats, client: str) -> Iterator[tuple[int
 
 
 def _redact_text(value: str, max_len: int = 500) -> str:
-    redacted = SECRET_VALUE_RE.sub(lambda match: f"{match.group(1)}<redacted>", value)
+    def _replace(match: re.Match[str]) -> str:
+        prefix = match.group("prefix") or ""
+        return f"{prefix}<redacted>"
+
+    redacted = SECRET_VALUE_RE.sub(_replace, value)
     if len(redacted) > max_len:
         return redacted[:max_len] + "...<truncated>"
     return redacted
@@ -409,7 +465,11 @@ def _extract_paths(arguments: Any, keys: set[str]) -> list[str]:
     paths: list[str] = []
     for key, value in arguments.items():
         key_text = str(key).lower()
-        if key_text in keys or key_text.endswith("_path") or key_text.endswith("_paths"):
+        if (
+            key_text in keys
+            or key_text.endswith("_path")
+            or key_text.endswith("_paths")
+        ):
             paths.extend(_extract_paths_from_value(value))
     return _dedupe(paths)
 
@@ -504,9 +564,13 @@ def _build_tool_activity(
 ) -> dict[str, Any]:
     parsed_args = _parse_tool_arguments(arguments)
     kind = _tool_kind(tool_name)
-    read_paths = _extract_paths(parsed_args, READ_PATH_KEYS) if kind in {"read", "tool"} else []
+    read_paths = (
+        _extract_paths(parsed_args, READ_PATH_KEYS) if kind in {"read", "tool"} else []
+    )
     modified_paths = (
-        _extract_paths(parsed_args, WRITE_PATH_KEYS) if kind in {"modify", "tool"} else []
+        _extract_paths(parsed_args, WRITE_PATH_KEYS)
+        if kind in {"modify", "tool"}
+        else []
     )
     command = _command_text(tool_name, parsed_args)
     commit_count = 0
@@ -541,7 +605,9 @@ def _tool_summary(tool_activity: list[dict[str, Any]]) -> dict[str, Any]:
     for item in tool_activity:
         names.append(str(item.get("tool_name") or "unknown"))
         read_paths.extend(str(path) for path in item.get("file_paths_read") or [])
-        modified_paths.extend(str(path) for path in item.get("file_paths_modified") or [])
+        modified_paths.extend(
+            str(path) for path in item.get("file_paths_modified") or []
+        )
         git_commit_count += _safe_int(item.get("git_commit_count")) or 0
         git_push_count += _safe_int(item.get("git_push_count")) or 0
     return {
@@ -577,19 +643,43 @@ def _provider_from_model(model: Optional[str], fallback: Optional[str] = None) -
     return "unknown"
 
 
+def _source_path_metadata(path: Path | str) -> dict[str, str]:
+    """Persist only non-identifying path correlation fields.
+
+    Absolute home paths embed local usernames and layout; store a hash plus
+    basename for operator correlation, and keep full paths out of DB metadata.
+    """
+    path_text = str(path)
+    path_obj = Path(path_text)
+    return {
+        "source_path_hash": _sha(path_text),
+        "source_path_basename": path_obj.name,
+    }
+
+
 def _storage_client_name(source_client: str) -> str:
     return CLIENT_NAME_BY_SOURCE.get(source_client, source_client)
 
 
 def _safe_float(value: Any) -> Optional[float]:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        if isinstance(value, Decimal):
+    """Coerce floats using the shared AAWM helper; Decimal falls back locally."""
+    if isinstance(value, Decimal):
+        try:
             return float(value)
-    return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+    try:
+        from litellm.integrations.aawm_agent_identity import (
+            _safe_float as _shared_safe_float,
+        )
+    except Exception:  # pragma: no cover - thin hosts without litellm installed
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    return _shared_safe_float(value)
 
 
 def _model_cost_info(model: str, provider: str) -> Optional[dict[str, Any]]:
@@ -640,14 +730,19 @@ def _cache_creation_write_cost(
     )
     creation_detail = (
         usage_obj.get("cache_creation")
-        if isinstance(usage_obj, dict) and isinstance(usage_obj.get("cache_creation"), dict)
+        if isinstance(usage_obj, dict)
+        and isinstance(usage_obj.get("cache_creation"), dict)
         else {}
     )
     one_hour_tokens = _safe_int(creation_detail.get("ephemeral_1h_input_tokens")) or 0
     five_min_tokens = _safe_int(creation_detail.get("ephemeral_5m_input_tokens")) or 0
     if one_hour_tokens or five_min_tokens:
-        remaining = max(cache_creation_input_tokens - one_hour_tokens - five_min_tokens, 0)
-        one_hour_effective_cost = above_1hr_cost if above_1hr_cost is not None else base_cost
+        remaining = max(
+            cache_creation_input_tokens - one_hour_tokens - five_min_tokens, 0
+        )
+        one_hour_effective_cost = (
+            above_1hr_cost if above_1hr_cost is not None else base_cost
+        )
         return (
             (one_hour_tokens * one_hour_effective_cost)
             + (five_min_tokens * base_cost)
@@ -778,9 +873,7 @@ def _base_record(
     summary = _tool_summary(tools)
     storage_client_name = _storage_client_name(source_client_name)
     resolved_total = (
-        total_tokens
-        if total_tokens is not None
-        else input_tokens + output_tokens
+        total_tokens if total_tokens is not None else input_tokens + output_tokens
     )
     response_cost_usd = _calculate_response_cost_usd(
         model=model or "unknown",
@@ -962,7 +1055,10 @@ def _iter_claude_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any
                     group["content"].append(block)
                     if block.get("type") != "tool_use":
                         continue
-                    tool_id = _safe_str(block.get("id")) or f"line-{line_index}:tool-{len(group['tool_activity'])}"
+                    tool_id = (
+                        _safe_str(block.get("id"))
+                        or f"line-{line_index}:tool-{len(group['tool_activity'])}"
+                    )
                     if tool_id in group["tool_ids"]:
                         continue
                     group["tool_ids"].add(tool_id)
@@ -992,16 +1088,17 @@ def _iter_claude_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any
                 or str(group["line_index"])
             )
             content = group["content"]
-            reasoning_present, reasoning_estimated, signature_present = (
-                _extract_claude_reasoning(content)
-            )
+            (
+                reasoning_present,
+                reasoning_estimated,
+                signature_present,
+            ) = _extract_claude_reasoning(content)
             input_tokens = _safe_int(usage.get("input_tokens")) or 0
             output_tokens = _safe_int(usage.get("output_tokens")) or 0
             cache_read = _safe_int(usage.get("cache_read_input_tokens")) or 0
             cache_creation = _safe_int(usage.get("cache_creation_input_tokens")) or 0
             metadata = {
-                "source_path": str(path),
-                "source_path_hash": path_hash,
+                **_source_path_metadata(path),
                 "source_line": group["line_index"],
                 "source_lines": group["source_lines"],
                 "source_request_id": obj.get("requestId"),
@@ -1041,7 +1138,9 @@ def _iter_claude_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any
             )
 
 
-def _load_codex_threads(codex_root: Path, stats: ScanStats) -> dict[str, dict[str, Any]]:
+def _load_codex_threads(
+    codex_root: Path, stats: ScanStats
+) -> dict[str, dict[str, Any]]:
     db_candidates = sorted(codex_root.glob("state_*.sqlite"))
     if not db_candidates:
         stats.files_skipped["codex:missing_state_db"] += 1
@@ -1080,11 +1179,17 @@ def _iter_codex_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]
         thread = thread_by_rollout.get(str(path), {})
         thread_id = _safe_str(thread.get("id")) or path.stem.rsplit("-", 1)[-1]
         path_hash = _sha(str(path))
-        model = _safe_str(thread.get("model")) or _safe_str(thread.get("model_provider")) or "unknown"
+        model = (
+            _safe_str(thread.get("model"))
+            or _safe_str(thread.get("model_provider"))
+            or "unknown"
+        )
         provider = _provider_from_model(model, _safe_str(thread.get("model_provider")))
         repository = _safe_str(thread.get("cwd"))
         client_version = _safe_str(thread.get("cli_version"))
-        agent_name = _safe_str(thread.get("agent_role")) or _safe_str(thread.get("agent_nickname"))
+        agent_name = _safe_str(thread.get("agent_role")) or _safe_str(
+            thread.get("agent_nickname")
+        )
         pending_tools: list[dict[str, Any]] = []
         last_usage_signature: Optional[tuple[int, int, int, int, int]] = None
         for line_index, obj in _iter_jsonl(path, stats, "codex"):
@@ -1094,7 +1199,11 @@ def _iter_codex_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]
             event_type = obj.get("type")
             payload_type = payload.get("type")
             if event_type == "session_meta":
-                meta_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+                meta_payload = (
+                    payload.get("payload")
+                    if isinstance(payload.get("payload"), dict)
+                    else payload
+                )
                 if isinstance(meta_payload, dict):
                     model = _safe_str(meta_payload.get("model")) or model
                     repository = _safe_str(meta_payload.get("cwd")) or repository
@@ -1110,7 +1219,9 @@ def _iter_codex_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]
                     _build_tool_activity(
                         tool_index=len(pending_tools),
                         tool_name=_safe_str(payload.get("name")) or "unknown",
-                        tool_call_id=_safe_str(payload.get("call_id") or payload.get("id")),
+                        tool_call_id=_safe_str(
+                            payload.get("call_id") or payload.get("id")
+                        ),
                         arguments=arguments or {},
                         metadata={"source": "codex_response_item"},
                     )
@@ -1150,11 +1261,12 @@ def _iter_codex_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]
                 continue
             rate_limits = payload.get("rate_limits")
             metadata = {
-                "source_path": str(path),
-                "source_path_hash": path_hash,
+                **_source_path_metadata(path),
                 "source_line": line_index,
                 "thread_source": thread.get("source"),
-                "thread_title": _redact_text(str(thread.get("title") or ""), max_len=200),
+                "thread_title": _redact_text(
+                    str(thread.get("title") or ""), max_len=200
+                ),
                 "thread_created_at": thread.get("created_at_ms")
                 or thread.get("created_at"),
                 "thread_updated_at": thread.get("updated_at_ms")
@@ -1213,7 +1325,9 @@ def _load_gemini_project_roots(gemini_root: Path) -> dict[str, str]:
     return {str(project): str(path) for path, project in projects.items()}
 
 
-def _read_gemini_messages(path: Path, stats: ScanStats) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _read_gemini_messages(
+    path: Path, stats: ScanStats
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     stats.files_seen["gemini"] += 1
     if path.suffix == ".jsonl":
         header: dict[str, Any] = {}
@@ -1244,9 +1358,12 @@ def _read_gemini_messages(path: Path, stats: ScanStats) -> tuple[dict[str, Any],
         stats.files_skipped["gemini:json_error"] += 1
         return {}, []
     messages = data.get("messages") if isinstance(data, dict) else []
-    return data if isinstance(data, dict) else {}, [
-        item for item in messages if isinstance(item, dict)
-    ] if isinstance(messages, list) else []
+    return (
+        data if isinstance(data, dict) else {},
+        [item for item in messages if isinstance(item, dict)]
+        if isinstance(messages, list)
+        else [],
+    )
 
 
 def _gemini_message_is_model(message: dict[str, Any]) -> bool:
@@ -1267,7 +1384,9 @@ def _iter_gemini_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any
         return
     project_roots = _load_gemini_project_roots(gemini_root)
     seen_messages: set[tuple[str, str, str, str]] = set()
-    for path in sorted(list(tmp_root.rglob("chats/*.jsonl")) + list(tmp_root.rglob("chats/*.json"))):
+    for path in sorted(
+        list(tmp_root.rglob("chats/*.jsonl")) + list(tmp_root.rglob("chats/*.json"))
+    ):
         header, messages = _read_gemini_messages(path, stats)
         try:
             project_name = path.relative_to(tmp_root).parts[0]
@@ -1295,12 +1414,32 @@ def _iter_gemini_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any
             if dedupe_key in seen_messages:
                 continue
             seen_messages.add(dedupe_key)
-            tokens = message.get("tokens") if isinstance(message.get("tokens"), dict) else {}
-            input_tokens = _safe_int(tokens.get("input")) or _safe_int(tokens.get("input_tokens")) or 0
-            output_tokens = _safe_int(tokens.get("output")) or _safe_int(tokens.get("output_tokens")) or 0
-            cache_read = _safe_int(tokens.get("cached")) or _safe_int(tokens.get("cache_read_input_tokens")) or 0
-            reasoning_tokens = _safe_int(tokens.get("thoughts")) or _safe_int(tokens.get("reasoning")) or 0
-            total_tokens = _safe_int(tokens.get("total")) or input_tokens + output_tokens
+            tokens = (
+                message.get("tokens") if isinstance(message.get("tokens"), dict) else {}
+            )
+            input_tokens = (
+                _safe_int(tokens.get("input"))
+                or _safe_int(tokens.get("input_tokens"))
+                or 0
+            )
+            output_tokens = (
+                _safe_int(tokens.get("output"))
+                or _safe_int(tokens.get("output_tokens"))
+                or 0
+            )
+            cache_read = (
+                _safe_int(tokens.get("cached"))
+                or _safe_int(tokens.get("cache_read_input_tokens"))
+                or 0
+            )
+            reasoning_tokens = (
+                _safe_int(tokens.get("thoughts"))
+                or _safe_int(tokens.get("reasoning"))
+                or 0
+            )
+            total_tokens = (
+                _safe_int(tokens.get("total")) or input_tokens + output_tokens
+            )
             tool_activity: list[dict[str, Any]] = []
             tool_calls = message.get("toolCalls")
             if isinstance(tool_calls, list):
@@ -1316,10 +1455,13 @@ def _iter_gemini_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any
                             metadata={"source": "gemini_toolCalls"},
                         )
                     )
-            thoughts = message.get("thoughts") if isinstance(message.get("thoughts"), list) else []
+            thoughts = (
+                message.get("thoughts")
+                if isinstance(message.get("thoughts"), list)
+                else []
+            )
             metadata = {
-                "source_path": str(path),
-                "source_path_hash": path_hash,
+                **_source_path_metadata(path),
                 "source_message_index": message_index,
                 "source_message_id": message_id,
                 "project_name": project_name,
@@ -1387,13 +1529,17 @@ def _iter_grok_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]]
     for session_dir in _iter_grok_session_dirs(sessions_root):
         stats.files_seen["grok_summary"] += 1
         try:
-            summary = json.loads((session_dir / "summary.json").read_text(encoding="utf-8"))
+            summary = json.loads(
+                (session_dir / "summary.json").read_text(encoding="utf-8")
+            )
         except (OSError, json.JSONDecodeError):
             stats.files_skipped["grok:summary_error"] += 1
             continue
         info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
         session_id = _safe_str(info.get("id")) or session_dir.name
-        repository = _safe_str(info.get("cwd")) or _grok_cwd_from_session_dir(session_dir)
+        repository = _safe_str(info.get("cwd")) or _grok_cwd_from_session_dir(
+            session_dir
+        )
         model = _safe_str(summary.get("current_model_id")) or "grok-build"
         created_base = (
             _parse_datetime(summary.get("created_at"))
@@ -1406,6 +1552,9 @@ def _iter_grok_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]]
         for line_index, obj in _iter_jsonl(path, stats, "grok"):
             if obj.get("type") != "assistant":
                 continue
+            # Grok chat lines lack per-message timestamps; synthetic spacing is
+            # only for stable ordering within a session and must not be treated
+            # as accurate wall-clock times (day buckets are approximate).
             row_time = created_base + timedelta(milliseconds=line_index)
             tool_activity: list[dict[str, Any]] = []
             tool_calls = obj.get("tool_calls")
@@ -1425,13 +1574,21 @@ def _iter_grok_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]]
                             metadata={"source": "grok_tool_calls"},
                         )
                     )
-            reasoning_present, reasoning_estimated, signature_present = (
-                _grok_reasoning_state(obj)
-            )
+            (
+                reasoning_present,
+                reasoning_estimated,
+                signature_present,
+            ) = _grok_reasoning_state(obj)
             metadata = {
-                "source_path": str(path),
-                "source_path_hash": _sha(str(path)),
+                **_source_path_metadata(path),
                 "source_line": line_index,
+                "timestamp_source": "session_summary_plus_line_offset",
+                "timestamp_precision": "approximate_session_day",
+                "timestamp_note": (
+                    "Grok chat_history lines lack per-message timestamps; "
+                    "created_at is session summary anchor + line_index ms and "
+                    "is approximate for day-bucketing only."
+                ),
                 "session_request_id": summary.get("request_id"),
                 "session_created_at": summary.get("created_at"),
                 "session_updated_at": summary.get("updated_at"),
@@ -1453,7 +1610,9 @@ def _iter_grok_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]]
                 repository=repository,
                 reasoning_tokens_estimated=reasoning_estimated,
                 reasoning_tokens_source=(
-                    "estimated_from_grok_reasoning_text" if reasoning_estimated else None
+                    "estimated_from_grok_reasoning_text"
+                    if reasoning_estimated
+                    else None
                 ),
                 reasoning_present=reasoning_present,
                 thinking_signature_present=signature_present,
@@ -1462,7 +1621,9 @@ def _iter_grok_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]]
             )
 
 
-def _iter_records(root: Path, clients: set[str], stats: ScanStats) -> Iterator[dict[str, Any]]:
+def _iter_records(
+    root: Path, clients: set[str], stats: ScanStats
+) -> Iterator[dict[str, Any]]:
     if "claude" in clients:
         yield from _iter_claude_records(root, stats)
     if "codex" in clients:
@@ -1473,7 +1634,18 @@ def _iter_records(root: Path, clients: set[str], stats: ScanStats) -> Iterator[d
         yield from _iter_grok_records(root, stats)
 
 
-def _postgres_dsn_from_args(args: argparse.Namespace) -> str:
+def _postgres_dsn_from_args(
+    args: argparse.Namespace,
+    *,
+    require_explicit: bool = False,
+) -> str:
+    """Resolve Postgres DSN from CLI args / env.
+
+    Hardcoded dev host/user/password defaults are not used. When
+    ``require_explicit`` is True (``--apply`` and day-existence checks that
+    actually open a connection), a missing DSN/env configuration fails closed
+    instead of writing to an unintended local default database.
+    """
     if args.pg_dsn:
         return args.pg_dsn
     has_component_override = any(
@@ -1482,11 +1654,56 @@ def _postgres_dsn_from_args(args: argparse.Namespace) -> str:
     direct_dsn = os.getenv("AAWM_DIRECT_DATABASE_URL")
     if not has_component_override and direct_dsn and direct_dsn.strip():
         return direct_dsn.strip()
-    host = args.pg_host or os.getenv("AAWM_DB_HOST") or "127.0.0.1"
-    port = args.pg_port or os.getenv("AAWM_DB_PORT") or "5434"
-    user = args.pg_user or os.getenv("AAWM_DB_USER") or "aawm"
-    password = args.pg_password or os.getenv("AAWM_DB_PASSWORD") or "aawm_dev"
+
+    host = args.pg_host or os.getenv("AAWM_DB_HOST")
+    port = args.pg_port or os.getenv("AAWM_DB_PORT")
+    user = args.pg_user or os.getenv("AAWM_DB_USER")
+    password = args.pg_password or os.getenv("AAWM_DB_PASSWORD")
+
+    if require_explicit:
+        missing = [
+            name
+            for name, value in (
+                ("AAWM_DB_HOST/--pg-host", host),
+                ("AAWM_DB_PORT/--pg-port", port),
+                ("AAWM_DB_USER/--pg-user", user),
+                ("AAWM_DB_PASSWORD/--pg-password", password),
+            )
+            if not value
+        ]
+        # Component path must be fully specified. Do not fall back to
+        # AAWM_DIRECT_DATABASE_URL once any --pg-* override is present, and do
+        # not fill host/user/password from hardcoded dev defaults.
+        if missing:
+            raise RuntimeError(
+                "Refusing to connect without an explicit database configuration. "
+                "Set AAWM_DIRECT_DATABASE_URL, or provide --pg-dsn / "
+                "AAWM_DB_HOST+PORT+USER+PASSWORD (and matching --pg-* flags). "
+                f"Missing: {', '.join(missing)}"
+            )
+        assert host and port and user and password  # for type checkers
+
+    # Non-apply callers that only need a display/default string still get a
+    # localhost template without embedding a password when unset.
+    host = host or "127.0.0.1"
+    port = port or "5434"
+    user = user or "aawm"
+    password = password or ""
     return f"postgresql://{quote(user)}:{quote(password)}@{host}:{port}/{quote(args.target_db_name)}"
+
+
+def _assert_target_database(conn: Any, target_db_name: str) -> str:
+    """Fail closed when the live connection is not the operator-selected DB."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_database()")
+        row = cur.fetchone()
+    current_database = row[0] if row else None
+    if current_database != target_db_name:
+        raise RuntimeError(
+            f"Refusing to use database {current_database!r}; expected "
+            f"{target_db_name!r}"
+        )
+    return str(current_database)
 
 
 def _storage_client_names_for_sources(clients: Iterable[str]) -> list[str]:
@@ -1543,7 +1760,7 @@ def _fetch_existing_days(
     """Return calendar days that already have backfill rows, keyed by client_name."""
     if psycopg is None:
         raise RuntimeError("psycopg is required for the session_history day check")
-    dsn = _postgres_dsn_from_args(args)
+    dsn = _postgres_dsn_from_args(args, require_explicit=True)
     sql, params = _existing_days_query(
         tz_name=tz_name,
         client_names=client_names,
@@ -1551,14 +1768,8 @@ def _fetch_existing_days(
     )
     existing: dict[str, set[date]] = defaultdict(set)
     with psycopg.connect(dsn, connect_timeout=args.pg_connect_timeout) as conn:
+        _assert_target_database(conn, args.target_db_name)
         with conn.cursor() as cur:
-            cur.execute("SELECT current_database()")
-            [current_database] = cur.fetchone()
-            if current_database != args.target_db_name:
-                raise RuntimeError(
-                    f"Refusing to use database {current_database!r}; expected "
-                    f"{args.target_db_name!r}"
-                )
             cur.execute(sql, params)
             for client_name, day in cur.fetchall():
                 if client_name is None or day is None:
@@ -1627,7 +1838,148 @@ INSERT INTO public.session_history (
     %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
 )
-ON CONFLICT (litellm_call_id) DO NOTHING
+ON CONFLICT (litellm_call_id) DO UPDATE SET
+    -- Merge semantics align with aawm_agent_identity session_history writes so
+    -- re-running this backfill after a parser fix can repair incomplete rows
+    -- (unlike DO NOTHING, which froze first-insert values forever).
+    session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), session_history.session_id),
+    trace_id = COALESCE(NULLIF(EXCLUDED.trace_id, ''), session_history.trace_id),
+    provider_response_id = COALESCE(
+        NULLIF(EXCLUDED.provider_response_id, ''),
+        session_history.provider_response_id
+    ),
+    provider = COALESCE(NULLIF(EXCLUDED.provider, ''), session_history.provider),
+    model = COALESCE(NULLIF(EXCLUDED.model, ''), session_history.model),
+    model_group = COALESCE(NULLIF(EXCLUDED.model_group, ''), session_history.model_group),
+    agent_name = COALESCE(NULLIF(EXCLUDED.agent_name, ''), session_history.agent_name),
+    agent_id = COALESCE(NULLIF(EXCLUDED.agent_id, ''), session_history.agent_id),
+    tenant_id = COALESCE(NULLIF(EXCLUDED.tenant_id, ''), session_history.tenant_id),
+    call_type = COALESCE(NULLIF(EXCLUDED.call_type, ''), session_history.call_type),
+    created_at = LEAST(session_history.created_at, EXCLUDED.created_at),
+    start_time = COALESCE(session_history.start_time, EXCLUDED.start_time),
+    end_time = COALESCE(EXCLUDED.end_time, session_history.end_time),
+    input_tokens = GREATEST(session_history.input_tokens, EXCLUDED.input_tokens),
+    output_tokens = GREATEST(session_history.output_tokens, EXCLUDED.output_tokens),
+    total_tokens = GREATEST(session_history.total_tokens, EXCLUDED.total_tokens),
+    cache_read_input_tokens = GREATEST(
+        session_history.cache_read_input_tokens,
+        EXCLUDED.cache_read_input_tokens
+    ),
+    cache_creation_input_tokens = GREATEST(
+        session_history.cache_creation_input_tokens,
+        EXCLUDED.cache_creation_input_tokens
+    ),
+    reasoning_tokens_reported = COALESCE(
+        GREATEST(
+            NULLIF(session_history.reasoning_tokens_reported, 0),
+            NULLIF(EXCLUDED.reasoning_tokens_reported, 0)
+        ),
+        NULLIF(session_history.reasoning_tokens_reported, 0),
+        NULLIF(EXCLUDED.reasoning_tokens_reported, 0)
+    ),
+    reasoning_tokens_estimated = COALESCE(
+        GREATEST(
+            NULLIF(session_history.reasoning_tokens_estimated, 0),
+            NULLIF(EXCLUDED.reasoning_tokens_estimated, 0)
+        ),
+        NULLIF(session_history.reasoning_tokens_estimated, 0),
+        NULLIF(EXCLUDED.reasoning_tokens_estimated, 0)
+    ),
+    reasoning_tokens_source = COALESCE(
+        NULLIF(EXCLUDED.reasoning_tokens_source, ''),
+        session_history.reasoning_tokens_source
+    ),
+    reasoning_present = session_history.reasoning_present OR EXCLUDED.reasoning_present,
+    thinking_signature_present = (
+        session_history.thinking_signature_present OR EXCLUDED.thinking_signature_present
+    ),
+    provider_cache_attempted = (
+        session_history.provider_cache_attempted OR EXCLUDED.provider_cache_attempted
+    ),
+    provider_cache_status = COALESCE(
+        NULLIF(EXCLUDED.provider_cache_status, ''),
+        session_history.provider_cache_status
+    ),
+    provider_cache_miss = session_history.provider_cache_miss OR EXCLUDED.provider_cache_miss,
+    provider_cache_miss_reason = COALESCE(
+        NULLIF(EXCLUDED.provider_cache_miss_reason, ''),
+        session_history.provider_cache_miss_reason
+    ),
+    provider_cache_miss_token_count = COALESCE(
+        GREATEST(
+            session_history.provider_cache_miss_token_count,
+            EXCLUDED.provider_cache_miss_token_count
+        ),
+        session_history.provider_cache_miss_token_count,
+        EXCLUDED.provider_cache_miss_token_count
+    ),
+    provider_cache_miss_cost_usd = COALESCE(
+        GREATEST(
+            session_history.provider_cache_miss_cost_usd,
+            EXCLUDED.provider_cache_miss_cost_usd
+        ),
+        session_history.provider_cache_miss_cost_usd,
+        EXCLUDED.provider_cache_miss_cost_usd
+    ),
+    tool_call_count = GREATEST(session_history.tool_call_count, EXCLUDED.tool_call_count),
+    invalid_tool_call_count = GREATEST(
+        session_history.invalid_tool_call_count,
+        EXCLUDED.invalid_tool_call_count
+    ),
+    tool_names = COALESCE(EXCLUDED.tool_names, session_history.tool_names),
+    file_read_count = GREATEST(session_history.file_read_count, EXCLUDED.file_read_count),
+    file_modified_count = GREATEST(
+        session_history.file_modified_count,
+        EXCLUDED.file_modified_count
+    ),
+    changed_pre_commit_config = (
+        session_history.changed_pre_commit_config OR EXCLUDED.changed_pre_commit_config
+    ),
+    changed_env_file = session_history.changed_env_file OR EXCLUDED.changed_env_file,
+    changed_pyproject_toml = (
+        session_history.changed_pyproject_toml OR EXCLUDED.changed_pyproject_toml
+    ),
+    changed_gitignore = session_history.changed_gitignore OR EXCLUDED.changed_gitignore,
+    git_commit_count = GREATEST(session_history.git_commit_count, EXCLUDED.git_commit_count),
+    git_push_count = GREATEST(session_history.git_push_count, EXCLUDED.git_push_count),
+    response_cost_usd = COALESCE(
+        GREATEST(session_history.response_cost_usd, EXCLUDED.response_cost_usd),
+        session_history.response_cost_usd,
+        EXCLUDED.response_cost_usd
+    ),
+    litellm_environment = COALESCE(
+        NULLIF(EXCLUDED.litellm_environment, ''),
+        session_history.litellm_environment
+    ),
+    client_name = COALESCE(NULLIF(EXCLUDED.client_name, ''), session_history.client_name),
+    client_version = COALESCE(
+        NULLIF(EXCLUDED.client_version, ''),
+        session_history.client_version
+    ),
+    client_user_agent = COALESCE(
+        NULLIF(EXCLUDED.client_user_agent, ''),
+        session_history.client_user_agent
+    ),
+    token_permission_input = GREATEST(
+        session_history.token_permission_input,
+        EXCLUDED.token_permission_input
+    ),
+    token_permission_output = GREATEST(
+        session_history.token_permission_output,
+        EXCLUDED.token_permission_output
+    ),
+    permission_usd_cost = GREATEST(
+        session_history.permission_usd_cost,
+        EXCLUDED.permission_usd_cost
+    ),
+    -- JSONB || keeps keys present only on the left operand. Historical local-CLI
+    -- rows may still store absolute ``source_path``; strip that deprecated key
+    -- after the merge so rescans remove it while preserving unrelated metadata.
+    metadata = (
+        COALESCE(session_history.metadata, '{}'::jsonb)
+        || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+    ) - 'source_path',
+    repository = COALESCE(NULLIF(EXCLUDED.repository, ''), session_history.repository)
 """
 
 TOOL_ACTIVITY_INSERT_SQL = """
@@ -1655,6 +2007,9 @@ INSERT INTO public.session_history_tool_activity (
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
     %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb
 )
+-- Scoped to (litellm_call_id, tool_index) only: distinct tool_index values for
+-- the same call, and the same tool_index on different calls, remain insertable.
+-- Do not broaden this conflict key or distinct tool events will be suppressed.
 ON CONFLICT (litellm_call_id, tool_index) DO NOTHING
 """
 
@@ -1717,11 +2072,15 @@ def _history_payload(record: dict[str, Any]) -> tuple[Any, ...]:
 
 def _tool_payloads(record: dict[str, Any]) -> list[tuple[Any, ...]]:
     payloads: list[tuple[Any, ...]] = []
-    record_metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    record_metadata = (
+        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    )
     for index, tool in enumerate(record.get("tool_activity") or []):
         if not isinstance(tool, dict):
             continue
-        tool_metadata = tool.get("metadata") if isinstance(tool.get("metadata"), dict) else {}
+        tool_metadata = (
+            tool.get("metadata") if isinstance(tool.get("metadata"), dict) else {}
+        )
         stored_tool_metadata = {
             **tool_metadata,
             "source_import": record_metadata.get("source_import"),
@@ -1740,7 +2099,9 @@ def _tool_payloads(record: dict[str, Any]) -> list[tuple[Any, ...]]:
                 record["model"],
                 record.get("agent_name"),
                 record.get("agent_id"),
-                _safe_int(tool.get("tool_index")) if _safe_int(tool.get("tool_index")) is not None else index,
+                _safe_int(tool.get("tool_index"))
+                if _safe_int(tool.get("tool_index")) is not None
+                else index,
                 tool.get("tool_call_id"),
                 tool.get("tool_name") or "unknown",
                 tool.get("tool_kind"),
@@ -1760,7 +2121,9 @@ def _apply_batch(conn: Any, records: list[dict[str, Any]]) -> None:
     if not records:
         return
     with conn.cursor() as cur:
-        cur.executemany(SESSION_HISTORY_INSERT_SQL, [_history_payload(item) for item in records])
+        cur.executemany(
+            SESSION_HISTORY_INSERT_SQL, [_history_payload(item) for item in records]
+        )
         tool_payloads: list[tuple[Any, ...]] = []
         for record in records:
             tool_payloads.extend(_tool_payloads(record))
@@ -1783,7 +2146,9 @@ def _sample_record(record: dict[str, Any], day: date) -> dict[str, Any]:
         "provider_cache_status": record.get("provider_cache_status"),
         "provider_cache_miss": record.get("provider_cache_miss"),
         "provider_cache_miss_reason": record.get("provider_cache_miss_reason"),
-        "provider_cache_miss_token_count": record.get("provider_cache_miss_token_count"),
+        "provider_cache_miss_token_count": record.get(
+            "provider_cache_miss_token_count"
+        ),
         "provider_cache_miss_cost_usd": record.get("provider_cache_miss_cost_usd"),
         "reasoning_tokens": record.get("reasoning_tokens_reported")
         or record.get("reasoning_tokens_estimated"),
@@ -1792,6 +2157,16 @@ def _sample_record(record: dict[str, Any], day: date) -> dict[str, Any]:
         "tool_call_count": record.get("tool_call_count"),
         "tool_names": record.get("tool_names"),
         "litellm_call_id": record.get("litellm_call_id"),
+        "timestamp_precision": (
+            (record.get("metadata") or {}).get("timestamp_precision")
+            if isinstance(record.get("metadata"), dict)
+            else None
+        ),
+        "timestamp_source": (
+            (record.get("metadata") or {}).get("timestamp_source")
+            if isinstance(record.get("metadata"), dict)
+            else None
+        ),
     }
 
 
@@ -1817,9 +2192,9 @@ def _print_summary(
     print(f"target_database: {args.target_db_name}")
     print(f"day_timezone: {args.day_timezone}")
     print(f"source_import: {IMPORT_MARKER}")
-    all_existing_days = {
-        day for days in existing_days.values() for day in days
-    }
+    print(f"rescan_existing_days: {bool(getattr(args, 'rescan_existing_days', False))}")
+    print(f"batch_size: {args.batch_size}")
+    all_existing_days = {day for days in existing_days.values() for day in days}
     if all_existing_days:
         print(
             "existing_session_history_days: "
@@ -1866,6 +2241,13 @@ def _print_summary(
         f"git_pushes={summary.git_push_count}"
     )
     print(f"records_without_token_detail: {summary.no_token_records}")
+    if summary.approximate_timestamp_records:
+        print(
+            "approximate_timestamp_records: "
+            f"{summary.approximate_timestamp_records} "
+            "(typically Grok session-summary + line-offset times; "
+            "day buckets for those rows are approximate)"
+        )
 
     if summary.by_date:
         dates = sorted(summary.by_date)
@@ -1922,7 +2304,9 @@ def _print_summary(
     _print_counter("Files skipped", stats.files_skipped)
     _print_counter("Parse errors", stats.parse_errors)
     _print_counter("Records seen before day skip", stats.records_seen)
-    _print_counter("Records skipped because day already exists", stats.records_skipped_existing_day)
+    _print_counter(
+        "Records skipped because day already exists", stats.records_skipped_existing_day
+    )
 
     print("\nRedacted sample candidate rows")
     if not summary.samples:
@@ -1936,7 +2320,9 @@ def _parse_clients(value: str) -> set[str]:
     valid = {"claude", "codex", "gemini", "grok"}
     unknown = clients - valid
     if unknown:
-        raise argparse.ArgumentTypeError(f"unknown clients: {', '.join(sorted(unknown))}")
+        raise argparse.ArgumentTypeError(
+            f"unknown clients: {', '.join(sorted(unknown))}"
+        )
     return clients or valid
 
 
@@ -1944,13 +2330,38 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Dry-run/apply local CLI transcript backfill into session_history."
     )
-    parser.add_argument("--home", default=str(Path.home()), help="Home directory containing CLI state")
-    parser.add_argument("--clients", type=_parse_clients, default=_parse_clients("claude,codex,gemini,grok"))
+    parser.add_argument(
+        "--home", default=str(Path.home()), help="Home directory containing CLI state"
+    )
+    parser.add_argument(
+        "--clients",
+        type=_parse_clients,
+        default=_parse_clients("claude,codex,gemini,grok"),
+    )
     parser.add_argument("--day-timezone", default=DEFAULT_TIMEZONE)
-    parser.add_argument("--from-date", help="Only include candidate days on or after YYYY-MM-DD")
-    parser.add_argument("--to-date", help="Only include candidate days on or before YYYY-MM-DD")
-    parser.add_argument("--apply", action="store_true", help="Write rows. Default is dry-run only.")
-    parser.add_argument("--batch-size", type=int, default=1000)
+    parser.add_argument(
+        "--from-date", help="Only include candidate days on or after YYYY-MM-DD"
+    )
+    parser.add_argument(
+        "--to-date", help="Only include candidate days on or before YYYY-MM-DD"
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="Write rows. Default is dry-run only."
+    )
+    parser.add_argument(
+        "--rescan-existing-days",
+        action="store_true",
+        help=(
+            "Do not skip days that already have this client's source_import rows. "
+            "Use after a mid-day crash or parser fix; apply merges on litellm_call_id."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Max rows per executemany flush within a client/day (default 1000).",
+    )
     parser.add_argument("--target-db-name", default=DEFAULT_TARGET_DB)
     parser.add_argument("--pg-dsn")
     parser.add_argument("--pg-host")
@@ -1973,13 +2384,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     tz = ZoneInfo(args.day_timezone)
     from_date = _optional_date(args.from_date)
     to_date = _optional_date(args.to_date)
+    if args.batch_size < 1:
+        raise RuntimeError("--batch-size must be >= 1")
     storage_client_names = _storage_client_names_for_sources(args.clients)
-    existing_days = _fetch_existing_days(
-        args,
-        args.day_timezone,
-        storage_client_names,
-        source_import=IMPORT_MARKER,
-    )
     stats = ScanStats()
     summary = DryRunSummary()
 
@@ -1988,13 +2395,45 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.apply:
         if psycopg is None:
             raise RuntimeError("psycopg is required for --apply")
+        # Fail closed: --apply never uses hardcoded dev credentials.
         conn = psycopg.connect(
-            _postgres_dsn_from_args(args),
+            _postgres_dsn_from_args(args, require_explicit=True),
             connect_timeout=args.pg_connect_timeout,
         )
         conn.autocommit = False
+        try:
+            _assert_target_database(conn, args.target_db_name)
+        except Exception:
+            conn.close()
+            raise
+
+    # Day-existence checks need a DB. For dry-run without explicit DB config,
+    # skip the check (empty existing_days) rather than fail-open to aawm_dev.
+    # --rescan-existing-days intentionally ignores prior source_import days so
+    # partial-day crashes and parser fixes can complete via DO UPDATE merge.
+    existing_days: dict[str, set[date]] = {}
+    if args.rescan_existing_days:
+        print(
+            "existing_days_check_skipped: --rescan-existing-days "
+            "(reprocessing days; apply merges on litellm_call_id)"
+        )
+    else:
+        try:
+            existing_days = _fetch_existing_days(
+                args,
+                args.day_timezone,
+                storage_client_names,
+                source_import=IMPORT_MARKER,
+            )
+        except Exception as exc:
+            # Dry-run stays read-only and non-fatal when DB config/connection is
+            # missing or unavailable; --apply must still fail closed.
+            if args.apply:
+                raise
+            print(f"existing_days_check_skipped: {exc}")
 
     try:
+        last_commit_key: Optional[tuple[str, date]] = None
         for record in _iter_records(root, args.clients, stats):
             client = str(record.get("client_name") or "unknown")
             stats.records_seen[client] += 1
@@ -2007,13 +2446,29 @@ def main(argv: Optional[list[str]] = None) -> int:
             if to_date and day > to_date:
                 continue
             # Only skip days that already have rows for THIS client/source.
-            if day in existing_days.get(client, set()):
+            if (not args.rescan_existing_days) and day in existing_days.get(
+                client, set()
+            ):
                 stats.records_skipped_existing_day[client] += 1
                 continue
             stats.records_after_day_filter[client] += 1
             summary.add(record, day)
             if args.apply and conn is not None:
+                commit_key = (client, day)
+                # Flush at client/day boundaries so a crash mid-run leaves only
+                # the current day incomplete rather than mixing many days in one
+                # uncommitted batch. Partial-day recovery uses DO UPDATE merge
+                # plus --rescan-existing-days for the affected date range.
+                if (
+                    batch
+                    and last_commit_key is not None
+                    and commit_key != last_commit_key
+                ):
+                    _apply_batch(conn, batch)
+                    conn.commit()
+                    batch.clear()
                 batch.append(record)
+                last_commit_key = commit_key
                 if len(batch) >= args.batch_size:
                     _apply_batch(conn, batch)
                     conn.commit()

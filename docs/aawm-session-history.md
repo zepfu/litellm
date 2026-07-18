@@ -466,6 +466,63 @@ Console summary includes `database`, `target_db_name`, `projects_dir`,
 `memories_dir`, `session_evidence_limit_per_session`, `candidate_rows`,
 `repairable_rows`, `classified_unresolved_rows`, and `applied`.
 
+## Local CLI Transcript Backfill
+
+`scripts/backfill_local_cli_session_history.py` imports historical Claude,
+Codex, Gemini, and Grok CLI transcripts into `public.session_history` and
+`session_history_tool_activity`.
+
+Operator contract:
+
+- Default mode is dry-run (scan + summary only). Pass `--apply` only after
+  reviewing the candidate summary.
+- Day-skip is scoped to `(client_name, metadata.source_import)` for this
+  importer (`local_cli_history_2026_05_19`), not to global calendar days across
+  all providers. Live proxy rows for another client therefore do not block a
+  local CLI client for the same day.
+- Apply flushes are bounded by `--batch-size` (default 1000) and also commit at
+  `(client_name, day)` boundaries so a crash mid-run does not leave many days
+  half-written in one uncommitted multi-day batch.
+- A partial-day crash still leaves that day present in the skip set. Re-run with
+  `--rescan-existing-days` (optionally plus `--from-date` / `--to-date`) after a
+  mid-day interruption or parser fix. Apply uses `ON CONFLICT (litellm_call_id)
+  DO UPDATE` merge semantics so rescan repairs incomplete rows instead of
+  freezing first-insert values.
+- Persisted metadata stores `source_path_hash` / `source_path_basename` only
+  (not absolute home paths). Tool arguments are redacted/truncated.
+- Grok `chat_history.jsonl` lines usually lack per-message wall-clock times;
+  rows use a session-summary anchor plus line offset and set
+  `metadata.timestamp_precision=approximate_session_day`. Dry-run output reports
+  `approximate_timestamp_records` and redacted samples include
+  `timestamp_precision` / `timestamp_source` so operators do not treat those day
+  buckets as exact wall-clock times.
+- `--apply` and the existing-day probe refuse to connect without explicit DB
+  config (`AAWM_DIRECT_DATABASE_URL` or `--pg-dsn` / `AAWM_DB_*` / `--pg-*`) and
+  refuse to continue unless `current_database()` equals `--target-db-name`
+  (default `aawm_tristore`).
+
+```bash
+# Dry-run against local CLI state under $HOME
+./.venv/bin/python scripts/backfill_local_cli_session_history.py \
+  --clients claude,codex,gemini,grok
+
+# Apply for one client after reviewing dry-run output
+./.venv/bin/python scripts/backfill_local_cli_session_history.py \
+  --clients codex \
+  --target-db-name aawm_tristore \
+  --batch-size 1000 \
+  --apply
+
+# Complete a partial day / re-merge after a parser fix
+./.venv/bin/python scripts/backfill_local_cli_session_history.py \
+  --clients codex \
+  --from-date 2026-03-01 \
+  --to-date 2026-03-01 \
+  --rescan-existing-days \
+  --target-db-name aawm_tristore \
+  --apply
+```
+
 ## Rate Limit And Billing Observations
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing
