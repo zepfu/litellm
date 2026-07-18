@@ -70,6 +70,26 @@ UNRELATED_RUNTIME_LOG_ERROR_SIGNATURES = [
     'deepseek/deepseek-v4-flash:free',
     'reset reason: connection timeout',
 ]
+# Bound docker CLI calls so an unresponsive daemon/logs cannot hang the suite.
+DEFAULT_DOCKER_SUBPROCESS_TIMEOUT_SECONDS = 30
+# Tight window for positive "unrelated concurrent traffic" evidence around a match.
+UNRELATED_RUNTIME_LOG_LOCAL_CONTEXT_CHARS = 800
+# Failures that may be soft-failed when provider-unavailable log evidence is present.
+PROVIDER_UNAVAILABLE_SOFT_FAILABLE_FAILURE_MARKERS = (
+    'command failed',
+    'timed out after',
+    'TimeoutExpired',
+    'runtime healthcheck failed',
+    'runtime container `',
+    'provider unavailable',
+    'provider-unavailable',
+    'connection refused',
+    'ConnectError',
+    'APIConnectionError',
+    'APITimeoutError',
+    'ReadTimeout',
+    'ConnectTimeout',
+)
 RUNTIME_LOG_MODEL_FIELD_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
 _VALIDATION_DB_CONNECTIONS: dict[tuple[str, int, str, str, str], Any] = {}
 
@@ -96,6 +116,20 @@ def _load_run_acceptance_module() -> Any:
 
 
 RA = _load_run_acceptance_module()
+
+
+def _emit_stdout(message: str, *, flush: bool = False) -> None:
+    """Write operator-facing stdout (avoids Ruff T201 print ban)."""
+    sys.stdout.write(message if message.endswith('\n') else f'{message}\n')
+    if flush:
+        sys.stdout.flush()
+
+
+def _emit_stderr(message: str, *, flush: bool = False) -> None:
+    """Write operator-facing stderr (avoids Ruff T201 print ban)."""
+    sys.stderr.write(message if message.endswith('\n') else f'{message}\n')
+    if flush:
+        sys.stderr.flush()
 
 
 def _extract_path_value(value: Any, path: str) -> Any | None:
@@ -225,13 +259,17 @@ def _append_claude_agents_arg(command: list[Any], agents: Any) -> list[Any]:
 
 
 def _docker_status_for_container(container_name: str) -> str:
-    result = subprocess.run(
-        ['docker', 'ps', '--filter', f'name=^{container_name}$', '--format', '{{.Status}}'],
-        cwd=str(ROOT),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ['docker', 'ps', '--filter', f'name=^{container_name}$', '--format', '{{.Status}}'],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=DEFAULT_DOCKER_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return ''
     if result.returncode != 0:
         return ''
     return result.stdout.strip()
@@ -1425,14 +1463,18 @@ def _validate_runtime_postcondition(*, family: str, litellm_base_url: str, check
         failures.append(f'{family} runtime healthcheck failed: {exc}')
 
     if container_name:
-        result = subprocess.run(
-            ['docker', 'ps', '-a', '--filter', f'name=^{container_name}$', '--format', '{{.Status}}'],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        docker_status = result.stdout.strip() if result.returncode == 0 else ''
+        try:
+            result = subprocess.run(
+                ['docker', 'ps', '-a', '--filter', f'name=^{container_name}$', '--format', '{{.Status}}'],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=DEFAULT_DOCKER_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+            docker_status = result.stdout.strip() if result.returncode == 0 else ''
+        except subprocess.TimeoutExpired:
+            docker_status = ''
         summary['docker_status'] = docker_status
         if not docker_status:
             failures.append(f'{family} runtime container `{container_name}` not found')
@@ -1474,17 +1516,25 @@ def _read_runtime_logs_since(
     if until_value:
         command.extend(['--until', until_value])
     command.extend(['--tail', str(tail_lines), container_name])
-    result = subprocess.run(
-        command,
-        cwd=str(ROOT),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    log_text = '\n'.join(
-        value for value in (result.stdout, result.stderr) if isinstance(value, str) and value
-    )
-    summary['docker_logs_exit_code'] = result.returncode
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=DEFAULT_DOCKER_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        log_text = '\n'.join(
+            value for value in (result.stdout, result.stderr) if isinstance(value, str) and value
+        )
+        summary['docker_logs_exit_code'] = result.returncode
+    except subprocess.TimeoutExpired:
+        log_text = ''
+        summary['docker_logs_exit_code'] = 124
+        summary['docker_logs_error'] = (
+            f'docker logs timed out after {DEFAULT_DOCKER_SUBPROCESS_TIMEOUT_SECONDS}s'
+        )
     summary['docker_logs_since'] = since_value
     summary['docker_logs_until'] = until_value
     summary['log_excerpt'] = log_text[-4000:] if log_text else ''
@@ -1552,32 +1602,78 @@ def _runtime_log_attribution_substrings(
     return sorted(values)
 
 
+def _local_runtime_log_match_window(
+    context: str,
+    substring: str,
+    *,
+    radius: int = UNRELATED_RUNTIME_LOG_LOCAL_CONTEXT_CHARS,
+) -> str:
+    """Return a tight window around the first occurrence of substring in context."""
+    if not context or not substring:
+        return context
+    match_index = context.find(substring)
+    if match_index < 0:
+        return context
+    start_index = max(0, match_index - radius)
+    end_index = min(len(context), match_index + len(substring) + radius)
+    return context[start_index:end_index]
+
+
+def _foreign_models_in_runtime_log_context(
+    context: str,
+    attribution_substrings: list[str],
+) -> list[str]:
+    foreign: list[str] = []
+    for model in RUNTIME_LOG_MODEL_FIELD_RE.findall(context):
+        if not model:
+            continue
+        if any(model in value for value in attribution_substrings):
+            continue
+        foreign.append(model)
+    return foreign
+
+
 def _is_unrelated_runtime_log_match(
     *,
     substring: str,
     context: str,
     attribution_substrings: list[str],
 ) -> bool:
+    """Ignore a forbidden match only with positive foreign-traffic evidence.
+
+    Absence of attribution alone is never enough. An unrelated provider
+    signature must appear near the match. Upstream 429/5xx signatures
+    additionally require a foreign model field near the match so interleaved
+    concurrent logs cannot silently mask a genuine regression.
+    """
     if substring not in ATTRIBUTION_SCOPED_RUNTIME_LOG_SUBSTRINGS:
         return False
     if not context or not attribution_substrings:
         return False
     if any(value in context for value in attribution_substrings):
         return False
-    if not any(signature in context for signature in UNRELATED_RUNTIME_LOG_ERROR_SIGNATURES):
-        return False
-    if any(
-        marker in context for marker in UNRELATED_AUTO_AGENT_RUNTIME_LOG_CONTEXT_MARKERS
-    ):
-        return True
+    local_context = _local_runtime_log_match_window(context, substring)
     if not any(
-        marker in context for marker in UNRELATED_PASSTHROUGH_RUNTIME_LOG_CONTEXT_MARKERS
+        signature in local_context for signature in UNRELATED_RUNTIME_LOG_ERROR_SIGNATURES
     ):
         return False
-    return any(
-        model and all(model not in value for value in attribution_substrings)
-        for model in RUNTIME_LOG_MODEL_FIELD_RE.findall(context)
+    has_auto_agent = any(
+        marker in context for marker in UNRELATED_AUTO_AGENT_RUNTIME_LOG_CONTEXT_MARKERS
     )
+    has_passthrough = any(
+        marker in context for marker in UNRELATED_PASSTHROUGH_RUNTIME_LOG_CONTEXT_MARKERS
+    )
+    foreign_models_local = _foreign_models_in_runtime_log_context(
+        local_context,
+        attribution_substrings,
+    )
+    if substring in DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS:
+        return bool(foreign_models_local) and (has_passthrough or has_auto_agent)
+    if has_auto_agent:
+        return True
+    if not has_passthrough:
+        return False
+    return bool(foreign_models_local)
 
 
 def _validate_runtime_logs(
@@ -2647,9 +2743,10 @@ def _claude_projects_root(checks: dict[str, Any]) -> pathlib.Path:
         or checks.get('projects_root')
         or os.environ.get('CLAUDE_PROJECTS_ROOT')
         or os.environ.get('CLAUDE_PROJECTS_DIR')
-        or '/home/zepfu/.claude/projects'
     )
-    return pathlib.Path(str(configured)).expanduser()
+    if configured:
+        return pathlib.Path(str(configured)).expanduser()
+    return pathlib.Path.home() / '.claude' / 'projects'
 
 
 def _iter_claude_jsonl(path: pathlib.Path) -> list[tuple[int, dict[str, Any]]]:
@@ -4528,6 +4625,9 @@ def _declared_candidates_for_case(case_config: dict[str, Any]) -> list[dict[str,
 
 def _verification_status_for_case(result: dict[str, Any]) -> str:
     if result.get('skipped') is True:
+        # fail_on_skip records skipped=True with failures; treat that as failed.
+        if result.get('failures') or result.get('passed') is False:
+            return 'failed'
         return 'skipped'
     if not result.get('passed'):
         return 'failed'
@@ -4641,15 +4741,21 @@ def _build_case_verification_matrix_row(
 def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
+    skipped_cases: list[str] = []
     for family, result in results.items():
+        if result.get('skipped') is True:
+            skipped_cases.append(family)
         for failure in result.get('failures', []):
             failures.append(f'{family}: {failure}')
         for warning in result.get('warnings', []):
             warnings.append(f'{family}: {warning}')
+    skipped_cases = sorted(skipped_cases)
     return {
         'passed': not failures,
         'failures': failures,
         'warnings': warnings,
+        'skipped_count': len(skipped_cases),
+        'skipped_cases': skipped_cases,
         'prompt_overhead_cost_share': _build_prompt_overhead_cost_share_report(
             results
         ),
@@ -4735,6 +4841,18 @@ def _provider_unavailable_timeout_error_result(
     }
 
 
+def _is_provider_unavailable_soft_failable_failure(failure: str) -> bool:
+    """Only connectivity/timeout-class failures may be provider-unavailable soft-fails."""
+    if not isinstance(failure, str) or not failure:
+        return False
+    if 'runtime logs contained forbidden substring' in failure:
+        return False
+    return any(
+        marker in failure
+        for marker in PROVIDER_UNAVAILABLE_SOFT_FAILABLE_FAILURE_MARKERS
+    )
+
+
 def _provider_unavailable_failure_soft_fail_result(
     *,
     failures: list[str],
@@ -4771,11 +4889,25 @@ def _provider_unavailable_failure_soft_fail_result(
     if len(matched_substrings) != len(required_substrings):
         return failures, [], warnings, runtime_logs
 
-    soft_failures = list(failures)
+    soft_failures = [
+        failure
+        for failure in failures
+        if _is_provider_unavailable_soft_failable_failure(failure)
+    ]
+    if not soft_failures:
+        return failures, [], warnings, runtime_logs
+    remaining_failures = [
+        failure for failure in failures if failure not in soft_failures
+    ]
     soft_warnings = [
         f'provider-unavailable soft-fail: {failure}' for failure in soft_failures
     ]
-    return [], soft_failures, sorted(set([*warnings, *soft_warnings])), runtime_logs
+    return (
+        remaining_failures,
+        soft_failures,
+        sorted(set([*warnings, *soft_warnings])),
+        runtime_logs,
+    )
 
 
 def _write_artifact(path: pathlib.Path, artifact: dict[str, Any]) -> None:
@@ -4819,6 +4951,176 @@ def _parse_selected_cases(
     return requested
 
 
+def _missing_env_case_result(
+    *,
+    case_config: dict[str, Any],
+    suite_config: dict[str, Any],
+    missing_required_env: list[str],
+) -> dict[str, Any]:
+    missing_env_message = (
+        f'missing required env: {", ".join(sorted(missing_required_env))}'
+    )
+    fail_on_skip = bool(
+        case_config.get('fail_on_skip')
+        if case_config.get('fail_on_skip') is not None
+        else suite_config.get('fail_on_skip')
+    )
+    if fail_on_skip:
+        return {
+            'passed': False,
+            'skipped': True,
+            'failures': [missing_env_message],
+            'soft_failures': [],
+            'warnings': [],
+            'skip_reason': missing_env_message,
+        }
+    return {
+        'passed': True,
+        'skipped': True,
+        'failures': [],
+        'soft_failures': [],
+        'warnings': [missing_env_message],
+        'skip_reason': missing_env_message,
+    }
+
+
+def _record_case_artifact_result(
+    *,
+    artifact: dict[str, Any],
+    artifact_path: pathlib.Path,
+    case_name: str,
+    case_config: dict[str, Any],
+    case_result: dict[str, Any],
+    selected_case_order: int,
+) -> None:
+    artifact['results'][case_name] = case_result
+    artifact['summary'] = _build_summary(artifact['results'])
+    verification_alias = str(case_config.get('verification_alias') or case_name)
+    matrix_candidate_order = int(
+        case_config.get('verification_candidate_order', selected_case_order)
+    )
+    artifact['verification_matrix'] = [
+        row
+        for row in artifact['verification_matrix']
+        if row.get('case_name') != case_name
+    ] + [
+        _build_case_verification_matrix_row(
+            alias=verification_alias,
+            case_name=case_name,
+            candidate_order=matrix_candidate_order,
+            case_config=case_config,
+            case_result=case_result,
+        )
+    ]
+    _write_artifact(artifact_path, artifact)
+    _emit_stderr(
+        f"[done] {case_name} passed={case_result.get('passed')} "
+        f"skipped={case_result.get('skipped', False)} "
+        f"failures={len(case_result.get('failures', []))} "
+        f"warnings={len(case_result.get('warnings', []))}",
+        flush=True,
+    )
+
+
+def _resolve_main_credentials(
+    *,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[str, str, str, str, str] | int:
+    public_key_env = config.get('langfuse_public_key_env', 'LANGFUSE_PUBLIC_KEY')
+    secret_key_env = config.get('langfuse_secret_key_env', 'LANGFUSE_SECRET_KEY')
+    public_key = os.environ.get(public_key_env, '')
+    secret_key = os.environ.get(secret_key_env, '')
+    query_url = (
+        args.langfuse_query_url
+        or os.environ.get('LANGFUSE_QUERY_URL')
+        or config.get('langfuse_query_url', 'http://127.0.0.1:3000')
+    )
+    if not public_key or not secret_key:
+        _emit_stderr(
+            f'Missing Langfuse credentials in env vars {public_key_env}/{secret_key_env}'
+        )
+        return 2
+    return public_key, secret_key, query_url, public_key_env, secret_key_env
+
+
+def _build_initial_artifact(
+    *,
+    config: dict[str, Any],
+    profile: dict[str, str],
+    target: str,
+    litellm_base_url: str,
+    query_url: str,
+    public_key_env: str,
+    secret_key_env: str,
+) -> dict[str, Any]:
+    artifact: dict[str, Any] = {
+        'suite_version': config.get('suite_version', 1),
+        'timestamp': RA._isoformat(RA._utcnow()),
+        'git_commit': RA._git_value('rev-parse', 'HEAD'),
+        'git_branch': RA._git_value('branch', '--show-current'),
+        'environment': {
+            'target_profile': target,
+            'litellm_base_url': litellm_base_url,
+            'anthropic_base_url': profile['anthropic_base_url'],
+            'langfuse_query_url': query_url,
+            'langfuse_public_key_env': public_key_env,
+            'langfuse_secret_key_env': secret_key_env,
+            'expected_trace_environment': profile['expected_trace_environment'],
+            'docker_container_name': profile['docker_container_name'],
+            'docker_container_status': _docker_status_for_container(
+                profile['docker_container_name']
+            ),
+        },
+        'results': {},
+        'verification_matrix': [],
+        'summary': {},
+    }
+    artifact['summary'] = _build_summary(artifact['results'])
+    return artifact
+
+
+def _run_selected_case(
+    *,
+    case_name: str,
+    case_config: dict[str, Any],
+    suite_config: dict[str, Any],
+    query_url: str,
+    public_key: str,
+    secret_key: str,
+    litellm_base_url: str,
+) -> dict[str, Any]:
+    case_started = RA._utcnow()
+    missing_required_env = _missing_required_env(case_config)
+    if missing_required_env:
+        return _missing_env_case_result(
+            case_config=case_config,
+            suite_config=suite_config,
+            missing_required_env=missing_required_env,
+        )
+    try:
+        return _validate_case(
+            case_name,
+            case_config,
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            litellm_base_url=litellm_base_url,
+        )
+    except Exception as exc:
+        provider_unavailable_timeout = _provider_unavailable_timeout_error_result(
+            case_name,
+            exc,
+            case_config,
+            started=case_started,
+        )
+        if provider_unavailable_timeout is not None:
+            return provider_unavailable_timeout
+        if bool(case_config.get('warning_only')):
+            return _warning_only_error_result(case_name, exc, case_config)
+        return RA._family_error_result(case_name, exc)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Run real-Claude Anthropic adapter acceptance checks through a target LiteLLM instance.')
     parser.add_argument('--config', default=str(DEFAULT_CONFIG), help='Path to adapter suite config JSON.')
@@ -4856,15 +5158,10 @@ def main() -> int:
         profile=profile,
     )
 
-    public_key_env = config.get('langfuse_public_key_env', 'LANGFUSE_PUBLIC_KEY')
-    secret_key_env = config.get('langfuse_secret_key_env', 'LANGFUSE_SECRET_KEY')
-    public_key = os.environ.get(public_key_env, '')
-    secret_key = os.environ.get(secret_key_env, '')
-    query_url = args.langfuse_query_url or os.environ.get('LANGFUSE_QUERY_URL') or config.get('langfuse_query_url', 'http://127.0.0.1:3000')
-
-    if not public_key or not secret_key:
-        print(f'Missing Langfuse credentials in env vars {public_key_env}/{secret_key_env}', file=sys.stderr)
-        return 2
+    credentials = _resolve_main_credentials(config=config, args=args)
+    if isinstance(credentials, int):
+        return credentials
+    public_key, secret_key, query_url, public_key_env, secret_key_env = credentials
 
     cases = config.get('cases') or {}
     available_cases = list(cases.keys())
@@ -4875,113 +5172,47 @@ def main() -> int:
     )
 
     litellm_base_url = config.get('litellm_base_url', profile['litellm_base_url'])
-
-    artifact: dict[str, Any] = {
-        'suite_version': config.get('suite_version', 1),
-        'timestamp': RA._isoformat(RA._utcnow()),
-        'git_commit': RA._git_value('rev-parse', 'HEAD'),
-        'git_branch': RA._git_value('branch', '--show-current'),
-        'environment': {
-            'target_profile': target,
-            'litellm_base_url': litellm_base_url,
-            'anthropic_base_url': profile['anthropic_base_url'],
-            'langfuse_query_url': query_url,
-            'langfuse_public_key_env': public_key_env,
-            'langfuse_secret_key_env': secret_key_env,
-            'expected_trace_environment': profile['expected_trace_environment'],
-            'docker_container_name': profile['docker_container_name'],
-            'docker_container_status': _docker_status_for_container(
-                profile['docker_container_name']
-            ),
-        },
-        'results': {},
-        'verification_matrix': [],
-        'summary': {},
-    }
-    artifact['summary'] = _build_summary(artifact['results'])
+    artifact = _build_initial_artifact(
+        config=config,
+        profile=profile,
+        target=target,
+        litellm_base_url=litellm_base_url,
+        query_url=query_url,
+        public_key_env=public_key_env,
+        secret_key_env=secret_key_env,
+    )
     _write_artifact(artifact_path, artifact)
 
     for selected_case_order, case_name in enumerate(selected_cases):
-        print(f'[start] {case_name}', file=sys.stderr, flush=True)
-        case_started = RA._utcnow()
-        try:
-            missing_required_env = _missing_required_env(cases[case_name])
-            if missing_required_env:
-                artifact['results'][case_name] = {
-                    'passed': True,
-                    'skipped': True,
-                    'failures': [],
-                    'soft_failures': [],
-                    'warnings': [
-                        f'missing required env: {", ".join(sorted(missing_required_env))}'
-                    ],
-                }
-                continue
-            artifact['results'][case_name] = _validate_case(
-                case_name,
-                cases[case_name],
-                query_url=query_url,
-                public_key=public_key,
-                secret_key=secret_key,
-                litellm_base_url=litellm_base_url,
-            )
-        except Exception as exc:
-            provider_unavailable_timeout = _provider_unavailable_timeout_error_result(
-                case_name,
-                exc,
-                cases[case_name],
-                started=case_started,
-            )
-            if provider_unavailable_timeout is not None:
-                artifact['results'][case_name] = provider_unavailable_timeout
-            elif bool(cases[case_name].get('warning_only')):
-                artifact['results'][case_name] = _warning_only_error_result(
-                    case_name,
-                    exc,
-                    cases[case_name],
-                )
-            else:
-                artifact['results'][case_name] = RA._family_error_result(
-                    case_name, exc
-                )
-        finally:
-            artifact['summary'] = _build_summary(artifact['results'])
-            case_result = artifact['results'].get(case_name, {})
-            verification_alias = str(
-                cases[case_name].get('verification_alias') or case_name
-            )
-            matrix_candidate_order = int(
-                cases[case_name].get(
-                    'verification_candidate_order',
-                    selected_case_order,
-                )
-            )
-            artifact['verification_matrix'] = [
-                row
-                for row in artifact['verification_matrix']
-                if row.get('case_name') != case_name
-            ] + [
-                _build_case_verification_matrix_row(
-                    alias=verification_alias,
-                    case_name=case_name,
-                    candidate_order=matrix_candidate_order,
-                    case_config=cases[case_name],
-                    case_result=case_result,
-                )
-            ]
-            _write_artifact(artifact_path, artifact)
-            print(
-                f"[done] {case_name} passed={case_result.get('passed')} "
-                f"skipped={case_result.get('skipped', False)} "
-                f"failures={len(case_result.get('failures', []))} "
-                f"warnings={len(case_result.get('warnings', []))}",
-                file=sys.stderr,
-                flush=True,
-            )
+        _emit_stderr(f'[start] {case_name}', flush=True)
+        case_result = _run_selected_case(
+            case_name=case_name,
+            case_config=cases[case_name],
+            suite_config=config,
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            litellm_base_url=litellm_base_url,
+        )
+        _record_case_artifact_result(
+            artifact=artifact,
+            artifact_path=artifact_path,
+            case_name=case_name,
+            case_config=cases[case_name],
+            case_result=case_result,
+            selected_case_order=selected_case_order,
+        )
 
     artifact['summary'] = _build_summary(artifact['results'])
     _write_artifact(artifact_path, artifact)
-    print(json.dumps(artifact['summary'], indent=2))
+    _emit_stdout(json.dumps(artifact['summary'], indent=2))
+    skipped_count = int(artifact['summary'].get('skipped_count') or 0)
+    if skipped_count:
+        skipped_cases = artifact['summary'].get('skipped_cases') or []
+        _emit_stderr(
+            f"[summary] skipped_cases={skipped_count}: {', '.join(skipped_cases)}",
+            flush=True,
+        )
     return 0 if artifact['summary']['passed'] else 1
 
 

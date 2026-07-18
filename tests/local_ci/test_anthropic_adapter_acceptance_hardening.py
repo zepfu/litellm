@@ -765,9 +765,12 @@ def test_provider_unavailable_command_failure_can_soft_fail_with_exact_log_signa
         )
     )
 
-    assert failures == []
+    # RR-082: only connectivity/timeout-class failures soft-fail; unrelated
+    # validation failures (e.g. missing Langfuse traces) stay hard.
     assert soft_failures == [
         "claude_adapter_gpt_oss_120b command failed",
+    ]
+    assert failures == [
         "missing claude_adapter_gpt_oss_120b trace name: claude-code.orchestrator",
     ]
     assert warnings
