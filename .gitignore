@@ -116,6 +116,8 @@ captures/
 cache/
 .agent/
 .analysis/
+.pytest-classifier/
+.testable-artifacts/
 .scenario.md
 .aawm-scripts/
 .claude/
