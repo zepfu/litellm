@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import asyncpg
@@ -131,7 +132,10 @@ def _normalize_clickhouse_url(value: Optional[str]) -> str:
     hostname = (parsed.hostname or "127.0.0.1").replace("clickhouse", "127.0.0.1")
     port = f":{parsed.port}" if parsed.port else ""
     netloc = f"{hostname}{port}"
-    return urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
 
 def _redact_clickhouse_url_userinfo(url: Optional[str]) -> Optional[str]:
     if url is None:
@@ -148,7 +152,9 @@ def _redact_clickhouse_url_userinfo(url: Optional[str]) -> Optional[str]:
             userinfo = f"{userinfo}:***"
         userinfo = f"{userinfo}@"
     redacted_netloc = f"{userinfo}{hostname}{port}"
-    return urlunsplit((parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 def _build_clickhouse_auth_diagnostics(auth: Dict[str, Any]) -> Dict[str, Any]:
@@ -161,7 +167,8 @@ def _build_clickhouse_auth_diagnostics(auth: Dict[str, Any]) -> Dict[str, Any]:
         "url_source": auth["url_source"],
         "user_source": auth["user_source"],
         "password_source": auth["password_source"],
-        "using_builtin_local_url_default": auth["url_source"] == "default:local_http_8123",
+        "using_builtin_local_url_default": auth["url_source"]
+        == "default:local_http_8123",
         "using_builtin_clickhouse_credentials": (
             auth["user_source"] == "default:clickhouse_builtin"
             and auth["password_source"] == "default:clickhouse_builtin"
@@ -169,14 +176,50 @@ def _build_clickhouse_auth_diagnostics(auth: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _parse_optional_datetime(value: Any) -> Optional[datetime]:
+    """Parse operator / source timestamps into timezone-aware UTC datetimes.
 
-def _parse_optional_datetime(value: Optional[str]) -> Optional[datetime]:
+    Accepts ``datetime`` instances, ISO-8601 strings (``T`` or space separator),
+    and ``Z`` suffixes. Empty or unparseable values return ``None`` so batch
+    cursors never crash on a null ClickHouse timestamp.
+    """
     if value is None:
         return None
-    normalized = value.strip().replace("Z", "+00:00")
-    if not normalized:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if not isinstance(value, str):
+        value = str(value)
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {"none", "null"}:
         return None
-    return datetime.fromisoformat(normalized)
+    normalized = normalized.replace("Z", "+00:00")
+    # ClickHouse JSONEachRow commonly emits "YYYY-MM-DD HH:MM:SS[.fff]".
+    if "T" not in normalized and " " in normalized:
+        date_part, time_part = normalized.split(" ", 1)
+        if len(date_part) == 10 and date_part[4] == "-" and date_part[7] == "-":
+            normalized = f"{date_part}T{time_part}"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _signature_numeric(value: Any) -> Optional[float]:
+    """Normalize numeric signature fields so float/int/Decimal compare equal."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return number
 
 
 def _parse_json_value(value: Any) -> Any:
@@ -196,9 +239,17 @@ def _parse_json_value(value: Any) -> Any:
 
 
 def _parse_clickhouse_map(raw_map: Any) -> Dict[str, Any]:
-    if not isinstance(raw_map, dict):
+    """Normalize ClickHouse / event metadata into a fresh mutable dict.
+
+    Always returns a new mapping so callers can tag backfill provenance without
+    mutating the source event body or shared nested objects.
+    """
+    parsed = _parse_json_value(raw_map)
+    if not isinstance(parsed, dict):
         return {}
-    return {str(key): _parse_json_value(value) for key, value in raw_map.items()}
+    # Shallow-copy values after JSON parse so top-level tags never write back
+    # into the raw source map (and nested JSON strings still expand once).
+    return {str(key): _parse_json_value(value) for key, value in parsed.items()}
 
 
 def _quote_clickhouse_string(value: str) -> str:
@@ -212,7 +263,9 @@ def _format_clickhouse_datetime(value: datetime) -> str:
 
 
 class ClickHouseClient:
-    def __init__(self, *, url: str, user: str, password: str, timeout_seconds: int) -> None:
+    def __init__(
+        self, *, url: str, user: str, password: str, timeout_seconds: int
+    ) -> None:
         self.url = url
         self.timeout_seconds = timeout_seconds
         self._auth_header = "Basic " + base64.b64encode(
@@ -314,7 +367,11 @@ class ClickHouseClient:
                 f" AND o.id < {_quote_clickhouse_string(cursor_id)}))"
             )
 
-        input_select = "o.input AS observation_input," if include_input else "NULL AS observation_input,"
+        input_select = (
+            "o.input AS observation_input,"
+            if include_input
+            else "NULL AS observation_input,"
+        )
         query = f"""
             SELECT
                 o.id AS observation_id,
@@ -345,7 +402,10 @@ class ClickHouseClient:
         to_created_at: Optional[str],
         entity_type: str,
     ) -> List[Dict[str, Any]]:
-        predicates = ["is_deleted = 0", f"entity_type = {_quote_clickhouse_string(entity_type)}"]
+        predicates = [
+            "is_deleted = 0",
+            f"entity_type = {_quote_clickhouse_string(entity_type)}",
+        ]
         from_dt = _parse_optional_datetime(from_created_at)
         to_dt = _parse_optional_datetime(to_created_at)
         if from_dt is not None:
@@ -422,7 +482,11 @@ class MinioEventBlobClient:
 def _infer_provider(model: Optional[str], metadata: Dict[str, Any]) -> Optional[str]:
     explicit = metadata.get("custom_llm_provider") or metadata.get("provider")
     if isinstance(explicit, str) and explicit.strip():
-        return "gemini" if explicit.strip().lower() == "google" else explicit.strip().lower()
+        return (
+            "gemini"
+            if explicit.strip().lower() == "google"
+            else explicit.strip().lower()
+        )
     text = " ".join(
         str(value)
         for value in (
@@ -509,7 +573,9 @@ def _build_record_from_langfuse_body(
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(body, dict):
         return None
-    metadata = _parse_clickhouse_map(body.get("metadata"))
+    # Work on a private metadata copy so rate_limit_backfill_* tags never mutate
+    # the caller's event/body metadata (safe metadata updates).
+    metadata = dict(_parse_clickhouse_map(body.get("metadata")))
     if body.get("environment") is not None:
         metadata.setdefault("litellm_environment", body.get("environment"))
     if body.get("name") is not None:
@@ -517,6 +583,8 @@ def _build_record_from_langfuse_body(
     if source_locator:
         metadata["rate_limit_backfill_locator"] = source_locator
     metadata["rate_limit_backfill_source"] = backfill_source
+    # Isolate kwargs-facing metadata from any further mutation by extractors.
+    kwargs_metadata = dict(metadata)
 
     model = body.get("model") or metadata.get("model") or "unknown"
     result_payload = _coerce_result_payload(
@@ -530,14 +598,14 @@ def _build_record_from_langfuse_body(
         "litellm_session_id": metadata.get("session_id"),
         "litellm_trace_id": body.get("traceId") or metadata.get("trace_id"),
         "standard_logging_object": {
-            "metadata": metadata,
+            "metadata": kwargs_metadata,
             "response": result_payload,
             "output": result_payload,
             "trace_id": body.get("traceId"),
             "session_id": metadata.get("session_id"),
         },
         "litellm_params": {
-            "metadata": metadata,
+            "metadata": kwargs_metadata,
             "litellm_session_id": metadata.get("session_id"),
             "litellm_trace_id": body.get("traceId") or metadata.get("trace_id"),
         },
@@ -573,7 +641,9 @@ def _build_record_from_langfuse_body(
     }
 
 
-def _build_body_from_clickhouse_row(row: Dict[str, Any], *, include_input: bool) -> Dict[str, Any]:
+def _build_body_from_clickhouse_row(
+    row: Dict[str, Any], *, include_input: bool
+) -> Dict[str, Any]:
     metadata = _parse_clickhouse_map(row.get("observation_metadata"))
     if row.get("observation_environment") is not None:
         metadata.setdefault("litellm_environment", row.get("observation_environment"))
@@ -647,16 +717,24 @@ def build_record_from_langfuse_event(
 def _signature_datetime_millis(value: Any) -> Optional[str]:
     """Normalize datetimes for signature equality.
 
-    None stays None so missing timestamps compare equal across builder paths.
-    Non-datetime values fall back to str() for defensive compatibility.
+    Naive datetimes are treated as UTC so write-path aware stamps match
+    asyncpg rows that may return naive or aware TIMESTAMPTZ values. None stays
+    None so missing timestamps compare equal across builder paths. Other
+    values are parsed when possible, otherwise fall back to str().
     """
     if value is None:
         return None
     if isinstance(value, datetime):
-        if value.tzinfo is not None:
-            value = value.astimezone(timezone.utc)
-        return value.isoformat(timespec="milliseconds")
-    return str(value)
+        parsed = value
+    else:
+        parsed = _parse_optional_datetime(value)
+        if parsed is None:
+            return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat(timespec="milliseconds")
 
 
 def _canonical_observation_signature(
@@ -687,10 +765,10 @@ def _canonical_observation_signature(
         quota_key,
         _signature_datetime_millis(observed_at),
         _signature_datetime_millis(provider_resets_at),
-        remaining_pct,
-        quota_limit,
-        quota_used,
-        quota_remaining,
+        _signature_numeric(remaining_pct),
+        _signature_numeric(quota_limit),
+        _signature_numeric(quota_used),
+        _signature_numeric(quota_remaining),
         _signature_datetime_millis(billing_period_start_at),
         _signature_datetime_millis(billing_period_end_at),
         trace_id,
@@ -743,7 +821,17 @@ def _observation_signature_from_db_row(row: Dict[str, Any]) -> Tuple[Any, ...]:
     )
 
 
-async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def _filter_existing_observations(
+    records: List[Dict[str, Any]],
+    *,
+    conn: Any = None,
+) -> List[Dict[str, Any]]:
+    """Drop observations already present in public.rate_limit_observations.
+
+    Prefer a long-lived ``conn`` opened once for the whole run (RR-069 #2).
+    When ``conn`` is omitted, fall back to a one-shot connect for tests/callers
+    that have not threaded a shared connection.
+    """
     call_ids = sorted(
         {
             str(observation.get("litellm_call_id"))
@@ -762,12 +850,16 @@ async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[D
     )
     if not call_ids and not trace_ids:
         return records
-    target_dsn = _build_aawm_admin_dsn()
-    if not target_dsn:
-        raise RuntimeError("AAWM/tristore database configuration is missing")
-    conn = await asyncpg.connect(target_dsn)
+
+    owns_conn = conn is None
+    if owns_conn:
+        target_dsn = _build_aawm_admin_dsn()
+        if not target_dsn:
+            raise RuntimeError("AAWM/tristore database configuration is missing")
+        conn = await asyncpg.connect(target_dsn)
     try:
-        await _ensure_session_history_schema(conn)
+        if owns_conn:
+            await _ensure_session_history_schema(conn)
         rows = await conn.fetch(
             """
             SELECT source, provider, model, quota_key, observed_at,
@@ -782,11 +874,10 @@ async def _filter_existing_observations(records: List[Dict[str, Any]]) -> List[D
             trace_ids,
         )
     finally:
-        await conn.close()
-    existing = {
-        _observation_signature_from_db_row(dict(row))
-        for row in rows
-    }
+        if owns_conn:
+            await conn.close()
+
+    existing = {_observation_signature_from_db_row(dict(row)) for row in rows}
     filtered: List[Dict[str, Any]] = []
     for record in records:
         observations = [
@@ -808,7 +899,16 @@ def _configure_target_database_env(args: argparse.Namespace) -> None:
             os.environ[env_name] = value
 
 
-async def _verify_target_database(required_database: Optional[str]) -> None:
+async def _acquire_target_connection(
+    required_database: Optional[str] = None,
+    *,
+    ensure_schema: bool = True,
+) -> Any:
+    """Open one asyncpg connection for the apply path (RR-069 #2).
+
+    Caller owns the returned connection and must close it. Schema readiness is
+    checked once here rather than on every skip-existing batch.
+    """
     target_dsn = _build_aawm_admin_dsn()
     if not target_dsn:
         raise RuntimeError("AAWM/tristore database configuration is missing")
@@ -820,9 +920,18 @@ async def _verify_target_database(required_database: Optional[str]) -> None:
                 "Refusing to apply rate-limit backfill to "
                 f"{current_database!r}; expected {required_database!r}"
             )
-        await _ensure_session_history_schema(conn)
-    finally:
+        if ensure_schema:
+            await _ensure_session_history_schema(conn)
+        return conn
+    except Exception:
         await conn.close()
+        raise
+
+
+async def _verify_target_database(required_database: Optional[str]) -> None:
+    """Compatibility helper: open, verify, ensure schema, then close."""
+    conn = await _acquire_target_connection(required_database)
+    await conn.close()
 
 
 def _dedupe_records(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -860,6 +969,7 @@ async def _persist_records(
     apply: bool,
     skip_existing: bool,
     stats: BackfillStats,
+    conn: Any = None,
 ) -> None:
     records = _dedupe_records(records)
     stats.candidate_records += len(records)
@@ -868,11 +978,13 @@ async def _persist_records(
     )
     if not apply or not records:
         return
-    filtered = await _filter_existing_observations(records) if skip_existing else records
-    stats.skipped_existing_observations += (
-        sum(len(record.get("rate_limit_observations", [])) for record in records)
-        - sum(len(record.get("rate_limit_observations", [])) for record in filtered)
-    )
+    if skip_existing:
+        filtered = await _filter_existing_observations(records, conn=conn)
+    else:
+        filtered = records
+    stats.skipped_existing_observations += sum(
+        len(record.get("rate_limit_observations", [])) for record in records
+    ) - sum(len(record.get("rate_limit_observations", [])) for record in filtered)
     if not filtered:
         return
     await _persist_session_history_records(filtered)
@@ -881,7 +993,49 @@ async def _persist_records(
     )
 
 
-async def _run_clickhouse_backfill(args: argparse.Namespace, client: ClickHouseClient) -> BackfillStats:
+
+def _keyset_cursor_from_row(
+    row: Dict[str, Any],
+    *,
+    time_field: str,
+    id_field: str,
+) -> Tuple[datetime, str]:
+    """Build a strict keyset cursor from the last row of a page.
+
+    Missing/unparseable timestamps or empty ids would drop the cursor predicate
+    on the next batch and re-scan page 1 forever. Fail closed instead.
+    """
+    cursor_time = _parse_optional_datetime(row.get(time_field))
+    raw_id = row.get(id_field)
+    cursor_id = str(raw_id).strip() if raw_id is not None else ""
+    if cursor_time is None or not cursor_id or cursor_id.lower() in {"none", "null"}:
+        raise RuntimeError(
+            "keyset cursor cannot advance: last row missing usable "
+            f"{time_field!r}/{id_field!r} "
+            f"(time={row.get(time_field)!r}, id={raw_id!r})"
+        )
+    return cursor_time, cursor_id
+
+
+def _assert_keyset_progress(
+    previous: Optional[Tuple[datetime, str]],
+    current: Tuple[datetime, str],
+) -> None:
+    """Refuse non-progressing keyset pages that would otherwise loop forever."""
+    if previous is not None and previous == current:
+        prev_time, prev_id = previous
+        raise RuntimeError(
+            "keyset cursor did not progress between batches; refusing to loop "
+            f"(cursor_time={prev_time.isoformat()}, cursor_id={prev_id!r})"
+        )
+
+
+async def _run_clickhouse_backfill(
+    args: argparse.Namespace,
+    client: ClickHouseClient,
+    *,
+    target_conn: Any = None,
+) -> BackfillStats:
     stats = BackfillStats()
     cursor_start_time: Optional[datetime] = None
     cursor_id: Optional[str] = None
@@ -902,7 +1056,9 @@ async def _run_clickhouse_backfill(args: argparse.Namespace, client: ClickHouseC
         for row in rows:
             stats.scanned_rows += 1
             processed += 1
-            record = build_record_from_clickhouse_row(row, include_input=args.include_input)
+            record = build_record_from_clickhouse_row(
+                row, include_input=args.include_input
+            )
             if record is not None:
                 records.append(record)
             if args.limit is not None and processed >= args.limit:
@@ -912,14 +1068,23 @@ async def _run_clickhouse_backfill(args: argparse.Namespace, client: ClickHouseC
             apply=args.apply,
             skip_existing=args.skip_existing,
             stats=stats,
+            conn=target_conn,
         )
         if args.limit is not None and processed >= args.limit:
             break
         last_row = rows[-1]
-        cursor_id = str(last_row.get("observation_id") or "")
-        cursor_start_time = _parse_optional_datetime(
-            str(last_row.get("observation_start_time")).replace(" ", "T")
+        next_cursor = _keyset_cursor_from_row(
+            last_row,
+            time_field="observation_start_time",
+            id_field="observation_id",
         )
+        _assert_keyset_progress(
+            (cursor_start_time, cursor_id)
+            if cursor_start_time is not None and cursor_id is not None
+            else None,
+            next_cursor,
+        )
+        cursor_start_time, cursor_id = next_cursor
     return stats
 
 
@@ -927,6 +1092,8 @@ async def _run_minio_backfill(
     args: argparse.Namespace,
     client: ClickHouseClient,
     blob_client: MinioEventBlobClient,
+    *,
+    target_conn: Any = None,
 ) -> BackfillStats:
     stats = BackfillStats()
     cursor_created_at: Optional[datetime] = None
@@ -972,14 +1139,23 @@ async def _run_minio_backfill(
             apply=args.apply,
             skip_existing=args.skip_existing,
             stats=stats,
+            conn=target_conn,
         )
         if args.limit is not None and processed >= args.limit:
             break
         last_row = rows[-1]
-        cursor_id = str(last_row.get("id") or "")
-        cursor_created_at = _parse_optional_datetime(
-            str(last_row.get("created_at")).replace(" ", "T")
+        next_cursor = _keyset_cursor_from_row(
+            last_row,
+            time_field="created_at",
+            id_field="id",
         )
+        _assert_keyset_progress(
+            (cursor_created_at, cursor_id)
+            if cursor_created_at is not None and cursor_id is not None
+            else None,
+            next_cursor,
+        )
+        cursor_created_at, cursor_id = next_cursor
     return stats
 
 
@@ -1083,21 +1259,35 @@ def _resolve_minio_config(args: argparse.Namespace) -> Dict[str, str]:
 
 async def _run(args: argparse.Namespace) -> Dict[str, Any]:
     _configure_target_database_env(args)
-    if args.apply:
-        await _verify_target_database(args.require_target_database)
-    clickhouse_auth = _resolve_clickhouse_auth_sources(args)
-    clickhouse_config = _resolve_clickhouse_config(args)
-    preflight_ran = _should_preflight_clickhouse_for_source_mode(args.source_mode)
-    if preflight_ran:
-        await asyncio.to_thread(_preflight_clickhouse_connection, clickhouse_auth)
-    client = ClickHouseClient(**clickhouse_config)
-    if args.source_mode == "clickhouse":
-        stats = await _run_clickhouse_backfill(args, client)
-    elif args.source_mode == "minio":
-        blob_client = MinioEventBlobClient(**_resolve_minio_config(args))
-        stats = await _run_minio_backfill(args, client, blob_client)
-    else:
-        raise ValueError(f"unsupported source mode: {args.source_mode}")
+    # One target connection for the whole apply run: DB guard + schema check
+    # once, then reused by skip-existing filters across every batch (RR-069 #2).
+    target_conn: Any = None
+    try:
+        if args.apply:
+            target_conn = await _acquire_target_connection(
+                args.require_target_database,
+                ensure_schema=True,
+            )
+        clickhouse_auth = _resolve_clickhouse_auth_sources(args)
+        clickhouse_config = _resolve_clickhouse_config(args)
+        preflight_ran = _should_preflight_clickhouse_for_source_mode(args.source_mode)
+        if preflight_ran:
+            await asyncio.to_thread(_preflight_clickhouse_connection, clickhouse_auth)
+        client = ClickHouseClient(**clickhouse_config)
+        if args.source_mode == "clickhouse":
+            stats = await _run_clickhouse_backfill(
+                args, client, target_conn=target_conn
+            )
+        elif args.source_mode == "minio":
+            blob_client = MinioEventBlobClient(**_resolve_minio_config(args))
+            stats = await _run_minio_backfill(
+                args, client, blob_client, target_conn=target_conn
+            )
+        else:
+            raise ValueError(f"unsupported source mode: {args.source_mode}")
+    finally:
+        if target_conn is not None:
+            await target_conn.close()
     return {
         "source_mode": args.source_mode,
         "applied": bool(args.apply),
@@ -1123,8 +1313,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Backfill public.rate_limit_observations from Langfuse history."
     )
-    parser.add_argument("--source-mode", choices=("clickhouse", "minio"), default="clickhouse")
-    parser.add_argument("--apply", action="store_true", help="Write extracted observations.")
+    parser.add_argument(
+        "--source-mode", choices=("clickhouse", "minio"), default="clickhouse"
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="Write extracted observations."
+    )
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--from-start-time", default=None)

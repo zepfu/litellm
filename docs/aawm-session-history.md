@@ -435,6 +435,50 @@ explicit fresh-period evidence, not null/unknown. xAI OAuth rate-limit headers p
 amounts and carry billing period ends when the provider config or managed
 subscription context exposes one.
 
+### Historical rate-limit backfill
+
+`scripts/backfill_rate_limit_observations.py` replays structured Langfuse
+ClickHouse (or MinIO event-blob) generation metadata through the same runtime
+quota extractors used by the AAWM callback and writes into
+`public.rate_limit_observations`. Free-form prose keyword matches are candidates
+only; they do not become rows unless a known provider payload parses.
+
+Operator contract:
+
+```bash
+# Dry-run (default; no writes)
+./.venv/bin/python scripts/backfill_rate_limit_observations.py \
+  --source-mode clickhouse \
+  --from-start-time 2026-05-05T00:00:00Z \
+  --to-start-time 2026-05-14T00:00:00Z
+
+# Apply after dry-run proof (refuses non-aawm_tristore unless overridden)
+./.venv/bin/python scripts/backfill_rate_limit_observations.py \
+  --source-mode clickhouse \
+  --from-start-time 2026-05-05T00:00:00Z \
+  --to-start-time 2026-05-14T00:00:00Z \
+  --require-target-database aawm_tristore \
+  --apply
+```
+
+- Default is dry-run. Prefer dry-run counts before any `--apply` run.
+- `--skip-existing` is on by default (`--no-skip-existing` disables it). Skip
+  identity is a shared 13-field signature used by both in-batch dedup and the
+  DB pre-filter: `source`, `provider`, `model`, `quota_key`, `observed_at`,
+  `provider_resets_at`/`expected_reset_at`, `remaining_pct`, `quota_limit`,
+  `quota_used`, `quota_remaining`, `billing_period_start_at`,
+  `billing_period_end_at`, and `trace_id`. Timestamps are compared at
+  millisecond UTC precision (naive DB stamps treated as UTC); numeric fields
+  are float-normalized so int/Decimal/float compare equal.
+- Apply paths open one target asyncpg connection, run the schema readiness
+  check once, and reuse that connection for every skip-existing batch instead
+  of reconnecting per `--batch-size` page.
+- `--require-target-database` defaults to `aawm_tristore` and refuses apply when
+  `current_database()` does not match.
+- CLI and ClickHouse cursor timestamps accept space-separated or `T`-separated
+  ISO values (and `Z`); unparseable cursor stamps become `None` rather than
+  crashing the batch loop.
+
 ## Provider Credit Observations
 
 
