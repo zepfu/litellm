@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Backfill first-class latency columns on public.session_history."""
+"""Backfill first-class latency columns on public.session_history.
+
+Schema ownership note (RR-071):
+  ``session_history`` DDL is migration-owned. This script no longer runs
+  CREATE/ALTER/INDEX on every invocation. The shared
+  ``litellm.integrations.aawm_agent_identity._ensure_session_history_schema``
+  helper is a readiness gate only (no DDL). Operators who need an emergency
+  bootstrap can pass ``--ensure-schema``, which applies the *same* SQL
+  constants already defined in ``aawm_agent_identity`` rather than a second
+  copy-pasted catalog.
+"""
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -45,10 +57,13 @@ from litellm.integrations.aawm_agent_identity import (  # noqa: E402
     _AAWM_SESSION_HISTORY_ALTER_STATEMENTS,
     _AAWM_SESSION_HISTORY_INDEX_STATEMENTS,
     _AAWM_SESSION_HISTORY_TABLE_SQL,
-    _SESSION_HISTORY_PREVIOUS_GAP_FIELD,
     _SESSION_HISTORY_LATENCY_FIELDS,
+    _SESSION_HISTORY_PREVIOUS_GAP_FIELD,
     _build_aawm_dsn,
     _build_session_history_latency_breakdown,
+    # Shared readiness helper (async, migration-owned no-op). Imported so this
+    # script does not maintain a second "ensure schema" policy surface.
+    _ensure_session_history_schema as _shared_ensure_session_history_schema,
 )
 
 
@@ -98,7 +113,15 @@ def _safe_json_metadata(value: Any) -> Dict[str, Any]:
     return {}
 
 
-def _ensure_session_history_schema(conn: psycopg.Connection) -> None:
+def _bootstrap_session_history_schema_from_shared_sql(
+    conn: psycopg.Connection,
+) -> None:
+    """Optional operator bootstrap using shared SQL constants only.
+
+    Prefer migrations. This exists solely for ``--ensure-schema`` so the
+    script does not own a diverging DDL catalog; statements come from
+    ``aawm_agent_identity``.
+    """
     with conn.cursor() as cur:
         cur.execute(_AAWM_SESSION_HISTORY_TABLE_SQL)
         for statement in _AAWM_SESSION_HISTORY_ALTER_STATEMENTS:
@@ -106,6 +129,20 @@ def _ensure_session_history_schema(conn: psycopg.Connection) -> None:
         for statement in _AAWM_SESSION_HISTORY_INDEX_STATEMENTS:
             cur.execute(statement)
     conn.commit()
+
+
+def _acknowledge_shared_schema_policy() -> None:
+    """Document dependency on the shared ensure helper without running DDL.
+
+    The shared async helper is intentionally a no-op readiness gate
+    (schema changes are migration-owned). Referencing it keeps this script
+    coupled to that policy instead of reintroducing a local ensure that
+    mutates schema on every run.
+    """
+    # Touch the imported symbol so accidental removals fail loudly at import
+    # analysis / tests, and so future agents find the shared policy entrypoint.
+    if _shared_ensure_session_history_schema is None:  # pragma: no cover
+        raise RuntimeError("shared session_history schema helper is unavailable")
 
 
 def _same_float(left: Any, right: Any) -> bool:
@@ -339,6 +376,7 @@ def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
         raise RuntimeError("AAWM/tristore database configuration is missing")
 
     initial_cursor_id = int(args.cursor_id or 0)
+    schema_bootstrapped = False
     with psycopg.connect(dsn, row_factory=psycopg.rows.dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT current_database()")
@@ -349,21 +387,32 @@ def _run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
                 f"expected {args.expected_database!r}"
             )
 
-        _ensure_session_history_schema(conn)
+        # Default: no DDL. Align with shared migration-owned schema policy.
+        _acknowledge_shared_schema_policy()
+        if args.ensure_schema:
+            _bootstrap_session_history_schema_from_shared_sql(conn)
+            schema_bootstrapped = True
+
         latency_summary = _run_latency_backfill_pass(conn, args, initial_cursor_id)
         gap_summary = _run_gap_backfill_pass(conn, args, initial_cursor_id)
 
     return {
         "applied": bool(args.apply),
         "database": args.expected_database,
+        "ensure_schema": bool(args.ensure_schema),
+        "schema_bootstrapped": schema_bootstrapped,
         **latency_summary,
         **gap_summary,
     }
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Backfill session_history latency columns from stored metadata.",
+        description=(
+            "Backfill session_history latency columns from stored metadata. "
+            "Schema DDL is migration-owned; this script does not alter schema "
+            "unless --ensure-schema is explicitly passed."
+        ),
     )
     parser.add_argument("--apply", action="store_true", help="Write updates.")
     parser.add_argument("--batch-size", type=int, default=1000)
@@ -377,15 +426,25 @@ def _parse_args() -> argparse.Namespace:
         help="Recompute rows even when all latency columns are already populated.",
     )
     parser.add_argument(
+        "--ensure-schema",
+        action="store_true",
+        help=(
+            "Opt-in emergency bootstrap: apply shared session_history SQL "
+            "constants from aawm_agent_identity (CREATE/ALTER/INDEX). Default "
+            "is off because schema is migration-owned and unconditional DDL "
+            "takes ACCESS EXCLUSIVE lock windows on every run."
+        ),
+    )
+    parser.add_argument(
         "--expected-database",
         default="aawm_tristore",
         help="Refuse to run unless current_database() matches this value.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    summary = _run_backfill(_parse_args())
+def main(argv: Optional[list[str]] = None) -> int:
+    summary = _run_backfill(_parse_args(argv))
     print(json.dumps(summary, sort_keys=True))  # noqa: T201
     return 0
 
