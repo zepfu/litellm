@@ -509,16 +509,30 @@ Operational notes:
   `LITELLM_AAWM_ERROR_LOG_ENV`) derives `aawm-routing-dev-v1` or
   `aawm-routing-prod-v1`. Use one explicit shared namespace only for
   intentionally shared routing planes.
-- Redis timeout and write-retry behavior is controlled by:
+- Redis timeout, reconnect, and write-retry behavior is controlled by the
+  dedicated alias-routing Redis manager (`litellm/proxy/aawm_alias_routing_redis.py`):
   - `AAWM_ALIAS_ROUTING_REDIS_TIMEOUT_SECONDS` (`float`, default `10`, clamped
     to `1.0`–`60.0`): passed to the alias-routing Redis client
     `socket_timeout` and shared by both URL and host-based Redis
     configuration. Non-finite values (`nan`, `inf`, `-inf`) fall back to the
     default `10`.
+  - `AAWM_ALIAS_ROUTING_REDIS_SELF_HEAL_INTERVAL_SECONDS` (`float`, default `30`,
+    clamped to `5.0`–`300.0`): after a configured Redis target is unreachable at
+    startup, a single background task reattempts connectivity on this interval
+    without delaying proxy readiness. Success reattaches the durable DualCache
+    and stops the task; `shutdown()` cancels it. Non-finite values fall back to
+    `30`.
   - `AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS` (`float`,
     default `0.25`, clamped to `0.05`–`2.0`): wait time before one bounded retry
     for durable `SET` write failures when the failure is retryable. Non-finite
-    values (`nan`, `inf`, `-inf`) fall back to the default `0.25`.
+    values (`nan`, `inf`, `-inf`) fall back to the default `0.25`. Retry attempt
+    count and retryable-error classification also live in the Redis manager so
+    connection and durable-write policy stay consolidated.
+- URL mode vs host-style settings:
+  - When `AAWM_ALIAS_ROUTING_REDIS_URL` is set, URL mode wins. Host-style env
+    vars (`HOST`, `PORT`, `PASSWORD`, `USERNAME`, `SSL`, `DB`) are ignored and
+    emit a single config warning listing the ignored names so partial migrations
+    do not fail opaquely later.
 - Durable key shape:
   `aawm:alias-routing:{namespace}:{family}:{kind}:{state_key}` where `family` is
   `codex` or `anthropic`, and `kind` is `affinity` or `cooldown`.

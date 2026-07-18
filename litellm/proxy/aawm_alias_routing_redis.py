@@ -10,13 +10,50 @@ import asyncio
 import math
 import logging
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.redis_cache import RedisCache
 
 
 logger = logging.getLogger(__name__)
+
+# Durable-write retry policy lives here so connection/timeout and write resilience
+# share one subsystem owner. redis.exceptions is imported at module top with a
+# guarded fallback so hot write paths never pay an inline import.
+try:
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+
+    _REDIS_RETRYABLE_EXCEPTIONS: Tuple[type[BaseException], ...] = (
+        RedisConnectionError,
+        RedisTimeoutError,
+    )
+except Exception:  # pragma: no cover - redis may be unavailable in some installs
+    _REDIS_RETRYABLE_EXCEPTIONS = ()
+
+DURABLE_WRITE_RETRY_ATTEMPTS = 1
+DURABLE_WRITE_RETRY_BACKOFF_SECONDS_DEFAULT = 0.25
+DURABLE_WRITE_RETRY_BACKOFF_SECONDS_MIN = 0.05
+DURABLE_WRITE_RETRY_BACKOFF_SECONDS_MAX = 2.0
+DURABLE_WRITE_RETRY_BACKOFF_SECONDS_ENV = (
+    "AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS"
+)
+
+# Host-style settings that RedisCache(url=...) does not consume.
+_URL_MODE_IGNORED_ENV_VARS = (
+    "AAWM_ALIAS_ROUTING_REDIS_HOST",
+    "AAWM_ALIAS_ROUTING_REDIS_PASSWORD",
+    "AAWM_ALIAS_ROUTING_REDIS_USERNAME",
+    "AAWM_ALIAS_ROUTING_REDIS_SSL",
+    "AAWM_ALIAS_ROUTING_REDIS_DB",
+    "AAWM_ALIAS_ROUTING_REDIS_PORT",
+)
+
+
+def _env_is_set(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and bool(str(value).strip())
 
 
 def resolve_alias_routing_state_namespace() -> str:
@@ -53,6 +90,14 @@ class AAWMAliasRoutingRedisManager:
     # permanent failures still fall back to memory quickly and visibly.
     STARTUP_CONNECT_ATTEMPTS = 3
     STARTUP_RETRY_DELAY_SECONDS = 0.05
+    # Background self-heal after startup fallback. Runs off the critical path so a
+    # slow/unavailable Redis does not block proxy readiness, but can reattach once
+    # the sidecar becomes reachable. Interval is intentionally longer than the
+    # startup retry delay.
+    DEFAULT_SELF_HEAL_INTERVAL_SECONDS = 30.0
+    MIN_SELF_HEAL_INTERVAL_SECONDS = 5.0
+    MAX_SELF_HEAL_INTERVAL_SECONDS = 300.0
+    SELF_HEAL_INTERVAL_ENV_VAR = "AAWM_ALIAS_ROUTING_REDIS_SELF_HEAL_INTERVAL_SECONDS"
 
     def __init__(self) -> None:
         self._cache: Optional[RedisCache] = None
@@ -63,6 +108,11 @@ class AAWMAliasRoutingRedisManager:
         self._reachable: Union[bool, str] = "unknown"
         self._error_type: Optional[str] = None
         self._namespace: str = self.DEFAULT_NAMESPACE
+        self._self_heal_task: Optional[asyncio.Task[Any]] = None
+        self._self_heal_stop: Optional[asyncio.Event] = None
+        # Set when initialize() has observed a configured Redis that fell back to
+        # memory so status/tests can tell self-heal is armed without inspecting tasks.
+        self._self_heal_armed: bool = False
 
     @staticmethod
     def _parse_bool(value: Optional[str]) -> bool:
@@ -117,9 +167,16 @@ class AAWMAliasRoutingRedisManager:
 
         redis_url = os.getenv("AAWM_ALIAS_ROUTING_REDIS_URL")
         if redis_url:
-            if (os.getenv("AAWM_ALIAS_ROUTING_REDIS_HOST") or "").strip():
+            ignored = [
+                env_var
+                for env_var in _URL_MODE_IGNORED_ENV_VARS
+                if _env_is_set(env_var)
+            ]
+            if ignored:
                 logger.warning(
-                    "AAWM alias routing Redis config has both URL and host; URL mode is enabled."
+                    "AAWM alias routing Redis config uses URL mode; "
+                    "ignoring host-style settings that RedisCache(url=...) does not consume: %s",
+                    ", ".join(ignored),
                 )
             return {
                 "mode": "url",
@@ -196,6 +253,15 @@ class AAWMAliasRoutingRedisManager:
             return DualCache(default_in_memory_ttl=1, redis_cache=cache)
         self._managed_dual_cache.redis_cache = cache
         return self._managed_dual_cache
+
+    @classmethod
+    def _resolve_self_heal_interval_seconds(cls) -> float:
+        return cls._parse_float(
+            os.getenv(cls.SELF_HEAL_INTERVAL_ENV_VAR),
+            default=cls.DEFAULT_SELF_HEAL_INTERVAL_SECONDS,
+            minimum=cls.MIN_SELF_HEAL_INTERVAL_SECONDS,
+            maximum=cls.MAX_SELF_HEAL_INTERVAL_SECONDS,
+        )
 
     def get_dual_cache(self) -> Optional[Any]:
         if self._managed_dual_cache is None:
@@ -313,15 +379,19 @@ class AAWMAliasRoutingRedisManager:
             self._initialized = True
             self._reachable = "unknown"
             self._error_type = None
+            self._self_heal_armed = False
             self._detach_cached_client()
             await self._disconnect_previous_cache(
                 previous_cache,
                 message="AAWM alias routing Redis close during disable failed",
             )
             self._cache = None
+            await self._stop_self_heal_task()
             return
 
         if self._initialized and self._is_cache_attached() and self._reachable is True:
+            self._self_heal_armed = False
+            await self._stop_self_heal_task()
             return
 
         # Remove a prior attachment if this manager installed it before attempting
@@ -344,6 +414,8 @@ class AAWMAliasRoutingRedisManager:
             self._reachable = True
             self._error_type = None
             self._initialized = True
+            self._self_heal_armed = False
+            await self._stop_self_heal_task()
             return
 
         # Failed reconfiguration must not leave a detached previous client
@@ -357,12 +429,119 @@ class AAWMAliasRoutingRedisManager:
         self._reachable = False
         self._error_type = type(last_error).__name__ if last_error is not None else None
         self._initialized = False
+        self._self_heal_armed = True
         logger.warning(
             "AAWM alias routing Redis unavailable; using memory cache fallback."
         )
+        self._ensure_self_heal_task()
+
+    def _ensure_self_heal_task(self) -> None:
+        """Schedule at most one background reconnect task after startup fallback."""
+        if self._self_heal_task is not None and not self._self_heal_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (sync test path); self-heal arms only under asyncio.
+            return
+        if self._self_heal_stop is None:
+            self._self_heal_stop = asyncio.Event()
+        else:
+            self._self_heal_stop.clear()
+        self._self_heal_task = loop.create_task(self._self_heal_loop())
+
+    async def _stop_self_heal_task(self) -> None:
+        if self._self_heal_stop is not None:
+            self._self_heal_stop.set()
+        task = self._self_heal_task
+        if task is None:
+            return
+        current = asyncio.current_task()
+        # When reconnect succeeds, initialize() is awaited by the self-heal task
+        # itself. Do not cancel/await that same task from inside initialize().
+        if task is current:
+            self._self_heal_task = None
+            return
+        self._self_heal_task = None
+        if task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug(
+                "AAWM alias routing Redis self-heal task stop failed",
+                exc_info=True,
+            )
+
+    async def _self_heal_loop(self) -> None:
+        """Periodically reattempt Redis connectivity after a configured fallback.
+
+        Does not run during the initial startup critical path. Uses the same
+        initialize() entrypoint so reconnect shares wiring/status semantics.
+
+        Concurrent manual re-init is best-effort: there is intentionally no
+        initialize lock, so callers may overlap. Self-heal still falls back
+        safely and stops once durable cache is attached.
+        """
+        stop_event = self._self_heal_stop
+        try:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                interval = max(0.0, float(self._resolve_self_heal_interval_seconds()))
+                # One interruptible wait for the full interval: set stop_event
+                # wakes shutdown promptly without polling every 50ms.
+                if stop_event is None:
+                    if interval > 0:
+                        await asyncio.sleep(interval)
+                else:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if not self._configured:
+                    return
+                if self._is_cache_attached() and self._reachable is True:
+                    self._self_heal_armed = False
+                    return
+
+                logger.info(
+                    "AAWM alias routing Redis self-heal reattempting connectivity."
+                )
+                try:
+                    await self.initialize()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "AAWM alias routing Redis self-heal attempt failed",
+                        exc_info=True,
+                    )
+                    continue
+
+                if self._is_cache_attached() and self._reachable is True:
+                    logger.info(
+                        "AAWM alias routing Redis self-heal restored durable cache."
+                    )
+                    self._self_heal_armed = False
+                    return
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current = asyncio.current_task()
+            if self._self_heal_task is current:
+                self._self_heal_task = None
 
     async def shutdown(self) -> None:
         """Detach and disconnect the manager-owned Redis client."""
+        await self._stop_self_heal_task()
         self._detach_cached_client()
         await self._disconnect_cached_client()
         self._cache = None
@@ -372,11 +551,17 @@ class AAWMAliasRoutingRedisManager:
         self._configured = False
         self._config_mode = "unconfigured"
         self._namespace = self.DEFAULT_NAMESPACE
+        self._self_heal_armed = False
 
     def get_status(self) -> Dict[str, Any]:
         """Return sanitized runtime status for alias-routing state cache."""
         namespace = self._namespace or self.DEFAULT_NAMESPACE
         mode = "redis" if self._is_cache_attached() else "memory"
+        self_heal_active = bool(
+            self._self_heal_armed
+            and self._configured
+            and not (self._is_cache_attached() and self._reachable is True)
+        )
         return {
             "configured": self._configured,
             "config_mode": self._config_mode,
@@ -386,10 +571,18 @@ class AAWMAliasRoutingRedisManager:
             "namespace": namespace,
             "key_prefix": self._build_key_prefix(namespace),
             "error_type": self._error_type,
+            "self_heal_active": self_heal_active,
         }
 
     def reset(self) -> None:
         """Reset local manager state for tests without disconnecting live clients."""
+        task = self._self_heal_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._self_heal_task = None
+        if self._self_heal_stop is not None:
+            self._self_heal_stop.set()
+        self._self_heal_stop = None
         self._detach_cached_client()
         self._initialized = False
         self._reachable = "unknown"
@@ -397,6 +590,7 @@ class AAWMAliasRoutingRedisManager:
         self._configured = False
         self._config_mode = "unconfigured"
         self._namespace = self.DEFAULT_NAMESPACE
+        self._self_heal_armed = False
 
 
 aawm_alias_routing_redis_manager = AAWMAliasRoutingRedisManager()
@@ -420,3 +614,40 @@ def get_status() -> Dict[str, Any]:
 
 def reset() -> None:
     aawm_alias_routing_redis_manager.reset()
+
+
+def _parse_durable_write_retry_backoff_seconds(raw: Optional[str]) -> float:
+    return AAWMAliasRoutingRedisManager._parse_float(
+        raw,
+        default=DURABLE_WRITE_RETRY_BACKOFF_SECONDS_DEFAULT,
+        minimum=DURABLE_WRITE_RETRY_BACKOFF_SECONDS_MIN,
+        maximum=DURABLE_WRITE_RETRY_BACKOFF_SECONDS_MAX,
+    )
+
+
+def get_durable_write_retry_attempts() -> int:
+    """Return how many additional SET attempts follow the first durable write."""
+    return max(0, int(DURABLE_WRITE_RETRY_ATTEMPTS))
+
+
+def get_durable_write_retry_backoff_seconds() -> float:
+    """Resolve env-tunable backoff between durable write retries."""
+    return _parse_durable_write_retry_backoff_seconds(
+        os.getenv(DURABLE_WRITE_RETRY_BACKOFF_SECONDS_ENV)
+    )
+
+
+def is_retryable_redis_error(exc: BaseException) -> bool:
+    """Classify whether a durable-write failure should receive one bounded retry."""
+    if isinstance(
+        exc,
+        (
+            asyncio.TimeoutError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    ):
+        return True
+    if _REDIS_RETRYABLE_EXCEPTIONS and isinstance(exc, _REDIS_RETRYABLE_EXCEPTIONS):
+        return True
+    return False

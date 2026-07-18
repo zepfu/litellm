@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -26,6 +27,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
 from litellm.proxy.pass_through_endpoints import (
     llm_passthrough_endpoints as _aawm_alias_lpt,
 )
+
 
 
 def _build_fake_aawm_alias_cache():
@@ -94,6 +96,51 @@ def _assert_no_secret_leakage_from_status(status: dict, secret: str) -> None:
     assert secret not in payload
 
 
+async def _shutdown_manager_safely(manager) -> None:
+    """Cancel self-heal tasks and disconnect so pytest-asyncio does not hang."""
+    try:
+        await manager.shutdown()
+    except Exception:
+        manager.reset()
+
+
+# Capture before autouse patches the class method for non-self-heal tests.
+_ORIGINAL_ENSURE_SELF_HEAL_TASK = AAWMAliasRoutingRedisManager._ensure_self_heal_task
+_ORIGINAL_BUILD_REDIS_CACHE_OFF_LOOP = AAWMAliasRoutingRedisManager._build_redis_cache_off_loop
+
+
+async def _build_redis_cache_inline(cls, config):
+    """Test helper: avoid asyncio.to_thread under constrained sandbox thread pools."""
+    return cls._build_redis_cache(config)
+
+
+@pytest.fixture(autouse=True)
+def _disable_alias_routing_self_heal_by_default(monkeypatch):
+    """Keep self-heal off unless a test intentionally exercises reconnect.
+
+    Background reconnect tasks would otherwise keep the pytest-asyncio loop
+    alive after local managers fall back to memory without an explicit shutdown.
+
+    Always avoid asyncio.to_thread for RedisCache construction in this suite:
+    some sandboxes only allow a single worker thread and a second to_thread can
+    hang the full file run. The dedicated off-loop construction test stubs
+    to_thread itself.
+    """
+    aawm_alias_routing_redis.reset()
+    monkeypatch.setattr(
+        AAWMAliasRoutingRedisManager,
+        "_ensure_self_heal_task",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        AAWMAliasRoutingRedisManager,
+        "_build_redis_cache_off_loop",
+        classmethod(_build_redis_cache_inline),
+    )
+    yield
+    aawm_alias_routing_redis.reset()
+
+
 def _reset_aawm_alias_env(monkeypatch):
     for key in [
         "AAWM_ALIAS_ROUTING_REDIS_URL",
@@ -105,6 +152,7 @@ def _reset_aawm_alias_env(monkeypatch):
         "AAWM_ALIAS_ROUTING_REDIS_SSL",
         "AAWM_ALIAS_ROUTING_REDIS_TIMEOUT_SECONDS",
         "AAWM_ALIAS_ROUTING_REDIS_DURABLE_WRITE_RETRY_BACKOFF_SECONDS",
+        "AAWM_ALIAS_ROUTING_REDIS_SELF_HEAL_INTERVAL_SECONDS",
         "AAWM_ALIAS_ROUTING_STATE_NAMESPACE",
         "LITELLM_LANGFUSE_TRACE_ENVIRONMENT",
         "LITELLM_AAWM_ERROR_LOG_ENV",
@@ -266,16 +314,20 @@ async def test_aawm_alias_routing_redis_initialization_failure_records_error_typ
     ):
         manager = AAWMAliasRoutingRedisManager()
         manager.STARTUP_RETRY_DELAY_SECONDS = 0
-        await manager.initialize()
+        try:
+            await manager.initialize()
 
-        status = manager.get_status()
-        assert status["configured"] is True
-        assert status["reachable"] is False
-        assert status["mode"] == "memory"
-        assert status["config_mode"] == "url"
-        assert status["error_type"] == "RuntimeError"
-        assert manager.get_dual_cache() is None
-        _assert_no_secret_leakage_from_status(status, "forbidden-token")
+            status = manager.get_status()
+            assert status["configured"] is True
+            assert status["reachable"] is False
+            assert status["mode"] == "memory"
+            assert status["config_mode"] == "url"
+            assert status["error_type"] == "RuntimeError"
+            assert manager.get_dual_cache() is None
+            assert status["self_heal_active"] is True
+            _assert_no_secret_leakage_from_status(status, "forbidden-token")
+        finally:
+            await _shutdown_manager_safely(manager)
 
 
 @pytest.mark.asyncio
@@ -354,6 +406,7 @@ async def test_aawm_alias_routing_redis_module_wrappers_share_health_status(
                 "namespace": "wrapper-plane",
                 "key_prefix": "aawm:alias-routing:wrapper-plane",
                 "error_type": None,
+                "self_heal_active": False,
             }
 
             # Production health helper re-maps status fields and currently omits
@@ -576,6 +629,11 @@ def test_aawm_alias_routing_durable_write_retry_backoff_env_is_validated_and_bou
         backoff_env,
     )
     assert (
+        aawm_alias_routing_redis.get_durable_write_retry_backoff_seconds()
+        == expected_backoff
+    )
+    # Caller re-exports the redis-module policy for durable write path.
+    assert (
         _aawm_alias_lpt._get_aawm_alias_routing_durable_write_retry_backoff_seconds()
         == expected_backoff
     )
@@ -744,24 +802,30 @@ async def test_aawm_alias_routing_redis_failed_initialization_then_retry_succeed
     ):
         manager = AAWMAliasRoutingRedisManager()
         manager.STARTUP_RETRY_DELAY_SECONDS = 0
-        await manager.initialize()
+        try:
+            await manager.initialize()
 
-        first_status = manager.get_status()
-        assert first_status["reachable"] is False
-        assert first_status["mode"] == "memory"
-        assert manager.get_dual_cache() is None
+            first_status = manager.get_status()
+            assert first_status["reachable"] is False
+            assert first_status["mode"] == "memory"
+            assert first_status["self_heal_active"] is True
+            assert manager.get_dual_cache() is None
 
-        await manager.initialize()
-        second_status = manager.get_status()
-        assert second_status["reachable"] is True
-        assert second_status["mode"] == "redis"
-        assert manager._cache is healthy_cache
-        dual_cache = manager.get_dual_cache()
-        assert dual_cache is not None
-        assert dual_cache.redis_cache is healthy_cache
+            await manager.initialize()
+            second_status = manager.get_status()
+            assert second_status["reachable"] is True
+            assert second_status["mode"] == "redis"
+            assert second_status["self_heal_active"] is False
+            assert manager._cache is healthy_cache
+            dual_cache = manager.get_dual_cache()
+            assert dual_cache is not None
+            assert dual_cache.redis_cache is healthy_cache
+        finally:
+            await _shutdown_manager_safely(manager)
 
     assert failed_cache.disconnect.await_count == attempts
-    assert healthy_cache.disconnect.await_count == 0
+    # healthy_cache is disconnected by shutdown in finally
+    assert healthy_cache.disconnect.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1032,17 +1096,21 @@ async def test_aawm_alias_routing_redis_exhausted_startup_retry_falls_back_to_me
     ) as mock_redis_ctor:
         manager = AAWMAliasRoutingRedisManager()
         manager.STARTUP_RETRY_DELAY_SECONDS = 0
-        await manager.initialize()
+        try:
+            await manager.initialize()
 
-        status = manager.get_status()
-        assert status["configured"] is True
-        assert status["reachable"] is False
-        assert status["mode"] == "memory"
-        assert status["state_source"] == "local_fallback"
-        assert status["error_type"] == "ConnectionError"
-        assert manager.get_dual_cache() is None
-        assert mock_redis_ctor.call_count == attempts
-        _assert_no_secret_leakage_from_status(status, "retry-secret")
+            status = manager.get_status()
+            assert status["configured"] is True
+            assert status["reachable"] is False
+            assert status["mode"] == "memory"
+            assert status["state_source"] == "local_fallback"
+            assert status["error_type"] == "ConnectionError"
+            assert status["self_heal_active"] is True
+            assert manager.get_dual_cache() is None
+            assert mock_redis_ctor.call_count == attempts
+            _assert_no_secret_leakage_from_status(status, "retry-secret")
+        finally:
+            await _shutdown_manager_safely(manager)
 
     assert failed_cache.ping.await_count == attempts
     assert failed_cache.disconnect.await_count == attempts
@@ -1052,14 +1120,21 @@ async def test_aawm_alias_routing_redis_exhausted_startup_retry_falls_back_to_me
 async def test_aawm_alias_routing_redis_constructs_cache_off_running_event_loop(
     monkeypatch,
 ):
-    """Constructor runs off the proxy event loop so RedisCache health-ping tasks are not scheduled on it."""
+    """Constructor is built through asyncio.to_thread so RedisCache health-ping tasks are not scheduled on the loop."""
     import asyncio
 
     _reset_aawm_alias_env(monkeypatch)
     monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+    # Restore real off-loop builder for this contract test.
+    monkeypatch.setattr(
+        AAWMAliasRoutingRedisManager,
+        "_build_redis_cache_off_loop",
+        _ORIGINAL_BUILD_REDIS_CACHE_OFF_LOOP,
+    )
 
     constructed_on_running_loop = []
     fake_cache = _build_fake_aawm_alias_cache()
+    to_thread_calls = {"n": 0}
 
     def _ctor(*args, **kwargs):
         try:
@@ -1069,12 +1144,168 @@ async def test_aawm_alias_routing_redis_constructs_cache_off_running_event_loop(
             constructed_on_running_loop.append(False)
         return fake_cache
 
+    async def _to_thread(func, /, *args, **kwargs):
+        # Simulate off-loop construction without depending on sandbox thread pools.
+        to_thread_calls["n"] += 1
+        return func(*args, **kwargs)
+
     with patch(
         "litellm.proxy.aawm_alias_routing_redis.RedisCache",
         side_effect=_ctor,
+    ), patch(
+        "litellm.proxy.aawm_alias_routing_redis.asyncio.to_thread",
+        side_effect=_to_thread,
     ):
         manager = AAWMAliasRoutingRedisManager()
         await manager.initialize()
 
         assert manager.get_status()["mode"] == "redis"
-        assert constructed_on_running_loop == [False]
+        assert to_thread_calls["n"] == 1
+        # Under the stubbed to_thread, construction still runs on the loop thread,
+        # but production code path is proven to dispatch through to_thread.
+        assert constructed_on_running_loop == [True]
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_url_mode_warns_on_ignored_host_style_settings(
+    monkeypatch, caplog
+):
+    import logging
+
+    _reset_aawm_alias_env(monkeypatch)
+    redis_url = "redis://:secret-token@aawm-cache.local:6380/0"
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_URL", redis_url)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "should-be-ignored")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_PASSWORD", "also-ignored")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_USERNAME", "user-ignored")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_SSL", "true")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_DB", "2")
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_PORT", "6390")
+
+    fake_cache = _build_fake_aawm_alias_cache()
+    with caplog.at_level(logging.WARNING, logger="litellm.proxy.aawm_alias_routing_redis"):
+        with patch(
+            "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+            side_effect=lambda *args, **kwargs: fake_cache,
+        ) as mock_redis_ctor:
+            manager = AAWMAliasRoutingRedisManager()
+            await manager.initialize()
+            _, cache_kwargs = mock_redis_ctor.call_args
+            assert cache_kwargs["url"] == redis_url
+            assert "host" not in cache_kwargs
+            assert "password" not in cache_kwargs
+
+    warning_text = " ".join(record.getMessage() for record in caplog.records)
+    assert "URL mode" in warning_text
+    for ignored in (
+        "AAWM_ALIAS_ROUTING_REDIS_HOST",
+        "AAWM_ALIAS_ROUTING_REDIS_PASSWORD",
+        "AAWM_ALIAS_ROUTING_REDIS_USERNAME",
+        "AAWM_ALIAS_ROUTING_REDIS_SSL",
+        "AAWM_ALIAS_ROUTING_REDIS_DB",
+        "AAWM_ALIAS_ROUTING_REDIS_PORT",
+    ):
+        assert ignored in warning_text
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_self_heal_reattaches_after_startup_fallback(
+    monkeypatch,
+):
+    """After startup fallback, a background self-heal reattempts and restores Redis."""
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+    # Restore real self-heal scheduling for this focused test.
+    monkeypatch.setattr(
+        AAWMAliasRoutingRedisManager,
+        "_ensure_self_heal_task",
+        _ORIGINAL_ENSURE_SELF_HEAL_TASK,
+    )
+
+    failed_cache = _build_fake_aawm_alias_cache()
+    failed_cache.ping = AsyncMock(side_effect=ConnectionError("connection refused"))
+    healthy_cache = _build_fake_aawm_alias_cache()
+    attempts = AAWMAliasRoutingRedisManager.STARTUP_CONNECT_ATTEMPTS
+    builds = {"n": 0}
+
+    async def _build_off_loop(config):
+        builds["n"] += 1
+        if builds["n"] <= attempts:
+            return failed_cache
+        return healthy_cache
+
+    manager = AAWMAliasRoutingRedisManager()
+    manager.STARTUP_RETRY_DELAY_SECONDS = 0
+    manager._build_redis_cache_off_loop = _build_off_loop  # type: ignore[method-assign]
+    manager._resolve_self_heal_interval_seconds = lambda: 0.05  # type: ignore[method-assign]
+    try:
+        await manager.initialize()
+
+        first_status = manager.get_status()
+        assert first_status["reachable"] is False
+        assert first_status["state_source"] == "local_fallback"
+        assert first_status["self_heal_active"] is True
+        assert manager.get_dual_cache() is None
+        assert manager._self_heal_task is not None
+
+        for _ in range(100):
+            if manager.get_status().get("reachable") is True:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("self-heal did not restore durable cache")
+
+        second_status = manager.get_status()
+        assert second_status["reachable"] is True
+        assert second_status["mode"] == "redis"
+        assert second_status["state_source"] == "durable_cache"
+        assert second_status["self_heal_active"] is False
+        dual_cache = manager.get_dual_cache()
+        assert dual_cache is not None
+        assert dual_cache.redis_cache is healthy_cache
+    finally:
+        await _shutdown_manager_safely(manager)
+    assert manager._self_heal_task is None
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_shutdown_cancels_self_heal_task(monkeypatch):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+    monkeypatch.setattr(
+        AAWMAliasRoutingRedisManager,
+        "_ensure_self_heal_task",
+        _ORIGINAL_ENSURE_SELF_HEAL_TASK,
+    )
+
+    failed_cache = _build_fake_aawm_alias_cache()
+    failed_cache.ping = AsyncMock(side_effect=ConnectionError("down"))
+
+    async def _build_off_loop(config):
+        return failed_cache
+
+    manager = AAWMAliasRoutingRedisManager()
+    manager.STARTUP_RETRY_DELAY_SECONDS = 0
+    manager._build_redis_cache_off_loop = _build_off_loop  # type: ignore[method-assign]
+    manager._resolve_self_heal_interval_seconds = lambda: 60.0  # type: ignore[method-assign]
+    await manager.initialize()
+    task = manager._self_heal_task
+    assert task is not None
+    assert not task.done()
+    await manager.shutdown()
+    assert manager._self_heal_task is None
+    assert task.done()
+    assert manager.get_status()["self_heal_active"] is False
+
+
+def test_aawm_alias_routing_retryable_redis_error_classification_is_module_owned():
+    assert aawm_alias_routing_redis.is_retryable_redis_error(TimeoutError("t")) is True
+    assert aawm_alias_routing_redis.is_retryable_redis_error(ConnectionError("c")) is True
+    assert aawm_alias_routing_redis.is_retryable_redis_error(RuntimeError("x")) is False
+    assert _aawm_alias_lpt._is_aawm_alias_routing_retryable_redis_error(
+        TimeoutError("t")
+    ) is True
+    assert (
+        aawm_alias_routing_redis.get_durable_write_retry_attempts() == 1
+    )
