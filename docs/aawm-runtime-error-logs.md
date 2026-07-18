@@ -790,6 +790,13 @@ Repo scripts that query Langfuse ClickHouse
 - emit redacted `clickhouse_auth` diagnostics (normalized URL, redacted raw URL
   userinfo, user, and `*_source` fields) without passwords.
 
+`scripts/backfill_session_history_runtime_identity.py` additionally resolves
+ClickHouse auth once in `main()` (threaded into preflight/fetch), keyset-pages
+GENERATION observations (`--clickhouse-page-size`, optional
+`--clickhouse-max-pages` / `--clickhouse-resume-after-id`), and batch-loads
+PostgreSQL temp identity tables (`--insert-batch-size`). See
+`docs/aawm-session-history.md` § Runtime / Client Identity Backfill.
+
 Archive active `aawm-clickhouse-error.jsonl` intake only after verification shows
 no new default-user auth error signatures for the resolved caller class.
 

@@ -201,6 +201,50 @@ stored metadata (and `inbound_model_alias` when present) was insufficient to
 classify extended context; it does not mean LiteLLM inferred a window from
 observed token counts.
 
+## Runtime / Client Identity Backfill
+
+`scripts/backfill_session_history_runtime_identity.py` fills missing
+`session_history` runtime and client identity columns from Langfuse ClickHouse
+GENERATION observations (the same fields live traffic derives via
+`_build_session_runtime_identity`).
+
+Operator contract:
+
+- Default mode is dry-run. Pass `--apply` only after reviewing the JSON summary.
+- The script aborts unless `current_database()` equals `--target-db-name`
+  (default `aawm_tristore`).
+- ClickHouse auth is resolved **once** in `main()` from CLI flags / env
+  (`CLICKHOUSE_*` or `LANGFUSE_CLICKHOUSE_*`) and threaded into preflight and
+  fetch helpers (no per-layer re-derivation).
+- Observation fetch is keyset-paginated on `observations.id` with
+  `--clickhouse-page-size` (default 1000). Optional
+  `--clickhouse-max-pages` caps one run; resume a partial/timeout run with
+  `--clickhouse-resume-after-id <last_observation_id>` (exclusive).
+- PostgreSQL temp-table loads batch with `--insert-batch-size` (default 1000).
+- JSON summary includes `clickhouse_page_size`, `clickhouse_pages_fetched`,
+  `clickhouse_last_cursor_id`, and `insert_batch_size` so operators can resume
+  without re-scanning from the start of history.
+
+```bash
+# Dry-run (default)
+./.venv/bin/python scripts/backfill_session_history_runtime_identity.py
+
+# Resume a large history after a partial fetch
+./.venv/bin/python scripts/backfill_session_history_runtime_identity.py \
+  --clickhouse-page-size 500 \
+  --clickhouse-resume-after-id <last_cursor_id> \
+  --insert-batch-size 500
+
+# Apply against the exact tristore database
+./.venv/bin/python scripts/backfill_session_history_runtime_identity.py \
+  --target-db-name aawm_tristore \
+  --apply
+```
+
+Optional port-derived environment correction remains opt-in via
+`--derive-environment-from-port` and
+`--correct-default-environment-from-port`.
+
 ## Host Attribution
 
 `public.session_history` includes nullable `client_ip` and `host_name` text

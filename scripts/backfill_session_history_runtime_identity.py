@@ -17,6 +17,21 @@ Typical local usage:
       --target-db-name aawm_tristore \\
       --apply
 
+ClickHouse fetch is keyset-paginated (RR-072). Large histories should use
+`--clickhouse-page-size` (default 1000) and can resume after a partial run with
+`--clickhouse-resume-after-id <last_observation_id>`. Optional
+`--clickhouse-max-pages` (positive integer) caps one invocation. PostgreSQL
+temp-table loads use `--insert-batch-size` (default 1000). Auth is resolved
+once in ``main()`` and threaded through preflight/fetch (not re-derived per
+request layer). Each ClickHouse page is derived and inserted before the next
+page is requested, so Python identity retention stays O(page size) rather than
+O(total rows).
+
+    ./.venv/bin/python scripts/backfill_session_history_runtime_identity.py \\
+      --clickhouse-page-size 500 \\
+      --clickhouse-resume-after-id obs-abc \\
+      --insert-batch-size 500
+
 Port-derived environment correction is opt-in:
 
     ./.venv/bin/python scripts/backfill_session_history_runtime_identity.py \\
@@ -168,7 +183,10 @@ def _normalize_clickhouse_url(value: Optional[str]) -> str:
     hostname = (parsed.hostname or "127.0.0.1").replace("clickhouse", "127.0.0.1")
     port = f":{parsed.port}" if parsed.port else ""
     netloc = f"{hostname}{port}"
-    return urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
 
 def _redact_clickhouse_url_userinfo(url: Optional[str]) -> Optional[str]:
     if url is None:
@@ -185,7 +203,9 @@ def _redact_clickhouse_url_userinfo(url: Optional[str]) -> Optional[str]:
             userinfo = f"{userinfo}:***"
         userinfo = f"{userinfo}@"
     redacted_netloc = f"{userinfo}{hostname}{port}"
-    return urlunsplit((parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit(
+        (parsed.scheme, redacted_netloc, parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 def _build_clickhouse_auth_diagnostics(auth: Dict[str, str]) -> Dict[str, Any]:
@@ -198,13 +218,13 @@ def _build_clickhouse_auth_diagnostics(auth: Dict[str, str]) -> Dict[str, Any]:
         "url_source": auth["url_source"],
         "user_source": auth["user_source"],
         "password_source": auth["password_source"],
-        "using_builtin_local_url_default": auth["url_source"] == "default:local_http_8123",
+        "using_builtin_local_url_default": auth["url_source"]
+        == "default:local_http_8123",
         "using_builtin_clickhouse_credentials": (
             auth["user_source"] == "default:clickhouse_builtin"
             and auth["password_source"] == "default:clickhouse_builtin"
         ),
     }
-
 
 
 def _postgres_dsn_from_args(args: argparse.Namespace) -> str:
@@ -288,10 +308,10 @@ def _clickhouse_auth_diagnostics(auth: Dict[str, str]) -> Dict[str, Any]:
     return _build_clickhouse_auth_diagnostics(auth)
 
 
-def _preflight_clickhouse_connection(auth: Dict[str, str], *, timeout_seconds: int) -> None:
-    header = "Basic " + base64.b64encode(
-        f"{auth['user']}:{auth['password']}".encode()
-    ).decode("ascii")
+def _preflight_clickhouse_connection(
+    auth: Dict[str, str], *, timeout_seconds: int
+) -> None:
+    header = _clickhouse_auth_header(auth)
     parsed = urlsplit(auth["url"])
     query_url = urlunsplit(
         (
@@ -316,16 +336,28 @@ def _preflight_clickhouse_connection(auth: Dict[str, str], *, timeout_seconds: i
             response.read()
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"ClickHouse preflight failed with HTTP {exc.code}: {body}") from exc
+        raise RuntimeError(
+            f"ClickHouse preflight failed with HTTP {exc.code}: {body}"
+        ) from exc
 
 
-def _clickhouse_auth_header(args: argparse.Namespace) -> str:
-    auth = _resolve_clickhouse_auth_sources(args)
-    return "Basic " + base64.b64encode(f"{auth['user']}:{auth['password']}".encode()).decode("ascii")
+def _clickhouse_auth_header(auth: Dict[str, str]) -> str:
+    """Build Basic auth from a pre-resolved auth dict (RR-072: resolve once)."""
+    return "Basic " + base64.b64encode(
+        f"{auth['user']}:{auth['password']}".encode()
+    ).decode("ascii")
 
 
-def _request_clickhouse_rows(args: argparse.Namespace, query: str) -> list[Dict[str, Any]]:
-    auth = _resolve_clickhouse_auth_sources(args)
+def _request_clickhouse_rows(
+    auth: Dict[str, str],
+    query: str,
+    *,
+    timeout_seconds: int,
+) -> list[Dict[str, Any]]:
+    """POST a ClickHouse query and parse JSONEachRow lines.
+
+    Auth must be resolved once by the caller and threaded in (RR-072).
+    """
     base_url = auth["url"]
     parsed = urlsplit(base_url)
     query_url = urlunsplit(
@@ -340,22 +372,26 @@ def _request_clickhouse_rows(args: argparse.Namespace, query: str) -> list[Dict[
     request = Request(
         query_url,
         headers={
-            "Authorization": _clickhouse_auth_header(args),
+            "Authorization": _clickhouse_auth_header(auth),
             "Content-Type": "text/plain; charset=utf-8",
         },
         data=query.encode("utf-8"),
         method="POST",
     )
     try:
-        with urlopen(request, timeout=args.clickhouse_timeout_seconds) as response:
+        with urlopen(request, timeout=timeout_seconds) as response:
             payload = response.read().decode("utf-8")
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"ClickHouse query failed with HTTP {exc.code}: {body}") from exc
+        raise RuntimeError(
+            f"ClickHouse query failed with HTTP {exc.code}: {body}"
+        ) from exc
     return [json.loads(line) for line in payload.splitlines() if line.strip()]
 
 
-def _port_environment_from_requester_metadata(value: Any) -> tuple[Optional[str], Optional[str]]:
+def _port_environment_from_requester_metadata(
+    value: Any,
+) -> tuple[Optional[str], Optional[str]]:
     parsed = _parse_clickhouse_value(value)
     if not isinstance(parsed, dict):
         return None, None
@@ -372,8 +408,52 @@ def _port_environment_from_requester_metadata(value: Any) -> tuple[Optional[str]
     return None, host
 
 
-def _fetch_observation_identities(args: argparse.Namespace) -> list[ObservationIdentity]:
-    query = """
+def _sql_string_literal(value: str) -> str:
+    """Escape a string for safe embedding as a ClickHouse single-quoted literal."""
+    escaped = value.replace(chr(92), chr(92) * 2).replace(chr(39), chr(92) + chr(39))
+    return chr(39) + escaped + chr(39)
+
+
+def _build_observation_identity_page_query(
+    *,
+    limit: int,
+    cursor_id: Optional[str] = None,
+) -> str:
+    """Build one paged GENERATION observation query (ORDER BY id + LIMIT).
+
+    Keyset pagination on ``o.id`` keeps pages stable and resumable without
+    OFFSET scan cost (RR-072).
+    """
+    if limit < 1:
+        raise ValueError("clickhouse page limit must be >= 1")
+
+    predicates = [
+        "o.type = 'GENERATION'",
+        "o.is_deleted = 0",
+        "("
+        "length(t.environment) > 0 OR "
+        "length(o.metadata['litellm_environment']) > 0 OR "
+        "length(o.metadata['trace_environment']) > 0 OR "
+        "length(o.metadata['source_trace_environment']) > 0 OR "
+        "length(o.metadata['litellm_version']) > 0 OR "
+        "length(o.metadata['litellm_fork_version']) > 0 OR "
+        "length(o.metadata['litellm_wheel_versions']) > 0 OR "
+        "length(o.metadata['client_name']) > 0 OR "
+        "length(o.metadata['client_version']) > 0 OR "
+        "length(o.metadata['client_user_agent']) > 0 OR "
+        "length(o.metadata['user_agent']) > 0 OR "
+        "length(o.metadata['http_user_agent']) > 0 OR "
+        "length(o.metadata['cc_version']) > 0 OR "
+        "length(o.metadata['cc_entrypoint']) > 0 OR "
+        "length(o.metadata['anthropic_billing_header_fields']) > 0 OR "
+        "length(o.metadata['requester_metadata']) > 0"
+        ")",
+    ]
+    if cursor_id:
+        predicates.append(f"o.id > {_sql_string_literal(cursor_id)}")
+
+    where_sql = " AND ".join(predicates)
+    return f"""
 SELECT
   o.id AS observation_id,
   o.trace_id AS trace_id,
@@ -382,78 +462,157 @@ SELECT
   t.environment AS trace_environment
 FROM observations AS o
 LEFT JOIN traces AS t ON t.id = o.trace_id AND t.is_deleted = 0
-WHERE o.type = 'GENERATION'
-  AND o.is_deleted = 0
-  AND (
-    length(t.environment) > 0 OR
-    length(o.metadata['litellm_environment']) > 0 OR
-    length(o.metadata['trace_environment']) > 0 OR
-    length(o.metadata['source_trace_environment']) > 0 OR
-    length(o.metadata['litellm_version']) > 0 OR
-    length(o.metadata['litellm_fork_version']) > 0 OR
-    length(o.metadata['litellm_wheel_versions']) > 0 OR
-    length(o.metadata['client_name']) > 0 OR
-    length(o.metadata['client_version']) > 0 OR
-    length(o.metadata['client_user_agent']) > 0 OR
-    length(o.metadata['user_agent']) > 0 OR
-    length(o.metadata['http_user_agent']) > 0 OR
-    length(o.metadata['cc_version']) > 0 OR
-    length(o.metadata['cc_entrypoint']) > 0 OR
-    length(o.metadata['anthropic_billing_header_fields']) > 0 OR
-    length(o.metadata['requester_metadata']) > 0
-  )
+WHERE {where_sql}
+ORDER BY o.id ASC
+LIMIT {int(limit)}
 FORMAT JSONEachRow
 """
+
+
+def _observation_identity_from_row(
+    row: Dict[str, Any],
+    *,
+    derive_environment_from_port: bool,
+    correct_default_environment_from_port: bool,
+) -> Optional[ObservationIdentity]:
+    observation_id = _clean(row.get("observation_id"))
+    if observation_id is None:
+        return None
+
+    metadata = {
+        str(key): _parse_clickhouse_value(value)
+        for key, value in (row.get("observation_metadata") or {}).items()
+    }
+    trace_environment = _clean(row.get("trace_environment"))
+    if trace_environment and not metadata.get("source_trace_environment"):
+        metadata["source_trace_environment"] = trace_environment
+
+    identity = _build_session_runtime_identity(
+        metadata=metadata,
+        trace_environment=trace_environment,
+        allow_runtime=False,
+    )
+    port_environment, port_host = _port_environment_from_requester_metadata(
+        row.get("requester_metadata")
+    )
+
+    litellm_environment = _clean(identity.get("litellm_environment"))
+    if derive_environment_from_port and port_environment:
+        if litellm_environment is None or (
+            correct_default_environment_from_port and litellm_environment == "default"
+        ):
+            litellm_environment = port_environment
+
+    item = ObservationIdentity(
+        observation_id=observation_id,
+        trace_id=_clean(row.get("trace_id")),
+        litellm_environment=litellm_environment,
+        litellm_version=_clean(identity.get("litellm_version")),
+        litellm_fork_version=_clean(identity.get("litellm_fork_version")),
+        litellm_wheel_versions=_coerce_json_object(
+            identity.get("litellm_wheel_versions")
+        ),
+        client_name=_clean(identity.get("client_name")),
+        client_version=_clean(identity.get("client_version")),
+        client_user_agent=_clean(identity.get("client_user_agent")),
+        port_environment=port_environment,
+        port_host=port_host,
+    )
+    if any(getattr(item, field) for field in RUNTIME_IDENTITY_FIELDS):
+        return item
+    return None
+
+
+def _iter_observation_identity_pages(
+    args: argparse.Namespace,
+    auth: Dict[str, str],
+) -> Iterable[list[ObservationIdentity]]:
+    """Yield one page of derived observation identities at a time.
+
+    Uses keyset pagination (``o.id > cursor`` + LIMIT) so large histories do not
+    require one unbounded HTTP response (RR-072). Callers should consume and
+    persist each page before requesting the next so peak Python retention stays
+    O(page size). Cross-page de-duplication relies on the stable ``o.id`` keyset
+    cursor; only page-local de-duplication is retained for malformed responses.
+    """
+    page_size = int(getattr(args, "clickhouse_page_size", 1000) or 1000)
+    if page_size < 1:
+        raise ValueError("clickhouse_page_size must be >= 1")
+    max_pages = getattr(args, "clickhouse_max_pages", None)
+    if max_pages is not None:
+        max_pages = int(max_pages)
+        if max_pages < 1:
+            raise ValueError("clickhouse_max_pages must be >= 1")
+
+    cursor_id: Optional[str] = _clean(getattr(args, "clickhouse_resume_after_id", None))
+    pages_fetched = 0
+
+    try:
+        while True:
+            if max_pages is not None and pages_fetched >= max_pages:
+                break
+            query = _build_observation_identity_page_query(
+                limit=page_size,
+                cursor_id=cursor_id,
+            )
+            rows = _request_clickhouse_rows(
+                auth,
+                query,
+                timeout_seconds=args.clickhouse_timeout_seconds,
+            )
+            pages_fetched += 1
+            if not rows:
+                break
+
+            page_last_id: Optional[str] = None
+            page_seen: set[str] = set()
+            page_identities: list[ObservationIdentity] = []
+            for row in rows:
+                observation_id = _clean(row.get("observation_id"))
+                if observation_id is not None:
+                    page_last_id = observation_id
+                if observation_id is None or observation_id in page_seen:
+                    continue
+                page_seen.add(observation_id)
+                item = _observation_identity_from_row(
+                    row,
+                    derive_environment_from_port=bool(
+                        args.derive_environment_from_port
+                    ),
+                    correct_default_environment_from_port=bool(
+                        args.correct_default_environment_from_port
+                    ),
+                )
+                if item is not None:
+                    page_identities.append(item)
+
+            yield page_identities
+
+            # Always record the last raw row id for resume/diagnostics, even when
+            # the final page is short (RR-072).
+            if page_last_id is None:
+                break
+            cursor_id = page_last_id
+            if len(rows) < page_size:
+                break
+    finally:
+        # Stash pagination stats even if the consumer stops early.
+        args._clickhouse_pages_fetched = pages_fetched  # type: ignore[attr-defined]
+        args._clickhouse_last_cursor_id = cursor_id  # type: ignore[attr-defined]
+
+
+def _fetch_observation_identities(
+    args: argparse.Namespace,
+    auth: Dict[str, str],
+) -> list[ObservationIdentity]:
+    """Materialize all observation-identity pages (test/helper path only).
+
+    Production ``main()`` streams pages via ``_iter_observation_identity_pages``
+    so peak identity retention stays O(page size).
+    """
     identities: list[ObservationIdentity] = []
-    seen: set[str] = set()
-    for row in _request_clickhouse_rows(args, query):
-        observation_id = _clean(row.get("observation_id"))
-        if observation_id is None or observation_id in seen:
-            continue
-        seen.add(observation_id)
-
-        metadata = {
-            str(key): _parse_clickhouse_value(value)
-            for key, value in (row.get("observation_metadata") or {}).items()
-        }
-        trace_environment = _clean(row.get("trace_environment"))
-        if trace_environment and not metadata.get("source_trace_environment"):
-            metadata["source_trace_environment"] = trace_environment
-
-        identity = _build_session_runtime_identity(
-            metadata=metadata,
-            trace_environment=trace_environment,
-            allow_runtime=False,
-        )
-        port_environment, port_host = _port_environment_from_requester_metadata(
-            row.get("requester_metadata")
-        )
-
-        litellm_environment = _clean(identity.get("litellm_environment"))
-        if args.derive_environment_from_port and port_environment:
-            if litellm_environment is None or (
-                args.correct_default_environment_from_port
-                and litellm_environment == "default"
-            ):
-                litellm_environment = port_environment
-
-        item = ObservationIdentity(
-            observation_id=observation_id,
-            trace_id=_clean(row.get("trace_id")),
-            litellm_environment=litellm_environment,
-            litellm_version=_clean(identity.get("litellm_version")),
-            litellm_fork_version=_clean(identity.get("litellm_fork_version")),
-            litellm_wheel_versions=_coerce_json_object(
-                identity.get("litellm_wheel_versions")
-            ),
-            client_name=_clean(identity.get("client_name")),
-            client_version=_clean(identity.get("client_version")),
-            client_user_agent=_clean(identity.get("client_user_agent")),
-            port_environment=port_environment,
-            port_host=port_host,
-        )
-        if any(getattr(item, field) for field in RUNTIME_IDENTITY_FIELDS):
-            identities.append(item)
+    for page in _iter_observation_identity_pages(args, auth):
+        identities.extend(page)
     return identities
 
 
@@ -482,10 +641,15 @@ def _derive_trace_identities(
     return traces
 
 
-def _insert_temp_rows(
+def _iter_batches(items: Sequence[Any], batch_size: int) -> Iterable[Sequence[Any]]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    for index in range(0, len(items), batch_size):
+        yield items[index : index + batch_size]
+
+
+def _create_temp_identity_tables(
     cur: psycopg.Cursor,
-    observations: list[ObservationIdentity],
-    traces: list[TraceIdentity],
 ) -> None:
     cur.execute(
         """
@@ -519,48 +683,235 @@ CREATE TEMPORARY TABLE tmp_session_history_runtime_identity_trace (
 ) ON COMMIT DROP
 """
     )
-    cur.executemany(
-        """
+
+
+def _insert_observation_identity_rows(
+    cur: psycopg.Cursor,
+    observations: list[ObservationIdentity],
+    *,
+    insert_batch_size: int = 1000,
+) -> None:
+    if not observations:
+        return
+    obs_sql = """
 INSERT INTO tmp_session_history_runtime_identity_obs VALUES
 (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-""",
-        [
-            (
-                item.observation_id,
-                item.trace_id,
-                item.litellm_environment,
-                item.litellm_version,
-                item.litellm_fork_version,
-                item.litellm_wheel_versions,
-                item.client_name,
-                item.client_version,
-                item.client_user_agent,
-                item.port_environment,
-                item.port_host,
-            )
-            for item in observations
-        ],
-    )
-    cur.executemany(
-        """
+"""
+    for batch in _iter_batches(observations, insert_batch_size):
+        cur.executemany(
+            obs_sql,
+            [
+                (
+                    item.observation_id,
+                    item.trace_id,
+                    item.litellm_environment,
+                    item.litellm_version,
+                    item.litellm_fork_version,
+                    item.litellm_wheel_versions,
+                    item.client_name,
+                    item.client_version,
+                    item.client_user_agent,
+                    item.port_environment,
+                    item.port_host,
+                )
+                for item in batch
+            ],
+        )
+
+
+def _insert_trace_identity_rows(
+    cur: psycopg.Cursor,
+    traces: list[TraceIdentity],
+    *,
+    insert_batch_size: int = 1000,
+) -> None:
+    if not traces:
+        return
+    trace_sql = """
 INSERT INTO tmp_session_history_runtime_identity_trace VALUES
 (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-""",
-        [
-            (
-                item.trace_id,
-                item.litellm_environment,
-                item.litellm_version,
-                item.litellm_fork_version,
-                item.litellm_wheel_versions,
-                item.client_name,
-                item.client_version,
-                item.client_user_agent,
-                item.port_environment,
-            )
-            for item in traces
-        ],
+"""
+    for batch in _iter_batches(traces, insert_batch_size):
+        cur.executemany(
+            trace_sql,
+            [
+                (
+                    item.trace_id,
+                    item.litellm_environment,
+                    item.litellm_version,
+                    item.litellm_fork_version,
+                    item.litellm_wheel_versions,
+                    item.client_name,
+                    item.client_version,
+                    item.client_user_agent,
+                    item.port_environment,
+                )
+                for item in batch
+            ],
+        )
+
+
+def _populate_trace_identities_from_obs_temp(cur: psycopg.Cursor) -> int:
+    """Derive fill-safe per-trace identities from the temp observation table.
+
+    Mirrors ``_derive_trace_identities``: keep a field only when all non-null
+    observation values for that trace agree. Avoids retaining O(total rows) of
+    observation identities in Python after pages have been loaded.
+    """
+    cur.execute(
+        """
+INSERT INTO tmp_session_history_runtime_identity_trace (
+    trace_id,
+    litellm_environment,
+    litellm_version,
+    litellm_fork_version,
+    litellm_wheel_versions,
+    client_name,
+    client_version,
+    client_user_agent,
+    port_environment
+)
+SELECT
+    o.trace_id,
+    CASE
+        WHEN count(DISTINCT o.litellm_environment)
+            FILTER (WHERE o.litellm_environment IS NOT NULL) = 1
+        THEN min(o.litellm_environment)
+            FILTER (WHERE o.litellm_environment IS NOT NULL)
+        ELSE NULL
+    END AS litellm_environment,
+    CASE
+        WHEN count(DISTINCT o.litellm_version)
+            FILTER (WHERE o.litellm_version IS NOT NULL) = 1
+        THEN min(o.litellm_version) FILTER (WHERE o.litellm_version IS NOT NULL)
+        ELSE NULL
+    END AS litellm_version,
+    CASE
+        WHEN count(DISTINCT o.litellm_fork_version)
+            FILTER (WHERE o.litellm_fork_version IS NOT NULL) = 1
+        THEN min(o.litellm_fork_version)
+            FILTER (WHERE o.litellm_fork_version IS NOT NULL)
+        ELSE NULL
+    END AS litellm_fork_version,
+    CASE
+        WHEN count(DISTINCT o.litellm_wheel_versions)
+            FILTER (WHERE o.litellm_wheel_versions IS NOT NULL) = 1
+        THEN min(o.litellm_wheel_versions)
+            FILTER (WHERE o.litellm_wheel_versions IS NOT NULL)
+        ELSE NULL
+    END AS litellm_wheel_versions,
+    CASE
+        WHEN count(DISTINCT o.client_name)
+            FILTER (WHERE o.client_name IS NOT NULL) = 1
+        THEN min(o.client_name) FILTER (WHERE o.client_name IS NOT NULL)
+        ELSE NULL
+    END AS client_name,
+    CASE
+        WHEN count(DISTINCT o.client_version)
+            FILTER (WHERE o.client_version IS NOT NULL) = 1
+        THEN min(o.client_version) FILTER (WHERE o.client_version IS NOT NULL)
+        ELSE NULL
+    END AS client_version,
+    CASE
+        WHEN count(DISTINCT o.client_user_agent)
+            FILTER (WHERE o.client_user_agent IS NOT NULL) = 1
+        THEN min(o.client_user_agent)
+            FILTER (WHERE o.client_user_agent IS NOT NULL)
+        ELSE NULL
+    END AS client_user_agent,
+    CASE
+        WHEN count(DISTINCT o.port_environment)
+            FILTER (WHERE o.port_environment IS NOT NULL) = 1
+        THEN min(o.port_environment)
+            FILTER (WHERE o.port_environment IS NOT NULL)
+        ELSE NULL
+    END AS port_environment
+FROM tmp_session_history_runtime_identity_obs AS o
+WHERE o.trace_id IS NOT NULL
+  AND o.trace_id <> ''
+GROUP BY o.trace_id
+HAVING
+    (
+        CASE
+            WHEN count(DISTINCT o.litellm_environment)
+                FILTER (WHERE o.litellm_environment IS NOT NULL) = 1
+            THEN min(o.litellm_environment)
+                FILTER (WHERE o.litellm_environment IS NOT NULL)
+            ELSE NULL
+        END
+    ) IS NOT NULL
+    OR (
+        CASE
+            WHEN count(DISTINCT o.litellm_version)
+                FILTER (WHERE o.litellm_version IS NOT NULL) = 1
+            THEN min(o.litellm_version)
+                FILTER (WHERE o.litellm_version IS NOT NULL)
+            ELSE NULL
+        END
+    ) IS NOT NULL
+    OR (
+        CASE
+            WHEN count(DISTINCT o.litellm_fork_version)
+                FILTER (WHERE o.litellm_fork_version IS NOT NULL) = 1
+            THEN min(o.litellm_fork_version)
+                FILTER (WHERE o.litellm_fork_version IS NOT NULL)
+            ELSE NULL
+        END
+    ) IS NOT NULL
+    OR (
+        CASE
+            WHEN count(DISTINCT o.litellm_wheel_versions)
+                FILTER (WHERE o.litellm_wheel_versions IS NOT NULL) = 1
+            THEN min(o.litellm_wheel_versions)
+                FILTER (WHERE o.litellm_wheel_versions IS NOT NULL)
+            ELSE NULL
+        END
+    ) IS NOT NULL
+    OR (
+        CASE
+            WHEN count(DISTINCT o.client_name)
+                FILTER (WHERE o.client_name IS NOT NULL) = 1
+            THEN min(o.client_name) FILTER (WHERE o.client_name IS NOT NULL)
+            ELSE NULL
+        END
+    ) IS NOT NULL
+    OR (
+        CASE
+            WHEN count(DISTINCT o.client_version)
+                FILTER (WHERE o.client_version IS NOT NULL) = 1
+            THEN min(o.client_version)
+                FILTER (WHERE o.client_version IS NOT NULL)
+            ELSE NULL
+        END
+    ) IS NOT NULL
+    OR (
+        CASE
+            WHEN count(DISTINCT o.client_user_agent)
+                FILTER (WHERE o.client_user_agent IS NOT NULL) = 1
+            THEN min(o.client_user_agent)
+                FILTER (WHERE o.client_user_agent IS NOT NULL)
+            ELSE NULL
+        END
+    ) IS NOT NULL
+"""
     )
+    cur.execute("SELECT count(*) FROM tmp_session_history_runtime_identity_trace")
+    return int(cur.fetchone()[0])
+
+
+def _insert_temp_rows(
+    cur: psycopg.Cursor,
+    observations: list[ObservationIdentity],
+    traces: list[TraceIdentity],
+    *,
+    insert_batch_size: int = 1000,
+) -> None:
+    """Create temp tables and load pre-materialized identity lists (test helper)."""
+    _create_temp_identity_tables(cur)
+    _insert_observation_identity_rows(
+        cur, observations, insert_batch_size=insert_batch_size
+    )
+    _insert_trace_identity_rows(cur, traces, insert_batch_size=insert_batch_size)
 
 
 def _matched_cte(correct_default_environment_from_port: bool) -> str:
@@ -614,7 +965,9 @@ WITH matched AS (
 """
 
 
-def _dry_run(cur: psycopg.Cursor, *, correct_default_environment_from_port: bool) -> Dict[str, Any]:
+def _dry_run(
+    cur: psycopg.Cursor, *, correct_default_environment_from_port: bool
+) -> Dict[str, Any]:
     cur.execute(
         _matched_cte(correct_default_environment_from_port)
         + """
@@ -702,7 +1055,9 @@ def _parse_args() -> argparse.Namespace:
             "Langfuse ClickHouse observations using AawmAgentIdentity rules."
         )
     )
-    parser.add_argument("--apply", action="store_true", help="Write updates. Default is dry-run.")
+    parser.add_argument(
+        "--apply", action="store_true", help="Write updates. Default is dry-run."
+    )
     parser.add_argument(
         "--target-db-name",
         default="aawm_tristore",
@@ -712,11 +1067,47 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pg-host", default=None, help="PostgreSQL host override.")
     parser.add_argument("--pg-port", default=None, help="PostgreSQL port override.")
     parser.add_argument("--pg-user", default=None, help="PostgreSQL user override.")
-    parser.add_argument("--pg-password", default=None, help="PostgreSQL password override.")
+    parser.add_argument(
+        "--pg-password", default=None, help="PostgreSQL password override."
+    )
     parser.add_argument("--clickhouse-url", default=None, help="ClickHouse HTTP URL.")
     parser.add_argument("--clickhouse-user", default=None, help="ClickHouse user.")
-    parser.add_argument("--clickhouse-password", default=None, help="ClickHouse password.")
+    parser.add_argument(
+        "--clickhouse-password", default=None, help="ClickHouse password."
+    )
     parser.add_argument("--clickhouse-timeout-seconds", type=int, default=90)
+    parser.add_argument(
+        "--clickhouse-page-size",
+        type=int,
+        default=1000,
+        help=(
+            "ClickHouse page size (LIMIT) for observation identity fetch. "
+            "Pages use keyset pagination on observation id (RR-072)."
+        ),
+    )
+    parser.add_argument(
+        "--clickhouse-max-pages",
+        type=int,
+        default=None,
+        help=(
+            "Optional safety cap on ClickHouse pages fetched in one run "
+            "(positive integer). Omit to read until the table is exhausted."
+        ),
+    )
+    parser.add_argument(
+        "--clickhouse-resume-after-id",
+        default=None,
+        help=(
+            "Resume ClickHouse keyset pagination after this observation id "
+            "(exclusive). Useful after a partial/timeout run."
+        ),
+    )
+    parser.add_argument(
+        "--insert-batch-size",
+        type=int,
+        default=1000,
+        help="PostgreSQL executemany batch size when loading temp identity tables.",
+    )
     parser.add_argument(
         "--derive-environment-from-port",
         action="store_true",
@@ -735,19 +1126,28 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    if args.correct_default_environment_from_port and not args.derive_environment_from_port:
+    if (
+        args.correct_default_environment_from_port
+        and not args.derive_environment_from_port
+    ):
         raise SystemExit(
             "--correct-default-environment-from-port requires --derive-environment-from-port"
         )
 
+    # Resolve ClickHouse auth once and thread it through all CH call sites (RR-072).
     clickhouse_auth = _resolve_clickhouse_auth_sources(args)
     _preflight_clickhouse_connection(
         clickhouse_auth,
         timeout_seconds=args.clickhouse_timeout_seconds,
     )
 
-    observations = _fetch_observation_identities(args)
-    traces = _derive_trace_identities(observations)
+    if int(args.clickhouse_page_size) < 1:
+        raise SystemExit("--clickhouse-page-size must be >= 1")
+    if int(args.insert_batch_size) < 1:
+        raise SystemExit("--insert-batch-size must be >= 1")
+    if args.clickhouse_max_pages is not None and int(args.clickhouse_max_pages) < 1:
+        raise SystemExit("--clickhouse-max-pages must be >= 1")
+
     dsn = _postgres_dsn_from_args(args)
 
     with psycopg.connect(dsn) as conn:
@@ -759,7 +1159,16 @@ def main() -> int:
                     f"Refusing to run against {database!r}; expected {args.target_db_name!r}."
                 )
 
-            _insert_temp_rows(cur, observations, traces)
+            _create_temp_identity_tables(cur)
+            observation_identity_rows = 0
+            for page in _iter_observation_identity_pages(args, clickhouse_auth):
+                _insert_observation_identity_rows(
+                    cur,
+                    page,
+                    insert_batch_size=int(args.insert_batch_size),
+                )
+                observation_identity_rows += len(page)
+            trace_identity_rows = _populate_trace_identities_from_obs_temp(cur)
             dry_run = _dry_run(
                 cur,
                 correct_default_environment_from_port=args.correct_default_environment_from_port,
@@ -768,8 +1177,16 @@ def main() -> int:
                 "database": database,
                 "mode": "apply" if args.apply else "dry-run",
                 "clickhouse_auth": _clickhouse_auth_diagnostics(clickhouse_auth),
-                "observation_identity_rows": len(observations),
-                "trace_identity_rows": len(traces),
+                "observation_identity_rows": observation_identity_rows,
+                "trace_identity_rows": trace_identity_rows,
+                "clickhouse_page_size": int(args.clickhouse_page_size),
+                "clickhouse_pages_fetched": int(
+                    getattr(args, "_clickhouse_pages_fetched", 0) or 0
+                ),
+                "clickhouse_last_cursor_id": getattr(
+                    args, "_clickhouse_last_cursor_id", None
+                ),
+                "insert_batch_size": int(args.insert_batch_size),
                 "would_fill": dry_run,
             }
             if args.apply:
@@ -781,7 +1198,7 @@ def main() -> int:
             else:
                 conn.rollback()
 
-    print(json.dumps(result, indent=2, sort_keys=True))
+    print(json.dumps(result, indent=2, sort_keys=True))  # noqa: T201
     return 0
 
 
