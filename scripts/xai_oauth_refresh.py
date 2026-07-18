@@ -3,11 +3,8 @@
 
 from __future__ import annotations
 
-from litellm.secret_managers.credential_file_lock import credential_file_lock
-
 import json
 import os
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,20 +14,35 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
-DEFAULT_XAI_OAUTH_AUTH_FILE = "/home/zepfu/.litellm/xai/oauth-auth.json"
-DEFAULT_XAI_OAUTH_LOCK_FILE = "/home/zepfu/.litellm/xai/oauth-auth.json.lock"
+from litellm.secret_managers.credential_file_lock import credential_file_lock
+from litellm.secret_managers.credential_file_metadata import (
+    CredentialFileMetadata,
+    apply_credential_file_metadata,
+    resolve_credential_file_metadata,
+    snapshot_credential_file_metadata,
+)
+from litellm.secret_managers.credential_file_write import (
+    write_and_publish_private_text,
+    write_private_file_text,
+)
+
+from litellm.secret_managers.credential_error_sanitizer import (
+    DEFAULT_SECRET_FIELD_NAMES,
+    sanitize_credential_error_message,
+)
+
+# Portable ~ defaults (expanded via Path.expanduser at use sites).
+DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
+DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
 DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS = 300
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_XAI_OAUTH_AUTH_FILE_MODE = 0o600
+DEFAULT_XAI_OAUTH_ERROR_MESSAGE_LIMIT = 500
 
-_SECRET_FIELD_NAMES = {
-    "access_token",
-    "client_secret",
-    "id_token",
-    "key",
-    "refresh_token",
-}
+# Keep historical module alias; redaction lives in secret_managers.
+_SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
 
 
 @dataclass(frozen=True)
@@ -58,23 +70,14 @@ class XaiOAuthRefreshSummary:
 
 
 def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
-    """Create/write path with restrictive mode at creation time (no umask window)."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(str(path), flags, mode)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-    except Exception:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        raise
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
-
+    """Thin wrapper over shared private write (no umask window, symlink-safe)."""
+    write_private_file_text(
+        path,
+        content,
+        mode=mode,
+        default_mode=DEFAULT_XAI_OAUTH_AUTH_FILE_MODE,
+        refuse_symlink=True,
+    )
 
 
 def refresh_xai_oauth_auth_file(
@@ -104,7 +107,9 @@ def refresh_xai_oauth_auth_file(
         try:
             raw_payload = _read_credential_payload(resolved_auth_file)
             credential = _select_credential_record(raw_payload, resolved_scope)
-            current_expires_at = _format_expires_at(_parse_expires_at(credential.get("expires_at")))
+            current_expires_at = _format_expires_at(
+                _parse_expires_at(credential.get("expires_at"))
+            )
 
             if not force and not _credential_needs_refresh(
                 credential,
@@ -153,7 +158,9 @@ def refresh_xai_oauth_auth_file(
 def _resolve_scope(scope: Optional[str]) -> str:
     if isinstance(scope, str) and scope.strip():
         return scope.strip()
-    env_scope = os.getenv("AAWM_XAI_OAUTH_SCOPE") or os.getenv("LITELLM_XAI_OAUTH_SCOPE")
+    env_scope = os.getenv("AAWM_XAI_OAUTH_SCOPE") or os.getenv(
+        "LITELLM_XAI_OAUTH_SCOPE"
+    )
     if isinstance(env_scope, str) and env_scope.strip():
         return env_scope.strip()
     return DEFAULT_XAI_OAUTH_SCOPE
@@ -175,27 +182,49 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
 
 @contextmanager
 def _credential_file_lock(lock_path: Path) -> Iterator[None]:
-    """Delegate to shared credential_file_lock (fcntl + warning on failure)."""
+    """Delegate to shared credential_file_lock (module-scoped fcntl + warnings)."""
     with credential_file_lock(lock_path):
         yield
 
-    handle = lock_path.open("a+", encoding="utf-8")
-    try:
-        try:
-            import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
-        yield
-    finally:
-        try:
-            import fcntl
+def _snapshot_credential_file_metadata(
+    auth_path: Path,
+) -> CredentialFileMetadata:
+    return snapshot_credential_file_metadata(
+        auth_path,
+        default_mode=DEFAULT_XAI_OAUTH_AUTH_FILE_MODE,
+        refuse_symlink=True,
+    )
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except (ImportError, OSError):
-            pass
-        handle.close()
+
+def _resolve_credential_file_metadata(auth_path: Path) -> CredentialFileMetadata:
+    """Resolve ownership/mode for ``auth_path`` via shared helpers.
+
+    Snapshot goes through ``_snapshot_credential_file_metadata`` so tests and
+    monkeypatches of the thin local wrapper remain effective. Symlink targets
+    are refused during snapshot/resolve.
+    """
+    return resolve_credential_file_metadata(
+        auth_path,
+        default_mode=DEFAULT_XAI_OAUTH_AUTH_FILE_MODE,
+        mode_env="AAWM_XAI_OAUTH_AUTH_FILE_MODE",
+        uid_env="AAWM_XAI_OAUTH_AUTH_FILE_UID",
+        gid_env="AAWM_XAI_OAUTH_AUTH_FILE_GID",
+        base_metadata=_snapshot_credential_file_metadata(auth_path),
+        refuse_symlink=True,
+    )
+
+
+def _apply_credential_file_metadata(
+    target_path: Path,
+    metadata: CredentialFileMetadata,
+) -> None:
+    apply_credential_file_metadata(
+        target_path,
+        metadata,
+        default_mode=DEFAULT_XAI_OAUTH_AUTH_FILE_MODE,
+        refuse_symlink=True,
+    )
 
 
 def _read_credential_payload(auth_path: Path) -> Dict[str, Any]:
@@ -205,7 +234,9 @@ def _read_credential_payload(auth_path: Path) -> Dict[str, Any]:
     except FileNotFoundError as exc:
         raise ValueError(f"xAI OAuth auth file not found at {auth_path}.") from exc
     except json.JSONDecodeError as exc:
-        raise ValueError(f"xAI OAuth auth file at {auth_path} is not valid JSON.") from exc
+        raise ValueError(
+            f"xAI OAuth auth file at {auth_path} is not valid JSON."
+        ) from exc
 
     if not isinstance(payload, dict):
         raise ValueError("xAI OAuth auth file must contain a JSON object.")
@@ -234,7 +265,9 @@ def _select_credential_record(
 
 
 def _looks_like_credential_record(value: Mapping[str, Any]) -> bool:
-    return bool(value.get("key") or value.get("access_token") or value.get("refresh_token"))
+    return bool(
+        value.get("key") or value.get("access_token") or value.get("refresh_token")
+    )
 
 
 def _credential_needs_refresh(
@@ -242,9 +275,14 @@ def _credential_needs_refresh(
     *,
     buffer_seconds: int,
 ) -> bool:
+    """Return True when the credential should be refreshed.
+
+    Missing/unparseable ``expires_at`` fails safe toward refresh so a malformed
+    record is not treated as permanently fresh.
+    """
     expires_at = _parse_expires_at(credential.get("expires_at"))
     if expires_at is None:
-        return False
+        return True
     return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=buffer_seconds)
 
 
@@ -383,24 +421,28 @@ def _update_credential_record(
 
 
 def _write_credential_payload(auth_path: Path, payload: Mapping[str, Any]) -> None:
-    auth_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = auth_path.with_name(f".{auth_path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    """Publish credential JSON via shared exclusive temp + atomic replace.
+
+    Uses ``write_and_publish_private_text`` so temp names are not pid-only,
+    symlink targets are refused, and failed temps are cleaned up consistently.
+    """
     try:
+        # Shared one-shot path: exclusive private temp, symlink refusal, metadata
+        # apply on temp, atomic publish, and failed-temp cleanup. Symlink targets
+        # are refused both when resolving metadata and when publishing.
+        metadata = _resolve_credential_file_metadata(auth_path)
         content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-        try:
-            current_mode = auth_path.stat().st_mode & 0o777
-            if current_mode & 0o077:
-                current_mode = 0o600
-        except OSError:
-            current_mode = 0o600
-        _write_private_file_text(tmp_path, content, mode=current_mode)
-        os.replace(tmp_path, auth_path)
+        write_and_publish_private_text(
+            auth_path,
+            content,
+            metadata=metadata,
+            default_mode=DEFAULT_XAI_OAUTH_AUTH_FILE_MODE,
+            mkdir_parents=True,
+        )
     except (OSError, TypeError, ValueError) as exc:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise ValueError(f"Failed to persist refreshed xAI OAuth auth data: {exc}") from exc
+        raise ValueError(
+            f"Failed to persist refreshed xAI OAuth auth data: {exc}"
+        ) from exc
 
 
 def _clean_oauth_string(value: Any) -> Optional[str]:
@@ -409,11 +451,8 @@ def _clean_oauth_string(value: Any) -> Optional[str]:
     return None
 
 
-def _sanitize_error_message(message: str, *, limit: int = 500) -> str:
-    sanitized = str(message)
-    for field_name in _SECRET_FIELD_NAMES:
-        sanitized = sanitized.replace(field_name, f"{field_name[:3]}***")
-    if len(sanitized) > limit:
-        sanitized = sanitized[: limit - 3] + "..."
-    return sanitized
-
+def _sanitize_error_message(
+    message: str, *, limit: int = DEFAULT_XAI_OAUTH_ERROR_MESSAGE_LIMIT
+) -> str:
+    """Redact secret *values* keyed by known field names (not just the labels)."""
+    return sanitize_credential_error_message(message, limit=limit)

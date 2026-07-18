@@ -1417,7 +1417,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             "Managed xAI OAuth auth JSON file maintained by this sidecar. "
             "Defaults to AAWM_XAI_OAUTH_AUTH_FILE, then LiteLLM managed xAI "
-            "OAuth auth-file env vars, or /home/zepfu/.litellm/xai/oauth-auth.json."
+            "OAuth auth-file env vars, or ~/.litellm/xai/oauth-auth.json."
         ),
     )
     parser.add_argument(
@@ -1425,7 +1425,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=os.getenv("AAWM_XAI_OAUTH_LOCK_FILE", DEFAULT_XAI_OAUTH_LOCK_FILE),
         help=(
             "Lock file for sidecar managed xAI OAuth refresh writes. Defaults "
-            "to AAWM_XAI_OAUTH_LOCK_FILE or /home/zepfu/.litellm/xai/oauth-auth.json.lock."
+            "to AAWM_XAI_OAUTH_LOCK_FILE or ~/.litellm/xai/oauth-auth.json.lock."
         ),
     )
     parser.add_argument(

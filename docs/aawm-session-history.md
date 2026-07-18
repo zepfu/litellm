@@ -1336,21 +1336,36 @@ fresh, not a second LiteLLM-managed copy.
 ## Managed xAI OAuth Credentials
 
 Managed `oa_xai/*` routes read `LITELLM_XAI_OAUTH_AUTH_FILE`, normally
-`/home/zepfu/.litellm/xai/oauth-auth.json`. LiteLLM is a read-only consumer of
-that file. During request handling it selects a valid scoped credential and
-fails with clear sidecar-refresh wording when the credential is missing, lacks
-an access token, or is expired/near expiry. LiteLLM must not refresh or write
-this managed credential during model requests.
+`~/.litellm/xai/oauth-auth.json` (expanded with `Path.expanduser()`). AAWM
+compose commonly binds the expanded host path for that home-relative default.
+LiteLLM is a read-only consumer of that file. During request handling it selects
+a valid scoped credential and fails with clear sidecar-refresh wording when the
+credential is missing, lacks an access token, or is expired/near expiry. LiteLLM
+must not refresh or write this managed credential during model requests.
 
-The provider-status sidecar is the scheduled managed xAI OAuth writer. It
-mounts `/home/zepfu/.litellm/xai` writable, locks the configured auth file,
-refreshes using the managed credential's refresh token and OIDC client id, and
-writes updated access token, refresh token, ID token, token type, and expiry
-fields atomically. The dev LiteLLM container mounts the same host directory
-read-only. In dev compose the sidecar runs with
-`AAWM_XAI_OAUTH_REFRESH_ENABLED=1`,
-`AAWM_XAI_OAUTH_AUTH_FILE=/home/zepfu/.litellm/xai/oauth-auth.json`, and a
-one-hour refresh interval.
+The provider-status sidecar is the scheduled managed xAI OAuth writer. It mounts
+the configured managed xAI credential directory writable, locks the configured
+auth file, refreshes using the managed credential's refresh token and OIDC
+client id, and writes updated access token, refresh token, ID token, token type,
+and expiry fields atomically. `scripts/xai_oauth_refresh.py` and the sidecar
+CLI help/defaults use the portable `~/.litellm/xai/oauth-auth.json` auth path
+and matching lock file, reuse the shared `credential_file_lock` helper
+(module-scoped `fcntl` with flock-failure warnings, never silent), and publish
+through `credential_file_write.write_and_publish_private_text` with an
+exclusive same-directory `0600` temp, metadata applied before atomic replace,
+failed-temp cleanup, and symlink-target refusal. Ownership/mode snapshot,
+resolve, and apply use
+`litellm/secret_managers/credential_file_metadata.py`; group/other-readable or
+writable modes are clamped back to `0600`, and optional
+`AAWM_XAI_OAUTH_AUTH_FILE_UID` / `AAWM_XAI_OAUTH_AUTH_FILE_GID` /
+`AAWM_XAI_OAUTH_AUTH_FILE_MODE` overrides are honored when set. Missing or
+unparseable `expires_at` fails safe toward refresh rather than treating the
+record as permanently fresh. Upstream refresh error bodies have secret *values*
+redacted before they enter the returned summary or sidecar telemetry. The dev
+LiteLLM container mounts the same host directory read-only. In dev compose the
+sidecar runs with `AAWM_XAI_OAUTH_REFRESH_ENABLED=1`,
+`AAWM_XAI_OAUTH_AUTH_FILE` set to the expanded host path for
+`~/.litellm/xai/oauth-auth.json`, and a one-hour refresh interval.
 
 Each managed xAI OAuth refresh attempt writes sanitized provider-auth telemetry
 into `provider_auth_observations` and `provider_auth_current`. Rows use provider
