@@ -107,6 +107,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         self._reasoning_done_emitted = False
         self._reasoning_item_id: Optional[str] = None
         self._accumulated_reasoning_content_parts: List[str] = []
+        # Per-stream accumulation of provider_specific_fields from chat-completion
+        # chunks (e.g. code_interpreter_results). Instance-local to avoid leakage.
+        self._accumulated_provider_specific_fields: Dict[str, Any] = {}
 
     def _get_or_assign_tool_output_index(self, call_id: str) -> int:
         existing = self._tool_output_index_by_call_id.get(call_id)
@@ -479,16 +482,216 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         event.__dict__["sequence_number"] = self._sequence_number
         return event
 
+    @staticmethod
+    def _copy_provider_field_value(value: Any) -> Any:
+        """Copy mutable provider field values to avoid shared state.
+
+        Lists of dicts (e.g. code_interpreter_results) copy each dict entry so
+        downstream mutation of stamped ModelResponse fields cannot leak back
+        into the iterator accumulator.
+        """
+        if isinstance(value, list):
+            return [
+                dict(item) if isinstance(item, dict) else item for item in value
+            ]
+        if isinstance(value, dict):
+            return dict(value)
+        return value
+
+    @classmethod
+    def _copy_provider_specific_fields(cls, fields: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: cls._copy_provider_field_value(value) for key, value in fields.items()
+        }
+
+    @staticmethod
+    def _merge_list_provider_field_values(
+        existing: List[Any], incoming: List[Any]
+    ) -> List[Any]:
+        """
+        Merge list-valued provider_specific_fields without silent overwrite or
+        duplicate growth.
+
+        Providers may emit list fields either:
+        - cumulatively (each chunk has the full list so far), or
+        - incrementally (each chunk has only new items).
+
+        Prefer the cumulative form when detectable; otherwise append only items
+        not already present (equality-based) while preserving order.
+
+        For list items that are dicts with a stable ``id`` key (e.g.
+        ``code_interpreter_results``), merge by id with last-write-wins so later
+        emissions can enrich earlier entries (container_id, outputs) without
+        creating duplicates.
+        """
+        if not existing:
+            return [
+                dict(item) if isinstance(item, dict) else item for item in incoming
+            ]
+        if not incoming:
+            return [
+                dict(item) if isinstance(item, dict) else item for item in existing
+            ]
+
+        # Cumulative: incoming is existing plus zero-or-more suffix items.
+        if len(incoming) >= len(existing) and incoming[: len(existing)] == existing:
+            return [
+                dict(item) if isinstance(item, dict) else item for item in incoming
+            ]
+
+        # Incoming is a prefix/subset of what we already have — keep existing.
+        if len(existing) >= len(incoming) and existing[: len(incoming)] == incoming:
+            return [
+                dict(item) if isinstance(item, dict) else item for item in existing
+            ]
+
+        # Dict items with stable ids: last-write-wins per id, first-seen order.
+        combined = list(existing) + list(incoming)
+        if all(
+            isinstance(item, dict) and item.get("id") not in (None, "")
+            for item in combined
+        ):
+            by_id: Dict[str, Any] = {}
+            order: List[str] = []
+            for item in combined:
+                item_id = str(item["id"])
+                if item_id not in by_id:
+                    order.append(item_id)
+                by_id[item_id] = dict(item)
+            return [by_id[item_id] for item_id in order]
+
+        # Incremental: append only new items (preserve first-seen order).
+        merged = [
+            dict(item) if isinstance(item, dict) else item for item in existing
+        ]
+        for item in incoming:
+            candidate = dict(item) if isinstance(item, dict) else item
+            if candidate not in merged:
+                merged.append(candidate)
+        return merged
+
+    def _merge_provider_specific_fields(self, src: dict) -> None:
+        """
+        Merge provider_specific_fields from one streaming chunk into the
+        instance-local accumulator.
+
+        Merge semantics:
+        - Missing keys are added.
+        - Scalar / non-list values use last-value-wins.
+        - List values use cumulative-or-incremental merge that neither silently
+          drops earlier items nor grows quadratically from repeated cumulative
+          emissions.
+        - Stored values are copied so callers cannot mutate accumulated state.
+        """
+        for key, val in src.items():
+            if val is None:
+                continue
+            existing = self._accumulated_provider_specific_fields.get(key)
+            if (
+                existing is not None
+                and isinstance(val, list)
+                and isinstance(existing, list)
+            ):
+                self._accumulated_provider_specific_fields[key] = (
+                    self._merge_list_provider_field_values(existing, val)
+                )
+            else:
+                self._accumulated_provider_specific_fields[key] = (
+                    self._copy_provider_field_value(val)
+                )
+
+    def _accumulate_provider_specific_fields_from_chunk(
+        self, chunk: ModelResponseStream
+    ) -> None:
+        """Collect provider_specific_fields from chunk and delta surfaces."""
+        for src in (
+            getattr(chunk, "provider_specific_fields", None),
+            getattr(
+                chunk.choices[0].delta if chunk.choices else None,
+                "provider_specific_fields",
+                None,
+            ),
+        ):
+            if src and isinstance(src, dict):
+                self._merge_provider_specific_fields(src)
+
+    def _merge_stamped_provider_fields(
+        self, dest: Dict[str, Any], stamped: Dict[str, Any]
+    ) -> None:
+        """Merge stamped fields into dest without dropping ordered list values."""
+        for key, val in stamped.items():
+            if val is None:
+                continue
+            existing = dest.get(key)
+            if (
+                existing is not None
+                and isinstance(val, list)
+                and isinstance(existing, list)
+            ):
+                dest[key] = self._merge_list_provider_field_values(existing, val)
+            else:
+                dest[key] = self._copy_provider_field_value(val)
+
+    def _stamp_accumulated_provider_specific_fields(
+        self, response: ModelResponse
+    ) -> None:
+        """
+        Attach stream-accumulated provider_specific_fields onto the aggregated
+        ModelResponse used for the terminal response.completed event.
+
+        Stamps both:
+        - ``response._hidden_params["provider_specific_fields"]`` (generic
+          passthrough + RR-063 streaming reconstruction path)
+        - each choice message's ``provider_specific_fields`` (preferred
+          non-streaming / message-level reconstruction surface)
+
+        List-valued keys (notably ``code_interpreter_results``) are merged with
+        the same ordered semantics as per-chunk accumulation so RR-063 receives
+        a complete, ordered list even when intermediate stream_chunk_builder
+        message fields only saw a partial last-value-wins view.
+        """
+        if not self._accumulated_provider_specific_fields:
+            return
+
+        stamped = self._copy_provider_specific_fields(
+            self._accumulated_provider_specific_fields
+        )
+
+        if not hasattr(response, "_hidden_params") or response._hidden_params is None:
+            response._hidden_params = {}
+        hidden_psf = response._hidden_params.setdefault("provider_specific_fields", {})
+        if not isinstance(hidden_psf, dict):
+            hidden_psf = {}
+            response._hidden_params["provider_specific_fields"] = hidden_psf
+        self._merge_stamped_provider_fields(hidden_psf, stamped)
+
+        for choice in getattr(response, "choices", None) or []:
+            message = getattr(choice, "message", None)
+            if message is None:
+                continue
+            existing_msg_psf = getattr(message, "provider_specific_fields", None)
+            if not isinstance(existing_msg_psf, dict):
+                existing_msg_psf = {}
+            self._merge_stamped_provider_fields(existing_msg_psf, stamped)
+            try:
+                message.provider_specific_fields = existing_msg_psf
+            except Exception:
+                # Fall back to setattr for objects that store fields loosely.
+                setattr(message, "provider_specific_fields", existing_msg_psf)
+
     def create_litellm_model_response(
         self,
     ) -> Optional[ModelResponse]:
-        return cast(
+        response = cast(
             Optional[ModelResponse],
             stream_chunk_builder(
                 chunks=self.collected_chat_completion_chunks,
                 logging_obj=self.litellm_logging_obj,
             ),
         )
+        if response is not None:
+            self._stamp_accumulated_provider_specific_fields(response)
+        return response
 
     @staticmethod
     def _snapshot_chunk_for_stream_chunk_builder(
@@ -853,6 +1056,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     if chunk is not None:
                         chunk = cast(ModelResponseStream, chunk)
                         self._ensure_output_item_for_chunk(chunk)
+                        self._accumulate_provider_specific_fields_from_chunk(chunk)
                         # Proceed to transformation
                         self.collected_chat_completion_chunks.append(
                             self._snapshot_chunk_for_stream_chunk_builder(chunk)
@@ -964,6 +1168,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 try:
                     chunk = self.litellm_custom_stream_wrapper.__next__()
                     self._ensure_output_item_for_chunk(chunk)
+                    self._accumulate_provider_specific_fields_from_chunk(
+                        cast(ModelResponseStream, chunk)
+                    )
                     # Emit any just-queued output_item event
                     if self._pending_response_events:
                         return self._pending_response_events.pop(0)

@@ -6,7 +6,9 @@ import TabItem from '@theme/TabItem';
 
 LiteLLM provides an endpoint in the spec of [OpenAI's `/responses` API](https://platform.openai.com/docs/api-reference/responses)
 
-Requests to /chat/completions may be bridged here automatically when the provider lacks support for that endpoint. The model’s default `mode` determines how bridging works.(see `model_prices_and_context_window`) 
+Requests to /chat/completions may be bridged here automatically when the provider lacks support for that endpoint. The model’s default `mode` determines how bridging works.(see `model_prices_and_context_window`)
+
+When a provider is bridged through chat-completions streaming, LiteLLM accumulates per-chunk `provider_specific_fields` (including ordered `code_interpreter_results` from server-side tool execution) onto the terminal aggregated response used for `response.completed`, so reconstruction into OpenAI-shaped `code_interpreter_call` output items remains complete for streaming paths.
 
 | Feature | Supported | Notes |
 |---------|-----------|--------|
