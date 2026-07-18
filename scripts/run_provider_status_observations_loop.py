@@ -104,7 +104,9 @@ GROK_BILLING_MONTHLY_CREDITS_QUOTA_KEY = "xai_grok_build_monthly_credits:credits
 DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED = False
 DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS = 30.0
-DEFAULT_CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+DEFAULT_CODEX_USAGE_URL = (
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+)
 DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS = 3
 DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY = "codex_rate_limit_reset"
@@ -135,6 +137,7 @@ DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED = False
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS = 3600.0
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS = 4.0
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR = "/app/.analysis"
+DEFAULT_OBSERVABILITY_ANOMALY_ERROR_LOG_MAX_BYTES = 10 * 1024 * 1024
 OBSERVABILITY_ANOMALY_SAMPLE_LIMIT = 5
 OBSERVABILITY_NULL_REPOSITORY_CLUSTER_MIN_ROWS = 10
 GROK_BILLING_IDENTITY_HEADER_FIELDS = (
@@ -218,6 +221,7 @@ class CodexResetCreditPollError(ValueError):
         self.status_code = status_code
         self.attempt_count = max(1, attempt_count)
         self.retry_count = max(0, retry_count)
+
 
 GROK_BILLING_RATE_LIMIT_INSERT_SQL = """
 WITH candidate AS (
@@ -928,9 +932,7 @@ class ProviderStatusLoopConfig:
     codex_auth_file: str = DEFAULT_CODEX_AUTH_FILE
     codex_auth_file_source: str = "default"
     codex_lock_file: str = DEFAULT_CODEX_LOCK_FILE
-    codex_refresh_interval_seconds: float = (
-        DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS
-    )
+    codex_refresh_interval_seconds: float = DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS
     codex_refresh_buffer_seconds: int = (
         codex_oauth_refresh.DEFAULT_CODEX_REFRESH_BUFFER_SECONDS
     )
@@ -975,7 +977,9 @@ class ProviderStatusLoopConfig:
         DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS
     )
     codex_usage_url: str = DEFAULT_CODEX_USAGE_URL
-    codex_reset_credit_poll_max_attempts: int = DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS
+    codex_reset_credit_poll_max_attempts: int = (
+        DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS
+    )
     codex_reset_credit_poll_retry_backoff_seconds: float = (
         DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS
     )
@@ -1050,7 +1054,6 @@ def _resolve_grok_sidecar_auth_file(
         return str(Path(grok_home).expanduser() / "auth.json"), "GROK_HOME"
 
     return DEFAULT_GROK_OIDC_AUTH_FILE, "default"
-
 
 
 def _resolve_codex_sidecar_auth_file(
@@ -1770,9 +1773,10 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             ),
         ),
         help=(
-            "Directory where detected anomalies are appended as "
-            "<environment>-error.jsonl. Defaults to "
-            "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR, "
+            "Directory for <environment>-error.jsonl anomaly intake. Standing "
+            "anomaly classes are deduped via append-safe checks (no rewrite of "
+            "the shared JSONL) and growth is bounded by projected-size refusal. "
+            "Defaults to AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR, "
             "LITELLM_AAWM_ERROR_LOG_DIR, or /app/.analysis."
         ),
     )
@@ -1813,7 +1817,6 @@ def _validate_grok_oidc_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--grok-oidc-http-timeout-seconds must be greater than 0")
 
 
-
 def _validate_codex_config_args(args: argparse.Namespace) -> None:
     if args.codex_refresh_interval_seconds <= 0:
         raise SystemExit("--codex-refresh-interval-seconds must be greater than 0")
@@ -1838,7 +1841,9 @@ def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
     if args.grok_billing_poll_interval_seconds <= 0:
         raise SystemExit("--grok-billing-poll-interval-seconds must be greater than 0")
     if args.grok_billing_poll_http_timeout_seconds <= 0:
-        raise SystemExit("--grok-billing-poll-http-timeout-seconds must be greater than 0")
+        raise SystemExit(
+            "--grok-billing-poll-http-timeout-seconds must be greater than 0"
+        )
     if not str(args.grok_billing_url).strip():
         raise SystemExit("--grok-billing-url must not be empty")
     if not str(args.grok_billing_client_version).strip():
@@ -1899,15 +1904,18 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
     _validate_config_args(args)
     grok_billing_http_method = str(args.grok_billing_http_method).strip().upper()
 
-    resolved_grok_auth_file, resolved_grok_auth_file_source = (
-        _resolve_grok_sidecar_auth_file(args.grok_oidc_auth_file)
-    )
-    resolved_codex_auth_file, resolved_codex_auth_file_source = (
-        _resolve_codex_sidecar_auth_file(args.codex_auth_file)
-    )
-    resolved_xai_oauth_auth_file, resolved_xai_oauth_auth_file_source = (
-        _resolve_xai_oauth_sidecar_auth_file(args.xai_oauth_auth_file)
-    )
+    (
+        resolved_grok_auth_file,
+        resolved_grok_auth_file_source,
+    ) = _resolve_grok_sidecar_auth_file(args.grok_oidc_auth_file)
+    (
+        resolved_codex_auth_file,
+        resolved_codex_auth_file_source,
+    ) = _resolve_codex_sidecar_auth_file(args.codex_auth_file)
+    (
+        resolved_xai_oauth_auth_file,
+        resolved_xai_oauth_auth_file_source,
+    ) = _resolve_xai_oauth_sidecar_auth_file(args.xai_oauth_auth_file)
 
     return ProviderStatusLoopConfig(
         apply=args.apply,
@@ -1975,9 +1983,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         codex_reset_credit_poll_retry_backoff_seconds=(
             args.codex_reset_credit_poll_retry_backoff_seconds
         ),
-        observability_anomaly_scan_enabled=(
-            args.observability_anomaly_scan_enabled
-        ),
+        observability_anomaly_scan_enabled=(args.observability_anomaly_scan_enabled),
         observability_anomaly_scan_interval_seconds=(
             args.observability_anomaly_scan_interval_seconds
         ),
@@ -2005,7 +2011,9 @@ def _dsn_args(config: ProviderStatusLoopConfig) -> argparse.Namespace:
 def _resolve_dsn(config: ProviderStatusLoopConfig) -> str:
     dsn = probes._build_dsn(_dsn_args(config))
     if not dsn:
-        raise RuntimeError("No database DSN found. Set AAWM_DB_* or AAWM_PROVIDER_STATUS_DSN.")
+        raise RuntimeError(
+            "No database DSN found. Set AAWM_DB_* or AAWM_PROVIDER_STATUS_DSN."
+        )
     return dsn
 
 
@@ -2074,7 +2082,9 @@ def setup_schema_once(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     }
 
 
-def _bounded_summary_field(value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT) -> Optional[str]:
+def _bounded_summary_field(
+    value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT
+) -> Optional[str]:
     if value is None:
         return None
     text = re.sub(r"\s+", " ", str(value)).strip()
@@ -2093,7 +2103,9 @@ def _redacted_failure_message(value: Any) -> Optional[str]:
     return _bounded_summary_field(text, limit=PROVIDER_FAILURE_MESSAGE_LIMIT)
 
 
-def _redacted_summary_field(value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT) -> Optional[str]:
+def _redacted_summary_field(
+    value: Any, *, limit: int = PROVIDER_FAILURE_FIELD_LIMIT
+) -> Optional[str]:
     text = _bounded_summary_field(value, limit=limit)
     if text is None:
         return None
@@ -2195,7 +2207,6 @@ def _persist_grok_oidc_auth_observation(
     except Exception as exc:
         return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
     return True, inserted_count, None, None
-
 
 
 def _build_codex_auth_observation(
@@ -2340,7 +2351,9 @@ def _persist_xai_oauth_auth_observation(
     return True, inserted_count, None, None
 
 
-def _provider_failure_summaries(rows: Sequence[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], int]:
+def _provider_failure_summaries(
+    rows: Sequence[Dict[str, Any]]
+) -> tuple[list[Dict[str, Any]], int]:
     failed_rows = [row for row in rows if not row.get("success")]
     summaries: list[Dict[str, Any]] = []
     for row in failed_rows[:PROVIDER_FAILURE_SUMMARY_LIMIT]:
@@ -2410,9 +2423,17 @@ def run_cycle(config: ProviderStatusLoopConfig) -> Dict[str, Any]:
     return summary
 
 
-
 CODEX_RESET_CREDIT_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 500, 502, 503, 504}
-CODEX_RESET_CREDIT_NON_RETRYABLE_HTTP_STATUS_CODES = {400, 401, 403, 404, 405, 409, 422, 429}
+CODEX_RESET_CREDIT_NON_RETRYABLE_HTTP_STATUS_CODES = {
+    400,
+    401,
+    403,
+    404,
+    405,
+    409,
+    422,
+    429,
+}
 CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS = (
     "operation was cancelled",
     "timeout expired",
@@ -2489,7 +2510,11 @@ def _resolve_codex_reset_credit_poll_url(config: ProviderStatusLoopConfig) -> st
     configured = str(config.codex_usage_url).strip()
     if not configured:
         return probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
-    legacy = getattr(probes, "LEGACY_CODEX_WHAM_USAGE_URL", "https://chatgpt.com/backend-api/wham/usage")
+    legacy = getattr(
+        probes,
+        "LEGACY_CODEX_WHAM_USAGE_URL",
+        "https://chatgpt.com/backend-api/wham/usage",
+    )
     if configured.rstrip("/") == legacy.rstrip("/"):
         return probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
     return configured
@@ -2507,7 +2532,9 @@ def _parse_codex_reset_credit_available_count(response_body: Mapping[str, Any]) 
     if isinstance(legacy, dict):
         available = legacy.get("available_count")
         if isinstance(available, bool):
-            raise ValueError("Codex reset-credit payload available_count was not an integer.")
+            raise ValueError(
+                "Codex reset-credit payload available_count was not an integer."
+            )
         if isinstance(available, int):
             return available
         if isinstance(available, float) and available.is_integer():
@@ -2518,7 +2545,9 @@ def _parse_codex_reset_credit_available_count(response_body: Mapping[str, Any]) 
     if isinstance(camel_credits, dict):
         available = camel_credits.get("availableCount")
         if isinstance(available, bool):
-            raise ValueError("Codex reset-credit payload availableCount was not an integer.")
+            raise ValueError(
+                "Codex reset-credit payload availableCount was not an integer."
+            )
         if isinstance(available, int):
             return available
         if isinstance(available, float) and available.is_integer():
@@ -2545,7 +2574,9 @@ def _parse_codex_reset_credit_field(
 def _parse_codex_reset_credit_credit_entry(
     entry: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    provider_credit_id = _parse_codex_reset_credit_field(entry, "id", "credit_id", "creditId")
+    provider_credit_id = _parse_codex_reset_credit_field(
+        entry, "id", "credit_id", "creditId"
+    )
     if provider_credit_id is not None:
         provider_credit_id = str(provider_credit_id).strip() or None
     granted_at = probes._normalize_provider_credit_timestamp(
@@ -2615,11 +2646,7 @@ def _normalize_codex_reset_credit_status(
         return "used"
     if provider_status in {"used", "redeemed", "consumed", "expired"}:
         return "used" if provider_status != "expired" else "expired"
-    if (
-        observed_at is not None
-        and expires_at is not None
-        and observed_at > expires_at
-    ):
+    if observed_at is not None and expires_at is not None and observed_at > expires_at:
         return "expired"
     if provider_status in {"available", "active", "unused"}:
         return "available"
@@ -2645,7 +2672,9 @@ def _parse_codex_reset_credit_expires_at(
     except ValueError:
         credits = []
     if credits:
-        expiries = [credit["expires_at"] for credit in credits if credit.get("expires_at")]
+        expiries = [
+            credit["expires_at"] for credit in credits if credit.get("expires_at")
+        ]
         return max(expiries) if expiries else None
     for credits_key, expires_key in (
         ("rate_limit_reset_credits", "expires_at"),
@@ -2678,7 +2707,9 @@ def _build_codex_reset_credit_raw_provider_fields(
             continue
         fields: Dict[str, Any] = {
             credits_key: {
-                count_key: available_count if available_count is not None else credits.get(count_key),
+                count_key: available_count
+                if available_count is not None
+                else credits.get(count_key),
             }
         }
         if expires_key in credits:
@@ -2733,14 +2764,13 @@ def _apply_codex_reset_credit_visible_source_url(
 ) -> List[Dict[str, Any]]:
     if not observations:
         return observations
-    available_rows = [
-        row for row in observations if row.get("status") == "available"
-    ]
+    available_rows = [row for row in observations if row.get("status") == "available"]
     if not available_rows:
         return observations
     newest = max(
         available_rows,
-        key=lambda row: row.get("granted_at") or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda row: row.get("granted_at")
+        or datetime.min.replace(tzinfo=timezone.utc),
     )
     updated: List[Dict[str, Any]] = []
     for row in observations:
@@ -3073,7 +3103,9 @@ def _build_codex_reset_credit_seed_observations(
                 for visible_granted_at, visible_expires_at in visible_credit_windows
             ):
                 continue
-        status = "expired" if expires_at is not None and observed_at > expires_at else "used"
+        status = (
+            "expired" if expires_at is not None and observed_at > expires_at else "used"
+        )
         raw_provider_fields = {
             "seed": {
                 "granted_at": granted_at.isoformat().replace("+00:00", "Z"),
@@ -3160,8 +3192,12 @@ def _codex_reset_credit_retryable_http_error(
     if status_code in {401, 403, 429}:
         return False
     normalized_hint = (error_hint or "").strip().lower()
-    if status_code == 400 and normalized_hint and any(
-        hint in normalized_hint for hint in CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS
+    if (
+        status_code == 400
+        and normalized_hint
+        and any(
+            hint in normalized_hint for hint in CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS
+        )
     ):
         return True
     if status_code in CODEX_RESET_CREDIT_NON_RETRYABLE_HTTP_STATUS_CODES:
@@ -3175,7 +3211,11 @@ def _codex_reset_credit_retryable_url_error(exc: urllib_error.URLError) -> bool:
     reason = getattr(exc, "reason", None)
     if isinstance(reason, TimeoutError):
         return True
-    if isinstance(reason, OSError) and getattr(reason, "errno", None) in {110, 111, 113}:
+    if isinstance(reason, OSError) and getattr(reason, "errno", None) in {
+        110,
+        111,
+        113,
+    }:
         return True
     message = str(reason or exc).strip().lower()
     return any(hint in message for hint in CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS)
@@ -3241,10 +3281,11 @@ def _fetch_codex_reset_credit_payload(
         except urllib_error.URLError as exc:
             last_status_code = None
             last_error_hint = None
-            last_error_message = (
-                "Codex reset-credit poll failed while contacting the reset-credit detail endpoint."
-            )
-            if attempt_count < max_attempts and _codex_reset_credit_retryable_url_error(exc):
+            last_error_message = "Codex reset-credit poll failed while contacting the reset-credit detail endpoint."
+            if (
+                attempt_count < max_attempts
+                and _codex_reset_credit_retryable_url_error(exc)
+            ):
                 retry_count += 1
                 _codex_reset_credit_poll_sleep(
                     _codex_reset_credit_poll_backoff_seconds(
@@ -3382,7 +3423,8 @@ def _run_codex_reset_credit_poll_task(
     last_attempt = state.codex_reset_credit_last_attempt_monotonic
     if (
         last_attempt is not None
-        and now_monotonic - last_attempt < config.codex_reset_credit_poll_interval_seconds
+        and now_monotonic - last_attempt
+        < config.codex_reset_credit_poll_interval_seconds
     ):
         return None
 
@@ -3556,8 +3598,7 @@ def _grok_billing_request_contract_summary(
         config,
         access_token="<redacted>",
         identity_headers={
-            header_name: "<redacted>"
-            for header_name in identity_header_names
+            header_name: "<redacted>" for header_name in identity_header_names
         }
         if identity_header_names
         else None,
@@ -3642,8 +3683,10 @@ def _grok_billing_retryable_http_error(
     if status_code in {401, 403, 429}:
         return False
     normalized_hint = (error_hint or "").strip().lower()
-    if status_code == 400 and normalized_hint and any(
-        hint in normalized_hint for hint in GROK_BILLING_RETRYABLE_ERROR_HINTS
+    if (
+        status_code == 400
+        and normalized_hint
+        and any(hint in normalized_hint for hint in GROK_BILLING_RETRYABLE_ERROR_HINTS)
     ):
         return True
     if status_code in GROK_BILLING_NON_RETRYABLE_HTTP_STATUS_CODES:
@@ -3730,12 +3773,9 @@ def _fetch_grok_billing_payload(
                 error_hint=last_error_hint,
                 fallback_message="",
             )
-            if (
-                attempt_count < max_attempts
-                and _grok_billing_retryable_http_error(
-                    exc,
-                    error_hint=last_error_hint,
-                )
+            if attempt_count < max_attempts and _grok_billing_retryable_http_error(
+                exc,
+                error_hint=last_error_hint,
             ):
                 retry_count += 1
                 _grok_billing_poll_sleep(
@@ -3900,11 +3940,14 @@ def _grok_billing_snapshot_parts(
         signals.append("grok_billing_payload")
     evidence["signals"] = signals
 
-    if monthly_limit is not None and monthly_limit > 0 and used is not None and used >= 0:
+    if (
+        monthly_limit is not None
+        and monthly_limit > 0
+        and used is not None
+        and used >= 0
+    ):
         used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
-        remaining_pct = float(
-            int(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)
-        )
+        remaining_pct = float(int(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5))
         quota_remaining = max(0.0, monthly_limit - used)
         if "grok_billing_monthly_counter" not in signals:
             signals.append("grok_billing_monthly_counter")
@@ -3923,9 +3966,7 @@ def _grok_billing_snapshot_parts(
                     config.get("monthlyLimit")
                 ),
                 "used": _json_safe_grok_billing_value(config.get("used")),
-                "onDemandCap": _json_safe_grok_billing_value(
-                    config.get("onDemandCap")
-                ),
+                "onDemandCap": _json_safe_grok_billing_value(config.get("onDemandCap")),
                 "billingPeriodStart": config.get("billingPeriodStart"),
                 "billingPeriodEnd": config.get("billingPeriodEnd"),
                 "quota_unit": "grok_billing_used",
@@ -4227,7 +4268,9 @@ def _set_grok_billing_database_timeouts(
         "SELECT set_config('application_name', %s, false)",
         (f"{probes._provider_status_db_application_name()}-grok-billing",),
     )
-    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",)
+    )
     cur.execute(
         "SELECT set_config('statement_timeout', %s, true)",
         (f"{statement_timeout_ms}ms",),
@@ -4244,7 +4287,9 @@ def _set_observability_anomaly_scan_database_timeouts(
         "SELECT set_config('application_name', %s, false)",
         (f"{probes._provider_status_db_application_name()}-anomaly-scan",),
     )
-    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",)
+    )
     cur.execute(
         "SELECT set_config('statement_timeout', %s, true)",
         (f"{statement_timeout_ms}ms",),
@@ -4319,9 +4364,7 @@ def _collect_observability_anomalies(
 def _observability_anomaly_error_log_path(
     config: ProviderStatusLoopConfig,
 ) -> Path:
-    directory = Path(
-        config.observability_anomaly_scan_error_log_dir
-    ).expanduser()
+    directory = Path(config.observability_anomaly_scan_error_log_dir).expanduser()
     environment = re.sub(
         r"[^A-Za-z0-9_.-]+",
         "_",
@@ -4363,16 +4406,12 @@ def _normalize_error_log_file_metadata(path: Path) -> None:
         uid_raw = os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_UID", "").strip()
         gid_raw = os.getenv("LITELLM_AAWM_ERROR_LOG_FILE_GID", "").strip()
         target_uid = (
-            _parse_error_log_non_negative_int_env(
-                "LITELLM_AAWM_ERROR_LOG_FILE_UID"
-            )
+            _parse_error_log_non_negative_int_env("LITELLM_AAWM_ERROR_LOG_FILE_UID")
             if uid_raw
             else parent_stat.st_uid
         )
         target_gid = (
-            _parse_error_log_non_negative_int_env(
-                "LITELLM_AAWM_ERROR_LOG_FILE_GID"
-            )
+            _parse_error_log_non_negative_int_env("LITELLM_AAWM_ERROR_LOG_FILE_GID")
             if gid_raw
             else parent_stat.st_gid
         )
@@ -4380,8 +4419,7 @@ def _normalize_error_log_file_metadata(path: Path) -> None:
         if (
             target_uid is not None
             and target_gid is not None
-            and (current_stat.st_uid, current_stat.st_gid)
-            != (target_uid, target_gid)
+            and (current_stat.st_uid, current_stat.st_gid) != (target_uid, target_gid)
             and hasattr(os, "chown")
         ):
             try:
@@ -4436,33 +4474,280 @@ def _build_observability_anomaly_error_record(
     }
 
 
+def _observability_anomaly_error_log_max_bytes() -> int:
+    """Max bytes for the active shared anomaly intake file before append refusal."""
+    raw = os.getenv("LITELLM_AAWM_ERROR_LOG_MAX_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_OBSERVABILITY_ANOMALY_ERROR_LOG_MAX_BYTES
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        return DEFAULT_OBSERVABILITY_ANOMALY_ERROR_LOG_MAX_BYTES
+    return value if value > 0 else DEFAULT_OBSERVABILITY_ANOMALY_ERROR_LOG_MAX_BYTES
+
+
+def _encode_observability_anomaly_error_line(record: Mapping[str, Any]) -> str:
+    return (
+        json.dumps(
+            _json_safe_grok_billing_value(record),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def _observability_anomaly_identity_key(
+    record: Mapping[str, Any],
+) -> Optional[tuple[Any, ...]]:
+    """Stable identity for sidecar anomaly rows that may be standing.
+
+    Recurring scans for the same anomaly_class + environment should not append
+    unbounded hourly duplicates. Unrelated / non-anomaly rows return None so
+    they are never treated as standing anomaly identities.
+    """
+    if str(record.get("event") or "") != "aawm_observability_anomaly":
+        return None
+    anomaly_class = str(record.get("anomaly_class") or "").strip()
+    if not anomaly_class:
+        return None
+    environment = str(record.get("environment") or "").strip() or "unknown"
+    anomaly_source = (
+        str(record.get("anomaly_source") or "").strip()
+        or "provider_status_observations_sidecar"
+    )
+    return (environment, anomaly_source, anomaly_class)
+
+
+def _observability_anomaly_example_identity(example: Any) -> tuple[Any, ...]:
+    if not isinstance(example, Mapping):
+        return ("raw", repr(example))
+    preferred_keys = (
+        "row_id",
+        "id",
+        "session_id",
+        "trace_id",
+        "litellm_call_id",
+        "model",
+        "client_name",
+        "provider",
+        "quota_key",
+    )
+    parts: list[Any] = []
+    for key in preferred_keys:
+        if key in example and example.get(key) is not None:
+            parts.append((key, example.get(key)))
+    if parts:
+        return tuple(parts)
+    try:
+        return (
+            "json",
+            json.dumps(
+                _json_safe_grok_billing_value(example),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+    except Exception:
+        return ("repr", repr(example))
+
+
+def _observability_anomaly_content_signature(
+    record: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    examples = record.get("examples") or []
+    if not isinstance(examples, Sequence) or isinstance(examples, (str, bytes)):
+        example_ids: tuple[Any, ...] = ()
+    else:
+        example_ids = tuple(
+            _observability_anomaly_example_identity(example) for example in examples
+        )
+    return (
+        int(record.get("row_count") or 0),
+        str(record.get("expected") or ""),
+        float(record.get("lookback_hours") or 0.0),
+        example_ids,
+    )
+
+
+def _read_error_log_jsonl_records(path: Path) -> list[Dict[str, Any]]:
+    """Read-only parse of shared intake. Never used to rewrite the active file."""
+    if not path.exists():
+        return []
+    records: list[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    records.append(
+                        {
+                            "event": "aawm_error_log_malformed_line",
+                            "raw_text": line[:2048],
+                        }
+                    )
+                    continue
+                if isinstance(payload, dict):
+                    records.append(payload)
+                else:
+                    records.append(
+                        {
+                            "event": "aawm_error_log_non_object_line",
+                            "raw_payload": payload,
+                        }
+                    )
+    except OSError:
+        return []
+    return records
+
+
+def _latest_observability_anomaly_records_by_identity(
+    existing_records: Sequence[Mapping[str, Any]],
+) -> Dict[tuple[Any, ...], Dict[str, Any]]:
+    """Map anomaly identity -> latest prior row (read-only index over shared JSONL)."""
+    latest: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+    for record in existing_records:
+        key = _observability_anomaly_identity_key(record)
+        if key is None:
+            continue
+        latest[key] = dict(record)
+    return latest
+
+
+def _select_observability_anomaly_records_to_append(
+    existing_records: Sequence[Mapping[str, Any]],
+    *,
+    new_records: Sequence[Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Choose append-only anomaly rows without rewriting shared intake.
+
+    Standing identical anomalies (same identity + content signature as the
+    latest prior row for that identity) are skipped. Material changes and new
+    identities are returned for O_APPEND. Unrelated non-anomaly rows are never
+    modified; this function only decides what new lines to append.
+    """
+    latest_by_key = _latest_observability_anomaly_records_by_identity(existing_records)
+    to_append: list[Dict[str, Any]] = []
+    for new_record in new_records:
+        payload = dict(new_record)
+        key = _observability_anomaly_identity_key(payload)
+        if key is None:
+            # Non-identity rows from this writer are still append-only.
+            to_append.append(payload)
+            continue
+        existing = latest_by_key.get(key)
+        if existing is not None and (
+            _observability_anomaly_content_signature(existing)
+            == _observability_anomaly_content_signature(payload)
+        ):
+            continue
+        to_append.append(payload)
+        latest_by_key[key] = payload
+    return to_append
+
+
+def _error_log_path_size_bytes(path: Path) -> int:
+    try:
+        if path.exists():
+            return int(path.stat().st_size)
+    except OSError:
+        return 0
+    return 0
+
+
+def _append_error_log_jsonl_lines(path: Path, lines: Sequence[str]) -> None:
+    """Append UTF-8 JSONL lines with O_APPEND so concurrent writers cannot clobber.
+
+    This path never truncates, rewrites, renames, or unlinks the shared active
+    intake file. Ownership/mode repair runs after a successful append only.
+    """
+    if not lines:
+        return
+    payload = "".join(lines).encode("utf-8")
+    if not payload:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    fd = os.open(path, flags, 0o644)
+    try:
+        # Single write of the full batch; O_APPEND seeks to EOF per write on Linux.
+        os.write(fd, payload)
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+    _normalize_error_log_file_metadata(path)
+
+
 def _write_observability_anomaly_error_records(
     config: ProviderStatusLoopConfig,
     *,
     observed_at: datetime,
     anomalies: Sequence[Mapping[str, Any]],
 ) -> tuple[int, Path]:
+    """Append anomaly intake with standing dedupe + projected-size backpressure.
+
+    Concurrency / retention contract (RR-089):
+    - The shared ``<environment>-error.jsonl`` file is append-only for this
+      writer. It is never rewritten via temp+``os.replace``, rotated, truncated,
+      or unlinked by the sidecar (including when backup-count-style envs are 0).
+    - Generic / terminal AAWM JSONL writers that also append to the same path
+      therefore cannot lose rows to a read/merge/replace race from this path.
+    - Standing anomalies (same class/environment + same content signature as the
+      latest prior row for that identity) are not re-appended every scan.
+    - Material changes append a fresh durable row (prior rows remain until
+      operator cleanup of the intake file).
+    - Unrelated non-anomaly JSONL records are preserved because the active file
+      is never rewritten or deleted here.
+    - Growth is bounded by refusing appends whose projected size would exceed
+      ``LITELLM_AAWM_ERROR_LOG_MAX_BYTES``; refusal leaves existing unresolved
+      intake untouched.
+    """
     path = _observability_anomaly_error_log_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    with path.open("a", encoding="utf-8") as handle:
-        for anomaly in anomalies:
-            record = _build_observability_anomaly_error_record(
-                config,
-                observed_at=observed_at,
-                anomaly=anomaly,
-            )
-            handle.write(
-                json.dumps(
-                    _json_safe_grok_billing_value(record),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            handle.write("\n")
-            written += 1
-    _normalize_error_log_file_metadata(path)
-    return written, path
+
+    new_records = [
+        _build_observability_anomaly_error_record(
+            config,
+            observed_at=observed_at,
+            anomaly=anomaly,
+        )
+        for anomaly in anomalies
+    ]
+    if not new_records:
+        return 0, path
+
+    existing_records = _read_error_log_jsonl_records(path)
+    to_append = _select_observability_anomaly_records_to_append(
+        existing_records,
+        new_records=new_records,
+    )
+    if not to_append:
+        if path.exists():
+            _normalize_error_log_file_metadata(path)
+        return 0, path
+
+    encoded_lines = [
+        _encode_observability_anomaly_error_line(record) for record in to_append
+    ]
+    pending_bytes = sum(len(line.encode("utf-8")) for line in encoded_lines)
+    current_bytes = _error_log_path_size_bytes(path)
+    max_bytes = _observability_anomaly_error_log_max_bytes()
+    if current_bytes + pending_bytes > max_bytes:
+        # Refuse rather than rewrite/rotate/delete shared unresolved intake.
+        if path.exists():
+            _normalize_error_log_file_metadata(path)
+        return 0, path
+
+    _append_error_log_jsonl_lines(path, encoded_lines)
+    return len(to_append), path
 
 
 def _build_grok_billing_observations_for_dry_run(
@@ -4569,7 +4854,6 @@ def _run_grok_oidc_metadata_repair_task(
         "environment": config.environment,
         **summary,
     }
-
 
 
 def _run_codex_oauth_refresh_task(
@@ -4874,7 +5158,9 @@ def _emit(payload: Dict[str, Any]) -> None:
 
 
 def _utc_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -4960,7 +5246,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         remaining_seconds = config.interval_seconds - (time.monotonic() - cycle_started)
         while remaining_seconds > 0 and not stopping:
             time.sleep(min(remaining_seconds, 1.0))
-            remaining_seconds = config.interval_seconds - (time.monotonic() - cycle_started)
+            remaining_seconds = config.interval_seconds - (
+                time.monotonic() - cycle_started
+            )
 
     _emit(
         {

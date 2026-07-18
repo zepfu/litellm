@@ -329,9 +329,14 @@ Relevant environment variables:
   scan attempts. Defaults to `3600`.
 - `AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS`: recent database window
   scanned for anomalies. Defaults to `4`.
-- `AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR`: directory where detected
-  anomalies are appended as `<environment>-error.jsonl`. Defaults to
+- `AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR`: directory for
+  `<environment>-error.jsonl` anomaly intake. Defaults to
   `LITELLM_AAWM_ERROR_LOG_DIR` when set, otherwise `/app/.analysis`.
+- Shared size bound (same env var as the generic AAWM error sink):
+  `LITELLM_AAWM_ERROR_LOG_MAX_BYTES` (default `10485760` / 10 MiB). The sidecar
+  refuses appends that would exceed this projected size rather than rotating or
+  rewriting the shared active file. `LITELLM_AAWM_ERROR_LOG_BACKUP_COUNT` is not
+  used by this writer (backup-count `0` must never delete unresolved intake here).
 
 In managed dev compose the task is enabled by default on the same hourly cadence
 as the other scheduled sidecar tasks. The scan uses the sidecar environment name
@@ -343,10 +348,35 @@ Each due attempt emits a separate `observability_anomaly_scan` JSON line with
 sanitized status fields such as `attempted`, `status`, `lookback_hours`,
 `anomaly_count`, `anomaly_classes`, `error_log_record_count`, and
 `error_log_path`. Healthy scans keep `status=healthy`. When one or more anomaly
-classes match, the scan sets `status=anomalies_found` and appends one append-safe
-JSONL record per anomaly class to the environment error file.
+classes match, the scan sets `status=anomalies_found` and appends only new or
+materially changed anomaly intake rows into the environment error file.
 
-Each appended anomaly record uses `event=aawm_observability_anomaly` and should
+Intake write behavior (RR-089):
+
+- **Append-safe shared sink**: the sidecar only opens
+  `<environment>-error.jsonl` with `O_APPEND` (create+write). It never rewrites,
+  truncates, renames, rotates, or unlinks the active shared JSONL. Concurrent
+  generic/terminal AAWM writers that append to the same path therefore cannot
+  lose rows to a sidecar read/merge/`os.replace` race.
+- **Dedupe / standing check**: records are keyed by
+  `(environment, anomaly_source, anomaly_class)` against the latest prior row for
+  that identity in the active file (read-only index). An identical standing
+  anomaly is not re-appended every scan interval (`error_log_record_count=0`).
+  Material changes (row_count, expected, lookback, or sample identities) append a
+  fresh durable row with a new `observed_at`; prior unresolved rows remain until
+  operator cleanup. Distinct anomaly classes remain separate rows.
+- **Preserve unrelated intake**: non-`aawm_observability_anomaly` JSONL rows
+  already present in the active file are left untouched because the file is never
+  rewritten. Unresolved intake is never deleted merely because it is unresolved,
+  including when `LITELLM_AAWM_ERROR_LOG_BACKUP_COUNT=0`.
+- **Bound growth / projected-size refusal**: if `current_size + pending_line_bytes`
+  would exceed `LITELLM_AAWM_ERROR_LOG_MAX_BYTES`, the write is refused
+  (`error_log_record_count=0`) and existing intake is left intact. Ownership/mode
+  repair still runs after successful appends only.
+- **Operator signal**: `error_log_record_count` is the number of anomaly rows
+  newly appended on that scan, not the total lines in the file.
+
+Each anomaly record uses `event=aawm_observability_anomaly` and should
 include at least:
 
 - `environment`
