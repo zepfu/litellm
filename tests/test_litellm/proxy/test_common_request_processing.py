@@ -18,6 +18,7 @@ from litellm._logging import (
     AawmHealthAccessLogFilter,
     AawmRouteAccessLogReplacementFilter,
     clear_aawm_route_access_log_replacements,
+    register_aawm_route_access_log_replacement,
     verbose_proxy_logger,
 )
 from litellm._uuid import uuid
@@ -1022,6 +1023,68 @@ class TestProxyBaseLLMRequestProcessing:
             )
             is True
         )
+
+    def test_aawm_route_access_log_filter_consumes_duplicate_registration_count(
+        self,
+    ):
+        clear_aawm_route_access_log_replacements()
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        replacement = {
+            "client_addr": "172.19.0.1:52834",
+            "method": "POST",
+            "full_path": "/openai_passthrough/responses",
+            "http_version": "1.1",
+        }
+
+        register_aawm_route_access_log_replacement(**replacement)
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    client_addr=replacement["client_addr"],
+                    method=replacement["method"],
+                    full_path=replacement["full_path"],
+                    http_version=replacement["http_version"],
+                    status_code=500,
+                )
+            )
+            is True
+        )
+
+        register_aawm_route_access_log_replacement(**replacement)
+        register_aawm_route_access_log_replacement(**replacement)
+
+        matching_record = _build_uvicorn_access_record(
+            client_addr=replacement["client_addr"],
+            method=replacement["method"],
+            full_path=replacement["full_path"],
+            http_version=replacement["http_version"],
+        )
+        assert access_filter.filter(matching_record) is False
+        assert access_filter.filter(matching_record) is False
+        assert access_filter.filter(matching_record) is True
+
+        register_aawm_route_access_log_replacement(**replacement)
+        matching_record.name = "gunicorn.access"
+        assert access_filter.filter(matching_record) is False
+
+    def test_aawm_route_access_log_filter_bounds_pending_registrations(self):
+        clear_aawm_route_access_log_replacements()
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        replacement = {
+            "client_addr": "172.19.0.1:52834",
+            "method": "POST",
+            "full_path": "/openai_passthrough/responses",
+            "http_version": "1.1",
+        }
+        matching_record = _build_uvicorn_access_record(**replacement)
+
+        for _ in range(1025):
+            register_aawm_route_access_log_replacement(**replacement)
+
+        suppressed = sum(
+            not access_filter.filter(matching_record) for _ in range(1025)
+        )
+        assert suppressed == 1024
 
     def test_aawm_route_log_deduplicates_repeated_route_context(
         self,

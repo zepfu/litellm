@@ -18,11 +18,15 @@ import httpx
 from fastapi import Request
 
 from litellm._logging import (
+    discard_aawm_route_access_log_replacement,
     register_aawm_route_access_log_replacement,
     verbose_aawm_route_logger,
 )
 
 _AAWM_ROUTE_ACCESS_LOG_SCOPE_KEY = "aawm_route_access_log_emitted"
+_AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY = (
+    "aawm_route_access_log_replacement_key"
+)
 _AAWM_ROUTE_ACCESS_LOGGER_NAME = verbose_aawm_route_logger.name
 _AAWM_ROUTE_ACCESS_LOG_TYPE = "ROUTE"
 _AAWM_ROUTE_LOG_MAX_FIELD_CHARS = 180
@@ -2383,21 +2387,13 @@ def _get_aawm_route_native_access_log_path(request: Request) -> Optional[str]:
     if not isinstance(scope, dict):
         return None
 
-    # RR-054 #39: prefer private adapted display path; never require mutated query_string.
-    display_path = scope.get("_aawm_adapted_access_log_display_path")
-    if isinstance(display_path, str) and display_path:
-        return display_path
-
     path = scope.get("path")
     if not isinstance(path, str):
         return None
 
     full_path = quote(path)
-    target_label = scope.get("_aawm_adapted_access_log_target")
     query_string = scope.get("query_string")
     if not query_string:
-        if isinstance(target_label, str) and target_label:
-            return f"{full_path}?adapted_to={target_label}"
         return full_path
 
     try:
@@ -2408,9 +2404,6 @@ def _get_aawm_route_native_access_log_path(request: Request) -> Optional[str]:
     except UnicodeDecodeError:
         return full_path
 
-    # Legacy: some call sites previously encoded " -> target" into query_string.
-    if isinstance(target_label, str) and target_label and f" -> {target_label}" not in query_label and f"adapted_to={target_label}" not in query_label:
-        query_label = f"{query_label} -> {target_label}" if query_label else f"adapted_to={target_label}"
     return f"{full_path}?{query_label}"
 
 
@@ -2424,12 +2417,31 @@ def _register_aawm_route_access_log_replacement(request: Request) -> None:
     if isinstance(client, (list, tuple)) and len(client) >= 2:
         client_addr = f"{client[0]}:{client[1]}"
 
+    method = str(scope.get("method") or getattr(request, "method", "") or "")
+    full_path = _get_aawm_route_native_access_log_path(request)
+    http_version = str(scope.get("http_version") or "")
+    if not client_addr or not method or not full_path or not http_version:
+        return
+
+    replacement_key = (client_addr, method, full_path, http_version)
+    previous_key = scope.get(_AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY)
+    if previous_key == replacement_key:
+        return
+    if isinstance(previous_key, tuple) and len(previous_key) == 4:
+        discard_aawm_route_access_log_replacement(
+            client_addr=previous_key[0],
+            method=previous_key[1],
+            full_path=previous_key[2],
+            http_version=previous_key[3],
+        )
+
     register_aawm_route_access_log_replacement(
         client_addr=client_addr,
-        method=str(scope.get("method") or getattr(request, "method", "") or ""),
-        full_path=_get_aawm_route_native_access_log_path(request),
-        http_version=str(scope.get("http_version") or ""),
+        method=method,
+        full_path=full_path,
+        http_version=http_version,
     )
+    scope[_AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY] = replacement_key
 
 
 def _get_aawm_route_log_model_label(

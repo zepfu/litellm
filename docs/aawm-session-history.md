@@ -1530,6 +1530,12 @@ incoming request has enough local context to identify the route and, when
 available, the egress target. Pass-through requests and general proxy requests
 such as embeddings use the same formatter and native access-log suppression
 path.
+Suppression keys use the unchanged native ASGI path plus its original query
+string. Private adapted display metadata is used only for structured route and
+rollup presentation. Duplicate identical registrations from distinct requests
+are counted in a bounded pending queue, while repeated route emission for one
+request is idempotent. Exact matching failed 4xx/5xx access records remain
+visible while consuming their pending registration.
 The display shape is:
 
 ```text

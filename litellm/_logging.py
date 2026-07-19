@@ -946,7 +946,9 @@ _egress_guard_alert_filter = EgressGuardAlertFilter()
 _AawmRouteAccessLogReplacementKey = Tuple[str, str, str, str]
 _AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_LIMIT = 1024
 _aawm_route_access_log_replacement_lock = threading.Lock()
-_aawm_route_access_log_replacements: Set[_AawmRouteAccessLogReplacementKey] = set()
+_aawm_route_access_log_replacements: Dict[
+    _AawmRouteAccessLogReplacementKey, int
+] = {}
 _aawm_route_access_log_replacement_order: Deque[
     _AawmRouteAccessLogReplacementKey
 ] = deque()
@@ -979,16 +981,53 @@ def register_aawm_route_access_log_replacement(
         str(http_version),
     )
     with _aawm_route_access_log_replacement_lock:
-        if key not in _aawm_route_access_log_replacements:
-            _aawm_route_access_log_replacements.add(key)
-            _aawm_route_access_log_replacement_order.append(key)
+        _aawm_route_access_log_replacements[key] = (
+            _aawm_route_access_log_replacements.get(key, 0) + 1
+        )
+        _aawm_route_access_log_replacement_order.append(key)
 
         while (
             len(_aawm_route_access_log_replacement_order)
             > _AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_LIMIT
         ):
             stale_key = _aawm_route_access_log_replacement_order.popleft()
-            _aawm_route_access_log_replacements.discard(stale_key)
+            stale_count = _aawm_route_access_log_replacements.get(stale_key)
+            if stale_count is None:
+                continue
+            if stale_count > 1:
+                _aawm_route_access_log_replacements[stale_key] = stale_count - 1
+            else:
+                del _aawm_route_access_log_replacements[stale_key]
+
+
+def discard_aawm_route_access_log_replacement(
+    *,
+    client_addr: Optional[str],
+    method: Optional[str],
+    full_path: Optional[str],
+    http_version: Optional[str],
+) -> None:
+    if not client_addr or not method or not full_path or not http_version:
+        return
+
+    key = (
+        str(client_addr),
+        str(method),
+        _normalize_aawm_route_access_log_replacement_path(full_path),
+        str(http_version),
+    )
+    with _aawm_route_access_log_replacement_lock:
+        replacement_count = _aawm_route_access_log_replacements.get(key)
+        if replacement_count is None:
+            return
+        if replacement_count > 1:
+            _aawm_route_access_log_replacements[key] = replacement_count - 1
+        else:
+            del _aawm_route_access_log_replacements[key]
+        try:
+            _aawm_route_access_log_replacement_order.remove(key)
+        except ValueError:
+            pass
 
 
 def _aawm_route_access_log_key_from_record(
@@ -1022,9 +1061,13 @@ def _consume_aawm_route_access_log_replacement(
         return False
 
     with _aawm_route_access_log_replacement_lock:
-        if key not in _aawm_route_access_log_replacements:
+        replacement_count = _aawm_route_access_log_replacements.get(key)
+        if replacement_count is None:
             return False
-        _aawm_route_access_log_replacements.remove(key)
+        if replacement_count > 1:
+            _aawm_route_access_log_replacements[key] = replacement_count - 1
+        else:
+            del _aawm_route_access_log_replacements[key]
         try:
             _aawm_route_access_log_replacement_order.remove(key)
         except ValueError:
@@ -1099,7 +1142,11 @@ class AawmRouteAccessLogReplacementFilter(logging.Filter):
         if record.name not in {"uvicorn.access", "gunicorn.access"}:
             return True
         if _consume_aawm_route_access_log_replacement(record):
-            return False
+            status_code = _status_code_from_access_log_record(record)
+            return (
+                status_code is None
+                or not _is_successful_access_status_code(status_code)
+            )
         if _should_suppress_successful_aawm_passthrough_arrow_access_log(record):
             return False
         return True

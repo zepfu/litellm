@@ -910,29 +910,57 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog, monkeypatch) -> None:
     clear_aawm_route_access_log_replacements()
     clear_aawm_route_rollups()
     monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
-    request = _build_aawm_route_log_request()
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4001/openai_passthrough/responses?stream=false"
+    )
+    adapted_display_path = (
+        "/openai_passthrough/responses?adapted_to=chatgpt.com/backend-api/codex/responses"
+    )
+    adapted_target = (
+        "chatgpt.com/backend-api/codex/responses"
+    )
+    request.scope["_aawm_adapted_access_log_display_path"] = adapted_display_path
+    request.scope["_aawm_adapted_access_log_target"] = adapted_target
+    native_path = request.scope["path"]
+    native_query_string = request.scope["query_string"]
     request_body = {
-        "model": "claude-sonnet-4-6",
+        "model": "gpt-5.3-codex-spark",
         "metadata": {"model_alias_label": "aawm-code-anthropic"},
     }
 
     with _capture_aawm_route_logs(caplog):
         emit_aawm_route_access_log(
             request=request,
-            target="https://api.anthropic.com/v1/messages",
+            target="https://chatgpt.com/backend-api/codex/responses",
             request_body=request_body,
         )
         emit_aawm_route_access_log(
             request=request,
-            target="https://api.anthropic.com/v1/messages",
+            target="https://chatgpt.com/backend-api/codex/responses",
             request_body=request_body,
         )
+
+    assert request.scope["path"] == native_path
+    assert request.scope["query_string"] == native_query_string
+    assert request.scope["_aawm_adapted_access_log_target"] == adapted_target
+    assert (
+        request.scope["_aawm_adapted_access_log_display_path"]
+        == adapted_display_path
+    )
 
     access_filter = AawmRouteAccessLogReplacementFilter()
     assert (
         access_filter.filter(
             _build_uvicorn_access_record(
-                full_path="/anthropic/v1/messages?beta=true",
+                full_path="/v1/models",
+            )
+        )
+        is True
+    )
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path="/openai_passthrough/responses?stream=false",
             )
         )
         is False
@@ -940,7 +968,7 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog, monkeypatch) -> None:
     assert (
         access_filter.filter(
             _build_uvicorn_access_record(
-                full_path="/anthropic/v1/messages?beta=true",
+                full_path="/openai_passthrough/responses?stream=false",
             )
         )
         is True
@@ -953,9 +981,9 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog, monkeypatch) -> None:
     assert len(route_records) == 1
     assert re.fullmatch(
         r"\d{8} \d{2}:\d{2}:\d{2} \[ROUTE\] - "
-        r"claude-sonnet-4-6\(aawm-code-anthropic\) "
-        r"POST 172\.19\.0\.1:52834 /anthropic/v1/messages\?beta=true "
-        r"-> api\.anthropic\.com/v1/messages",
+        r"gpt-5\.3-codex-spark\(aawm-code-anthropic\) "
+        r"POST 172\.19\.0\.1:52834 /openai_passthrough/responses\?stream=false "
+        r"-> chatgpt\.com/backend-api/codex/responses",
         route_records[0],
     )
 
