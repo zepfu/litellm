@@ -104,6 +104,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _classify_passthrough_hidden_retry_failure,
     _get_passthrough_hidden_retry_wait_seconds,
     _is_known_grok_build_usage_balance_exhausted_response,
+    _is_known_grok_personal_team_spending_limit_response,
     _record_passthrough_hidden_retry_metadata,
 )
 from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
@@ -268,6 +269,7 @@ from .aawm_alias_routing_policy import (
     CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
     CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _POLICY_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
     CODEX_AUTO_AGENT_XAI_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_XAI_LANE_KEY,
+    CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER,
     CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES as _POLICY_CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES,
     OPENROUTER_FREE_DAILY_QUOTA_MODELS as _POLICY_OPENROUTER_FREE_DAILY_QUOTA_MODELS,
@@ -452,6 +454,7 @@ _CODEX_AUTO_AGENT_XAI_PROVIDER = _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER
 _CODEX_AUTO_AGENT_OPENCODE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_OPENCODE_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
 _CODEX_AUTO_AGENT_XAI_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_LANE_KEY
+_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
 _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
 _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = _POLICY_DEFAULT_COOLDOWN
 _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = _POLICY_CAPACITY_COOLDOWN
@@ -794,6 +797,9 @@ _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = 300.0
 _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = 300.0
 _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = (
     "GROK_BUILD_USAGE_BALANCE_EXHAUSTED"
+)
+_CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN = (
+    "GROK_PERSONAL_TEAM_SPENDING_LIMIT"
 )
 _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL = (
     "https://cli-chat-proxy.grok.com/v1/responses"
@@ -4808,7 +4814,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_XAI_LANE_KEY
+        lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     else:
@@ -4819,6 +4825,18 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         initial_cooldown_state_source,
     ) = await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
     cooldown_state_source: Optional[str] = initial_cooldown_state_source
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
+    ) = await _apply_codex_auto_agent_grok_account_lane_cooldown(
+        candidate=candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=_get_codex_auto_agent_active_cooldown_state,
+    )
     (
         cooldown_seconds,
         cooldown_state_source,
@@ -4944,7 +4962,7 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_XAI_LANE_KEY
+        lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     elif candidate["provider"] == _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER:
@@ -4960,6 +4978,18 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_key=cooldown_key,
     )
     cooldown_state_source: Optional[str] = initial_cooldown_state_source
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
+    ) = await _apply_codex_auto_agent_grok_account_lane_cooldown(
+        candidate=candidate,
+        lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=_get_anthropic_auto_agent_active_cooldown_state,
+    )
     (
         cooldown_seconds,
         cooldown_state_source,
@@ -5279,6 +5309,8 @@ def _add_codex_auto_agent_text_error_tokens(
 ) -> None:
     if "grok build usage balance exhausted" in text_lower:
         tokens.add(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN)
+    if "personal-team-blocked:spending-limit" in text_lower:
+        tokens.add(_CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN)
     if (
         "usage_limit_reached" in text_lower
         or "usage limit" in text_lower
@@ -5769,6 +5801,7 @@ async def _apply_auto_agent_alias_cooldown(
     cooldown_seconds: float,
     error_class: Optional[str],
     set_candidate_cooldown: Callable[[str, float], Awaitable[object]],
+    grok_account_quota_exhausted: bool = False,
 ) -> str:
     """Shared auto-agent cooldown apply (RR-054 #12).
 
@@ -5786,6 +5819,21 @@ async def _apply_auto_agent_alias_cooldown(
             selected_cooldown_key,
             cooldown_seconds,
         )
+        if grok_account_quota_exhausted:
+            lane_cooldown_key = (
+                _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
+                    candidate,
+                    lane_key,
+                )
+            )
+            if (
+                lane_cooldown_key is not None
+                and lane_cooldown_key != selected_cooldown_key
+            ):
+                await set_candidate_cooldown(
+                    lane_cooldown_key,
+                    cooldown_seconds,
+                )
         return cooldown_scope
 
     request_local_key = _get_codex_auto_agent_request_local_cooldown_key(
@@ -5812,6 +5860,7 @@ async def _apply_codex_auto_agent_alias_cooldown(
     selected_cooldown_key: str,
     cooldown_seconds: float,
     error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
 ) -> str:
     return await _apply_auto_agent_alias_cooldown(
         request=request,
@@ -5821,6 +5870,7 @@ async def _apply_codex_auto_agent_alias_cooldown(
         cooldown_seconds=cooldown_seconds,
         error_class=error_class,
         set_candidate_cooldown=_set_codex_auto_agent_cooldown,
+        grok_account_quota_exhausted=grok_account_quota_exhausted,
     )
 
 
@@ -5832,6 +5882,7 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
     selected_cooldown_key: str,
     cooldown_seconds: float,
     error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
 ) -> str:
     return await _apply_auto_agent_alias_cooldown(
         request=request,
@@ -5841,12 +5892,25 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
         cooldown_seconds=cooldown_seconds,
         error_class=error_class,
         set_candidate_cooldown=_set_anthropic_auto_agent_cooldown,
+        grok_account_quota_exhausted=grok_account_quota_exhausted,
     )
 
 
 def _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc: Any) -> bool:
     status_code = _extract_google_adapter_exception_status_code(exc)
     return _is_known_grok_build_usage_balance_exhausted_response(
+        url=httpx.URL(
+            _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL
+        ),
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        status_code=status_code,
+        exc=exc,
+    )
+
+
+def _is_codex_auto_agent_grok_personal_team_spending_limit(exc: Any) -> bool:
+    status_code = _extract_google_adapter_exception_status_code(exc)
+    return _is_known_grok_personal_team_spending_limit_response(
         url=httpx.URL(
             _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL
         ),
@@ -5872,12 +5936,60 @@ def _is_codex_auto_agent_grok_account_quota_candidate(
     }
 
 
+def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:
+    route_family = str(candidate.get("route_family") or "")
+    if route_family in {
+        "codex_xai_oauth_responses_adapter",
+        "anthropic_xai_oauth_responses_adapter",
+    }:
+        return _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
+    return _CODEX_AUTO_AGENT_XAI_LANE_KEY
+
+
+def _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
+    candidate: Payload,
+    lane_key: Optional[str],
+) -> Optional[str]:
+    if not lane_key or not _is_codex_auto_agent_grok_account_quota_candidate(
+        candidate
+    ):
+        return None
+    return f"{candidate.get('provider')}:__account_quota__:{lane_key}"
+
+
+async def _apply_codex_auto_agent_grok_account_lane_cooldown(
+    *,
+    candidate: Payload,
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
+) -> tuple[float, Optional[str], Optional[str]]:
+    lane_cooldown_key = _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
+        candidate,
+        lane_key,
+    )
+    if lane_cooldown_key is None:
+        return cooldown_seconds, cooldown_state_source, skip_reason
+    lane_seconds, lane_source = await get_active_cooldown_state(lane_cooldown_key)
+    if lane_seconds > cooldown_seconds:
+        cooldown_seconds = lane_seconds
+        cooldown_state_source = lane_source
+    if lane_seconds > 0 and skip_reason is None:
+        skip_reason = "account_quota_cooldown"
+    return cooldown_seconds, cooldown_state_source, skip_reason
+
+
 def _is_codex_auto_agent_grok_account_quota_exhaustion(
     exc: Any,
     *,
     candidate: Optional[dict[str, Any]] = None,
 ) -> bool:
-    if not _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc):
+    if not (
+        _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc)
+        or _is_codex_auto_agent_grok_personal_team_spending_limit(exc)
+    ):
         return False
     if candidate is None:
         return True
@@ -5889,7 +6001,7 @@ def _classify_codex_auto_agent_retryable_exhaustion(
 ) -> Optional[str]:
     status_code = _extract_google_adapter_exception_status_code(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc):
+    if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
         return "capacity_exhausted"
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
@@ -5989,10 +6101,9 @@ def _get_codex_auto_agent_cooldown_seconds(
     ) and _is_codex_auto_agent_durable_cooldown_error_class(error_class):
         return _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS
     if (
-        _is_codex_auto_agent_grok_account_quota_candidate(candidate)
-        and (
-            _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN in tokens
-            or _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc)
+        _is_codex_auto_agent_grok_account_quota_exhaustion(
+            exc,
+            candidate=candidate,
         )
         and _is_codex_auto_agent_durable_cooldown_error_class(error_class)
     ):
@@ -6049,6 +6160,7 @@ async def _set_codex_auto_agent_candidate_cooldowns(
     selected_cooldown_key: str,
     cooldown_seconds: float,
     error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
 ) -> str:
     return await _apply_codex_auto_agent_alias_cooldown(
         request=request,
@@ -6057,6 +6169,7 @@ async def _set_codex_auto_agent_candidate_cooldowns(
         selected_cooldown_key=selected_cooldown_key,
         cooldown_seconds=cooldown_seconds,
         error_class=error_class,
+        grok_account_quota_exhausted=grok_account_quota_exhausted,
     )
 
 
@@ -21334,6 +21447,12 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                 if error_class is None:
                     raise
                 last_retryable_exc = exc
+                grok_account_quota_exhausted = (
+                    _is_codex_auto_agent_grok_account_quota_exhaustion(
+                        exc,
+                        candidate=candidate,
+                    )
+                )
                 cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
                     exc,
                     candidate=candidate,
@@ -21345,6 +21464,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     selected_cooldown_key=selection["cooldown_key"],
                     cooldown_seconds=cooldown_seconds,
                     error_class=error_class,
+                    grok_account_quota_exhausted=grok_account_quota_exhausted,
                 )
                 error_tokens = _update_codex_auto_agent_retryable_attempt_record(
                     attempt_record=attempt_record,

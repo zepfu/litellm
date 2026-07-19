@@ -523,12 +523,16 @@ for xAI passthrough targets only. LiteLLM preserves the upstream `402` for calle
 logs a warning with `failure_kind=upstream_grok_account_quota_exhaustion` without a
 traceback, and does not emit active `.analysis/*-error.jsonl` intake for this known
 quota shape. Unrelated Grok `402` bodies still use the normal failure logging path.
-For `aawm-code` and `aawm-code-anthropic` alias routes, the same known Grok Build
-`402` body is also classified as retryable provider/account quota exhaustion: the
-exhausted Grok candidate gets a durable cooldown, non-in-flight requests fall through
-to the next alias candidate when one is available, and in-flight sessions return
-`redispatch_required` with attempt metadata including `error_status_code`,
-`failure_class`, and `error_tokens`.
+For model-alias routes, both known Grok account-exhaustion responses are
+classified as retryable provider/account quota exhaustion. Native Grok and
+managed xAI OAuth use separate account-safe lane identities. The affected lane
+gets a five-minute in-memory and Redis cooldown, remaining candidates on that
+same lane are skipped, and a fresh request advances immediately to the next
+independent candidate when one is available. Stateful continuations never
+switch providers; they return `redispatch_required` with attempt metadata
+including `error_status_code`, `failure_class`, `error_tokens`, and the lane
+identity. LiteLLM does not hold the request or retry in the background until a
+weekly limit resets.
 
 Unexpected `/signals` `401` bodies, unexpected `/replicas/update` `404` bodies,
 other Grok side-channel `401`/`404` failures, and any data-bearing side-channel

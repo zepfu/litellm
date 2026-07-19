@@ -21156,7 +21156,7 @@ async def test_anthropic_auto_agent_alias_code_selects_sonnet_5_1m_before_plain_
         "openai:gpt-5.3-codex-spark:__default__",
         "xai:xai/grok-4.5:xai_grok_native",
         "xai:grok-composer-2.5-fast:xai_grok_native",
-        "xai:oa_xai/grok-build:xai_grok_native",
+        "xai:oa_xai/grok-build:xai_oauth_managed",
     ):
         await _set_anthropic_auto_agent_cooldown(cooldown_key, 60.0)
 
@@ -21190,7 +21190,7 @@ async def test_anthropic_auto_agent_alias_code_native_sonnet_5_1m_normalizes_mod
         "openai:gpt-5.3-codex-spark:__default__",
         "xai:xai/grok-4.5:xai_grok_native",
         "xai:grok-composer-2.5-fast:xai_grok_native",
-        "xai:oa_xai/grok-build:xai_grok_native",
+        "xai:oa_xai/grok-build:xai_oauth_managed",
     ):
         await _set_anthropic_auto_agent_cooldown(cooldown_key, 60.0)
 
@@ -22062,7 +22062,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_reaches_native_last_
         "openai:gpt-5.3-codex-spark:__default__",
         "xai:xai/grok-4.5:xai_grok_native",
         "xai:grok-composer-2.5-fast:xai_grok_native",
-        "xai:oa_xai/grok-build:xai_grok_native",
+        "xai:oa_xai/grok-build:xai_oauth_managed",
     ):
         await _set_anthropic_auto_agent_cooldown(cooldown_key, 60.0)
 
@@ -27101,7 +27101,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permissio
         "xai:grok-composer-2.5-fast:xai_grok_native"
     )
     assert durable_seconds == 0.0
-    assert durable_source == "local_fallback"
+    assert durable_source in {"local_fallback", "negative_cache"}
 
 
 @pytest.mark.parametrize(
@@ -28351,7 +28351,7 @@ async def test_codex_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_cont
     }
     # Force native Grok 4.5 first: managed oa_xai/grok-4.5 is otherwise preferred.
     await _set_codex_auto_agent_cooldown(
-        "xai:oa_xai/grok-4.5:xai_grok_native",
+        "xai:oa_xai/grok-4.5:xai_oauth_managed",
         60.0,
     )
     transient_error = ProxyException(
@@ -28938,7 +28938,7 @@ async def test_candidate_unavailable_xai_is_request_local_without_durable_write(
     assert scope == "request_local"
     assert dual_cache.set_calls == []
     assert durable_seconds == 0.0
-    assert durable_source == "local_fallback"
+    assert durable_source in {"local_fallback", "negative_cache"}
 
 
 @pytest.mark.asyncio
@@ -39344,6 +39344,18 @@ def _build_grok_build_usage_balance_exhausted_error() -> HTTPException:
     )
 
 
+def _build_grok_personal_team_spending_limit_error() -> HTTPException:
+    return HTTPException(
+        status_code=403,
+        detail=(
+            b'{"code":"personal-team-blocked:spending-limit",'
+            b'"error":"You have run out of credits or need a Grok subscription. '
+            b'Add credits at https://grok.com/?_s=usage or upgrade at '
+            b'https://grok.com/supergrok."}'
+        ),
+    )
+
+
 def test_codex_auto_agent_retryable_exhaustion_classifies_grok_build_usage_balance_exhausted():
     exc = _build_grok_build_usage_balance_exhausted_error()
 
@@ -39355,10 +39367,31 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_grok_build_usage_balan
     assert exc.status_code == 402
 
 
+def test_codex_auto_agent_retryable_exhaustion_classifies_grok_personal_team_spending_limit():
+    exc = _build_grok_personal_team_spending_limit_error()
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
+        "capacity_exhausted"
+    )
+    tokens = _extract_codex_auto_agent_error_tokens(exc)
+    assert "GROK_PERSONAL_TEAM_SPENDING_LIMIT" in tokens
+    assert exc.status_code == 403
+
+
 def test_codex_auto_agent_retryable_exhaustion_ignores_unrelated_402_body():
     exc = HTTPException(
         status_code=402,
         detail=b'{"error":"Payment required for this workspace"}',
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
+    assert _extract_codex_auto_agent_error_tokens(exc) == set()
+
+
+def test_codex_auto_agent_retryable_exhaustion_ignores_unrelated_403_body():
+    exc = HTTPException(
+        status_code=403,
+        detail=b'{"error":"This API key is not authorized for the selected model"}',
     )
 
     assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
@@ -39627,7 +39660,7 @@ def test_codex_auto_agent_grok_composer_durable_cooldown_seconds_are_five_minute
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_back_after_grok_build_usage_balance_exhausted():
+async def test_codex_auto_agent_alias_code_skips_native_lane_after_grok_personal_team_spending_limit():
     request = _build_codex_auto_agent_request()
     body = {
         "model": "aawm-code",
@@ -39635,20 +39668,19 @@ async def test_codex_auto_agent_alias_code_falls_back_after_grok_build_usage_bal
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    grok_error = _build_grok_build_usage_balance_exhausted_error()
+    grok_error = _build_grok_personal_team_spending_limit_error()
     managed_xai_success = Response(
         content='{"ok": true}', media_type="application/json"
     )
     dual_cache = _FakeAawmAliasRoutingDualCache()
-    cooldown_key = "xai:grok-composer-2.5-fast:xai_grok_native"
-    grok45_cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
+    cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
+    lane_cooldown_key = "xai:__account_quota__:xai_grok_native"
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
-    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(grok45_cooldown_key, None)
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(lane_cooldown_key, None)
     await _set_codex_auto_agent_cooldown(
         "openai:gpt-5.3-codex-spark:__default__",
         60.0,
     )
-    await _set_codex_auto_agent_cooldown(grok45_cooldown_key, 60.0)
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
@@ -39675,21 +39707,66 @@ async def test_codex_auto_agent_alias_code_falls_back_after_grok_build_usage_bal
     mock_grok_native.assert_awaited_once()
     mock_xai_oauth.assert_awaited_once()
     metadata = request.scope["parsed_body"][1]["litellm_metadata"]
-    composer_attempt = metadata["codex_auto_agent_attempts"][0]
-    assert composer_attempt["model"] == "grok-composer-2.5-fast"
-    assert composer_attempt["status"] == "cooldown_set"
-    assert composer_attempt["error_class"] == "capacity_exhausted"
-    assert composer_attempt["error_status_code"] == 402
-    assert composer_attempt["cooldown_scope"] == "candidate"
-    assert composer_attempt["cooldown_seconds"] == 300.0
-    assert "GROK_BUILD_USAGE_BALANCE_EXHAUSTED" in composer_attempt["error_tokens"]
+    grok_attempt = metadata["codex_auto_agent_attempts"][0]
+    assert grok_attempt["model"] == "xai/grok-4.5"
+    assert grok_attempt["status"] == "cooldown_set"
+    assert grok_attempt["error_class"] == "capacity_exhausted"
+    assert grok_attempt["error_status_code"] == 403
+    assert grok_attempt["cooldown_scope"] == "candidate"
+    assert grok_attempt["cooldown_seconds"] == 300.0
+    assert "GROK_PERSONAL_TEAM_SPENDING_LIMIT" in grok_attempt["error_tokens"]
+    skipped_by_model = {
+        candidate["model"]: candidate
+        for candidate in metadata["codex_auto_agent_skipped_candidates"]
+    }
+    assert skipped_by_model["grok-composer-2.5-fast"]["lane_key"] == (
+        "xai_grok_native"
+    )
+    assert skipped_by_model["grok-composer-2.5-fast"]["reason"] == (
+        "account_quota_cooldown"
+    )
     assert metadata["codex_auto_agent_selected_model"] == "oa_xai/grok-build"
+    assert metadata["codex_auto_agent_lane_key"] == "xai_oauth_managed"
     assert any(
         call["key"]
         == _build_aawm_alias_routing_durable_cache_key(
             alias_family="codex",
             state_kind="cooldown",
             state_key=cooldown_key,
+        )
+        for call in dual_cache.set_calls
+    )
+    _codex_auto_agent_cooldown_until_monotonic_by_key.pop(
+        lane_cooldown_key,
+        None,
+    )
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        recovered_lane_seconds, recovered_lane_source = (
+            await _get_codex_auto_agent_active_cooldown_state(lane_cooldown_key)
+        )
+        recovered_selection = await _select_codex_auto_agent_candidate(
+            request=request,
+            request_body=body,
+        )
+    assert recovered_lane_seconds > 0
+    assert recovered_lane_source == "durable_cache"
+    assert recovered_selection["candidate"]["model"] == "oa_xai/grok-build"
+    recovered_composer = next(
+        candidate
+        for candidate in recovered_selection["skipped"]
+        if candidate["model"] == "grok-composer-2.5-fast"
+    )
+    assert recovered_composer["reason"] == "account_quota_cooldown"
+    assert recovered_composer["cooldown_state_source"] == "memory"
+    assert any(
+        call["key"]
+        == _build_aawm_alias_routing_durable_cache_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=lane_cooldown_key,
         )
         for call in dual_cache.set_calls
     )
@@ -39766,7 +39843,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_in_flight_grok_build_usage_balance_exhausted_redispatches():
+async def test_anthropic_auto_agent_alias_in_flight_grok_personal_team_spending_limit_redispatches():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "aawm-code-anthropic"
@@ -39791,7 +39868,7 @@ async def test_anthropic_auto_agent_alias_in_flight_grok_build_usage_balance_exh
         "last_resort": False,
         "expires_at_monotonic": time.monotonic() + 3600,
     }
-    grok_error = _build_grok_build_usage_balance_exhausted_error()
+    grok_error = _build_grok_personal_team_spending_limit_error()
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
@@ -39819,9 +39896,9 @@ async def test_anthropic_auto_agent_alias_in_flight_grok_build_usage_balance_exh
         "aawm_anthropic_auto_agent_redispatch_required"
     )
     assert exc_info.value.detail["failure_class"] == "capacity_exhausted"
-    assert exc_info.value.detail["error_status_code"] == 402
+    assert exc_info.value.detail["error_status_code"] == 403
     assert exc_info.value.detail["cooldown_seconds"] == 300.0
-    assert "GROK_BUILD_USAGE_BALANCE_EXHAUSTED" in exc_info.value.detail["error_tokens"]
+    assert "GROK_PERSONAL_TEAM_SPENDING_LIMIT" in exc_info.value.detail["error_tokens"]
     assert (
         exc_info.value.detail["redispatch_reason"]
         == "in_flight_retryable_provider_exhaustion"
@@ -39829,7 +39906,7 @@ async def test_anthropic_auto_agent_alias_in_flight_grok_build_usage_balance_exh
     parsed_body = request.scope["parsed_body"][1]
     grok_attempt = parsed_body["litellm_metadata"]["anthropic_auto_agent_attempts"][0]
     assert grok_attempt["error_class"] == "capacity_exhausted"
-    assert grok_attempt["error_status_code"] == 402
+    assert grok_attempt["error_status_code"] == 403
     assert grok_attempt["cooldown_scope"] == "candidate"
     mock_grok_native.assert_awaited_once()
     mock_spark.assert_not_called()
