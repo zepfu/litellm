@@ -617,6 +617,19 @@ Operator contract:
   --apply
 ```
 
+## Managed Kimi Code Subscription Cost Semantics
+
+Managed Kimi Code session-history rows treat token-derived prices as reference
+cost fields, not an invoice. They set
+`metadata.billing_mode=kimi_code_subscription` and
+`metadata.actual_invoice_cost_known=false`; `response_cost_usd` is left unset.
+The persisted provenance includes `reference_cost_kind`,
+`reference_cost_currency`, `reference_cost_model`, `reference_cost_source`,
+`reference_cost_cached_input_usd`, `reference_cost_uncached_input_usd`,
+`reference_cost_output_usd`, and `reference_cost_total_usd`.
+Consumers must not turn a reference amount into actual subscription spend
+or native quota consumption without independent evidence.
+
 ## Rate Limit And Billing Observations
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing
@@ -1065,6 +1078,14 @@ Common keys include:
 - `codex_auto_agent_skipped_candidates` or
   `anthropic_auto_agent_skipped_candidates`: candidates skipped because of
   cooldown or stateful session-affinity cooldown.
+
+Managed Kimi Code account/auth/quota/provider-capacity failures use the shared
+`kimi_code_managed_account` lane, so they suppress K3 and managed K2.7
+candidates that depend on the same CLI grant. Unsupported model, effort, or
+capability failures remain candidate-scoped and may continue to another
+authenticated managed candidate. Declaring `aawm-sota-moonshot` or inserting a
+Kimi candidate in an alias does not enable it without a configured route, the
+shared credential, and accepted authenticated `/models` capability evidence.
 
 For retryable provider errors, the handler records a
 `candidate_retryable_failure` event, cools down that candidate, and selects the

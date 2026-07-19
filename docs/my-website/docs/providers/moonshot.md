@@ -38,6 +38,31 @@ You can overwrite the base url with:
 os.environ["MOONSHOT_API_BASE"] = "https://api.moonshot.cn/v1"
 ```
 
+## Managed Kimi Code OAuth (AAWM)
+
+This is separate from the paid Moonshot API-key integration above. The
+`moonshot/` route continues to use `MOONSHOT_API_KEY`; it is not a substitute
+for the managed OAuth-backed `kimi_code` provider.
+
+Managed Kimi Code accepts only these exact model IDs: `k3`,
+`kimi-for-coding`, and `kimi-for-coding-highspeed`. The authenticated Kimi
+Code `/models` response is the capability authority, including whether a
+requested reasoning effort is supported. Missing or unrecognized capability
+data does not justify inventing output ceilings, translating to another model,
+or silently substituting an effort.
+
+The raw Kimi CLI compatibility gateway is the trusted-local `/kimi/v1` route.
+It accepts only a direct `127.0.0.1` or `::1` peer; forwarded identity headers
+are ignored. Incoming authorization and forwarded/provider-specific identity
+headers are stripped, and the gateway supplies the managed Kimi credential
+instead of relaying caller authorization.
+
+For the shared credential and native lock contract, see
+`docs/aawm-oauth-credential-maintenance.md` in the repository. Native quota
+observation semantics are maintained in
+`docs/aawm-provider-status-observations.md`; subscription reference-cost and
+alias cooldown provenance are maintained in `docs/aawm-session-history.md`.
+
 ## Usage - LiteLLM Python SDK
 
 ### Non-streaming

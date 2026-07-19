@@ -17,12 +17,18 @@ Related deeper context:
 | Codex / ChatGPT OAuth | `scripts/codex_oauth_refresh.py` (sidecar) | LiteLLM Codex adapter routes | `~/.codex/auth.json` |
 | Managed xAI OAuth (`oa_xai/*`) | `scripts/xai_oauth_refresh.py` (sidecar) | LiteLLM managed xAI OAuth routes | `~/.litellm/xai/oauth-auth.json` |
 | Grok native OIDC | `scripts/grok_oidc_refresh.py` (sidecar) | LiteLLM Grok native routes | Caller-supplied configured path |
+| Kimi Code CLI OAuth (`kimi_code`) | Existing Kimi Code CLI grant; sidecar refresh only when enabled | Configured LiteLLM Kimi Code consumers | `~/.kimi-code/credentials/kimi-code.json` |
 | Antigravity OAuth | `scripts/antigravity_oauth_refresh.py` (manual / non-sidecar) | LiteLLM Antigravity routes | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
 
 LiteLLM is a **read-only consumer** of these files during request handling. It
 selects a still-valid access token (or fails the candidate with a clear
 refresh-required message). It must not refresh, seed, or rewrite these
 credentials on the request path.
+
+Kimi Code uses the existing host Kimi CLI credential in place. It is not a
+LiteLLM-owned second grant. A configured managed `kimi_code` route consumes the
+same credential read-only; possessing the file or naming an alias does not
+enable routing or transport by itself.
 
 ## Portable default paths
 
@@ -36,12 +42,14 @@ credential path. Defaults must not hardcode a specific operator home directory.
 | Codex | `~/.codex/auth.json` | `~/.codex/auth.json.lock` |
 | Managed xAI OAuth | `~/.litellm/xai/oauth-auth.json` | `~/.litellm/xai/oauth-auth.json.lock` |
 | Grok OIDC | Caller-supplied configured path | same directory, `.lock` sibling when configured |
+| Kimi Code CLI OAuth | `~/.kimi-code/credentials/kimi-code.json` | `~/.kimi-code/oauth/kimi-code` (native `proper-lockfile` creates the transient `kimi-code.lock` directory) |
 | Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` | `~/.gemini/antigravity-cli/antigravity-oauth-token.lock` |
 | Antigravity CLI binary candidates | `~/.local/bin/agy` | n/a |
 
 Override paths with the normal env vars for the family in use (for example
 `AAWM_CODEX_AUTH_FILE` / `LITELLM_CODEX_AUTH_FILE`,
 `AAWM_XAI_OAUTH_AUTH_FILE` / `LITELLM_XAI_OAUTH_AUTH_FILE`,
+`AAWM_KIMI_OAUTH_AUTH_FILE` / `LITELLM_KIMI_OAUTH_AUTH_FILE`,
 `LITELLM_XAI_GROK_AUTH_FILE`,
 `AAWM_ANTIGRAVITY_AUTH_FILE` / `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` and seed
 variants). Compose may bind the expanded host path into containers; the script
@@ -84,11 +92,11 @@ where the script supports that (Codex and Grok repair paths).
 Publication preserves existing file ownership and private mode unless optional
 env overrides are set. Each family uses the same shape:
 
-| Purpose | Codex | Managed xAI | Grok OIDC | Antigravity |
-| --- | --- | --- | --- | --- |
-| UID | `AAWM_CODEX_AUTH_FILE_UID` | `AAWM_XAI_OAUTH_AUTH_FILE_UID` | `AAWM_GROK_OIDC_AUTH_FILE_UID` | `AAWM_ANTIGRAVITY_AUTH_FILE_UID` |
-| GID | `AAWM_CODEX_AUTH_FILE_GID` | `AAWM_XAI_OAUTH_AUTH_FILE_GID` | `AAWM_GROK_OIDC_AUTH_FILE_GID` | `AAWM_ANTIGRAVITY_AUTH_FILE_GID` |
-| Mode | `AAWM_CODEX_AUTH_FILE_MODE` | `AAWM_XAI_OAUTH_AUTH_FILE_MODE` | `AAWM_GROK_OIDC_AUTH_FILE_MODE` | `AAWM_ANTIGRAVITY_AUTH_FILE_MODE` |
+| Purpose | Codex | Managed xAI | Grok OIDC | Kimi Code CLI | Antigravity |
+| --- | --- | --- | --- | --- | --- |
+| UID | `AAWM_CODEX_AUTH_FILE_UID` | `AAWM_XAI_OAUTH_AUTH_FILE_UID` | `AAWM_GROK_OIDC_AUTH_FILE_UID` | `AAWM_KIMI_OAUTH_AUTH_FILE_UID` | `AAWM_ANTIGRAVITY_AUTH_FILE_UID` |
+| GID | `AAWM_CODEX_AUTH_FILE_GID` | `AAWM_XAI_OAUTH_AUTH_FILE_GID` | `AAWM_GROK_OIDC_AUTH_FILE_GID` | `AAWM_KIMI_OAUTH_AUTH_FILE_GID` | `AAWM_ANTIGRAVITY_AUTH_FILE_GID` |
+| Mode | `AAWM_CODEX_AUTH_FILE_MODE` | `AAWM_XAI_OAUTH_AUTH_FILE_MODE` | `AAWM_GROK_OIDC_AUTH_FILE_MODE` | `AAWM_KIMI_OAUTH_AUTH_FILE_MODE` | `AAWM_ANTIGRAVITY_AUTH_FILE_MODE` |
 
 Rules:
 
@@ -135,6 +143,44 @@ Behavior:
 Rows and summaries must never include access tokens, refresh tokens, raw
 auth-file contents, or raw auth-file path material beyond what operators already
 configured.
+
+## Kimi Code CLI credential ownership
+
+The shared Kimi Code CLI credential and native lock target are:
+
+```text
+~/.kimi-code/credentials/kimi-code.json
+~/.kimi-code/oauth/kimi-code
+```
+
+Use that same existing JSON in place. Do not copy it into a LiteLLM directory,
+symlink it, or create another grant. The Kimi CLI's native `proper-lockfile`
+lock for the `oauth/kimi-code` target is the transient sibling directory
+`oauth/kimi-code.lock`; do not bind-mount that transient directory directly.
+
+Dev compose has a strict writer/consumer split:
+
+- `litellm-dev` bind-mounts only
+  `~/.kimi-code/credentials/kimi-code.json` read-only. A configured Kimi Code
+  request worker consumes that shared file and picks up later replacements on
+  subsequent requests without a container restart.
+- `provider-status-observations` receives read-write access only to
+  `~/.kimi-code/credentials` and `~/.kimi-code/oauth`. The latter is required
+  for the native `oauth/kimi-code` lock target and its `kimi-code.lock`
+  directory; the sidecar does not receive the broader `~/.kimi-code` tree.
+- Scheduled refresh is disabled by default:
+  `AAWM_KIMI_OAUTH_REFRESH_ENABLED=0`. Set it to `1` only when refresh of the
+  existing CLI grant is explicitly intended, and set any needed
+  `AAWM_KIMI_OAUTH_AUTH_FILE`, `AAWM_KIMI_OAUTH_LOCK_FILE`, interval, timeout,
+  and optional uid/gid/mode overrides.
+
+The compose contract controls credential ownership and hot-reload visibility;
+it does not enable a Kimi route by itself. Managed-route behavior, exact model
+IDs, and `/models` capability gating are documented in
+[`moonshot.md`](my-website/docs/providers/moonshot.md#managed-kimi-code-oauth-aawm).
+Any production-equivalent deployment must preserve the same read-only worker
+and single-writer sidecar contract, but production mutation remains a separate
+operator-authorized rollout.
 
 ## Antigravity staged HOME distinction
 
@@ -207,5 +253,6 @@ restart event.
 | Codex refresh | `scripts/codex_oauth_refresh.py` |
 | Managed xAI refresh | `scripts/xai_oauth_refresh.py` |
 | Grok OIDC refresh | `scripts/grok_oidc_refresh.py` |
+| Managed Kimi Code refresh | `scripts/kimi_oauth_refresh.py` |
 | Antigravity refresh | `scripts/antigravity_oauth_refresh.py` |
 | Sidecar loop | `scripts/run_provider_status_observations_loop.py` |

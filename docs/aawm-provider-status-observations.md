@@ -111,6 +111,35 @@ Grok billing has two distinct payload shapes and must not be conflated:
   with `quota_period=monthly` and are **not** used as a fallback for weekly
   credit percent.
 
+## Kimi Code Native Usage Observations
+
+The optional native Kimi Code usage poll records
+`source=kimi_code_usage`, `provider=kimi_code`, `client=kimi-code`,
+`model=kimi-code`, and `quota_type=quota_units`. Its versioned parser records
+the parser/source versions and parser path in safe evidence; a parsed reset is
+stored in `expected_reset_at`, while an absent or malformed reset remains
+unknown rather than guessed. Account identity is represented only by the
+derived `account_hash`, never by the raw account fields.
+
+Native quota windows use
+`kimi_code_5h:quota_units`, `kimi_code_7d:quota_units`, and, when supplied,
+`kimi_code_monthly:quota_units`; a supplied parallel limit is a separate
+concurrency observation. The units are provider-native quota units, not token,
+USD, output-length, or model-capability claims. Missing optional monthly,
+parallel, reset, or usage values do not prove unlimited quota, zero usage, a
+disabled model, or a billing outcome.
+
+Malformed or missing Kimi usage telemetry is a degraded observation, not a
+successful zero-quota snapshot. Account-wide quota/capacity evidence applies a
+shared managed-account cooldown. Authenticated `/models` capability or effort
+rejection is candidate-scoped, so it does not cool unrelated managed models.
+An alias declaration does not enable Kimi Code: a configured route plus a valid
+credential and accepted capability remain required.
+
+This is an interpretation-only documentation update. It adds no
+`session_history` or observation schema, view, or API change, so no
+`dashboard-shell` handoff is needed.
+
 Anthropic unified response headers persist separate weekly buckets:
 
 - `anthropic_unified_7d:7d` — baseline unified seven-day quota (`quota_period=seven_day`, `window_minutes=10080`).
