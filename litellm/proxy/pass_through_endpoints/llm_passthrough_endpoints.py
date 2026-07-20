@@ -2853,6 +2853,30 @@ def _record_adapted_completed_route_rollup_turn(
         )
 
 
+def _record_adapted_completed_route_rollup_after_stream(
+    response: StreamingResponse,
+    rollup_kwargs: dict[str, Any],
+    *,
+    adapter_label: str,
+) -> StreamingResponse:
+    original_iterator = response.body_iterator
+    recorded = False
+
+    async def _wrapped_iterator() -> Any:
+        nonlocal recorded
+        async for chunk in original_iterator:
+            yield chunk
+        if not recorded:
+            recorded = True
+            _record_adapted_completed_route_rollup_turn(
+                rollup_kwargs,
+                adapter_label=adapter_label,
+            )
+
+    response.body_iterator = _wrapped_iterator()
+    return response
+
+
 def _auto_agent_alias_model_rollup_label(event: dict[str, Any]) -> Optional[str]:
     model = _clean_codex_auth_value(event.get("model"))
     alias_model = _clean_codex_auth_value(event.get("alias_model"))
@@ -24394,21 +24418,56 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
     use_alias_candidate_probe: bool = False,
 ) -> Response:
     _ = endpoint, fastapi_response, user_api_key_dict
+    rollup_kwargs: dict[str, Any] = {}
+
+    async def _prepare_and_emit_route_log(
+        **kwargs: Any,
+    ) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
+        plan = await _prepare_codex_kimi_chat_completions_adapter_route(**kwargs)
+        metadata = plan.perform_kwargs.get("litellm_metadata")
+        if not isinstance(metadata, dict):
+            metadata = plan.prepared_request_body.get("litellm_metadata")
+        rollup_kwargs.update(
+            _build_adapted_route_rollup_kwargs(
+                metadata if isinstance(metadata, dict) else {}
+            )
+        )
+        _annotate_request_scope_for_adapted_access_log(request, plan.target_url)
+        _emit_adapted_route_access_log(
+            request=request,
+            target_url=str(plan.target_url),
+            request_body=plan.prepared_request_body,
+            rollup_kwargs=rollup_kwargs,
+            adapter_label="Kimi Code",
+        )
+        return plan
+
     response = await _aawm_adapter_driver.run_completion_adapter_route(
-        prepare=_prepare_codex_kimi_chat_completions_adapter_route,
+        prepare=_prepare_and_emit_route_log,
         perform=_perform_codex_kimi_chat_completions_adapter_call,
         request=request,
         prepared_request_body=prepared_request_body,
         adapter_model=adapter_model,
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
-    return await _validate_codex_auto_agent_responses_payload(
+    validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=adapter_model,
         adapter="codex_kimi_chat_completions_adapter",
         adapter_label="Kimi Code",
         request_body=prepared_request_body,
     )
+    if isinstance(validated_response, StreamingResponse):
+        return _record_adapted_completed_route_rollup_after_stream(
+            validated_response,
+            rollup_kwargs,
+            adapter_label="Kimi Code",
+        )
+    _record_adapted_completed_route_rollup_turn(
+        rollup_kwargs,
+        adapter_label="Kimi Code",
+    )
+    return validated_response
 
 
 async def _handle_codex_opencode_zen_adapter_route(

@@ -773,9 +773,19 @@ async def test_should_run_codex_nonstream_through_hot_read_kimi_provider(monkeyp
         )
 
     respx_mock.post(KIMI_CODE_CHAT_COMPLETIONS_URL).mock(side_effect=upstream)
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._annotate_request_scope_for_adapted_access_log",
-        side_effect=lambda *_args: order.append("annotated"),
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._annotate_request_scope_for_adapted_access_log",
+            side_effect=lambda *_args: (
+                order.append("annotated") if not order else None
+            ),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_adapted_route_access_log",
+        ) as emit_route_log,
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._record_adapted_completed_route_rollup_turn",
+        ) as record_completed_turn,
     ):
         response = await _handle_codex_kimi_chat_completions_adapter_route(
             endpoint="/v1/responses",
@@ -798,6 +808,14 @@ async def test_should_run_codex_nonstream_through_hot_read_kimi_provider(monkeyp
             adapter_model="kimi_code/k3-high",
         )
 
+    assert emit_route_log.call_count == 1
+    assert emit_route_log.call_args.kwargs["target_url"] == (
+        KIMI_CODE_CHAT_COMPLETIONS_URL
+    )
+    assert emit_route_log.call_args.kwargs["request_body"]["model"] == (
+        "kimi_code/k3-high"
+    )
+    assert record_completed_turn.call_count == 1
     response_text = response.body.decode()
     assert "inspect" in response_text
     assert "done" in response_text
@@ -944,28 +962,40 @@ async def test_should_emit_codex_stream_terminal_usage_and_tool_events(monkeypat
         headers={"content-type": "text/event-stream"},
     )
 
-    response = await _handle_codex_kimi_chat_completions_adapter_route(
-        endpoint="/v1/responses",
-        request=_request(),
-        fastapi_response=MagicMock(spec=Response),
-        user_api_key_dict=MagicMock(),
-        prepared_request_body={
-            "model": "kimi_code/k3-max",
-            "input": "inspect",
-            "tools": [
-                {
-                    "type": "custom",
-                    "name": "apply_patch",
-                    "description": "Apply a patch to files in the workspace.",
-                },
-                {"type": "custom", "name": "exec_command"},
-            ],
-            "stream": True,
-        },
-        adapter_model="kimi_code/k3-max",
-    )
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_adapted_route_access_log",
+        ) as emit_route_log,
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._record_adapted_completed_route_rollup_turn",
+        ) as record_completed_turn,
+    ):
+        response = await _handle_codex_kimi_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": "kimi_code/k3-max",
+                "input": "inspect",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a patch to files in the workspace.",
+                    },
+                    {"type": "custom", "name": "exec_command"},
+                ],
+                "stream": True,
+            },
+            adapter_model="kimi_code/k3-max",
+        )
 
-    event_text = await _stream_text(response)
+        assert emit_route_log.call_count == 1
+        assert record_completed_turn.call_count == 0
+        event_text = await _stream_text(response)
+        assert record_completed_turn.call_count == 1
+
     assert "response.completed" in event_text
     assert "call_apply_patch" in event_text
     assert "apply_patch" in event_text
