@@ -148,9 +148,11 @@ Run the opt-in Codex gate as
 `native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration`.
 It uses the target-selected production Codex profile and requires two completed
 `spawn_agent` calls, at least twelve persisted child `exec_command` rows, and a
-9,800-10,200 character final block. Both spawn calls must omit `fork_turns`;
-setting it to `none` discards the parent Moonshot context and allows the child
-sessions to select the default alias.
+9,800-10,200 character final block. Both spawn calls must set
+`model="aawm-sota-moonshot"` and `fork_turns="none"` and must carry complete
+self-contained plaintext child messages. Do not use the legacy
+`fork_context` field and do not rely on inherited or encrypted parent context
+to carry the child task.
 
 Kimi streaming coverage must include a response that leaves the bounded eager
 validation path before emitting multiple collaboration calls. The output-item

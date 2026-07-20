@@ -1779,8 +1779,15 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
         in command
     )
     prompt = command[-1]
-    assert "omit the fork_turns field entirely" in prompt
-    assert "do not set fork_turns to none" in prompt
+    assert 'model="aawm-sota-moonshot"' in prompt
+    assert 'fork_turns="none"' in prompt
+    assert "complete self-contained plaintext message" in prompt
+    assert "do not include the legacy fork_context field" in prompt
+    assert "Do not rely on inherited context" in prompt
+    assert "prohibit further agent spawning" in prompt
+    assert "fork_context=false" not in prompt
+    assert "omit the fork_turns field entirely" not in prompt
+    assert "do not set fork_turns to none" not in prompt
 
     output_checks = case_config["command_output_text_checks"]
     assert output_checks["minimum_chars"] == 9800

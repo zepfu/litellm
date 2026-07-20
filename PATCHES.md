@@ -58,6 +58,37 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.127 - Codex MultiAgentV2 spawn-agent schema correction
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.127`. The Codex
+`spawn_agent` tool rewrite now advertises the active MultiAgentV2 contract:
+lower-case `model`, `fork_turns`, and `message`. `fork_turns` is a string with
+supported values `none` and `all`; isolated workers use `fork_turns="none"`.
+The rewrite removes legacy `fork_context` from both the property map and
+`required` while preserving runtime-provided fields such as `task_name`.
+
+The production Moonshot Codex stress prompt now sets
+`model="aawm-sota-moonshot"` and `fork_turns="none"` on both child dispatches
+and provides each child a complete self-contained plaintext task. This prevents
+the children from replaying inherited parent orchestration while preserving
+explicit provider-native Moonshot routing.
+
+**Why:** Codex 0.144.6 MultiAgentV2 rejects `fork_context` with the handled
+error `fork_context is not supported in MultiAgentV2; use fork_turns instead`.
+Omitting `fork_turns` inherited opaque parent continuation state and produced
+unreliable child task envelopes. The fork was rewriting the live tool schema to
+the legacy field, so a harness-only correction could not succeed.
+
+**Why not upstream:** The generic Codex tool schema is client-owned, but the
+AAWM fork intentionally rewrites that schema and fanout guidance for its model
+aliases and production acceptance harness. Keeping the rewrite aligned with
+the installed Codex runtime is fork-local behavior.
+
+**Validation status:** The complete passthrough module passes (`971 passed`);
+the acceptance-hardening suite passes (`96 passed`); and focused Ruff, JSON
+parsing, Python compilation, and `git diff --check` pass. Production Codex and
+Claude Moonshot stress acceptance remains required under `PROD_RELEASE.md`.
+
 ### aawm.126 - Managed Kimi OAuth expiry and Moonshot stress acceptance
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.126`. Managed

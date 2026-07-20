@@ -18325,13 +18325,15 @@ def test_codex_spawn_agent_tool_description_patch_replaces_restrictive_policy():
         "status": "applied",
         "tool_name": "spawn_agent",
         "path": "tools.0.parameters",
-        "fields_added": ["model", "fork_context", "message"],
+        "fields_added": ["model", "fork_turns", "message"],
+        "fields_removed": [],
         "occurrences": 0,
     }
     patched_description = updated_body["tools"][0]["description"]
     assert "Use subagents to parallelize independent work" in patched_description
     assert "aawm-codex-agent-auto" in patched_description
-    assert "fork_context=false" in patched_description
+    assert 'fork_turns="none"' in patched_description
+    assert "fork_context" not in patched_description
     assert "read-only payload does not apply" in patched_description
     assert "latest frontier model" in patched_description
     assert "latest Codex model" in patched_description
@@ -18341,9 +18343,16 @@ def test_codex_spawn_agent_tool_description_patch_replaces_restrictive_policy():
     spawn_agent_parameters = updated_body["tools"][0]["parameters"]
     assert spawn_agent_parameters["type"] == "object"
     spawn_agent_properties = spawn_agent_parameters["properties"]
-    assert list(spawn_agent_properties) == ["model", "fork_context", "message"]
+    assert list(spawn_agent_properties) == ["model", "fork_turns", "message"]
     assert spawn_agent_properties["model"]["type"] == "string"
-    assert spawn_agent_properties["fork_context"]["type"] == "boolean"
+    assert spawn_agent_properties["fork_turns"] == {
+        "type": "string",
+        "enum": ["none", "all"],
+        "description": (
+            "Which parent turns to fork into the worker. Use none for isolated "
+            "workers unless the complete parent context is explicitly required."
+        ),
+    }
     assert spawn_agent_properties["message"]["type"] == "string"
     assert updated_body["tools"][1] == request_body["tools"][1]
 
@@ -18377,11 +18386,20 @@ def test_codex_spawn_agent_tool_patch_adds_function_payload_schema_fields():
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "task_name": {
+                                "type": "string",
+                                "description": "Existing task label.",
+                            },
+                            "fork_context": {
+                                "type": "boolean",
+                                "description": "Legacy context control.",
+                            },
                             "message": {
                                 "type": "string",
                                 "description": "Existing prompt field.",
                             }
                         },
+                        "required": ["task_name", "fork_context", "message"],
                     },
                 },
             }
@@ -18398,17 +18416,25 @@ def test_codex_spawn_agent_tool_patch_adds_function_payload_schema_fields():
         if event["id"] == "spawn-agent-payload-schema"
     )
     assert schema_event["path"] == "tools.0.function.parameters"
-    assert schema_event["fields_added"] == ["model", "fork_context"]
+    assert schema_event["fields_added"] == ["model", "fork_turns"]
+    assert schema_event["fields_removed"] == ["fork_context"]
 
     function = updated_body["tools"][0]["function"]
     assert "aawm-codex-agent-auto" in function["description"]
     properties = function["parameters"]["properties"]
     assert properties["model"]["type"] == "string"
-    assert properties["fork_context"]["type"] == "boolean"
+    assert properties["fork_turns"]["type"] == "string"
+    assert properties["fork_turns"]["enum"] == ["none", "all"]
+    assert "fork_context" not in properties
+    assert properties["task_name"] == {
+        "type": "string",
+        "description": "Existing task label.",
+    }
     assert properties["message"] == {
         "type": "string",
         "description": "Existing prompt field.",
     }
+    assert function["parameters"]["required"] == ["task_name", "message"]
 
 
 def test_codex_multi_agent_tool_search_description_gets_fanout_policy():
@@ -32735,11 +32761,12 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
         == "session_history_tool_definition_snapshots"
     )
     assert "aawm-codex-agent-auto" in prepared_body["tools"][0]["description"]
-    assert "fork_context=false" in prepared_body["tools"][0]["description"]
+    assert 'fork_turns="none"' in prepared_body["tools"][0]["description"]
+    assert "fork_context" not in prepared_body["tools"][0]["description"]
     spawn_agent_parameters = prepared_body["tools"][0]["parameters"]
     assert set(spawn_agent_parameters["properties"]) == {
         "model",
-        "fork_context",
+        "fork_turns",
         "message",
     }
 

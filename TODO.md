@@ -186,7 +186,7 @@ these docs only as needed:
 
 ## Next
 
-- Promote `v1.82.3-aawm.126` to `aawm-litellm` production for managed Kimi
+- Promote `v1.82.3-aawm.127` to `aawm-litellm` production for managed Kimi
   collaboration namespace adaptation, corrected reasoning/message/tool stream
   ordering, large-stream namespace restoration, continuation replay, handled
   passthrough 4xx logging, exact source-error route rollups, full-row
@@ -208,8 +208,10 @@ these docs only as needed:
   Claude `ANTHROPIC_BASE_URL`/non-secret custom-header overlay. Do not set,
   copy, synthesize, or override `ANTHROPIC_API_KEY`; the real Claude CLI must
   use its existing OAuth credential state. The Codex collaboration prompt must
-  omit `fork_turns` from both child spawns so the child sessions retain the
-  parent Moonshot context and selected model.
+  set `model="aawm-sota-moonshot"` and `fork_turns="none"` on both child
+  spawns and provide complete self-contained plaintext child tasks. Do not use
+  legacy `fork_context` or inherited encrypted context as the child task
+  envelope.
   Keep `litellm-dev` on its current code and monitor its logs for new signatures;
   do not use it as the Moonshot production acceptance target.
 

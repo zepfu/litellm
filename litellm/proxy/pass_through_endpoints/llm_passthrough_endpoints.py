@@ -1276,7 +1276,7 @@ _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "same task across agents.\n\n"
     "For read-only or exploration workers, call multi_agent_v1.spawn_agent with "
     'lower-case payload fields: model="aawm-codex-agent-auto", '
-    "fork_context=false unless context sharing is explicitly needed, and message "
+    'fork_turns="none" unless context sharing is explicitly needed, and message '
     "containing the read-only boundary plus the audit task. If a fix is needed, "
     "the worker should describe the patch only.\n\n"
     "For coding workers, this read-only payload does not apply. Include the "
@@ -1301,12 +1301,12 @@ _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
             "the selected coding model for coding workers."
         ),
     },
-    "fork_context": {
-        "type": "boolean",
+    "fork_turns": {
+        "type": "string",
+        "enum": ["none", "all"],
         "description": (
-            "Whether to fork the current conversation context into the worker. "
-            "Use false for isolated read-only audits unless context sharing is "
-            "explicitly required."
+            "Which parent turns to fork into the worker. Use none for isolated "
+            "workers unless the complete parent context is explicitly required."
         ),
     },
     "message": {
@@ -1319,7 +1319,7 @@ _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER = (
     "model",
-    "fork_context",
+    "fork_turns",
     "message",
 )
 _CODEX_CORE_TOOL_GUIDANCE_BY_NAME: dict[str, str] = {
@@ -17712,7 +17712,7 @@ def _append_codex_core_tool_guidance_to_description(
 
 def _patch_codex_spawn_agent_payload_parameters(
     parameters: Any,
-) -> tuple[Any, list[str]]:
+) -> tuple[Any, list[str], list[str]]:
     if parameters is None:
         updated_parameters: dict[str, Any] = {
             "type": "object",
@@ -17723,13 +17723,18 @@ def _patch_codex_spawn_agent_payload_parameters(
         if "type" not in updated_parameters:
             updated_parameters["type"] = "object"
     else:
-        return parameters, []
+        return parameters, [], []
 
     properties = updated_parameters.get("properties")
     if not isinstance(properties, dict):
         properties = {}
     else:
         properties = dict(properties)
+
+    removed_fields: list[str] = []
+    if "fork_context" in properties:
+        properties.pop("fork_context")
+        removed_fields.append("fork_context")
 
     added_fields: list[str] = []
     for field_name in _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER:
@@ -17740,11 +17745,17 @@ def _patch_codex_spawn_agent_payload_parameters(
         )
         added_fields.append(field_name)
 
-    if not added_fields:
-        return parameters, []
+    required = updated_parameters.get("required")
+    if isinstance(required, list) and "fork_context" in required:
+        updated_parameters["required"] = [
+            field_name for field_name in required if field_name != "fork_context"
+        ]
+
+    if not added_fields and not removed_fields:
+        return parameters, [], []
 
     updated_parameters["properties"] = properties
-    return updated_parameters, added_fields
+    return updated_parameters, added_fields, removed_fields
 
 
 def _get_openai_tool_name(tool: dict[str, Any]) -> Optional[str]:
@@ -19167,10 +19178,12 @@ def _patch_codex_spawn_agent_tool_description(
         else:
             parameters = updated_tool.get("parameters")
 
-        updated_parameters, added_fields = _patch_codex_spawn_agent_payload_parameters(
-            parameters
-        )
-        if not added_fields or updated_parameters is parameters:
+        (
+            updated_parameters,
+            added_fields,
+            removed_fields,
+        ) = _patch_codex_spawn_agent_payload_parameters(parameters)
+        if (not added_fields and not removed_fields) or updated_parameters is parameters:
             continue
 
         if updated_tool is tool:
@@ -19193,6 +19206,7 @@ def _patch_codex_spawn_agent_tool_description(
                 "tool_name": _CODEX_SPAWN_AGENT_TOOL_NAME,
                 "path": path,
                 "fields_added": added_fields,
+                "fields_removed": removed_fields,
                 "occurrences": 0,
             }
         )
