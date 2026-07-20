@@ -62,6 +62,7 @@
     "native_openai_passthrough_responses",
     "native_openai_passthrough_responses_codex",
     "native_openai_passthrough_responses_codex_tool_activity",
+    "native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration",
     "native_grok_cli_passthrough_grok_build",
     "native_grok_cli_passthrough_grok_composer",
     "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools",
@@ -561,6 +562,167 @@
       },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60
+    },
+    "native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration": {
+      "verification_alias": "aawm-sota-moonshot",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "codex-v2-collaboration",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-max",
+          "route_family": "codex_kimi_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-high",
+          "route_family": "codex_kimi_chat_completions_adapter"
+        }
+      ],
+      "cli_passthrough": "codex",
+      "command": [
+        "codex",
+        "exec",
+        "--ignore-user-config",
+        "--enable",
+        "multi_agent",
+        "--enable",
+        "multi_agent_v2",
+        "-c",
+        "suppress_unstable_features_warning=true",
+        "-c",
+        "model_provider=\"{codex_profile}\"",
+        "-c",
+        "model_catalog_json=\"{repository_root}/scripts/local-ci/codex_moonshot_model_catalog.json\"",
+        "-c",
+        "model_providers.{codex_profile}.name=\"LiteLLM\"",
+        "-c",
+        "model_providers.{codex_profile}.base_url=\"{litellm_base_url}/openai_passthrough\"",
+        "-c",
+        "model_providers.{codex_profile}.requires_openai_auth=true",
+        "-c",
+        "model_providers.{codex_profile}.wire_api=\"responses\"",
+        "-m",
+        "aawm-sota-moonshot",
+        "-s",
+        "read-only",
+        "-C",
+        "{repository_root}",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.x-litellm-end-user-id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_user_id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_name=\"{case_name}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
+        "--json",
+        "Production Moonshot acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first tool response spawn exactly two children concurrently. For both spawn_agent calls, omit the fork_turns field entirely so Codex preserves the full parent turn context and model selection; do not set fork_turns to none. Each child must independently complete exactly two sequential batches of three parallel exec_command calls in {repository_root}. Batch 1 commands: pwd; git rev-parse --show-toplevel; git branch --show-current. Batch 2 commands, only after all Batch 1 results: git rev-parse HEAD; git status --short; git diff --check. Child A must return CHILD_A_TWO_PARALLEL_BATCHES_PASSED only after all six commands succeed. Child B must return CHILD_B_TWO_PARALLEL_BATCHES_PASSED only after all six commands succeed. Wait for both children and verify both markers. Then return one plain ASCII block between 9800 and 10200 characters, beginning exactly with CODEX_MOONSHOT_PROD_ACCEPTANCE_START, containing both child markers within the first 300 characters, continuing with neutral repeated filler prose, and ending exactly with CODEX_MOONSHOT_PROD_ACCEPTANCE_END. If collaboration tools or either child fail, report the exact blocker and do not emit the success block."
+      ],
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": false,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/openai_passthrough/v1/responses",
+        "/openai_passthrough/responses"
+      ],
+      "required_trace_tags": [
+        "model-alias:aawm-sota-moonshot",
+        "codex-auto-agent-alias:aawm-sota-moonshot"
+      ],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "codex_auto_agent_selected_provider",
+        "codex_auto_agent_selected_model",
+        "codex_auto_agent_selected_route_family"
+      ],
+      "command_output_text_checks": {
+        "required_prefix": "CODEX_MOONSHOT_PROD_ACCEPTANCE_START",
+        "required_suffix": "CODEX_MOONSHOT_PROD_ACCEPTANCE_END",
+        "required_substrings": [
+          "CHILD_A_TWO_PARALLEL_BATCHES_PASSED",
+          "CHILD_B_TWO_PARALLEL_BATCHES_PASSED"
+        ],
+        "minimum_chars": 9800,
+        "maximum_chars": 10200
+      },
+      "command_stderr_text_checks": {
+        "forbidden_substrings": [
+          "Traceback",
+          "failed to refresh available models",
+          "missing field `models`",
+          "OutputTextDelta without active item"
+        ]
+      },
+      "codex_collaboration_validation": {
+        "minimum_tool_counts": {
+          "spawn_agent": 2,
+          "wait": 1
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 90,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "kimi_code"
+              ],
+              "model": [
+                "k3-max",
+                "k3-high"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "aawm-sota-moonshot",
+              "requested_model_alias": "aawm-sota-moonshot",
+              "codex_auto_agent_alias": "aawm-sota-moonshot"
+            },
+            "metadata_required_truthy": [
+              "codex_auto_agent_selected_provider",
+              "codex_auto_agent_selected_model",
+              "codex_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "required_contains": {
+              "repository": "litellm"
+            },
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 90,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "provider": "kimi_code",
+            "tool_name": "exec_command",
+            "tool_kind": "command",
+            "minimum_count": 12
+          }
+        ]
+      },
+      "timeout_seconds": 900,
+      "langfuse_poll_timeout_seconds": 120
     },
     "native_openai_passthrough_responses_codex_tool_activity": {
       "cli_passthrough": "codex",

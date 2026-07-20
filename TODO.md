@@ -186,14 +186,16 @@ these docs only as needed:
 
 ## Next
 
-- Promote `v1.82.3-aawm.125` to `aawm-litellm` production for managed Kimi
+- Promote `v1.82.3-aawm.126` to `aawm-litellm` production for managed Kimi
   collaboration namespace adaptation, corrected reasoning/message/tool stream
   ordering, large-stream namespace restoration, continuation replay, handled
   passthrough 4xx logging, exact source-error route rollups, full-row
   failure/cooldown coloring, alias-to-provider-model enforcement, and the
-  three-hour Grok quota cooldown policy. Follow `PROD_RELEASE.md`, reuse the
-  canonical Kimi credential in place, and mutate only the production LiteLLM
-  service.
+  three-hour Grok quota cooldown policy. The production provider-status
+  sidecar must also refresh the same canonical Kimi credential in place through
+  its native lock path; do not create a credential copy. Follow
+  `PROD_RELEASE.md` and recreate only the named production LiteLLM and
+  provider-status services required by this release.
   Acceptance requires real Codex V2 Responses and Claude Anthropic ingress
   parents selecting the Kimi route, multiple child agent dispatches, at least
   two separate parallel tool-call batches per child, roughly 10,000 characters
@@ -205,7 +207,9 @@ these docs only as needed:
   `--target prod` must select the `litellm` Codex profile and set only the
   Claude `ANTHROPIC_BASE_URL`/non-secret custom-header overlay. Do not set,
   copy, synthesize, or override `ANTHROPIC_API_KEY`; the real Claude CLI must
-  use its existing OAuth credential state.
+  use its existing OAuth credential state. The Codex collaboration prompt must
+  omit `fork_turns` from both child spawns so the child sessions retain the
+  parent Moonshot context and selected model.
   Keep `litellm-dev` on its current code and monitor its logs for new signatures;
   do not use it as the Moonshot production acceptance target.
 

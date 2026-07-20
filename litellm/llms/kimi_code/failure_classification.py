@@ -106,6 +106,7 @@ _AUTH_MARKERS: Final[tuple[str, ...]] = (
     "invalid credential",
     "credential expired",
     "token expired",
+    "token is expired",
     "refresh token",
 )
 _QUOTA_MARKERS: Final[tuple[str, ...]] = (

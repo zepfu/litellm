@@ -181,14 +181,14 @@ dispatches the `sota-moonshot` child profile through the single canonical
 `aawm-sota-moonshot` alias, requires Read then Grep with a tool-result
 continuation, and accepts the final marker only after that sequence. It is not
 a raw `/v1/messages`, chat-completions, or one-turn completion smoke test.
-Run it only against the restarted development service during the bounded
-Moonshot live-proof step:
+Run it against the production service during the bounded Moonshot live-proof
+step:
 
 ```bash
 python3 run_anthropic_adapter_acceptance.py \
-  --target dev \
+  --target prod \
   --cases claude_adapter_aawm_sota_moonshot_agentic_tool_continuation \
-  --write-artifact /tmp/moonshot-anthropic-agentic-dev.json
+  --write-artifact /tmp/moonshot-anthropic-agentic-prod.json
 ```
 
 The artifact records the safe adapter path
@@ -219,6 +219,21 @@ the generic fanout policy text appears in the logged request, and fails if the
 restrictive `Only use spawn_agent if and only if...` language is still present.
 This is the deterministic default proof; behavioral subagent fanout can remain
 a separate canary.
+
+The Moonshot Codex V2 collaboration case is also opt-in. It uses the same
+target-selected `litellm` / `litellm-dev` profile and harness-owned trace,
+tenant, session, and repository headers as the native Codex cases. It adds the
+bounded inline provider definition required by `--ignore-user-config`, loads
+the checked-in Moonshot model-catalog fixture, requires two child dispatches,
+at least twelve child `exec_command` activity rows, and a 9,800-10,200
+character final block:
+
+```bash
+python3 run_anthropic_adapter_acceptance.py \
+  --target prod \
+  --cases native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration \
+  --write-artifact /tmp/moonshot-codex-collaboration-prod.json
+```
 
 ```bash
 python3 run_anthropic_adapter_acceptance.py \

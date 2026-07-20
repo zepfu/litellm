@@ -32,6 +32,18 @@ from litellm.llms.kimi_code import (
             "refresh_required",
         ),
         (
+            400,
+            "upstream_error",
+            (
+                "Kimi Code OAuth credentials are unavailable or invalid: "
+                "access token is expired."
+            ),
+            KimiCodeFailureKind.REFRESH_REQUIRED_AUTH,
+            KimiCodeFailureScope.MANAGED_ACCOUNT,
+            KimiCodeMetadataGate.NONE,
+            "refresh_required",
+        ),
+        (
             429,
             "insufficient_quota",
             "Managed quota exhausted.",

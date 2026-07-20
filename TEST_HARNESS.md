@@ -144,6 +144,14 @@ production logs, Langfuse, `aawm_tristore.public.session_history`, and
 `/home/zepfu/.kimi-code/credentials` mount at the same path; acceptance must not
 copy or synthesize Kimi credentials.
 
+Run the opt-in Codex gate as
+`native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration`.
+It uses the target-selected production Codex profile and requires two completed
+`spawn_agent` calls, at least twelve persisted child `exec_command` rows, and a
+9,800-10,200 character final block. Both spawn calls must omit `fork_turns`;
+setting it to `none` discards the parent Moonshot context and allows the child
+sessions to select the default alias.
+
 Kimi streaming coverage must include a response that leaves the bounded eager
 validation path before emitting multiple collaboration calls. The output-item
 events and terminal response must retain `namespace=collaboration`; a

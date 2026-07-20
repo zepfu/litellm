@@ -174,6 +174,114 @@ def _parse_command_output_json(stdout: str) -> dict[str, Any] | None:
     return objects[-1]
 
 
+def _extract_command_output_text(stdout: str) -> str:
+    objects = RA._parse_stdout_json_objects(stdout)
+    for obj in reversed(objects):
+        if obj.get("type") == "item.completed":
+            item = obj.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str):
+                    return text
+        if obj.get("type") == "result":
+            result = obj.get("result")
+            if isinstance(result, str):
+                return result
+    return stdout
+
+
+def _validate_command_text_checks(
+    *,
+    family: str,
+    text: str,
+    checks: dict[str, Any],
+    label: str,
+) -> tuple[dict[str, Any], list[str]]:
+    if not checks:
+        return {"enabled": False}, []
+
+    failures: list[str] = []
+    required_prefix = checks.get("required_prefix")
+    required_suffix = checks.get("required_suffix")
+    required_substrings = _as_string_list(checks.get("required_substrings"))
+    forbidden_substrings = _as_string_list(checks.get("forbidden_substrings"))
+    minimum_chars = checks.get("minimum_chars")
+    maximum_chars = checks.get("maximum_chars")
+
+    if isinstance(required_prefix, str) and not text.startswith(required_prefix):
+        failures.append(
+            f"{family} {label} did not start with {required_prefix!r}"
+        )
+    if isinstance(required_suffix, str) and not text.endswith(required_suffix):
+        failures.append(
+            f"{family} {label} did not end with {required_suffix!r}"
+        )
+    for substring in required_substrings:
+        if substring not in text:
+            failures.append(
+                f"{family} {label} missing required substring {substring!r}"
+            )
+    for substring in forbidden_substrings:
+        if substring in text:
+            failures.append(
+                f"{family} {label} contained forbidden substring {substring!r}"
+            )
+    if minimum_chars is not None and len(text) < int(minimum_chars):
+        failures.append(
+            f"{family} {label} below minimum length: expected >= {int(minimum_chars)}, got {len(text)}"
+        )
+    if maximum_chars is not None and len(text) > int(maximum_chars):
+        failures.append(
+            f"{family} {label} above maximum length: expected <= {int(maximum_chars)}, got {len(text)}"
+        )
+
+    return {
+        "enabled": True,
+        "length": len(text),
+        "required_prefix": required_prefix,
+        "required_suffix": required_suffix,
+        "required_substrings": required_substrings,
+        "forbidden_substrings": forbidden_substrings,
+    }, failures
+
+
+def _validate_codex_collaboration_events(
+    *,
+    family: str,
+    stdout: str,
+    checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    if not checks:
+        return {"enabled": False}, []
+
+    tool_counts: dict[str, int] = {}
+    for obj in RA._parse_stdout_json_objects(stdout):
+        if obj.get("type") not in {"item.started", "item.completed"}:
+            continue
+        item = obj.get("item")
+        if not isinstance(item, dict) or item.get("type") != "collab_tool_call":
+            continue
+        if obj.get("type") == "item.completed":
+            tool = item.get("tool")
+            if isinstance(tool, str) and tool:
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
+
+    failures: list[str] = []
+    minimum_tool_counts = checks.get("minimum_tool_counts") or {}
+    for tool, minimum in minimum_tool_counts.items():
+        actual = tool_counts.get(str(tool), 0)
+        if actual < int(minimum):
+            failures.append(
+                f"{family} missing completed Codex collaboration calls for {tool!r}: expected >= {int(minimum)}, got {actual}"
+            )
+
+    return {
+        "enabled": True,
+        "tool_counts": tool_counts,
+        "minimum_tool_counts": minimum_tool_counts,
+    }, failures
+
+
 def _extract_command_session_id(stdout: str) -> str | None:
     direct = RA._extract_command_session_id(stdout)
     if direct:
@@ -602,6 +710,7 @@ def _apply_target_profile_to_config(  # noqa: PLR0915
             'case_name': case_name,
             'tenant_id': tenant_id,
             'harness_run_id': harness_run_id,
+            'repository_root': str(ROOT),
             'litellm_base_url': profile['litellm_base_url'],
             'anthropic_base_url': profile['anthropic_base_url'],
         }
@@ -879,6 +988,7 @@ def _ensure_cli_harness_context(
         'harness_user_id': harness_user_id,
         'session_id': session_id,
         'repository': repository,
+        'repository_root': str(ROOT),
         'litellm_base_url': profile['litellm_base_url'],
         'anthropic_base_url': profile['anthropic_base_url'],
         'codex_profile': codex_profile,
@@ -3976,6 +4086,32 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         checks=config.get('command_json_checks') or {},
     )
     failures.extend(command_json_failures)
+    command_output_text_summary, command_output_text_failures = (
+        _validate_command_text_checks(
+            family=name,
+            text=_extract_command_output_text(run["stdout"]),
+            checks=config.get("command_output_text_checks") or {},
+            label="command output",
+        )
+    )
+    failures.extend(command_output_text_failures)
+    command_stderr_text_summary, command_stderr_text_failures = (
+        _validate_command_text_checks(
+            family=name,
+            text=run["stderr"],
+            checks=config.get("command_stderr_text_checks") or {},
+            label="command stderr",
+        )
+    )
+    failures.extend(command_stderr_text_failures)
+    codex_collaboration_summary, codex_collaboration_failures = (
+        _validate_codex_collaboration_events(
+            family=name,
+            stdout=run["stdout"],
+            checks=config.get("codex_collaboration_validation") or {},
+        )
+    )
+    failures.extend(codex_collaboration_failures)
     empty_success_summary, empty_success_failures = (
         _validate_no_successful_empty_command_output(
             family=name,
@@ -4113,6 +4249,9 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             "generation_observations": generation_observations,
         },
         "command_json": command_json_summary,
+        "command_output_text": command_output_text_summary,
+        "command_stderr_text": command_stderr_text_summary,
+        "codex_collaboration": codex_collaboration_summary,
         "empty_success": empty_success_summary,
         "session_history": session_history_summary,
         "session_history_passed": session_history_passed,

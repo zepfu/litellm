@@ -1423,13 +1423,15 @@ async def test_should_return_one_bounded_400_for_invalid_kimi_request_shape(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("status_code", (400, 401))
 async def test_should_return_bounded_401_for_direct_managed_auth_failure(
     stream,
+    status_code,
 ):
     raw_secret = "raw-expired-token-detail"
     upstream_failure = _KimiAdapterFailure(
-        status_code=401,
-        message=f"credential expired: {raw_secret}",
+        status_code=status_code,
+        message=f"access token is expired: {raw_secret}",
     )
 
     with (
@@ -1471,10 +1473,13 @@ async def test_should_return_bounded_401_for_direct_managed_auth_failure(
 
 
 @pytest.mark.asyncio
-async def test_should_preserve_alias_probe_auth_metadata_and_original_failure():
+@pytest.mark.parametrize("status_code", (400, 401))
+async def test_should_preserve_alias_probe_auth_metadata_and_original_failure(
+    status_code,
+):
     upstream_failure = _KimiAdapterFailure(
-        status_code=401,
-        message="credential expired: raw-provider-detail",
+        status_code=status_code,
+        message="access token is expired: raw-provider-detail",
     )
 
     with (
@@ -1504,7 +1509,7 @@ async def test_should_preserve_alias_probe_auth_metadata_and_original_failure():
         "scope": "managed_account",
         "upstream_id": "k3",
         "metadata_gate": "none",
-        "status_code": 401,
+        "status_code": status_code,
         "trace_id": "trace-safe",
         "reset_reason": "refresh_required",
     }

@@ -190,6 +190,9 @@ D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
 MS012_MOONSHOT_AGENTIC_CASE = "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation"
 MS012_MOONSHOT_AGENT_PROFILE = "sota-moonshot"
 MS012_MOONSHOT_ALIAS = "aawm-sota-moonshot"
+MOONSHOT_CODEX_COLLABORATION_CASE = (
+    "native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration"
+)
 MS012_MOONSHOT_ADAPTER_PATH = "anthropic_kimi_chat_completions_adapter"
 MS012_MOONSHOT_DECLARED_MODELS = {
     "kimi_code/k3-max",
@@ -1745,6 +1748,159 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
         "input_conversation_tokens_estimated",
     ):
         assert session_history_validation["minimums"][column_name] == 1
+
+
+def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][MOONSHOT_CODEX_COLLABORATION_CASE]
+
+    assert MOONSHOT_CODEX_COLLABORATION_CASE in config["default_excluded_cases"]
+    assert case_config["cli_passthrough"] == "codex"
+    assert case_config["verification_alias"] == MS012_MOONSHOT_ALIAS
+    assert case_config["match_trace_session_id_from_stdout"] is False
+
+    command = case_config["command"]
+    assert command[:2] == ["codex", "exec"]
+    assert "--ignore-user-config" in command
+    assert command.count("--enable") == 2
+    assert "multi_agent" in command
+    assert "multi_agent_v2" in command
+    assert command[command.index("-m") + 1] == MS012_MOONSHOT_ALIAS
+    assert (
+        'model_provider="{codex_profile}"'
+        in command
+    )
+    assert (
+        'model_providers.{codex_profile}.base_url="{litellm_base_url}/openai_passthrough"'
+        in command
+    )
+    assert (
+        'model_catalog_json="{repository_root}/scripts/local-ci/codex_moonshot_model_catalog.json"'
+        in command
+    )
+    prompt = command[-1]
+    assert "omit the fork_turns field entirely" in prompt
+    assert "do not set fork_turns to none" in prompt
+
+    output_checks = case_config["command_output_text_checks"]
+    assert output_checks["minimum_chars"] == 9800
+    assert output_checks["maximum_chars"] == 10200
+    assert output_checks["required_prefix"] == "CODEX_MOONSHOT_PROD_ACCEPTANCE_START"
+    assert output_checks["required_suffix"] == "CODEX_MOONSHOT_PROD_ACCEPTANCE_END"
+    assert set(output_checks["required_substrings"]) == {
+        "CHILD_A_TWO_PARALLEL_BATCHES_PASSED",
+        "CHILD_B_TWO_PARALLEL_BATCHES_PASSED",
+    }
+
+    assert case_config["codex_collaboration_validation"]["minimum_tool_counts"] == {
+        "spawn_agent": 2,
+        "wait": 1,
+    }
+    [tool_row] = case_config["tool_activity_validation"]["expected_rows"]
+    assert tool_row == {
+        "provider": "kimi_code",
+        "tool_name": "exec_command",
+        "tool_kind": "command",
+        "minimum_count": 12,
+    }
+
+    [session_row] = case_config["session_history_validation"]["expected_rows"]
+    assert session_row["required_one_of"] == {
+        "provider": ["kimi_code"],
+        "model": ["k3-max", "k3-high"],
+    }
+    assert session_row["metadata_required_equals"] == {
+        "model_alias_label": MS012_MOONSHOT_ALIAS,
+        "requested_model_alias": MS012_MOONSHOT_ALIAS,
+        "codex_auto_agent_alias": MS012_MOONSHOT_ALIAS,
+    }
+
+
+def test_command_text_checks_validate_codex_agent_message_and_stderr():
+    harness = _load_harness_module()
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "START child-a child-b END",
+                    },
+                }
+            ),
+        ]
+    )
+
+    output_text = harness._extract_command_output_text(stdout)
+    summary, failures = harness._validate_command_text_checks(
+        family="moonshot",
+        text=output_text,
+        label="command output",
+        checks={
+            "required_prefix": "START",
+            "required_suffix": "END",
+            "required_substrings": ["child-a", "child-b"],
+            "forbidden_substrings": ["Traceback"],
+            "minimum_chars": 10,
+            "maximum_chars": 100,
+        },
+    )
+
+    assert failures == []
+    assert summary["length"] == len("START child-a child-b END")
+
+    _, stderr_failures = harness._validate_command_text_checks(
+        family="moonshot",
+        text="failed to refresh available models",
+        label="command stderr",
+        checks={"forbidden_substrings": ["failed to refresh available models"]},
+    )
+    assert stderr_failures == [
+        "moonshot command stderr contained forbidden substring 'failed to refresh available models'"
+    ]
+
+
+def test_codex_collaboration_validation_counts_completed_calls_only():
+    harness = _load_harness_module()
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {"type": "collab_tool_call", "tool": "spawn_agent"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "collab_tool_call", "tool": "spawn_agent"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "collab_tool_call", "tool": "spawn_agent"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "collab_tool_call", "tool": "wait"},
+                }
+            ),
+        ]
+    )
+
+    summary, failures = harness._validate_codex_collaboration_events(
+        family="moonshot",
+        stdout=stdout,
+        checks={"minimum_tool_counts": {"spawn_agent": 2, "wait": 1}},
+    )
+
+    assert failures == []
+    assert summary["tool_counts"] == {"spawn_agent": 2, "wait": 1}
 
 
 def test_default_suite_keeps_peeromega_fanout_and_native_anthropic_rate_limit_gate_opt_in():

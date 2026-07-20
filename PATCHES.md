@@ -58,6 +58,40 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.126 - Managed Kimi OAuth expiry and Moonshot stress acceptance
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.126`. Managed
+Kimi failure classification now recognizes the provider's exact
+`token is expired` wording even when it arrives as HTTP 400, classifies the
+failure as managed-account authentication requiring refresh, and preserves the
+bounded handled-error path instead of misreporting the response as a malformed
+request.
+
+The repository acceptance harness now includes an opt-in production Codex V2
+Moonshot collaboration case. It uses the existing target-selected Codex
+profile, trace/session headers, and OAuth state; requires two completed child
+dispatches, twelve child command-activity rows, and a 9,800-10,200 character
+final block; and rejects traceback or stream-ordering diagnostics. The prompt
+requires both `spawn_agent` calls to omit `fork_turns` so Codex keeps the full
+parent context and model selection for the child sessions. Command-output and
+collaboration-event validators make those requirements explicit release gates.
+
+**Why:** Production returned the refreshable Kimi OAuth-expiry condition as
+`kimi_code_invalid_request`, leaving the managed account unavailable until an
+operator refreshed it manually. The first full Codex collaboration run also
+spawned children without the parent Moonshot context, so their traffic selected
+the default alias and could not satisfy provider-native Moonshot acceptance.
+
+**Why not upstream:** The managed Kimi OAuth credential, AAWM alias selection,
+Codex V2 production stress shape, and session-history/tool-activity gates are
+fork-local operational behavior.
+
+**Validation status:** The focused harness and Kimi classifier/adapter
+selection passes (`146 passed`). Focused Ruff, JSON parsing, Python
+compilation, Compose parsing, and `git diff --check` pass. Production sidecar
+refresh, Codex child-context inheritance, and equivalent Claude CLI stress
+acceptance remain required under `PROD_RELEASE.md`.
+
 ### aawm.125 - Handled provider-error rollups and quota cooldown hardening
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.125`. Handled
