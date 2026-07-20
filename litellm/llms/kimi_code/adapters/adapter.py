@@ -173,6 +173,93 @@ def _get_kimi_message_field(message: Any, field: str) -> Any:
     return getattr(message, field, None)
 
 
+def _is_kimi_empty_text_content(content: Any) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content.strip() == ""
+    if not isinstance(content, list):
+        return False
+    if not content:
+        return True
+    for part in content:
+        if isinstance(part, str):
+            if part.strip():
+                return False
+            continue
+        if not isinstance(part, dict):
+            return False
+        part_type = part.get("type")
+        if part_type not in (None, "text", "output_text"):
+            return False
+        text = part.get("text")
+        if not isinstance(text, str) or text.strip():
+            return False
+    return True
+
+
+def _kimi_message_has_tool_call(message: Any) -> bool:
+    tool_calls = _get_kimi_message_field(message, "tool_calls")
+    if isinstance(tool_calls, list) and bool(tool_calls):
+        return True
+    return bool(_get_kimi_message_field(message, "function_call"))
+
+
+def _copy_kimi_message_without_content(message: Any) -> Any:
+    if isinstance(message, dict):
+        updated_message = dict(message)
+    else:
+        model_dump = getattr(message, "model_dump", None)
+        if not callable(model_dump):
+            return message
+        updated_message = model_dump()
+    updated_message.pop("content", None)
+    return updated_message
+
+
+def _sanitize_kimi_chat_messages(
+    messages: list[Any],
+) -> tuple[list[Any], dict[str, Any]]:
+    """Remove replay-only empty text without dropping valid tool history."""
+
+    updated_messages: list[Any] = []
+    removed_empty_message_count = 0
+    stripped_tool_call_content_count = 0
+    for message in messages:
+        role = _get_kimi_message_field(message, "role")
+        content = _get_kimi_message_field(message, "content")
+        if role == "tool":
+            updated_messages.append(message)
+            continue
+        if _kimi_message_has_tool_call(message):
+            if _is_kimi_empty_text_content(content):
+                message = _copy_kimi_message_without_content(message)
+                stripped_tool_call_content_count += 1
+            updated_messages.append(message)
+            continue
+        if _is_kimi_empty_text_content(content):
+            removed_empty_message_count += 1
+            continue
+        updated_messages.append(message)
+
+    if (
+        removed_empty_message_count == 0
+        and stripped_tool_call_content_count == 0
+    ):
+        return messages, {}
+    return updated_messages, {
+        "kimi_code_chat_message_shape_sanitized": True,
+        "kimi_code_chat_message_shape_messages_from_count": len(messages),
+        "kimi_code_chat_message_shape_messages_to_count": len(updated_messages),
+        "kimi_code_chat_message_shape_removed_empty_message_count": (
+            removed_empty_message_count
+        ),
+        "kimi_code_chat_message_shape_stripped_tool_call_content_count": (
+            stripped_tool_call_content_count
+        ),
+    }
+
+
 def normalize_kimi_code_custom_tool_outputs(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
@@ -435,6 +522,20 @@ def _handle_kimi_adapter_exception(
         exc,
         adapter_model=adapter_model,
     )
+    if (
+        metadata.get("kind") == "malformed"
+        and metadata.get("status_code") in {400, 422}
+    ):
+        raise HTTPException(
+            status_code=int(cast(int, metadata["status_code"])),
+            detail={
+                "error": {
+                    "message": "Managed Kimi Code rejected the request shape.",
+                    "type": "invalid_request_error",
+                    "code": "kimi_code_invalid_request",
+                }
+            },
+        ) from exc
     if use_alias_candidate_probe:
         setattr(exc, "kimi_code_probe_failure_metadata", metadata)
         return
@@ -502,7 +603,15 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
     messages = completion_kwargs.get("messages")
     if not isinstance(messages, list):
         raise ValueError("Kimi Code request history must contain a messages list.")
-    completion_kwargs["messages"] = _normalize_kimi_tool_result_adjacency(messages)
+    normalized_messages = _normalize_kimi_tool_result_adjacency(messages)
+    normalized_messages, sanitization_changes = _sanitize_kimi_chat_messages(
+        normalized_messages
+    )
+    completion_kwargs["messages"] = normalized_messages
+    if sanitization_changes:
+        litellm_metadata.update(sanitization_changes)
+        request_body["litellm_metadata"] = litellm_metadata
+        completion_kwargs["metadata"] = litellm_metadata
     _apply_kimi_reasoning_effort(
         request_body=request_body,
         upstream_model=upstream_model,

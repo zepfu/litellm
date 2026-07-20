@@ -1598,8 +1598,12 @@ def _extract_passthrough_upstream_error_text(exc: Exception) -> str:
         error_value = detail.get("error")
         if isinstance(error_value, dict):
             detail_text = str(error_value.get("message") or error_value)
+        elif error_value is not None:
+            detail_text = str(error_value)
+        elif detail.get("detail") is not None:
+            detail_text = str(detail.get("detail"))
         else:
-            detail_text = str(error_value or detail)
+            detail_text = str(detail)
     elif detail is not None:
         detail_text = str(detail)
     else:
@@ -1623,6 +1627,9 @@ def _extract_passthrough_upstream_error_text(exc: Exception) -> str:
             return str(error_value.get("message") or error_value)
         if error_value is not None:
             return str(error_value)
+        detail_value = upstream_payload.get("detail")
+        if detail_value is not None:
+            return str(detail_value)
     return detail_text
 
 
@@ -1662,6 +1669,20 @@ def _sanitize_passthrough_request_shape_error_preview(error_text: str) -> Option
         redacted,
     )
     return _clean_passthrough_error_context_value(redacted)
+
+
+def _get_passthrough_handled_http_error_summary(
+    exc: Exception,
+    *,
+    status_code: Optional[int],
+) -> str:
+    error_text = _extract_passthrough_upstream_error_text(exc)
+    summary = _sanitize_passthrough_request_shape_error_preview(error_text)
+    if summary:
+        return summary
+    if status_code is not None:
+        return f"HTTP {status_code} request rejected"
+    return "Request rejected"
 
 
 def _build_passthrough_request_shape_failure_request_payload(
@@ -4182,6 +4203,13 @@ async def pass_through_request(  # noqa: PLR0915
         suppress_provider_rate_limit_traceback = (
             _is_passthrough_expected_provider_rate_limit(status_code=status_code)
         )
+        suppress_handled_http_client_error_traceback = bool(
+            isinstance(e, HTTPException)
+            and status_code is not None
+            and status.HTTP_400_BAD_REQUEST
+            <= status_code
+            < status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
         # Provider-specific classifiers via registry-style dispatch (RR-056 #3).
         # Logging and traceback suppression are driven from classification fields
         # so registry failure_kind / log_message stay the single source of truth.
@@ -4257,7 +4285,7 @@ async def pass_through_request(  # noqa: PLR0915
             log_fn(
                 log_message,
                 status_code,
-                str(e),
+                classification.log_error_summary or str(e),
                 extra=log_extra,
             )
         elif error_log_context.get("failure_kind") == (
@@ -4285,6 +4313,20 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code,
                 str(e),
                 extra=error_log_context,
+            )
+        elif suppress_handled_http_client_error_traceback:
+            verbose_proxy_logger.error(
+                "Pass through endpoint surfaced handled client/provider error status=%s error=%s",
+                status_code,
+                _get_passthrough_handled_http_error_summary(
+                    e,
+                    status_code=status_code,
+                ),
+                extra={
+                    **error_log_context,
+                    "failure_kind": "handled_upstream_client_error",
+                },
+                exc_info=False,
             )
         elif suppress_terminal_failure_traceback:
             hidden_retry_metadata = _ensure_passthrough_metadata(kwargs)
@@ -4370,6 +4412,7 @@ async def pass_through_request(  # noqa: PLR0915
             not suppress_terminal_failure_traceback
             and not suppress_alias_intermediate_safety_policy_denial
             and not suppress_provider_rate_limit_traceback
+            and not suppress_handled_http_client_error_traceback
             and not provider_classification_suppresses_traceback
             and error_log_context.get("failure_kind")
             != "request_shape_deserialization_failed"

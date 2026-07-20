@@ -5149,7 +5149,7 @@ class TestPassThroughTerminalFailureLogging:
         )
 
     @pytest.mark.asyncio
-    async def test_pass_through_request_chatgpt_codex_unrelated_400_keeps_exception_logging(
+    async def test_pass_through_request_chatgpt_codex_unrelated_400_logs_without_traceback(
         self,
     ):
         mock_request = MagicMock(spec=Request)
@@ -5179,6 +5179,9 @@ class TestPassThroughTerminalFailureLogging:
             "litellm.proxy.proxy_server.proxy_logging_obj"
         ) as mock_logging_obj, patch.object(
             verbose_proxy_logger,
+            "error",
+        ) as mock_error, patch.object(
+            verbose_proxy_logger,
             "exception",
         ) as mock_exception:
             mock_client_obj = MagicMock()
@@ -5201,13 +5204,107 @@ class TestPassThroughTerminalFailureLogging:
 
         assert exc_info.value.code == "400"
         assert str(upstream_detail, "utf-8") in str(exc_info.value.detail)
-        mock_exception.assert_called_once()
+        mock_exception.assert_not_called()
+        error_call = next(
+            call
+            for call in mock_error.call_args_list
+            if "handled client/provider error" in str(call.args[0])
+        )
+        assert error_call.args[1] == 400
+        assert error_call.args[2] == "Unsupported content type"
+        assert (
+            error_call.kwargs["extra"]["failure_kind"]
+            == "handled_upstream_client_error"
+        )
+        assert error_call.kwargs["exc_info"] is False
         mock_logging_obj.post_call_failure_hook.assert_awaited_once()
         assert (
-            "Unsupported content type"
-            in mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+            mock_logging_obj.post_call_failure_hook.await_args.kwargs[
                 "traceback_str"
             ]
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_openai_model_not_found_warns_without_traceback(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.openai.com/v1/responses"
+        upstream_detail = (
+            b'{"error":{"message":"The requested model \'aawm-code\' does not '
+            b'exist.","type":"invalid_request_error","param":"model",'
+            b'"code":"model_not_found"}}'
+        )
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=upstream_detail,
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "aawm-code"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch.object(
+            verbose_proxy_logger,
+            "warning",
+        ) as mock_warning, patch.object(
+            verbose_proxy_logger,
+            "exception",
+        ) as mock_exception:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "aawm-code"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+
+        assert exc_info.value.code == "400"
+        mock_exception.assert_not_called()
+        warning_call = next(
+            call
+            for call in mock_warning.call_args_list
+            if "OpenAI model-not-found" in str(call.args[0])
+        )
+        assert warning_call.args[1] == 400
+        assert warning_call.args[2] == (
+            "The requested model 'aawm-code' does not exist."
+        )
+        assert "{" not in warning_call.args[2]
+        assert (
+            warning_call.kwargs["extra"]["failure_kind"]
+            == "openai_model_not_found"
+        )
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert (
+            mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                "traceback_str"
+            ]
+            is None
         )
 
     @pytest.mark.asyncio
@@ -6091,7 +6188,7 @@ class TestPassThroughTerminalFailureLogging:
                     mock_logging_obj.post_call_failure_hook.await_args.kwargs[
                         "traceback_str"
                     ]
-                    is not None
+                    is None
                 )
                 mock_direct_capture.assert_awaited_once()
         finally:
@@ -6107,9 +6204,12 @@ class TestPassThroughTerminalFailureLogging:
             for line in error_log_path.read_text(encoding="utf-8").splitlines()
         ]
         payload = next(
-            item for item in payloads if "Exception occured - 401:" in item["message"]
+            item
+            for item in payloads
+            if "handled client/provider error status=401" in item["message"]
         )
         context = payload["context"]
+        assert not payload.get("traceback")
 
         assert context["status_code"] == 401
         assert context["endpoint"] == "/grok/v1/sessions/{session_id}/signals"

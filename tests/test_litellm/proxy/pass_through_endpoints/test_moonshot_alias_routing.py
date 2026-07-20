@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import time
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from starlette.requests import Request
+from starlette.responses import Response
 
 from litellm.proxy.pass_through_endpoints import (
     llm_passthrough_endpoints as lpe,
@@ -211,6 +213,46 @@ async def test_should_preserve_sota_moonshot_continuation_affinity_per_ingress()
     assert codex_continuation["selection_reason"] == "session_affinity"
     assert anthropic_continuation["candidate"]["model"] == "kimi_code/k3-max"
     assert anthropic_continuation["selection_reason"] == "session_affinity"
+
+
+@pytest.mark.asyncio
+async def test_should_not_retry_bounded_kimi_invalid_request_for_continuation() -> None:
+    await lpe._set_codex_auto_agent_cooldown(
+        "openai:gpt-5.3-codex-spark:__default__",
+        60.0,
+    )
+    request = _request("/v1/responses")
+    body = _codex_body("aawm-code", continuation=True)
+    terminal_error = HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "message": "Managed Kimi Code rejected the request shape.",
+                "type": "invalid_request_error",
+                "code": "kimi_code_invalid_request",
+            }
+        },
+    )
+
+    with patch.object(
+        lpe,
+        "_handle_codex_kimi_chat_completions_adapter_route",
+        new=AsyncMock(side_effect=terminal_error),
+    ) as kimi_handler:
+        with pytest.raises(HTTPException) as caught:
+            await lpe._handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+    assert caught.value is terminal_error
+    assert kimi_handler.await_count == 1
 
 
 @pytest.mark.asyncio

@@ -239,6 +239,7 @@ async def test_should_use_responses_session_history_for_continuation(monkeypatch
         "tool_call_id": "exec_command:0",
         "content": "/workspace",
     }
+    empty_assistant_message = {"role": "assistant", "content": []}
     later_user_message = {"role": "user", "content": "continue"}
     session_handler = AsyncMock(
         return_value={
@@ -247,6 +248,7 @@ async def test_should_use_responses_session_history_for_continuation(monkeypatch
                 restored_assistant_message,
                 later_user_message,
                 tool_result_message,
+                empty_assistant_message,
             ],
             "custom_llm_provider": "kimi_code",
             "metadata": {"trace_id": "trace-kimi-continuation"},
@@ -279,15 +281,21 @@ async def test_should_use_responses_session_history_for_continuation(monkeypatch
     assert handler_kwargs["litellm_completion_request"]["metadata"]["trace_id"] == "trace-kimi-continuation"
     completion_kwargs = plan.perform_kwargs["completion_kwargs"]
     assert completion_kwargs["messages"] == [
-        restored_assistant_message,
+        {
+            "role": "assistant",
+            "tool_calls": restored_assistant_message["tool_calls"],
+        },
         tool_result_message,
         later_user_message,
     ]
-    assert completion_kwargs["messages"][0] is restored_assistant_message
     assert completion_kwargs["messages"][1] is tool_result_message
+    assert "content" not in completion_kwargs["messages"][0]
     assert completion_kwargs["messages"][0]["tool_calls"][0]["function"]["arguments"] == '{"cmd":"pwd"}'
     assert sum(message["role"] == "assistant" for message in completion_kwargs["messages"]) == 1
     assert completion_kwargs["metadata"]["trace_id"] == "trace-kimi-continuation"
+    assert completion_kwargs["metadata"]["kimi_code_chat_message_shape_sanitized"] is True
+    assert completion_kwargs["metadata"]["kimi_code_chat_message_shape_removed_empty_message_count"] == 1
+    assert completion_kwargs["metadata"]["kimi_code_chat_message_shape_stripped_tool_call_content_count"] == 1
     assert completion_kwargs["litellm_trace_id"] == "session-trace-kimi"
     assert plan.client_requested_stream is True
 
@@ -377,7 +385,10 @@ async def test_should_preserve_custom_tool_outputs_before_kimi_filtering(
 
     completion_kwargs = plan.perform_kwargs["completion_kwargs"]
     assert completion_kwargs["messages"] == [
-        assistant_message,
+        {
+            "role": "assistant",
+            "tool_calls": assistant_message["tool_calls"],
+        },
         {
             "role": "tool",
             "tool_call_id": "exec_command:0",
@@ -461,7 +472,6 @@ async def test_should_use_full_codex_replay_without_prisma_session_database(
         },
         {
             "role": "assistant",
-            "content": None,
             "tool_calls": [
                 {
                     "id": "exec_command:0",
@@ -543,7 +553,10 @@ async def test_should_order_multiple_kimi_tool_results_by_assistant_call_order(
 
     messages = plan.perform_kwargs["completion_kwargs"]["messages"]
     assert messages == [
-        assistant_message,
+        {
+            "role": "assistant",
+            "tool_calls": assistant_message["tool_calls"],
+        },
         first_result,
         second_result,
         later_message,
@@ -1171,6 +1184,49 @@ class _KimiAdapterFailure(RuntimeError):
         self.message = message
         self.error_code = "token_expired" if status_code == 401 else "upstream_error"
         self.headers = {"x-trace-id": "trace-safe"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_alias_candidate_probe", (False, True))
+async def test_should_return_one_bounded_400_for_invalid_kimi_request_shape(
+    use_alias_candidate_probe,
+):
+    raw_provider_detail = "text content is empty: raw-provider-detail"
+    upstream_failure = _KimiAdapterFailure(
+        status_code=400,
+        message=raw_provider_detail,
+    )
+    completion_mock = AsyncMock(side_effect=upstream_failure)
+
+    with (
+        patch("litellm.acompletion", new=completion_mock),
+        pytest.raises(HTTPException) as caught,
+    ):
+        await _handle_codex_kimi_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": "kimi_code/k3-high",
+                "input": "hello",
+                "stream": False,
+            },
+            adapter_model="kimi_code/k3-high",
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail == {
+        "error": {
+            "message": "Managed Kimi Code rejected the request shape.",
+            "type": "invalid_request_error",
+            "code": "kimi_code_invalid_request",
+        }
+    }
+    assert raw_provider_detail not in json.dumps(caught.value.detail)
+    assert completion_mock.await_count == 1
+    assert not hasattr(caught.value, "kimi_code_probe_failure_metadata")
 
 
 @pytest.mark.asyncio

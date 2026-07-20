@@ -57,6 +57,14 @@ are ignored. Incoming authorization and forwarded/provider-specific identity
 headers are stripped, and the gateway supplies the managed Kimi credential
 instead of relaying caller authorization.
 
+Codex and Anthropic adapter continuations preserve assistant tool calls and
+their paired tool results. When replay contains an assistant tool-call message
+whose text content is blank, the adapter omits the `content` field instead of
+sending `null` or an empty value that Kimi rejects. A remaining Kimi 400/422
+request-shape rejection is returned once as a bounded client error; it is not
+retried as provider capacity and must not surface as HTTP 500 or a raw
+traceback.
+
 Kimi Code `0.27.0` cannot use a custom `KIMI_CODE_BASE_URL` while retaining
 the official default credential slot. It derives a separate environment-scoped
 OAuth slot for every custom base URL. Do not copy or symlink

@@ -58,6 +58,45 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.122 — Managed Kimi replay hardening and handled 4xx logging
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.122`. Managed
+Kimi Code continuation replay now preserves assistant tool calls and paired tool
+results while omitting blank assistant `content` fields that Kimi rejects.
+Residual Kimi 400/422 request-shape failures terminate after one bounded
+client-visible error instead of entering alias retries and surfacing as HTTP
+500.
+
+The shared passthrough failure boundary now treats returned 4xx
+`HTTPException` values as handled client/provider errors. It preserves the real
+client-visible status and detail, emits a bounded sanitized message without
+`exc_info`, and passes no traceback to failure callbacks. Unexpected handled
+4xx failures still produce structured error intake, while known OpenAI
+`model_not_found` responses use a dedicated warning-only classifier with a
+single-line provider message. Internal exceptions and unhandled server failures
+retain traceback diagnostics.
+
+**Why:** Codex tool continuation history could contain an assistant tool-call
+message with explicit `content: null`. Kimi returned `text content is empty`,
+and the alias path retried the deterministic 400 before leaking HTTP 500 and
+full ASGI tracebacks. Separate malformed verifier requests also showed that
+ordinary upstream 400 `model_not_found` responses were returned correctly but
+logged as raw exception chains and multiline JSON. These are handled request
+failures, not server crashes.
+
+**Why not upstream:** The managed Kimi credential/alias path, AAWM continuation
+replay, structured runtime error intake, and production route-log contract are
+fork-local behavior.
+
+**Validation status:** Focused Kimi adapter and alias tests pass (`40 passed`);
+the complete passthrough terminal-failure logging class passes (`29 passed`);
+focused Ruff and `git diff --check` pass. Dev evidence before release confirmed
+the Kimi replay fix with a real two-turn tool continuation and no post-restart
+recurrence of `text content is empty`. Production promotion, real Codex and
+Claude parent/child parallel-tool stress sessions, exact `session_history`
+evidence, and the final production log scan remain required under
+`PROD_RELEASE.md`.
+
 ### aawm.121 — Native Grok continuation same-candidate transient retries
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.121`. For genuine

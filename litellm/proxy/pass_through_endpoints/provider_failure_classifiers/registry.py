@@ -20,6 +20,11 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.chatgpt_c
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.google_code_assist import (
     _is_known_google_code_assist_tos_violation_response,
 )
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
+    _get_openai_model_not_found_error_summary,
+    _get_openai_model_not_found_failure_kind,
+    _is_known_openai_model_not_found_response,
+)
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.grok import (
     _get_passthrough_grok_billing_timeout_failure_kind,
     _get_passthrough_grok_build_usage_balance_exhausted_failure_kind,
@@ -45,6 +50,7 @@ class PassthroughProviderFailureClassification:
     log_level: str = "warning"
     failure_kind: Optional[str] = None
     log_message: Optional[str] = None
+    log_error_summary: Optional[str] = None
     # Historical contract: known Grok account/auth failures skip the generic
     # post_call_failure_hook path (already classified / noisy).
     skip_post_call_failure_hook: bool = False
@@ -280,6 +286,32 @@ def _classify_google_code_assist_tos(
     )
 
 
+def _classify_openai_model_not_found(
+    *,
+    request: Request,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> Optional[PassthroughProviderFailureClassification]:
+    if not _is_known_openai_model_not_found_response(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+        status_code=status_code,
+        exc=exc,
+    ):
+        return None
+    return PassthroughProviderFailureClassification(
+        name="openai_model_not_found",
+        failure_kind=_get_openai_model_not_found_failure_kind(),
+        log_message=(
+            "Pass through endpoint surfaced OpenAI model-not-found "
+            "status=%s error=%s"
+        ),
+        log_error_summary=_get_openai_model_not_found_error_summary(exc),
+    )
+
+
 def _classify_anthropic_known_failure(
     *,
     request: Request,
@@ -317,6 +349,7 @@ PASSTHROUGH_PROVIDER_FAILURE_CLASSIFIERS: Sequence[ProviderFailureClassifier] = 
     _classify_chatgpt_codex_invalid_encrypted_content,
     _classify_chatgpt_codex_model_not_supported,
     _classify_google_code_assist_tos,
+    _classify_openai_model_not_found,
     _classify_anthropic_known_failure,
 )
 
