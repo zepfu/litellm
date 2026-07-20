@@ -65,6 +65,16 @@
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "default_reasoning_effort": "high",
         "input_cost_per_token": 3e-06,
         "litellm_provider": "kimi_code",
@@ -99,6 +109,16 @@
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "default_reasoning_effort": "high",
         "input_cost_per_token": 3e-06,
         "litellm_provider": "kimi_code",

@@ -128,6 +128,22 @@ fanout policy text in the request, and absence of the restrictive
 request-shape based rather than requiring Codex to actually spawn subagents on
 every smoke run.
 
+### Moonshot production acceptance
+
+Moonshot promotion is production-only. Run every instance-backed Kimi smoke,
+CLI, streaming, routing, tool-use, logging, database-correlation, and
+acceptance check against `aawm-litellm` on `:4000`; do not send Moonshot
+acceptance traffic through `litellm-dev` on `:4001`.
+
+The release gate uses real Codex V2 Responses and Claude CLI parents. Each
+parent must select `aawm-sota-moonshot`, dispatch multiple child agents, have
+every child complete at least two separate parallel tool-call batches, and
+return approximately 10,000 characters of block text. Correlate the run through
+production logs, Langfuse, `aawm_tristore.public.session_history`, and
+`public.session_history_tool_activity`. Keep the canonical
+`/home/zepfu/.kimi-code/credentials` mount at the same path; acceptance must not
+copy or synthesize Kimi credentials.
+
 OpenRouter Responses hard gates must catch both incomplete-but-useful streams
 and successful-empty streams. If OpenRouter omits `response.completed` but emits
 usable text, the adapter may synthesize a valid Anthropic `message_delta` /

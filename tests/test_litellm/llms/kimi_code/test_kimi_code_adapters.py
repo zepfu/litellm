@@ -119,6 +119,42 @@ def _write_credentials(path: Path) -> None:
     )
 
 
+def _collaboration_namespace_tool() -> dict:
+    return {
+        "type": "namespace",
+        "name": "collaboration",
+        "description": "Spawn and manage sub-agents.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Spawn a child agent.",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_name": {"type": "string"},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["task_name", "message"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "wait_agent",
+                "description": "Wait for child activity.",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"timeout_ms": {"type": "integer"}},
+                    "additionalProperties": False,
+                },
+            },
+        ],
+    }
+
+
 def _request() -> MagicMock:
     request = MagicMock()
     request.headers = {}
@@ -954,6 +990,162 @@ async def test_should_adapt_apply_patch_and_restore_custom_tool_calls_for_kimi(m
         "input": patch_text,
         "status": "completed",
     }
+
+
+@pytest.mark.asyncio
+async def test_should_flatten_collaboration_namespace_and_restore_nonstream_call(
+    monkeypatch,
+    tmp_path,
+    respx_mock,
+):
+    credentials_path = tmp_path / "kimi-code.json"
+    _write_credentials(credentials_path)
+    monkeypatch.setenv(KIMI_CODE_CREDENTIAL_PATH_ENV, str(credentials_path))
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    spawn_arguments = {
+        "task_name": "child_a",
+        "message": "Inspect the release documentation.",
+    }
+
+    respx_mock.post(KIMI_CODE_CHAT_COMPLETIONS_URL).respond(
+        json={
+            "id": "chatcmpl-kimi",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "k3",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_spawn",
+                                "type": "function",
+                                "function": {
+                                    "name": "spawn_agent",
+                                    "arguments": json.dumps(spawn_arguments),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 7,
+                "total_tokens": 19,
+            },
+        }
+    )
+
+    response = await _handle_codex_kimi_chat_completions_adapter_route(
+        endpoint="/v1/responses",
+        request=_request(),
+        fastapi_response=MagicMock(spec=Response),
+        user_api_key_dict=MagicMock(),
+        prepared_request_body={
+            "model": "kimi_code/k3-max",
+            "input": [
+                {"role": "user", "content": "dispatch the child"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_prior_spawn",
+                    "namespace": "collaboration",
+                    "name": "spawn_agent",
+                    "arguments": json.dumps(spawn_arguments),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_prior_spawn",
+                    "output": "child started",
+                },
+            ],
+            "tools": [_collaboration_namespace_tool()],
+            "tool_choice": {
+                "type": "function",
+                "namespace": "collaboration",
+                "name": "spawn_agent",
+            },
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3-max",
+    )
+
+    upstream_body = json.loads(respx_mock.calls[0].request.content)
+    assert [tool["function"]["name"] for tool in upstream_body["tools"]] == [
+        "spawn_agent",
+        "wait_agent",
+    ]
+    assert upstream_body["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "spawn_agent"},
+    }
+    assert upstream_body["messages"][-2]["role"] == "assistant"
+    assert upstream_body["messages"][-2]["tool_calls"][0]["function"]["name"] == (
+        "spawn_agent"
+    )
+    assert upstream_body["messages"][-1]["role"] == "tool"
+    assert upstream_body["messages"][-1]["tool_call_id"] == "call_prior_spawn"
+
+    response_body = json.loads(response.body)
+    function_call = next(
+        item for item in response_body["output"] if item["type"] == "function_call"
+    )
+    assert function_call["name"] == "spawn_agent"
+    assert function_call["namespace"] == "collaboration"
+    assert json.loads(function_call["arguments"]) == spawn_arguments
+
+
+@pytest.mark.asyncio
+async def test_should_restore_collaboration_namespace_in_stream(
+    monkeypatch,
+    tmp_path,
+    respx_mock,
+):
+    credentials_path = tmp_path / "kimi-code.json"
+    _write_credentials(credentials_path)
+    monkeypatch.setenv(KIMI_CODE_CREDENTIAL_PATH_ENV, str(credentials_path))
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    stream_body = "\n\n".join(
+        [
+            'data: {"id":"chatcmpl-kimi","object":"chat.completion.chunk","created":1,"model":"k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_spawn","type":"function","function":{"name":"spawn_agent","arguments":"{\\"task_name\\":\\"child_a\\",\\"message\\":\\"inspect\\"}"}}]},"finish_reason":null}]}',
+            'data: {"id":"chatcmpl-kimi","object":"chat.completion.chunk","created":1,"model":"k3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls","usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}]}',
+            "data: [DONE]",
+            "",
+        ]
+    )
+    respx_mock.post(KIMI_CODE_CHAT_COMPLETIONS_URL).respond(
+        content=stream_body.encode(),
+        headers={"content-type": "text/event-stream"},
+    )
+
+    response = await _handle_codex_kimi_chat_completions_adapter_route(
+        endpoint="/v1/responses",
+        request=_request(),
+        fastapi_response=MagicMock(spec=Response),
+        user_api_key_dict=MagicMock(),
+        prepared_request_body={
+            "model": "kimi_code/k3-max",
+            "input": "dispatch the child",
+            "tools": [_collaboration_namespace_tool()],
+            "stream": True,
+        },
+        adapter_model="kimi_code/k3-max",
+    )
+
+    event_text = await _stream_text(response)
+
+    assert '"spawn_agent"' in event_text
+    assert '"collaboration"' in event_text
+    assert "response.function_call_arguments.done" in event_text
+    upstream_body = json.loads(respx_mock.calls[0].request.content)
+    assert [tool["function"]["name"] for tool in upstream_body["tools"]] == [
+        "spawn_agent",
+        "wait_agent",
+    ]
 
 
 @pytest.mark.asyncio

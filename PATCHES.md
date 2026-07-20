@@ -58,6 +58,41 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.123 — Kimi Codex collaboration namespace and stream ordering
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.123`. For
+`kimi_code/k3-high` and `kimi_code/k3-max`, the model catalog now allowlists
+the six current Codex V2 `collaboration` namespace functions:
+`spawn_agent`, `send_message`, `followup_task`, `wait_agent`,
+`interrupt_agent`, and `list_agents`. The Kimi Responses adapter flattens those
+recognized children into ordinary function definitions, normalizes matching
+continuation calls and tool choices for Kimi, records bounded adaptation and
+skip metadata, and restores `namespace=collaboration` on returned function
+calls. Unknown namespaces, malformed children, and name collisions remain
+unmapped and continue through the existing unsupported-tool policy.
+
+The chat-completion-to-Responses streaming iterator now assigns distinct output
+indexes for reasoning, message text, and later tool calls. A reasoning-first
+stream closes its reasoning item before opening the message item, so Codex no
+longer receives `response.output_text.delta` for an inactive item.
+
+**Why:** Production Codex V2 traffic reached managed Kimi successfully, but
+LiteLLM removed the collaboration namespace before egress, preventing child
+dispatch. The same run exposed invalid output-item ordering that Codex reported
+as `OutputTextDelta without active item`.
+
+**Why not upstream:** The managed Kimi alias, the exact Codex collaboration
+allowlist, AAWM adapter metadata, and the production acceptance contract are
+fork-local behavior. The stream fix is carried here to satisfy that managed
+adapter contract.
+
+**Validation status:** The complete passthrough module passes (`967 passed`);
+the dedicated Moonshot alias-routing module passes (`7 passed`); all Kimi
+adapter tests pass (`35 passed`); the focused reasoning/tool stream selection
+passes (`14 passed`); focused mypy, Ruff, JSON parsing, Python compilation, and
+`git diff --check` pass. Production promotion and real Codex V2 plus Claude CLI
+parent/child acceptance remain required under `PROD_RELEASE.md`.
+
 ### aawm.122 — Managed Kimi replay hardening and handled 4xx logging
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.122`. Managed

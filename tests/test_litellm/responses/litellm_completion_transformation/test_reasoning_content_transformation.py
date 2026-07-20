@@ -4,6 +4,8 @@ Test reasoning content preservation in Responses API transformation
 
 from unittest.mock import AsyncMock
 
+import pytest
+
 from litellm.responses.litellm_completion_transformation.streaming_iterator import (
     LiteLLMCompletionStreamingIterator,
 )
@@ -136,6 +138,101 @@ class TestReasoningContentStreaming:
         # Assert
         assert transformed_chunk.delta == "Regular content only"
         assert transformed_chunk.type == "response.output_text.delta"
+
+
+class _AsyncChunkStream:
+    def __init__(self, chunks):
+        self._chunks = iter(chunks)
+        self.logging_obj = None
+
+    async def __anext__(self):
+        try:
+            return next(self._chunks)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+@pytest.mark.asyncio
+async def test_reasoning_item_closes_before_message_text_item_opens():
+    reasoning_chunk = ModelResponseStream(
+        id="chatcmpl-kimi",
+        created=1234567890,
+        model="test-model",
+        object="chat.completion.chunk",
+        choices=[
+            StreamingChoices(
+                finish_reason=None,
+                index=0,
+                delta=Delta(
+                    content="",
+                    role="assistant",
+                    reasoning_content="Inspecting the task.",
+                ),
+            )
+        ],
+    )
+    text_chunk = ModelResponseStream(
+        id="chatcmpl-kimi",
+        created=1234567890,
+        model="test-model",
+        object="chat.completion.chunk",
+        choices=[
+            StreamingChoices(
+                finish_reason=None,
+                index=0,
+                delta=Delta(content="Working on it.", role="assistant"),
+            )
+        ],
+    )
+    iterator = LiteLLMCompletionStreamingIterator(
+        model="test-model",
+        litellm_custom_stream_wrapper=_AsyncChunkStream(
+            [reasoning_chunk, text_chunk]
+        ),
+        request_input="Test input",
+        responses_api_request={},
+    )
+
+    events = [await iterator.__anext__() for _ in range(9)]
+    event_types = [event.type for event in events]
+
+    assert event_types == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_summary_part.done",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.output_text.delta",
+    ]
+    reasoning_added = events[2]
+    reasoning_delta = events[3]
+    message_added = events[7]
+    text_delta = events[8]
+    assert reasoning_added.output_index == 0
+    assert reasoning_delta.output_index == 0
+    assert reasoning_delta.item_id == reasoning_added.item.id
+    assert message_added.output_index == 1
+    assert text_delta.output_index == 1
+    assert text_delta.item_id == message_added.item.id
+
+    iterator._queue_tool_call_delta_events(
+        [
+            {
+                "index": 0,
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "arguments": '{"task_name":"child_a","message":"inspect"}',
+                },
+            }
+        ]
+    )
+    tool_added = iterator._pending_tool_events.pop(0)
+    assert tool_added.output_index == 2
 
 
 class TestReasoningContentFinalResponse:

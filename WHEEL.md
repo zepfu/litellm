@@ -390,6 +390,8 @@ The current Anthropic-route multi-provider adapter work is split intentionally:
   - Anthropic-route adapter routing and translation logic
   - provider-family egress guard
   - adapted access-log labeling
+  - managed Kimi Codex namespace flattening/restoration and Responses stream
+    item ordering
   - backend `session_history` / Langfuse plumbing needed for adapted traffic
 - callback wheel:
   - callback-side enrichment and `session_history` persistence
@@ -397,6 +399,8 @@ The current Anthropic-route multi-provider adapter work is split intentionally:
   - Claude-specific prompt rewrites and dynamic context injection
 - harness/config artifacts:
   - validation policy and model/pricing distribution
+  - model-scoped Kimi namespace-function allowlists in the model config archive
+    and bundled fallback catalog
 
 In other words: OpenAI/Codex, Google Code Assist, OpenRouter, and NVIDIA
 adaptation on `/anthropic/v1/messages` is currently base-fork behavior, not an

@@ -1263,6 +1263,9 @@ _CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD = "unsupported_request_params
 _CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "unsupported_input_item_types"
 _CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "rewrite_input_item_types"
 _CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = "custom_tool_function_adapters"
+_CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = (
+    "namespace_tool_function_adapters"
+)
 _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "Use subagents to parallelize independent work while keeping one local owner "
     "on the critical path. Follow the current operator and project instructions "
@@ -13215,6 +13218,75 @@ def _restore_adapted_custom_tool_calls_in_response_body(
     return restored_body, restored_count, None
 
 
+def _advertised_namespace_tool_function_adapter_map(
+    request_body: Optional[dict[str, Any]],
+    *,
+    adapter_model: str,
+) -> dict[str, str]:
+    if not isinstance(request_body, dict):
+        return {}
+
+    adapter_names = _get_namespace_tool_function_adapter_names_for_model(
+        adapter_model
+    )
+    if not adapter_names:
+        return {}
+
+    _, adapted_tools, _ = _adapt_codex_namespace_tool_definitions(
+        request_body.get("tools"),
+        adapter_names=adapter_names,
+    )
+    return {
+        str(item["name"]): str(item["namespace"])
+        for item in adapted_tools
+        if isinstance(item.get("name"), str)
+        and isinstance(item.get("namespace"), str)
+    }
+
+
+def _restore_adapted_namespace_tool_calls_in_response_body(
+    response_body: dict[str, Any],
+    *,
+    request_body: Optional[dict[str, Any]],
+    adapter_model: str,
+) -> tuple[dict[str, Any], int]:
+    namespace_by_name = _advertised_namespace_tool_function_adapter_map(
+        request_body,
+        adapter_model=adapter_model,
+    )
+    if not namespace_by_name:
+        return response_body, 0
+
+    output = response_body.get("output")
+    if not isinstance(output, list):
+        return response_body, 0
+
+    restored_output: list[Any] = []
+    restored_count = 0
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            restored_output.append(item)
+            continue
+
+        item_name = _normalize_low_cardinality_tag_value(item.get("name"))
+        namespace = namespace_by_name.get(item_name or "")
+        if namespace is None or item.get("namespace") is not None:
+            restored_output.append(item)
+            continue
+
+        restored_item = dict(item)
+        restored_item["namespace"] = namespace
+        restored_output.append(restored_item)
+        restored_count += 1
+
+    if restored_count == 0:
+        return response_body, 0
+
+    restored_body = dict(response_body)
+    restored_body["output"] = restored_output
+    return restored_body, restored_count
+
+
 def _raise_codex_auto_agent_malformed_adapted_custom_tool_call(
     *,
     response_body: dict[str, Any],
@@ -13793,6 +13865,17 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         if restored_custom_tool_count:
             response_body = restored_body
             response_changed = True
+        (
+            restored_body,
+            restored_namespace_tool_count,
+        ) = _restore_adapted_namespace_tool_calls_in_response_body(
+            response_body,
+            request_body=request_body,
+            adapter_model=adapter_model,
+        )
+        if restored_namespace_tool_count:
+            response_body = restored_body
+            response_changed = True
         if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
             _raise_codex_auto_agent_malformed_tool_call_text_payload(
                 response_body=response_body,
@@ -13862,6 +13945,16 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 )
             if restored_custom_tool_count:
                 response_body = restored_body
+            (
+                restored_body,
+                restored_namespace_tool_count,
+            ) = _restore_adapted_namespace_tool_calls_in_response_body(
+                response_body,
+                request_body=request_body,
+                adapter_model=adapter_model,
+            )
+            if restored_namespace_tool_count:
+                response_body = restored_body
             if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
                 _raise_codex_auto_agent_malformed_tool_call_text_payload(
                     response_body=response_body,
@@ -13870,7 +13963,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     adapter_label=adapter_label,
                     intake_context=intake_context,
                 )
-            if isinstance(repaired_body, dict) or restored_custom_tool_count:
+            if (
+                isinstance(repaired_body, dict)
+                or restored_custom_tool_count
+                or restored_namespace_tool_count
+            ):
                 return Response(
                     content=json.dumps(response_body),
                     media_type=response.media_type or "application/json",
@@ -17704,6 +17801,46 @@ def _get_custom_tool_function_adapter_names_for_model(model: Any) -> set[str]:
     return set()
 
 
+def _get_namespace_tool_function_adapter_names_for_model(
+    model: Any,
+) -> dict[str, set[str]]:
+    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
+    if not candidate_model_cost_keys:
+        return {}
+
+    model_cost_sources = [
+        litellm.model_cost,
+        _load_bundled_model_cost_map_for_codex_policy(),
+    ]
+    for model_cost in model_cost_sources:
+        for key in candidate_model_cost_keys:
+            model_info = model_cost.get(key)
+            if not isinstance(model_info, dict):
+                continue
+
+            configured_adapters = model_info.get(
+                _CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD
+            )
+            if not isinstance(configured_adapters, dict):
+                continue
+
+            normalized_adapters: dict[str, set[str]] = {}
+            for namespace, tool_names in configured_adapters.items():
+                normalized_namespace = _normalize_low_cardinality_tag_value(namespace)
+                if normalized_namespace is None or not isinstance(tool_names, list):
+                    continue
+                normalized_names = {
+                    normalized
+                    for value in tool_names
+                    if (normalized := _normalize_low_cardinality_tag_value(value))
+                }
+                if normalized_names:
+                    normalized_adapters[normalized_namespace] = normalized_names
+            return normalized_adapters
+
+    return {}
+
+
 def _adapted_custom_tool_function_schema(
     tool: dict[str, Any],
     *,
@@ -17956,6 +18093,339 @@ def _adapt_codex_custom_tools_to_functions_from_request_body(
         adapted_tools=adapted_tools,
         adapted_input_items=adapted_input_items,
         adapted_tool_choice=adapted_tool_choice,
+    )
+    return updated_body, adapted_tools
+
+
+def _adapt_codex_namespace_tool_definitions(
+    tools: Any,
+    *,
+    adapter_names: dict[str, set[str]],
+) -> tuple[
+    Optional[list[Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    if not isinstance(tools, list):
+        return None, [], []
+
+    occupied_names = {
+        normalized_name
+        for tool in tools
+        if isinstance(tool, dict)
+        and _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
+        != "namespace"
+        and (
+            normalized_name := _normalize_low_cardinality_tag_value(
+                _get_openai_tool_name(tool)
+            )
+        )
+    }
+    updated_tools: list[Any] = []
+    adapted_tools: list[dict[str, Any]] = []
+    skipped_tools: list[dict[str, Any]] = []
+    changed = False
+
+    for tool_index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            updated_tools.append(tool)
+            continue
+
+        tool_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
+        namespace = _normalize_low_cardinality_tag_value(
+            _get_openai_tool_name(tool)
+        )
+        allowed_names = adapter_names.get(namespace or "")
+        if tool_type != "namespace" or allowed_names is None:
+            updated_tools.append(tool)
+            continue
+
+        changed = True
+        namespace_tools = tool.get("tools")
+        if not isinstance(namespace_tools, list):
+            skipped_tools.append(
+                {
+                    "namespace": namespace,
+                    "tool_index": tool_index,
+                    "reason": "tools_not_list",
+                }
+            )
+            continue
+
+        for child_index, child in enumerate(namespace_tools):
+            skip_detail: dict[str, Any] = {
+                "namespace": namespace,
+                "tool_index": tool_index,
+                "child_index": child_index,
+            }
+            if not isinstance(child, dict):
+                skipped_tools.append(
+                    {**skip_detail, "reason": "child_not_object"}
+                )
+                continue
+
+            child_type = _normalize_low_cardinality_tag_value(
+                _get_openai_tool_type(child)
+            )
+            child_name = _normalize_low_cardinality_tag_value(
+                _get_openai_tool_name(child)
+            )
+            if child_type != "function":
+                skipped_tools.append(
+                    {
+                        **skip_detail,
+                        "name": child_name,
+                        "reason": "child_not_function",
+                    }
+                )
+                continue
+            if child_name not in allowed_names:
+                skipped_tools.append(
+                    {
+                        **skip_detail,
+                        "name": child_name,
+                        "reason": "child_not_configured",
+                    }
+                )
+                continue
+            if not isinstance(child.get("parameters"), dict):
+                skipped_tools.append(
+                    {
+                        **skip_detail,
+                        "name": child_name,
+                        "reason": "parameters_not_object",
+                    }
+                )
+                continue
+            if child_name in occupied_names:
+                skipped_tools.append(
+                    {
+                        **skip_detail,
+                        "name": child_name,
+                        "reason": "name_collision",
+                    }
+                )
+                continue
+
+            adapted_tool: dict[str, Any] = {
+                "type": "function",
+                "name": child_name,
+                "parameters": copy.deepcopy(child["parameters"]),
+            }
+            description = child.get("description")
+            if isinstance(description, str) and description.strip():
+                adapted_tool["description"] = description
+            strict = child.get("strict")
+            if isinstance(strict, bool):
+                adapted_tool["strict"] = strict
+
+            updated_tools.append(adapted_tool)
+            occupied_names.add(child_name)
+            adapted_tools.append(
+                {
+                    "namespace": namespace,
+                    "name": child_name,
+                    "tool_index": tool_index,
+                    "child_index": child_index,
+                }
+            )
+
+    return (updated_tools if changed else None), adapted_tools, skipped_tools
+
+
+def _adapt_codex_namespace_input_items(
+    input_items: Any,
+    *,
+    adapter_names: dict[str, set[str]],
+) -> tuple[Optional[list[Any]], list[dict[str, Any]]]:
+    if not isinstance(input_items, list):
+        return None, []
+
+    updated_items: list[Any] = []
+    adapted_items: list[dict[str, Any]] = []
+    changed = False
+    for input_index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            updated_items.append(item)
+            continue
+
+        namespace = _normalize_low_cardinality_tag_value(item.get("namespace"))
+        item_name = _normalize_low_cardinality_tag_value(item.get("name"))
+        if (
+            namespace is None
+            or item_name not in adapter_names.get(namespace, set())
+            or item.get("type") not in {"function_call", "custom_tool_call"}
+        ):
+            updated_items.append(item)
+            continue
+
+        adapted_item = dict(item)
+        original_type = adapted_item.get("type")
+        adapted_item.pop("namespace", None)
+        if original_type == "custom_tool_call":
+            raw_input = adapted_item.get("input")
+            if not isinstance(raw_input, str):
+                updated_items.append(item)
+                continue
+            adapted_item["type"] = "function_call"
+            adapted_item["arguments"] = raw_input
+            adapted_item.pop("input", None)
+
+        updated_items.append(adapted_item)
+        adapted_items.append(
+            {
+                "namespace": namespace,
+                "name": item_name,
+                "input_index": input_index,
+                "source_type": original_type,
+            }
+        )
+        changed = True
+
+    return (updated_items if changed else None), adapted_items
+
+
+def _adapt_codex_namespace_tool_choice(
+    tool_choice: Any,
+    *,
+    adapter_names: dict[str, set[str]],
+) -> tuple[Any, Optional[dict[str, str]]]:
+    if not isinstance(tool_choice, dict):
+        return tool_choice, None
+
+    namespace = _normalize_low_cardinality_tag_value(tool_choice.get("namespace"))
+    tool_name = _normalize_low_cardinality_tag_value(tool_choice.get("name"))
+    if namespace is None or tool_name not in adapter_names.get(namespace, set()):
+        return tool_choice, None
+
+    tool_choice_type = _normalize_low_cardinality_tag_value(tool_choice.get("type"))
+    if tool_choice_type not in {"custom", "function"}:
+        return tool_choice, None
+
+    updated_choice = {
+        "type": "function",
+        "function": {"name": tool_name},
+    }
+    return updated_choice, {"namespace": namespace, "name": tool_name}
+
+
+def _add_codex_namespace_tool_function_adapter_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    adapted_tools: list[dict[str, Any]],
+    adapted_input_items: list[dict[str, Any]],
+    adapted_tool_choice: Optional[dict[str, str]],
+    skipped_tools: list[dict[str, Any]],
+) -> dict[str, Any]:
+    adapted_namespaces = _dedupe_sorted_str_list(
+        [
+            str(item["namespace"])
+            for item in adapted_tools
+            if isinstance(item.get("namespace"), str)
+        ]
+    )
+    adapted_names = _dedupe_sorted_str_list(
+        [
+            str(item["name"])
+            for item in adapted_tools
+            if isinstance(item.get("name"), str)
+        ]
+    )
+    tags_to_add = ["codex-namespace-tool-function-adapted"]
+    tags_to_add.extend(
+        f"codex-namespace-tool-function:{namespace}"
+        for namespace in adapted_namespaces
+    )
+    if skipped_tools:
+        tags_to_add.append("codex-namespace-tool-function-skipped")
+
+    span_metadata: dict[str, Any] = {
+        "tool_count": len(adapted_tools),
+        "namespaces": adapted_namespaces,
+        "tool_names": adapted_names,
+        "input_item_count": len(adapted_input_items),
+        "tool_choice_adapted": adapted_tool_choice is not None,
+        "skipped_count": len(skipped_tools),
+    }
+    return _merge_litellm_metadata(
+        request_body,
+        tags_to_add=tags_to_add,
+        extra_fields={
+            "codex_namespace_tool_function_adapter_count": len(adapted_tools),
+            "codex_namespace_tool_function_adapter_namespaces": adapted_namespaces,
+            "codex_namespace_tool_function_adapter_names": adapted_names,
+            "codex_namespace_tool_function_adapter_tools": adapted_tools,
+            "codex_namespace_tool_function_adapter_input_item_count": len(
+                adapted_input_items
+            ),
+            "codex_namespace_tool_function_adapter_input_items": adapted_input_items,
+            "codex_namespace_tool_function_adapter_tool_choice": adapted_tool_choice,
+            "codex_namespace_tool_function_adapter_skipped_count": len(
+                skipped_tools
+            ),
+            "codex_namespace_tool_function_adapter_skipped_tools": skipped_tools,
+            "langfuse_spans": [
+                _build_langfuse_span_descriptor(
+                    name="codex.namespace_tool_function_adapted",
+                    metadata=span_metadata,
+                )
+            ],
+        },
+    )
+
+
+def _adapt_codex_namespace_tools_to_functions_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    adapter_names = _get_namespace_tool_function_adapter_names_for_model(
+        request_body.get("model")
+    )
+    if not adapter_names:
+        return request_body, []
+
+    updated_tools, adapted_tools, skipped_tools = (
+        _adapt_codex_namespace_tool_definitions(
+            request_body.get("tools"),
+            adapter_names=adapter_names,
+        )
+    )
+    active_adapter_names = adapter_names
+    if isinstance(request_body.get("tools"), list):
+        active_adapter_names = {}
+        for adapted_tool in adapted_tools:
+            namespace = adapted_tool.get("namespace")
+            tool_name = adapted_tool.get("name")
+            if isinstance(namespace, str) and isinstance(tool_name, str):
+                active_adapter_names.setdefault(namespace, set()).add(tool_name)
+    updated_input, adapted_input_items = _adapt_codex_namespace_input_items(
+        request_body.get("input"),
+        adapter_names=active_adapter_names,
+    )
+    updated_tool_choice, adapted_tool_choice = _adapt_codex_namespace_tool_choice(
+        request_body.get("tool_choice"),
+        adapter_names=active_adapter_names,
+    )
+    if (
+        updated_tools is None
+        and updated_input is None
+        and adapted_tool_choice is None
+        and not skipped_tools
+    ):
+        return request_body, []
+
+    updated_body = dict(request_body)
+    if updated_tools is not None:
+        updated_body["tools"] = updated_tools
+    if updated_input is not None:
+        updated_body["input"] = updated_input
+    if adapted_tool_choice is not None:
+        updated_body["tool_choice"] = updated_tool_choice
+    updated_body = _add_codex_namespace_tool_function_adapter_logging_metadata(
+        updated_body,
+        adapted_tools=adapted_tools,
+        adapted_input_items=adapted_input_items,
+        adapted_tool_choice=adapted_tool_choice,
+        skipped_tools=skipped_tools,
     )
     return updated_body, adapted_tools
 
@@ -24328,6 +24798,11 @@ async def _prepare_codex_kimi_chat_completions_adapter_route(
     )
     adapted_request_body, _adapted_custom_tools = (
         _adapt_codex_custom_tools_to_functions_from_request_body(prepared_request_body)
+    )
+    adapted_request_body, _adapted_namespace_tools = (
+        _adapt_codex_namespace_tools_to_functions_from_request_body(
+            adapted_request_body
+        )
     )
     adapted_request_body, _unsupported_hosted_tools = (
         _drop_unsupported_codex_hosted_tools_from_request_body(adapted_request_body)

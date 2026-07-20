@@ -143,7 +143,9 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body,
     _validate_codex_auto_agent_responses_payload,
     _adapt_codex_custom_tools_to_functions_from_request_body,
+    _adapt_codex_namespace_tools_to_functions_from_request_body,
     _restore_adapted_custom_tool_calls_in_response_body,
+    _restore_adapted_namespace_tool_calls_in_response_body,
     _normalize_codex_google_code_assist_reasoning_effort,
     _perform_google_adapter_pass_through_request,
     _perform_codex_auto_agent_openrouter_completion_request,
@@ -6248,7 +6250,7 @@ class TestPassThroughRequestRetryableFailures:
         payload = next(
             item
             for item in payloads
-            if "pass_through_endpoint" in item["message"]
+            if item.get("context", {}).get("source") == "pass_through_endpoint"
         )
         assert payload["context"]["source"] == "pass_through_endpoint"
         assert payload["context"]["endpoint"] == "/anthropic/v1/messages?beta=true"
@@ -18713,6 +18715,42 @@ def _codex_apply_patch_custom_tool_definition() -> dict[str, Any]:
     }
 
 
+def _codex_collaboration_namespace_tool_definition() -> dict[str, Any]:
+    return {
+        "type": "namespace",
+        "name": "collaboration",
+        "description": "Spawn and manage sub-agents.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Spawn a child agent.",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_name": {"type": "string"},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["task_name", "message"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "wait_agent",
+                "description": "Wait for child activity.",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"timeout_ms": {"type": "integer"}},
+                    "additionalProperties": False,
+                },
+            },
+        ],
+    }
+
+
 @pytest.mark.parametrize(
     "model_catalog_path",
     [
@@ -18752,6 +18790,16 @@ def test_kimi_apply_patch_custom_tool_adapter_metadata_is_bundled(
         assert model_catalog[model]["custom_tool_function_adapters"] == [
             "apply_patch"
         ]
+        assert model_catalog[model]["namespace_tool_function_adapters"] == {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent",
+            ]
+        }
         assert model_catalog[model]["unsupported_hosted_tools"] == [
             "custom",
             "image_generation",
@@ -18764,6 +18812,209 @@ def test_kimi_apply_patch_custom_tool_adapter_metadata_is_bundled(
             "custom_tool_call_output",
         ]
     assert "custom_tool_function_adapters" not in model_catalog["kimi_code/k3"]
+
+
+@pytest.mark.parametrize("model", ["kimi_code/k3-high", "kimi_code/k3-max"])
+def test_kimi_collaboration_namespace_is_flattened_with_continuation_and_tool_choice(
+    model,
+):
+    request_body = {
+        "model": model,
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            _codex_collaboration_namespace_tool_definition(),
+            {
+                "type": "namespace",
+                "name": "unrelated",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "ignore_me",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        ],
+        "tool_choice": {
+            "type": "function",
+            "namespace": "collaboration",
+            "name": "spawn_agent",
+        },
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_spawn",
+                "namespace": "collaboration",
+                "name": "spawn_agent",
+                "arguments": '{"task_name":"child_a","message":"inspect"}',
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_wait",
+                "namespace": "collaboration",
+                "name": "wait_agent",
+                "input": '{"timeout_ms":1000}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_wait",
+                "output": "complete",
+            },
+        ],
+    }
+
+    adapted_body, adapted_tools = (
+        _adapt_codex_namespace_tools_to_functions_from_request_body(request_body)
+    )
+
+    assert [tool["name"] for tool in adapted_body["tools"][:3]] == [
+        "read_file",
+        "spawn_agent",
+        "wait_agent",
+    ]
+    assert adapted_body["tools"][3]["name"] == "unrelated"
+    assert adapted_tools == [
+        {
+            "namespace": "collaboration",
+            "name": "spawn_agent",
+            "tool_index": 1,
+            "child_index": 0,
+        },
+        {
+            "namespace": "collaboration",
+            "name": "wait_agent",
+            "tool_index": 1,
+            "child_index": 1,
+        },
+    ]
+    assert adapted_body["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "spawn_agent"},
+    }
+    assert adapted_body["input"][0].get("namespace") is None
+    assert adapted_body["input"][1] == {
+        "type": "function_call",
+        "call_id": "call_wait",
+        "name": "wait_agent",
+        "arguments": '{"timeout_ms":1000}',
+    }
+    metadata = adapted_body["litellm_metadata"]
+    assert metadata["codex_namespace_tool_function_adapter_count"] == 2
+    assert metadata["codex_namespace_tool_function_adapter_namespaces"] == [
+        "collaboration"
+    ]
+    assert metadata["codex_namespace_tool_function_adapter_input_item_count"] == 2
+    assert metadata["codex_namespace_tool_function_adapter_tool_choice"] == {
+        "namespace": "collaboration",
+        "name": "spawn_agent",
+    }
+
+
+def test_kimi_collaboration_namespace_skips_collisions_and_malformed_children():
+    namespace_tool = _codex_collaboration_namespace_tool_definition()
+    namespace_tool["tools"].extend(
+        [
+            {
+                "type": "function",
+                "name": "send_message",
+                "parameters": "not-a-schema",
+            },
+            {
+                "type": "function",
+                "name": "unknown_child",
+                "parameters": {"type": "object"},
+            },
+        ]
+    )
+    request_body = {
+        "model": "kimi_code/k3-max",
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            namespace_tool,
+        ],
+        "tool_choice": {
+            "type": "function",
+            "namespace": "collaboration",
+            "name": "spawn_agent",
+        },
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_collision",
+                "namespace": "collaboration",
+                "name": "spawn_agent",
+                "arguments": "{}",
+            }
+        ],
+    }
+
+    adapted_body, adapted_tools = (
+        _adapt_codex_namespace_tools_to_functions_from_request_body(request_body)
+    )
+
+    assert [tool["name"] for tool in adapted_body["tools"]] == [
+        "spawn_agent",
+        "wait_agent",
+    ]
+    assert adapted_tools == [
+        {
+            "namespace": "collaboration",
+            "name": "wait_agent",
+            "tool_index": 1,
+            "child_index": 1,
+        }
+    ]
+    assert adapted_body["tool_choice"] == request_body["tool_choice"]
+    assert adapted_body["input"] == request_body["input"]
+    skipped = adapted_body["litellm_metadata"][
+        "codex_namespace_tool_function_adapter_skipped_tools"
+    ]
+    assert [item["reason"] for item in skipped] == [
+        "name_collision",
+        "parameters_not_object",
+        "child_not_configured",
+    ]
+
+
+def test_kimi_collaboration_function_response_restores_namespace():
+    response_body = {
+        "id": "resp_spawn",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_spawn",
+                "call_id": "call_spawn",
+                "name": "spawn_agent",
+                "arguments": '{"task_name":"child_a","message":"inspect"}',
+            }
+        ],
+    }
+
+    restored_body, restored_count = (
+        _restore_adapted_namespace_tool_calls_in_response_body(
+            response_body,
+            request_body={
+                "tools": [_codex_collaboration_namespace_tool_definition()],
+            },
+            adapter_model="kimi_code/k3-max",
+        )
+    )
+
+    assert restored_count == 1
+    assert restored_body["output"][0]["namespace"] == "collaboration"
+    assert restored_body["output"][0]["type"] == "function_call"
+    assert restored_body["output"][0]["arguments"] == (
+        '{"task_name":"child_a","message":"inspect"}'
+    )
 
 
 @pytest.mark.parametrize("model", ["kimi_code/k3-high", "kimi_code/k3-max"])
@@ -19937,6 +20188,26 @@ def clear_codex_auto_agent_alias_state(monkeypatch):
     _codex_auto_agent_antigravity_lane_key_by_key.clear()
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
+    for candidate_map, aliases in (
+        (
+            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
+            ("aawm-code", "aawm-low"),
+        ),
+        (
+            _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
+            ("aawm-code-anthropic", "aawm-low-anthropic"),
+        ),
+    ):
+        for alias in aliases:
+            monkeypatch.setitem(
+                candidate_map,
+                alias,
+                tuple(
+                    candidate
+                    for candidate in candidate_map[alias]
+                    if candidate["provider"] != "kimi_code"
+                ),
+            )
     clear_aawm_route_rollups()
     yield
     aawm_claude_control_plane._claude_tool_advertisement_compaction_cache.clear()
