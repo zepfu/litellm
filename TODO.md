@@ -186,12 +186,14 @@ these docs only as needed:
 
 ## Next
 
-- Promote `v1.82.3-aawm.128` to `aawm-litellm` production for managed Kimi
+- Promote `v1.82.3-aawm.129` to `aawm-litellm` production for managed Kimi
   collaboration namespace adaptation, corrected reasoning/message/tool stream
   ordering, large-stream namespace restoration, continuation replay, handled
   passthrough 4xx logging, exact source-error route rollups, full-row
-  failure/cooldown coloring, alias-to-provider-model enforcement, and the
-  three-hour Grok quota cooldown policy. The production provider-status
+  failure/cooldown coloring, alias-to-provider-model enforcement, the
+  three-hour Grok quota cooldown policy, correctly classified bounded stream
+  peeks, and post-flatten Codex spawn-agent role/model schema. The production
+  provider-status
   sidecar must also refresh the same canonical Kimi credential in place through
   its native lock path; do not create a credential copy. Follow
   `PROD_RELEASE.md` and recreate only the named production LiteLLM and
@@ -208,10 +210,14 @@ these docs only as needed:
   Claude `ANTHROPIC_BASE_URL`/non-secret custom-header overlay. Do not set,
   copy, synthesize, or override `ANTHROPIC_API_KEY`; the real Claude CLI must
   use its existing OAuth credential state. The Codex collaboration prompt must
-  set `model="aawm-sota-moonshot"` and `fork_turns="none"` on both child
-  spawns and provide complete self-contained plaintext child tasks. Do not use
-  legacy `fork_context` or inherited encrypted context as the child task
-  envelope.
+  register the existing `moonshot` agent role and set
+  `agent_type="moonshot"`, `model="aawm-sota-moonshot"`, and
+  `fork_turns="none"` on both child spawns while providing complete
+  self-contained plaintext child tasks. Do not use legacy `fork_context` or
+  inherited encrypted context as the child task envelope. Validate completed
+  spawn payloads through `public.session_history_tool_activity`; Codex
+  `--json` stdout is required for visible `wait` events but is not an
+  authoritative spawn ledger when the installed CLI omits those events.
   Run the existing-harness Codex and Claude system-time gates, each executing
   `date --iso-8601=seconds` through Bash and requiring the exact stdout as the
   final response. The Claude stress gate must dispatch two Moonshot children,

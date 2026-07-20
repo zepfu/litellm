@@ -185,8 +185,10 @@ def test_rr054_stream_validation_main_path_source_enforces_bounds() -> None:
     assert "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS" in source
     assert "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES" in source
     assert "peek.exhausted" in source
-    assert '"peek overflow (chunks=%s bytes=%s adapter=%s); preserving the "' in source
-    assert '"complete upstream stream"' in source
+    assert '"peek limit (reason=%s chunks=%s bytes=%s max_chunks=%s "' in source
+    assert 'peek.stop_reason == "pending_stream"' in source
+    assert "complete upstream " in source
+    assert "stream" in source
 
 
 # ---------------------------------------------------------------------------
@@ -271,14 +273,33 @@ async def test_rr054_stream_validation_chunk_overflow_replays_losslessly(
     assert len(original) > 2
     upstream = await _upstream_from_chunks(original)
 
-    with patch.object(lpe, "_should_log_aawm_alias_routing_event", return_value=True):
+    with patch.object(
+        lpe, "_should_log_aawm_alias_routing_event", return_value=True
+    ), patch.object(lpe.verbose_proxy_logger, "warning") as warning_mock:
         response = await lpe._validate_codex_auto_agent_responses_payload(
             upstream,
             adapter_model="test-model",
             adapter="codex_auto_agent_openai_responses",
             adapter_label="OpenAI Responses",
+            intake_context={
+                "model_alias": "aawm-test",
+                "session_id": "session-test",
+                "litellm_call_id": "call-test",
+                "trace_id": "trace-test",
+            },
         )
 
+    warning_mock.assert_called_once()
+    warning_args = warning_mock.call_args.args
+    assert "peek limit" in warning_args[0]
+    assert warning_args[1] == "chunk_limit"
+    assert warning_args[-5:] == (
+        "test-model",
+        "aawm-test",
+        "session-test",
+        "call-test",
+        "trace-test",
+    )
     replayed = await _drain_stream(response)
     assert [_decode_chunk(c) for c in replayed] == [
         _decode_chunk(c) for c in original
@@ -301,18 +322,75 @@ async def test_rr054_stream_validation_byte_overflow_replays_losslessly(
     )
 
     upstream = await _upstream_from_chunks(original)
-    response = await lpe._validate_codex_auto_agent_responses_payload(
-        upstream,
-        adapter_model="test-model",
-        adapter="codex_auto_agent_openai_responses",
-        adapter_label="OpenAI Responses",
-    )
+    with patch.object(
+        lpe, "_should_log_aawm_alias_routing_event", return_value=True
+    ), patch.object(lpe.verbose_proxy_logger, "warning") as warning_mock:
+        response = await lpe._validate_codex_auto_agent_responses_payload(
+            upstream,
+            adapter_model="test-model",
+            adapter="codex_auto_agent_openai_responses",
+            adapter_label="OpenAI Responses",
+        )
 
+    warning_mock.assert_called_once()
+    assert warning_mock.call_args.args[1] == "byte_limit"
     replayed = await _drain_stream(response)
     assert [_decode_chunk(c) for c in replayed] == [
         _decode_chunk(c) for c in original
     ]
     assert "response.completed" in _rendered(replayed)
+
+
+@pytest.mark.asyncio
+async def test_rr054_stream_validation_pending_stream_is_not_logged_as_overflow() -> None:
+    first_chunk_ready = asyncio.Event()
+    release_second_chunk = asyncio.Event()
+    chunks = _minimal_valid_stream_chunks(text="pending-stream")
+
+    async def _pending_upstream() -> AsyncIterator[bytes]:
+        first_chunk_ready.set()
+        yield chunks[0]
+        await release_second_chunk.wait()
+        for chunk in chunks[1:]:
+            yield chunk
+
+    upstream = StreamingResponse(
+        _pending_upstream(),
+        media_type="text/event-stream",
+    )
+    with patch.object(lpe.verbose_proxy_logger, "warning") as warning_mock, patch.object(
+        lpe.verbose_proxy_logger, "debug"
+    ) as debug_mock:
+        response = await lpe._validate_codex_auto_agent_responses_payload(
+            upstream,
+            adapter_model="kimi_code/k3-max",
+            adapter="codex_kimi_chat_completions_adapter",
+            adapter_label="Kimi Code",
+            intake_context={
+                "model_alias": "aawm-sota-moonshot",
+                "session_id": "session-pending",
+                "litellm_call_id": "call-pending",
+                "trace_id": "trace-pending",
+            },
+        )
+        await first_chunk_ready.wait()
+        release_second_chunk.set()
+        replayed = await _drain_stream(response)
+
+    warning_mock.assert_not_called()
+    debug_mock.assert_called_once()
+    debug_args = debug_mock.call_args.args
+    assert debug_args[1] == "pending_stream"
+    assert debug_args[-5:] == (
+        "kimi_code/k3-max",
+        "aawm-sota-moonshot",
+        "session-pending",
+        "call-pending",
+        "trace-pending",
+    )
+    assert [_decode_chunk(c) for c in replayed] == [
+        _decode_chunk(c) for c in chunks
+    ]
 
 
 @pytest.mark.asyncio

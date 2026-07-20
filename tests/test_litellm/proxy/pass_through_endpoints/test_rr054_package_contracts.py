@@ -812,6 +812,7 @@ async def test_rr054_streaming_peek_exhausted_and_overflow() -> None:
     small = StreamingResponse(small_body(), media_type="text/event-stream", status_code=200)
     peek = await streaming.peek_streaming_response(small, max_chunks=10, max_bytes=100)
     assert peek.exhausted is True
+    assert peek.stop_reason == "stream_exhausted"
     assert peek.buffered_chunks == [b"a", b"b"]
     replayed: list[Any] = []
     async for chunk in peek.response.body_iterator:
@@ -826,6 +827,7 @@ async def test_rr054_streaming_peek_exhausted_and_overflow() -> None:
     large = StreamingResponse(large_body(), media_type="text/event-stream", status_code=200)
     peek2 = await streaming.peek_streaming_response(large, max_chunks=1, max_bytes=1000)
     assert peek2.exhausted is False
+    assert peek2.stop_reason == "chunk_limit"
     # lossless continuation still yields all bytes
     cont: list[Any] = []
     async for chunk in peek2.response.body_iterator:

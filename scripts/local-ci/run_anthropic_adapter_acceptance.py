@@ -1034,6 +1034,7 @@ def _ensure_cli_harness_context(
         'session_id': session_id,
         'repository': repository,
         'repository_root': str(ROOT),
+        'codex_home': str(pathlib.Path.home() / '.codex'),
         'litellm_base_url': profile['litellm_base_url'],
         'anthropic_base_url': profile['anthropic_base_url'],
         'codex_profile': codex_profile,
@@ -3043,6 +3044,25 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
                 failures.append(
                     f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} did not include arguments containing {required_argument_substring!r}'
                 )
+        each_required_argument_substrings = expected_row.get(
+            'each_arguments_required_substrings'
+        )
+        if isinstance(each_required_argument_substrings, list):
+            for required_argument_substring in each_required_argument_substrings:
+                if not (
+                    isinstance(required_argument_substring, str)
+                    and required_argument_substring
+                ):
+                    continue
+                missing_match_count = sum(
+                    required_argument_substring
+                    not in json.dumps(row.get('arguments'), sort_keys=True)
+                    for row in matches
+                )
+                if missing_match_count:
+                    failures.append(
+                        f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} had {missing_match_count} matching row(s) without arguments containing {required_argument_substring!r}'
+                    )
         forbidden_command_substrings = []
         configured_forbidden_command = expected_row.get(
             'command_text_forbidden_substring'

@@ -18325,7 +18325,7 @@ def test_codex_spawn_agent_tool_description_patch_replaces_restrictive_policy():
         "status": "applied",
         "tool_name": "spawn_agent",
         "path": "tools.0.parameters",
-        "fields_added": ["model", "fork_turns", "message"],
+        "fields_added": ["agent_type", "model", "fork_turns", "message"],
         "fields_removed": [],
         "occurrences": 0,
     }
@@ -18343,7 +18343,13 @@ def test_codex_spawn_agent_tool_description_patch_replaces_restrictive_policy():
     spawn_agent_parameters = updated_body["tools"][0]["parameters"]
     assert spawn_agent_parameters["type"] == "object"
     spawn_agent_properties = spawn_agent_parameters["properties"]
-    assert list(spawn_agent_properties) == ["model", "fork_turns", "message"]
+    assert list(spawn_agent_properties) == [
+        "agent_type",
+        "model",
+        "fork_turns",
+        "message",
+    ]
+    assert spawn_agent_properties["agent_type"]["type"] == "string"
     assert spawn_agent_properties["model"]["type"] == "string"
     assert spawn_agent_properties["fork_turns"] == {
         "type": "string",
@@ -18416,12 +18422,13 @@ def test_codex_spawn_agent_tool_patch_adds_function_payload_schema_fields():
         if event["id"] == "spawn-agent-payload-schema"
     )
     assert schema_event["path"] == "tools.0.function.parameters"
-    assert schema_event["fields_added"] == ["model", "fork_turns"]
+    assert schema_event["fields_added"] == ["agent_type", "model", "fork_turns"]
     assert schema_event["fields_removed"] == ["fork_context"]
 
     function = updated_body["tools"][0]["function"]
     assert "aawm-codex-agent-auto" in function["description"]
     properties = function["parameters"]["properties"]
+    assert properties["agent_type"]["type"] == "string"
     assert properties["model"]["type"] == "string"
     assert properties["fork_turns"]["type"] == "string"
     assert properties["fork_turns"]["enum"] == ["none", "all"]
@@ -18897,6 +18904,9 @@ def test_kimi_collaboration_namespace_is_flattened_with_continuation_and_tool_ch
     adapted_body, adapted_tools = (
         _adapt_codex_namespace_tools_to_functions_from_request_body(request_body)
     )
+    patched_body, patch_events = _apply_codex_tool_description_patches_to_request_body(
+        adapted_body
+    )
 
     assert [tool["name"] for tool in adapted_body["tools"][:3]] == [
         "read_file",
@@ -18939,6 +18949,21 @@ def test_kimi_collaboration_namespace_is_flattened_with_continuation_and_tool_ch
         "namespace": "collaboration",
         "name": "spawn_agent",
     }
+    assert [event["id"] for event in patch_events] == [
+        "spawn-agent-payload-schema"
+    ]
+    spawn_parameters = patched_body["tools"][1]["parameters"]
+    assert set(spawn_parameters["properties"]) == {
+        "task_name",
+        "agent_type",
+        "model",
+        "fork_turns",
+        "message",
+    }
+    assert spawn_parameters["properties"]["agent_type"]["type"] == "string"
+    assert spawn_parameters["properties"]["model"]["type"] == "string"
+    assert spawn_parameters["properties"]["fork_turns"]["enum"] == ["none", "all"]
+    assert spawn_parameters["properties"]["message"]["type"] == "string"
 
 
 def test_kimi_collaboration_namespace_skips_collisions_and_malformed_children():
@@ -32765,6 +32790,7 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     assert "fork_context" not in prepared_body["tools"][0]["description"]
     spawn_agent_parameters = prepared_body["tools"][0]["parameters"]
     assert set(spawn_agent_parameters["properties"]) == {
+        "agent_type",
         "model",
         "fork_turns",
         "message",

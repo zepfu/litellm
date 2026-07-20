@@ -1293,6 +1293,13 @@ _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "one place."
 )
 _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
+    "agent_type": {
+        "type": "string",
+        "description": (
+            "Optional configured agent role. Use a role whose config selects the "
+            "required model and execution policy."
+        ),
+    },
     "model": {
         "type": "string",
         "description": (
@@ -1318,6 +1325,7 @@ _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
     },
 }
 _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER = (
+    "agent_type",
     "model",
     "fork_turns",
     "message",
@@ -13978,16 +13986,50 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,
         )
         if not peek.exhausted:
-            if _should_log_aawm_alias_routing_event(
-                f"validate-stream-overflow:{adapter}"
-            ):
-                verbose_proxy_logger.warning(
-                    "Codex auto-agent responses validation bypassed after bounded "
-                    "peek overflow (chunks=%s bytes=%s adapter=%s); preserving the "
-                    "complete upstream stream",
+            correlation = intake_context or {}
+            model_alias = correlation.get("model_alias")
+            if model_alias is None and isinstance(request_body, dict):
+                model_alias = request_body.get("model")
+            session_id = correlation.get("session_id")
+            litellm_call_id = correlation.get("litellm_call_id")
+            trace_id = correlation.get("trace_id")
+            if peek.stop_reason == "pending_stream":
+                verbose_proxy_logger.debug(
+                    "Codex auto-agent responses validation continued lazily "
+                    "(reason=%s chunks=%s bytes=%s adapter=%s "
+                    "adapter_model=%s model_alias=%s session_id=%s "
+                    "litellm_call_id=%s trace_id=%s); preserving the complete "
+                    "upstream stream",
+                    peek.stop_reason,
                     len(peek.buffered_chunks),
                     peek.buffered_bytes,
                     adapter,
+                    adapter_model,
+                    model_alias or "<missing>",
+                    session_id or "<missing>",
+                    litellm_call_id or "<missing>",
+                    trace_id or "<missing>",
+                )
+            elif _should_log_aawm_alias_routing_event(
+                f"validate-stream-limit:{adapter}:{peek.stop_reason}"
+            ):
+                verbose_proxy_logger.warning(
+                    "Codex auto-agent responses validation bypassed after bounded "
+                    "peek limit (reason=%s chunks=%s bytes=%s max_chunks=%s "
+                    "max_bytes=%s adapter=%s adapter_model=%s model_alias=%s "
+                    "session_id=%s litellm_call_id=%s trace_id=%s); preserving "
+                    "the complete upstream stream",
+                    peek.stop_reason,
+                    len(peek.buffered_chunks),
+                    peek.buffered_bytes,
+                    _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,
+                    _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,
+                    adapter,
+                    adapter_model,
+                    model_alias or "<missing>",
+                    session_id or "<missing>",
+                    litellm_call_id or "<missing>",
+                    trace_id or "<missing>",
                 )
             return _restore_adapted_namespace_tool_calls_in_streaming_response(
                 peek.response,
@@ -24993,6 +25035,10 @@ async def _prepare_codex_kimi_chat_completions_adapter_route(
             adapted_request_body
         )
     )
+    (
+        adapted_request_body,
+        _codex_tool_description_patch_events,
+    ) = _apply_codex_tool_description_patches_to_request_body(adapted_request_body)
     adapted_request_body, _unsupported_hosted_tools = (
         _drop_unsupported_codex_hosted_tools_from_request_body(adapted_request_body)
     )
@@ -25119,6 +25165,12 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
         adapter_model=adapter_model,
         adapter="codex_kimi_chat_completions_adapter",
         adapter_label="Kimi Code",
+        intake_context=_build_malformed_tool_call_intake_context(
+            request,
+            prepared_request_body,
+            adapter="codex_kimi_chat_completions_adapter",
+            provider="kimi_code",
+        ),
         request_body=prepared_request_body,
     )
     if isinstance(validated_response, StreamingResponse):

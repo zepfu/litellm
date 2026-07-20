@@ -148,11 +148,15 @@ Run the opt-in Codex gate as
 `native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration`.
 It uses the target-selected production Codex profile and requires two completed
 `spawn_agent` calls, at least twelve persisted child `exec_command` rows, and a
-9,800-10,200 character final block. Both spawn calls must set
-`model="aawm-sota-moonshot"` and `fork_turns="none"` and must carry complete
-self-contained plaintext child messages. Do not use the legacy
-`fork_context` field and do not rely on inherited or encrypted parent context
-to carry the child task.
+9,800-10,200 character final block. The ignored-user-config launch explicitly
+registers the existing `~/.codex/agents/moonshot.toml` role. Both spawn calls
+must set `agent_type="moonshot"`, `model="aawm-sota-moonshot"`, and
+`fork_turns="none"` and must carry complete self-contained plaintext child
+messages. The harness validates those spawn payloads through
+`public.session_history_tool_activity` because installed Codex JSON stdout can
+omit successful spawn events; stdout collaboration validation still requires
+visible completed `wait` events. Do not use the legacy `fork_context` field and
+do not rely on inherited or encrypted parent context to carry the child task.
 
 Run the Claude stress gate as
 `claude_adapter_aawm_sota_moonshot_parallel_stress`. The parent uses the real
@@ -176,8 +180,11 @@ stdout exactly. The Claude case additionally requires the Moonshot child text to
 equal the same tool-result stdout.
 
 Kimi streaming coverage must include a response that leaves the bounded eager
-validation path before emitting multiple collaboration calls. The output-item
-events and terminal response must retain `namespace=collaboration`; a
+validation path before emitting multiple collaboration calls. A merely pending
+next chunk is normal streaming behavior and must not produce a warning; only
+the configured chunk or byte limits may produce a bounded, correlated warning.
+The output-item events and terminal response must retain
+`namespace=collaboration`; a
 small-stream-only namespace test is insufficient.
 
 OpenRouter Responses hard gates must catch both incomplete-but-useful streams

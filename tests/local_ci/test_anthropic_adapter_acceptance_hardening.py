@@ -1924,7 +1924,13 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
         'model_catalog_json="{repository_root}/scripts/local-ci/codex_moonshot_model_catalog.json"'
         in command
     )
+    assert (
+        'agents.moonshot.description="Moonshot production acceptance worker"'
+        in command
+    )
+    assert 'agents.moonshot.config_file="{codex_home}/agents/moonshot.toml"' in command
     prompt = command[-1]
+    assert 'agent_type="moonshot"' in prompt
     assert 'model="aawm-sota-moonshot"' in prompt
     assert 'fork_turns="none"' in prompt
     assert "complete self-contained plaintext message" in prompt
@@ -1946,11 +1952,22 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
     }
 
     assert case_config["codex_collaboration_validation"]["minimum_tool_counts"] == {
-        "spawn_agent": 2,
         "wait": 1,
     }
-    [tool_row] = case_config["tool_activity_validation"]["expected_rows"]
-    assert tool_row == {
+    spawn_row, command_row = case_config["tool_activity_validation"]["expected_rows"]
+    assert spawn_row == {
+        "provider": "kimi_code",
+        "tool_name": "spawn_agent",
+        "tool_kind": "other",
+        "minimum_count": 2,
+        "each_arguments_required_substrings": [
+            '"agent_type": "moonshot"',
+            '"model": "aawm-sota-moonshot"',
+            '"fork_turns": "none"',
+            '"message": "',
+        ],
+    }
+    assert command_row == {
         "provider": "kimi_code",
         "tool_name": "exec_command",
         "tool_kind": "command",
@@ -3943,6 +3960,94 @@ def test_tool_activity_validation_rejects_missing_required_argument_substring(mo
 
     assert failures == [
         "case tool_activity rows for provider='openai' model='gpt-5.5' tool_name='WebSearch' did not include arguments containing 'IANA example domain'"
+    ]
+
+    harness._close_validation_db_connections()
+
+
+def test_tool_activity_validation_requires_argument_substrings_on_every_match(
+    monkeypatch,
+):
+    harness = _load_harness_module()
+    harness._close_validation_db_connections()
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            pass
+
+        def fetchall(self):
+            return [
+                {
+                    "provider": "kimi_code",
+                    "model": "kimi_code/k3-max",
+                    "tool_index": 0,
+                    "tool_name": "spawn_agent",
+                    "tool_kind": "other",
+                    "command_text": "",
+                    "arguments": {
+                        "model": "aawm-sota-moonshot",
+                        "fork_turns": "none",
+                        "message": "Child A",
+                    },
+                    "metadata": {},
+                    "created_at": None,
+                },
+                {
+                    "provider": "kimi_code",
+                    "model": "kimi_code/k3-max",
+                    "tool_index": 1,
+                    "tool_name": "spawn_agent",
+                    "tool_kind": "other",
+                    "command_text": "",
+                    "arguments": {
+                        "fork_turns": "none",
+                        "message": "Child B",
+                    },
+                    "metadata": {},
+                    "created_at": None,
+                },
+            ]
+
+    class FakeConnection:
+        closed = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(harness.psycopg, "connect", lambda **kwargs: FakeConnection())
+
+    _, failures = harness._validate_tool_activity(
+        family="case",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "expected_rows": [
+                {
+                    "provider": "kimi_code",
+                    "tool_name": "spawn_agent",
+                    "tool_kind": "other",
+                    "minimum_count": 2,
+                    "each_arguments_required_substrings": [
+                        '"model": "aawm-sota-moonshot"',
+                        '"fork_turns": "none"',
+                        '"message": "',
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case tool_activity rows for provider='kimi_code' model=None tool_name='spawn_agent' had 1 matching row(s) without arguments containing '\"model\": \"aawm-sota-moonshot\"'"
     ]
 
     harness._close_validation_db_connections()

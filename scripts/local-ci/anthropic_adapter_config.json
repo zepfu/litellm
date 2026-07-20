@@ -600,6 +600,10 @@
         "-c",
         "model_catalog_json=\"{repository_root}/scripts/local-ci/codex_moonshot_model_catalog.json\"",
         "-c",
+        "agents.moonshot.description=\"Moonshot production acceptance worker\"",
+        "-c",
+        "agents.moonshot.config_file=\"{codex_home}/agents/moonshot.toml\"",
+        "-c",
         "model_providers.{codex_profile}.name=\"LiteLLM\"",
         "-c",
         "model_providers.{codex_profile}.base_url=\"{litellm_base_url}/openai_passthrough\"",
@@ -622,7 +626,7 @@
         "-c",
         "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
         "--json",
-        "Production Moonshot acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first tool response spawn exactly two children concurrently. For each spawn_agent call set model=\"aawm-sota-moonshot\", set fork_turns=\"none\", provide a complete self-contained plaintext message, and do not include the legacy fork_context field. Do not rely on inherited context, an empty task payload, or encrypted continuation state. The Child A message must explicitly identify Child A, prohibit further agent spawning, require exactly two sequential batches of three parallel exec_command calls in {repository_root}, list Batch 1 as pwd; git rev-parse --show-toplevel; git branch --show-current, list Batch 2 after all Batch 1 results as git rev-parse HEAD; git status --short; git diff --check, and require CHILD_A_TWO_PARALLEL_BATCHES_PASSED only after all six commands succeed. The Child B message must contain the same complete instructions while explicitly identifying Child B and requiring CHILD_B_TWO_PARALLEL_BATCHES_PASSED. Wait for both children and verify both markers. Then return one plain ASCII block between 9800 and 10200 characters, beginning exactly with CODEX_MOONSHOT_PROD_ACCEPTANCE_START, containing both child markers within the first 300 characters, continuing with neutral repeated filler prose, and ending exactly with CODEX_MOONSHOT_PROD_ACCEPTANCE_END. If collaboration tools or either child fail, report the exact blocker and do not emit the success block."
+        "Production Moonshot acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first tool response spawn exactly two children concurrently. For each spawn_agent call set agent_type=\"moonshot\", set model=\"aawm-sota-moonshot\", set fork_turns=\"none\", provide a complete self-contained plaintext message, and do not include the legacy fork_context field. Do not rely on inherited context, an empty task payload, or encrypted continuation state. The Child A message must explicitly identify Child A, prohibit further agent spawning, require exactly two sequential batches of three parallel exec_command calls in {repository_root}, list Batch 1 as pwd; git rev-parse --show-toplevel; git branch --show-current, list Batch 2 after all Batch 1 results as git rev-parse HEAD; git status --short; git diff --check, and require CHILD_A_TWO_PARALLEL_BATCHES_PASSED only after all six commands succeed. The Child B message must contain the same complete instructions while explicitly identifying Child B and requiring CHILD_B_TWO_PARALLEL_BATCHES_PASSED. Wait for both children and verify both markers. Then return one plain ASCII block between 9800 and 10200 characters, beginning exactly with CODEX_MOONSHOT_PROD_ACCEPTANCE_START, containing both child markers within the first 300 characters, continuing with neutral repeated filler prose, and ending exactly with CODEX_MOONSHOT_PROD_ACCEPTANCE_END. If collaboration tools or either child fail, report the exact blocker and do not emit the success block."
       ],
       "require_trace_session_id": true,
       "match_trace_session_id_from_stdout": false,
@@ -662,7 +666,6 @@
       },
       "codex_collaboration_validation": {
         "minimum_tool_counts": {
-          "spawn_agent": 2,
           "wait": 1
         }
       },
@@ -716,6 +719,18 @@
         "poll_timeout_seconds": 90,
         "poll_interval_seconds": 1,
         "expected_rows": [
+          {
+            "provider": "kimi_code",
+            "tool_name": "spawn_agent",
+            "tool_kind": "other",
+            "minimum_count": 2,
+            "each_arguments_required_substrings": [
+              "\"agent_type\": \"moonshot\"",
+              "\"model\": \"aawm-sota-moonshot\"",
+              "\"fork_turns\": \"none\"",
+              "\"message\": \""
+            ]
+          },
           {
             "provider": "kimi_code",
             "tool_name": "exec_command",

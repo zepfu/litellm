@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Coroutine
+from typing import Any, Coroutine, Literal, Optional
 
 from fastapi.responses import StreamingResponse
+
+StreamPeekStopReason = Literal[
+    "stream_exhausted",
+    "pending_stream",
+    "chunk_limit",
+    "byte_limit",
+]
 
 
 @dataclass(frozen=True)
@@ -16,7 +23,11 @@ class BoundedStreamPeek:
     response: StreamingResponse
     buffered_chunks: list[Any]
     buffered_bytes: int
-    exhausted: bool
+    stop_reason: StreamPeekStopReason
+
+    @property
+    def exhausted(self) -> bool:
+        return self.stop_reason == "stream_exhausted"
 
 
 def _chunk_size(chunk: object) -> int:
@@ -54,14 +65,16 @@ async def peek_streaming_response(
                 ),
                 buffered_chunks=buffered_chunks,
                 buffered_bytes=buffered_bytes,
-                exhausted=True,
+                stop_reason="stream_exhausted",
             )
 
         chunk_bytes = _chunk_size(chunk)
-        if (
-            len(buffered_chunks) >= max(0, max_chunks)
-            or buffered_bytes + chunk_bytes > max(0, max_bytes)
-        ):
+        stop_reason: Optional[StreamPeekStopReason] = None
+        if len(buffered_chunks) >= max(0, max_chunks):
+            stop_reason = "chunk_limit"
+        elif buffered_bytes + chunk_bytes > max(0, max_bytes):
+            stop_reason = "byte_limit"
+        if stop_reason is not None:
             async def _continue_losslessly() -> Any:
                 for buffered in buffered_chunks:
                     yield buffered
@@ -78,7 +91,7 @@ async def peek_streaming_response(
                 ),
                 buffered_chunks=buffered_chunks,
                 buffered_bytes=buffered_bytes,
-                exhausted=False,
+                stop_reason=stop_reason,
             )
         buffered_chunks.append(chunk)
         buffered_bytes += chunk_bytes
@@ -120,7 +133,7 @@ async def peek_streaming_response(
                 ),
                 buffered_chunks=buffered_chunks,
                 buffered_bytes=buffered_bytes,
-                exhausted=False,
+                stop_reason="pending_stream",
             )
         try:
             chunk = next_chunk_task.result()

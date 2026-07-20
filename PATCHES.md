@@ -58,6 +58,51 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.129 - Moonshot stream diagnostics and Codex child-role routing
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.129`. Bounded
+Codex response-stream peeking now records an explicit stop reason:
+`stream_exhausted`, `pending_stream`, `chunk_limit`, or `byte_limit`. A stream
+that is merely waiting for its next asynchronous chunk continues losslessly at
+debug level instead of emitting a false overflow warning. Real chunk or byte
+limits retain a bounded warning with configured maxima plus adapter, model
+alias, session, call, and trace correlation.
+
+The Kimi Codex route now reapplies the existing spawn-agent schema patch after
+flattening the `collaboration` namespace. The flattened `spawn_agent` function
+therefore exposes the active role/model contract, including `agent_type`,
+`model`, `fork_turns`, and `message`, while preserving existing fields such as
+`task_name`.
+
+The existing authenticated production harness explicitly registers the
+existing `~/.codex/agents/moonshot.toml` role while keeping
+`--ignore-user-config`, requires both child spawns to set
+`agent_type="moonshot"`, `model="aawm-sota-moonshot"`, and
+`fork_turns="none"`, and validates both spawns through persisted
+`public.session_history_tool_activity`. Codex JSON stdout remains authoritative
+for visible completed `wait` events, but no longer incorrectly gates spawns
+that the installed CLI omits from `--json` output.
+
+**Why:** Production logged an ordinary Kimi stream at only 11 chunks and
+36,031 bytes as a bounded-peek overflow even though the configured limits were
+5,000 chunks and 8 MiB. The same acceptance run persisted two correct Moonshot
+spawn payloads, but Codex stdout omitted those spawn events and the created
+children had `agent_role=null`, selected the default `aawm-sota` role, and
+failed before tool execution. The Kimi namespace-flattening order also left the
+model-visible nested spawn schema without the role/model fields needed to make
+that selection explicit.
+
+**Why not upstream:** The Kimi namespace adapter, AAWM Codex tool-schema
+rewrite, production-only Moonshot role, tristore validation, and route-log
+correlation are fork-local behavior.
+
+**Validation status:** The complete passthrough module passes (`971 passed`);
+the acceptance-hardening suite passes (`104 passed`); focused stream/schema
+tests pass; and Ruff, JSON parsing, Python compilation, and
+`git diff --check` pass. Production Codex and Claude Moonshot acceptance plus
+bounded production-log and `aawm_tristore` correlation remain required under
+`PROD_RELEASE.md`.
+
 ### aawm.128 - Kimi gateway error rollups and Moonshot acceptance gates
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.128`. Managed
