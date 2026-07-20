@@ -1131,11 +1131,7 @@ def completion(  # type: ignore # noqa: PLR0915
     logit_bias: Optional[dict] = None,
     user: Optional[str] = None,
     # openai v1.0+ new params
-    reasoning_effort: Optional[
-        Literal[
-            "none", "minimal", "low", "medium", "high", "xhigh", "max", "default"
-        ]
-    ] = None,
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "default"]] = None,
     verbosity: Optional[Literal["low", "medium", "high"]] = None,
     response_format: Optional[Union[dict, Type[BaseModel]]] = None,
     seed: Optional[int] = None,
@@ -1147,6 +1143,7 @@ def completion(  # type: ignore # noqa: PLR0915
     web_search_options: Optional[OpenAIWebSearchOptions] = None,
     deployment_id=None,
     extra_headers: Optional[dict] = None,
+    prompt_cache_key: Optional[str] = None,
     safety_identifier: Optional[str] = None,
     service_tier: Optional[str] = None,
     # soon to be deprecated params by OpenAI
@@ -1197,6 +1194,7 @@ def completion(  # type: ignore # noqa: PLR0915
         api_key (str, optional): API key (default is None).
         model_list (list, optional): List of api base, version, keys
         extra_headers (dict, optional): Additional headers to include in the request.
+        prompt_cache_key (str, optional): Stable key used by compatible providers for prompt-cache routing.
 
         LITELLM Specific Params
         mock_response (str, optional): If provided, return a mock completion response for testing or debugging purposes (default is None).
@@ -1574,6 +1572,7 @@ def completion(  # type: ignore # noqa: PLR0915
             "reasoning_effort": reasoning_effort,
             "thinking": thinking,
             "web_search_options": web_search_options,
+            "prompt_cache_key": prompt_cache_key,
             "safety_identifier": safety_identifier,
             "service_tier": service_tier,
             "allowed_openai_params": kwargs.get("allowed_openai_params"),

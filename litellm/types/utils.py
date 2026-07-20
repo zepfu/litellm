@@ -139,8 +139,11 @@ class ProviderSpecificModelInfo(TypedDict, total=False):
     supports_url_context: Optional[bool]
     supports_minimal_reasoning_effort: Optional[bool]
     supports_none_reasoning_effort: Optional[bool]
+    supports_low_reasoning_effort: Optional[bool]
+    supports_high_reasoning_effort: Optional[bool]
     supports_xhigh_reasoning_effort: Optional[bool]
     supports_max_reasoning_effort: Optional[bool]
+    default_reasoning_effort: Optional[str]
 
 
 class SearchContextCostPerQuery(TypedDict, total=False):
@@ -3160,6 +3163,7 @@ class LlmProviders(str, Enum):
     TEXT_COMPLETION_CODESTRAL = "text-completion-codestral"
     DASHSCOPE = "dashscope"
     MOONSHOT = "moonshot"
+    KIMI_CODE = "kimi_code"
     PUBLICAI = "publicai"
     V0 = "v0"
     MORPH = "morph"

@@ -168,16 +168,22 @@ Dev compose has a strict writer/consumer split:
   `~/.kimi-code/credentials` and `~/.kimi-code/oauth`. The latter is required
   for the native `oauth/kimi-code` lock target and its `kimi-code.lock`
   directory; the sidecar does not receive the broader `~/.kimi-code` tree.
-- Scheduled refresh is disabled by default:
-  `AAWM_KIMI_OAUTH_REFRESH_ENABLED=0`. Set it to `1` only when refresh of the
-  existing CLI grant is explicitly intended, and set any needed
+- The standalone sidecar CLI keeps scheduled Kimi refresh disabled unless
+  `AAWM_KIMI_OAUTH_REFRESH_ENABLED=1` is set. Development Compose enables it
+  by default and checks every 300 seconds because Kimi Code access tokens are
+  short-lived. It refreshes the existing CLI grant in place under the native
+  lock; it does not create or copy a credential. Override
   `AAWM_KIMI_OAUTH_AUTH_FILE`, `AAWM_KIMI_OAUTH_LOCK_FILE`, interval, timeout,
-  and optional uid/gid/mode overrides.
+  or uid/gid/mode only when the deployment requires different host paths.
 
 The compose contract controls credential ownership and hot-reload visibility;
 it does not enable a Kimi route by itself. Managed-route behavior, exact model
 IDs, and `/models` capability gating are documented in
 [`moonshot.md`](my-website/docs/providers/moonshot.md#managed-kimi-code-oauth-aawm).
+Kimi Code `0.27.0` derives a separate OAuth storage slot for a custom
+`KIMI_CODE_BASE_URL`, so the CLI cannot currently use the local gateway while
+retaining this exact default credential file. Do not work around that client
+limitation by copying or symlinking the credential or enrolling another grant.
 Any production-equivalent deployment must preserve the same read-only worker
 and single-writer sidecar contract, but production mutation remains a separate
 operator-authorized rollout.

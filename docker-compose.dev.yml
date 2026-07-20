@@ -12,7 +12,7 @@ services:
         max-size: "100m"
         max-file: "5"
     ports:
-      - "4001:4001"
+      - "127.0.0.1:4001:4001"
     volumes:
       # Mount source for live code changes (key files only)
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
@@ -36,6 +36,9 @@ services:
       - ./litellm/types/llms/vertex_ai.py:/app/litellm/types/llms/vertex_ai.py
       - ./litellm/types/utils.py:/app/litellm/types/utils.py
       - ./litellm/llms/custom_httpx/aiohttp_transport.py:/app/litellm/llms/custom_httpx/aiohttp_transport.py
+      # Keep the complete Kimi provider package coherent with the bind-mounted
+      # proxy handlers during development.
+      - ./litellm/llms/kimi_code:/app/litellm/llms/kimi_code:ro
       - ./litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py:/app/litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py
       - ./litellm/llms/base_llm/rerank/transformation.py:/app/litellm/llms/base_llm/rerank/transformation.py
       - ./litellm/llms/hosted_vllm/embedding/transformation.py:/app/litellm/llms/hosted_vllm/embedding/transformation.py
@@ -65,6 +68,7 @@ services:
       - ./litellm/proxy/pass_through_endpoints/streaming_handler.py:/app/litellm/proxy/pass_through_endpoints/streaming_handler.py
       - ./litellm/proxy/pass_through_endpoints/success_handler.py:/app/litellm/proxy/pass_through_endpoints/success_handler.py
       - ./litellm/proxy/pass_through_endpoints/google_code_assist_quota.py:/app/litellm/proxy/pass_through_endpoints/google_code_assist_quota.py
+      - ./litellm/proxy/pass_through_endpoints/kimi_gateway.py:/app/litellm/proxy/pass_through_endpoints/kimi_gateway.py:ro
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/base_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/base_passthrough_logging_handler.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/anthropic_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/anthropic_passthrough_logging_handler.py
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py
@@ -97,6 +101,9 @@ services:
       # Managed xAI OAuth credentials for oa_xai/* routes. LiteLLM reads only;
       # provider-status-observations owns scheduled refresh writes.
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai:ro
+      # Kimi Code CLI credential directory. LiteLLM only reads the host CLI's
+      # existing grant; the directory mount preserves atomic credential replacement.
+      - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
       # Home-level local-only analysis artifacts; raw full-payload captures may include credentials.
       - /home/zepfu/.analysis:/home/zepfu/.analysis
       # Gemini CLI install for OAuth client fallback during local adapter testing
@@ -179,6 +186,7 @@ services:
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
       - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
+      - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
@@ -238,6 +246,10 @@ services:
       - /home/zepfu/.codex:/home/zepfu/.codex
       # The provider-status sidecar is the scheduled writer for managed xAI OAuth.
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
+      # Kimi Code refresh needs only the shared credential directory and the
+      # native proper-lockfile parent for the oauth/kimi-code sentinel.
+      - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials
+      - /home/zepfu/.kimi-code/oauth:/home/zepfu/.kimi-code/oauth
     environment:
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}
@@ -301,6 +313,15 @@ services:
       - AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS:-300}
       - AAWM_XAI_OAUTH_FORCE_REFRESH=${AAWM_XAI_OAUTH_FORCE_REFRESH:-1}
       - AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
+      - AAWM_KIMI_OAUTH_REFRESH_ENABLED=${AAWM_KIMI_OAUTH_REFRESH_ENABLED:-1}
+      - AAWM_KIMI_OAUTH_AUTH_FILE=${AAWM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
+      - AAWM_KIMI_OAUTH_LOCK_FILE=${AAWM_KIMI_OAUTH_LOCK_FILE:-/home/zepfu/.kimi-code/oauth/kimi-code}
+      - AAWM_KIMI_OAUTH_AUTH_FILE_UID=${AAWM_KIMI_OAUTH_AUTH_FILE_UID:-1000}
+      - AAWM_KIMI_OAUTH_AUTH_FILE_GID=${AAWM_KIMI_OAUTH_AUTH_FILE_GID:-1000}
+      - AAWM_KIMI_OAUTH_AUTH_FILE_MODE=${AAWM_KIMI_OAUTH_AUTH_FILE_MODE:-0o600}
+      - AAWM_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS=${AAWM_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS:-300}
+      - AAWM_KIMI_OAUTH_FORCE_REFRESH=${AAWM_KIMI_OAUTH_FORCE_REFRESH:-0}
+      - AAWM_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
       - AAWM_CODEX_RESET_CREDIT_POLL_ENABLED=${AAWM_CODEX_RESET_CREDIT_POLL_ENABLED:-1}
       - AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS=${AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS:-3600}
       - AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS:-30}

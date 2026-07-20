@@ -18,6 +18,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from inspect import isawaitable
 from pathlib import Path
 from functools import lru_cache, partial
 from importlib.resources import files
@@ -210,6 +211,7 @@ from litellm.proxy.vector_store_endpoints.utils import (
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str
+from litellm.llms.kimi_code.adapters import adapter as _kimi_code_adapters
 from litellm.types.llms.openai import (
     RESPONSES_API_TERMINAL_STREAM_EVENTS,
     ResponsesAPIOptionalRequestParams,
@@ -228,6 +230,7 @@ from .aawm_alias_routing_policy import (
     ANTHROPIC_AAWM_READ_ALIAS as _POLICY_ANTHROPIC_AAWM_READ_ALIAS,
     ANTHROPIC_AAWM_SOTA_ALIAS as _POLICY_ANTHROPIC_AAWM_SOTA_ALIAS,
     ANTHROPIC_AAWM_SOTA_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_CANDIDATES,
+    ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES,
     ANTHROPIC_AUTO_AGENT_CANDIDATES as _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES,
     ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS as _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     ANTHROPIC_AUTO_AGENT_HAIKU_MODEL as _POLICY_ANTHROPIC_AUTO_AGENT_HAIKU_MODEL,
@@ -251,6 +254,8 @@ from .aawm_alias_routing_policy import (
     CODEX_AAWM_SOTA_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_CANDIDATES,
     CODEX_AAWM_SOTA_OPENAI_ALIAS as _POLICY_CODEX_AAWM_SOTA_OPENAI_ALIAS,
     CODEX_AAWM_SOTA_OPENAI_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_OPENAI_CANDIDATES,
+    CODEX_AAWM_SOTA_MOONSHOT_ALIAS as _POLICY_CODEX_AAWM_SOTA_MOONSHOT_ALIAS,
+    CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES,
     CODEX_AAWM_SOTA_XAI_ALIAS as _POLICY_CODEX_AAWM_SOTA_XAI_ALIAS,
     CODEX_AAWM_SOTA_XAI_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_XAI_CANDIDATES,
     CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER as _POLICY_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
@@ -262,6 +267,8 @@ from .aawm_alias_routing_policy import (
     CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS as _POLICY_TRANSIENT_COOLDOWN,
     CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS as _POLICY_USAGE_LIMIT_COOLDOWN,
     CODEX_AUTO_AGENT_GOOGLE_PROVIDER as _POLICY_CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
+    CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
+    CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
     CODEX_AUTO_AGENT_MODEL_ALIAS as _POLICY_CODEX_AUTO_AGENT_MODEL_ALIAS,
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _POLICY_CODEX_AUTO_AGENT_NATIVE_PROVIDER,
     CODEX_AUTO_AGENT_OPENCODE_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY,
@@ -272,6 +279,7 @@ from .aawm_alias_routing_policy import (
     CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER,
     CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES as _POLICY_CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES,
+    KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS as _POLICY_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,
     OPENROUTER_FREE_DAILY_QUOTA_MODELS as _POLICY_OPENROUTER_FREE_DAILY_QUOTA_MODELS,
 )
 
@@ -448,6 +456,7 @@ _aawm_alias_routing_log_until_monotonic_by_key = (
 _CODEX_AUTO_AGENT_MODEL_ALIAS = _POLICY_CODEX_AUTO_AGENT_MODEL_ALIAS
 _CODEX_AUTO_AGENT_NATIVE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_NATIVE_PROVIDER
 _CODEX_AUTO_AGENT_GOOGLE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_GOOGLE_PROVIDER
+_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
 _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER = _POLICY_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
 _CODEX_AUTO_AGENT_XAI_PROVIDER = _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER
@@ -455,6 +464,7 @@ _CODEX_AUTO_AGENT_OPENCODE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_OPENCODE_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
 _CODEX_AUTO_AGENT_XAI_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_LANE_KEY
 _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
+_CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
 _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
 _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = _POLICY_DEFAULT_COOLDOWN
 _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = _POLICY_CAPACITY_COOLDOWN
@@ -470,8 +480,10 @@ _CODEX_AAWM_ORCHESTRATION_ALIAS = _POLICY_CODEX_AAWM_ORCHESTRATION_ALIAS
 _CODEX_AAWM_SOTA_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_CANDIDATES
 _CODEX_AAWM_SOTA_OPENAI_ALIAS = _POLICY_CODEX_AAWM_SOTA_OPENAI_ALIAS
 _CODEX_AAWM_SOTA_XAI_ALIAS = _POLICY_CODEX_AAWM_SOTA_XAI_ALIAS
+_CODEX_AAWM_SOTA_MOONSHOT_ALIAS = _POLICY_CODEX_AAWM_SOTA_MOONSHOT_ALIAS
 _CODEX_AAWM_SOTA_OPENAI_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_OPENAI_CANDIDATES
 _CODEX_AAWM_SOTA_XAI_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_XAI_CANDIDATES
+_CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES
 _CODEX_AAWM_CODE_CANDIDATES = _POLICY_CODEX_AAWM_CODE_CANDIDATES
 _CODEX_AAWM_LOW_CANDIDATES = _POLICY_CODEX_AAWM_LOW_CANDIDATES
 _CODEX_AAWM_ORCHESTRATION_CANDIDATES = _POLICY_CODEX_AAWM_ORCHESTRATION_CANDIDATES
@@ -486,6 +498,7 @@ _ANTHROPIC_AAWM_CODE_ALIAS = _POLICY_ANTHROPIC_AAWM_CODE_ALIAS
 _ANTHROPIC_AAWM_LOW_ALIAS = _POLICY_ANTHROPIC_AAWM_LOW_ALIAS
 _ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_ALIAS
 _ANTHROPIC_AAWM_SOTA_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_CANDIDATES
+_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES
 _ANTHROPIC_AAWM_CODE_CANDIDATES = _POLICY_ANTHROPIC_AAWM_CODE_CANDIDATES
 _ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES = _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES
 _ANTHROPIC_AAWM_LOW_CANDIDATES = _POLICY_ANTHROPIC_AAWM_LOW_CANDIDATES
@@ -516,6 +529,10 @@ _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER = (
 _ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS = (
     _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS
 )
+_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS = (
+    _POLICY_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS
+)
+
 
 def _get_codex_auto_agent_candidates_for_alias(
     alias_model: str,
@@ -2068,6 +2085,15 @@ def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
     return None
 
 
+def _normalize_kimi_code_chat_completions_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    return _kimi_code_adapters.normalize_kimi_code_chat_completions_adapter_model_name(
+        model,
+        allowed_models=_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,
+    )
+
+
 def _normalize_anthropic_google_completion_adapter_model_name(model: Any) -> Optional[str]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._normalize_anthropic_google_completion_adapter_model_name(model)
@@ -2096,6 +2122,15 @@ def _resolve_codex_opencode_zen_adapter_model(
     return _normalize_opencode_zen_adapter_model_name(request_body.get("model"))
 
 
+def _resolve_codex_kimi_chat_completions_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    return _normalize_kimi_code_chat_completions_adapter_model_name(request_body.get("model"))
+
+
 def _resolve_anthropic_opencode_zen_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
@@ -2104,6 +2139,19 @@ def _resolve_anthropic_opencode_zen_adapter_model(
         return None
     for candidate in _get_anthropic_adapter_model_candidates(request_body):
         normalized_model = _normalize_opencode_zen_adapter_model_name(candidate)
+        if normalized_model is not None:
+            return normalized_model
+    return None
+
+
+def _resolve_anthropic_kimi_chat_completions_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_kimi_code_chat_completions_adapter_model_name(candidate)
         if normalized_model is not None:
             return normalized_model
     return None
@@ -4678,6 +4726,7 @@ def _build_auto_agent_skipped_candidates_from_states(
         )
         for field in (
             "cooldown_state_source",
+            "cooldown_scope",
             "failure_phase",
             "attempted_provider_call",
         ):
@@ -4767,6 +4816,27 @@ async def _apply_codex_auto_agent_adapter_local_candidate_cooldown(
     return cooldown_seconds, cooldown_state_source, skip_reason
 
 
+async def _apply_kimi_code_managed_account_lane_cooldown(
+    *,
+    candidate: dict[str, Any],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
+) -> tuple[float, Optional[str], Optional[str], Optional[str]]:
+    """Apply one Kimi managed-account lane without conflating candidate gates."""
+
+    if not _is_kimi_code_auto_agent_candidate(candidate):
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    managed_seconds, managed_source = await get_active_cooldown_state(_get_kimi_code_managed_account_cooldown_key())
+    if managed_seconds <= 0:
+        return cooldown_seconds, cooldown_state_source, skip_reason, None
+    if managed_seconds >= cooldown_seconds:
+        cooldown_seconds = managed_seconds
+        cooldown_state_source = f"kimi_managed_account:{managed_source}"
+    return cooldown_seconds, cooldown_state_source, skip_reason, "managed_account"
+
+
 async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     request: Request,
     *,
@@ -4815,6 +4885,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
         lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
+        lane_key = _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     else:
@@ -4832,6 +4904,18 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     ) = await _apply_codex_auto_agent_grok_account_lane_cooldown(
         candidate=candidate,
         lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=_get_codex_auto_agent_active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
+        managed_account_cooldown_scope,
+    ) = await _apply_kimi_code_managed_account_lane_cooldown(
+        candidate=candidate,
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
@@ -4894,6 +4978,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         state["failure_phase"] = failure_phase
     if attempted_provider_call is not None:
         state["attempted_provider_call"] = attempted_provider_call
+    if managed_account_cooldown_scope is not None:
+        state["cooldown_scope"] = managed_account_cooldown_scope
     return state
 
 
@@ -4903,7 +4989,10 @@ async def _get_anthropic_auto_agent_candidate_cooldown_state(
     cooldown_key: str,
 ) -> tuple[float, str]:
     """OpenAI/Codex candidates merge Anthropic + Codex cooldown; others use Anthropic-only."""
-    if provider == _CODEX_AUTO_AGENT_NATIVE_PROVIDER:
+    if provider in {
+        _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+    }:
         return await _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
             cooldown_key
         )
@@ -4963,6 +5052,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
         lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
+        lane_key = _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     elif candidate["provider"] == _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER:
@@ -4989,6 +5080,23 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
         get_active_cooldown_state=_get_anthropic_auto_agent_active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
+        managed_account_cooldown_scope,
+    ) = await _apply_kimi_code_managed_account_lane_cooldown(
+        candidate=candidate,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=lambda cooldown_key: (
+            _get_anthropic_auto_agent_candidate_cooldown_state(
+                provider=_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+                cooldown_key=cooldown_key,
+            )
+        ),
     )
     (
         cooldown_seconds,
@@ -5047,6 +5155,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         state["failure_phase"] = failure_phase
     if attempted_provider_call is not None:
         state["attempted_provider_call"] = attempted_provider_call
+    if managed_account_cooldown_scope is not None:
+        state["cooldown_scope"] = managed_account_cooldown_scope
     return state
 
 
@@ -5480,6 +5590,135 @@ def _is_codex_auto_agent_xai_candidate(
     return candidate.get("provider") == _CODEX_AUTO_AGENT_XAI_PROVIDER
 
 
+_KIMI_CODE_SAFE_FAILURE_KINDS = frozenset(
+    {
+        "refresh_required_auth",
+        "quota",
+        "provider_capacity",
+        "transient",
+        "malformed",
+        "unsupported_model",
+        "unsupported_effort",
+        "unsupported_capability",
+        "unknown",
+    }
+)
+_KIMI_CODE_SAFE_FAILURE_SCOPES = frozenset({"managed_account", "candidate", "telemetry", "none"})
+_KIMI_CODE_SAFE_METADATA_GATES = frozenset({"none", "model_id", "think_effort", "capability"})
+_KIMI_CODE_SAFE_RESET_REASONS = frozenset(
+    {
+        "refresh_required",
+        "quota_exhausted",
+        "provider_capacity",
+        "transient_upstream_failure",
+        "malformed_provider_response",
+        "unsupported_model",
+        "unsupported_effort",
+        "unsupported_capability",
+        "unclassified_failure",
+    }
+)
+_KIMI_CODE_SAFE_UPSTREAM_IDS = frozenset({"k3", "kimi-for-coding", "kimi-for-coding-highspeed"})
+_KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL = "__managed_account__"
+
+
+def _is_kimi_code_auto_agent_candidate(candidate: Optional[dict[str, Any]]) -> bool:
+    return isinstance(candidate, dict) and candidate.get("provider") == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
+
+
+def _get_kimi_code_managed_account_cooldown_key() -> str:
+    return _codex_auto_agent_candidate_key(
+        {
+            "provider": _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+            "model": _KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL,
+        },
+        _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
+    )
+
+
+def _get_safe_kimi_code_probe_failure_metadata(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Return only adapter-classifier allowlisted Kimi probe metadata."""
+
+    if not _is_kimi_code_auto_agent_candidate(candidate):
+        return None
+    raw_metadata = getattr(exc, "kimi_code_probe_failure_metadata", None)
+    if not isinstance(raw_metadata, dict):
+        return None
+    kind = raw_metadata.get("kind")
+    scope = raw_metadata.get("scope")
+    upstream_id = raw_metadata.get("upstream_id")
+    metadata_gate = raw_metadata.get("metadata_gate")
+    reset_reason = raw_metadata.get("reset_reason")
+    status_code = raw_metadata.get("status_code")
+    trace_id = raw_metadata.get("trace_id")
+    if (
+        kind not in _KIMI_CODE_SAFE_FAILURE_KINDS
+        or scope not in _KIMI_CODE_SAFE_FAILURE_SCOPES
+        or upstream_id not in _KIMI_CODE_SAFE_UPSTREAM_IDS
+        or metadata_gate not in _KIMI_CODE_SAFE_METADATA_GATES
+        or reset_reason not in _KIMI_CODE_SAFE_RESET_REASONS
+    ):
+        return None
+    if status_code is not None and (
+        not isinstance(status_code, int) or isinstance(status_code, bool) or status_code < 100 or status_code > 599
+    ):
+        return None
+    if trace_id is not None and (
+        not isinstance(trace_id, str)
+        or len(trace_id) > 256
+        or not trace_id
+        or any(not (character.isalnum() or character in "._-") for character in trace_id)
+    ):
+        return None
+    return {
+        "kind": kind,
+        "scope": scope,
+        "upstream_id": upstream_id,
+        "metadata_gate": metadata_gate,
+        "status_code": status_code,
+        "trace_id": trace_id,
+        "reset_reason": reset_reason,
+    }
+
+
+def _classify_kimi_code_auto_agent_probe_failure(
+    metadata: Optional[dict[str, Any]],
+) -> Optional[str]:
+    if metadata is None:
+        return None
+    scope = metadata["scope"]
+    if scope == "managed_account":
+        return "kimi_code_managed_account"
+    if scope == "candidate":
+        return "kimi_code_candidate_failure"
+    return "kimi_code_no_cooldown"
+
+
+def _build_safe_kimi_code_selection_telemetry(
+    *,
+    alias_model: str,
+    candidate: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build an alias-attempt record without copying provider payload details."""
+
+    return {
+        "alias": alias_model,
+        "candidate": candidate["model"],
+        "upstream_id": metadata["upstream_id"],
+        "metadata_gate": metadata["metadata_gate"],
+        "scope": metadata["scope"],
+        "reset_reason": metadata["reset_reason"],
+        "kind": metadata["kind"],
+        "status_code": metadata["status_code"],
+        "trace_id": metadata["trace_id"],
+    }
+
+
 def _is_codex_auto_agent_transient_internal_error_class(
     error_class: Optional[str],
 ) -> bool:
@@ -5645,7 +5884,23 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     error_class: Optional[str],
     *,
     candidate: Optional[dict[str, Any]] = None,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
+    if _is_kimi_code_auto_agent_candidate(candidate):
+        if (
+            error_class == "kimi_code_managed_account"
+            and kimi_failure_metadata is not None
+            and kimi_failure_metadata.get("scope") == "managed_account"
+        ):
+            return "managed_account"
+        if (
+            error_class == "kimi_code_candidate_failure"
+            and kimi_failure_metadata is not None
+            and kimi_failure_metadata.get("scope") == "candidate"
+        ):
+            return "candidate"
+        if error_class == "kimi_code_no_cooldown":
+            return "none"
     if error_class == "safety_policy_denied":
         return "request_local"
     # Native Grok 4.5 is live. Broad candidate-unavailable probes can still
@@ -5654,23 +5909,15 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     # managed OAuth Grok 4.5, etc.) stay request-local so missing/refreshing
     # credentials cannot leave multi-hour Redis candidate cooldowns.
     # Explicit rate-limit / capacity / quota classes still use candidate scope.
-    if (
-        error_class == "candidate_unavailable"
-        and _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
-    ):
+    if error_class == "candidate_unavailable" and _is_codex_auto_agent_native_grok_4_5_candidate(candidate):
         return "none"
-    if error_class == "candidate_unavailable" and _is_codex_auto_agent_xai_candidate(
-        candidate
-    ):
+    if error_class == "candidate_unavailable" and _is_codex_auto_agent_xai_candidate(candidate):
         return "request_local"
     # Native Grok 4.5 malformed tool-call text remains rejected and can still
     # redispatch in-flight, but must not write a durable candidate cooldown.
     # Composer / Grok Build / non-native candidates keep durable candidate
     # cooldowns for this class.
-    if (
-        error_class == "malformed_tool_call_text"
-        and _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
-    ):
+    if error_class == "malformed_tool_call_text" and _is_codex_auto_agent_native_grok_4_5_candidate(candidate):
         return "request_local"
     if _is_codex_auto_agent_native_grok_4_5_candidate(
         candidate
@@ -5802,6 +6049,7 @@ async def _apply_auto_agent_alias_cooldown(
     error_class: Optional[str],
     set_candidate_cooldown: Callable[[str, float], Awaitable[object]],
     grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
     """Shared auto-agent cooldown apply (RR-054 #12).
 
@@ -5811,8 +6059,15 @@ async def _apply_auto_agent_alias_cooldown(
     cooldown_scope = _get_codex_auto_agent_candidate_cooldown_scope(
         error_class,
         candidate=candidate,
+        kimi_failure_metadata=kimi_failure_metadata,
     )
     if cooldown_scope == "none":
+        return cooldown_scope
+    if cooldown_scope == "managed_account":
+        await set_candidate_cooldown(
+            _get_kimi_code_managed_account_cooldown_key(),
+            cooldown_seconds,
+        )
         return cooldown_scope
     if cooldown_scope == "candidate":
         await set_candidate_cooldown(
@@ -5820,11 +6075,9 @@ async def _apply_auto_agent_alias_cooldown(
             cooldown_seconds,
         )
         if grok_account_quota_exhausted:
-            lane_cooldown_key = (
-                _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
-                    candidate,
-                    lane_key,
-                )
+            lane_cooldown_key = _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
+                candidate,
+                lane_key,
             )
             if (
                 lane_cooldown_key is not None
@@ -5861,6 +6114,7 @@ async def _apply_codex_auto_agent_alias_cooldown(
     cooldown_seconds: float,
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
     return await _apply_auto_agent_alias_cooldown(
         request=request,
@@ -5871,6 +6125,7 @@ async def _apply_codex_auto_agent_alias_cooldown(
         error_class=error_class,
         set_candidate_cooldown=_set_codex_auto_agent_cooldown,
         grok_account_quota_exhausted=grok_account_quota_exhausted,
+        kimi_failure_metadata=kimi_failure_metadata,
     )
 
 
@@ -5883,6 +6138,7 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
     cooldown_seconds: float,
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
     return await _apply_auto_agent_alias_cooldown(
         request=request,
@@ -5893,15 +6149,14 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
         error_class=error_class,
         set_candidate_cooldown=_set_anthropic_auto_agent_cooldown,
         grok_account_quota_exhausted=grok_account_quota_exhausted,
+        kimi_failure_metadata=kimi_failure_metadata,
     )
 
 
 def _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc: Any) -> bool:
     status_code = _extract_google_adapter_exception_status_code(exc)
     return _is_known_grok_build_usage_balance_exhausted_response(
-        url=httpx.URL(
-            _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL
-        ),
+        url=httpx.URL(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
         status_code=status_code,
         exc=exc,
@@ -5911,9 +6166,7 @@ def _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc: Any) -> bool:
 def _is_codex_auto_agent_grok_personal_team_spending_limit(exc: Any) -> bool:
     status_code = _extract_google_adapter_exception_status_code(exc)
     return _is_known_grok_personal_team_spending_limit_response(
-        url=httpx.URL(
-            _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL
-        ),
+        url=httpx.URL(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
         status_code=status_code,
         exc=exc,
@@ -6161,6 +6414,7 @@ async def _set_codex_auto_agent_candidate_cooldowns(
     cooldown_seconds: float,
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
     return await _apply_codex_auto_agent_alias_cooldown(
         request=request,
@@ -6170,6 +6424,7 @@ async def _set_codex_auto_agent_candidate_cooldowns(
         cooldown_seconds=cooldown_seconds,
         error_class=error_class,
         grok_account_quota_exhausted=grok_account_quota_exhausted,
+        kimi_failure_metadata=kimi_failure_metadata,
     )
 
 
@@ -6180,15 +6435,16 @@ def _update_codex_auto_agent_retryable_attempt_record(
     error_class: str,
     cooldown_seconds: float,
     cooldown_scope: Optional[str] = None,
+    alias_model: Optional[str] = None,
+    candidate: Optional[dict[str, Any]] = None,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> set[str]:
     error_tokens = _extract_codex_auto_agent_error_tokens(exc)
     error_status_code = _extract_google_adapter_exception_status_code(exc)
     error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
     retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
     update: dict[str, Any] = {
-        "status": (
-            "retryable_no_cooldown" if cooldown_scope == "none" else "cooldown_set"
-        ),
+        "status": ("retryable_no_cooldown" if cooldown_scope == "none" else "cooldown_set"),
         "error_class": error_class,
         "error_tokens": sorted(error_tokens),
         "failure_phase": "provider_attempt",
@@ -6206,6 +6462,16 @@ def _update_codex_auto_agent_retryable_attempt_record(
         update["error_code"] = str(error_code)
     if retry_after_seconds is not None:
         update["retry_after_seconds"] = round(float(retry_after_seconds), 3)
+    if (
+        alias_model is not None
+        and candidate is not None
+        and kimi_failure_metadata is not None
+    ):
+        update["kimi_code_failure"] = _build_safe_kimi_code_selection_telemetry(
+            alias_model=alias_model,
+            candidate=candidate,
+            metadata=kimi_failure_metadata,
+        )
     attempt_record.update(update)
     return error_tokens
 
@@ -10314,16 +10580,41 @@ async def _responses_sse_from_iterator(
     responses_iterator: Any,
     on_complete: Optional[Callable[[], None]] = None,
 ) -> Any:
-    async for event in responses_iterator:
-        event_type = _mapping_or_attr_get(event, "type")
-        serialized = _serialize_responses_adapter_response(event)
-        if isinstance(event_type, str) and event_type:
-            yield f"event: {event_type}\ndata: {serialized}\n\n"
-            continue
-        yield f"data: {serialized}\n\n"
-    if on_complete is not None:
-        on_complete()
-    yield "data: [DONE]\n\n"
+    try:
+        async for event in responses_iterator:
+            event_type = _mapping_or_attr_get(event, "type")
+            serialized = _serialize_responses_adapter_response(event)
+            if isinstance(event_type, str) and event_type:
+                yield f"event: {event_type}\ndata: {serialized}\n\n"
+                continue
+            yield f"data: {serialized}\n\n"
+        if on_complete is not None:
+            on_complete()
+        yield "data: [DONE]\n\n"
+    finally:
+        close_targets = (
+            responses_iterator,
+            getattr(responses_iterator, "litellm_custom_stream_wrapper", None),
+        )
+        closed_target_ids: set[int] = set()
+        for close_target in close_targets:
+            if close_target is None or id(close_target) in closed_target_ids:
+                continue
+            closed_target_ids.add(id(close_target))
+            close_fn = getattr(close_target, "aclose", None)
+            if not callable(close_fn):
+                close_fn = getattr(close_target, "close", None)
+            if not callable(close_fn):
+                continue
+            try:
+                close_result = close_fn()
+                if isawaitable(close_result):
+                    await close_result
+            except BaseException:
+                verbose_proxy_logger.debug(
+                    "Failed to close Responses adapter stream resource",
+                    exc_info=True,
+                )
 
 
 def _build_codex_streaming_response_from_google_code_assist_stream(*, response: StreamingResponse, adapter_request: SimpleNamespace) -> StreamingResponse:
@@ -14688,6 +14979,27 @@ async def _perform_anthropic_responses_adapter_pass_through(
     )
 
 
+async def _perform_normalized_anthropic_completion_adapter_stream(
+    *,
+    handler: Any,
+    handler_call_kwargs: dict[str, Any],
+    handler_extra_kwargs: dict[str, Any],
+    completion_stream_normalizer: Callable[[Any], Any],
+) -> object:
+    completion_kwargs, tool_name_mapping = handler._prepare_completion_kwargs(
+        **handler_call_kwargs,
+        extra_kwargs=handler_extra_kwargs,
+    )
+    raw_completion_stream = await litellm.acompletion(**completion_kwargs)
+    normalized_completion_stream = completion_stream_normalizer(raw_completion_stream)
+    return handler._transform_completion_response(
+        normalized_completion_stream,
+        model=handler_call_kwargs["model"],
+        stream=True,
+        tool_name_mapping=tool_name_mapping,
+    )
+
+
 async def _perform_anthropic_completion_adapter_messages_call(
     *,
     config: "_aawm_adapter_config.AnthropicCompletionAdapterConfig",
@@ -14703,11 +15015,10 @@ async def _perform_anthropic_completion_adapter_messages_call(
     stream_override: Optional[bool] = None,
     timeout: Optional[float] = None,
     max_retries: Optional[int] = None,
-    operation_wrapper: Optional[
-        Callable[[Callable[[], Awaitable[object]]], Awaitable[object]]
-    ] = None,
+    operation_wrapper: Optional[Callable[[Callable[[], Awaitable[object]]], Awaitable[object]]] = None,
     fake_stream: bool = False,
     extra_handler_kwargs: Optional[Payload] = None,
+    completion_stream_normalizer: Optional[Callable[[Any], Any]] = None,
 ) -> Response:
     """Shared completion-adapter messages handler + response branch (RR-054 #9)."""
     from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
@@ -14718,16 +15029,11 @@ async def _perform_anthropic_completion_adapter_messages_call(
     )
 
     stream_flag = (
-        bool(prepared_request_body.get("stream"))
-        if client_requested_stream is None
-        else bool(client_requested_stream)
+        bool(prepared_request_body.get("stream")) if client_requested_stream is None else bool(client_requested_stream)
     )
     upstream_stream = stream_flag if stream_override is None else bool(stream_override)
     requested_model = prepared_request_body.get("model")
-    model_name = (
-        model_for_upstream
-        or (requested_model if isinstance(requested_model, str) else adapter_model)
-    )
+    model_name = model_for_upstream or (requested_model if isinstance(requested_model, str) else adapter_model)
     handler_extra_kwargs: dict[str, Any] = {
         "custom_llm_provider": custom_llm_provider or config.custom_llm_provider,
         "api_key": api_key,
@@ -14794,33 +15100,43 @@ async def _perform_anthropic_completion_adapter_messages_call(
     output_config = (
         raw_output_config if isinstance(raw_output_config, dict) else None
     )
+    handler_call_kwargs = {
+        "max_tokens": max_tokens,
+        "messages": messages,
+        "model": model_name,
+        "metadata": _build_completion_adapter_metadata(prepared_request_body),
+        "stop_sequences": stop_sequences,
+        "stream": upstream_stream,
+        "system": system,
+        "temperature": temperature,
+        "thinking": thinking,
+        "tool_choice": tool_choice,
+        "tools": tools,
+        "top_k": top_k,
+        "top_p": top_p,
+        "output_format": output_format,
+        "output_config": output_config,
+    }
 
     async def _operation() -> object:
+        if upstream_stream and completion_stream_normalizer is not None:
+            return await _perform_normalized_anthropic_completion_adapter_stream(
+                handler=LiteLLMMessagesToCompletionTransformationHandler,
+                handler_call_kwargs=handler_call_kwargs,
+                handler_extra_kwargs=handler_extra_kwargs,
+                completion_stream_normalizer=completion_stream_normalizer,
+            )
         return await LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler(
-            max_tokens=max_tokens,
-            messages=messages,
-            model=model_name,
-            metadata=_build_completion_adapter_metadata(prepared_request_body),
-            stop_sequences=stop_sequences,
-            stream=upstream_stream,
-            system=system,
-            temperature=temperature,
-            thinking=thinking,
-            tool_choice=tool_choice,
-            tools=tools,
-            top_k=top_k,
-            top_p=top_p,
-            output_format=output_format,
-            output_config=output_config,
+            **handler_call_kwargs,
             **handler_extra_kwargs,
         )
 
+    _annotate_request_scope_for_adapted_access_log(request, target_url)
     if operation_wrapper is not None:
         completion_response = await operation_wrapper(_operation)
     else:
         completion_response = await _operation()
 
-    _annotate_request_scope_for_adapted_access_log(request, target_url)
     if stream_flag:
         if fake_stream:
             if not _is_anthropic_messages_response(completion_response):
@@ -14845,78 +15161,44 @@ def _is_anthropic_messages_response(
 
 
 _ANTHROPIC_OPENAI_PROVIDER_RUNTIME = _anthropic_openai_provider.Runtime(
-    resolve_auth_context=lambda request: (
-        _resolve_anthropic_openai_responses_adapter_auth_context(request)
-    ),
+    resolve_auth_context=lambda request: (_resolve_anthropic_openai_responses_adapter_auth_context(request)),
     compact_context=lambda body, **kwargs: (
-        _compact_openai_adapter_claude_context_in_anthropic_request_body(
-            body, **kwargs
-        )
+        _compact_openai_adapter_claude_context_in_anthropic_request_body(body, **kwargs)
     ),
     log_debug=lambda message, *args: verbose_proxy_logger.debug(message, *args),
-    build_request_body=lambda body, **kwargs: (
-        _build_anthropic_responses_adapter_request_body(body, **kwargs)
-    ),
+    build_request_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
     apply_policies=lambda source, translated, **kwargs: (
-        _apply_anthropic_responses_adapter_policies_from_config(
-            source, translated, **kwargs
-        )
+        _apply_anthropic_responses_adapter_policies_from_config(source, translated, **kwargs)
     ),
-    add_breakout_metadata=lambda body: (
-        _add_codex_request_breakout_logging_metadata(body)
-    ),
+    add_breakout_metadata=lambda body: (_add_codex_request_breakout_logging_metadata(body)),
     contains_mcp_tools=lambda body: _responses_request_contains_mcp_tools(body),
-    get_target_base=lambda request, **kwargs: (
-        _get_anthropic_adapter_openai_target_base(request, **kwargs)
-    ),
-    normalize_endpoint=lambda **kwargs: (
-        BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)
-    ),
+    get_target_base=lambda request, **kwargs: (_get_anthropic_adapter_openai_target_base(request, **kwargs)),
+    normalize_endpoint=lambda **kwargs: (BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)),
     join_url=lambda *args: BaseOpenAIPassThroughHandler._join_url_paths(*args),
     url_factory=httpx.URL,
     provider=litellm.LlmProviders.OPENAI.value,
-    forward_header_allowlist=tuple(
-        _ANTHROPIC_ADAPTER_OPENAI_FORWARD_HEADER_ALLOWLIST
-    ),
-    xpass_header_allowlist=tuple(
-        _ANTHROPIC_ADAPTER_OPENAI_XPASS_HEADER_ALLOWLIST
-    ),
+    forward_header_allowlist=tuple(_ANTHROPIC_ADAPTER_OPENAI_FORWARD_HEADER_ALLOWLIST),
+    xpass_header_allowlist=tuple(_ANTHROPIC_ADAPTER_OPENAI_XPASS_HEADER_ALLOWLIST),
 )
 
 _ANTHROPIC_XAI_PROVIDER_RUNTIME = _anthropic_xai_provider.Runtime(
-    build_responses_body=lambda body, **kwargs: (
-        _build_anthropic_responses_adapter_request_body(body, **kwargs)
-    ),
+    build_responses_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
     apply_responses_policies=lambda source, translated, **kwargs: (
-        _apply_anthropic_responses_adapter_policies_from_config(
-            source, translated, **kwargs
-        )
+        _apply_anthropic_responses_adapter_policies_from_config(source, translated, **kwargs)
     ),
-    drop_unsupported_params=lambda body: (
-        _drop_unsupported_codex_request_params_from_request_body(body)
-    ),
+    drop_unsupported_params=lambda body: (_drop_unsupported_codex_request_params_from_request_body(body)),
     prepare_passthrough_request=_prepare_oa_xai_passthrough_request,
     unavailable_detail=lambda exc: _xai_oauth_candidate_unavailable_detail(exc),
     raise_candidate_unavailable=lambda detail: (
-        _raise_xai_oauth_auto_agent_candidate_unavailable(
-            cast(Exception, detail)
-        )
+        _raise_xai_oauth_auto_agent_candidate_unavailable(cast(Exception, detail))
     ),
     to_native_model=lambda model: _to_xai_native_passthrough_model(model),
-    normalize_endpoint=lambda **kwargs: (
-        BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)
-    ),
+    normalize_endpoint=lambda **kwargs: (BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)),
     join_url=lambda *args: BaseOpenAIPassThroughHandler._join_url_paths(*args),
     url_factory=httpx.URL,
-    assemble_headers=lambda **kwargs: (
-        BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)
-    ),
-    prepare_completion_body=lambda body, **kwargs: (
-        _prepare_anthropic_completion_adapter_request_body(body, **kwargs)
-    ),
-    validate_egress=lambda **kwargs: (
-        HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)
-    ),
+    assemble_headers=lambda **kwargs: (BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)),
+    prepare_completion_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
+    validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
     provider=litellm.LlmProviders.XAI.value,
     provider_target=litellm.LlmProviders.XAI,
 )
@@ -15386,6 +15668,42 @@ async def _prepare_anthropic_opencode_zen_completion_adapter_route(
     )
 
 
+async def _prepare_anthropic_kimi_chat_completions_adapter_route(
+    *,
+    request: Request,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
+    return await _kimi_code_adapters.prepare_anthropic_kimi_chat_completions_adapter_route(
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+
+
+async def _handle_anthropic_kimi_chat_completions_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    _ = endpoint, fastapi_response, user_api_key_dict
+    return await _aawm_adapter_driver.run_completion_adapter_route(
+        prepare=_prepare_anthropic_kimi_chat_completions_adapter_route,
+        perform=_perform_anthropic_completion_adapter_messages_call,
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+
+
 async def _handle_anthropic_opencode_zen_completion_adapter_route(
     *,
     endpoint: str,
@@ -15454,6 +15772,7 @@ def _get_first_secret_value(secret_names: tuple[str, ...]) -> Optional[str]:
         if value:
             return value
     return None
+
 
 # RR-054 #1: wire Google OAuth package runtime deps after helpers exist.
 _aawm_google_oauth.configure_google_oauth_runtime(
@@ -17899,6 +18218,16 @@ def _add_codex_unsupported_input_item_logging_metadata(
 def _drop_unsupported_codex_input_items_from_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if (
+        _normalize_kimi_code_chat_completions_adapter_model_name(
+            request_body.get("model")
+        )
+        is not None
+    ):
+        request_body = _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(
+            request_body
+        )
+
     unsupported_input_item_types = _get_unsupported_input_item_types_for_model(
         request_body.get("model")
     )
@@ -21284,6 +21613,17 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    async def _kimi_code() -> Response:
+        return await _handle_anthropic_kimi_chat_completions_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=True,
+        )
+
     async def _native() -> Response:
         native_candidate_body = candidate_body
         native_custom_headers = custom_headers
@@ -21321,6 +21661,7 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER: _antigravity,
             _CODEX_AUTO_AGENT_GOOGLE_PROVIDER: _google,
             _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
+            _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
         },
         route_family_handlers={
             _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
@@ -21350,9 +21691,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
     select_candidate_fn: _AutoAgentAliasSelectionFn,
     add_alias_metadata_fn: _AutoAgentAliasMetadataFn,
     perform_candidate_request_fn: Callable[..., Awaitable[Response]],
-    get_active_cooldown_state_fn: Callable[
-        [str], Awaitable[tuple[float, str]]
-    ],
+    get_active_cooldown_state_fn: Callable[[str], Awaitable[tuple[float, str]]],
     set_session_affinity_fn: Callable[..., Awaitable[object]],
     apply_cooldown_fn: Callable[..., Awaitable[str]],
     raise_redispatch_required_fn: Callable[..., None],
@@ -21443,7 +21782,15 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                 )
                 return response
             except Exception as exc:
-                error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
+                kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
+                    exc,
+                    candidate=candidate,
+                )
+                error_class = _classify_kimi_code_auto_agent_probe_failure(
+                    kimi_failure_metadata
+                )
+                if error_class is None:
+                    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
                 if error_class is None:
                     raise
                 last_retryable_exc = exc
@@ -21465,6 +21812,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     cooldown_seconds=cooldown_seconds,
                     error_class=error_class,
                     grok_account_quota_exhausted=grok_account_quota_exhausted,
+                    kimi_failure_metadata=kimi_failure_metadata,
                 )
                 error_tokens = _update_codex_auto_agent_retryable_attempt_record(
                     attempt_record=attempt_record,
@@ -21472,6 +21820,9 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     error_class=error_class,
                     cooldown_seconds=cooldown_seconds,
                     cooldown_scope=cooldown_scope,
+                    alias_model=alias_model,
+                    candidate=candidate,
+                    kimi_failure_metadata=kimi_failure_metadata,
                 )
                 if cooldown_scope == "none" and not has_continuation_state:
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
@@ -21517,16 +21868,10 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                         error_code=attempt_record.get("error_code"),
                         retry_after_seconds=attempt_record.get("retry_after_seconds"),
                         failure_phase=attempt_record.get("failure_phase"),
-                        attempted_provider_call=attempt_record.get(
-                            "attempted_provider_call"
-                        ),
-                        audit_events=failure_metadata.get(
-                            "aawm_alias_routing_audit_events"
-                        ),
+                        attempted_provider_call=attempt_record.get("attempted_provider_call"),
+                        audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
                         attempts=failure_metadata.get(attempts_metadata_key),
-                        skipped_candidates=failure_metadata.get(
-                            skipped_candidates_metadata_key
-                        ),
+                        skipped_candidates=failure_metadata.get(skipped_candidates_metadata_key),
                     )
                 native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
                     is_native_grok_4_5_candidate=(
@@ -21548,9 +21893,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     same_candidate_backoff_seconds,
                     native_grok_retry_metadata,
                 ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
-                    is_native_grok_4_5_candidate=(
-                        _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
-                    ),
+                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
                     has_continuation_state=has_continuation_state,
                     error_class=error_class,
                     cooldown_scope=cooldown_scope,
@@ -22066,6 +22409,22 @@ async def anthropic_proxy_route(
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=prepared_request_body,
                 adapter_model=opencode_zen_adapter_model,
+            )
+
+        kimi_code_adapter_model = (
+            _resolve_anthropic_kimi_chat_completions_adapter_model(
+                prepared_request_body,
+                endpoint=encoded_endpoint,
+            )
+        )
+        if kimi_code_adapter_model is not None:
+            return await _handle_anthropic_kimi_chat_completions_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=kimi_code_adapter_model,
             )
 
         google_adapter_model = _resolve_anthropic_google_completion_adapter_model(
@@ -23916,6 +24275,125 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     return response
 
 
+async def _prepare_codex_kimi_chat_completions_adapter_route(
+    *,
+    request: Request,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
+    prepared_request_body = _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(
+        prepared_request_body
+    )
+    adapted_request_body, _adapted_custom_tools = (
+        _adapt_codex_custom_tools_to_functions_from_request_body(prepared_request_body)
+    )
+    adapted_request_body, _unsupported_hosted_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(adapted_request_body)
+    )
+    adapted_request_body, _unsupported_input_items = (
+        _drop_unsupported_codex_input_items_from_request_body(adapted_request_body)
+    )
+    adapted_request_body, _removed_tool_choice = (
+        _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
+    )
+    return await _kimi_code_adapters.prepare_codex_kimi_chat_completions_adapter_route(
+        request=request,
+        prepared_request_body=adapted_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+
+
+async def _perform_codex_kimi_chat_completions_adapter_call(
+    *,
+    config: "_aawm_adapter_config.AnthropicCompletionAdapterConfig",
+    request: Request,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    target_url: Union[str, httpx.URL],
+    api_key: str,
+    api_base: str,
+    client_requested_stream: bool,
+    completion_kwargs: Payload,
+    request_input: Any,
+    responses_api_request: ResponsesAPIOptionalRequestParams,
+    litellm_metadata: Payload,
+    upstream_model: str,
+) -> Response:
+    """Execute Kimi chat completions and reuse the standard Responses wrapper."""
+    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+        LiteLLMCompletionStreamingIterator,
+    )
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    _ = config
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
+    completion_response = await litellm.acompletion(
+        **completion_kwargs,
+        api_key=api_key,
+        api_base=api_base,
+        litellm_metadata=litellm_metadata,
+        proxy_server_request={
+            "headers": dict(request.headers),
+            "body": prepared_request_body,
+        },
+        shared_session=_get_proxy_shared_aiohttp_session(),
+    )
+    if client_requested_stream:
+        return StreamingResponse(
+            _responses_sse_from_iterator(
+                LiteLLMCompletionStreamingIterator(
+                    model=upstream_model,
+                    litellm_custom_stream_wrapper=completion_response,
+                    request_input=request_input,
+                    responses_api_request=responses_api_request,
+                    custom_llm_provider=litellm.LlmProviders.KIMI_CODE.value,
+                    litellm_metadata=litellm_metadata,
+                )
+            ),
+            media_type="text/event-stream",
+        )
+    responses_api_response = (
+        LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            chat_completion_response=completion_response,
+            request_input=request_input,
+            responses_api_request=responses_api_request,
+        )
+    )
+    return _build_responses_response_from_adapter_response(responses_api_response)
+
+
+async def _handle_codex_kimi_chat_completions_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    _ = endpoint, fastapi_response, user_api_key_dict
+    response = await _aawm_adapter_driver.run_completion_adapter_route(
+        prepare=_prepare_codex_kimi_chat_completions_adapter_route,
+        perform=_perform_codex_kimi_chat_completions_adapter_call,
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+    return await _validate_codex_auto_agent_responses_payload(
+        response,
+        adapter_model=adapter_model,
+        adapter="codex_kimi_chat_completions_adapter",
+        adapter_label="Kimi Code",
+        request_body=prepared_request_body,
+    )
+
+
 async def _handle_codex_opencode_zen_adapter_route(
     *,
     endpoint: str,
@@ -23931,12 +24409,10 @@ async def _handle_codex_opencode_zen_adapter_route(
     )
 
     _ = fastapi_response
-    normalized_request = (
-        await _anthropic_opencode_zen_normalization.normalize_codex_request(
-            _get_anthropic_opencode_zen_normalization_runtime(),
-            prepared_request_body,
-            adapter_model=adapter_model,
-        )
+    normalized_request = await _anthropic_opencode_zen_normalization.normalize_codex_request(
+        _get_anthropic_opencode_zen_normalization_runtime(),
+        prepared_request_body,
+        adapter_model=adapter_model,
     )
     request_body = normalized_request.request_body
     request_input = normalized_request.request_input
@@ -23987,10 +24463,7 @@ async def _handle_codex_opencode_zen_adapter_route(
             shared_session=_get_proxy_shared_aiohttp_session(),
         )
     except Exception as exc:
-        if (
-            use_alias_candidate_probe
-            and _opencode_zen_candidate_unavailable_detail(exc) is not None
-        ):
+        if use_alias_candidate_probe and _opencode_zen_candidate_unavailable_detail(exc) is not None:
             _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
         raise
     if bool(request_body.get("stream")):
@@ -24314,6 +24787,17 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    async def _kimi_code() -> Response:
+        return await _handle_codex_kimi_chat_completions_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=True,
+        )
+
     async def _native() -> Response:
         return await _perform_codex_auto_agent_native_openai_request(
             request=request,
@@ -24331,6 +24815,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             _CODEX_AUTO_AGENT_GOOGLE_PROVIDER: _google,
             _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER: _antigravity,
             _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
+            _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
         },
         route_family_handlers={
             _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
@@ -24384,9 +24869,7 @@ async def _handle_codex_auto_agent_alias_route(
         alias_model=alias_model,
         request=request,
         prepared_request_body=prepared_request_body,
-        max_candidate_attempts=len(
-            _get_codex_auto_agent_candidates_for_alias(alias_model)
-        ),
+        max_candidate_attempts=len(_get_codex_auto_agent_candidates_for_alias(alias_model)),
         select_candidate_fn=_select_codex_auto_agent_candidate,
         add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
         perform_candidate_request_fn=_perform_candidate_request,
@@ -24423,9 +24906,7 @@ class BaseOpenAIPassThroughHandler:
                 "OpenAI passthrough requests for xAI OAuth models require a managed xAI OAuth credential."
             )
 
-        request_body["model"] = _to_xai_native_passthrough_model(
-            request_body.get("model")
-        )
+        request_body["model"] = _to_xai_native_passthrough_model(request_body.get("model"))
         openai_route_family = _get_openai_passthrough_route_family(endpoint)
         encoded_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
             endpoint=endpoint,
@@ -24680,6 +25161,31 @@ class BaseOpenAIPassThroughHandler:
                             user_api_key_dict=user_api_key_dict,
                             prepared_request_body=prepared_request_body,
                             adapter_model=opencode_zen_adapter_model,
+                        )
+                    kimi_code_adapter_model = (
+                        _resolve_codex_kimi_chat_completions_adapter_model(
+                            prepared_request_body,
+                            endpoint=endpoint,
+                        )
+                    )
+                    if kimi_code_adapter_model is not None:
+                        prepared_request_body = (
+                            _prepare_request_body_for_passthrough_observability(
+                                request=request,
+                                request_body=prepared_request_body,
+                            )
+                        )
+                        if prepared_request_body is not request_body:
+                            _safe_set_request_parsed_body(
+                                request, prepared_request_body
+                            )
+                        return await _handle_codex_kimi_chat_completions_adapter_route(
+                            endpoint=endpoint,
+                            request=request,
+                            fastapi_response=fastapi_response,
+                            user_api_key_dict=user_api_key_dict,
+                            prepared_request_body=prepared_request_body,
+                            adapter_model=kimi_code_adapter_model,
                         )
                     antigravity_adapter_model = (
                         _resolve_codex_antigravity_code_assist_adapter_model(

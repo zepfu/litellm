@@ -187,6 +187,14 @@ D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
     ("xai", "oa_xai/grok-build"),
     ("anthropic", "claude-sonnet-4-6"),
 }
+MS012_MOONSHOT_AGENTIC_CASE = "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation"
+MS012_MOONSHOT_AGENT_PROFILE = "sota-moonshot"
+MS012_MOONSHOT_ALIAS = "aawm-sota-moonshot"
+MS012_MOONSHOT_ADAPTER_PATH = "anthropic_kimi_chat_completions_adapter"
+MS012_MOONSHOT_DECLARED_MODELS = {
+    "kimi_code/k3-max",
+    "kimi_code/k3-high",
+}
 
 D1322_LOW_ALIAS_REPLAY_CASES = (
     "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools",
@@ -2595,6 +2603,244 @@ def test_d1256_alias_replay_case_uses_aawm_code_anthropic_child_model_and_declar
     assert all("model" not in row for row in durable_rows)
     assert all(row["maximum_count"] == 1 for row in durable_rows)
     assert all(row["minimum_count"] == 1 for row in durable_rows)
+
+
+def test_ms012_moonshot_case_uses_the_canonical_alias_and_agentic_contract():
+    harness = _load_harness_module()
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][MS012_MOONSHOT_AGENTIC_CASE]
+
+    assert MS012_MOONSHOT_AGENTIC_CASE in config["default_excluded_cases"]
+    assert case_config["moonshot_anthropic_agentic_only"] is True
+    assert case_config["verification_alias"] == MS012_MOONSHOT_ALIAS
+    assert case_config["verification_candidate_order"] == -1
+    assert case_config["verification_candidate_label"] == "agentic-tool-continuation"
+    assert case_config["allowed_generation_routes"] == ["/anthropic/v1/messages"]
+    assert set(case_config["claude_agents"]) == {MS012_MOONSHOT_AGENT_PROFILE}
+
+    command = case_config["command"]
+    assert command[0] == "claude"
+    assert "--model" not in command
+    assert command[command.index("--allowedTools") + 1] == "Agent"
+    assert "Dispatch to the sota-moonshot agent" in command[2]
+    assert "After the Read tool result" in command[2]
+    assert "After the Grep tool result" in command[2]
+
+    agent = case_config["claude_agents"][MS012_MOONSHOT_AGENT_PROFILE]
+    assert agent["model"] == MS012_MOONSHOT_ALIAS
+    assert agent["tools"] == ["Read", "Grep"]
+    assert "After the Read tool result" in agent["prompt"]
+    assert "After the Grep tool result" in agent["prompt"]
+
+    assert {
+        (row["provider"], row["model"], row["route_family"]) for row in case_config["verification_declared_candidates"]
+    } == {("kimi_code", model, MS012_MOONSHOT_ADAPTER_PATH) for model in MS012_MOONSHOT_DECLARED_MODELS}
+    assert set(case_config["required_trace_tags"]) >= {
+        "route:anthropic_messages",
+        f"route:{MS012_MOONSHOT_ADAPTER_PATH}",
+        "anthropic-kimi-chat-completions-adapter",
+        f"model-alias:{MS012_MOONSHOT_ALIAS}",
+        f"anthropic-auto-agent-alias:{MS012_MOONSHOT_ALIAS}",
+    }
+    assert f"claude-code.{MS012_MOONSHOT_AGENT_PROFILE}" in case_config["required_trace_names"]
+
+    transcript_agent = case_config["transcript_tool_use_validation"]["expected_agents"][0]
+    assert transcript_agent == {
+        "agent_type": MS012_MOONSHOT_AGENT_PROFILE,
+        "expected_tool_counts": {"Read": 1, "Grep": 1},
+        "expected_tool_sequence": ["Read", "Grep"],
+        "minimum_total_tool_uses": 2,
+        "maximum_total_tool_uses": 2,
+        "maximum_tool_uses_per_assistant_message": 1,
+        "require_tool_result_before_next_tool_use": True,
+        "forbid_tool_result_errors": True,
+    }
+    session_row = case_config["session_history_validation"]["expected_rows"][0]
+    assert session_row["required_one_of"] == {
+        "provider": ["kimi_code"],
+        "model": ["k3-max", "k3-high"],
+    }
+    assert session_row["metadata_required_equals"] == {
+        "model_alias_label": MS012_MOONSHOT_ALIAS,
+        "requested_model_alias": MS012_MOONSHOT_ALIAS,
+        "anthropic_auto_agent_alias": MS012_MOONSHOT_ALIAS,
+    }
+
+    summary, failures = harness._validate_moonshot_anthropic_agentic_contract(
+        family=MS012_MOONSHOT_AGENTIC_CASE,
+        config=case_config,
+    )
+
+    assert failures == []
+    assert summary == {
+        "adapter_path": MS012_MOONSHOT_ADAPTER_PATH,
+        "canonical_alias": MS012_MOONSHOT_ALIAS,
+        "agent_profile": MS012_MOONSHOT_AGENT_PROFILE,
+        "allowed_generation_routes": ["/anthropic/v1/messages"],
+        "declared_models": sorted(MS012_MOONSHOT_DECLARED_MODELS),
+    }
+    assert "aawm-sota-moonshot-anthropic" not in json.dumps(config)
+
+
+def test_ms012_moonshot_contract_rejects_a_raw_smoke_substitution():
+    harness = _load_harness_module()
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    raw_smoke = json.loads(json.dumps(config["cases"][MS012_MOONSHOT_AGENTIC_CASE]))
+    raw_smoke["command"] = [
+        "claude",
+        "-p",
+        "Reply with exactly two words: smoke check",
+        "--output-format",
+        "json",
+        "--model",
+        MS012_MOONSHOT_ALIAS,
+        "--allowedTools",
+        "",
+    ]
+    raw_smoke.pop("claude_agents")
+    raw_smoke.pop("transcript_tool_use_validation")
+
+    _, failures = harness._validate_moonshot_anthropic_agentic_contract(
+        family=MS012_MOONSHOT_AGENTIC_CASE,
+        config=raw_smoke,
+    )
+
+    assert any("must not use a direct --model selector" in failure for failure in failures)
+    assert any("must require top-level Agent tool dispatch" in failure for failure in failures)
+    assert any("must define exactly the sota-moonshot child profile" in failure for failure in failures)
+    assert any("must validate the sota-moonshot child transcript" in failure for failure in failures)
+
+
+def test_ms012_moonshot_transcript_requires_tool_result_continuation(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = tmp_path / "project" / "session-1" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-moonshot.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": MS012_MOONSHOT_AGENT_PROFILE}),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "moonshot",
+                        "message": {
+                            "id": "msg-read",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-read",
+                                    "name": "Read",
+                                    "input": {"file_path": ("scripts/local-ci/" "sequential_core_tools_fixture.txt")},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "agentId": "moonshot",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-read",
+                                    "content": "fixture text",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "moonshot",
+                        "message": {
+                            "id": "msg-grep",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-grep",
+                                    "name": "Grep",
+                                    "input": {
+                                        "pattern": "sequential-core-tools-grep",
+                                        "path": ("scripts/local-ci/" "sequential_core_tools_fixture.txt"),
+                                        "output_mode": "content",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "agentId": "moonshot",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-grep",
+                                    "content": "sequential-core-tools-grep",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "moonshot",
+                        "message": {
+                            "id": "msg-final",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": ("MOONSHOT ANTHROPIC AGENTIC TOOL " "CONTINUATION PASSED"),
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary, failures = harness._validate_transcript_tool_use(
+        family=MS012_MOONSHOT_AGENTIC_CASE,
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [
+                {
+                    "agent_type": MS012_MOONSHOT_AGENT_PROFILE,
+                    "expected_tool_counts": {"Read": 1, "Grep": 1},
+                    "expected_tool_sequence": ["Read", "Grep"],
+                    "minimum_total_tool_uses": 2,
+                    "maximum_total_tool_uses": 2,
+                    "maximum_tool_uses_per_assistant_message": 1,
+                    "require_tool_result_before_next_tool_use": True,
+                    "forbid_tool_result_errors": True,
+                }
+            ],
+        },
+    )
+
+    assert failures == []
+    records = summary["agents"][0]["records"]
+    assert [record["tool_name"] for record in records] == ["Read", "Grep"]
+    assert all(record["tool_result_line"] for record in records)
 
 
 def test_d1251_parallel_read_cases_do_not_include_disallowed_gemini_models():

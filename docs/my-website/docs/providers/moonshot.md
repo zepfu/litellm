@@ -57,6 +57,15 @@ are ignored. Incoming authorization and forwarded/provider-specific identity
 headers are stripped, and the gateway supplies the managed Kimi credential
 instead of relaying caller authorization.
 
+Kimi Code `0.27.0` cannot use a custom `KIMI_CODE_BASE_URL` while retaining
+the official default credential slot. It derives a separate environment-scoped
+OAuth slot for every custom base URL. Do not copy or symlink
+`~/.kimi-code/credentials/kimi-code.json`, and do not enroll a second grant to
+make the CLI use this gateway. Until the client supports an explicit
+same-credential custom-base contract, keep the direct `kimi` command on the
+official endpoint. The gateway remains available to trusted loopback clients
+that explicitly present the current managed bearer.
+
 For the shared credential and native lock contract, see
 `docs/aawm-oauth-credential-maintenance.md` in the repository. Native quota
 observation semantics are maintained in

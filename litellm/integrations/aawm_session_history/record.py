@@ -67,6 +67,7 @@ _RECORD_API_NAMES: Tuple[str, ...] = (
     "_derive_session_history_reasoning_fields",
     "_derive_session_history_tool_fields",
     "_derive_session_history_provider_cache_fields",
+    "_build_kimi_code_reference_cost_metadata",
     "_build_session_history_record_from_spend_log_row",
     "_build_session_history_record_from_langfuse_trace_observation",
     "_build_session_history_metadata",
@@ -379,6 +380,86 @@ def _derive_session_history_provider_cache_fields(
             provider_cache_state.get("miss_cost_usd") if provider_cache_state else None
         ),
     }
+
+
+# --- _build_kimi_code_reference_cost_metadata ---
+def _build_kimi_code_reference_cost_metadata(
+    *,
+    provider: Optional[str],
+    model: str,
+    prompt_tokens: int,
+    cache_read_input_tokens: int,
+    completion_tokens: int,
+) -> Dict[str, Any]:
+    """Build non-invoice reference-cost metadata for managed Kimi Code usage."""
+    if str(provider or "").strip().lower() != "kimi_code":
+        return {}
+
+    normalized_model = str(model or "").strip()
+    if normalized_model.lower().startswith("kimi_code/"):
+        normalized_model = normalized_model.split("/", 1)[1]
+    if not normalized_model or normalized_model == "unknown":
+        return {}
+
+    try:
+        litellm = _get_litellm_module()
+        pricing_model = (
+            "k3"
+            if normalized_model in {"k3-low", "k3-high", "k3-max"}
+            else normalized_model
+        )
+        model_info = litellm.get_model_info(
+            model=pricing_model,
+            custom_llm_provider="kimi_code",
+        )
+        model_cost_entry = litellm.model_cost.get(
+            f"kimi_code/{normalized_model}"
+        ) or litellm.model_cost.get(f"kimi_code/{pricing_model}")
+        if not isinstance(model_cost_entry, dict):
+            return {}
+        source = _clean_non_empty_string(model_cost_entry.get("source"))
+        cache_read_rate = _safe_float(model_info.get("cache_read_input_token_cost"))
+        input_rate = _safe_float(model_info.get("input_cost_per_token"))
+        output_rate = _safe_float(model_info.get("output_cost_per_token"))
+        if source is None or cache_read_rate is None or input_rate is None or output_rate is None:
+            return {}
+
+        normalized_prompt_tokens = max(_safe_int(prompt_tokens) or 0, 0)
+        normalized_cached_tokens = min(
+            max(_safe_int(cache_read_input_tokens) or 0, 0),
+            normalized_prompt_tokens,
+        )
+        normalized_completion_tokens = max(_safe_int(completion_tokens) or 0, 0)
+        uncached_input_tokens = normalized_prompt_tokens - normalized_cached_tokens
+
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=pricing_model,
+            prompt_tokens=normalized_prompt_tokens,
+            completion_tokens=normalized_completion_tokens,
+            cache_read_input_tokens=normalized_cached_tokens,
+            custom_llm_provider="kimi_code",
+        )
+    except Exception as exc:
+        verbose_logger.debug(
+            "AawmAgentIdentity: failed to calculate Kimi Code reference cost " "for model=%s: %s",
+            normalized_model,
+            exc,
+        )
+        return {}
+
+    return {
+        "billing_mode": "kimi_code_subscription",
+        "actual_invoice_cost_known": False,
+        "reference_cost_kind": "official_public_subscription_route",
+        "reference_cost_currency": "USD",
+        "reference_cost_model": f"kimi_code/{normalized_model}",
+        "reference_cost_source": source,
+        "reference_cost_cached_input_usd": normalized_cached_tokens * cache_read_rate,
+        "reference_cost_uncached_input_usd": uncached_input_tokens * input_rate,
+        "reference_cost_output_usd": normalized_completion_tokens * output_rate,
+        "reference_cost_total_usd": prompt_cost + completion_cost,
+    }
+
 
 # --- _build_session_history_record_from_spend_log_row ---
 def _build_session_history_record_from_spend_log_row(
@@ -1053,84 +1134,83 @@ def _build_session_history_record(  # noqa: PLR0915
                 request_tags.append(tag)
 
     response_cost_usd = None
-    if resolved_provider == "openrouter":
-        response_cost_usd = _first_reported_openrouter_cost(metadata, usage_dict)
-    if response_cost_usd is None:
-        response_cost_usd = _safe_float(
-            _first_non_none(
-                kwargs.get("response_cost"),
-                standard_logging_object.get("response_cost"),
-                hidden_params.get("response_cost"),
-                _maybe_get_path(
-                    hidden_params,
-                    "additional_headers",
-                    "llm_provider-x-litellm-response-cost",
-                ),
-                metadata.get("litellm_response_cost"),
-                metadata.get("response_cost"),
-                metadata.get("usage_openrouter_cost"),
-                usage_dict.get("cost"),
+    if resolved_provider != "kimi_code":
+        if resolved_provider == "openrouter":
+            response_cost_usd = _first_reported_openrouter_cost(metadata, usage_dict)
+        if response_cost_usd is None:
+            response_cost_usd = _safe_float(
+                _first_non_none(
+                    kwargs.get("response_cost"),
+                    standard_logging_object.get("response_cost"),
+                    hidden_params.get("response_cost"),
+                    _maybe_get_path(
+                        hidden_params,
+                        "additional_headers",
+                        "llm_provider-x-litellm-response-cost",
+                    ),
+                    metadata.get("litellm_response_cost"),
+                    metadata.get("response_cost"),
+                    metadata.get("usage_openrouter_cost"),
+                    usage_dict.get("cost"),
+                )
             )
-        )
-    if (
-        (response_cost_usd is None or response_cost_usd == 0)
-        and prompt_tokens > 0
-        and resolved_model != "unknown"
-        and not usage_dict.get("token_count_response")
-    ):
-        try:
-            litellm = _get_litellm_module()
-            ResponseAPILoggingUtils = _get_response_api_logging_utils()
+        if (
+            (response_cost_usd is None or response_cost_usd == 0)
+            and prompt_tokens > 0
+            and resolved_model != "unknown"
+            and not usage_dict.get("token_count_response")
+        ):
+            try:
+                litellm = _get_litellm_module()
+                ResponseAPILoggingUtils = _get_response_api_logging_utils()
 
-            usage_for_cost = None
-            if (
-                ResponseAPILoggingUtils is not None
-                and isinstance(usage_obj, dict)
-                and {
-                    "input_tokens",
-                    "output_tokens",
-                }.issubset(usage_obj.keys())
-            ):
-                usage_for_cost = (
-                    ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
+                usage_for_cost = None
+                if (
+                    ResponseAPILoggingUtils is not None
+                    and isinstance(usage_obj, dict)
+                    and {
+                        "input_tokens",
+                        "output_tokens",
+                    }.issubset(usage_obj.keys())
+                ):
+                    usage_for_cost = ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
                         dict(usage_obj)
                     )
+                prompt_cost, completion_cost = litellm.cost_per_token(
+                    model=resolved_model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    custom_llm_provider=kwargs.get("custom_llm_provider"),
+                    cache_creation_input_tokens=cache_creation_input_tokens,
+                    cache_read_input_tokens=cache_read_input_tokens,
+                    usage_object=usage_for_cost,
+                    call_type="responses",
                 )
-            prompt_cost, completion_cost = litellm.cost_per_token(
-                model=resolved_model,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                custom_llm_provider=kwargs.get("custom_llm_provider"),
-                cache_creation_input_tokens=cache_creation_input_tokens,
-                cache_read_input_tokens=cache_read_input_tokens,
-                usage_object=usage_for_cost,
-                call_type="responses",
-            )
-            response_cost_usd = prompt_cost + completion_cost
-        except Exception as exc:
-            response_cost_usd = _calculate_response_cost_from_bundled_model_cost_map(
-                model=resolved_model,
-                custom_llm_provider=kwargs.get("custom_llm_provider"),
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                usage_obj=usage_obj,
-            )
-            verbose_logger.debug(
-                "AawmAgentIdentity: failed to backfill response cost for model=%s: %s",
-                resolved_model,
-                exc,
-            )
+                response_cost_usd = prompt_cost + completion_cost
+            except Exception as exc:
+                response_cost_usd = _calculate_response_cost_from_bundled_model_cost_map(
+                    model=resolved_model,
+                    custom_llm_provider=kwargs.get("custom_llm_provider"),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    usage_obj=usage_obj,
+                )
+                verbose_logger.debug(
+                    "AawmAgentIdentity: failed to backfill response cost for model=%s: %s",
+                    resolved_model,
+                    exc,
+                )
 
-        if response_cost_usd == 0:
-            bundled_response_cost = _calculate_response_cost_from_bundled_model_cost_map(
-                model=resolved_model,
-                custom_llm_provider=kwargs.get("custom_llm_provider"),
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                usage_obj=usage_obj,
-            )
-            if bundled_response_cost is not None:
-                response_cost_usd = bundled_response_cost
+            if response_cost_usd == 0:
+                bundled_response_cost = _calculate_response_cost_from_bundled_model_cost_map(
+                    model=resolved_model,
+                    custom_llm_provider=kwargs.get("custom_llm_provider"),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    usage_obj=usage_obj,
+                )
+                if bundled_response_cost is not None:
+                    response_cost_usd = bundled_response_cost
 
     permission_usage_fields = _build_permission_usage_fields(
         metadata=metadata,
@@ -1161,6 +1241,15 @@ def _build_session_history_record(  # noqa: PLR0915
         ),
     )
     provider_cache_state = cache_fields["provider_cache_state"]
+    kimi_code_reference_cost_metadata = _build_kimi_code_reference_cost_metadata(
+        provider=resolved_provider,
+        model=resolved_model,
+        prompt_tokens=prompt_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        completion_tokens=completion_tokens,
+    )
+    if kimi_code_reference_cost_metadata:
+        metadata.update(kimi_code_reference_cost_metadata)
 
     runtime_identity = _build_session_runtime_identity(
         metadata=metadata,

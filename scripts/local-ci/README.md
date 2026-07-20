@@ -176,6 +176,26 @@ Target profiles:
 - `--target dev` validates `http://127.0.0.1:4001/anthropic`, `litellm-dev`, and Langfuse trace environment `dev`.
 - `--target prod` validates `http://127.0.0.1:4000/anthropic`, `aawm-litellm`, and Langfuse trace environment `prod`.
 
+Moonshot Anthropic Messages acceptance is an opt-in, full agentic case. It
+dispatches the `sota-moonshot` child profile through the single canonical
+`aawm-sota-moonshot` alias, requires Read then Grep with a tool-result
+continuation, and accepts the final marker only after that sequence. It is not
+a raw `/v1/messages`, chat-completions, or one-turn completion smoke test.
+Run it only against the restarted development service during the bounded
+Moonshot live-proof step:
+
+```bash
+python3 run_anthropic_adapter_acceptance.py \
+  --target dev \
+  --cases claude_adapter_aawm_sota_moonshot_agentic_tool_continuation \
+  --write-artifact /tmp/moonshot-anthropic-agentic-dev.json
+```
+
+The artifact records the safe adapter path
+`anthropic_kimi_chat_completions_adapter`, canonical alias, selected K3 model,
+and tool-result replay evidence. It does not require or print credential
+material.
+
 Native passthrough checks live in the same harness and are opt-in. HTTP cases
 send direct requests through the provider passthrough routes. CLI cases launch
 the real local provider CLIs (`claude`, `codex`) so they use the same

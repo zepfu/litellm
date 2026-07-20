@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import signal
@@ -17,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qsl, urlsplit
@@ -45,6 +46,12 @@ try:
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     xai_oauth_refresh = importlib.import_module("xai_oauth_refresh")
+
+try:
+    from scripts import kimi_oauth_refresh
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    kimi_oauth_refresh = importlib.import_module("kimi_oauth_refresh")
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -86,6 +93,107 @@ XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = (
 )
 DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
+# Kimi Code uses the host CLI's existing credential and its native lock
+# sentinel. The Kimi CLI's proper-lockfile implementation creates the
+# sibling `kimi-code.lock` directory beneath the mounted oauth parent.
+DEFAULT_KIMI_OAUTH_AUTH_FILE = "~/.kimi-code/credentials/kimi-code.json"
+DEFAULT_KIMI_OAUTH_LOCK_FILE = "~/.kimi-code/oauth/kimi-code"
+DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
+DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS = kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS
+DEFAULT_KIMI_USAGE_POLL_ENABLED = False
+DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+KIMI_CODE_USAGE_SOURCE = "kimi_code_usage"
+KIMI_CODE_USAGE_PARSER_VERSION = "kimi_code_usage_v2"
+KIMI_CODE_USAGE_SOURCE_VERSION = "kimi_code_0.27.0_managed_usage_v1"
+KIMI_CODE_USAGE_CLIENT = "kimi-code"
+KIMI_CODE_USAGE_MODEL = "kimi-code"
+KIMI_CODE_USAGE_QUOTA_TYPE = "quota_units"
+KIMI_CODE_5H_QUOTA_KEY = "kimi_code_5h:quota_units"
+KIMI_CODE_7D_QUOTA_KEY = "kimi_code_7d:quota_units"
+KIMI_CODE_MONTHLY_QUOTA_KEY = "kimi_code_monthly:quota_units"
+KIMI_USAGE_WINDOW_DEFINITIONS = {
+    "5h": {
+        "aliases": frozenset(
+            {
+                "5h",
+                "fivehour",
+                "fivehours",
+                "quota5h",
+                "usage5h",
+                "usage5hour",
+                "usage5hours",
+            }
+        ),
+        "quota_key": KIMI_CODE_5H_QUOTA_KEY,
+    },
+    "7d": {
+        "aliases": frozenset(
+            {
+                "7d",
+                "sevenday",
+                "sevendays",
+                "quota7d",
+                "usage7d",
+                "usage7day",
+                "usage7days",
+            }
+        ),
+        "quota_key": KIMI_CODE_7D_QUOTA_KEY,
+    },
+    "monthly": {
+        "aliases": frozenset(
+            {
+                "month",
+                "monthly",
+                "monthlyquota",
+                "monthlyusage",
+                "quotamonthly",
+                "usagemonthly",
+            }
+        ),
+        "quota_key": KIMI_CODE_MONTHLY_QUOTA_KEY,
+    },
+}
+KIMI_USAGE_QUOTA_LIMIT_FIELDS = (
+    "limit",
+    "quota",
+    "total",
+    "capacity",
+    "max",
+)
+KIMI_USAGE_QUOTA_USED_FIELDS = (
+    "used",
+    "usage",
+    "consumed",
+    "current",
+)
+KIMI_USAGE_QUOTA_REMAINING_FIELDS = (
+    "remaining",
+    "available",
+    "left",
+)
+KIMI_USAGE_RESET_FIELDS = (
+    "reset_at",
+    "resetat",
+    "reset_time",
+    "resettime",
+    "next_reset",
+    "nextreset",
+    "end_at",
+    "endat",
+    "ends_at",
+    "endsat",
+)
+KIMI_USAGE_START_FIELDS = (
+    "start_at",
+    "startat",
+    "starts_at",
+    "startsat",
+    "period_start",
+    "periodstart",
+)
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -221,6 +329,29 @@ class CodexResetCreditPollError(ValueError):
         self.status_code = status_code
         self.attempt_count = max(1, attempt_count)
         self.retry_count = max(0, retry_count)
+
+
+class KimiUsagePollError(ValueError):
+    """Sanitized Kimi Code usage-poll failure with a non-secret classification."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int],
+        telemetry_class: str,
+        attempt_count: int,
+        retry_count: int,
+        refresh_attempted: bool = False,
+        refresh_succeeded: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.telemetry_class = telemetry_class
+        self.attempt_count = max(1, attempt_count)
+        self.retry_count = max(0, retry_count)
+        self.refresh_attempted = refresh_attempted
+        self.refresh_succeeded = refresh_succeeded
 
 
 GROK_BILLING_RATE_LIMIT_INSERT_SQL = """
@@ -951,10 +1082,18 @@ class ProviderStatusLoopConfig:
     )
     xai_oauth_force_refresh: bool = False
     xai_oauth_http_timeout_seconds: float = DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS
+    kimi_oauth_refresh_enabled: bool = False
+    kimi_oauth_auth_file: str = DEFAULT_KIMI_OAUTH_AUTH_FILE
+    kimi_oauth_auth_file_source: str = "default"
+    kimi_oauth_lock_file: str = DEFAULT_KIMI_OAUTH_LOCK_FILE
+    kimi_oauth_refresh_interval_seconds: float = DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS
+    kimi_oauth_force_refresh: bool = False
+    kimi_oauth_http_timeout_seconds: float = DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS
+    kimi_usage_poll_enabled: bool = DEFAULT_KIMI_USAGE_POLL_ENABLED
+    kimi_usage_poll_interval_seconds: float = DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS
+    kimi_usage_poll_http_timeout_seconds: float = DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS
     grok_billing_poll_enabled: bool = DEFAULT_GROK_BILLING_POLL_ENABLED
-    grok_billing_poll_interval_seconds: float = (
-        DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS
-    )
+    grok_billing_poll_interval_seconds: float = DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS
     grok_billing_poll_http_timeout_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS
     )
@@ -1002,6 +1141,9 @@ class SidecarTaskState:
     grok_oidc_last_attempt_monotonic: Optional[float] = None
     codex_oauth_last_attempt_monotonic: Optional[float] = None
     xai_oauth_last_attempt_monotonic: Optional[float] = None
+    kimi_oauth_last_attempt_monotonic: Optional[float] = None
+    kimi_usage_last_attempt_monotonic: Optional[float] = None
+    kimi_usage_refresh_pending: bool = False
     grok_billing_last_attempt_monotonic: Optional[float] = None
     codex_reset_credit_last_attempt_monotonic: Optional[float] = None
     observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
@@ -1107,6 +1249,25 @@ def _resolve_xai_oauth_sidecar_auth_file(
             return str(Path(env_value).expanduser()), env_name
 
     return DEFAULT_XAI_OAUTH_AUTH_FILE, "default"
+
+
+def _resolve_kimi_oauth_sidecar_auth_file(
+    explicit_auth_file: Optional[str],
+) -> tuple[str, str]:
+    explicit_value = (
+        explicit_auth_file.strip()
+        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
+        else None
+    )
+
+    aawm_auth_file = os.getenv("AAWM_KIMI_OAUTH_AUTH_FILE", "").strip()
+    if aawm_auth_file:
+        return str(Path(aawm_auth_file).expanduser()), "AAWM_KIMI_OAUTH_AUTH_FILE"
+
+    if explicit_value and explicit_value != DEFAULT_KIMI_OAUTH_AUTH_FILE:
+        return str(Path(explicit_value).expanduser()), "explicit"
+
+    return DEFAULT_KIMI_OAUTH_AUTH_FILE, "default"
 
 
 def _resolve_grok_billing_client_version() -> str:
@@ -1485,6 +1646,117 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "to AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS or 30."
         ),
     )
+    kimi_oauth_group = parser.add_mutually_exclusive_group()
+    kimi_oauth_group.add_argument(
+        "--kimi-oauth-refresh-enabled",
+        dest="kimi_oauth_refresh_enabled",
+        action="store_true",
+        default=_env_bool("AAWM_KIMI_OAUTH_REFRESH_ENABLED", False),
+        help=(
+            "Run the Kimi OAuth auth-file refresh task from this sidecar loop. "
+            "Defaults to AAWM_KIMI_OAUTH_REFRESH_ENABLED or false."
+        ),
+    )
+    kimi_oauth_group.add_argument(
+        "--no-kimi-oauth-refresh",
+        dest="kimi_oauth_refresh_enabled",
+        action="store_false",
+        help="Disable the Kimi OAuth auth-file refresh task.",
+    )
+    parser.add_argument(
+        "--kimi-oauth-auth-file",
+        default=os.getenv("AAWM_KIMI_OAUTH_AUTH_FILE", DEFAULT_KIMI_OAUTH_AUTH_FILE),
+        help=(
+            "Kimi OAuth auth JSON file maintained by this sidecar. Defaults to "
+            "AAWM_KIMI_OAUTH_AUTH_FILE or "
+            "~/.kimi-code/credentials/kimi-code.json."
+        ),
+    )
+    parser.add_argument(
+        "--kimi-oauth-lock-file",
+        default=os.getenv("AAWM_KIMI_OAUTH_LOCK_FILE", DEFAULT_KIMI_OAUTH_LOCK_FILE),
+        help=(
+            "Native Kimi OAuth lock sentinel for sidecar refresh writes. "
+            "Defaults to AAWM_KIMI_OAUTH_LOCK_FILE or "
+            "~/.kimi-code/oauth/kimi-code."
+        ),
+    )
+    parser.add_argument(
+        "--kimi-oauth-refresh-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS",
+            DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Kimi OAuth refresh attempts. Defaults to "
+            "AAWM_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--kimi-oauth-force-refresh",
+        action="store_true",
+        default=_env_bool("AAWM_KIMI_OAUTH_FORCE_REFRESH", False),
+        help=(
+            "Refresh the Kimi OAuth credential on every scheduled attempt even "
+            "when the current credential is still valid."
+        ),
+    )
+    parser.add_argument(
+        "--kimi-oauth-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Kimi OAuth token endpoint calls. Defaults to "
+            "AAWM_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
+    kimi_usage_group = parser.add_mutually_exclusive_group()
+    kimi_usage_group.add_argument(
+        "--kimi-usage-poll-enabled",
+        dest="kimi_usage_poll_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_KIMI_USAGE_POLL_ENABLED",
+            DEFAULT_KIMI_USAGE_POLL_ENABLED,
+        ),
+        help=(
+            "Read native Kimi Code usage quotas using the existing Kimi OAuth "
+            "credential. Defaults to AAWM_KIMI_USAGE_POLL_ENABLED or false."
+        ),
+    )
+    kimi_usage_group.add_argument(
+        "--no-kimi-usage-poll",
+        dest="kimi_usage_poll_enabled",
+        action="store_false",
+        help="Disable native Kimi Code usage polling.",
+    )
+    parser.add_argument(
+        "--kimi-usage-poll-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS",
+            DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Kimi Code usage poll attempts. Defaults to "
+            "AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--kimi-usage-poll-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Kimi Code usage polling. Defaults to " "AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
     billing_group = parser.add_mutually_exclusive_group()
     billing_group.add_argument(
         "--grok-billing-poll-enabled",
@@ -1788,6 +2060,8 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_grok_oidc_config_args(args)
     _validate_codex_config_args(args)
     _validate_xai_oauth_config_args(args)
+    _validate_kimi_oauth_config_args(args)
+    _validate_kimi_usage_config_args(args)
     _validate_grok_billing_config_args(args)
     _validate_observability_anomaly_scan_config_args(args)
     _validate_codex_reset_credit_poll_config_args(args)
@@ -1837,13 +2111,27 @@ def _validate_xai_oauth_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--xai-oauth-http-timeout-seconds must be greater than 0")
 
 
+def _validate_kimi_oauth_config_args(args: argparse.Namespace) -> None:
+    if args.kimi_oauth_refresh_interval_seconds <= 0:
+        raise SystemExit(
+            "--kimi-oauth-refresh-interval-seconds must be greater than 0"
+        )
+    if args.kimi_oauth_http_timeout_seconds <= 0:
+        raise SystemExit("--kimi-oauth-http-timeout-seconds must be greater than 0")
+
+
+def _validate_kimi_usage_config_args(args: argparse.Namespace) -> None:
+    if args.kimi_usage_poll_interval_seconds <= 0:
+        raise SystemExit("--kimi-usage-poll-interval-seconds must be greater than 0")
+    if args.kimi_usage_poll_http_timeout_seconds <= 0:
+        raise SystemExit("--kimi-usage-poll-http-timeout-seconds must be greater than 0")
+
+
 def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
     if args.grok_billing_poll_interval_seconds <= 0:
         raise SystemExit("--grok-billing-poll-interval-seconds must be greater than 0")
     if args.grok_billing_poll_http_timeout_seconds <= 0:
-        raise SystemExit(
-            "--grok-billing-poll-http-timeout-seconds must be greater than 0"
-        )
+        raise SystemExit("--grok-billing-poll-http-timeout-seconds must be greater than 0")
     if not str(args.grok_billing_url).strip():
         raise SystemExit("--grok-billing-url must not be empty")
     if not str(args.grok_billing_client_version).strip():
@@ -1916,6 +2204,10 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         resolved_xai_oauth_auth_file,
         resolved_xai_oauth_auth_file_source,
     ) = _resolve_xai_oauth_sidecar_auth_file(args.xai_oauth_auth_file)
+    (
+        resolved_kimi_oauth_auth_file,
+        resolved_kimi_oauth_auth_file_source,
+    ) = _resolve_kimi_oauth_sidecar_auth_file(args.kimi_oauth_auth_file)
 
     return ProviderStatusLoopConfig(
         apply=args.apply,
@@ -1957,6 +2249,16 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         xai_oauth_refresh_buffer_seconds=args.xai_oauth_refresh_buffer_seconds,
         xai_oauth_force_refresh=args.xai_oauth_force_refresh,
         xai_oauth_http_timeout_seconds=args.xai_oauth_http_timeout_seconds,
+        kimi_oauth_refresh_enabled=args.kimi_oauth_refresh_enabled,
+        kimi_oauth_auth_file=resolved_kimi_oauth_auth_file,
+        kimi_oauth_auth_file_source=resolved_kimi_oauth_auth_file_source,
+        kimi_oauth_lock_file=args.kimi_oauth_lock_file,
+        kimi_oauth_refresh_interval_seconds=args.kimi_oauth_refresh_interval_seconds,
+        kimi_oauth_force_refresh=args.kimi_oauth_force_refresh,
+        kimi_oauth_http_timeout_seconds=args.kimi_oauth_http_timeout_seconds,
+        kimi_usage_poll_enabled=args.kimi_usage_poll_enabled,
+        kimi_usage_poll_interval_seconds=args.kimi_usage_poll_interval_seconds,
+        kimi_usage_poll_http_timeout_seconds=args.kimi_usage_poll_http_timeout_seconds,
         grok_billing_poll_enabled=args.grok_billing_poll_enabled,
         grok_billing_poll_interval_seconds=args.grok_billing_poll_interval_seconds,
         grok_billing_poll_http_timeout_seconds=args.grok_billing_poll_http_timeout_seconds,
@@ -1968,31 +2270,17 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_http_method=grok_billing_http_method,
         grok_billing_include_model_override=args.grok_billing_include_model_override,
         grok_billing_poll_max_attempts=args.grok_billing_poll_max_attempts,
-        grok_billing_poll_retry_backoff_seconds=(
-            args.grok_billing_poll_retry_backoff_seconds
-        ),
+        grok_billing_poll_retry_backoff_seconds=(args.grok_billing_poll_retry_backoff_seconds),
         codex_reset_credit_poll_enabled=args.codex_reset_credit_poll_enabled,
-        codex_reset_credit_poll_interval_seconds=(
-            args.codex_reset_credit_poll_interval_seconds
-        ),
-        codex_reset_credit_poll_http_timeout_seconds=(
-            args.codex_reset_credit_poll_http_timeout_seconds
-        ),
+        codex_reset_credit_poll_interval_seconds=(args.codex_reset_credit_poll_interval_seconds),
+        codex_reset_credit_poll_http_timeout_seconds=(args.codex_reset_credit_poll_http_timeout_seconds),
         codex_usage_url=args.codex_usage_url,
         codex_reset_credit_poll_max_attempts=args.codex_reset_credit_poll_max_attempts,
-        codex_reset_credit_poll_retry_backoff_seconds=(
-            args.codex_reset_credit_poll_retry_backoff_seconds
-        ),
+        codex_reset_credit_poll_retry_backoff_seconds=(args.codex_reset_credit_poll_retry_backoff_seconds),
         observability_anomaly_scan_enabled=(args.observability_anomaly_scan_enabled),
-        observability_anomaly_scan_interval_seconds=(
-            args.observability_anomaly_scan_interval_seconds
-        ),
-        observability_anomaly_scan_lookback_hours=(
-            args.observability_anomaly_scan_lookback_hours
-        ),
-        observability_anomaly_scan_error_log_dir=(
-            args.observability_anomaly_scan_error_log_dir
-        ),
+        observability_anomaly_scan_interval_seconds=(args.observability_anomaly_scan_interval_seconds),
+        observability_anomaly_scan_lookback_hours=(args.observability_anomaly_scan_lookback_hours),
+        observability_anomaly_scan_error_log_dir=(args.observability_anomaly_scan_error_log_dir),
     )
 
 
@@ -2351,9 +2639,78 @@ def _persist_xai_oauth_auth_observation(
     return True, inserted_count, None, None
 
 
-def _provider_failure_summaries(
-    rows: Sequence[Dict[str, Any]]
-) -> tuple[list[Dict[str, Any]], int]:
+def _build_kimi_oauth_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> Dict[str, Any]:
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
+        timezone.utc
+    )
+    expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
+    status = _provider_auth_status_from_event(event)
+    successful_validation = status in {"refreshed", "skipped"} and not event.get(
+        "error_class"
+    )
+    auth_file = event.get("auth_file") or config.kimi_oauth_auth_file
+    metadata = {
+        "auth_file_hash_algorithm": "sha256",
+        "auth_file_source": config.kimi_oauth_auth_file_source,
+        "refresh_interval_seconds": config.kimi_oauth_refresh_interval_seconds,
+        "force_refresh": config.kimi_oauth_force_refresh,
+        "raw_status_flags": {
+            "attempted": bool(event.get("attempted")),
+            "refreshed": bool(event.get("refreshed")),
+            "skipped": bool(event.get("skipped")),
+            "auth_degraded": bool(event.get("auth_degraded")),
+        },
+    }
+    return {
+        "observed_at": observed_at,
+        "environment": event.get("environment") or config.environment,
+        "provider": "kimi_code",
+        "auth_family": "kimi_oauth",
+        "credential_scope": _redacted_summary_field(
+            event.get("scope") or kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_SCOPE,
+            limit=512,
+        ),
+        "auth_file_hash": probes.auth_file_identity_hash(auth_file),
+        "status": status,
+        "attempted": bool(event.get("attempted")),
+        "refreshed": bool(event.get("refreshed")),
+        "skipped": bool(event.get("skipped")),
+        "expires_at": expires_at,
+        "last_success_at": observed_at if successful_validation else None,
+        "source_task": "kimi_oauth_refresh",
+        "error_class": _redacted_summary_field(event.get("error_class")),
+        "error_message": _redacted_failure_message(event.get("error_message")),
+        "metadata": metadata,
+    }
+
+
+def _persist_kimi_oauth_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    if not config.apply:
+        return False, 0, None, "apply_disabled"
+
+    observation = _build_kimi_oauth_auth_observation(config, event)
+    dsn = _resolve_dsn(config)
+    try:
+        inserted_count = probes.insert_provider_auth_observations(
+            dsn,
+            [observation],
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return False, 0, exc.error_class, _redacted_failure_message(str(exc))
+    except Exception as exc:
+        return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
+    return True, inserted_count, None, None
+
+
+def _provider_failure_summaries(rows: Sequence[Dict[str, Any]]) -> tuple[list[Dict[str, Any]], int]:
     failed_rows = [row for row in rows if not row.get("success")]
     summaries: list[Dict[str, Any]] = []
     for row in failed_rows[:PROVIDER_FAILURE_SUMMARY_LIMIT]:
@@ -2680,12 +3037,12 @@ def _parse_codex_reset_credit_expires_at(
         ("rate_limit_reset_credits", "expires_at"),
         ("rateLimitResetCredits", "expiresAt"),
     ):
-        credits = response_body.get(credits_key)
-        if not isinstance(credits, dict):
+        credits_summary = response_body.get(credits_key)
+        if not isinstance(credits_summary, dict):
             continue
-        if expires_key not in credits:
+        if expires_key not in credits_summary:
             continue
-        value = credits.get(expires_key)
+        value = credits_summary.get(expires_key)
         return probes._normalize_provider_credit_timestamp(value)
     return None
 
@@ -2707,15 +3064,11 @@ def _build_codex_reset_credit_raw_provider_fields(
             continue
         fields: Dict[str, Any] = {
             credits_key: {
-                count_key: available_count
-                if available_count is not None
-                else credits.get(count_key),
+                count_key: available_count if available_count is not None else credits.get(count_key),
             }
         }
         if expires_key in credits:
-            fields[credits_key][expires_key] = _json_safe_codex_reset_credit_value(
-                credits.get(expires_key)
-            )
+            fields[credits_key][expires_key] = _json_safe_codex_reset_credit_value(credits.get(expires_key))
         return fields
     if available_count is not None:
         return {
@@ -3507,6 +3860,709 @@ def _load_grok_billing_access_token(auth_file: str) -> str:
     return _load_grok_billing_auth_context(auth_file)["access_token"]
 
 
+def _load_kimi_usage_access_token(auth_file: str) -> str:
+    """Read the Kimi CLI credential in place without copying or refreshing it."""
+    credential = kimi_oauth_refresh._read_credential_payload(Path(auth_file).expanduser())
+    access_token = credential.get("access_token")
+    if isinstance(access_token, str) and access_token.strip():
+        return access_token.strip()
+    raise ValueError("Kimi Code credential does not contain a usable access token.")
+
+
+def _build_kimi_usage_request_headers(*, access_token: str) -> Dict[str, str]:
+    """Build the smallest native request contract; never add Kimi device headers."""
+    return {
+        "accept": "application/json",
+        "authorization": f"Bearer {access_token}",
+        "user-agent": KIMI_CODE_USAGE_CLIENT,
+    }
+
+
+def _kimi_usage_http_telemetry_class(status_code: int) -> str:
+    if status_code in {401, 403}:
+        return "auth"
+    if status_code == 404:
+        return "not_found"
+    if status_code == 429:
+        return "rate_limit"
+    if status_code >= 500:
+        return "upstream"
+    return "http_error"
+
+
+def _kimi_usage_poll_error(
+    *,
+    status_code: Optional[int],
+    telemetry_class: str,
+    attempt_count: int,
+    retry_count: int,
+    refresh_attempted: bool,
+    refresh_succeeded: bool,
+    message: Optional[str] = None,
+) -> KimiUsagePollError:
+    if message is None:
+        message = "Kimi Code usage poll failed"
+        if status_code is not None:
+            message += f" with HTTP {status_code}"
+        message += "."
+    return KimiUsagePollError(
+        message,
+        status_code=status_code,
+        telemetry_class=telemetry_class,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+        refresh_attempted=refresh_attempted,
+        refresh_succeeded=refresh_succeeded,
+    )
+
+
+def _fetch_kimi_usage_payload(
+    config: ProviderStatusLoopConfig,
+) -> Dict[str, Any]:
+    attempt_count = 0
+    retry_count = 0
+    refresh_attempted = False
+    refresh_succeeded = False
+
+    while attempt_count < 2:
+        attempt_count += 1
+        access_token = _load_kimi_usage_access_token(config.kimi_oauth_auth_file)
+        request = urllib_request.Request(
+            DEFAULT_KIMI_USAGE_URL,
+            headers=_build_kimi_usage_request_headers(access_token=access_token),
+            method="GET",
+        )
+        response_body: Optional[str] = None
+        try:
+            with urllib_request.urlopen(
+                request,
+                timeout=config.kimi_usage_poll_http_timeout_seconds,
+            ) as response:
+                status_code = int(getattr(response, "status", None) or response.getcode())
+                if 200 <= status_code < 300:
+                    response_body = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            status_code = exc.code
+        except (urllib_error.URLError, TimeoutError, OSError) as exc:
+            raise _kimi_usage_poll_error(
+                status_code=None,
+                telemetry_class="transport",
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+                refresh_attempted=refresh_attempted,
+                refresh_succeeded=refresh_succeeded,
+                message=("Kimi Code usage poll failed while contacting the native " "endpoint."),
+            ) from exc
+
+        if status_code in {401, 403} and attempt_count == 1:
+            refresh_attempted = True
+            try:
+                refresh_summary = kimi_oauth_refresh.refresh_kimi_oauth_auth_file(
+                    config.kimi_oauth_auth_file,
+                    force=True,
+                    lock_file=config.kimi_oauth_lock_file,
+                    http_timeout_seconds=config.kimi_oauth_http_timeout_seconds,
+                )
+            except Exception:
+                raise _kimi_usage_poll_error(
+                    status_code=status_code,
+                    telemetry_class="auth",
+                    attempt_count=attempt_count,
+                    retry_count=retry_count,
+                    refresh_attempted=True,
+                    refresh_succeeded=False,
+                    message=("Kimi Code usage credential refresh failed after an " "authentication rejection."),
+                ) from None
+
+            refresh_succeeded = bool(
+                not refresh_summary.get("error_class")
+                and not refresh_summary.get("auth_degraded")
+                and (refresh_summary.get("refreshed") or refresh_summary.get("skipped"))
+            )
+            if not refresh_succeeded:
+                raise _kimi_usage_poll_error(
+                    status_code=status_code,
+                    telemetry_class="auth",
+                    attempt_count=attempt_count,
+                    retry_count=retry_count,
+                    refresh_attempted=True,
+                    refresh_succeeded=False,
+                    message=("Kimi Code usage credential refresh failed after an " "authentication rejection."),
+                )
+            retry_count = 1
+            continue
+
+        if status_code < 200 or status_code >= 300:
+            raise _kimi_usage_poll_error(
+                status_code=status_code,
+                telemetry_class=_kimi_usage_http_telemetry_class(status_code),
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+                refresh_attempted=refresh_attempted,
+                refresh_succeeded=refresh_succeeded,
+            )
+
+        try:
+            payload = json.loads(response_body or "")
+        except json.JSONDecodeError as exc:
+            raise _kimi_usage_poll_error(
+                status_code=status_code,
+                telemetry_class="malformed_telemetry",
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+                refresh_attempted=refresh_attempted,
+                refresh_succeeded=refresh_succeeded,
+                message="Kimi Code usage endpoint returned invalid JSON.",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise _kimi_usage_poll_error(
+                status_code=status_code,
+                telemetry_class="malformed_telemetry",
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+                refresh_attempted=refresh_attempted,
+                refresh_succeeded=refresh_succeeded,
+                message="Kimi Code usage endpoint returned a non-object payload.",
+            )
+        return {
+            "status_code": status_code,
+            "payload": payload,
+            "attempt_count": attempt_count,
+            "retry_count": retry_count,
+            "refresh_attempted": refresh_attempted,
+            "refresh_succeeded": refresh_succeeded,
+        }
+
+    raise AssertionError("bounded Kimi Code usage retry loop unexpectedly exhausted")
+
+
+def _normalize_kimi_usage_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def _kimi_usage_mapping_nodes(
+    payload: Mapping[str, Any],
+) -> list[tuple[tuple[str, ...], Mapping[str, Any]]]:
+    nodes: list[tuple[tuple[str, ...], Mapping[str, Any]]] = []
+    pending: list[tuple[tuple[str, ...], Any]] = [((), payload)]
+    while pending:
+        path, value = pending.pop(0)
+        if len(path) > 5:
+            continue
+        if isinstance(value, Mapping):
+            nodes.append((path, value))
+            for key, nested in value.items():
+                pending.append((path + (str(key),), nested))
+        elif isinstance(value, list):
+            for index, nested in enumerate(value[:50]):
+                pending.append((path + (str(index),), nested))
+    return nodes
+
+
+def _kimi_usage_named_value(
+    mapping: Mapping[str, Any],
+    field_names: Sequence[str],
+) -> tuple[bool, Any]:
+    normalized_names = {_normalize_kimi_usage_key(name) for name in field_names}
+    for key, value in mapping.items():
+        if _normalize_kimi_usage_key(key) in normalized_names:
+            return True, value
+    return False, None
+
+
+def _parse_kimi_usage_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _parse_kimi_usage_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return None
+        if numeric > 10_000_000_000:
+            numeric /= 1000.0
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return _parse_grok_billing_timestamp(value)
+
+
+def _find_kimi_usage_window_value(
+    nodes: Sequence[tuple[tuple[str, ...], Mapping[str, Any]]],
+    aliases: Collection[str],
+) -> tuple[bool, Any, tuple[str, ...]]:
+    normalized_aliases = {_normalize_kimi_usage_key(alias) for alias in aliases}
+    for path, mapping in nodes:
+        for key, value in mapping.items():
+            if _normalize_kimi_usage_key(key) in normalized_aliases:
+                return True, value, path + (str(key),)
+        period_present, period_value = _kimi_usage_named_value(
+            mapping,
+            ("period", "window", "duration", "type"),
+        )
+        if period_present and _normalize_kimi_usage_key(period_value) in normalized_aliases:
+            return True, mapping, path
+    return False, None, ()
+
+
+def _parse_kimi_usage_window(
+    window: str,
+    *,
+    value_present: bool,
+    value: Any,
+) -> Dict[str, Any]:
+    if not value_present:
+        return {"window": window, "state": "absent"}
+    if not isinstance(value, Mapping):
+        return {"window": window, "state": "malformed"}
+
+    fields = {
+        "limit": _kimi_usage_named_value(value, KIMI_USAGE_QUOTA_LIMIT_FIELDS),
+        "used": _kimi_usage_named_value(value, KIMI_USAGE_QUOTA_USED_FIELDS),
+        "remaining": _kimi_usage_named_value(
+            value,
+            KIMI_USAGE_QUOTA_REMAINING_FIELDS,
+        ),
+    }
+    parsed: Dict[str, Optional[float]] = {}
+    for field_name, (field_present, raw_value) in fields.items():
+        if not field_present:
+            parsed[field_name] = None
+            continue
+        numeric = _parse_kimi_usage_number(raw_value)
+        if numeric is None:
+            return {"window": window, "state": "malformed"}
+        parsed[field_name] = numeric
+
+    if all(value is None for value in parsed.values()):
+        return {"window": window, "state": "malformed"}
+
+    quota_limit = parsed["limit"]
+    quota_used = parsed["used"]
+    quota_remaining = parsed["remaining"]
+    if quota_remaining is None and quota_limit is not None and quota_used is not None:
+        quota_remaining = max(0.0, quota_limit - quota_used)
+    if quota_used is None and quota_limit is not None and quota_remaining is not None:
+        quota_used = max(0.0, quota_limit - quota_remaining)
+
+    reset_present, reset_value = _kimi_usage_named_value(value, KIMI_USAGE_RESET_FIELDS)
+    start_present, start_value = _kimi_usage_named_value(value, KIMI_USAGE_START_FIELDS)
+    reset_at = _parse_kimi_usage_timestamp(reset_value) if reset_present else None
+    start_at = _parse_kimi_usage_timestamp(start_value) if start_present else None
+    reset_state = "absent" if not reset_present else "valid" if reset_at is not None else "malformed"
+    start_state = "absent" if not start_present else "valid" if start_at is not None else "malformed"
+
+    remaining_pct: Optional[float] = None
+    if quota_limit is not None and quota_limit > 0:
+        if quota_remaining is not None:
+            remaining_pct = max(0.0, min(100.0, quota_remaining / quota_limit * 100.0))
+        elif quota_used is not None:
+            remaining_pct = max(0.0, min(100.0, 100.0 - quota_used / quota_limit * 100.0))
+
+    if quota_used is not None:
+        state = "valid_zero" if quota_used == 0 else "valid_nonzero"
+    else:
+        numeric_values = [value for value in (quota_limit, quota_remaining) if value is not None]
+        state = "valid_zero" if numeric_values and all(value == 0 for value in numeric_values) else "valid_nonzero"
+    return {
+        "window": window,
+        "state": state,
+        "quota_limit": quota_limit,
+        "quota_used": quota_used,
+        "quota_remaining": quota_remaining,
+        "remaining_pct": remaining_pct,
+        "billing_period_start_at": start_at,
+        "billing_period_end_at": reset_at,
+        "expected_reset_at": reset_at,
+        "reset_state": reset_state,
+        "start_state": start_state,
+        "usage_exceeds_limit": bool(quota_limit is not None and quota_used is not None and quota_used > quota_limit),
+    }
+
+
+def _kimi_usage_native_5h_detail(
+    raw_limits: Any,
+) -> tuple[str, Optional[Mapping[str, Any]]]:
+    if not isinstance(raw_limits, list):
+        return "malformed", None
+    for item in raw_limits[:50]:
+        if not isinstance(item, Mapping):
+            continue
+        window = item.get("window")
+        if not isinstance(window, Mapping):
+            continue
+        duration_present, duration_value = _kimi_usage_named_value(
+            window,
+            ("duration",),
+        )
+        unit_present, unit_value = _kimi_usage_named_value(
+            window,
+            ("timeUnit", "time_unit"),
+        )
+        duration = _parse_kimi_usage_number(duration_value) if duration_present else None
+        unit = _normalize_kimi_usage_key(unit_value) if unit_present else ""
+        if duration != 300 or "minute" not in unit:
+            continue
+        detail = item.get("detail")
+        return "present", detail if isinstance(detail, Mapping) else item
+    return "absent", None
+
+
+def _parse_kimi_usage_native_windows(
+    payload: Mapping[str, Any],
+) -> tuple[Dict[str, Dict[str, Any]], set[str]]:
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    handled: set[str] = set()
+
+    if "limits" in payload:
+        handled.add("5h")
+        state, detail = _kimi_usage_native_5h_detail(payload.get("limits"))
+        if state == "present":
+            snapshot = _parse_kimi_usage_window(
+                "5h",
+                value_present=True,
+                value=detail,
+            )
+        else:
+            snapshot = {"window": "5h", "state": state}
+        snapshot["parser_path"] = "native"
+        snapshots["5h"] = snapshot
+
+    if "usage" in payload:
+        handled.add("7d")
+        snapshot = _parse_kimi_usage_window(
+            "7d",
+            value_present=True,
+            value=payload.get("usage"),
+        )
+        snapshot["parser_path"] = "native"
+        snapshots["7d"] = snapshot
+
+    if "totalQuota" in payload:
+        handled.add("monthly")
+        total_quota = payload.get("totalQuota")
+        if isinstance(total_quota, Mapping) and not total_quota:
+            snapshot = {"window": "monthly", "state": "absent"}
+        else:
+            value: Any
+            if isinstance(total_quota, Mapping):
+                detail = total_quota.get("detail")
+                value = detail if isinstance(detail, Mapping) else total_quota
+            else:
+                value = total_quota
+            snapshot = _parse_kimi_usage_window(
+                "monthly",
+                value_present=True,
+                value=value,
+            )
+        snapshot["parser_path"] = "native"
+        snapshots["monthly"] = snapshot
+
+    return snapshots, handled
+
+
+def _parse_kimi_usage_parallel_limit(
+    nodes: Sequence[tuple[tuple[str, ...], Mapping[str, Any]]],
+) -> Dict[str, Any]:
+    for _path, mapping in nodes:
+        parallel_present, parallel_value = _kimi_usage_named_value(mapping, ("parallel",))
+        if not parallel_present:
+            continue
+        if not isinstance(parallel_value, Mapping):
+            return {"state": "malformed", "limit": None}
+        limit_present, limit_value = _kimi_usage_named_value(
+            parallel_value,
+            KIMI_USAGE_QUOTA_LIMIT_FIELDS,
+        )
+        if not limit_present:
+            return {"state": "malformed", "limit": None}
+        limit = _parse_kimi_usage_number(limit_value)
+        if limit is None:
+            return {"state": "malformed", "limit": None}
+        return {
+            "state": "valid_zero" if limit == 0 else "valid_nonzero",
+            "limit": limit,
+        }
+    return {"state": "absent", "limit": None}
+
+
+def _sanitize_kimi_usage_metadata_value(value: Any) -> Any:
+    if isinstance(value, list):
+        sanitized = [
+            _redacted_summary_field(item, limit=160) for item in value[:20] if isinstance(item, (str, int, float, bool))
+        ]
+        return [item for item in sanitized if item is not None]
+    if isinstance(value, (str, int, float, bool)):
+        return _redacted_summary_field(value, limit=160)
+    return None
+
+
+def _kimi_usage_provider_metadata(
+    payload: Mapping[str, Any],
+    *,
+    parallel: Mapping[str, Any],
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    for source_key, target_key in (
+        ("domain", "domain"),
+        ("subType", "sub_type"),
+    ):
+        sanitized = _sanitize_kimi_usage_metadata_value(payload.get(source_key))
+        if sanitized not in (None, "", []):
+            metadata[target_key] = sanitized
+
+    authentication = payload.get("authentication")
+    if isinstance(authentication, Mapping):
+        for source_key, target_key in (
+            ("method", "authentication_method"),
+            ("scope", "authentication_scope"),
+        ):
+            sanitized = _sanitize_kimi_usage_metadata_value(authentication.get(source_key))
+            if sanitized not in (None, "", []):
+                metadata[target_key] = sanitized
+
+    user = payload.get("user")
+    if isinstance(user, Mapping):
+        membership = user.get("membership")
+        if isinstance(membership, Mapping):
+            level = _sanitize_kimi_usage_metadata_value(membership.get("level"))
+            if level not in (None, "", []):
+                metadata["membership_level"] = level
+        region = _sanitize_kimi_usage_metadata_value(user.get("region"))
+        if region not in (None, "", []):
+            metadata["region"] = region
+
+    if parallel.get("limit") is not None:
+        metadata["parallel_limit"] = parallel["limit"]
+    return metadata
+
+
+def _kimi_usage_account_identity(
+    payload: Mapping[str, Any],
+) -> tuple[Optional[str], list[str]]:
+    """Hash only native account IDs; never derive a durable ID from a token."""
+    user = payload.get("user")
+    if isinstance(user, Mapping):
+        identity_parts = []
+        identity_fields = []
+        for field_name in ("userId", "businessId"):
+            value = user.get(field_name)
+            if isinstance(value, (str, int)) and str(value).strip():
+                identity_parts.append(f"{field_name}={value}")
+                identity_fields.append(field_name)
+        if identity_parts:
+            material = ("kimi-code-account|" + "|".join(identity_parts)).encode("utf-8")
+            return hashlib.sha256(material).hexdigest(), identity_fields
+
+    nodes = _kimi_usage_mapping_nodes(payload)
+    for _path, mapping in nodes:
+        for field_name in ("account_id", "accountId", "user_id", "userId"):
+            value = mapping.get(field_name)
+            if isinstance(value, (str, int)) and str(value).strip():
+                material = f"kimi-code-account|{field_name}={value}".encode("utf-8")
+                return hashlib.sha256(material).hexdigest(), [field_name]
+        for container_name in ("account", "user"):
+            nested = mapping.get(container_name)
+            if isinstance(nested, Mapping):
+                value = nested.get("id")
+                if isinstance(value, (str, int)) and str(value).strip():
+                    material = (f"kimi-code-account|{container_name}.id={value}").encode("utf-8")
+                    return hashlib.sha256(material).hexdigest(), [f"{container_name}.id"]
+    return None, []
+
+
+def _build_kimi_usage_rate_limit_payloads(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    response_body: Mapping[str, Any],
+) -> tuple[list[tuple[Any, ...]], Dict[str, Any]]:
+    nodes = _kimi_usage_mapping_nodes(response_body)
+    account_hash, account_identity_fields = _kimi_usage_account_identity(response_body)
+    parallel = _parse_kimi_usage_parallel_limit(nodes)
+    provider_metadata = _kimi_usage_provider_metadata(
+        response_body,
+        parallel=parallel,
+    )
+    native_snapshots, native_handled = _parse_kimi_usage_native_windows(response_body)
+    snapshots: list[Dict[str, Any]] = []
+    window_states: Dict[str, str] = {}
+    window_sources: Dict[str, str] = {}
+    for window, definition in KIMI_USAGE_WINDOW_DEFINITIONS.items():
+        if window in native_handled:
+            snapshot = native_snapshots[window]
+        else:
+            value_present, value, _path = _find_kimi_usage_window_value(
+                nodes,
+                definition["aliases"],
+            )
+            snapshot = _parse_kimi_usage_window(
+                window,
+                value_present=value_present,
+                value=value,
+            )
+            snapshot["parser_path"] = "drift_fallback"
+        snapshots.append(snapshot)
+        window_states[window] = snapshot["state"]
+        window_sources[window] = snapshot["parser_path"]
+
+    malformed_windows = sorted(window for window, state in window_states.items() if state == "malformed")
+    valid_snapshots = [snapshot for snapshot in snapshots if snapshot["state"] in {"valid_zero", "valid_nonzero"}]
+    parser_summary: Dict[str, Any] = {
+        "source_version": KIMI_CODE_USAGE_PARSER_VERSION,
+        "native_contract_version": KIMI_CODE_USAGE_SOURCE_VERSION,
+        "window_states": window_states,
+        "window_sources": window_sources,
+        "malformed_windows": malformed_windows,
+        "parallel_state": parallel["state"],
+        "parallel_limit_present": parallel["limit"] is not None,
+        "parallel_row_emitted": False,
+        "account_identity_hashed": account_hash is not None,
+        "account_identity_fields": account_identity_fields,
+        "provider_metadata": provider_metadata,
+        "valid_window_count": len(valid_snapshots),
+    }
+    if native_handled:
+        parser_summary["parser_path"] = (
+            "native_with_drift_fallback" if len(native_handled) < len(KIMI_USAGE_WINDOW_DEFINITIONS) else "native"
+        )
+    else:
+        parser_summary["parser_path"] = "drift_fallback"
+    if not account_hash:
+        parser_summary["telemetry_status"] = "missing_account_identity"
+        return [], parser_summary
+    if not valid_snapshots:
+        parser_summary["telemetry_status"] = "malformed" if malformed_windows else "absent"
+        return [], parser_summary
+
+    parser_summary["telemetry_status"] = "partial" if malformed_windows else "valid"
+    payloads: list[tuple[Any, ...]] = []
+    for snapshot in valid_snapshots:
+        definition = KIMI_USAGE_WINDOW_DEFINITIONS[snapshot["window"]]
+        raw_provider_fields = {
+            "parser_version": KIMI_CODE_USAGE_PARSER_VERSION,
+            "source_version": KIMI_CODE_USAGE_SOURCE_VERSION,
+            "window": snapshot["window"],
+            "parser_path": snapshot["parser_path"],
+            "window_state": snapshot["state"],
+            "quota_unit": KIMI_CODE_USAGE_QUOTA_TYPE,
+            "quota_limit": snapshot["quota_limit"],
+            "quota_used": snapshot["quota_used"],
+            "quota_remaining": snapshot["quota_remaining"],
+            "reset_at_state": snapshot["reset_state"],
+            "period_start_state": snapshot["start_state"],
+            "parallel_limit": parallel["limit"],
+            "parallel_state": parallel["state"],
+            "provider_metadata": provider_metadata,
+        }
+        evidence = {
+            "signals": [
+                "kimi_code_usage_payload",
+                "kimi_code_native_quota_window",
+            ],
+            "parser_version": KIMI_CODE_USAGE_PARSER_VERSION,
+            "source_version": KIMI_CODE_USAGE_SOURCE_VERSION,
+            "telemetry_status": parser_summary["telemetry_status"],
+            "window_state": snapshot["state"],
+            "window_parser_path": snapshot["parser_path"],
+            "account_identity_fields": account_identity_fields,
+            "provider_metadata_keys": sorted(provider_metadata),
+            "parallel_row_emitted": False,
+            "unit_note": (
+                "Native Kimi Code quota values are preserved as quota units; " "they are not interpreted as tokens."
+            ),
+        }
+        if snapshot["usage_exceeds_limit"]:
+            evidence["signals"].append("kimi_code_usage_exceeds_limit")
+        payloads.append(
+            (
+                observed_at,
+                KIMI_CODE_USAGE_CLIENT,
+                None,
+                account_hash,
+                "kimi_code",
+                KIMI_CODE_USAGE_MODEL,
+                definition["quota_key"],
+                snapshot["window"],
+                KIMI_CODE_USAGE_QUOTA_TYPE,
+                snapshot["expected_reset_at"],
+                snapshot["remaining_pct"],
+                snapshot["quota_limit"],
+                snapshot["quota_used"],
+                snapshot["quota_remaining"],
+                snapshot["billing_period_start_at"],
+                snapshot["billing_period_end_at"],
+                json.dumps(raw_provider_fields, sort_keys=True),
+                json.dumps(evidence, sort_keys=True),
+                KIMI_CODE_USAGE_SOURCE,
+                None,
+                None,
+                f"kimi-code-usage-poll-{observed_at.strftime('%Y%m%d%H%M%S')}",
+            )
+        )
+    return payloads, parser_summary
+
+
+def _set_kimi_usage_database_timeouts(
+    cur: Any,
+    *,
+    lock_timeout_ms: int,
+    statement_timeout_ms: int,
+) -> None:
+    cur.execute(
+        "SELECT set_config('application_name', %s, false)",
+        (f"{probes._provider_status_db_application_name()}-kimi-usage",),
+    )
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{statement_timeout_ms}ms",),
+    )
+
+
+def _persist_kimi_usage_observations(
+    config: ProviderStatusLoopConfig,
+    payloads: Sequence[tuple[Any, ...]],
+) -> int:
+    if not payloads:
+        return 0
+    dsn = _resolve_dsn(config)
+    inserted_count = 0
+    try:
+        with probes.psycopg.connect(dsn) as conn:
+            try:
+                with conn.cursor() as cur:
+                    _set_kimi_usage_database_timeouts(
+                        cur,
+                        lock_timeout_ms=config.db_lock_timeout_ms,
+                        statement_timeout_ms=config.db_statement_timeout_ms,
+                    )
+                    for payload in payloads:
+                        cur.execute(GROK_BILLING_RATE_LIMIT_INSERT_SQL, payload)
+                        inserted_count += max(0, cur.rowcount)
+            except (
+                probes.psycopg.errors.LockNotAvailable,
+                probes.psycopg.errors.QueryCanceled,
+            ) as exc:
+                conn.rollback()
+                raise probes.ProviderStatusDatabaseWriteSkipped(
+                    error_class=exc.__class__.__name__,
+                    message=str(exc),
+                ) from exc
+    except probes.ProviderStatusDatabaseWriteSkipped:
+        raise
+    return inserted_count
+
+
 def _load_grok_billing_auth_context(auth_file: str) -> Dict[str, Any]:
     payload = grok_oidc_refresh._read_credential_payload(Path(auth_file).expanduser())
     scope = grok_oidc_refresh._resolve_scope(None)
@@ -3518,9 +4574,7 @@ def _load_grok_billing_auth_context(auth_file: str) -> Dict[str, Any]:
                 "access_token": token.strip(),
                 "identity_headers": _grok_billing_identity_headers(credential),
             }
-    raise ValueError(
-        "Grok OIDC auth file does not contain a usable access token for billing poll."
-    )
+    raise ValueError("Grok OIDC auth file does not contain a usable access token for billing poll.")
 
 
 def _grok_billing_identity_headers(
@@ -3536,10 +4590,7 @@ def _grok_billing_identity_headers(
             missing_fields.append(credential_field)
     if missing_fields:
         joined_fields = ", ".join(sorted(missing_fields))
-        raise ValueError(
-            "Grok OIDC auth file does not contain required billing identity "
-            f"fields: {joined_fields}."
-        )
+        raise ValueError("Grok OIDC auth file does not contain required billing identity " f"fields: {joined_fields}.")
     return headers
 
 
@@ -4966,6 +6017,170 @@ def _run_xai_oauth_refresh_task(
     return event
 
 
+def _run_kimi_oauth_refresh_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.kimi_oauth_refresh_enabled:
+        return None
+    last_attempt = state.kimi_oauth_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt < config.kimi_oauth_refresh_interval_seconds
+    ):
+        return None
+
+    state.kimi_oauth_last_attempt_monotonic = now_monotonic
+    try:
+        summary = kimi_oauth_refresh.refresh_kimi_oauth_auth_file(
+            config.kimi_oauth_auth_file,
+            force=config.kimi_oauth_force_refresh,
+            lock_file=config.kimi_oauth_lock_file,
+            http_timeout_seconds=config.kimi_oauth_http_timeout_seconds,
+        )
+    except Exception as exc:
+        summary = {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.kimi_oauth_auth_file,
+            "scope": kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_SCOPE,
+            "error_class": exc.__class__.__name__,
+            "error_message": _redacted_failure_message(str(exc)),
+        }
+    else:
+        error_message = summary.get("error_message")
+        if error_message:
+            summary["error_message"] = _redacted_failure_message(error_message)
+
+    safe_summary = {
+        key: summary.get(key)
+        for key in (
+            "attempted",
+            "refreshed",
+            "skipped",
+            "auth_file",
+            "scope",
+            "expires_at",
+            "auth_degraded",
+            "error_class",
+            "error_message",
+        )
+    }
+    event = {
+        "event": "kimi_oauth_refresh",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        **safe_summary,
+    }
+    (
+        persisted,
+        inserted_count,
+        skip_error_class,
+        skip_reason,
+    ) = _persist_kimi_oauth_auth_observation(config, event)
+    event["auth_observation_status"] = _provider_auth_status_from_event(event)
+    event["auth_observation_persisted"] = persisted
+    event["auth_observation_inserted_count"] = inserted_count
+    event["auth_observation_skip_error_class"] = skip_error_class
+    event["auth_observation_skip_reason"] = skip_reason
+    if event.get("refreshed") and config.kimi_usage_poll_enabled:
+        state.kimi_usage_refresh_pending = True
+    return event
+
+
+def _run_kimi_usage_poll_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.kimi_usage_poll_enabled:
+        return None
+    refresh_triggered = state.kimi_usage_refresh_pending
+    last_attempt = state.kimi_usage_last_attempt_monotonic
+    if (
+        not refresh_triggered
+        and last_attempt is not None
+        and now_monotonic - last_attempt < config.kimi_usage_poll_interval_seconds
+    ):
+        return None
+
+    state.kimi_usage_last_attempt_monotonic = now_monotonic
+    state.kimi_usage_refresh_pending = False
+    observed_at = datetime.now(timezone.utc)
+    summary: Dict[str, Any] = {
+        "attempted": True,
+        "persisted": False,
+        "skipped": False,
+        "trigger": "oauth_refresh" if refresh_triggered else "interval",
+        "credential_source": config.kimi_oauth_auth_file_source,
+        "usage_url": DEFAULT_KIMI_USAGE_URL,
+        "observation_count": 0,
+        "inserted_count": 0,
+        "status_code": None,
+        "attempt_count": 0,
+        "retry_count": 0,
+        "refresh_attempted": False,
+        "refresh_succeeded": False,
+        "telemetry_class": None,
+        "telemetry_status": None,
+        "error_class": None,
+        "error_message": None,
+    }
+    try:
+        fetched = _fetch_kimi_usage_payload(config)
+        summary["status_code"] = fetched["status_code"]
+        for field_name in (
+            "attempt_count",
+            "retry_count",
+            "refresh_attempted",
+            "refresh_succeeded",
+        ):
+            summary[field_name] = fetched.get(field_name, summary[field_name])
+        payloads, parser_summary = _build_kimi_usage_rate_limit_payloads(
+            config,
+            observed_at=observed_at,
+            response_body=fetched["payload"],
+        )
+        summary.update(parser_summary)
+        summary["observation_count"] = len(payloads)
+        if config.apply:
+            summary["inserted_count"] = _persist_kimi_usage_observations(
+                config,
+                payloads,
+            )
+            summary["persisted"] = bool(payloads)
+        if summary["telemetry_status"] in {
+            "malformed",
+            "missing_account_identity",
+        }:
+            summary["telemetry_class"] = "malformed_telemetry"
+    except Exception as exc:
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
+        if isinstance(exc, KimiUsagePollError):
+            summary["status_code"] = exc.status_code
+            summary["telemetry_class"] = exc.telemetry_class
+            summary["attempt_count"] = exc.attempt_count
+            summary["retry_count"] = exc.retry_count
+            summary["refresh_attempted"] = exc.refresh_attempted
+            summary["refresh_succeeded"] = exc.refresh_succeeded
+        elif isinstance(exc, kimi_oauth_refresh.KimiOAuthError):
+            summary["telemetry_class"] = "auth"
+        else:
+            summary["telemetry_class"] = "malformed_telemetry"
+
+    return {
+        "event": "kimi_usage_poll",
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        **summary,
+    }
+
+
 def _run_grok_billing_poll_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -4975,10 +6190,7 @@ def _run_grok_billing_poll_task(
     if not config.grok_billing_poll_enabled:
         return None
     last_attempt = state.grok_billing_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt < config.grok_billing_poll_interval_seconds
-    ):
+    if last_attempt is not None and now_monotonic - last_attempt < config.grok_billing_poll_interval_seconds:
         return None
 
     state.grok_billing_last_attempt_monotonic = now_monotonic
@@ -5064,11 +6276,7 @@ def _run_observability_anomaly_scan_task(
     if not config.observability_anomaly_scan_enabled:
         return None
     last_attempt = state.observability_anomaly_scan_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt
-        < config.observability_anomaly_scan_interval_seconds
-    ):
+    if last_attempt is not None and now_monotonic - last_attempt < config.observability_anomaly_scan_interval_seconds:
         return None
 
     state.observability_anomaly_scan_last_attempt_monotonic = now_monotonic
@@ -5131,6 +6339,8 @@ def run_due_sidecar_tasks(
         (_run_grok_oidc_refresh_task, "grok_oidc_refresh"),
         (_run_codex_oauth_refresh_task, "codex_oauth_refresh"),
         (_run_xai_oauth_refresh_task, "xai_oauth_refresh"),
+        (_run_kimi_oauth_refresh_task, "kimi_oauth_refresh"),
+        (_run_kimi_usage_poll_task, "kimi_usage_poll"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
         (_run_codex_reset_credit_poll_task, "codex_reset_credit_poll"),
         (_run_observability_anomaly_scan_task, "observability_anomaly_scan"),
@@ -5246,9 +6456,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         remaining_seconds = config.interval_seconds - (time.monotonic() - cycle_started)
         while remaining_seconds > 0 and not stopping:
             time.sleep(min(remaining_seconds, 1.0))
-            remaining_seconds = config.interval_seconds - (
-                time.monotonic() - cycle_started
-            )
+            remaining_seconds = config.interval_seconds - (time.monotonic() - cycle_started)
 
     _emit(
         {

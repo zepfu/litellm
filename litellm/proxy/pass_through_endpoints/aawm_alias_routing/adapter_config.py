@@ -165,6 +165,30 @@ OPENCODE_ZEN_COMPLETION = AnthropicCompletionAdapterConfig(
     custom_llm_provider="openai",  # OpenCode uses OpenAI-compatible base
 )
 
+CODEX_KIMI_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
+    adapter="codex_kimi_chat_completions_adapter",
+    adapter_label="Kimi Code",
+    route_family="codex_kimi_chat_completions_adapter",
+    tag_prefix="codex-kimi-chat-completions-adapter",
+    span_name="codex.kimi_chat_completions_adapter",
+    target_endpoint_label="kimi_code:/coding/v1/chat/completions",
+    credential_family="kimi_code",
+    expected_target_family="kimi_code",
+    custom_llm_provider="kimi_code",
+)
+
+ANTHROPIC_KIMI_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
+    adapter="anthropic_kimi_chat_completions_adapter",
+    adapter_label="Kimi Code",
+    route_family="anthropic_kimi_chat_completions_adapter",
+    tag_prefix="anthropic-kimi-chat-completions-adapter",
+    span_name="anthropic.kimi_chat_completions_adapter",
+    target_endpoint_label="kimi_code:/coding/v1/chat/completions",
+    credential_family="kimi_code",
+    expected_target_family="kimi_code",
+    custom_llm_provider="kimi_code",
+)
+
 
 def responses_finalize_kwargs(
     config: AnthropicResponsesAdapterConfig,

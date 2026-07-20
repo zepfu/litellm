@@ -574,6 +574,7 @@ deepgram_models: Set = set()
 elevenlabs_models: Set = set()
 dashscope_models: Set = set()
 moonshot_models: Set = set()
+kimi_code_models: Set = set()
 publicai_models: Set = set()
 v0_models: Set = set()
 morph_models: Set = set()
@@ -819,6 +820,8 @@ def add_known_models(model_cost_map: Optional[Dict] = None):
             dashscope_models.add(key)
         elif value.get("litellm_provider") == "moonshot":
             moonshot_models.add(key)
+        elif value.get("litellm_provider") == "kimi_code":
+            kimi_code_models.add(key)
         elif value.get("litellm_provider") == "publicai":
             publicai_models.add(key)
         elif value.get("litellm_provider") == "v0":
@@ -961,6 +964,7 @@ model_list = list(
     | elevenlabs_models
     | dashscope_models
     | moonshot_models
+    | kimi_code_models
     | publicai_models
     | v0_models
     | morph_models
@@ -1060,6 +1064,7 @@ models_by_provider: dict = {
     "heroku": heroku_models,
     "dashscope": dashscope_models,
     "moonshot": moonshot_models,
+    "kimi_code": kimi_code_models,
     "publicai": publicai_models,
     "v0": v0_models,
     "morph": morph_models,
@@ -1834,6 +1839,9 @@ if TYPE_CHECKING:
     from .llms.moonshot.chat.transformation import (
         MoonshotChatConfig as MoonshotChatConfig,
     )
+    from .llms.kimi_code.chat.transformation import (
+        KimiCodeChatConfig as KimiCodeChatConfig,
+    )
     from .llms.docker_model_runner.chat.transformation import (
         DockerModelRunnerChatConfig as DockerModelRunnerChatConfig,
     )
@@ -1978,6 +1986,11 @@ if os.getenv("LITELLM_DISABLE_LAZY_LOADING", "").lower() in ("1", "true", "yes",
 def __getattr__(name: str) -> Any:
     """Lazy import handler with cached registry for improved performance."""
     global _async_client_cleanup_registered
+    if name == "KimiCodeChatConfig":
+        from .llms.kimi_code.chat.transformation import KimiCodeChatConfig
+
+        return KimiCodeChatConfig
+
     # Register async client cleanup on first access (only once)
     if not _async_client_cleanup_registered:
         from litellm.llms.custom_httpx.async_client_cleanup import (

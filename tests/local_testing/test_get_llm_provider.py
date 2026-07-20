@@ -1,11 +1,9 @@
 import os
 import sys
-import traceback
 
 from dotenv import load_dotenv
 
 load_dotenv()
-import io
 
 from unittest.mock import patch
 
@@ -94,9 +92,6 @@ def test_get_llm_provider_ai21_chat_test2():
         model="ai21/jamba-1.5-large",
     )
 
-    print("model=", model)
-    print("custom_llm_provider=", custom_llm_provider)
-    print("api_base=", api_base)
     assert custom_llm_provider == "ai21_chat"
     assert model == "jamba-1.5-large"
     assert api_base == "https://api.ai21.com/studio/v1"
@@ -110,9 +105,6 @@ def test_get_llm_provider_cohere_chat_test2():
         model="cohere/command-r-plus",
     )
 
-    print("model=", model)
-    print("custom_llm_provider=", custom_llm_provider)
-    print("api_base=", api_base)
     assert custom_llm_provider == "cohere_chat"
     assert model == "command-r-plus"
 
@@ -137,8 +129,8 @@ def test_default_api_base():
             # Get the API base for the given provider
             if provider == "github_copilot":
                 continue
-            # Skip chatgpt as it requires OAuth authentication
-            if provider == "chatgpt":
+            # Skip managed OAuth providers that require a live local credential.
+            if provider in {"chatgpt", "kimi_code"}:
                 continue
             # Skip ragflow as it requires specific model format: ragflow/chat/{id}/{model} or ragflow/agent/{id}/{model}
             if provider == "ragflow":
@@ -337,8 +329,6 @@ def test_get_llm_provider_LITELLM_PROXY_ALWAYS_true():
     }, clear=True):
         model, provider, key, base = litellm.get_llm_provider(model=test_model_input)
     
-    print("get_llm_provider", model, provider, key, base)
-
     assert model == expected_model_output
     assert provider == "litellm_proxy"
     assert key == proxy_api_key

@@ -39,6 +39,7 @@
     "claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools",
     "claude_adapter_anthropic_claude_sonnet_4_6_child_parallel_read_tools",
     "claude_adapter_aawm_code_anthropic_alias_child_parallel_read_tools",
+    "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation",
     "claude_adapter_opencode_zen_deepseek_v4_flash_child_parallel_read_tools",
     "claude_adapter_opencode_zen_big_pickle_child_parallel_read_tools",
     "claude_adapter_peeromega_fanout",
@@ -3423,6 +3424,206 @@
           "tools"
         ]
       }
+    },
+    "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation": {
+      "moonshot_anthropic_agentic_only": true,
+      "failure_context": "Moonshot Anthropic Messages adapter (anthropic_kimi_chat_completions_adapter, alias aawm-sota-moonshot)",
+      "verification_alias": "aawm-sota-moonshot",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "agentic-tool-continuation",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-max",
+          "route_family": "anthropic_kimi_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-high",
+          "route_family": "anthropic_kimi_chat_completions_adapter"
+        }
+      ],
+      "command": [
+        "claude",
+        "-p",
+        "Dispatch to the sota-moonshot agent. Do not perform these steps yourself; wait for the actual child response. The child must call Read on scripts/local-ci/sequential_core_tools_fixture.txt in its first assistant message with no text. After the Read tool result, the child must call Grep with pattern exactly `sequential-core-tools-grep`, path exactly `scripts/local-ci/sequential_core_tools_fixture.txt`, and output_mode exactly `content` in a second assistant message with no text. After the Grep tool result, the child must stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: MOONSHOT ANTHROPIC AGENTIC TOOL CONTINUATION PASSED",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "sota-moonshot": {
+          "description": "Canonical Moonshot SOTA acceptance profile for Anthropic Messages tool-result continuation.",
+          "model": "aawm-sota-moonshot",
+          "effort": "max",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Grep"
+          ],
+          "prompt": "You are the deterministic sota-moonshot acceptance profile. This is not a repository investigation. Your first assistant message must contain exactly one Read tool_use block and no text for scripts/local-ci/sequential_core_tools_fixture.txt. After the Read tool result, your next assistant message must contain exactly one Grep tool_use block and no text for pattern `sequential-core-tools-grep`, path `scripts/local-ci/sequential_core_tools_fixture.txt`, output_mode `content`. After the Grep tool result, do not call more tools and return only the caller's exact final line."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.sota-moonshot"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.sota-moonshot": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_kimi_chat_completions_adapter",
+        "anthropic-kimi-chat-completions-adapter",
+        "model-alias:aawm-sota-moonshot",
+        "anthropic-auto-agent-alias:aawm-sota-moonshot"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family",
+        "anthropic_auto_agent_selected_provider",
+        "anthropic_auto_agent_selected_model",
+        "anthropic_auto_agent_selected_route_family"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "tools"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_contains": {
+          "result": "MOONSHOT ANTHROPIC AGENTIC TOOL CONTINUATION PASSED"
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "kimi_code"
+              ],
+              "model": [
+                "k3-max",
+                "k3-high"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "aawm-sota-moonshot",
+              "requested_model_alias": "aawm-sota-moonshot",
+              "anthropic_auto_agent_alias": "aawm-sota-moonshot"
+            },
+            "metadata_required_truthy": [
+              "anthropic_auto_agent_selected_provider",
+              "anthropic_auto_agent_selected_model",
+              "anthropic_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 1
+          },
+          {
+            "tool_name": "Read",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential_core_tools_fixture.txt"
+          },
+          {
+            "tool_name": "Grep",
+            "tool_kind": "read",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "arguments_required_substring": "sequential-core-tools-grep"
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 20,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "sota-moonshot",
+            "expected_tool_counts": {
+              "Read": 1,
+              "Grep": 1
+            },
+            "expected_tool_sequence": [
+              "Read",
+              "Grep"
+            ],
+            "minimum_total_tool_uses": 2,
+            "maximum_total_tool_uses": 2,
+            "maximum_tool_uses_per_assistant_message": 1,
+            "require_tool_result_before_next_tool_use": true,
+            "forbid_tool_result_errors": true
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 90,
+      "allow_zero_cost": true
     },
     "claude_adapter_opencode_zen_deepseek_v4_flash_child_parallel_read_tools": {
       "command": [

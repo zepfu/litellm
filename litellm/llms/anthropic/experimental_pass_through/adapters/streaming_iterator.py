@@ -4,6 +4,7 @@ import json
 import os
 import traceback
 from collections import deque
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Iterator, Literal, Optional
 
 from litellm import verbose_logger
@@ -1106,8 +1107,23 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         Async version of anthropic_sse_wrapper.
         Convert AnthropicStreamWrapper dict chunks to Server-Sent Events format.
         """
-        async for chunk in self:
-            yield encode_anthropic_sse_chunk(chunk)
+        try:
+            async for chunk in self:
+                yield encode_anthropic_sse_chunk(chunk)
+        finally:
+            close_fn = getattr(self.completion_stream, "aclose", None)
+            if not callable(close_fn):
+                close_fn = getattr(self.completion_stream, "close", None)
+            if callable(close_fn):
+                try:
+                    close_result = close_fn()
+                    if isawaitable(close_result):
+                        await close_result
+                except BaseException:
+                    verbose_logger.debug(
+                        "Failed to close Anthropic completion adapter stream",
+                        exc_info=True,
+                    )
 
     def _increment_content_block_index(self):
         self.current_content_block_index += 1

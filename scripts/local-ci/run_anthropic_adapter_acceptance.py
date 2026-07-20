@@ -54,6 +54,12 @@ DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS = [
     'runtime logs contained forbidden substring',
     'successful empty',
 ]
+MOONSHOT_ANTHROPIC_AGENTIC_CASE = "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation"
+MOONSHOT_ANTHROPIC_AGENTIC_FLAG = "moonshot_anthropic_agentic_only"
+MOONSHOT_ANTHROPIC_ADAPTER_PATH = "anthropic_kimi_chat_completions_adapter"
+MOONSHOT_CANONICAL_ALIAS = "aawm-sota-moonshot"
+MOONSHOT_AGENT_PROFILE = "sota-moonshot"
+MOONSHOT_SELECTED_MODELS = {"kimi_code/k3-max", "kimi_code/k3-high"}
 ATTRIBUTION_SCOPED_RUNTIME_LOG_SUBSTRINGS = {
     *DEFAULT_RUNTIME_LOG_FORBIDDEN_SUBSTRINGS,
     *DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS,
@@ -258,6 +264,215 @@ def _append_claude_agents_arg(command: list[Any], agents: Any) -> list[Any]:
     ]
 
 
+def _validate_moonshot_anthropic_agentic_contract(  # noqa: PLR0915
+    *,
+    family: str,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Reject a Moonshot case that regresses to a raw completion smoke test."""
+    is_moonshot_case = family == MOONSHOT_ANTHROPIC_AGENTIC_CASE or bool(config.get(MOONSHOT_ANTHROPIC_AGENTIC_FLAG))
+    if not is_moonshot_case:
+        return {}, []
+
+    context = (
+        "Moonshot Anthropic Messages adapter contract "
+        f"({MOONSHOT_ANTHROPIC_ADAPTER_PATH}, alias {MOONSHOT_CANONICAL_ALIAS})"
+    )
+    failures: list[str] = []
+
+    def _require(condition: bool, requirement: str) -> None:
+        if not condition:
+            failures.append(f"{context} {requirement}")
+
+    command = config.get("command")
+    if not isinstance(command, list):
+        command = []
+    command_values = [str(value) for value in command]
+    command_prompt = ""
+    if "-p" in command_values:
+        prompt_index = command_values.index("-p") + 1
+        if prompt_index < len(command_values):
+            command_prompt = command_values[prompt_index]
+    allowed_tools = None
+    if "--allowedTools" in command_values:
+        tools_index = command_values.index("--allowedTools") + 1
+        if tools_index < len(command_values):
+            allowed_tools = command_values[tools_index]
+
+    _require(
+        config.get(MOONSHOT_ANTHROPIC_AGENTIC_FLAG) is True,
+        "must set moonshot_anthropic_agentic_only=true",
+    )
+    _require(
+        not isinstance(config.get("http_request"), dict),
+        "must launch the Claude agent runtime, not an HTTP smoke request",
+    )
+    _require(
+        command_values[:1] == ["claude"],
+        "must launch the Claude CLI for Anthropic Messages ingress",
+    )
+    _require(
+        "--model" not in command_values and "-m" not in command_values,
+        "must not use a direct --model selector in place of the child profile",
+    )
+    _require(
+        allowed_tools == "Agent",
+        "must require top-level Agent tool dispatch",
+    )
+    _require(
+        "Dispatch to the sota-moonshot agent" in command_prompt,
+        "must dispatch the sota-moonshot agent profile",
+    )
+    _require(
+        "tool result" in command_prompt.lower(),
+        "must require continuation after tool results",
+    )
+
+    agents = config.get("claude_agents")
+    _require(
+        isinstance(agents, dict) and set(agents) == {MOONSHOT_AGENT_PROFILE},
+        "must define exactly the sota-moonshot child profile",
+    )
+    agent_config = agents.get(MOONSHOT_AGENT_PROFILE) if isinstance(agents, dict) else None
+    if not isinstance(agent_config, dict):
+        agent_config = {}
+    _require(
+        agent_config.get("model") == MOONSHOT_CANONICAL_ALIAS,
+        "must select the canonical aawm-sota-moonshot alias",
+    )
+    _require(
+        agent_config.get("tools") == ["Read", "Grep"],
+        "must expose the deterministic Read then Grep tool sequence",
+    )
+    agent_prompt = agent_config.get("prompt")
+    _require(
+        isinstance(agent_prompt, str)
+        and "After the Read tool result" in agent_prompt
+        and "After the Grep tool result" in agent_prompt,
+        "must require tool-result continuation before the child final answer",
+    )
+
+    declared_candidates = config.get("verification_declared_candidates")
+    declared_pairs = (
+        {
+            (candidate.get("model"), candidate.get("route_family"))
+            for candidate in declared_candidates
+            if isinstance(candidate, dict)
+        }
+        if isinstance(declared_candidates, list)
+        else set()
+    )
+    _require(
+        config.get("verification_alias") == MOONSHOT_CANONICAL_ALIAS,
+        "must report the canonical Moonshot alias",
+    )
+    _require(
+        declared_pairs == {(model, MOONSHOT_ANTHROPIC_ADAPTER_PATH) for model in MOONSHOT_SELECTED_MODELS},
+        "must declare only k3-max and k3-high through the Moonshot adapter",
+    )
+
+    _require(
+        config.get("allowed_generation_routes") == ["/anthropic/v1/messages"],
+        "must validate Anthropic Messages ingress only",
+    )
+    required_trace_tags = set(config.get("required_trace_tags") or [])
+    _require(
+        {
+            "route:anthropic_messages",
+            f"route:{MOONSHOT_ANTHROPIC_ADAPTER_PATH}",
+            "anthropic-kimi-chat-completions-adapter",
+            f"model-alias:{MOONSHOT_CANONICAL_ALIAS}",
+            f"anthropic-auto-agent-alias:{MOONSHOT_CANONICAL_ALIAS}",
+        }
+        <= required_trace_tags,
+        "must require Moonshot adapter route and alias trace tags",
+    )
+    _require(
+        f"claude-code.{MOONSHOT_AGENT_PROFILE}" in set(config.get("required_trace_names") or []),
+        "must require the sota-moonshot child trace",
+    )
+
+    transcript_validation = config.get("transcript_tool_use_validation")
+    expected_agents = transcript_validation.get("expected_agents") if isinstance(transcript_validation, dict) else None
+    expected_agent = (
+        expected_agents[0]
+        if isinstance(expected_agents, list) and len(expected_agents) == 1 and isinstance(expected_agents[0], dict)
+        else {}
+    )
+    _require(
+        expected_agent.get("agent_type") == MOONSHOT_AGENT_PROFILE,
+        "must validate the sota-moonshot child transcript",
+    )
+    _require(
+        expected_agent.get("expected_tool_counts") == {"Read": 1, "Grep": 1}
+        and expected_agent.get("expected_tool_sequence") == ["Read", "Grep"]
+        and expected_agent.get("require_tool_result_before_next_tool_use") is True
+        and expected_agent.get("maximum_tool_uses_per_assistant_message") == 1,
+        "must require sequential tool use with tool-result replay",
+    )
+
+    command_json_checks = config.get("command_json_checks")
+    required_result = (
+        command_json_checks.get("required_contains", {}).get("result")
+        if isinstance(command_json_checks, dict) and isinstance(command_json_checks.get("required_contains"), dict)
+        else None
+    )
+    _require(
+        required_result == "MOONSHOT ANTHROPIC AGENTIC TOOL CONTINUATION PASSED",
+        "must require the final agentic completion marker",
+    )
+
+    session_validation = config.get("session_history_validation")
+    expected_rows = session_validation.get("expected_rows") if isinstance(session_validation, dict) else None
+    session_row = (
+        expected_rows[0]
+        if isinstance(expected_rows, list) and len(expected_rows) == 1 and isinstance(expected_rows[0], dict)
+        else {}
+    )
+    required_one_of = session_row.get("required_one_of")
+    metadata_required_equals = session_row.get("metadata_required_equals")
+    metadata_required_truthy = set(session_row.get("metadata_required_truthy") or [])
+    _require(
+        isinstance(required_one_of, dict)
+        and set(required_one_of.get("provider") or []) == {"kimi_code"}
+        and set(required_one_of.get("model") or []) == {"k3-max", "k3-high"},
+        "must require Kimi Code k3-max or k3-high session metadata",
+    )
+    _require(
+        isinstance(metadata_required_equals, dict)
+        and metadata_required_equals.get("model_alias_label") == MOONSHOT_CANONICAL_ALIAS
+        and metadata_required_equals.get("requested_model_alias") == MOONSHOT_CANONICAL_ALIAS
+        and metadata_required_equals.get("anthropic_auto_agent_alias") == MOONSHOT_CANONICAL_ALIAS,
+        "must require canonical alias metadata in session history",
+    )
+    _require(
+        {
+            "anthropic_auto_agent_selected_provider",
+            "anthropic_auto_agent_selected_model",
+            "anthropic_auto_agent_selected_route_family",
+            "aawm_alias_routing_audit_events",
+        }
+        <= metadata_required_truthy,
+        "must require selected Moonshot adapter metadata in session history",
+    )
+    _require(
+        not bool(config.get("warning_only")) and not bool(config.get("skip_generation_quality_checks")),
+        "must not downgrade the agentic acceptance path to a warning or smoke check",
+    )
+
+    return {
+        "adapter_path": MOONSHOT_ANTHROPIC_ADAPTER_PATH,
+        "canonical_alias": MOONSHOT_CANONICAL_ALIAS,
+        "agent_profile": MOONSHOT_AGENT_PROFILE,
+        "allowed_generation_routes": config.get("allowed_generation_routes"),
+        "declared_models": sorted(
+            model
+            for model, route_family in declared_pairs
+            if route_family == MOONSHOT_ANTHROPIC_ADAPTER_PATH and isinstance(model, str)
+        ),
+    }, failures
+
+
 def _docker_status_for_container(container_name: str) -> str:
     try:
         result = subprocess.run(
@@ -318,7 +533,7 @@ def _target_profile_settings(
     return profile
 
 
-def _apply_target_profile_to_config(
+def _apply_target_profile_to_config(  # noqa: PLR0915
     config: dict[str, Any],
     *,
     target: str,
@@ -352,7 +567,7 @@ def _apply_target_profile_to_config(
             updated_case.get('skip_trace_environment_validation')
         )
         if skip_trace_environment_validation:
-            updated_case.pop('expected_trace_environment', None)
+            updated_case.pop("expected_trace_environment", None)
         else:
             updated_case['expected_trace_environment'] = profile[
                 'expected_trace_environment'
@@ -976,7 +1191,7 @@ def _preview_request_payload_value(value: Any) -> str:
     return RA._preview_request_body_path_value(value)
 
 
-def _validate_logged_request_payload_checks(
+def _validate_logged_request_payload_checks(  # noqa: PLR0915
     *,
     family: str,
     observations: list[dict[str, Any]],
@@ -1009,9 +1224,7 @@ def _validate_logged_request_payload_checks(
     required_equals_observed: dict[str, list[str]] = {
         str(path): [] for path in required_equals
     }
-    required_one_of_found: dict[str, bool] = {
-        str(path): False for path in required_one_of
-    }
+    required_one_of_found: dict[str, bool] = {str(path): False for path in required_one_of}
     required_one_of_observed: dict[str, list[str]] = {
         str(path): [] for path in required_one_of
     }
@@ -1776,7 +1989,7 @@ def _validate_runtime_logs(
     return summary, failures, warnings
 
 
-def _validate_session_history(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def _validate_session_history(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:  # noqa: PLR0915
     if not session_id:
         return {'record': None}, [f'{family} missing command session_id for session_history validation']
 
@@ -1795,7 +2008,7 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     expected_litellm_environment = checks.get('expected_litellm_environment')
     require_runtime_identity = checks.get('require_runtime_identity', True) is not False
 
-    query = '''
+    query = """
         select provider, model, session_id, tenant_id, repository,
                input_tokens, output_tokens, total_tokens,
                cache_read_input_tokens, cache_creation_input_tokens,
@@ -1824,7 +2037,7 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
         from public.session_history
         where session_id = %s
         order by start_time desc
-    '''
+    """
     conn = _validation_db_connection(db_settings)
     poll_timeout_seconds = max(0.0, float(checks.get('poll_timeout_seconds') or 0))
     poll_interval_seconds = max(0.1, float(checks.get('poll_interval_seconds') or 1))
@@ -2554,7 +2767,7 @@ def _validate_rate_limit_observations(
     }, match_failures, warnings
 
 
-def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:  # noqa: PLR0915
     if not session_id:
         return {'record': None, 'records': []}, [f'{family} missing command session_id for tool_activity validation']
 
@@ -2592,10 +2805,10 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
             matches = [
                 row
                 for row in records
-                if (row_provider is None or row.get('provider') == row_provider)
-                and (row_model is None or row.get('model') == row_model)
-                and (row_tool_name is None or row.get('tool_name') == row_tool_name)
-                and (row_tool_kind is None or row.get('tool_kind') == row_tool_kind)
+                if (row_provider is None or row.get("provider") == row_provider)
+                and (row_model is None or row.get("model") == row_model)
+                and (row_tool_name is None or row.get("tool_name") == row_tool_name)
+                and (row_tool_kind is None or row.get("tool_kind") == row_tool_kind)
             ]
             minimum_count = int(expected_row.get('minimum_count') or 1)
             if len(matches) < minimum_count:
@@ -2980,7 +3193,7 @@ def _tool_count_bounds(expected: Any) -> tuple[int, int | None]:
     return minimum, maximum
 
 
-def _validate_transcript_agent_tool_uses(
+def _validate_transcript_agent_tool_uses(  # noqa: PLR0915
     *,
     family: str,
     session_id: str,
@@ -3334,7 +3547,7 @@ def _http_request_repeat_delay_seconds(config: dict[str, Any]) -> float:
         return 0.0
 
 
-def _run_http_request(config: dict[str, Any]) -> dict[str, Any]:
+def _run_http_request(config: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0915
     request_config = dict(config.get('http_request') or {})
     method = str(request_config.get('method') or 'POST').upper()
     base_url = str(request_config.get('litellm_base_url') or '').rstrip('/')
@@ -3554,7 +3767,7 @@ def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, A
     return final_started, final_run, attempts
 
 
-def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_key: str, secret_key: str, litellm_base_url: str) -> dict[str, Any]:
+def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_key: str, secret_key: str, litellm_base_url: str) -> dict[str, Any]:  # noqa: PLR0915
     started, run, command_attempts = _run_command_with_retry(config=config)
     command_session_id = _extract_command_session_id(run['stdout'])
     if (
@@ -3595,7 +3808,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             user_id=lookup_user_id,
             start_time=started,
             limit=100,
-            timeout_seconds=int(config.get('langfuse_poll_timeout_seconds', 60)),
+            timeout_seconds=int(config.get("langfuse_poll_timeout_seconds", 60)),
         )
     elif can_session_trace_lookup:
         traces, lookup_error = RA._poll_langfuse_session_traces(
@@ -3840,6 +4053,11 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     )
     warnings.extend(downgraded_warnings)
 
+    failure_context = config.get('failure_context')
+    if isinstance(failure_context, str) and failure_context:
+        failures = [f'{failure_context}: {failure}' for failure in failures]
+        warnings = [f'{failure_context}: {warning}' for warning in warnings]
+
     unique_failures = sorted(set(failures))
     unique_warnings = sorted(set(warnings))
     warning_only = bool(config.get('warning_only'))
@@ -3869,47 +4087,47 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
 
     return {
         **run,
-        'streaming_checked': config.get('streaming_checked', False),
-        'warning_only': warning_only,
-        'command_attempts': command_attempts,
-        'langfuse': {
-            'required_trace_names': expected_trace_names,
-            'actual_trace_names': actual_trace_names,
-            'expected_user_ids': expected_user_ids,
-            'actual_user_ids': actual_user_ids,
-            'expected_trace_user_ids_by_name': expected_trace_user_ids_by_name,
-            'trace_user_ids_by_name': trace_user_ids_by_name_summary,
-            'trace_ids': trace_ids,
-            'trace_count': len(traces),
-            'lookup_error': lookup_error,
-            'filtered_trace_ids': filtered_trace_ids,
-            'command_session_id': command_session_id,
-            'trace_context': trace_context_summary,
-            'trace_enrichment': trace_enrichment_summary,
-            'generation_metadata': generation_metadata_summary,
-            'request_payload_checks': request_payload_summary,
-            'request_text_checks': request_text_summary,
-            'stream_tool_call_state': stream_tool_call_state_summary,
-            'aawm_dynamic_injection': aawm_dynamic_injection_summary,
-            'span_observations': span_observations,
-            'generation_observations': generation_observations,
+        "streaming_checked": config.get("streaming_checked", False),
+        "warning_only": warning_only,
+        "command_attempts": command_attempts,
+        "langfuse": {
+            "required_trace_names": expected_trace_names,
+            "actual_trace_names": actual_trace_names,
+            "expected_user_ids": expected_user_ids,
+            "actual_user_ids": actual_user_ids,
+            "expected_trace_user_ids_by_name": expected_trace_user_ids_by_name,
+            "trace_user_ids_by_name": trace_user_ids_by_name_summary,
+            "trace_ids": trace_ids,
+            "trace_count": len(traces),
+            "lookup_error": lookup_error,
+            "filtered_trace_ids": filtered_trace_ids,
+            "command_session_id": command_session_id,
+            "trace_context": trace_context_summary,
+            "trace_enrichment": trace_enrichment_summary,
+            "generation_metadata": generation_metadata_summary,
+            "request_payload_checks": request_payload_summary,
+            "request_text_checks": request_text_summary,
+            "stream_tool_call_state": stream_tool_call_state_summary,
+            "aawm_dynamic_injection": aawm_dynamic_injection_summary,
+            "span_observations": span_observations,
+            "generation_observations": generation_observations,
         },
-        'command_json': command_json_summary,
-        'empty_success': empty_success_summary,
-        'session_history': session_history_summary,
-        'session_history_passed': session_history_passed,
-        'rate_limit_observations': rate_limit_observations_summary,
-        'tool_activity': tool_activity_summary,
-        'transcript_tool_use': transcript_tool_use_summary,
-        'tool_activity_passed': tool_activity_passed,
-        'transcript_tool_use_passed': transcript_tool_use_passed,
-        'stream_tool_call_state_passed': stream_tool_call_state_passed,
-        'runtime_postconditions': runtime_summary,
-        'runtime_logs': runtime_log_summary,
-        'passed': not hard_failures,
-        'failures': hard_failures,
-        'soft_failures': soft_failures,
-        'warnings': unique_warnings,
+        "command_json": command_json_summary,
+        "empty_success": empty_success_summary,
+        "session_history": session_history_summary,
+        "session_history_passed": session_history_passed,
+        "rate_limit_observations": rate_limit_observations_summary,
+        "tool_activity": tool_activity_summary,
+        "transcript_tool_use": transcript_tool_use_summary,
+        "tool_activity_passed": tool_activity_passed,
+        "transcript_tool_use_passed": transcript_tool_use_passed,
+        "stream_tool_call_state_passed": stream_tool_call_state_passed,
+        "runtime_postconditions": runtime_summary,
+        "runtime_logs": runtime_log_summary,
+        "passed": not hard_failures,
+        "failures": hard_failures,
+        "soft_failures": soft_failures,
+        "warnings": unique_warnings,
     }
 
 
@@ -5090,6 +5308,22 @@ def _run_selected_case(
     secret_key: str,
     litellm_base_url: str,
 ) -> dict[str, Any]:
+    agentic_contract, contract_failures = (
+        _validate_moonshot_anthropic_agentic_contract(
+            family=case_name,
+            config=case_config,
+        )
+    )
+    if contract_failures:
+        return {
+            'passed': False,
+            'skipped': False,
+            'failures': contract_failures,
+            'soft_failures': [],
+            'warnings': [],
+            'agentic_contract': agentic_contract,
+        }
+
     case_started = RA._utcnow()
     missing_required_env = _missing_required_env(case_config)
     if missing_required_env:
@@ -5099,7 +5333,7 @@ def _run_selected_case(
             missing_required_env=missing_required_env,
         )
     try:
-        return _validate_case(
+        result = _validate_case(
             case_name,
             case_config,
             query_url=query_url,
@@ -5107,6 +5341,8 @@ def _run_selected_case(
             secret_key=secret_key,
             litellm_base_url=litellm_base_url,
         )
+        result['agentic_contract'] = agentic_contract
+        return result
     except Exception as exc:
         provider_unavailable_timeout = _provider_unavailable_timeout_error_result(
             case_name,
@@ -5116,21 +5352,23 @@ def _run_selected_case(
         )
         if provider_unavailable_timeout is not None:
             return provider_unavailable_timeout
-        if bool(case_config.get('warning_only')):
+        if bool(case_config.get("warning_only")):
             return _warning_only_error_result(case_name, exc, case_config)
         return RA._family_error_result(case_name, exc)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Run real-Claude Anthropic adapter acceptance checks through a target LiteLLM instance.')
-    parser.add_argument('--config', default=str(DEFAULT_CONFIG), help='Path to adapter suite config JSON.')
+    parser = argparse.ArgumentParser(
+        description="Run real-Claude Anthropic adapter acceptance checks through a target LiteLLM instance."
+    )
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to adapter suite config JSON.")
     parser.add_argument('--write-artifact', required=True, help='Where to write the JSON artifact.')
     parser.add_argument('--langfuse-query-url', default=None, help='Override Langfuse query URL.')
     parser.add_argument('--cases', default=None, help='Comma-separated subset of adapter cases to run.')
     parser.add_argument(
-        '--target',
-        default=os.environ.get('AAWM_ADAPTER_TARGET', None),
-        help='Target profile to test. Built-ins: dev (:4001/litellm-dev), prod (:4000/aawm-litellm).',
+        "--target",
+        default=os.environ.get("AAWM_ADAPTER_TARGET", None),
+        help="Target profile to test. Built-ins: dev (:4001/litellm-dev), prod (:4000/aawm-litellm).",
     )
     parser.add_argument('--litellm-base-url', default=None, help='Override the target LiteLLM base URL.')
     parser.add_argument('--anthropic-base-url', default=None, help='Override ANTHROPIC_BASE_URL passed to Claude CLI.')

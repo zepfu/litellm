@@ -5746,85 +5746,43 @@ def _get_model_info_helper(  # noqa: PLR0915
                 max_input_tokens=_model_info.get("max_input_tokens", None),
                 max_output_tokens=_model_info.get("max_output_tokens", None),
                 input_cost_per_token=_input_cost_per_token,
-                input_cost_per_token_flex=_model_info.get(
-                    "input_cost_per_token_flex", None
-                ),
-                input_cost_per_token_priority=_model_info.get(
-                    "input_cost_per_token_priority", None
-                ),
-                cache_creation_input_token_cost=_model_info.get(
-                    "cache_creation_input_token_cost", None
-                ),
+                input_cost_per_token_flex=_model_info.get("input_cost_per_token_flex", None),
+                input_cost_per_token_priority=_model_info.get("input_cost_per_token_priority", None),
+                cache_creation_input_token_cost=_model_info.get("cache_creation_input_token_cost", None),
                 cache_creation_input_token_cost_above_200k_tokens=_model_info.get(
                     "cache_creation_input_token_cost_above_200k_tokens", None
                 ),
-                cache_read_input_token_cost=_model_info.get(
-                    "cache_read_input_token_cost", None
-                ),
+                cache_read_input_token_cost=_model_info.get("cache_read_input_token_cost", None),
                 cache_read_input_token_cost_above_200k_tokens=_model_info.get(
                     "cache_read_input_token_cost_above_200k_tokens", None
                 ),
                 cache_read_input_token_cost_above_272k_tokens=_model_info.get(
                     "cache_read_input_token_cost_above_272k_tokens", None
                 ),
-                cache_read_input_token_cost_flex=_model_info.get(
-                    "cache_read_input_token_cost_flex", None
-                ),
-                cache_read_input_token_cost_priority=_model_info.get(
-                    "cache_read_input_token_cost_priority", None
-                ),
+                cache_read_input_token_cost_flex=_model_info.get("cache_read_input_token_cost_flex", None),
+                cache_read_input_token_cost_priority=_model_info.get("cache_read_input_token_cost_priority", None),
                 cache_creation_input_token_cost_above_1hr=_model_info.get(
                     "cache_creation_input_token_cost_above_1hr", None
                 ),
-                input_cost_per_character=_model_info.get(
-                    "input_cost_per_character", None
-                ),
-                input_cost_per_token_above_128k_tokens=_model_info.get(
-                    "input_cost_per_token_above_128k_tokens", None
-                ),
-                input_cost_per_token_above_200k_tokens=_model_info.get(
-                    "input_cost_per_token_above_200k_tokens", None
-                ),
-                input_cost_per_token_above_272k_tokens=_model_info.get(
-                    "input_cost_per_token_above_272k_tokens", None
-                ),
+                input_cost_per_character=_model_info.get("input_cost_per_character", None),
+                input_cost_per_token_above_128k_tokens=_model_info.get("input_cost_per_token_above_128k_tokens", None),
+                input_cost_per_token_above_200k_tokens=_model_info.get("input_cost_per_token_above_200k_tokens", None),
+                input_cost_per_token_above_272k_tokens=_model_info.get("input_cost_per_token_above_272k_tokens", None),
                 input_cost_per_query=_model_info.get("input_cost_per_query", None),
                 input_cost_per_second=_model_info.get("input_cost_per_second", None),
-                input_cost_per_audio_token=_model_info.get(
-                    "input_cost_per_audio_token", None
-                ),
-                input_cost_per_image_token=_model_info.get(
-                    "input_cost_per_image_token", None
-                ),
+                input_cost_per_audio_token=_model_info.get("input_cost_per_audio_token", None),
+                input_cost_per_image_token=_model_info.get("input_cost_per_image_token", None),
                 input_cost_per_image=_model_info.get("input_cost_per_image", None),
-                input_cost_per_audio_per_second=_model_info.get(
-                    "input_cost_per_audio_per_second", None
-                ),
-                input_cost_per_video_per_second=_model_info.get(
-                    "input_cost_per_video_per_second", None
-                ),
-                input_cost_per_token_batches=_model_info.get(
-                    "input_cost_per_token_batches"
-                ),
-                output_cost_per_token_batches=_model_info.get(
-                    "output_cost_per_token_batches"
-                ),
+                input_cost_per_audio_per_second=_model_info.get("input_cost_per_audio_per_second", None),
+                input_cost_per_video_per_second=_model_info.get("input_cost_per_video_per_second", None),
+                input_cost_per_token_batches=_model_info.get("input_cost_per_token_batches"),
+                output_cost_per_token_batches=_model_info.get("output_cost_per_token_batches"),
                 output_cost_per_token=_output_cost_per_token,
-                output_cost_per_token_flex=_model_info.get(
-                    "output_cost_per_token_flex", None
-                ),
-                output_cost_per_token_priority=_model_info.get(
-                    "output_cost_per_token_priority", None
-                ),
-                output_cost_per_audio_token=_model_info.get(
-                    "output_cost_per_audio_token", None
-                ),
-                output_cost_per_character=_model_info.get(
-                    "output_cost_per_character", None
-                ),
-                output_cost_per_reasoning_token=_model_info.get(
-                    "output_cost_per_reasoning_token", None
-                ),
+                output_cost_per_token_flex=_model_info.get("output_cost_per_token_flex", None),
+                output_cost_per_token_priority=_model_info.get("output_cost_per_token_priority", None),
+                output_cost_per_audio_token=_model_info.get("output_cost_per_audio_token", None),
+                output_cost_per_character=_model_info.get("output_cost_per_character", None),
+                output_cost_per_reasoning_token=_model_info.get("output_cost_per_reasoning_token", None),
                 output_cost_per_token_above_128k_tokens=_model_info.get(
                     "output_cost_per_token_above_128k_tokens", None
                 ),
@@ -5838,80 +5796,45 @@ def _get_model_info_helper(  # noqa: PLR0915
                     "output_cost_per_token_above_272k_tokens", None
                 ),
                 output_cost_per_second=_model_info.get("output_cost_per_second", None),
-                output_cost_per_video_per_second=_model_info.get(
-                    "output_cost_per_video_per_second", None
-                ),
+                output_cost_per_video_per_second=_model_info.get("output_cost_per_video_per_second", None),
                 output_cost_per_image=_model_info.get("output_cost_per_image", None),
-                output_cost_per_image_token=_model_info.get(
-                    "output_cost_per_image_token", None
-                ),
+                output_cost_per_image_token=_model_info.get("output_cost_per_image_token", None),
                 output_vector_size=_model_info.get("output_vector_size", None),
-                citation_cost_per_token=_model_info.get(
-                    "citation_cost_per_token", None
-                ),
+                citation_cost_per_token=_model_info.get("citation_cost_per_token", None),
                 tiered_pricing=_model_info.get("tiered_pricing", None),
-                litellm_provider=_model_info.get(
-                    "litellm_provider", custom_llm_provider
-                ),
+                litellm_provider=_model_info.get("litellm_provider", custom_llm_provider),
                 mode=_model_info.get("mode"),  # type: ignore
-                supports_system_messages=_model_info.get(
-                    "supports_system_messages", None
-                ),
-                supports_response_schema=_model_info.get(
-                    "supports_response_schema", None
-                ),
+                supports_system_messages=_model_info.get("supports_system_messages", None),
+                supports_response_schema=_model_info.get("supports_response_schema", None),
                 supports_vision=_model_info.get("supports_vision", None),
-                supports_function_calling=_model_info.get(
-                    "supports_function_calling", None
-                ),
+                supports_function_calling=_model_info.get("supports_function_calling", None),
                 supports_tool_choice=_model_info.get("supports_tool_choice", None),
-                supports_assistant_prefill=_model_info.get(
-                    "supports_assistant_prefill", None
-                ),
-                supports_prompt_caching=_model_info.get(
-                    "supports_prompt_caching", None
-                ),
+                supports_assistant_prefill=_model_info.get("supports_assistant_prefill", None),
+                supports_prompt_caching=_model_info.get("supports_prompt_caching", None),
                 supports_audio_input=_model_info.get("supports_audio_input", None),
                 supports_audio_output=_model_info.get("supports_audio_output", None),
                 supports_pdf_input=_model_info.get("supports_pdf_input", None),
-                supports_embedding_image_input=_model_info.get(
-                    "supports_embedding_image_input", None
-                ),
-                supports_native_streaming=_model_info.get(
-                    "supports_native_streaming", None
-                ),
+                supports_embedding_image_input=_model_info.get("supports_embedding_image_input", None),
+                supports_native_streaming=_model_info.get("supports_native_streaming", None),
                 supports_web_search=_model_info.get("supports_web_search", None),
                 supports_url_context=_model_info.get("supports_url_context", None),
                 supports_reasoning=_model_info.get("supports_reasoning", None),
-                supports_none_reasoning_effort=_model_info.get(
-                    "supports_none_reasoning_effort", None
-                ),
-                supports_minimal_reasoning_effort=_model_info.get(
-                    "supports_minimal_reasoning_effort", None
-                ),
-                supports_xhigh_reasoning_effort=_model_info.get(
-                    "supports_xhigh_reasoning_effort", None
-                ),
-                supports_max_reasoning_effort=_model_info.get(
-                    "supports_max_reasoning_effort", None
-                ),
+                supports_none_reasoning_effort=_model_info.get("supports_none_reasoning_effort", None),
+                supports_low_reasoning_effort=_model_info.get("supports_low_reasoning_effort", None),
+                supports_high_reasoning_effort=_model_info.get("supports_high_reasoning_effort", None),
+                supports_minimal_reasoning_effort=_model_info.get("supports_minimal_reasoning_effort", None),
+                supports_xhigh_reasoning_effort=_model_info.get("supports_xhigh_reasoning_effort", None),
+                supports_max_reasoning_effort=_model_info.get("supports_max_reasoning_effort", None),
+                default_reasoning_effort=_model_info.get("default_reasoning_effort", None),
                 supports_computer_use=_model_info.get("supports_computer_use", None),
-                search_context_cost_per_query=_model_info.get(
-                    "search_context_cost_per_query", None
-                ),
+                search_context_cost_per_query=_model_info.get("search_context_cost_per_query", None),
                 tpm=_model_info.get("tpm", None),
                 rpm=_model_info.get("rpm", None),
                 ocr_cost_per_page=_model_info.get("ocr_cost_per_page", None),
-                annotation_cost_per_page=_model_info.get(
-                    "annotation_cost_per_page", None
-                ),
-                provider_specific_entry=_model_info.get(
-                    "provider_specific_entry", None
-                ),
+                annotation_cost_per_page=_model_info.get("annotation_cost_per_page", None),
+                provider_specific_entry=_model_info.get("provider_specific_entry", None),
                 uses_embed_content=_model_info.get("uses_embed_content", None),
-                unsupported_hosted_tools=_model_info.get(
-                    "unsupported_hosted_tools", None
-                ),
+                unsupported_hosted_tools=_model_info.get("unsupported_hosted_tools", None),
             )
     except Exception as e:
         verbose_logger.debug(f"Error getting model info: {e}")
@@ -8143,6 +8066,7 @@ class ProviderConfigManager:
             LlmProviders.WANDB: (lambda: litellm.WandbConfig(), False),
             LlmProviders.DASHSCOPE: (lambda: litellm.DashScopeChatConfig(), False),
             LlmProviders.MOONSHOT: (lambda: litellm.MoonshotChatConfig(), False),
+            LlmProviders.KIMI_CODE: (lambda: litellm.KimiCodeChatConfig(), False),
             LlmProviders.DOCKER_MODEL_RUNNER: (
                 lambda: litellm.DockerModelRunnerChatConfig(),
                 False,

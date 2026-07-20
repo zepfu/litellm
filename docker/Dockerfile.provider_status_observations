@@ -1,6 +1,7 @@
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
     DEBIAN_FRONTEND=noninteractive \
     AAWM_LITELLM_ENVIRONMENT=dev \
     AAWM_PROVIDER_STATUS_APPLY=1 \
@@ -27,7 +28,15 @@ COPY scripts/record_provider_status_observations.py /app/scripts/record_provider
 COPY scripts/grok_oidc_refresh.py /app/scripts/grok_oidc_refresh.py
 COPY scripts/codex_oauth_refresh.py /app/scripts/codex_oauth_refresh.py
 COPY scripts/xai_oauth_refresh.py /app/scripts/xai_oauth_refresh.py
+COPY scripts/kimi_oauth_refresh.py /app/scripts/kimi_oauth_refresh.py
 COPY scripts/run_provider_status_observations_loop.py /app/scripts/run_provider_status_observations_loop.py
-RUN touch /app/scripts/__init__.py
+COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_managers/credential_error_sanitizer.py
+COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py
+COPY litellm/secret_managers/credential_file_metadata.py /app/litellm/secret_managers/credential_file_metadata.py
+COPY litellm/secret_managers/credential_file_write.py /app/litellm/secret_managers/credential_file_write.py
+RUN touch \
+    /app/scripts/__init__.py \
+    /app/litellm/__init__.py \
+    /app/litellm/secret_managers/__init__.py
 
 ENTRYPOINT ["python", "/app/scripts/run_provider_status_observations_loop.py"]

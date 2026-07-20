@@ -28,6 +28,7 @@ def _load(rel: str):
     "rel,writer,arg_name",
     [
         ("scripts/xai_oauth_refresh.py", "_write_credential_payload", "auth_path"),
+        ("scripts/kimi_oauth_refresh.py", "_write_credential_payload", "auth_path"),
         ("scripts/codex_oauth_refresh.py", None, None),
         ("litellm/llms/xai/oauth.py", "_write_credential_payload", "credential_path"),
         (
@@ -68,10 +69,26 @@ def test_credential_writer_ends_at_0600(rel, writer, arg_name, tmp_path: Path):
         assert leftovers == []
         return
 
-    target = tmp_path / "cred.json"
+    target = (
+        tmp_path / ".kimi-code" / "credentials" / "kimi-code.json"
+        if rel == "scripts/kimi_oauth_refresh.py"
+        else tmp_path / "cred.json"
+    )
     fn = getattr(mod, writer)
     if writer == "_write_token_data":
         fn(target, {"access_token": "a", "refresh_token": "b"})
+    elif rel == "scripts/kimi_oauth_refresh.py":
+        fn(
+            target,
+            {
+                "access_token": "a",
+                "refresh_token": "b",
+                "expires_at": 4_000_000_000,
+                "expires_in": 900,
+                "scope": "kimi-code",
+                "token_type": "Bearer",
+            },
+        )
     else:
         fn(target, {"access_token": "a", "refresh_token": "b", "type": "oauth"})
     assert target.is_file()

@@ -18738,6 +18738,125 @@ def test_grok_apply_patch_custom_tool_adapter_metadata_is_bundled(
 
 
 @pytest.mark.parametrize(
+    "model_catalog_path",
+    [
+        "model_prices_and_context_window.json",
+        "litellm/bundled_model_prices_and_context_window_fallback.json",
+    ],
+)
+def test_kimi_apply_patch_custom_tool_adapter_metadata_is_bundled(
+    model_catalog_path,
+):
+    model_catalog = json.loads(Path(model_catalog_path).read_text())
+    for model in ("kimi_code/k3-high", "kimi_code/k3-max"):
+        assert model_catalog[model]["custom_tool_function_adapters"] == [
+            "apply_patch"
+        ]
+        assert model_catalog[model]["unsupported_hosted_tools"] == [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search",
+        ]
+        assert model_catalog[model]["unsupported_input_item_types"] == [
+            "custom_tool_call",
+            "custom_tool_call_output",
+        ]
+    assert "custom_tool_function_adapters" not in model_catalog["kimi_code/k3"]
+
+
+@pytest.mark.parametrize("model", ["kimi_code/k3-high", "kimi_code/k3-max"])
+def test_kimi_apply_patch_is_adapted_before_unsupported_hosted_tools_are_removed(
+    model,
+):
+    request_body = {
+        "model": model,
+        "tools": [
+            _codex_apply_patch_custom_tool_definition(),
+            {"type": "custom", "name": "exec_command"},
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {"type": "plugin", "name": "kimi_plugin"},
+            {"type": "tool_search", "name": "tool_search"},
+            {"type": "namespace", "name": "functions"},
+            {"type": "web_search", "name": "web_search"},
+            {"type": "image_generation"},
+        ],
+    }
+
+    adapted_body, adapted_tools = (
+        _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    )
+    filtered_body, removed_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(adapted_body)
+    )
+
+    assert adapted_tools == [{"name": "apply_patch", "tool_index": 0}]
+    assert filtered_body["tools"] == [
+        adapted_body["tools"][0],
+        request_body["tools"][2],
+        request_body["tools"][3],
+    ]
+    assert [tool["type"] for tool in filtered_body["tools"]] == [
+        "function",
+        "function",
+        "plugin",
+    ]
+    assert removed_tools == [
+        {"type": "custom", "index": 1, "name": "exec_command"},
+        {"type": "tool_search", "index": 4, "name": "tool_search"},
+        {"type": "namespace", "index": 5, "name": "functions"},
+        {"type": "web_search", "index": 6, "name": "web_search"},
+        {"type": "image_generation", "index": 7},
+    ]
+    metadata = filtered_body["litellm_metadata"]
+    assert metadata["codex_custom_tool_function_adapter_names"] == ["apply_patch"]
+    assert metadata["codex_unsupported_hosted_tool_types_removed"] == [
+        "custom",
+        "image_generation",
+        "namespace",
+        "tool_search",
+        "web_search",
+    ]
+
+
+def test_kimi_custom_tool_output_is_normalized_before_unsupported_input_filter():
+    request_body = {
+        "model": "kimi_code/k3-high",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_apply_patch",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_apply_patch",
+                "output": "Done!",
+            },
+        ],
+    }
+
+    filtered_body, removed_items = (
+        _drop_unsupported_codex_input_items_from_request_body(request_body)
+    )
+
+    assert removed_items == [{"type": "custom_tool_call", "index": 0}]
+    assert filtered_body["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_apply_patch",
+            "output": "Done!",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
     "model",
     [
         "grok-build",

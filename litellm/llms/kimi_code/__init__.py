@@ -1,0 +1,51 @@
+"""Managed metadata helpers for Kimi Code live models."""
+
+from .failure_classification import (
+    KimiCodeFailureKind,
+    KimiCodeFailureMetadata,
+    KimiCodeFailureScope,
+    KimiCodeManagedEndpoint,
+    KimiCodeMetadataGate,
+    classify_kimi_code_failure,
+    classify_kimi_code_http_failure,
+)
+from .model_metadata import (
+    K2_7_MODEL_IDS,
+    K3_MODEL_ID,
+    MANAGED_KIMI_CODE_MODEL_IDS,
+    KimiCodeModelMetadata,
+    KimiCodeThinkEfforts,
+    get_kimi_code_model_metadata,
+    get_k3_default_think_effort,
+    is_always_thinking_eligible,
+    is_k2_7_model_id,
+    is_k3_model_id,
+    is_managed_kimi_code_model_id,
+    parse_kimi_code_models_payload,
+    supports_explicit_capabilities,
+    supports_k3_think_effort,
+)
+
+__all__ = [
+    "K2_7_MODEL_IDS",
+    "K3_MODEL_ID",
+    "MANAGED_KIMI_CODE_MODEL_IDS",
+    "KimiCodeFailureKind",
+    "KimiCodeFailureMetadata",
+    "KimiCodeFailureScope",
+    "KimiCodeManagedEndpoint",
+    "KimiCodeModelMetadata",
+    "KimiCodeMetadataGate",
+    "KimiCodeThinkEfforts",
+    "classify_kimi_code_failure",
+    "classify_kimi_code_http_failure",
+    "get_kimi_code_model_metadata",
+    "get_k3_default_think_effort",
+    "is_always_thinking_eligible",
+    "is_k2_7_model_id",
+    "is_k3_model_id",
+    "is_managed_kimi_code_model_id",
+    "parse_kimi_code_models_payload",
+    "supports_explicit_capabilities",
+    "supports_k3_think_effort",
+]
