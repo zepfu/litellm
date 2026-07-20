@@ -196,6 +196,29 @@ The artifact records the safe adapter path
 and tool-result replay evidence. It does not require or print credential
 material.
 
+The production stress companion dispatches two named Moonshot children. Each
+child must complete two distinct batches of three parallel read-only tool
+calls, and the parent must return the bounded 9,800-10,200 character acceptance
+block:
+
+```bash
+python3 run_anthropic_adapter_acceptance.py \
+  --target prod \
+  --cases claude_adapter_aawm_sota_moonshot_parallel_stress \
+  --write-artifact /tmp/moonshot-anthropic-parallel-stress-prod.json
+```
+
+The separate Claude Bash interaction gate requires the Moonshot child to run
+`date --iso-8601=seconds` exactly once and verifies that both the child and
+parent report the exact tool stdout:
+
+```bash
+python3 run_anthropic_adapter_acceptance.py \
+  --target prod \
+  --cases claude_adapter_aawm_sota_moonshot_child_bash_time \
+  --write-artifact /tmp/moonshot-anthropic-bash-time-prod.json
+```
+
 Native passthrough checks live in the same harness and are opt-in. HTTP cases
 send direct requests through the provider passthrough routes. CLI cases launch
 the real local provider CLIs (`claude`, `codex`) so they use the same
@@ -233,6 +256,17 @@ python3 run_anthropic_adapter_acceptance.py \
   --target prod \
   --cases native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration \
   --write-artifact /tmp/moonshot-codex-collaboration-prod.json
+```
+
+The Codex Bash interaction gate uses the same production profile and requires
+the model to run `date --iso-8601=seconds` exactly once, then return the exact
+command stdout:
+
+```bash
+python3 run_anthropic_adapter_acceptance.py \
+  --target prod \
+  --cases native_openai_passthrough_responses_codex_aawm_sota_moonshot_bash_time \
+  --write-artifact /tmp/moonshot-codex-bash-time-prod.json
 ```
 
 ```bash

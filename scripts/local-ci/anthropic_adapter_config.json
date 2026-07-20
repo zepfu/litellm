@@ -40,6 +40,8 @@
     "claude_adapter_anthropic_claude_sonnet_4_6_child_parallel_read_tools",
     "claude_adapter_aawm_code_anthropic_alias_child_parallel_read_tools",
     "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation",
+    "claude_adapter_aawm_sota_moonshot_child_bash_time",
+    "claude_adapter_aawm_sota_moonshot_parallel_stress",
     "claude_adapter_opencode_zen_deepseek_v4_flash_child_parallel_read_tools",
     "claude_adapter_opencode_zen_big_pickle_child_parallel_read_tools",
     "claude_adapter_peeromega_fanout",
@@ -63,6 +65,7 @@
     "native_openai_passthrough_responses_codex",
     "native_openai_passthrough_responses_codex_tool_activity",
     "native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration",
+    "native_openai_passthrough_responses_codex_aawm_sota_moonshot_bash_time",
     "native_grok_cli_passthrough_grok_build",
     "native_grok_cli_passthrough_grok_composer",
     "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools",
@@ -723,6 +726,173 @@
       },
       "timeout_seconds": 900,
       "langfuse_poll_timeout_seconds": 120
+    },
+    "native_openai_passthrough_responses_codex_aawm_sota_moonshot_bash_time": {
+      "verification_alias": "aawm-sota-moonshot",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "codex-bash-system-time",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-max",
+          "route_family": "codex_kimi_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-high",
+          "route_family": "codex_kimi_chat_completions_adapter"
+        }
+      ],
+      "cli_passthrough": "codex",
+      "command": [
+        "codex",
+        "exec",
+        "--ignore-user-config",
+        "-c",
+        "suppress_unstable_features_warning=true",
+        "-c",
+        "model_provider=\"{codex_profile}\"",
+        "-c",
+        "model_catalog_json=\"{repository_root}/scripts/local-ci/codex_moonshot_model_catalog.json\"",
+        "-c",
+        "model_providers.{codex_profile}.name=\"LiteLLM\"",
+        "-c",
+        "model_providers.{codex_profile}.base_url=\"{litellm_base_url}/openai_passthrough\"",
+        "-c",
+        "model_providers.{codex_profile}.requires_openai_auth=true",
+        "-c",
+        "model_providers.{codex_profile}.wire_api=\"responses\"",
+        "-m",
+        "aawm-sota-moonshot",
+        "-s",
+        "read-only",
+        "-C",
+        "{repository_root}",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.x-litellm-end-user-id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_user_id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_name=\"{case_name}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
+        "--json",
+        "Production Moonshot Bash interaction acceptance. Do not modify, create, or delete files and do not browse the web. Use exec_command exactly once to run exactly `date --iso-8601=seconds`. After the command succeeds, return only the exact stdout from that command with surrounding whitespace removed. Do not add markdown, labels, explanation, or any other text. If the command fails, report the exact blocker instead of fabricating a timestamp."
+      ],
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": false,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/openai_passthrough/v1/responses",
+        "/openai_passthrough/responses"
+      ],
+      "required_trace_tags": [
+        "model-alias:aawm-sota-moonshot",
+        "codex-auto-agent-alias:aawm-sota-moonshot"
+      ],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family",
+        "codex_auto_agent_selected_provider",
+        "codex_auto_agent_selected_model",
+        "codex_auto_agent_selected_route_family",
+        "responses_stream_event_types",
+        "responses_stream_tool_state"
+      ],
+      "required_generation_metadata_minimums": {
+        "responses_stream_tool_call_count": 1,
+        "codex_tool_call_count": 1
+      },
+      "stream_tool_call_state_validation": {
+        "required_event_types": [
+          "response.output_item.added",
+          "response.output_item.done"
+        ],
+        "expected_tools": [
+          {
+            "tool_name": "exec_command",
+            "tool_type": "function_call",
+            "arguments_required_substrings": [
+              "date --iso-8601=seconds"
+            ],
+            "minimum_count": 1,
+            "maximum_count": 1
+          }
+        ]
+      },
+      "bash_stdout_report_validation": {
+        "expected_command": "date --iso-8601=seconds",
+        "expected_regex": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:Z|[+-]\\d{2}:\\d{2})$"
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 90,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "kimi_code"
+              ],
+              "model": [
+                "k3-max",
+                "k3-high"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "aawm-sota-moonshot",
+              "requested_model_alias": "aawm-sota-moonshot",
+              "codex_auto_agent_alias": "aawm-sota-moonshot"
+            },
+            "metadata_required_truthy": [
+              "codex_auto_agent_selected_provider",
+              "codex_auto_agent_selected_model",
+              "codex_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "required_contains": {
+              "repository": "litellm"
+            },
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 90,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "provider": "kimi_code",
+            "tool_name": "exec_command",
+            "tool_kind": "command",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "command_text_contains": "date --iso-8601=seconds"
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 90,
+      "allow_zero_cost": true
     },
     "native_openai_passthrough_responses_codex_tool_activity": {
       "cli_passthrough": "codex",
@@ -3785,6 +3955,448 @@
       },
       "timeout_seconds": 300,
       "langfuse_poll_timeout_seconds": 90,
+      "allow_zero_cost": true
+    },
+    "claude_adapter_aawm_sota_moonshot_child_bash_time": {
+      "failure_context": "Moonshot Claude Bash system-time acceptance (anthropic_kimi_chat_completions_adapter, alias aawm-sota-moonshot)",
+      "verification_alias": "aawm-sota-moonshot",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "claude-bash-system-time",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-max",
+          "route_family": "anthropic_kimi_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-high",
+          "route_family": "anthropic_kimi_chat_completions_adapter"
+        }
+      ],
+      "command": [
+        "claude",
+        "-p",
+        "Production Moonshot Bash interaction acceptance. Dispatch exactly one sota-moonshot-time child using the Agent tool and do not run the command yourself. The child must use Bash exactly once to run exactly `date --iso-8601=seconds`, wait for the Bash result, and return only that exact stdout with surrounding whitespace removed. Wait for the actual child response, then return only the exact child text. Do not add markdown, labels, explanation, or any other text. If dispatch or Bash fails, report the exact blocker instead of fabricating a timestamp.",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "sota-moonshot-time": {
+          "description": "Canonical Moonshot SOTA Bash system-time acceptance profile.",
+          "model": "aawm-sota-moonshot",
+          "effort": "max",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Bash"
+          ],
+          "prompt": "You are the deterministic Moonshot Bash system-time acceptance child. This is not a repository investigation. Do not spawn agents. Use Bash exactly once to run exactly `date --iso-8601=seconds`. Wait for the Bash result, then stop using tools and return only the exact command stdout with surrounding whitespace removed. Do not add markdown, labels, explanation, or any other text. Never invent or transform the timestamp."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.sota-moonshot-time"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.sota-moonshot-time": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_kimi_chat_completions_adapter",
+        "anthropic-kimi-chat-completions-adapter",
+        "model-alias:aawm-sota-moonshot",
+        "anthropic-auto-agent-alias:aawm-sota-moonshot"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family",
+        "anthropic_auto_agent_selected_provider",
+        "anthropic_auto_agent_selected_model",
+        "anthropic_auto_agent_selected_route_family"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "tools"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_regex": {
+          "result": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:Z|[+-]\\d{2}:\\d{2})$"
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1
+        }
+      },
+      "bash_stdout_report_validation": {
+        "expected_command": "date --iso-8601=seconds",
+        "expected_regex": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:Z|[+-]\\d{2}:\\d{2})$",
+        "transcript_agent": "sota-moonshot-time"
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "kimi_code"
+              ],
+              "model": [
+                "k3-max",
+                "k3-high"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "aawm-sota-moonshot",
+              "requested_model_alias": "aawm-sota-moonshot",
+              "anthropic_auto_agent_alias": "aawm-sota-moonshot"
+            },
+            "metadata_required_truthy": [
+              "anthropic_auto_agent_selected_provider",
+              "anthropic_auto_agent_selected_model",
+              "anthropic_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 1,
+            "maximum_count": 1
+          },
+          {
+            "provider": "kimi_code",
+            "tool_name": "Bash",
+            "tool_kind": "command",
+            "minimum_count": 1,
+            "maximum_count": 1,
+            "command_text_contains": "date --iso-8601=seconds"
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 20,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "sota-moonshot-time",
+            "expected_tool_counts": {
+              "Bash": 1
+            },
+            "expected_tool_sequence": [
+              "Bash"
+            ],
+            "minimum_total_tool_uses": 1,
+            "maximum_total_tool_uses": 1,
+            "maximum_tool_uses_per_assistant_message": 1,
+            "forbid_tool_result_errors": true
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 90,
+      "allow_zero_cost": true
+    },
+    "claude_adapter_aawm_sota_moonshot_parallel_stress": {
+      "failure_context": "Moonshot Claude production stress (two Kimi children, two parallel tool batches each)",
+      "verification_alias": "aawm-sota-moonshot",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "claude-parallel-stress",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-max",
+          "route_family": "anthropic_kimi_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "kimi_code",
+          "model": "kimi_code/k3-high",
+          "route_family": "anthropic_kimi_chat_completions_adapter"
+        }
+      ],
+      "command": [
+        "claude",
+        "-p",
+        "Production Moonshot Claude acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first assistant message dispatch exactly two children concurrently using exactly two Agent tool calls and no text: sota-moonshot-stress-a and sota-moonshot-stress-b. Do not perform either child's work yourself. Each child must complete exactly two sequential batches of three parallel read-only tool calls. Batch 1 must be one assistant message with no text containing Read for scripts/local-ci/sequential_core_tools_fixture.txt, Glob with pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from `.`, and Grep with pattern exactly `sequential-core-tools-grep`, path exactly `scripts/local-ci/sequential_core_tools_fixture.txt`, and output_mode exactly `content`. Only after all Batch 1 tool results return, Batch 2 must be one assistant message with no text containing Read for scripts/local-ci/codex_moonshot_model_catalog.json, Glob with pattern exactly `scripts/local-ci/codex_moonshot_model_catalog.json` from `.`, and Grep with pattern exactly `aawm-sota-moonshot`, path exactly `scripts/local-ci/codex_moonshot_model_catalog.json`, and output_mode exactly `content`. Child A must then return only CHILD_A_TWO_PARALLEL_BATCHES_PASSED. Child B must then return only CHILD_B_TWO_PARALLEL_BATCHES_PASSED. Wait for both actual child responses and verify both markers. Then return one plain ASCII block between 9800 and 10200 characters, beginning exactly with CLAUDE_MOONSHOT_PROD_ACCEPTANCE_START, containing both child markers within the first 300 characters, continuing with neutral repeated filler prose, and ending exactly with CLAUDE_MOONSHOT_PROD_ACCEPTANCE_END. If Agent dispatch, either child, either parallel batch, or either marker fails, report the exact blocker and do not emit the success block.",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "sota-moonshot-stress-a": {
+          "description": "Moonshot production stress child A with two parallel read-only tool batches.",
+          "model": "aawm-sota-moonshot",
+          "effort": "max",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Glob",
+            "Grep"
+          ],
+          "prompt": "You are the deterministic Moonshot stress child A. This is not a repository investigation. Do not spawn agents. Execute exactly two sequential parallel batches from the caller. Each batch must contain exactly one Read, one Glob, and one Grep tool_use block in one assistant message with no text. Wait for all three Batch 1 results before emitting Batch 2. After all six tool results return without error, stop using tools and return only CHILD_A_TWO_PARALLEL_BATCHES_PASSED."
+        },
+        "sota-moonshot-stress-b": {
+          "description": "Moonshot production stress child B with two parallel read-only tool batches.",
+          "model": "aawm-sota-moonshot",
+          "effort": "max",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Glob",
+            "Grep"
+          ],
+          "prompt": "You are the deterministic Moonshot stress child B. This is not a repository investigation. Do not spawn agents. Execute exactly two sequential parallel batches from the caller. Each batch must contain exactly one Read, one Glob, and one Grep tool_use block in one assistant message with no text. Wait for all three Batch 1 results before emitting Batch 2. After all six tool results return without error, stop using tools and return only CHILD_B_TWO_PARALLEL_BATCHES_PASSED."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.sota-moonshot-stress-a",
+        "claude-code.sota-moonshot-stress-b"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.sota-moonshot-stress-a": "adapter-harness-tenant",
+        "claude-code.sota-moonshot-stress-b": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "route:anthropic_kimi_chat_completions_adapter",
+        "anthropic-kimi-chat-completions-adapter",
+        "model-alias:aawm-sota-moonshot",
+        "anthropic-auto-agent-alias:aawm-sota-moonshot"
+      ],
+      "required_generation_metadata_truthy": [
+        "anthropic_adapter_model",
+        "anthropic_adapter_original_model",
+        "anthropic_adapter_target_endpoint",
+        "passthrough_route_family",
+        "anthropic_auto_agent_selected_provider",
+        "anthropic_auto_agent_selected_model",
+        "anthropic_auto_agent_selected_route_family"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "tools"
+        ]
+      },
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false
+        },
+        "required_minimums": {
+          "usage.input_tokens": 1,
+          "usage.output_tokens": 1
+        }
+      },
+      "command_output_text_checks": {
+        "required_prefix": "CLAUDE_MOONSHOT_PROD_ACCEPTANCE_START",
+        "required_suffix": "CLAUDE_MOONSHOT_PROD_ACCEPTANCE_END",
+        "required_substrings": [
+          "CHILD_A_TWO_PARALLEL_BATCHES_PASSED",
+          "CHILD_B_TWO_PARALLEL_BATCHES_PASSED"
+        ],
+        "forbidden_substrings": [
+          "Traceback"
+        ],
+        "minimum_chars": 9800,
+        "maximum_chars": 10200
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 90,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "kimi_code"
+              ],
+              "model": [
+                "k3-max",
+                "k3-high"
+              ]
+            },
+            "minimum_count": 2,
+            "metadata_required_equals": {
+              "model_alias_label": "aawm-sota-moonshot",
+              "requested_model_alias": "aawm-sota-moonshot",
+              "anthropic_auto_agent_alias": "aawm-sota-moonshot"
+            },
+            "metadata_required_truthy": [
+              "anthropic_auto_agent_selected_provider",
+              "anthropic_auto_agent_selected_model",
+              "anthropic_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            }
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 90,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 2
+          },
+          {
+            "provider": "kimi_code",
+            "tool_name": "Read",
+            "tool_kind": "read",
+            "minimum_count": 4,
+            "maximum_count": 4
+          },
+          {
+            "provider": "kimi_code",
+            "tool_name": "Glob",
+            "tool_kind": "read",
+            "minimum_count": 4,
+            "maximum_count": 4
+          },
+          {
+            "provider": "kimi_code",
+            "tool_name": "Grep",
+            "tool_kind": "read",
+            "minimum_count": 4,
+            "maximum_count": 4
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 30,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "sota-moonshot-stress-a",
+            "expected_tool_counts": {
+              "Read": 2,
+              "Glob": 2,
+              "Grep": 2
+            },
+            "minimum_total_tool_uses": 6,
+            "maximum_total_tool_uses": 6,
+            "minimum_tools_in_single_assistant_message": 3,
+            "maximum_tool_uses_per_assistant_message": 3,
+            "minimum_parallel_tool_batches": 2,
+            "minimum_tools_per_parallel_batch": 3,
+            "forbid_tool_result_errors": true
+          },
+          {
+            "agent_type": "sota-moonshot-stress-b",
+            "expected_tool_counts": {
+              "Read": 2,
+              "Glob": 2,
+              "Grep": 2
+            },
+            "minimum_total_tool_uses": 6,
+            "maximum_total_tool_uses": 6,
+            "minimum_tools_in_single_assistant_message": 3,
+            "maximum_tool_uses_per_assistant_message": 3,
+            "minimum_parallel_tool_batches": 2,
+            "minimum_tools_per_parallel_batch": 3,
+            "forbid_tool_result_errors": true
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 900,
+      "langfuse_poll_timeout_seconds": 120,
       "allow_zero_cost": true
     },
     "claude_adapter_opencode_zen_deepseek_v4_flash_child_parallel_read_tools": {

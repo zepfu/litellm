@@ -154,6 +154,27 @@ self-contained plaintext child messages. Do not use the legacy
 `fork_context` field and do not rely on inherited or encrypted parent context
 to carry the child task.
 
+Run the Claude stress gate as
+`claude_adapter_aawm_sota_moonshot_parallel_stress`. The parent uses the real
+Claude CLI OAuth state and may receive only the target-selected
+`ANTHROPIC_BASE_URL` plus non-secret harness headers; never set or substitute
+`ANTHROPIC_API_KEY`. It must dispatch the two named Moonshot children, and each
+child transcript must contain exactly two separate assistant messages with
+three parallel read-only tool calls apiece. The harness requires six tool calls
+per child, at least two transcript batches with at least three tool calls each,
+twelve persisted child tool rows in total, both child completion markers, and
+the 9,800-10,200 character final block. Also run
+`claude_adapter_aawm_sota_moonshot_agentic_tool_continuation` to preserve the
+focused Read-then-Grep tool-result replay proof.
+
+Run the system-time interaction gates as
+`native_openai_passthrough_responses_codex_aawm_sota_moonshot_bash_time` and
+`claude_adapter_aawm_sota_moonshot_child_bash_time`. Each uses the existing
+authenticated CLI path, executes `date --iso-8601=seconds` exactly once through
+the Moonshot model, and requires the final parent response to equal the Bash
+stdout exactly. The Claude case additionally requires the Moonshot child text to
+equal the same tool-result stdout.
+
 Kimi streaming coverage must include a response that leaves the bounded eager
 validation path before emitting multiple collaboration calls. The output-item
 events and terminal response must retain `namespace=collaboration`; a

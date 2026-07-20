@@ -58,6 +58,41 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.128 - Kimi gateway error rollups and Moonshot acceptance gates
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.128`. Managed
+Kimi gateway requests now participate in the standard AAWM route-access and
+rollup path. Successful requests record route turns. Handled authentication,
+configuration, upstream HTTP, response-read, and response-stream failures emit
+one bounded sanitized warning or error plus a failed route row, while replacing
+the duplicate Uvicorn access record. The client still receives the original
+HTTP status and bounded provider response.
+
+The existing production acceptance harness now includes explicit Moonshot
+system-time gates for Codex and Claude. Each gate runs
+`date --iso-8601=seconds` through the model-visible Bash tool and requires the
+final response to equal the exact command stdout. The Claude stress case also
+requires two Moonshot children, two separate three-tool parallel batches per
+child, twelve persisted child tool rows, and a 9,800-10,200 character parent
+result.
+
+**Why:** A handled `/kimi/v1/usages` authentication failure returned the
+correct HTTP 401 but appeared only as a raw Uvicorn access line. It had no
+standard warning, exact sanitized route failure, or red failed row. Production
+acceptance also needed deterministic proof that both inbound client paths can
+dispatch Moonshot work, execute parallel tools, and interact with Bash instead
+of relying on plausible final text.
+
+**Why not upstream:** The managed Kimi gateway, AAWM route-rollup presentation,
+production-only Moonshot aliases, and authenticated Codex/Claude acceptance
+contracts are fork-local operational behavior.
+
+**Validation status:** The Kimi gateway suite passes (`21 passed`); the
+acceptance-hardening suite passes (`103 passed`); and focused Ruff, JSON
+parsing, Python compilation, and `git diff --check` pass. Production Codex and
+Claude Moonshot acceptance plus bounded production-log and `aawm_tristore`
+correlation remain required under `PROD_RELEASE.md`.
+
 ### aawm.127 - Codex MultiAgentV2 spawn-agent schema correction
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.127`. The Codex

@@ -188,8 +188,14 @@ D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
     ("anthropic", "claude-sonnet-4-6"),
 }
 MS012_MOONSHOT_AGENTIC_CASE = "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation"
+MS012_MOONSHOT_BASH_TIME_CASE = "claude_adapter_aawm_sota_moonshot_child_bash_time"
+MS012_MOONSHOT_STRESS_CASE = "claude_adapter_aawm_sota_moonshot_parallel_stress"
 MS012_MOONSHOT_AGENT_PROFILE = "sota-moonshot"
+MS012_MOONSHOT_TIME_AGENT_PROFILE = "sota-moonshot-time"
 MS012_MOONSHOT_ALIAS = "aawm-sota-moonshot"
+MOONSHOT_CODEX_BASH_TIME_CASE = (
+    "native_openai_passthrough_responses_codex_aawm_sota_moonshot_bash_time"
+)
 MOONSHOT_CODEX_COLLABORATION_CASE = (
     "native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration"
 )
@@ -537,6 +543,146 @@ def test_command_json_validator_rejects_required_regex_mismatch():
     assert summary["required_regex_hits"] == {"result": "looked at files"}
     assert failures == [
         f"case command JSON regex mismatch for `result`: expected pattern {pattern!r}, got 'looked at files'"
+    ]
+
+
+def test_bash_stdout_report_validator_accepts_exact_codex_command_output():
+    harness = _load_harness_module()
+    timestamp = "2026-07-20T16:05:19-04:00"
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "date --iso-8601=seconds",
+                        "aggregated_output": f"{timestamp}\n",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": timestamp,
+                    },
+                }
+            ),
+        ]
+    )
+
+    summary, failures = harness._validate_bash_stdout_report(
+        family="case",
+        stdout=stdout,
+        checks={
+            "expected_command": "date --iso-8601=seconds",
+            "expected_regex": (
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                r"(?:Z|[+-]\d{2}:\d{2})$"
+            ),
+        },
+        transcript_tool_use_summary={"agents": []},
+    )
+
+    assert failures == []
+    assert summary["source"] == "codex_command_stdout"
+    assert summary["bash_stdout"] == timestamp
+    assert summary["parent_output"] == timestamp
+
+
+def test_bash_stdout_report_validator_accepts_exact_claude_child_and_parent_output():
+    harness = _load_harness_module()
+    timestamp = "2026-07-20T16:06:21-04:00"
+
+    summary, failures = harness._validate_bash_stdout_report(
+        family="case",
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": False,
+                "result": timestamp,
+            }
+        ),
+        checks={
+            "expected_command": "date --iso-8601=seconds",
+            "expected_regex": (
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                r"(?:Z|[+-]\d{2}:\d{2})$"
+            ),
+            "transcript_agent": "sota-moonshot-time",
+        },
+        transcript_tool_use_summary={
+            "agents": [
+                {
+                    "expected_agent": "sota-moonshot-time",
+                    "records": [
+                        {
+                            "tool_name": "Bash",
+                            "input_preview": (
+                                '{"command": "date --iso-8601=seconds"}'
+                            ),
+                            "tool_result_content_text": timestamp,
+                        }
+                    ],
+                    "assistant_texts": [{"text": timestamp}],
+                }
+            ]
+        },
+    )
+
+    assert failures == []
+    assert summary["source"] == "claude_subagent_transcript"
+    assert summary["bash_stdout"] == timestamp
+    assert summary["child_output"] == timestamp
+    assert summary["parent_output"] == timestamp
+
+
+def test_bash_stdout_report_validator_rejects_rewritten_parent_output():
+    harness = _load_harness_module()
+    timestamp = "2026-07-20T16:07:22-04:00"
+    reported = f"System time: {timestamp}"
+
+    _summary, failures = harness._validate_bash_stdout_report(
+        family="case",
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": False,
+                "result": reported,
+            }
+        ),
+        checks={
+            "expected_command": "date --iso-8601=seconds",
+            "expected_regex": (
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                r"(?:Z|[+-]\d{2}:\d{2})$"
+            ),
+            "transcript_agent": "sota-moonshot-time",
+        },
+        transcript_tool_use_summary={
+            "agents": [
+                {
+                    "expected_agent": "sota-moonshot-time",
+                    "records": [
+                        {
+                            "tool_name": "Bash",
+                            "input_preview": (
+                                '{"command": "date --iso-8601=seconds"}'
+                            ),
+                            "tool_result_content_text": timestamp,
+                        }
+                    ],
+                    "assistant_texts": [{"text": timestamp}],
+                }
+            ]
+        },
+    )
+
+    assert failures == [
+        "case parent response did not exactly report Bash stdout: "
+        f"expected {timestamp!r}, got {reported!r}"
     ]
 
 
@@ -1823,6 +1969,39 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
     }
 
 
+def test_moonshot_codex_bash_time_case_requires_exact_stdout_reporting():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][MOONSHOT_CODEX_BASH_TIME_CASE]
+
+    assert MOONSHOT_CODEX_BASH_TIME_CASE in config["default_excluded_cases"]
+    assert case_config["cli_passthrough"] == "codex"
+    assert case_config["verification_alias"] == MS012_MOONSHOT_ALIAS
+    assert case_config["verification_candidate_label"] == "codex-bash-system-time"
+    assert case_config["match_trace_session_id_from_stdout"] is False
+
+    command = case_config["command"]
+    assert command[:2] == ["codex", "exec"]
+    assert "--ignore-user-config" in command
+    assert command[command.index("-m") + 1] == MS012_MOONSHOT_ALIAS
+    assert "Use exec_command exactly once" in command[-1]
+    assert "date --iso-8601=seconds" in command[-1]
+    assert "return only the exact stdout" in command[-1]
+
+    bash_validation = case_config["bash_stdout_report_validation"]
+    assert bash_validation["expected_command"] == "date --iso-8601=seconds"
+    assert "transcript_agent" not in bash_validation
+
+    [tool_row] = case_config["tool_activity_validation"]["expected_rows"]
+    assert tool_row == {
+        "provider": "kimi_code",
+        "tool_name": "exec_command",
+        "tool_kind": "command",
+        "minimum_count": 1,
+        "maximum_count": 1,
+        "command_text_contains": "date --iso-8601=seconds",
+    }
+
+
 def test_command_text_checks_validate_codex_agent_message_and_stderr():
     harness = _load_harness_module()
     stdout = "\n".join(
@@ -2843,6 +3022,112 @@ def test_ms012_moonshot_case_uses_the_canonical_alias_and_agentic_contract():
         "declared_models": sorted(MS012_MOONSHOT_DECLARED_MODELS),
     }
     assert "aawm-sota-moonshot-anthropic" not in json.dumps(config)
+
+
+def test_ms012_moonshot_claude_stress_case_requires_two_parallel_child_batches():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][MS012_MOONSHOT_STRESS_CASE]
+
+    assert MS012_MOONSHOT_STRESS_CASE in config["default_excluded_cases"]
+    assert case_config["verification_alias"] == MS012_MOONSHOT_ALIAS
+    assert case_config["verification_candidate_label"] == "claude-parallel-stress"
+    assert case_config["allowed_generation_routes"] == ["/anthropic/v1/messages"]
+
+    command = case_config["command"]
+    assert command[0] == "claude"
+    assert "--model" not in command
+    assert command[command.index("--allowedTools") + 1] == "Agent"
+    assert "exactly two Agent tool calls" in command[2]
+    assert "exactly two sequential batches of three parallel" in command[2]
+    assert "between 9800 and 10200 characters" in command[2]
+
+    expected_agents = {
+        "sota-moonshot-stress-a",
+        "sota-moonshot-stress-b",
+    }
+    assert set(case_config["claude_agents"]) == expected_agents
+    for agent_name, agent in case_config["claude_agents"].items():
+        assert agent["model"] == MS012_MOONSHOT_ALIAS
+        assert agent["tools"] == ["Read", "Glob", "Grep"]
+        assert "exactly two sequential parallel batches" in agent["prompt"]
+        child_label = "A" if agent_name.endswith("-a") else "B"
+        assert f"child {child_label}" in agent["prompt"]
+
+    output_checks = case_config["command_output_text_checks"]
+    assert output_checks["minimum_chars"] == 9800
+    assert output_checks["maximum_chars"] == 10200
+    assert output_checks["required_prefix"] == "CLAUDE_MOONSHOT_PROD_ACCEPTANCE_START"
+    assert output_checks["required_suffix"] == "CLAUDE_MOONSHOT_PROD_ACCEPTANCE_END"
+    assert set(output_checks["required_substrings"]) == {
+        "CHILD_A_TWO_PARALLEL_BATCHES_PASSED",
+        "CHILD_B_TWO_PARALLEL_BATCHES_PASSED",
+    }
+
+    transcript_agents = case_config["transcript_tool_use_validation"]["expected_agents"]
+    assert {agent["agent_type"] for agent in transcript_agents} == expected_agents
+    for agent in transcript_agents:
+        assert agent["expected_tool_counts"] == {
+            "Read": 2,
+            "Glob": 2,
+            "Grep": 2,
+        }
+        assert agent["minimum_total_tool_uses"] == 6
+        assert agent["maximum_total_tool_uses"] == 6
+        assert agent["minimum_parallel_tool_batches"] == 2
+        assert agent["minimum_tools_per_parallel_batch"] == 3
+        assert agent["maximum_tool_uses_per_assistant_message"] == 3
+
+    tool_rows = case_config["tool_activity_validation"]["expected_rows"]
+    assert tool_rows[0]["tool_name"] == "Agent"
+    assert tool_rows[0]["minimum_count"] == 2
+    assert {
+        row["tool_name"]: (row["minimum_count"], row["maximum_count"])
+        for row in tool_rows[1:]
+    } == {
+        "Read": (4, 4),
+        "Glob": (4, 4),
+        "Grep": (4, 4),
+    }
+
+
+def test_ms012_moonshot_claude_bash_time_case_requires_exact_stdout_reporting():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][MS012_MOONSHOT_BASH_TIME_CASE]
+
+    assert MS012_MOONSHOT_BASH_TIME_CASE in config["default_excluded_cases"]
+    assert case_config["verification_alias"] == MS012_MOONSHOT_ALIAS
+    assert case_config["verification_candidate_label"] == "claude-bash-system-time"
+
+    command = case_config["command"]
+    assert command[0] == "claude"
+    assert command[command.index("--allowedTools") + 1] == "Agent"
+    assert "Dispatch exactly one sota-moonshot-time child" in command[2]
+    assert "date --iso-8601=seconds" in command[2]
+    assert "return only the exact child text" in command[2]
+
+    assert set(case_config["claude_agents"]) == {
+        MS012_MOONSHOT_TIME_AGENT_PROFILE
+    }
+    agent = case_config["claude_agents"][MS012_MOONSHOT_TIME_AGENT_PROFILE]
+    assert agent["model"] == MS012_MOONSHOT_ALIAS
+    assert agent["tools"] == ["Bash"]
+    assert "return only the exact command stdout" in agent["prompt"]
+
+    bash_validation = case_config["bash_stdout_report_validation"]
+    assert bash_validation == {
+        "expected_command": "date --iso-8601=seconds",
+        "expected_regex": (
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+            r"(?:Z|[+-]\d{2}:\d{2})$"
+        ),
+        "transcript_agent": MS012_MOONSHOT_TIME_AGENT_PROFILE,
+    }
+    [transcript_agent] = case_config["transcript_tool_use_validation"][
+        "expected_agents"
+    ]
+    assert transcript_agent["expected_tool_counts"] == {"Bash": 1}
+    assert transcript_agent["expected_tool_sequence"] == ["Bash"]
+    assert transcript_agent["maximum_total_tool_uses"] == 1
 
 
 def test_ms012_moonshot_contract_rejects_a_raw_smoke_substitution():
@@ -4138,6 +4423,61 @@ def test_transcript_tool_use_validation_accepts_required_parallel_message(tmp_pa
     agent_summary = summary["agents"][0]
     assert agent_summary["max_tool_uses_in_single_assistant_message"] == 3
     assert agent_summary["total_tool_uses"] == 3
+
+
+def test_transcript_tool_use_validation_requires_multiple_parallel_batches(tmp_path):
+    harness = _load_harness_module()
+    subagents_dir = tmp_path / "project" / "session-1" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    transcript = subagents_dir / "agent-def.jsonl"
+    transcript.with_suffix(".meta.json").write_text(
+        json.dumps({"agentType": "sota-moonshot-stress-a"}),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "agentId": "def",
+                "message": {
+                    "id": "msg-parallel-1",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}},
+                        {"type": "tool_use", "id": "tool-2", "name": "Glob", "input": {}},
+                        {"type": "tool_use", "id": "tool-3", "name": "Grep", "input": {}},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary, failures = harness._validate_transcript_tool_use(
+        family="case",
+        session_id="session-1",
+        checks={
+            "claude_projects_root": str(tmp_path),
+            "expected_agents": [
+                {
+                    "agent_type": "sota-moonshot-stress-a",
+                    "expected_tool_counts": {"Read": 1, "Glob": 1, "Grep": 1},
+                    "minimum_parallel_tool_batches": 2,
+                    "minimum_tools_per_parallel_batch": 3,
+                }
+            ],
+        },
+    )
+
+    assert failures == [
+        "case transcript for agent='sota-moonshot-stress-a' had 1 parallel tool batches with >= 3 tool_use blocks; expected >= 2"
+    ]
+    assert summary["agents"][0]["parallel_tool_batch_validation"] == {
+        "minimum_batches": 2,
+        "minimum_tools_per_batch": 3,
+        "qualifying_batches": 1,
+    }
 
 
 def test_transcript_tool_use_validation_reports_missing_child_agent(tmp_path):

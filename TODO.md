@@ -186,7 +186,7 @@ these docs only as needed:
 
 ## Next
 
-- Promote `v1.82.3-aawm.127` to `aawm-litellm` production for managed Kimi
+- Promote `v1.82.3-aawm.128` to `aawm-litellm` production for managed Kimi
   collaboration namespace adaptation, corrected reasoning/message/tool stream
   ordering, large-stream namespace restoration, continuation replay, handled
   passthrough 4xx logging, exact source-error route rollups, full-row
@@ -212,6 +212,14 @@ these docs only as needed:
   spawns and provide complete self-contained plaintext child tasks. Do not use
   legacy `fork_context` or inherited encrypted context as the child task
   envelope.
+  Run the existing-harness Codex and Claude system-time gates, each executing
+  `date --iso-8601=seconds` through Bash and requiring the exact stdout as the
+  final response. The Claude stress gate must dispatch two Moonshot children,
+  require two separate three-tool parallel batches per child, persist all
+  twelve child tool rows, and return a 9,800-10,200 character parent block.
+  Handled Kimi gateway failures must replace standalone Uvicorn/nonstandard
+  error lines with one bounded standard warning or error plus the exact
+  sanitized route-rollup failure row; raw JSON and tracebacks fail acceptance.
   Keep `litellm-dev` on its current code and monitor its logs for new signatures;
   do not use it as the Moonshot production acceptance target.
 

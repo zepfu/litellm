@@ -1,8 +1,9 @@
 import asyncio
 import json
+import logging
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,15 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from litellm._logging import (
+    AawmRouteAccessLogReplacementFilter,
+    clear_aawm_route_access_log_replacements,
+    verbose_proxy_logger,
+)
+from litellm.proxy.aawm_route_logging import (
+    clear_aawm_route_rollups,
+    flush_aawm_route_rollups,
+)
 from litellm.proxy.pass_through_endpoints import kimi_gateway
 
 
@@ -20,6 +30,15 @@ class _RawAsyncByteStream(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         for chunk in self._chunks:
             yield chunk
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _FailingRawAsyncByteStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        raise httpx.ReadError("Bearer upstream-stream-secret")
 
     async def aclose(self) -> None:
         return None
@@ -75,6 +94,24 @@ def _bearer_headers(token: str = "gateway-access-token") -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _build_uvicorn_access_record(
+    *,
+    method: str,
+    full_path: str,
+    status_code: int,
+    client_addr: str = "172.18.0.1:49152",
+) -> logging.LogRecord:
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(client_addr, method, full_path, "1.1", status_code),
+        exc_info=None,
+    )
+
+
 @pytest.fixture
 def credential_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     credential_directory = tmp_path / "credentials"
@@ -83,6 +120,15 @@ def credential_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     _write_credential(path, "gateway-access-token")
     monkeypatch.setenv("LITELLM_KIMI_OAUTH_AUTH_FILE", str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def clear_gateway_route_log_state() -> Iterator[None]:
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    yield
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
 
 
 def _set_upstream(
@@ -153,6 +199,60 @@ def test_kimi_gateway_rejects_missing_wrong_or_malformed_bearers(
     assert response.json()["detail"] == "Kimi Code gateway authorization is invalid."
     assert "wrong-access-token" not in response.text
     assert "gateway-access-token" not in response.text
+
+
+def test_kimi_gateway_auth_failure_uses_structured_log_and_failed_route_rollup(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+) -> None:
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    caplog.set_level(logging.WARNING, logger=verbose_proxy_logger.name)
+
+    response = _request(
+        _gateway_app(),
+        "GET",
+        "/kimi/v1/usages",
+        client_host="172.18.0.1",
+        headers={"User-Agent": "curl/8.0"},
+    )
+
+    assert response.status_code == 401
+    error_records = [
+        record
+        for record in caplog.records
+        if record.name == verbose_proxy_logger.name
+        and "Kimi Code gateway surfaced handled client/provider error"
+        in record.getMessage()
+    ]
+    assert len(error_records) == 1
+    assert error_records[0].levelno == logging.WARNING
+    assert (
+        error_records[0].getMessage()
+        == "Kimi Code gateway surfaced handled client/provider error status=401 "
+        "error=Kimi Code gateway authorization is invalid."
+    )
+    assert getattr(error_records[0], "source") == "kimi_code_gateway"
+    assert getattr(error_records[0], "failure_kind") == (
+        "gateway_authentication_rejected"
+    )
+
+    rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
+    assert "/kimi/v1/usages" in rendered_rollup
+    assert "kimi_code/__managed_account__ - Turns: 0" in rendered_rollup
+    assert "[Kimi Code gateway authorization is invalid.] [Failed]" in rendered_rollup
+
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    access_record = _build_uvicorn_access_record(
+        method="GET",
+        full_path="/kimi/v1/usages",
+        status_code=401,
+    )
+    assert access_filter.filter(access_record) is False
+    assert access_filter.filter(access_record) is True
+    clear_aawm_route_rollups()
 
 
 def test_kimi_gateway_ignores_forwarded_headers_for_authorization_and_strips_them_upstream(
@@ -326,6 +426,117 @@ def test_kimi_gateway_preserves_models_usages_and_nonstream_chat_responses(
     assert requests[2].content == chat_body
 
 
+def test_kimi_gateway_success_records_route_rollup_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+) -> None:
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": []},
+            request=request,
+        ),
+    )
+
+    response = _request(
+        _gateway_app(),
+        "GET",
+        "/kimi/v1/models",
+        client_host="172.18.0.1",
+        headers={**_bearer_headers(), "User-Agent": "curl/8.0"},
+    )
+
+    assert response.status_code == 200
+    rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
+    assert "/kimi/v1/models" in rendered_rollup
+    assert "kimi_code/__managed_account__ - Turns: 1" in rendered_rollup
+
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                method="GET",
+                full_path="/kimi/v1/models",
+                status_code=200,
+            )
+        )
+        is False
+    )
+    clear_aawm_route_rollups()
+
+
+def test_kimi_gateway_upstream_failure_logs_exact_source_error_and_failed_rollup(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+) -> None:
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    caplog.set_level(logging.WARNING, logger=verbose_proxy_logger.name)
+    upstream_body = b'{"error":{"message":"Kimi quota exhausted.","code":"quota"}}'
+    _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(
+            429,
+            content=upstream_body,
+            headers={"content-type": "application/json"},
+            request=request,
+        ),
+    )
+
+    response = _request(
+        _gateway_app(),
+        "POST",
+        "/kimi/v1/chat/completions",
+        client_host="172.18.0.1",
+        content=b'{"model":"k3-high","messages":[]}',
+        headers={
+            **_bearer_headers(),
+            "content-type": "application/json",
+            "User-Agent": "codex-cli/0.144.6",
+        },
+    )
+
+    assert response.status_code == 429
+    assert response.content == upstream_body
+    error_records = [
+        record
+        for record in caplog.records
+        if record.name == verbose_proxy_logger.name
+        and "Kimi Code gateway surfaced handled client/provider error"
+        in record.getMessage()
+    ]
+    assert len(error_records) == 1
+    assert error_records[0].getMessage().endswith(
+        "status=429 error=Kimi quota exhausted."
+    )
+    assert '{"error":' not in error_records[0].getMessage()
+    assert getattr(error_records[0], "failure_kind") == "gateway_upstream_non_success"
+
+    rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
+    assert "/kimi/v1/chat/completions" in rendered_rollup
+    assert "kimi_code/k3-high - Turns: 0" in rendered_rollup
+    assert "[Kimi quota exhausted.] [Failed]" in rendered_rollup
+
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                method="POST",
+                full_path="/kimi/v1/chat/completions",
+                status_code=429,
+            )
+        )
+        is False
+    )
+    clear_aawm_route_rollups()
+
+
 def test_kimi_gateway_preserves_raw_sse_bytes_order_done_and_usage(
     monkeypatch: pytest.MonkeyPatch,
     credential_path: Path,
@@ -361,6 +572,62 @@ def test_kimi_gateway_preserves_raw_sse_bytes_order_done_and_usage(
     assert response.content.index(b'"total_tokens":7') < response.content.index(b"[DONE]")
 
 
+def test_kimi_gateway_stream_read_failure_is_logged_without_asgi_exception(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+) -> None:
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    caplog.set_level(logging.ERROR, logger=verbose_proxy_logger.name)
+    _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            stream=_FailingRawAsyncByteStream(),
+            headers={"content-type": "text/event-stream", "x-trace-id": "trace-123"},
+            request=request,
+        ),
+    )
+
+    response = _request(
+        _gateway_app(),
+        "POST",
+        "/kimi/v1/chat/completions",
+        client_host="172.18.0.1",
+        content=b'{"model":"k3-high","stream":true,"messages":[]}',
+        headers={
+            **_bearer_headers(),
+            "content-type": "application/json",
+            "User-Agent": "codex-cli/0.144.6",
+        },
+    )
+
+    assert response.status_code == 200
+    assert b'"content":"partial"' in response.content
+    error_records = [
+        record
+        for record in caplog.records
+        if record.name == verbose_proxy_logger.name
+        and getattr(record, "failure_kind", None)
+        == "gateway_upstream_stream_failed"
+    ]
+    assert len(error_records) == 1
+    assert error_records[0].levelno == logging.ERROR
+    assert error_records[0].getMessage().endswith(
+        "status=502 error=Kimi Code gateway upstream response stream failed."
+    )
+    assert getattr(error_records[0], "trace_id") == "trace-123"
+    assert "upstream-stream-secret" not in error_records[0].getMessage()
+    assert not error_records[0].exc_info
+
+    rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
+    assert "kimi_code/k3-high - Turns: 0" in rendered_rollup
+    assert "[Kimi Code gateway upstream response stream failed.] [Failed]" in (
+        rendered_rollup
+    )
+    assert "upstream-stream-secret" not in rendered_rollup
+
+
 def test_kimi_gateway_uses_kimi_code_base_url_not_kimi_cli_base_url(
     monkeypatch: pytest.MonkeyPatch,
     credential_path: Path,
@@ -379,9 +646,14 @@ def test_kimi_gateway_uses_kimi_code_base_url_not_kimi_cli_base_url(
 
 
 def test_kimi_gateway_rejects_invalid_base_url_without_an_upstream_request(
+    caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     credential_path: Path,
 ) -> None:
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    caplog.set_level(logging.ERROR, logger=verbose_proxy_logger.name)
     monkeypatch.setenv("KIMI_CODE_BASE_URL", "http://insecure.example.test/coding/v1")
     requests = _set_upstream(
         monkeypatch,
@@ -392,6 +664,60 @@ def test_kimi_gateway_rejects_invalid_base_url_without_an_upstream_request(
 
     assert response.status_code == 503
     assert requests == []
+    assert any(
+        record.name == verbose_proxy_logger.name
+        and record.levelno == logging.ERROR
+        and record.getMessage()
+        == "Kimi Code gateway surfaced handled client/provider error status=503 "
+        "error=Kimi Code gateway upstream is unavailable."
+        and getattr(record, "failure_kind", None)
+        == "gateway_configuration_unavailable"
+        for record in caplog.records
+    )
+    rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
+    assert "[Kimi Code gateway upstream is unavailable.] [Failed]" in rendered_rollup
+    clear_aawm_route_rollups()
+
+
+def test_kimi_gateway_transport_failure_uses_handled_502_log_and_rollup(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+) -> None:
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    caplog.set_level(logging.ERROR, logger=verbose_proxy_logger.name)
+
+    def _raise_connect_error(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("provider connection token=secret", request=request)
+
+    _set_upstream(monkeypatch, _raise_connect_error)
+
+    response = _request(
+        _gateway_app(),
+        "GET",
+        "/kimi/v1/models",
+        headers={**_bearer_headers(), "User-Agent": "curl/8.0"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Kimi Code gateway upstream request failed."
+    assert any(
+        record.name == verbose_proxy_logger.name
+        and record.levelno == logging.ERROR
+        and record.getMessage()
+        == "Kimi Code gateway surfaced handled client/provider error status=502 "
+        "error=Kimi Code gateway upstream request failed."
+        and getattr(record, "failure_kind", None)
+        == "gateway_upstream_request_failed"
+        and not record.exc_info
+        for record in caplog.records
+    )
+    rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
+    assert "[Kimi Code gateway upstream request failed.] [Failed]" in rendered_rollup
+    assert "provider connection" not in rendered_rollup
+    clear_aawm_route_rollups()
 
 
 def test_kimi_gateway_has_no_oauth_or_token_proxy_routes() -> None:

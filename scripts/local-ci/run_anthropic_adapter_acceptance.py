@@ -190,6 +190,51 @@ def _extract_command_output_text(stdout: str) -> str:
     return stdout
 
 
+def _content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_content_text(item) for item in value)
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str):
+            return text
+        content = value.get("content")
+        if content is not None:
+            return _content_text(content)
+    return ""
+
+
+def _collect_codex_command_execution_results(stdout: str) -> list[dict[str, str]]:
+    collected: list[dict[str, str]] = []
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if value.get("type") == "command_execution":
+                command = value.get("command")
+                output = value.get("aggregated_output")
+                if not isinstance(output, str):
+                    output = value.get("stdout")
+                if not isinstance(output, str):
+                    output = value.get("output")
+                if isinstance(command, str) and isinstance(output, str):
+                    collected.append(
+                        {
+                            "command": command,
+                            "output": output,
+                        }
+                    )
+            for child in value.values():
+                _walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                _walk(child)
+
+    for obj in RA._parse_stdout_json_objects(stdout):
+        _walk(obj)
+    return collected
+
+
 def _validate_command_text_checks(
     *,
     family: str,
@@ -3102,6 +3147,36 @@ def _preview_json(value: Any, *, max_chars: int = 300) -> str:
     return text[: max_chars - 3] + '...'
 
 
+def _assistant_message_text(content: list[Any]) -> str:
+    return _content_text(
+        [
+            block
+            for block in content
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+    ).strip()
+
+
+def _append_assistant_text(
+    assistant_texts: list[dict[str, Any]],
+    *,
+    path: pathlib.Path,
+    line_number: int,
+    message_id: str,
+    content: list[Any],
+) -> None:
+    message_text = _assistant_message_text(content)
+    if message_text:
+        assistant_texts.append(
+            {
+                'path': str(path),
+                'line': line_number,
+                'message_id': message_id,
+                'text': message_text,
+            }
+        )
+
+
 def _transcript_agent_type(path: pathlib.Path) -> str | None:
     meta_path = path.with_suffix('.meta.json')
     try:
@@ -3158,6 +3233,7 @@ def _find_claude_subagent_transcripts(
 def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]:
     by_tool_name: dict[str, int] = {}
     by_assistant_message_id: dict[str, dict[str, int]] = {}
+    assistant_texts: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
     records_by_tool_use_id: dict[str, dict[str, Any]] = {}
     tool_result_errors: list[dict[str, Any]] = []
@@ -3197,12 +3273,22 @@ def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]
                         records_by_tool_use_id[tool_use_id][
                             'tool_result_content_preview'
                         ] = tool_result_record['content_preview']
+                        records_by_tool_use_id[tool_use_id][
+                            'tool_result_content_text'
+                        ] = _content_text(block.get('content')).strip()
                     if is_error:
                         tool_result_errors.append(tool_result_record)
                 continue
             if message.get('role') != 'assistant':
                 continue
             message_id = str(message.get('id') or '')
+            _append_assistant_text(
+                assistant_texts,
+                path=path,
+                line_number=line_number,
+                message_id=message_id,
+                content=content,
+            )
             for block in content:
                 if not isinstance(block, dict) or block.get('type') != 'tool_use':
                     continue
@@ -3246,9 +3332,11 @@ def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]
             message_id: dict(sorted(tool_counts.items()))
             for message_id, tool_counts in sorted(by_assistant_message_id.items())
         },
+        'assistant_message_tool_use_totals': dict(sorted(message_totals.items())),
         'max_tool_uses_in_single_assistant_message': max_tools_in_message,
         'total_tool_uses': len(records),
         'tool_result_errors': tool_result_errors,
+        'assistant_texts': assistant_texts,
         'records': records,
     }
 
@@ -3275,6 +3363,12 @@ def _normalize_transcript_agent_checks(checks: dict[str, Any]) -> list[dict[str,
         ),
         'minimum_tools_in_single_assistant_message': checks.get(
             'minimum_tools_in_single_assistant_message'
+        ),
+        'minimum_parallel_tool_batches': checks.get(
+            'minimum_parallel_tool_batches'
+        ),
+        'minimum_tools_per_parallel_batch': checks.get(
+            'minimum_tools_per_parallel_batch'
         ),
         'forbid_tool_result_errors': checks.get('forbid_tool_result_errors'),
         'expected_tool_sequence': checks.get('expected_tool_sequence'),
@@ -3425,6 +3519,28 @@ def _validate_transcript_agent_tool_uses(  # noqa: PLR0915
                 f'{family} transcript for agent={expected_agent_text!r} never had >= {expected_min} tool_use blocks in one assistant message; max was {max_per_message}'
             )
 
+    raw_min_parallel_batches = agent_checks.get('minimum_parallel_tool_batches')
+    if raw_min_parallel_batches is not None:
+        expected_batches = int(raw_min_parallel_batches)
+        minimum_tools_per_batch = int(
+            agent_checks.get('minimum_tools_per_parallel_batch') or 2
+        )
+        message_tool_totals = summary.get('assistant_message_tool_use_totals') or {}
+        qualifying_batches = sum(
+            1
+            for total in message_tool_totals.values()
+            if int(total) >= minimum_tools_per_batch
+        )
+        summary['parallel_tool_batch_validation'] = {
+            'minimum_batches': expected_batches,
+            'minimum_tools_per_batch': minimum_tools_per_batch,
+            'qualifying_batches': qualifying_batches,
+        }
+        if qualifying_batches < expected_batches:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} had {qualifying_batches} parallel tool batches with >= {minimum_tools_per_batch} tool_use blocks; expected >= {expected_batches}'
+            )
+
     if agent_checks.get('forbid_tool_result_errors') is True:
         tool_result_errors = summary.get('tool_result_errors') or []
         if tool_result_errors:
@@ -3486,6 +3602,110 @@ def _validate_transcript_tool_use(
         time.sleep(poll_interval_seconds)
 
     return final_summary, final_failures
+
+
+def _validate_bash_stdout_report(
+    *,
+    family: str,
+    stdout: str,
+    checks: dict[str, Any],
+    transcript_tool_use_summary: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    if not checks:
+        return {"enabled": False}, []
+
+    expected_command = str(checks.get("expected_command") or "").strip()
+    expected_pattern = str(checks.get("expected_regex") or "").strip()
+    expected_agent = str(checks.get("transcript_agent") or "").strip()
+    final_output = _extract_command_output_text(stdout).strip()
+    failures: list[str] = []
+    bash_stdout = ""
+    child_output = ""
+    source = "codex_command_stdout"
+
+    if expected_agent:
+        source = "claude_subagent_transcript"
+        agent_summaries = [
+            summary
+            for summary in transcript_tool_use_summary.get("agents") or []
+            if isinstance(summary, dict)
+            and summary.get("expected_agent") == expected_agent
+        ]
+        if len(agent_summaries) != 1:
+            failures.append(
+                f"{family} Bash stdout report expected one transcript summary for agent={expected_agent!r}, got {len(agent_summaries)}"
+            )
+        else:
+            agent_summary = agent_summaries[0]
+            bash_records = [
+                record
+                for record in agent_summary.get("records") or []
+                if isinstance(record, dict)
+                and record.get("tool_name") == "Bash"
+                and expected_command in str(record.get("input_preview") or "")
+            ]
+            if len(bash_records) != 1:
+                failures.append(
+                    f"{family} Bash stdout report expected one `{expected_command}` tool result for agent={expected_agent!r}, got {len(bash_records)}"
+                )
+            else:
+                bash_stdout = str(
+                    bash_records[0].get("tool_result_content_text") or ""
+                ).strip()
+            assistant_texts = [
+                item
+                for item in agent_summary.get("assistant_texts") or []
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            ]
+            if assistant_texts:
+                child_output = str(assistant_texts[-1]["text"]).strip()
+            else:
+                failures.append(
+                    f"{family} Bash stdout report missing final child text for agent={expected_agent!r}"
+                )
+    else:
+        matches = [
+            record
+            for record in _collect_codex_command_execution_results(stdout)
+            if expected_command in record["command"]
+        ]
+        if len(matches) != 1:
+            failures.append(
+                f"{family} Bash stdout report expected one `{expected_command}` command execution, got {len(matches)}"
+            )
+        else:
+            bash_stdout = matches[0]["output"].strip()
+
+    if expected_pattern:
+        try:
+            timestamp_matches = re.fullmatch(expected_pattern, bash_stdout) is not None
+        except re.error as exc:
+            failures.append(
+                f"{family} Bash stdout report has invalid expected regex {expected_pattern!r}: {exc}"
+            )
+        else:
+            if not timestamp_matches:
+                failures.append(
+                    f"{family} Bash stdout {bash_stdout!r} did not match {expected_pattern!r}"
+                )
+
+    if expected_agent and bash_stdout and child_output != bash_stdout:
+        failures.append(
+            f"{family} child response did not exactly report Bash stdout: expected {bash_stdout!r}, got {child_output!r}"
+        )
+    if bash_stdout and final_output != bash_stdout:
+        failures.append(
+            f"{family} parent response did not exactly report Bash stdout: expected {bash_stdout!r}, got {final_output!r}"
+        )
+
+    return {
+        "enabled": True,
+        "source": source,
+        "expected_command": expected_command,
+        "bash_stdout": bash_stdout,
+        "child_output": child_output or None,
+        "parent_output": final_output,
+    }, failures
 
 
 def _downgrade_configured_failures_to_warnings(
@@ -4162,6 +4382,15 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         if config.get('transcript_tool_use_validation')
         else True
     )
+    bash_stdout_report_summary, bash_stdout_report_failures = (
+        _validate_bash_stdout_report(
+            family=name,
+            stdout=run['stdout'],
+            checks=config.get('bash_stdout_report_validation') or {},
+            transcript_tool_use_summary=transcript_tool_use_summary,
+        )
+    )
+    failures.extend(bash_stdout_report_failures)
 
     runtime_summary, runtime_failures = _validate_runtime_postcondition(
         family=name,
@@ -4258,6 +4487,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         "rate_limit_observations": rate_limit_observations_summary,
         "tool_activity": tool_activity_summary,
         "transcript_tool_use": transcript_tool_use_summary,
+        "bash_stdout_report": bash_stdout_report_summary,
         "tool_activity_passed": tool_activity_passed,
         "transcript_tool_use_passed": transcript_tool_use_passed,
         "stream_tool_call_state_passed": stream_tool_call_state_passed,
