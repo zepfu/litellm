@@ -29209,8 +29209,10 @@ def test_auto_agent_alias_route_event_suppresses_healthy_selection(monkeypatch):
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
 
     emitted = []
+    monkeypatch.delenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", raising=False)
+    monkeypatch.delenv("AAWM_ALIAS_ROUTE_VERBOSE_JSON", raising=False)
     monkeypatch.setattr(
-        endpoints.verbose_proxy_logger,
+        endpoints.verbose_aawm_route_logger,
         "info",
         lambda message: emitted.append(message),
     )
@@ -29228,6 +29230,85 @@ def test_auto_agent_alias_route_event_suppresses_healthy_selection(monkeypatch):
     assert emitted == []
 
 
+def test_auto_agent_alias_route_event_emits_healthy_selection_when_enabled(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    emitted = []
+    monkeypatch.setenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", "1")
+    monkeypatch.setattr(
+        endpoints.verbose_aawm_route_logger,
+        "info",
+        lambda message: emitted.append(message),
+    )
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_selected",
+            "candidate_status": "selected",
+            "selection_reason": "candidate_available",
+            "alias_model": "aawm-sota-moonshot",
+            "provider": "kimi_code",
+            "model": "kimi_code/k3-max",
+        }
+    )
+
+    assert len(emitted) == 1
+    assert "AAWM_ALIAS_ROUTE:" in emitted[0]
+    assert '"alias_model":"aawm-sota-moonshot"' in emitted[0]
+    assert '"model":"kimi_code/k3-max"' in emitted[0]
+
+
+def test_auto_agent_alias_attempt_start_emits_latest_audit_event(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    request = _build_codex_auto_agent_request("moonshot-codex-log-test")
+    selected_event = {
+        "event_type": "candidate_selected",
+        "candidate_status": "selected",
+        "alias_model": "aawm-sota-moonshot",
+        "provider": "kimi_code",
+        "model": "kimi_code/k3-max",
+    }
+    emitted = []
+    monkeypatch.setenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", "1")
+    monkeypatch.setattr(
+        endpoints,
+        "_emit_auto_agent_alias_route_event",
+        lambda event, **_: emitted.append(event),
+    )
+
+    result = endpoints._record_auto_agent_alias_attempt_started(
+        alias_family="codex_auto_agent",
+        alias_model="aawm-sota-moonshot",
+        request=request,
+        prepared_request_body={"model": "aawm-sota-moonshot"},
+        selection={
+            "candidate": {
+                "provider": "kimi_code",
+                "model": "kimi_code/k3-max",
+            }
+        },
+        attempts=[{"provider": "kimi_code", "model": "kimi_code/k3-max"}],
+        attempt_record={"provider": "kimi_code", "model": "kimi_code/k3-max"},
+        add_alias_metadata_fn=lambda body, **_: {
+            **body,
+            "litellm_metadata": {
+                "aawm_alias_routing_audit_events": [
+                    {"event_type": "candidate_skipped_cooldown"},
+                    selected_event,
+                ]
+            },
+        },
+    )
+
+    assert result["litellm_metadata"]["aawm_alias_routing_audit_events"][-1] == (
+        selected_event
+    )
+    assert emitted == [selected_event]
+
+
 def test_auto_agent_alias_route_event_keeps_single_canonical_failure_warning(monkeypatch):
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
 
@@ -29241,7 +29322,7 @@ def test_auto_agent_alias_route_event_keeps_single_canonical_failure_warning(mon
         lambda message: emitted_warnings.append(message),
     )
     monkeypatch.setattr(
-        endpoints.verbose_proxy_logger,
+        endpoints.verbose_aawm_route_logger,
         "info",
         lambda message: emitted_info.append(message),
     )
@@ -29286,7 +29367,7 @@ def test_auto_agent_alias_route_event_emits_verbose_json_when_enabled(monkeypatc
     monkeypatch.setattr(endpoints, "emit_aawm_route_status_event", lambda **kwargs: None)
     monkeypatch.setattr(endpoints, "record_aawm_route_rollup", lambda **kwargs: None)
     monkeypatch.setattr(
-        endpoints.verbose_proxy_logger,
+        endpoints.verbose_aawm_route_logger,
         "info",
         lambda message: emitted_info.append(message),
     )

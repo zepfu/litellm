@@ -45,7 +45,7 @@ from typing_extensions import NotRequired, TypeGuard, TypedDict
 
 import litellm
 from litellm import get_llm_provider
-from litellm._logging import verbose_proxy_logger
+from litellm._logging import verbose_aawm_route_logger, verbose_proxy_logger
 from uuid import NAMESPACE_URL, uuid5
 from litellm._uuid import uuid4
 from litellm.constants import (
@@ -3067,7 +3067,7 @@ def _emit_auto_agent_alias_route_event(
     message = "AAWM_ALIAS_ROUTE: {}".format(
         json.dumps(log_payload, sort_keys=True, default=str, separators=(",", ":"))
     )
-    verbose_proxy_logger.info(message)
+    verbose_aawm_route_logger.info(message)
 
 
 def _should_emit_auto_agent_alias_route_event(
@@ -6494,6 +6494,23 @@ def _record_auto_agent_alias_attempt_started(
         attempts=attempts,
     )
     _safe_set_request_parsed_body(request, candidate_body)
+    candidate_metadata = candidate_body.get("litellm_metadata")
+    audit_events = (
+        candidate_metadata.get("aawm_alias_routing_audit_events")
+        if isinstance(candidate_metadata, dict)
+        else None
+    )
+    if (
+        isinstance(audit_events, list)
+        and audit_events
+        and (
+            _aawm_alias_route_verbose_json_enabled()
+            or _aawm_alias_route_healthy_json_enabled()
+        )
+    ):
+        latest_event = audit_events[-1]
+        if isinstance(latest_event, dict):
+            _emit_auto_agent_alias_route_event(latest_event)
     return candidate_body
 
 
