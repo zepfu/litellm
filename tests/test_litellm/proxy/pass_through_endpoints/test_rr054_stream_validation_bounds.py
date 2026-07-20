@@ -362,6 +362,158 @@ async def test_rr054_stream_validation_overflow_bypasses_validation_without_trun
     assert "response.failed" in _rendered(replayed)
 
 
+@pytest.mark.asyncio
+async def test_rr054_kimi_stream_overflow_restores_parallel_collaboration_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        lpe,
+        "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES",
+        64 * 1024,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS",
+        5000,
+    )
+
+    function_calls = [
+        {
+            "type": "function_call",
+            "id": f"fc_spawn_{index}",
+            "call_id": f"call_spawn_{index}",
+            "name": "spawn_agent",
+            "arguments": json.dumps(
+                {
+                    "task_name": f"child_{index}",
+                    "message": "inspect the assigned scope",
+                }
+            ),
+        }
+        for index in range(2)
+    ]
+    response_body = {
+        "id": "resp_kimi_parallel_spawn",
+        "object": "response",
+        "status": "completed",
+        "model": "kimi_code/k3-max",
+        "output": function_calls,
+    }
+    chunks = [
+        _sse_event(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": response_body["id"],
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": response_body["model"],
+                    "output": [],
+                },
+            },
+        ),
+        _sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_large",
+                "output_index": 0,
+                "delta": "x" * (70 * 1024),
+            },
+        ),
+        *[
+            event
+            for output_index, function_call in enumerate(function_calls, start=1)
+            for event in (
+                _sse_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": function_call,
+                    },
+                ),
+                _sse_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": function_call,
+                    },
+                ),
+            )
+        ],
+        _sse_event(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": response_body,
+            },
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    upstream = await _upstream_from_chunks(chunks)
+
+    response = await lpe._validate_codex_auto_agent_responses_payload(
+        upstream,
+        adapter_model="kimi_code/k3-max",
+        adapter="codex_kimi_chat_completions_adapter",
+        adapter_label="Kimi Code",
+        request_body={
+            "model": "kimi_code/k3-max",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    rendered = _rendered(await _drain_stream(response))
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in rendered.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    item_payloads = [
+        payload
+        for payload in payloads
+        if payload.get("type")
+        in {"response.output_item.added", "response.output_item.done"}
+    ]
+    assert len(item_payloads) == 4
+    assert {
+        payload["item"]["call_id"] for payload in item_payloads
+    } == {"call_spawn_0", "call_spawn_1"}
+    assert all(
+        payload["item"]["namespace"] == "collaboration"
+        for payload in item_payloads
+    )
+
+    completed_payload = next(
+        payload
+        for payload in payloads
+        if payload.get("type") == "response.completed"
+    )
+    assert [
+        item["namespace"] for item in completed_payload["response"]["output"]
+    ] == ["collaboration", "collaboration"]
+    assert "x" * 1024 in rendered
+    assert rendered.endswith("data: [DONE]\n\n")
+
+
 # ---------------------------------------------------------------------------
 # OpenRouter parity
 # ---------------------------------------------------------------------------

@@ -13244,6 +13244,24 @@ def _advertised_namespace_tool_function_adapter_map(
     }
 
 
+def _restore_adapted_namespace_tool_call_item(
+    item: Any,
+    *,
+    namespace_by_name: dict[str, str],
+) -> tuple[Any, int]:
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return item, 0
+
+    item_name = _normalize_low_cardinality_tag_value(item.get("name"))
+    namespace = namespace_by_name.get(item_name or "")
+    if namespace is None or item.get("namespace") is not None:
+        return item, 0
+
+    restored_item = dict(item)
+    restored_item["namespace"] = namespace
+    return restored_item, 1
+
+
 def _restore_adapted_namespace_tool_calls_in_response_body(
     response_body: dict[str, Any],
     *,
@@ -13264,20 +13282,14 @@ def _restore_adapted_namespace_tool_calls_in_response_body(
     restored_output: list[Any] = []
     restored_count = 0
     for item in output:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
-            restored_output.append(item)
-            continue
-
-        item_name = _normalize_low_cardinality_tag_value(item.get("name"))
-        namespace = namespace_by_name.get(item_name or "")
-        if namespace is None or item.get("namespace") is not None:
-            restored_output.append(item)
-            continue
-
-        restored_item = dict(item)
-        restored_item["namespace"] = namespace
+        restored_item, item_restored_count = (
+            _restore_adapted_namespace_tool_call_item(
+                item,
+                namespace_by_name=namespace_by_name,
+            )
+        )
         restored_output.append(restored_item)
-        restored_count += 1
+        restored_count += item_restored_count
 
     if restored_count == 0:
         return response_body, 0
@@ -13285,6 +13297,149 @@ def _restore_adapted_namespace_tool_calls_in_response_body(
     restored_body = dict(response_body)
     restored_body["output"] = restored_output
     return restored_body, restored_count
+
+
+def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
+    event_payload: dict[str, Any],
+    *,
+    namespace_by_name: dict[str, str],
+) -> tuple[dict[str, Any], int]:
+    restored_payload = event_payload
+    restored_count = 0
+
+    item, item_restored_count = _restore_adapted_namespace_tool_call_item(
+        event_payload.get("item"),
+        namespace_by_name=namespace_by_name,
+    )
+    if item_restored_count:
+        restored_payload = dict(restored_payload)
+        restored_payload["item"] = item
+        restored_count += item_restored_count
+
+    response_body = event_payload.get("response")
+    if isinstance(response_body, dict):
+        output = response_body.get("output")
+        if isinstance(output, list):
+            restored_output: list[Any] = []
+            response_restored_count = 0
+            for output_item in output:
+                restored_item, output_item_restored_count = (
+                    _restore_adapted_namespace_tool_call_item(
+                        output_item,
+                        namespace_by_name=namespace_by_name,
+                    )
+                )
+                restored_output.append(restored_item)
+                response_restored_count += output_item_restored_count
+            if response_restored_count:
+                restored_response_body = dict(response_body)
+                restored_response_body["output"] = restored_output
+                if restored_payload is event_payload:
+                    restored_payload = dict(restored_payload)
+                restored_payload["response"] = restored_response_body
+                restored_count += response_restored_count
+
+    return restored_payload, restored_count
+
+
+def _restore_adapted_namespace_tool_calls_in_sse_event_block(
+    event_block: str,
+    *,
+    namespace_by_name: dict[str, str],
+) -> tuple[str, int]:
+    lines = event_block.splitlines()
+    data_line_indexes = [
+        index for index, line in enumerate(lines) if line.startswith("data:")
+    ]
+    if not data_line_indexes:
+        return event_block, 0
+
+    raw_data = "\n".join(
+        lines[index].removeprefix("data:").lstrip(" ")
+        for index in data_line_indexes
+    )
+    if not raw_data or raw_data == "[DONE]":
+        return event_block, 0
+    try:
+        event_payload = json.loads(raw_data)
+    except Exception:
+        return event_block, 0
+    if not isinstance(event_payload, dict):
+        return event_block, 0
+
+    restored_payload, restored_count = (
+        _restore_adapted_namespace_tool_calls_in_stream_event_payload(
+            event_payload,
+            namespace_by_name=namespace_by_name,
+        )
+    )
+    if not restored_count:
+        return event_block, 0
+
+    rendered_data = json.dumps(restored_payload, ensure_ascii=False)
+    restored_lines: list[str] = []
+    inserted_data = False
+    data_line_index_set = set(data_line_indexes)
+    for index, line in enumerate(lines):
+        if index not in data_line_index_set:
+            restored_lines.append(line)
+            continue
+        if not inserted_data:
+            restored_lines.append(f"data: {rendered_data}")
+            inserted_data = True
+    return "\n".join(restored_lines), restored_count
+
+
+def _restore_adapted_namespace_tool_calls_in_streaming_response(
+    response: StreamingResponse,
+    *,
+    request_body: Optional[dict[str, Any]],
+    adapter_model: str,
+) -> StreamingResponse:
+    namespace_by_name = _advertised_namespace_tool_function_adapter_map(
+        request_body,
+        adapter_model=adapter_model,
+    )
+    if not namespace_by_name:
+        return response
+
+    original_iterator = response.body_iterator
+
+    async def _restoring_iterator() -> Any:
+        buffer = ""
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        async for raw_chunk in original_iterator:
+            if isinstance(raw_chunk, bytes):
+                buffer += decoder.decode(raw_chunk)
+            else:
+                buffer += str(raw_chunk)
+
+            while "\n\n" in buffer:
+                event_block, buffer = buffer.split("\n\n", 1)
+                restored_block, _ = (
+                    _restore_adapted_namespace_tool_calls_in_sse_event_block(
+                        event_block,
+                        namespace_by_name=namespace_by_name,
+                    )
+                )
+                yield f"{restored_block}\n\n"
+
+        buffer += decoder.decode(b"", final=True)
+        if buffer:
+            restored_block, _ = (
+                _restore_adapted_namespace_tool_calls_in_sse_event_block(
+                    buffer,
+                    namespace_by_name=namespace_by_name,
+                )
+            )
+            yield restored_block
+
+    return StreamingResponse(
+        _restoring_iterator(),
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type=response.media_type or "text/event-stream",
+    )
 
 
 def _raise_codex_auto_agent_malformed_adapted_custom_tool_call(
@@ -13819,7 +13974,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     peek.buffered_bytes,
                     adapter,
                 )
-            return peek.response
+            return _restore_adapted_namespace_tool_calls_in_streaming_response(
+                peek.response,
+                request_body=request_body,
+                adapter_model=adapter_model,
+            )
         response_body = await _collect_responses_response_from_stream(
             peek.response,
             event_summaries=event_summaries,

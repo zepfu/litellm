@@ -58,6 +58,30 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.124 - Kimi large-stream collaboration namespace restoration
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.124`. When
+bounded Responses validation switches to lossless streaming mode, the Kimi
+adapter now incrementally restores `namespace=collaboration` on recognized
+Codex function-call output items and the terminal response. The transformer
+buffers at most one SSE event and preserves the complete upstream stream.
+
+**Why:** Large Kimi responses could exceed or outlive the bounded validation
+peek. That path returned the untouched stream and bypassed the namespace
+restoration added in aawm.123, so Codex received plain `spawn_agent` calls and
+rejected them as unsupported.
+
+**Why not upstream:** The managed Kimi alias, Codex collaboration allowlist,
+and namespace-to-function adaptation are fork-local behavior.
+
+**Validation status:** The complete passthrough module passes (`967 passed`);
+the combined bounded-stream, Kimi adapter, and Moonshot routing suites pass
+(`57 passed`). The regression streams approximately 70 KiB before two
+`spawn_agent` calls and verifies namespace restoration on both output-item
+events and the terminal response. Focused Ruff, Python compilation, and
+`git diff --check` pass. Production Codex V2 and Claude CLI acceptance remain
+required under `PROD_RELEASE.md`.
+
 ### aawm.123 — Kimi Codex collaboration namespace and stream ordering
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.123`. For

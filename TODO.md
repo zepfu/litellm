@@ -186,17 +186,18 @@ these docs only as needed:
 
 ## Next
 
-- Promote `v1.82.3-aawm.123` to `aawm-litellm` production for managed Kimi
+- Promote `v1.82.3-aawm.124` to `aawm-litellm` production for managed Kimi
   collaboration namespace adaptation, corrected reasoning/message/tool stream
-  ordering, continuation replay, and handled passthrough 4xx logging. Follow
-  `PROD_RELEASE.md`, reuse the canonical Kimi credential in place, and mutate
-  only the production LiteLLM service. Acceptance requires real Codex V2
-  Responses and Claude Anthropic ingress parents selecting the Kimi route,
-  multiple child agent dispatches, at least two separate parallel tool-call
-  batches per child, roughly 10,000 characters of final block text from each
-  parent, exact
+  ordering, large-stream namespace restoration, continuation replay, and
+  handled passthrough 4xx logging. Follow `PROD_RELEASE.md`, reuse the canonical
+  Kimi credential in place, and mutate only the production LiteLLM service.
+  Acceptance requires real Codex V2 Responses and Claude Anthropic ingress
+  parents selecting the Kimi route, multiple child agent dispatches, at least
+  two separate parallel tool-call batches per child, roughly 10,000 characters
+  of final block text from each parent, exact
   `aawm_tristore.public.session_history` evidence, and an overlapping prod log
-  window with no raw traceback or JSON error blob for handled 4xx responses.
+  window with plainly correlated Kimi route records and no raw traceback or
+  JSON error blob for handled 4xx responses.
   Keep `litellm-dev` on its current code and monitor its logs for new signatures;
   do not use it as the Moonshot production acceptance target.
 

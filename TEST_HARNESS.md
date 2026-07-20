@@ -144,6 +144,11 @@ production logs, Langfuse, `aawm_tristore.public.session_history`, and
 `/home/zepfu/.kimi-code/credentials` mount at the same path; acceptance must not
 copy or synthesize Kimi credentials.
 
+Kimi streaming coverage must include a response that leaves the bounded eager
+validation path before emitting multiple collaboration calls. The output-item
+events and terminal response must retain `namespace=collaboration`; a
+small-stream-only namespace test is insufficient.
+
 OpenRouter Responses hard gates must catch both incomplete-but-useful streams
 and successful-empty streams. If OpenRouter omits `response.completed` but emits
 usable text, the adapter may synthesize a valid Anthropic `message_delta` /
