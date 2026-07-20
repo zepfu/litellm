@@ -949,6 +949,9 @@ _aawm_route_access_log_replacement_lock = threading.Lock()
 _aawm_route_access_log_replacements: Dict[
     _AawmRouteAccessLogReplacementKey, int
 ] = {}
+_aawm_route_access_log_all_status_replacements: set[
+    _AawmRouteAccessLogReplacementKey
+] = set()
 _aawm_route_access_log_replacement_order: Deque[
     _AawmRouteAccessLogReplacementKey
 ] = deque()
@@ -961,6 +964,7 @@ def _normalize_aawm_route_access_log_replacement_path(full_path: object) -> str:
 def clear_aawm_route_access_log_replacements() -> None:
     with _aawm_route_access_log_replacement_lock:
         _aawm_route_access_log_replacements.clear()
+        _aawm_route_access_log_all_status_replacements.clear()
         _aawm_route_access_log_replacement_order.clear()
 
 
@@ -970,6 +974,7 @@ def register_aawm_route_access_log_replacement(
     method: Optional[str],
     full_path: Optional[str],
     http_version: Optional[str],
+    suppress_all_statuses: bool = False,
 ) -> None:
     if not client_addr or not method or not full_path or not http_version:
         return
@@ -985,6 +990,8 @@ def register_aawm_route_access_log_replacement(
             _aawm_route_access_log_replacements.get(key, 0) + 1
         )
         _aawm_route_access_log_replacement_order.append(key)
+        if suppress_all_statuses:
+            _aawm_route_access_log_all_status_replacements.add(key)
 
         while (
             len(_aawm_route_access_log_replacement_order)
@@ -998,6 +1005,7 @@ def register_aawm_route_access_log_replacement(
                 _aawm_route_access_log_replacements[stale_key] = stale_count - 1
             else:
                 del _aawm_route_access_log_replacements[stale_key]
+                _aawm_route_access_log_all_status_replacements.discard(stale_key)
 
 
 def discard_aawm_route_access_log_replacement(
@@ -1024,6 +1032,7 @@ def discard_aawm_route_access_log_replacement(
             _aawm_route_access_log_replacements[key] = replacement_count - 1
         else:
             del _aawm_route_access_log_replacements[key]
+            _aawm_route_access_log_all_status_replacements.discard(key)
         try:
             _aawm_route_access_log_replacement_order.remove(key)
         except ValueError:
@@ -1055,24 +1064,26 @@ def _aawm_route_access_log_key_from_record(
 
 def _consume_aawm_route_access_log_replacement(
     record: logging.LogRecord,
-) -> bool:
+) -> Tuple[bool, bool]:
     key = _aawm_route_access_log_key_from_record(record)
     if key is None:
-        return False
+        return False, False
 
     with _aawm_route_access_log_replacement_lock:
         replacement_count = _aawm_route_access_log_replacements.get(key)
         if replacement_count is None:
-            return False
+            return False, False
+        suppress_all_statuses = key in _aawm_route_access_log_all_status_replacements
         if replacement_count > 1:
             _aawm_route_access_log_replacements[key] = replacement_count - 1
         else:
             del _aawm_route_access_log_replacements[key]
+            _aawm_route_access_log_all_status_replacements.discard(key)
         try:
             _aawm_route_access_log_replacement_order.remove(key)
         except ValueError:
             pass
-        return True
+        return True, suppress_all_statuses
 
 
 _AAWM_ARROW_ACCESS_LOG_SEPARATOR = " -> "
@@ -1141,7 +1152,12 @@ class AawmRouteAccessLogReplacementFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if record.name not in {"uvicorn.access", "gunicorn.access"}:
             return True
-        if _consume_aawm_route_access_log_replacement(record):
+        matched_replacement, suppress_all_statuses = (
+            _consume_aawm_route_access_log_replacement(record)
+        )
+        if matched_replacement:
+            if suppress_all_statuses:
+                return False
             status_code = _status_code_from_access_log_record(record)
             return (
                 status_code is None

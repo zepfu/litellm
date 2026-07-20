@@ -192,6 +192,10 @@ class TestProxyBaseLLMRequestProcessing:
 
     @staticmethod
     def _restore_verbose_proxy_logger(saved_handlers, saved_level, saved_propagate):
+        for handler in verbose_proxy_logger.handlers[:]:
+            if isinstance(handler, AawmErrorLogFileHandler):
+                handler.flush()
+                handler.close()
         verbose_proxy_logger.handlers.clear()
         for saved_handler in saved_handlers:
             verbose_proxy_logger.addHandler(saved_handler)
@@ -3210,6 +3214,105 @@ class TestAawmRouteRollup:
         )
         flushed = accumulator.flush(force=True, now=now)
         assert " - gpt-5.5(aawm-low) - Turns: 3 [Exhausted]" in flushed
+
+    def test_route_rollup_retains_sanitized_source_error(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 7, 20, 14, 5, 17)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        accumulator.record(
+            group_header_label="litellm#Codex[0.144.6]",
+            incoming_endpoint="/openai_passthrough/responses",
+            outgoing_target="codex_xai_oauth_responses_adapter",
+            model_label="oa_xai/grok-4.5(aawm-sota-xai)",
+            turns=0,
+            status="Cooling Down",
+            message="Grok Build usage balance exhausted",
+            now=now,
+        )
+
+        flushed = accumulator.flush(force=True, now=now)
+
+        assert flushed == [
+            "20260720 14:05:17 litellm#Codex[0.144.6] /openai_passthrough/responses",
+            (
+                " - oa_xai/grok-4.5(aawm-sota-xai) - Turns: 0 "
+                "[Grok Build usage balance exhausted] [Cooling Down] -> "
+                "codex_xai_oauth_responses_adapter"
+            ),
+        ]
+        assert "\x1b" not in "\n".join(flushed)
+
+    def test_route_rollup_console_emission_colors_entire_failed_and_cooldown_rows(
+        self,
+        monkeypatch,
+    ):
+        mock_logger = MagicMock()
+        monkeypatch.setattr(aawm_route_logging, "json_logs", False)
+
+        with patch.object(
+            aawm_route_logging.logging,
+            "getLogger",
+            return_value=mock_logger,
+        ):
+            aawm_route_logging._emit_aawm_route_rollup_lines(
+                [
+                    (
+                        "20260720 14:05:17 litellm#Codex[0.144.6] "
+                        "/openai_passthrough/responses"
+                    ),
+                    (
+                        " - oa_xai/grok-4.5(aawm-sota-xai) - Turns: 0 "
+                        "[Grok Build usage balance exhausted] [Cooling Down]"
+                    ),
+                    (
+                        " - grok-4.5(aawm-sota-xai) - Turns: 0 "
+                        "[The requested model 'grok-4.5' does not exist.] [Failed]"
+                    ),
+                ]
+            )
+
+        rendered = mock_logger.info.call_args.args[1]
+        assert rendered.startswith(
+            "20260720 14:05:17 litellm#Codex[0.144.6] "
+            "/openai_passthrough/responses\n"
+        )
+        assert (
+            "\x1b[94m - oa_xai/grok-4.5(aawm-sota-xai) - Turns: 0 "
+            "[Grok Build usage balance exhausted] [Cooling Down]\x1b[0m"
+        ) in rendered
+        assert (
+            "\x1b[91m - grok-4.5(aawm-sota-xai) - Turns: 0 "
+            "[The requested model 'grok-4.5' does not exist.] [Failed]\x1b[0m"
+        ) in rendered
+
+    def test_route_rollup_json_emission_remains_ansi_free(self, monkeypatch):
+        mock_logger = MagicMock()
+        monkeypatch.setattr(aawm_route_logging, "json_logs", True)
+
+        with patch.object(
+            aawm_route_logging.logging,
+            "getLogger",
+            return_value=mock_logger,
+        ):
+            aawm_route_logging._emit_aawm_route_rollup_lines(
+                [
+                    (
+                        "20260720 14:05:17 litellm#Codex[0.144.6] "
+                        "/openai_passthrough/responses"
+                    ),
+                    (
+                        " - grok-4.5(aawm-sota-xai) - Turns: 0 "
+                        "[The requested model 'grok-4.5' does not exist.] [Failed]"
+                    ),
+                ]
+            )
+
+        rendered = mock_logger.info.call_args.args[1]
+        assert "[Failed]" in rendered
+        assert "\x1b" not in rendered
 
     def test_route_rollup_status_event_keeps_immediate_error_shape(self, caplog):
         from datetime import datetime

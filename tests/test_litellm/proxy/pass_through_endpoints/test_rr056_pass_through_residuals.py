@@ -479,6 +479,7 @@ def test_provider_failure_logging_uses_registry_fields_not_hardcoded_cascade() -
     assert "elif _provider_failure_classification is not None:" in src
     assert "classification.failure_kind" in src
     assert "classification.log_message" in src
+    assert 'getattr(classification, "log_error_summary", None)' in src
     # Old per-vendor cascade names for logging must be gone.
     assert "suppress_chatgpt_codex_block_page_traceback" not in src
     assert 'failure_kind": "openai_chatgpt_codex_block_page"' not in src

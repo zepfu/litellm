@@ -197,6 +197,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds,
     _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible,
     _plan_codex_auto_agent_native_grok_continuation_transient_retry,
+    _update_codex_auto_agent_retryable_attempt_record,
     _apply_codex_auto_agent_alias_cooldown,
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
@@ -25119,6 +25120,14 @@ async def test_codex_auto_agent_alias_sota_falls_through_to_gpt_5_5_last_resort(
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt():
     request = _build_codex_auto_agent_request()
+    request.scope.update(
+        {
+            "client": ("172.19.0.1", 52834),
+            "method": "POST",
+            "http_version": "1.1",
+        }
+    )
+    clear_aawm_route_access_log_replacements()
     route_status = []
     body = {
         "model": "aawm-sota",
@@ -25170,6 +25179,22 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
 
     assert exc_info.value.status_code == 429
     mock_pass_through.assert_not_called()
+    access_record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(
+            "172.19.0.1:52834",
+            "POST",
+            "/openai_passthrough/v1/responses",
+            "1.1",
+            429,
+        ),
+        exc_info=None,
+    )
+    assert AawmRouteAccessLogReplacementFilter().filter(access_record) is False
     assert route_status == [
         {
             "alias_model": "aawm-sota",
@@ -28071,6 +28096,26 @@ def test_auto_agent_alias_route_rollup_status_preserves_true_cooldown_labels():
     )
 
 
+def test_codex_auto_agent_retryable_attempt_retains_exact_source_error():
+    attempt_record: dict[str, Any] = {}
+    exc = HTTPException(
+        status_code=402,
+        detail=b'{"error":"Grok Build usage balance exhausted"}',
+    )
+
+    _update_codex_auto_agent_retryable_attempt_record(
+        attempt_record=attempt_record,
+        exc=exc,
+        error_class="usage_limit_reached",
+        cooldown_seconds=10800.0,
+        cooldown_scope="candidate",
+    )
+
+    assert attempt_record["source_error"] == "Grok Build usage balance exhausted"
+    assert attempt_record["error_status_code"] == 402
+    assert attempt_record["status"] == "cooldown_set"
+
+
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries_without_redispatch():
     request = _build_codex_auto_agent_request()
@@ -29694,6 +29739,47 @@ def test_auto_agent_alias_route_event_records_zero_turn_rollup(monkeypatch):
             "model_label": "grok-composer-2.5-fast(aawm-low)",
             "turns": 0,
             "status": "Cooling Down",
+            "message": None,
+        }
+    ]
+
+
+def test_auto_agent_alias_route_event_records_source_error_on_rollup(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as endpoints
+
+    rollups = []
+    monkeypatch.setattr(endpoints, "emit_aawm_route_status_event", lambda **kwargs: None)
+    monkeypatch.setattr(
+        endpoints,
+        "record_aawm_route_rollup",
+        lambda **kwargs: rollups.append(kwargs),
+    )
+    monkeypatch.setattr(endpoints.verbose_proxy_logger, "warning", lambda message: None)
+
+    endpoints._emit_auto_agent_alias_route_event(
+        {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "usage_limit_reached",
+            "source_error": "Grok Build usage balance exhausted",
+            "alias_model": "aawm-sota-xai",
+            "model": "oa_xai/grok-4.5",
+            "rollup_group_header_label": "litellm#Codex[0.144.6]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "codex_xai_oauth_responses_adapter",
+        },
+        level="warning",
+    )
+
+    assert rollups == [
+        {
+            "group_header_label": "litellm#Codex[0.144.6]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "codex_xai_oauth_responses_adapter",
+            "model_label": "oa_xai/grok-4.5(aawm-sota-xai)",
+            "turns": 0,
+            "status": "Cooling Down",
+            "message": "Grok Build usage balance exhausted",
         }
     ]
 
@@ -29735,6 +29821,7 @@ def test_auto_agent_alias_route_event_records_cooldown_rollup_with_host(monkeypa
             "model_label": "openrouter/cohere/north-mini-code:free(aawm-low)",
             "turns": 0,
             "status": "Cooling Down",
+            "message": None,
         }
     ]
 
@@ -29891,6 +29978,7 @@ def test_auto_agent_alias_route_event_prefers_real_opencode_zen_target(monkeypat
             "model_label": "deepseek-v4-flash(aawm-low)",
             "turns": 0,
             "status": "Cooling Down",
+            "message": None,
         }
     ]
 
@@ -32737,6 +32825,51 @@ async def test_openai_passthrough_codex_auto_agent_alias_uses_alias_router(
     assert mock_alias_handler.await_args.kwargs["target_url"] == (
         "https://chatgpt.com/backend-api/codex/responses"
     )
+
+
+@pytest.mark.asyncio
+async def test_openai_passthrough_recognized_alias_without_codex_headers_uses_alias_router():
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "POST"
+    mock_request.headers = {
+        "authorization": "Bearer generic-openai-token",
+        "user-agent": "openai-python/1.0",
+    }
+    mock_request.query_params = {}
+    mock_response = MagicMock(spec=Response)
+    mock_user_api_key_dict = MagicMock()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+        new=AsyncMock(
+            return_value={
+                "model": "aawm-sota-xai",
+                "input": "hello",
+            }
+        ),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_auto_agent_alias_route",
+        new=AsyncMock(return_value={"ok": True}),
+    ) as mock_alias_handler, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+    ) as mock_create_pass_through_route:
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/responses",
+            request=mock_request,
+            fastapi_response=mock_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            base_target_url="https://api.openai.com",
+            api_key="test_api_key",
+            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
+        )
+
+    assert result == {"ok": True}
+    mock_alias_handler.assert_awaited_once()
+    assert (
+        mock_alias_handler.await_args.kwargs["prepared_request_body"]["model"]
+        == "aawm-sota-xai"
+    )
+    mock_create_pass_through_route.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -40111,18 +40244,24 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
     assert luna_attempt["cooldown_seconds"] > 0
 
 
-def test_codex_auto_agent_grok_composer_durable_cooldown_seconds_are_five_minutes():
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _build_grok_build_usage_balance_exhausted_error(),
+        _build_grok_personal_team_spending_limit_error(),
+    ],
+)
+def test_codex_auto_agent_grok_account_quota_cooldown_is_three_hours(exc):
     grok_candidate = {
         "provider": "xai",
         "model": "grok-composer-2.5-fast",
         "route_family": "codex_grok_native_responses_adapter",
         "last_resort": False,
     }
-    exc = _build_grok_build_usage_balance_exhausted_error()
 
     assert (
         _get_codex_auto_agent_cooldown_seconds(exc, candidate=grok_candidate)
-        == 300.0
+        == 3 * 60 * 60.0
     )
     assert (
         _get_codex_auto_agent_cooldown_scope("capacity_exhausted")
@@ -40184,7 +40323,7 @@ async def test_codex_auto_agent_alias_code_skips_native_lane_after_grok_personal
     assert grok_attempt["error_class"] == "capacity_exhausted"
     assert grok_attempt["error_status_code"] == 403
     assert grok_attempt["cooldown_scope"] == "candidate"
-    assert grok_attempt["cooldown_seconds"] == 300.0
+    assert grok_attempt["cooldown_seconds"] == 3 * 60 * 60.0
     assert "GROK_PERSONAL_TEAM_SPENDING_LIMIT" in grok_attempt["error_tokens"]
     skipped_by_model = {
         candidate["model"]: candidate
@@ -40206,6 +40345,28 @@ async def test_codex_auto_agent_alias_code_skips_native_lane_after_grok_personal
             state_key=cooldown_key,
         )
         for call in dual_cache.set_calls
+    )
+    codex_quota_cooldown_calls = [
+        call
+        for call in dual_cache.set_calls
+        if call["key"]
+        in {
+            _build_aawm_alias_routing_durable_cache_key(
+                alias_family="codex",
+                state_kind="cooldown",
+                state_key=cooldown_key,
+            ),
+            _build_aawm_alias_routing_durable_cache_key(
+                alias_family="codex",
+                state_kind="cooldown",
+                state_key=lane_cooldown_key,
+            ),
+        }
+    ]
+    assert len(codex_quota_cooldown_calls) == 2
+    assert all(
+        call["kwargs"]["ttl"] == pytest.approx(3 * 60 * 60.0)
+        for call in codex_quota_cooldown_calls
     )
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(
         lane_cooldown_key,
@@ -40252,8 +40413,12 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage
     managed_success = Response(content='{"ok": true}', media_type="application/json")
     dual_cache = _FakeAawmAliasRoutingDualCache()
     cooldown_key = "xai:grok-composer-2.5-fast:xai_grok_native"
+    lane_cooldown_key = "xai:__account_quota__:xai_grok_native"
     grok45_cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(
+        lane_cooldown_key, None
+    )
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(
         grok45_cooldown_key, None
     )
@@ -40299,7 +40464,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage
     assert grok_attempt["error_class"] == "capacity_exhausted"
     assert grok_attempt["error_status_code"] == 402
     assert grok_attempt["cooldown_scope"] == "candidate"
-    assert grok_attempt["cooldown_seconds"] == 300.0
+    assert grok_attempt["cooldown_seconds"] == 3 * 60 * 60.0
     assert "GROK_BUILD_USAGE_BALANCE_EXHAUSTED" in grok_attempt["error_tokens"]
     assert metadata["anthropic_auto_agent_selected_model"] == "oa_xai/grok-build"
     assert any(
@@ -40310,6 +40475,28 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage
             state_key=cooldown_key,
         )
         for call in dual_cache.set_calls
+    )
+    anthropic_quota_cooldown_calls = [
+        call
+        for call in dual_cache.set_calls
+        if call["key"]
+        in {
+            _build_aawm_alias_routing_durable_cache_key(
+                alias_family="anthropic",
+                state_kind="cooldown",
+                state_key=cooldown_key,
+            ),
+            _build_aawm_alias_routing_durable_cache_key(
+                alias_family="anthropic",
+                state_kind="cooldown",
+                state_key=lane_cooldown_key,
+            ),
+        }
+    ]
+    assert len(anthropic_quota_cooldown_calls) == 2
+    assert all(
+        call["kwargs"]["ttl"] == pytest.approx(3 * 60 * 60.0)
+        for call in anthropic_quota_cooldown_calls
     )
 
 
@@ -40368,7 +40555,7 @@ async def test_anthropic_auto_agent_alias_in_flight_grok_personal_team_spending_
     )
     assert exc_info.value.detail["failure_class"] == "capacity_exhausted"
     assert exc_info.value.detail["error_status_code"] == 403
-    assert exc_info.value.detail["cooldown_seconds"] == 300.0
+    assert exc_info.value.detail["cooldown_seconds"] == 3 * 60 * 60.0
     assert "GROK_PERSONAL_TEAM_SPENDING_LIMIT" in exc_info.value.detail["error_tokens"]
     assert (
         exc_info.value.detail["redispatch_reason"]

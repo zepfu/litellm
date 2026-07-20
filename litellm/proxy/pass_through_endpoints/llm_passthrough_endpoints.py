@@ -103,6 +103,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     pass_through_request,
     websocket_passthrough_request,
     _classify_passthrough_hidden_retry_failure,
+    _get_passthrough_handled_http_error_summary,
     _get_passthrough_hidden_retry_wait_seconds,
     _is_known_grok_build_usage_balance_exhausted_response,
     _is_known_grok_personal_team_spending_limit_response,
@@ -161,6 +162,7 @@ from litellm.proxy.aawm_route_logging import (
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
     record_aawm_route_rollup_turn,
+    register_aawm_route_rollup_access_log_replacement,
     resolve_aawm_route_host_attribution,
 )
 
@@ -811,7 +813,7 @@ _CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS = 30.0
 _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS = 30.0 * 60.0
 _CODEX_AUTO_AGENT_SPARK_MODEL = "gpt-5.3-codex-spark"
 _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = 300.0
-_CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = 300.0
+_CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = 3 * 60 * 60.0
 _CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = (
     "GROK_BUILD_USAGE_BALANCE_EXHAUSTED"
 )
@@ -2935,6 +2937,9 @@ def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str
 
 def _auto_agent_alias_route_status_message(event: dict[str, Any]) -> str:
     parts: list[str] = []
+    source_error = _clean_codex_auth_value(event.get("source_error"))
+    if source_error is not None:
+        parts.append(f"source_error={source_error}")
     for key in (
         "failure_class",
         "error_type",
@@ -3074,6 +3079,7 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
             model_label=label,
             turns=0,
             status=status,
+            message=_clean_codex_auth_value(event.get("source_error")),
         )
 
 
@@ -4133,6 +4139,7 @@ def _build_auto_agent_alias_audit_event(
     error_type: Optional[str] = None,
     error_code: Optional[Any] = None,
     error_tokens: Optional[Any] = None,
+    source_error: Optional[str] = None,
     retry_after_seconds: Optional[Any] = None,
     failure_phase: Optional[str] = None,
     attempted_provider_call: Optional[bool] = None,
@@ -4189,6 +4196,7 @@ def _build_auto_agent_alias_audit_event(
         "error_status_code": _auto_agent_alias_int(error_status_code),
         "error_type": error_type,
         "error_code": str(error_code) if error_code is not None else None,
+        "source_error": _clean_codex_auth_value(source_error),
         "retry_after_seconds": _auto_agent_alias_float(retry_after_seconds),
         "failure_phase": failure_phase,
         "attempted_provider_call": attempted_provider_call,
@@ -4336,6 +4344,7 @@ def _build_auto_agent_alias_audit_events(
                 error_type=attempt.get("error_type"),
                 error_code=attempt.get("error_code"),
                 error_tokens=attempt.get("error_tokens"),
+                source_error=attempt.get("source_error"),
                 retry_after_seconds=attempt.get("retry_after_seconds"),
                 failure_phase=attempt.get("failure_phase"),
                 attempted_provider_call=attempt.get("attempted_provider_call"),
@@ -6470,12 +6479,17 @@ def _update_codex_auto_agent_retryable_attempt_record(
     error_status_code = _extract_google_adapter_exception_status_code(exc)
     error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
     retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
+    source_error = _get_passthrough_handled_http_error_summary(
+        exc,
+        status_code=error_status_code,
+    )
     update: dict[str, Any] = {
         "status": ("retryable_no_cooldown" if cooldown_scope == "none" else "cooldown_set"),
         "error_class": error_class,
         "error_tokens": sorted(error_tokens),
         "failure_phase": "provider_attempt",
         "attempted_provider_call": True,
+        "source_error": source_error,
     }
     if cooldown_scope != "none":
         update["cooldown_seconds"] = round(float(cooldown_seconds), 3)
@@ -6595,6 +6609,7 @@ def _record_auto_agent_alias_attempt_failure(
             error_type=attempt_record.get("error_type"),
             error_code=attempt_record.get("error_code"),
             error_tokens=attempt_record.get("error_tokens"),
+            source_error=attempt_record.get("source_error"),
             retry_after_seconds=attempt_record.get("retry_after_seconds"),
             failure_phase=attempt_record.get("failure_phase"),
             attempted_provider_call=attempt_record.get("attempted_provider_call"),
@@ -22371,6 +22386,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
     log_label: str,
 ) -> Response:
     """Shared Anthropic/Codex auto-agent alias candidate loop (RR-054 #10)."""
+    register_aawm_route_rollup_access_log_replacement(request)
     attempts: list[dict[str, Any]] = []
     last_retryable_exc: Optional[Exception] = None
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(
@@ -25726,6 +25742,11 @@ class BaseOpenAIPassThroughHandler:
             is_codex_responses_request = _request_uses_codex_native_auth(
                 request
             ) and _is_openai_responses_endpoint(endpoint)
+            if _resolve_codex_auto_agent_alias_model(
+                prepared_request_body,
+                endpoint=endpoint,
+            ) is not None:
+                is_codex_responses_request = True
             if is_codex_responses_request:
                 prepared_request_body = _add_route_family_logging_metadata(
                     prepared_request_body,

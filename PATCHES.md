@@ -58,6 +58,43 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.125 - Handled provider-error rollups and quota cooldown hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.125`. Handled
+passthrough failures now retain the exact sanitized provider error in
+human-readable route rollups, color the complete failed route row red, and
+color complete `Cooling Down` rows blue while keeping structured JSON logs
+ANSI-free. Rollup-covered failures suppress duplicate Uvicorn access lines,
+including alias no-candidate termination, and wrapped `ProxyException.detail`
+values preserve the bounded source error presented to clients.
+
+Recognized AAWM aliases now resolve to concrete provider models before upstream
+request construction even when Codex-native headers are absent, preventing
+public alias names from leaking into provider request bodies. Known Grok HTTP
+403 personal-team spending-limit and HTTP 402 Grok Build balance-exhausted
+failures now apply a three-hour candidate and account-lane cooldown across both
+Codex and Anthropic alias routing instead of the previous five minutes.
+Compatibility handling also lets older classifier objects use sanitized error
+summaries without raising secondary exceptions.
+
+**Why:** The production and dev log surfaces could show unformatted duplicate
+failure lines, omit exact source errors from route summaries, and raise a
+secondary classifier traceback in mixed-version dev code. Alias leakage could
+also send a public AAWM model name upstream, while known account-exhaustion
+signals retried far sooner than their operational recovery window.
+
+**Why not upstream:** The route-rollup presentation, AAWM alias boundary,
+mixed-version dev compatibility, and account-lane cooldown policy are
+fork-local operational behavior.
+
+**Validation status:** The complete four-module release selection passes
+(`1304 passed`), including the order-sensitive JSONL logging checks; the
+earlier focused and adjacent selections also pass. Ruff, Python compilation,
+and `git diff --check` pass. A restart-only `litellm-dev` canary proved the
+three-hour cooldown, colored human-readable rows, no duplicate raw access line,
+no traceback, and no HTTP 500. Production promotion and scoped real Codex V2
+plus Claude CLI Moonshot acceptance remain required under `PROD_RELEASE.md`.
+
 ### aawm.124 - Kimi large-stream collaboration namespace restoration
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.124`. When

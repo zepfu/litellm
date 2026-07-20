@@ -19,6 +19,7 @@ from fastapi import Request
 
 from litellm._logging import (
     discard_aawm_route_access_log_replacement,
+    json_logs,
     register_aawm_route_access_log_replacement,
     verbose_aawm_route_logger,
 )
@@ -37,6 +38,9 @@ _AAWM_ROUTE_ROLLUP_DEFAULT_INTERVAL_SECONDS = 60
 _AAWM_ROUTE_ROLLUP_MAX_GROUPS = 256
 _AAWM_ROUTE_ROLLUP_MAX_SUBLINES = 16
 _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
+_AAWM_ROUTE_ROLLUP_RED = "\033[91m"
+_AAWM_ROUTE_ROLLUP_BLUE = "\033[94m"
+_AAWM_ROUTE_ROLLUP_RESET = "\033[0m"
 
 _AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS = 0.35
 _AAWM_ROUTE_HOST_REVERSE_DNS_CACHE_TTL_SECONDS = 300.0
@@ -1431,7 +1435,7 @@ def _resolve_aawm_route_rollup_default_destination(
 def _resolve_aawm_route_rollup_redundant_destination(
     *,
     incoming_endpoint: str,
-    sublines: list[tuple[str, int, Optional[str], str]],
+    sublines: list[tuple[str, int, Optional[str], str, Optional[str]]],
 ) -> Optional[str]:
     default_destination = _resolve_aawm_route_rollup_default_destination(
         incoming_endpoint
@@ -1442,7 +1446,7 @@ def _resolve_aawm_route_rollup_redundant_destination(
         return None
 
     destinations: set[str] = set()
-    for _, _, _, outgoing_target in sublines:
+    for _, _, _, outgoing_target, _ in sublines:
         if not outgoing_target:
             continue
         destinations.add(outgoing_target)
@@ -1469,7 +1473,7 @@ def _format_aawm_route_rollup_lines(
     *,
     group_header_label: str,
     incoming_endpoint: str,
-    sublines: list[tuple[str, int, Optional[str], str]],
+    sublines: list[tuple[str, int, Optional[str], str, Optional[str]]],
     now: Optional[datetime] = None,
     early: bool = False,
 ) -> list[str]:
@@ -1488,9 +1492,11 @@ def _format_aawm_route_rollup_lines(
         incoming_endpoint=incoming_endpoint,
         sublines=sublines,
     )
-    for model_label, turns, status, outgoing_target in sublines:
+    for model_label, turns, status, outgoing_target, message in sublines:
+        message_suffix = f" [{message}]" if message else ""
         lines.append(
             f" - {model_label} - Turns: {turns}"
+            f"{message_suffix}"
             f"{_format_aawm_route_rollup_status_tag(status)}"
             f"{_format_aawm_route_rollup_subline_destination_suffix(outgoing_target=outgoing_target, common_destination=common_destination)}"
         )
@@ -1502,6 +1508,7 @@ class _AawmRouteRollupSubline:
     turns: int = 0
     status: Optional[str] = None
     status_sequence: int = 0
+    message: Optional[str] = None
 
 
 @dataclass
@@ -1514,13 +1521,16 @@ class _AawmRouteRollupGroup:
     subline_order: list[tuple[str, str]] = field(default_factory=list)
     event_sequence: int = 0
 
-    def ordered_sublines(self) -> list[tuple[str, int, Optional[str], str]]:
+    def ordered_sublines(
+        self,
+    ) -> list[tuple[str, int, Optional[str], str, Optional[str]]]:
         return [
             (
                 subline_key[0],
                 self.sublines[subline_key].turns,
                 self.sublines[subline_key].status,
                 subline_key[1],
+                self.sublines[subline_key].message,
             )
             for subline_key in self.subline_order
             if subline_key in self.sublines
@@ -1564,6 +1574,7 @@ class AawmRouteRollupAccumulator:
         model_label: str,
         turns: int = 1,
         status: Optional[str] = None,
+        message: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> list[str]:
         if not self.enabled():
@@ -1573,6 +1584,7 @@ class AawmRouteRollupAccumulator:
         cleaned_incoming_endpoint = _clean_aawm_route_log_field(incoming_endpoint)
         cleaned_outgoing_target = _clean_aawm_route_log_field(outgoing_target)
         cleaned_model_label = _clean_aawm_route_log_field(model_label)
+        cleaned_message = _clean_aawm_route_log_field(message)
         if (
             not cleaned_group_header
             or not cleaned_incoming_endpoint
@@ -1623,6 +1635,8 @@ class AawmRouteRollupAccumulator:
             group.event_sequence += 1
             subline.status = normalized_status
             subline.status_sequence = group.event_sequence
+        if cleaned_message is not None:
+            subline.message = cleaned_message
 
         emitted_lines.extend(self.flush_due(now=now))
         return emitted_lines
@@ -1801,10 +1815,23 @@ def flush_aawm_route_rollups(
     return lines
 
 
+def _colorize_aawm_route_rollup_line(line: str) -> str:
+    if json_logs or not line.startswith(" - "):
+        return line
+    if " [Cooling Down]" in line:
+        return f"{_AAWM_ROUTE_ROLLUP_BLUE}{line}{_AAWM_ROUTE_ROLLUP_RESET}"
+    if " [Failed]" in line or " [Exhausted]" in line:
+        return f"{_AAWM_ROUTE_ROLLUP_RED}{line}{_AAWM_ROUTE_ROLLUP_RESET}"
+    return line
+
+
 def _emit_aawm_route_rollup_lines(lines: list[str]) -> None:
     if not lines:
         return
-    logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info("%s", "\n".join(lines))
+    rendered_lines = [_colorize_aawm_route_rollup_line(line) for line in lines]
+    logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info(
+        "%s", "\n".join(rendered_lines)
+    )
 
 
 def emit_flush_aawm_route_rollups(
@@ -1953,6 +1980,7 @@ def record_aawm_route_rollup(
     model_label: str,
     turns: int = 1,
     status: Optional[str] = None,
+    message: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> None:
     with _aawm_route_rollup_lock:
@@ -1966,6 +1994,7 @@ def record_aawm_route_rollup(
             model_label=model_label,
             turns=turns,
             status=status,
+            message=message,
             now=now,
         )
     _ensure_aawm_route_rollup_flush_worker()
@@ -1999,6 +2028,34 @@ def record_aawm_route_rollup_turn(
     )
 
 
+def record_aawm_route_rollup_failure(
+    kwargs: Optional[dict],
+    *,
+    message: Optional[str],
+    status: str = "Failed",
+    now: Optional[datetime] = None,
+) -> bool:
+    if not aawm_route_rollups_enabled():
+        return False
+    metadata = _get_aawm_route_rollup_metadata(kwargs)
+    if not isinstance(metadata, dict):
+        return False
+    context = metadata.get(_AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY)
+    if not isinstance(context, dict):
+        return False
+    record_aawm_route_rollup(
+        group_header_label=str(context.get("group_header_label") or ""),
+        incoming_endpoint=str(context.get("incoming_endpoint") or ""),
+        outgoing_target=str(context.get("outgoing_target") or ""),
+        model_label=str(context.get("model_label") or ""),
+        turns=0,
+        status=status,
+        message=message,
+        now=now,
+    )
+    return True
+
+
 def emit_aawm_route_status_event(
     *,
     alias_model: Optional[str],
@@ -2012,14 +2069,20 @@ def emit_aawm_route_status_event(
     model = _clean_aawm_route_log_field(model_label) or "unknown-model"
     detail = _clean_aawm_route_log_field(message) or "no detail"
     timestamp = (now or datetime.now()).strftime("%Y%m%d %H:%M:%S")
-    logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).warning(
-        "%s - %s: %s Status: %s - Message: %s",
-        timestamp,
-        alias,
-        model,
-        normalized_status,
-        detail,
+    message_line = (
+        f"{timestamp} - {alias}: {model} Status: {normalized_status} "
+        f"- Message: {detail}"
     )
+    if not json_logs:
+        if normalized_status == "Cooling Down":
+            message_line = (
+                f"{_AAWM_ROUTE_ROLLUP_BLUE}{message_line}{_AAWM_ROUTE_ROLLUP_RESET}"
+            )
+        elif normalized_status in {"Failed", "Exhausted"}:
+            message_line = (
+                f"{_AAWM_ROUTE_ROLLUP_RED}{message_line}{_AAWM_ROUTE_ROLLUP_RESET}"
+            )
+    logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).warning("%s", message_line)
 
 
 def _flush_aawm_route_rollups_at_exit() -> None:
@@ -2407,7 +2470,11 @@ def _get_aawm_route_native_access_log_path(request: Request) -> Optional[str]:
     return f"{full_path}?{query_label}"
 
 
-def _register_aawm_route_access_log_replacement(request: Request) -> None:
+def _register_aawm_route_access_log_replacement(
+    request: Request,
+    *,
+    suppress_all_statuses: bool = False,
+) -> None:
     scope = getattr(request, "scope", None)
     if not isinstance(scope, dict):
         return
@@ -2440,8 +2507,18 @@ def _register_aawm_route_access_log_replacement(request: Request) -> None:
         method=method,
         full_path=full_path,
         http_version=http_version,
+        suppress_all_statuses=suppress_all_statuses,
     )
     scope[_AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY] = replacement_key
+
+
+def register_aawm_route_rollup_access_log_replacement(request: Request) -> None:
+    if not aawm_route_rollups_enabled():
+        return
+    _register_aawm_route_access_log_replacement(
+        request,
+        suppress_all_statuses=True,
+    )
 
 
 def _get_aawm_route_log_model_label(
@@ -2646,18 +2723,22 @@ def emit_aawm_route_access_log(
         kwargs=kwargs,
         route_type=route_type,
     )
-    _register_aawm_route_access_log_replacement(request)
     if aawm_route_rollups_enabled():
-        attach_aawm_route_rollup_context(
+        rollup_context = attach_aawm_route_rollup_context(
             request=request,
             target=target,
             request_body=request_body,
             kwargs=kwargs,
             route_type=route_type,
         )
+        _register_aawm_route_access_log_replacement(
+            request,
+            suppress_all_statuses=rollup_context is not None,
+        )
         if completed:
             record_aawm_route_rollup_turn(kwargs)
         return
+    _register_aawm_route_access_log_replacement(request)
     if not _should_emit_aawm_route_access_log_key(dedup_key):
         return
     logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info("%s", line)

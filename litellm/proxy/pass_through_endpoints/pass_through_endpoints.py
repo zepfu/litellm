@@ -64,6 +64,7 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.aawm_route_logging import (
     build_aawm_route_access_log_line,  # noqa: F401 - re-exported for existing tests/callers
     emit_aawm_route_access_log,
+    record_aawm_route_rollup_failure,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.common_utils.http_parsing_utils import (
@@ -1578,10 +1579,8 @@ def _is_openai_passthrough_responses_error_context(
 
 
 def _extract_passthrough_upstream_error_text(exc: Exception) -> str:
-    detail: Any = None
-    if isinstance(exc, HTTPException):
-        detail = exc.detail
-    elif isinstance(exc, httpx.HTTPStatusError):
+    detail: Any = getattr(exc, "detail", None)
+    if detail is None and isinstance(exc, httpx.HTTPStatusError):
         try:
             detail = exc.response.text
         except Exception:
@@ -4236,6 +4235,18 @@ async def pass_through_request(  # noqa: PLR0915
                 False,
             )
         )
+        route_failure_summary = (
+            getattr(_provider_failure_classification, "log_error_summary", None)
+            if _provider_failure_classification is not None
+            else None
+        ) or _get_passthrough_handled_http_error_summary(
+            e,
+            status_code=status_code,
+        )
+        record_aawm_route_rollup_failure(
+            kwargs,
+            message=route_failure_summary,
+        )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",
@@ -4285,7 +4296,8 @@ async def pass_through_request(  # noqa: PLR0915
             log_fn(
                 log_message,
                 status_code,
-                classification.log_error_summary or str(e),
+                getattr(classification, "log_error_summary", None)
+                or route_failure_summary,
                 extra=log_extra,
             )
         elif error_log_context.get("failure_kind") == (

@@ -50,6 +50,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _enrich_passthrough_error_log_context_for_request_shape_422,
     _sanitize_passthrough_request_shape_error_preview,
     _execute_passthrough_pre_first_byte_with_hidden_retries,
+    _get_passthrough_handled_http_error_summary,
     _get_passthrough_hidden_retry_budget_seconds,
     _headers_for_json_passthrough_egress,
     _is_aawm_agent_identity_registered_in_litellm_callbacks,
@@ -1071,6 +1072,37 @@ def test_aawm_route_access_log_filter_suppresses_matching_access_record_once() -
         access_filter.filter(
             _build_uvicorn_access_record(
                 full_path="/anthropic/v1/messages?beta=true",
+            )
+        )
+        is True
+    )
+
+
+def test_aawm_route_access_log_filter_suppresses_failed_record_for_rollup() -> None:
+    clear_aawm_route_access_log_replacements()
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    register_aawm_route_access_log_replacement(
+        client_addr="172.19.0.1:52834",
+        method="POST",
+        full_path="/openai_passthrough/responses",
+        http_version="1.1",
+        suppress_all_statuses=True,
+    )
+
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path="/openai_passthrough/responses",
+                status_code=400,
+            )
+        )
+        is False
+    )
+    assert (
+        access_filter.filter(
+            _build_uvicorn_access_record(
+                full_path="/openai_passthrough/responses",
+                status_code=400,
             )
         )
         is True
@@ -3875,6 +3907,10 @@ class TestGrokPersonalTeamSpendingLimitLogging:
                     mock_warning.call_args.kwargs["extra"]["failure_kind"]
                     == "upstream_grok_account_quota_exhaustion"
                 )
+                assert (
+                    mock_warning.call_args.args[2]
+                    == "Personal team spending limit reached."
+                )
                 mock_exception.assert_not_called()
                 mock_logging_obj.post_call_failure_hook.assert_not_awaited()
         finally:
@@ -4018,6 +4054,24 @@ class TestGrokBuildUsageBalanceExhaustedLogging:
         assert not (tmp_path / "dev-error.jsonl").exists()
 
 
+def test_handled_http_error_summary_preserves_proxy_exception_detail():
+    exc = ProxyException(
+        message="HTTP 402 request rejected",
+        type="None",
+        param="None",
+        code=402,
+    )
+    setattr(exc, "detail", b'{"error":"Grok Build usage balance exhausted"}')
+
+    assert (
+        _get_passthrough_handled_http_error_summary(
+            exc,
+            status_code=402,
+        )
+        == "Grok Build usage balance exhausted"
+    )
+
+
 class TestGrokBillingPassthroughTimeoutLogging:
     def test_classifier_matches_known_billing_timeout_cancel_body(self):
         request = MagicMock(spec=Request)
@@ -4125,7 +4179,7 @@ class TestGrokBillingPassthroughTimeoutLogging:
         assert not (tmp_path / "dev-error.jsonl").exists()
 
     @pytest.mark.asyncio
-    async def test_pass_through_request_unexpected_billing_400_keeps_exception_logging(
+    async def test_pass_through_request_unexpected_billing_400_is_handled_without_traceback(
         self,
         monkeypatch,
         tmp_path,
@@ -4185,10 +4239,10 @@ class TestGrokBillingPassthroughTimeoutLogging:
                 assert exc_info.value.code == "400"
                 mock_logging_obj.post_call_failure_hook.assert_awaited_once()
                 assert (
-                    "billing unavailable"
-                    in mock_logging_obj.post_call_failure_hook.await_args.kwargs[
+                    mock_logging_obj.post_call_failure_hook.await_args.kwargs[
                         "traceback_str"
                     ]
+                    is None
                 )
                 mock_direct_capture.assert_awaited_once()
         finally:
@@ -4204,12 +4258,14 @@ class TestGrokBillingPassthroughTimeoutLogging:
             for line in error_log_path.read_text(encoding="utf-8").splitlines()
         ]
         payload = next(
-            item for item in payloads if "pass_through_endpoint" in item["message"]
+            item
+            for item in payloads
+            if "handled client/provider error status=400" in item["message"]
         )
         assert payload["context"]["endpoint"] == "/grok/v1/billing"
         assert payload["context"]["status_code"] == 400
         assert "billing unavailable" in payload["message"]
-        assert payload.get("traceback")
+        assert not payload.get("traceback")
 
 
 class TestPassThroughTerminalFailureLogging:
@@ -5264,7 +5320,9 @@ class TestPassThroughTerminalFailureLogging:
         ) as mock_warning, patch.object(
             verbose_proxy_logger,
             "exception",
-        ) as mock_exception:
+        ) as mock_exception, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.record_aawm_route_rollup_failure"
+        ) as mock_rollup_failure:
             mock_client_obj = MagicMock()
             mock_client_obj.client = MagicMock()
             mock_get_client.return_value = mock_client_obj
@@ -5299,6 +5357,10 @@ class TestPassThroughTerminalFailureLogging:
             warning_call.kwargs["extra"]["failure_kind"]
             == "openai_model_not_found"
         )
+        mock_rollup_failure.assert_called_once()
+        assert mock_rollup_failure.call_args.kwargs == {
+            "message": "The requested model 'aawm-code' does not exist."
+        }
         mock_logging_obj.post_call_failure_hook.assert_awaited_once()
         assert (
             mock_logging_obj.post_call_failure_hook.await_args.kwargs[
@@ -8777,8 +8839,8 @@ async def test_pass_through_alias_managed_xai_safety_403_skips_generic_failure_h
 
 
 @pytest.mark.asyncio
-async def test_pass_through_direct_xai_safety_403_invokes_generic_failure_handling():
-    """Direct/non-alias SAFETY_CHECK_TYPE_CYBER 403 still uses generic failure handling."""
+async def test_pass_through_direct_xai_safety_403_is_handled_without_traceback():
+    """Direct/non-alias SAFETY_CHECK_TYPE_CYBER 403 remains bounded and client-visible."""
     mock_request = MagicMock(spec=Request)
     mock_request.method = "POST"
     mock_request.url = "http://localhost:4001/grok/v1/responses"
@@ -8847,10 +8909,9 @@ async def test_pass_through_direct_xai_safety_403_invokes_generic_failure_handli
     assert "SAFETY_CHECK_TYPE_CYBER" in str(exc_info.value.message)
     post_failure_mock.assert_awaited_once()
     direct_capture_mock.assert_awaited_once()
-    mock_exception.assert_called_once()
+    mock_exception.assert_not_called()
     hook_kwargs = post_failure_mock.await_args.kwargs
-    assert hook_kwargs["traceback_str"] is not None
-    assert "SAFETY_CHECK_TYPE_CYBER" in hook_kwargs["traceback_str"] or ("403" in hook_kwargs["traceback_str"])
+    assert hook_kwargs["traceback_str"] is None
 
 
 @pytest.mark.asyncio
