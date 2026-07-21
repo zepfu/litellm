@@ -307,6 +307,13 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    the writable `.grok` mount. After sidecar recreation, verify the logs emit a
    `grok_billing_poll` event with `status_code=200` and `persisted=true`; the
    LiteLLM serving container does not emit this scheduled billing snapshot.
+   The same provider-status sidecar must enable hourly native Kimi usage
+   polling with `AAWM_KIMI_USAGE_POLL_ENABLED=1`,
+   `AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS=3600`, and the existing writable
+   Kimi credential mount used for OAuth maintenance. Do not copy or
+   reauthorize the credential. After sidecar recreation, verify a sanitized
+   `kimi_usage_poll` event reports `status_code=200`, `persisted=true`, and a
+   positive `observation_count`.
 
    When model-config behavior changed, verify the built image has the expected
    metadata before restarting prod. For example:

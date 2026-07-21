@@ -136,6 +136,25 @@ rejection is candidate-scoped, so it does not cool unrelated managed models.
 An alias declaration does not enable Kimi Code: a configured route plus a valid
 credential and accepted capability remain required.
 
+The provider-status sidecar enables this poll with the existing Kimi Code
+credential already mounted for OAuth maintenance. It sends an authenticated
+`GET https://api.kimi.com/coding/v1/usages`; it does not create, copy, or
+reauthorize a credential. The scheduled quota cadence is hourly and is
+independent of the five-minute provider-status and Kimi OAuth-maintenance loop.
+
+Relevant Kimi usage environment variables:
+
+- `AAWM_KIMI_USAGE_POLL_ENABLED`: enables the scheduled native usage poll.
+- `AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS`: minimum seconds between usage poll
+  attempts; the managed sidecar default is `3600`.
+- `AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS`: native usage endpoint timeout;
+  the managed sidecar default is `30`.
+
+Each due attempt emits one sanitized `kimi_usage_poll` JSON event. Successful
+runtime verification requires `status_code=200`, `persisted=true`, and a
+positive parsed `observation_count` without logging an access token or raw
+credential payload.
+
 This is an interpretation-only documentation update. It adds no
 `session_history` or observation schema, view, or API change, so no
 `dashboard-shell` handoff is needed.

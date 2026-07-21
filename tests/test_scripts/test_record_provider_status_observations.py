@@ -765,6 +765,12 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "AAWM_CODEX_OAUTH_FORCE_REFRESH=${AAWM_CODEX_OAUTH_FORCE_REFRESH:-1}",
     ):
         assert expected_codex_setting in compose_text
+    for expected_kimi_usage_setting in (
+        "AAWM_KIMI_USAGE_POLL_ENABLED=${AAWM_KIMI_USAGE_POLL_ENABLED:-1}",
+        "AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS=${AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS:-3600}",
+        "AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS:-30}",
+    ):
+        assert expected_kimi_usage_setting in compose_text
     assert (
         "AAWM_GROK_BILLING_POLL_ENABLED=${AAWM_GROK_BILLING_POLL_ENABLED:-1}"
         in compose_text
