@@ -188,7 +188,7 @@ these docs only as needed:
 
 ## Next
 
-- Publish and promote `v1.82.3-aawm.130` only after the exact committed image
+- Publish and promote `v1.82.3-aawm.131` only after the exact committed image
   passes the complete Moonshot and Alibaba tool-focused gate on `litellm-dev`
   `:4001`. Do not treat the current bind-mounted source proof as image proof.
   Use only the existing authenticated repository harness; never inspect,

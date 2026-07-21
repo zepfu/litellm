@@ -58,6 +58,27 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.131 - Artifact-converged Moonshot and Alibaba release
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.131`. This release
+carries the `.130` Moonshot, Alibaba Token Plan, adapter, logging, cooldown,
+and authenticated-harness implementation unchanged, while converging the
+automatic callback `0.0.68`, model-config `0.0.28`, and harness `0.0.43`
+version bumps on current `main`.
+
+The `v1.82.3-aawm.130` tag remains the preserved pre-autobump image and is not
+the production promotion target. The artifact-converged image must be tagged
+from the current `main` commit, proven on `litellm-dev`, and only then promoted
+under `PROD_RELEASE.md`.
+
+**Why:** The release runbook requires the image tag to point at current `main`
+after artifact autobumps. Published tags are immutable; a later release number
+is required instead of moving `.130`.
+
+**Validation status:** The `.130` source and bind-mounted dev gates remain
+green. `.131` changes only release metadata on top of the automatic artifact
+version commit and still requires exact-image dev and production proof.
+
 ### aawm.130 - Managed Alibaba Token Plan and adapter rollup hardening
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.130`. A bounded
