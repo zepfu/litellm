@@ -76,8 +76,13 @@ test slices and the existing authenticated targeted Moonshot dev harness with
 positive Langfuse generation costs. Harness release `h-v0.0.44` is published
 with asset `litellm-local-ci-harness-0.0.44.tar.gz` and SHA-256
 `ed6d875f61bb616ded956b3164bc882edb411caf8a4462f6cf0efb9a850af032`.
-The `.135` image must complete the installed-runtime publication smoke before
-production promotion under `PROD_RELEASE.md`.
+The `.135` image completed the installed-runtime package/import check and was
+promoted through `PROD_RELEASE.md` with callbacks `0.0.68`, control plane
+`0.0.11`, and model config `0.0.28`. The focused authenticated production
+Moonshot Codex case passed with exact `apply_patch` and `exec_command`
+correlation, Langfuse `costDetails.total=0.041088` plus matching reference-cost
+provenance, production session-history attribution, readiness HTTP `200`,
+restart count `0`, and no forbidden Docker-log signature.
 
 ### aawm.134 - Deterministic Kimi streaming reference-cost observability
 
