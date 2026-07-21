@@ -837,13 +837,17 @@ _CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS = (
 _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME = (
     "codex_auto_agent_prevention_guidance"
 )
-_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION = "2026-06-01.v1"
+_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION = "2026-07-21.v2"
 _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT = """Codex auto-agent completion contract:
 - Always produce a non-empty final answer after completing or stopping the task; do not end a successful request with only reasoning, tool calls, or no visible assistant text.
 - Do not return internal planning text as the final answer. Complete the requested work, or state the exact blocker and the next concrete step.
 - If a required tool is unavailable or blocked, state the exact observed tool/platform error and continue with bounded evidence from available context; do not claim tools or filesystem are unavailable unless a tool/platform error proves it.
 - If the user requested code or artifact changes, either make the scoped change or explicitly say no files were modified and why. Do not answer with a generic explanation of the function or file when implementation or verification was requested.
-- If verification could not be run, name the command or check that was not run and why."""
+- If verification could not be run, name the command or check that was not run and why.
+- For a coding or file-edit task, a design summary, plan, or statement that edits are about to begin is not a valid final answer. Do not stop until the edit tool has returned and the requested checks have run, or an explicit blocker has been proven.
+- Never claim `apply_patch` failed, aborted, or cannot edit a linked `/tmp` worktree unless the client returned an explicit tool error. Absolute paths to writable linked worktrees are supported. If no tool result is visible, retry the tool call instead of switching editing methods or finalizing.
+- Preserve the caller's editing contract. Do not replace `apply_patch` with Python, `sed`, or another file-mutation mechanism when the task or repository requires `apply_patch`.
+- A successful coding-task final answer must name the changed paths and requested verification results."""
 _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME = "aawm_read_agent_guidance"
 _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION = "2026-06-06.v1"
 _AAWM_READ_AGENT_GUIDANCE_PROMPT = """AAWM read-only agent contract:
@@ -13623,6 +13627,261 @@ def _restore_adapted_namespace_tool_calls_in_response_body(
     return restored_body, restored_count
 
 
+def _adapted_custom_tool_stream_state_keys(
+    event_payload: dict[str, Any],
+    *,
+    item: Any = None,
+) -> list[str]:
+    keys: list[str] = []
+    for source in (item, event_payload):
+        if not isinstance(source, dict):
+            continue
+        for field in ("call_id", "id", "item_id"):
+            value = source.get(field)
+            if isinstance(value, str) and value.strip():
+                keys.append(f"id:{value.strip()}")
+        output_index = source.get("output_index")
+        if isinstance(output_index, int):
+            keys.append(f"output:{output_index}")
+    return list(dict.fromkeys(keys))
+
+
+def _remember_adapted_custom_tool_stream_state(
+    state_by_key: dict[str, dict[str, Any]],
+    *,
+    event_payload: dict[str, Any],
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    state = {
+        "call_id": item.get("call_id") or item.get("id"),
+        "name": item.get("name"),
+        "arguments": "",
+    }
+    for key in _adapted_custom_tool_stream_state_keys(
+        event_payload,
+        item=item,
+    ):
+        state_by_key[key] = state
+    return state
+
+
+def _get_adapted_custom_tool_stream_state(
+    state_by_key: dict[str, dict[str, Any]],
+    event_payload: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    for key in _adapted_custom_tool_stream_state_keys(event_payload):
+        state = state_by_key.get(key)
+        if isinstance(state, dict):
+            return state
+    return None
+
+
+def _restore_adapted_custom_tool_calls_in_stream_event_payload(
+    event_payload: dict[str, Any],
+    *,
+    request_body: Optional[dict[str, Any]],
+    adapter_model: str,
+    adapted_names: set[str],
+    state_by_key: dict[str, dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], int]:
+    event_type = event_payload.get("type")
+    item = event_payload.get("item")
+
+    if (
+        event_type == "response.output_item.added"
+        and isinstance(item, dict)
+        and item.get("type") == "function_call"
+    ):
+        item_name = _normalize_low_cardinality_tag_value(item.get("name"))
+        if item_name in adapted_names:
+            _remember_adapted_custom_tool_stream_state(
+                state_by_key,
+                event_payload=event_payload,
+                item=item,
+            )
+            restored_item = dict(item)
+            restored_item["type"] = "custom_tool_call"
+            restored_item["input"] = ""
+            restored_item.pop("arguments", None)
+            restored_payload = dict(event_payload)
+            restored_payload["item"] = restored_item
+            return restored_payload, 1
+
+    state = _get_adapted_custom_tool_stream_state(
+        state_by_key,
+        event_payload,
+    )
+    if event_type == "response.function_call_arguments.delta" and state is not None:
+        delta = event_payload.get("delta")
+        if isinstance(delta, str):
+            state["arguments"] = f"{state.get('arguments') or ''}{delta}"
+        return None, 1
+
+    if event_type == "response.function_call_arguments.done" and state is not None:
+        arguments = event_payload.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = str(state.get("arguments") or "")
+        raw_input, error_reason = _parse_adapted_custom_tool_function_arguments(
+            arguments
+        )
+        if error_reason is None and raw_input is not None:
+            restored_payload = dict(event_payload)
+            restored_payload["type"] = "response.custom_tool_call_input.done"
+            restored_payload["input"] = raw_input
+            restored_payload.pop("arguments", None)
+            return restored_payload, 1
+
+    if event_type == "response.output_item.done" and isinstance(item, dict):
+        restored_body, restored_count, adapter_error = (
+            _restore_adapted_custom_tool_calls_in_response_body(
+                {"output": [item]},
+                request_body=request_body,
+                adapter_model=adapter_model,
+            )
+        )
+        if restored_count and adapter_error is None:
+            restored_payload = dict(event_payload)
+            restored_payload["item"] = restored_body["output"][0]
+            return restored_payload, restored_count
+
+    response_body = event_payload.get("response")
+    if isinstance(response_body, dict):
+        restored_body, restored_count, adapter_error = (
+            _restore_adapted_custom_tool_calls_in_response_body(
+                response_body,
+                request_body=request_body,
+                adapter_model=adapter_model,
+            )
+        )
+        if restored_count and adapter_error is None:
+            restored_payload = dict(event_payload)
+            restored_payload["response"] = restored_body
+            return restored_payload, restored_count
+
+    return event_payload, 0
+
+
+def _restore_adapted_custom_tool_calls_in_sse_event_block(
+    event_block: str,
+    *,
+    request_body: Optional[dict[str, Any]],
+    adapter_model: str,
+    adapted_names: set[str],
+    state_by_key: dict[str, dict[str, Any]],
+) -> tuple[Optional[str], int]:
+    lines = event_block.splitlines()
+    data_line_indexes = [
+        index for index, line in enumerate(lines) if line.startswith("data:")
+    ]
+    if not data_line_indexes:
+        return event_block, 0
+
+    raw_data = "\n".join(
+        lines[index].removeprefix("data:").lstrip(" ")
+        for index in data_line_indexes
+    )
+    if not raw_data or raw_data == "[DONE]":
+        return event_block, 0
+    try:
+        event_payload = json.loads(raw_data)
+    except Exception:
+        return event_block, 0
+    if not isinstance(event_payload, dict):
+        return event_block, 0
+
+    restored_payload, restored_count = (
+        _restore_adapted_custom_tool_calls_in_stream_event_payload(
+            event_payload,
+            request_body=request_body,
+            adapter_model=adapter_model,
+            adapted_names=adapted_names,
+            state_by_key=state_by_key,
+        )
+    )
+    if restored_payload is None:
+        return None, restored_count
+    if not restored_count:
+        return event_block, 0
+
+    rendered_data = json.dumps(restored_payload, ensure_ascii=False)
+    restored_event_type = restored_payload.get("type")
+    restored_lines: list[str] = []
+    inserted_data = False
+    data_line_index_set = set(data_line_indexes)
+    for index, line in enumerate(lines):
+        if line.startswith("event:") and isinstance(restored_event_type, str):
+            restored_lines.append(f"event: {restored_event_type}")
+            continue
+        if index not in data_line_index_set:
+            restored_lines.append(line)
+            continue
+        if not inserted_data:
+            restored_lines.append(f"data: {rendered_data}")
+            inserted_data = True
+    return "\n".join(restored_lines), restored_count
+
+
+def _restore_adapted_custom_tool_calls_in_streaming_response(
+    response: StreamingResponse,
+    *,
+    request_body: Optional[dict[str, Any]],
+    adapter_model: str,
+) -> StreamingResponse:
+    adapted_names = _advertised_custom_tool_function_adapter_names(
+        request_body,
+        adapter_model=adapter_model,
+    )
+    if not adapted_names:
+        return response
+
+    original_iterator = response.body_iterator
+
+    async def _restoring_iterator() -> Any:
+        buffer = ""
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        state_by_key: dict[str, dict[str, Any]] = {}
+        async for raw_chunk in original_iterator:
+            if isinstance(raw_chunk, bytes):
+                buffer += decoder.decode(raw_chunk)
+            else:
+                buffer += str(raw_chunk)
+
+            while "\n\n" in buffer:
+                event_block, buffer = buffer.split("\n\n", 1)
+                restored_block, _ = (
+                    _restore_adapted_custom_tool_calls_in_sse_event_block(
+                        event_block,
+                        request_body=request_body,
+                        adapter_model=adapter_model,
+                        adapted_names=adapted_names,
+                        state_by_key=state_by_key,
+                    )
+                )
+                if restored_block is not None:
+                    yield f"{restored_block}\n\n"
+
+        buffer += decoder.decode(b"", final=True)
+        if buffer:
+            restored_block, _ = (
+                _restore_adapted_custom_tool_calls_in_sse_event_block(
+                    buffer,
+                    request_body=request_body,
+                    adapter_model=adapter_model,
+                    adapted_names=adapted_names,
+                    state_by_key=state_by_key,
+                )
+            )
+            if restored_block is not None:
+                yield restored_block
+
+    return StreamingResponse(
+        _restoring_iterator(),
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type=response.media_type or "text/event-stream",
+    )
+
+
 def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
     event_payload: dict[str, Any],
     *,
@@ -14332,8 +14591,15 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     litellm_call_id or "<missing>",
                     trace_id or "<missing>",
                 )
+            restored_response = (
+                _restore_adapted_custom_tool_calls_in_streaming_response(
+                    peek.response,
+                    request_body=request_body,
+                    adapter_model=adapter_model,
+                )
+            )
             return _restore_adapted_namespace_tool_calls_in_streaming_response(
-                peek.response,
+                restored_response,
                 request_body=request_body,
                 adapter_model=adapter_model,
             )

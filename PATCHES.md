@@ -58,6 +58,40 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.133 - Lazy streamed custom-tool restoration for coding workers
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.133`. Codex
+Responses streams that remain pending or exceed the bounded validation peek now
+restore adapted custom tools lazily instead of returning provider-native
+function-call events unchanged. An adapted `apply_patch` call is exposed to
+Codex as `custom_tool_call`, its completed wrapped arguments are restored as a
+`response.custom_tool_call_input.done` event, and completed output items plus
+the terminal response carry the original raw patch input.
+
+The auto-agent completion guidance also rejects setup-only coding finals,
+requires explicit tool-error evidence before claiming `apply_patch` failed in a
+linked worktree, preserves repository editing contracts, and requires changed
+paths plus verification evidence for successful coding tasks.
+
+**Why:** Kimi coding workers could produce a correct adapted `apply_patch`
+function call after the validation stream became pending, but Codex received it
+as a normal `function_call` and therefore never executed the client-hosted
+custom tool. With no tool result, the worker could incorrectly infer a silent
+linked-worktree failure, switch to an unauthorized editor, or finalize before
+making changes.
+
+**Why not upstream:** The custom-tool adaptation, bounded stream validation,
+AAWM worker completion contract, and Kimi/Qwen authenticated harness gates are
+fork-local orchestration behavior.
+
+**Validation status:** Targeted regressions cover Kimi pending-stream
+restoration with an absolute linked-`/tmp` worktree patch, the existing
+fully-buffered custom-tool path, and the strengthened prevention guidance.
+Focused Ruff, Python compilation, and `git diff --check` pass. The exact
+`.133` image still requires isolated runtime preflight and small authenticated
+Kimi plus Qwen coding-worker proofs on `litellm-dev` before production
+promotion under `PROD_RELEASE.md`.
+
 ### aawm.132 - Shared terminal-error and provider-format hardening
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.132`.

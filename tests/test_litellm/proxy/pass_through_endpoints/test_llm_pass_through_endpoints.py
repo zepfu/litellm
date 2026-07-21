@@ -1008,6 +1008,16 @@ class TestResponsesAdapterToolChoice:
         assert "generic explanation of the function or file" in updated_body[
             "instructions"
         ]
+        assert "a design summary, plan, or statement that edits are about to begin" in (
+            updated_body["instructions"]
+        )
+        assert "linked `/tmp` worktree" in updated_body["instructions"]
+        assert "Do not replace `apply_patch` with Python, `sed`" in updated_body[
+            "instructions"
+        ]
+        assert "must name the changed paths and requested verification results" in (
+            updated_body["instructions"]
+        )
         assert updated_body["litellm_metadata"]["tags"] == [
             "existing-tag",
             "codex-auto-agent-prevention-guidance",
@@ -27007,6 +27017,187 @@ async def test_codex_auto_agent_grok_stream_restores_apply_patch_custom_tool_cal
         "status": "completed",
     }
     assert "response.function_call_arguments.done" not in rendered_stream
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_agent_kimi_pending_stream_restores_apply_patch_custom_tool_call():
+    patch_text = (
+        "*** Begin Patch\n"
+        "*** Update File: /tmp/linked-worktree/example.txt\n"
+        "@@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+    wrapped_arguments = json.dumps({"input": patch_text})
+    function_call = {
+        "type": "function_call",
+        "id": "fc_apply_patch",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "arguments": wrapped_arguments,
+        "status": "completed",
+    }
+    response_body = {
+        "id": "resp_apply_patch",
+        "status": "completed",
+        "output": [function_call],
+    }
+
+    async def _chunks():
+        yield (
+            "event: response.output_item.added\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        **function_call,
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        yield (
+            "event: response.function_call_arguments.delta\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_apply_patch",
+                    "output_index": 0,
+                    "delta": wrapped_arguments[:20],
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        yield (
+            "event: response.function_call_arguments.delta\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_apply_patch",
+                    "output_index": 0,
+                    "delta": wrapped_arguments[20:],
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        yield (
+            "event: response.function_call_arguments.done\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_apply_patch",
+                    "output_index": 0,
+                    "arguments": wrapped_arguments,
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        yield (
+            "event: response.output_item.done\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": function_call,
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+        yield (
+            "event: response.completed\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": response_body,
+                }
+            )
+            + "\n\n"
+        ).encode("utf-8")
+
+    pending_response = StreamingResponse(
+        _chunks(),
+        media_type="text/event-stream",
+    )
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._aawm_alias_streaming.peek_streaming_response",
+        new=AsyncMock(
+            return_value=SimpleNamespace(
+                exhausted=False,
+                response=pending_response,
+                stop_reason="pending_stream",
+                buffered_chunks=[],
+                buffered_bytes=0,
+            )
+        ),
+    ):
+        response = await _validate_codex_auto_agent_responses_payload(
+            pending_response,
+            adapter_model="kimi_code/k3-high",
+            adapter="codex_kimi_chat_completions_adapter",
+            adapter_label="Kimi Code",
+            request_body={
+                "model": "kimi_code/k3-high",
+                "tools": [_codex_apply_patch_custom_tool_definition()],
+            },
+        )
+
+    chunks = [
+        chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+        async for chunk in response.body_iterator
+    ]
+    rendered_stream = "".join(chunks)
+    assert "response.function_call_arguments" not in rendered_stream
+
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in rendered_stream.splitlines()
+        if line.startswith("data: {")
+    ]
+    added = next(
+        payload for payload in payloads if payload["type"] == "response.output_item.added"
+    )
+    assert added["item"] == {
+        "type": "custom_tool_call",
+        "id": "fc_apply_patch",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "input": "",
+        "status": "in_progress",
+    }
+    input_done = next(
+        payload
+        for payload in payloads
+        if payload["type"] == "response.custom_tool_call_input.done"
+    )
+    assert input_done["input"] == patch_text
+    assert input_done["item_id"] == "fc_apply_patch"
+    assert input_done["output_index"] == 0
+
+    output_item_done = next(
+        payload for payload in payloads if payload["type"] == "response.output_item.done"
+    )
+    assert output_item_done["item"] == {
+        "type": "custom_tool_call",
+        "id": "fc_apply_patch",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "input": patch_text,
+        "status": "completed",
+    }
+    completed = next(
+        payload for payload in payloads if payload["type"] == "response.completed"
+    )
+    assert completed["response"]["output"] == [output_item_done["item"]]
 
 
 @pytest.mark.asyncio
