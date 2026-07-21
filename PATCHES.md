@@ -58,6 +58,27 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.135 - Converged Kimi cost release after harness publication
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.135` on top of
+the `.134` Kimi streaming reference-cost fix and the automated harness version
+bump to `0.0.44`. There is no additional runtime behavior change.
+
+**Why:** Publishing `.134` triggered the expected harness artifact autobump,
+which moved `main` after the `.134` tag. Production release tags must identify
+current `main`; published tags are immutable and must not be force-moved.
+
+**Why not upstream:** This is AAWM fork and acceptance-harness release
+coordination.
+
+**Validation status:** The `.134` runtime code passed the focused `61 + 3 + 11`
+test slices and the existing authenticated targeted Moonshot dev harness with
+positive Langfuse generation costs. Harness release `h-v0.0.44` is published
+with asset `litellm-local-ci-harness-0.0.44.tar.gz` and SHA-256
+`ed6d875f61bb616ded956b3164bc882edb411caf8a4462f6cf0efb9a850af032`.
+The `.135` image must complete the installed-runtime publication smoke before
+production promotion under `PROD_RELEASE.md`.
+
 ### aawm.134 - Deterministic Kimi streaming reference-cost observability
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.134`. Managed
