@@ -58,6 +58,41 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.136 - Alibaba Token Plan console quota observations
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.136`. The
+provider-status sidecar now polls the authenticated Alibaba ModelStudio Token
+Plan Personal usage and subscription contracts with the operator-provided
+`ALIBABA_WEB_KEY` session envelope. It records separate 5-hour and 7-day
+Credit windows, converts provider-reported consumed fractions to remaining
+percentages, preserves reset and subscription-period timestamps, hashes the
+plan instance identifier, and leaves unavailable absolute Credit fields null.
+
+The usage and subscription schedules are independent, transient retries are
+bounded, 401/403 failures are not retried within one poll, and every result is
+emitted as a sanitized structured `alibaba_quota_poll` event. The shared
+sidecar error redactor now also recognizes `login_aliyunid_ticket`.
+
+**Why:** Alibaba Token Plan quota was visible in the ModelStudio web UI but was
+absent from `rate_limit_observations`. Local token totals and the Qwen inference
+API key cannot provide or authenticate this provider quota contract.
+
+**Why not upstream:** The AAWM provider-status scheduler, local
+`aawm_tristore` observation schema, authorized browser-session envelope, and
+dashboard reporting contract are fork-local operational behavior.
+
+**Validation status:** Twenty-three focused Alibaba tests and the full 145-test
+provider-status module pass. Secret-silent live validation returned HTTP 200
+from both console contracts. Dev image
+`sha256:6103c9614e70795994b0557bb2e11db1c3a5153ad36896901a8decfde90068cb`
+passed dependency preflight and wrote both quota keys with the expected
+remaining percentages and reset times. The structured event reported
+`persisted=true`, two observations, and no credential or traceback. The first
+proof inserted both rows; the final exact-image proof inserted zero because the
+dedupe guard found the identical current snapshot. Active error-intake counts
+remained unchanged. Production promotion must use the immutable `.136` release
+image and recreate only the production provider-status sidecar.
+
 ### aawm.135 - Converged Kimi cost release after harness publication
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.135` on top of

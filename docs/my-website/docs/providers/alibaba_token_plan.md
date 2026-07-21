@@ -93,6 +93,15 @@ Token Plan generations record:
 - `actual_invoice_cost_known=false`
 - `reference_cost_kind=provider_token_plan_no_public_per_token_rate`
 
+## Quota observability
+
+AAWM deployments may enable the provider-status sidecar's read-only
+ModelStudio quota poll. It records the Token Plan 5-hour and 7-day Credit
+windows without sending model traffic or using the plan-specific inference API
+key. See `docs/aawm-provider-status-observations.md` for the private
+`ALIBABA_WEB_KEY` session envelope, polling cadence, stored quota keys, and
+degraded-session behavior.
+
 LiteLLM does not invent a per-token price for this subscription. Consumers must
 not interpret a null invoice cost as a free request.
 

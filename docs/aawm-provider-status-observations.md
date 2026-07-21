@@ -159,6 +159,59 @@ This is an interpretation-only documentation update. It adds no
 `session_history` or observation schema, view, or API change, so no
 `dashboard-shell` handoff is needed.
 
+## Alibaba Token Plan quota polling
+
+The provider-status sidecar can poll the authenticated ModelStudio Token Plan
+console contract without sending inference traffic. It records the provider's
+5-hour and 7-day Credit usage windows as:
+
+- `alibaba_token_plan_5h:credits`
+- `alibaba_token_plan_7d:credits`
+
+Alibaba reports each window as a consumed fraction. The sidecar converts that
+fraction to `remaining_pct`, preserves the provider reset timestamp, and leaves
+absolute limit/used/remaining columns null because this console response does
+not provide authoritative absolute Credit limits. It does not invent daily or
+monthly quota windows.
+
+Authentication is supplied through `ALIBABA_WEB_KEY`, a URL-safe base64 JSON
+envelope containing only the existing `login_aliyunid_ticket` cookie value and
+the console `sec_token`. The sidecar does not copy the Token Plan inference API
+key, open a browser, reauthorize, refresh, or rotate this web session. When the
+session expires, the poll emits a sanitized degraded event until an operator
+replaces `ALIBABA_WEB_KEY`.
+
+The usage request runs at startup and then on the configured usage cadence.
+Subscription metadata is refreshed at startup and independently on the
+configured subscription cadence. The subscription response supplies the
+active-plan status, plan specification, period boundaries, and a plan-instance
+identifier used only to derive `account_hash`; the raw identifier is not
+persisted.
+
+Relevant environment variables:
+
+- `ALIBABA_WEB_KEY`: private compact web-session envelope. Never log or persist
+  its decoded values in database fields.
+- `AAWM_ALIBABA_QUOTA_POLL_ENABLED`: enables the scheduled poll.
+- `AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS`: minimum seconds between usage
+  polls; the managed sidecar default is `300`.
+- `AAWM_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS`: minimum seconds between
+  subscription refreshes; the managed sidecar default is `21600`.
+- `AAWM_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS`: request timeout; the managed
+  sidecar default is `30`.
+- `AAWM_ALIBABA_QUOTA_GATEWAY_URL`: override for the undocumented ModelStudio
+  gateway base URL. Keep the default unless contract verification proves a
+  provider change.
+- `AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS`: bounded attempts per endpoint call;
+  the managed sidecar default is `2`.
+- `AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS`: base exponential backoff for
+  transient failures; the managed sidecar default is `0.5`.
+
+Each due attempt emits one sanitized `alibaba_quota_poll` JSON event. Runtime
+success requires HTTP 200 responses, an active subscription, two parsed
+observations, successful persistence, and no credential, raw response, account
+identity, or traceback in container logs.
+
 Anthropic unified response headers persist separate weekly buckets:
 
 - `anthropic_unified_7d:7d` — baseline unified seven-day quota (`quota_period=seven_day`, `window_minutes=10080`).

@@ -188,17 +188,15 @@ these docs only as needed:
 
 ## Next
 
-- Publish and promote `v1.82.3-aawm.132`. The exact synchronized composite
-  candidate passed all eight concise Moonshot and Alibaba Codex/Claude cases on
-  `litellm-dev` `:4001` with clean logs, Langfuse traces, and
-  `aawm_tristore` correlation. The required callback `0.0.68`, control-plane
-  `0.0.11`, model-config `0.0.28`, and harness `0.0.43` GitHub Releases now
-  exist. Remaining work is to publish the `.132` core image, verify its exact
-  installed contents, follow `PROD_RELEASE.md` to promote only that image, and
-  rerun the same eight scoped cases with `--target prod`. Continue using only
-  the existing authenticated harness and canonical in-place credentials; keep
-  Claude cases serialized, keep the cases tool-focused rather than
-  throughput-oriented, and never blanket-stop containers.
+- Publish and promote `v1.82.3-aawm.136` for Alibaba Token Plan quota
+  observations. The candidate passed the focused and full provider-status test
+  modules, secret-silent live console replay, dev image dependency preflight,
+  structured sidecar-log validation, and exact `aawm_tristore` row
+  verification for separate 5-hour and 7-day Credit windows. Follow
+  `PROD_RELEASE.md`, build the production provider-status image from the
+  immutable `.136` fork image, pass the same dependency preflight, recreate
+  only `aawm-provider-status-observations-prod` with the existing
+  `ALIBABA_WEB_KEY`, and verify matching production rows and sanitized logs.
 
 - Rerun the Spark/Codex-dependent prod harness cases after the upstream Codex
   quota reset at `2026-05-18 15:08:41 UTC`: at minimum
