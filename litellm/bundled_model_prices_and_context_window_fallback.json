@@ -39,6 +39,210 @@
         "supports_web_search": true,
         "vector_store_cost_per_gb_per_day": 0.0
     },
+    "alibaba_token_plan/qwen3.8-max-preview": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
+    },
+    "alibaba_token_plan/qwen3.7-plus": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
+    },
+    "alibaba_token_plan/qwen3.7-max": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
+    },
+    "alibaba_token_plan/qwen3.6-flash": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
+    },
+    "alibaba_token_plan/deepseek-v4-pro": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
+    },
+    "alibaba_token_plan/glm-5.2": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
+    },
     "kimi_code/k3": {
         "cache_read_input_token_cost": 3e-07,
         "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",

@@ -297,6 +297,28 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         return not isinstance(partial, str) or not partial
 
     @staticmethod
+    def _should_queue_content_block_transition_delta(processed_chunk: Any) -> bool:
+        """Keep the first meaningful delta that triggered a new content block."""
+        if not isinstance(processed_chunk, dict):
+            return False
+        if processed_chunk.get("type") != "content_block_delta":
+            return False
+        delta = processed_chunk.get("delta")
+        if not isinstance(delta, dict):
+            return False
+        value_key_by_type = {
+            "text_delta": "text",
+            "input_json_delta": "partial_json",
+            "thinking_delta": "thinking",
+            "signature_delta": "signature",
+        }
+        value_key = value_key_by_type.get(delta.get("type"))
+        if value_key is None:
+            return False
+        value = delta.get(value_key)
+        return isinstance(value, str) and bool(value)
+
+    @staticmethod
     def _chunk_has_tool_call_delta(chunk: "ModelResponseStream") -> bool:
         try:
             tool_calls = chunk.choices[0].delta.tool_calls
@@ -748,9 +770,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
                 if should_start_new_block and not self.sent_content_block_finish:
                     # Queue the sequence: content_block_stop -> content_block_start.
-                    # For tool_use blocks we must also preserve the triggering
-                    # input_json_delta chunk; otherwise clients receive an empty
-                    # tool input and invoke the tool with missing arguments.
+                    # Preserve the triggering delta for every block transition.
+                    # It is the first content of the new block, not a duplicate.
                     self.chunk_queue.append(
                         emit_content_block_stop(
                             index=max(self.current_content_block_index - 1, 0)
@@ -762,12 +783,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             content_block=self.current_content_block_start,
                         )
                     )
-                    if (
-                        isinstance(processed_chunk, dict)
-                        and processed_chunk.get("type") == "content_block_delta"
-                        and isinstance(processed_chunk.get("delta"), dict)
-                        and processed_chunk["delta"].get("type") == "input_json_delta"
-                        and processed_chunk["delta"].get("partial_json")
+                    if self._should_queue_content_block_transition_delta(
+                        processed_chunk
                     ):
                         self.chunk_queue.append(processed_chunk)
                     self.sent_content_block_finish = False
@@ -983,9 +1000,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if not self.queued_usage_chunk:
                     if should_start_new_block and not self.sent_content_block_finish:
                         # Queue the sequence: content_block_stop -> content_block_start.
-                        # For tool_use blocks we must also preserve the triggering
-                        # input_json_delta chunk; otherwise clients receive an empty
-                        # tool input and invoke the tool with missing arguments.
+                        # Preserve the triggering delta for every block transition.
+                        # It is the first content of the new block, not a duplicate.
 
                         # 1. Stop current content block
                         self.chunk_queue.append(
@@ -1001,13 +1017,8 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                                 content_block=self.current_content_block_start,
                             )
                         )
-                        if (
-                            isinstance(processed_chunk, dict)
-                            and processed_chunk.get("type") == "content_block_delta"
-                            and isinstance(processed_chunk.get("delta"), dict)
-                            and processed_chunk["delta"].get("type")
-                            == "input_json_delta"
-                            and processed_chunk["delta"].get("partial_json")
+                        if self._should_queue_content_block_transition_delta(
+                            processed_chunk
                         ):
                             self.chunk_queue.append(processed_chunk)
 

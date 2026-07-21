@@ -255,6 +255,152 @@ async def test_should_translate_responses_tools_continuation_and_k3_effort():
 
 
 @pytest.mark.asyncio
+async def test_should_restore_codex_agent_task_payload_for_kimi():
+    task_payload = (
+        "You are Child A. Run two parallel command batches and return the "
+        "required completion marker."
+    )
+    ordinary_encrypted_reasoning = {
+        "type": "reasoning",
+        "id": "rs_opaque",
+        "summary": [],
+        "encrypted_content": "opaque-provider-continuation-state",
+    }
+
+    plan = await prepare_codex_kimi_chat_completions_adapter_route(
+        request=MagicMock(),
+        adapter_model="kimi_code/k3-max",
+        prepared_request_body={
+            "model": "kimi_code/k3-max",
+            "input": [
+                {
+                    "type": "agent_message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Message Type: NEW_TASK\n"
+                                "Task name: /root/child_a\n"
+                                "Sender: /root\n"
+                                "Payload:\n"
+                            ),
+                        },
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": task_payload,
+                        },
+                    ],
+                },
+                ordinary_encrypted_reasoning,
+            ],
+        },
+    )
+
+    prepared_input = plan.prepared_request_body["input"]
+    assert prepared_input[0]["content"] == [
+        {
+            "type": "input_text",
+            "text": (
+                "Message Type: NEW_TASK\n"
+                "Task name: /root/child_a\n"
+                "Sender: /root\n"
+                "Payload:\n"
+                f"{task_payload}"
+            ),
+        }
+    ]
+    assert prepared_input[1] == ordinary_encrypted_reasoning
+
+    completion_kwargs = plan.perform_kwargs["completion_kwargs"]
+    assert completion_kwargs["model"] == "k3"
+    assert completion_kwargs["reasoning_effort"] == "max"
+    assert completion_kwargs["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Message Type: NEW_TASK\n"
+                        "Task name: /root/child_a\n"
+                        "Sender: /root\n"
+                        "Payload:\n"
+                        f"{task_payload}"
+                    ),
+                }
+            ],
+        }
+    ]
+    metadata = plan.prepared_request_body["litellm_metadata"]
+    assert metadata["kimi_code_codex_agent_task_payload_restored"] is True
+    assert metadata["kimi_code_codex_agent_task_payload_restored_count"] == 1
+    assert metadata["kimi_code_codex_agent_task_payload_restored_chars"] == len(
+        task_payload
+    )
+    assert "codex-kimi-agent-task-payload-restored" in metadata["tags"]
+
+
+@pytest.mark.asyncio
+async def test_should_leave_nonempty_agent_payload_and_opaque_state_unchanged():
+    encrypted_part = {
+        "type": "encrypted_content",
+        "encrypted_content": "opaque-state-that-is-not-a-missing-task",
+    }
+    request_input = [
+        {
+            "type": "agent_message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Message Type: MESSAGE\n"
+                        "Task name: /root/child_a\n"
+                        "Sender: /root\n"
+                        "Payload:\n"
+                        "The task is already visible."
+                    ),
+                },
+                encrypted_part,
+            ],
+        }
+    ]
+
+    plan = await prepare_codex_kimi_chat_completions_adapter_route(
+        request=MagicMock(),
+        adapter_model="kimi_code/k3-high",
+        prepared_request_body={
+            "model": "kimi_code/k3-high",
+            "input": request_input,
+        },
+    )
+
+    assert plan.prepared_request_body["input"] == request_input
+    assert (
+        "kimi_code_codex_agent_task_payload_restored"
+        not in plan.prepared_request_body["litellm_metadata"]
+    )
+    assert plan.perform_kwargs["completion_kwargs"]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Message Type: MESSAGE\n"
+                        "Task name: /root/child_a\n"
+                        "Sender: /root\n"
+                        "Payload:\n"
+                        "The task is already visible."
+                    ),
+                }
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_should_use_responses_session_history_for_continuation(monkeypatch):
     restored_assistant_message = {
         "role": "assistant",
@@ -751,6 +897,10 @@ async def test_should_preserve_adapter_key_and_send_exact_upstream_model(adapter
     assert (
         anthropic_plan.prepared_request_body["litellm_metadata"]["passthrough_route_family"]
         == "anthropic_kimi_chat_completions_adapter"
+    )
+    assert (
+        "route:anthropic_kimi_chat_completions_adapter"
+        in anthropic_plan.prepared_request_body["litellm_metadata"]["tags"]
     )
     if forced_effort is None:
         assert "reasoning_effort" not in completion_kwargs
@@ -1261,9 +1411,17 @@ async def test_should_run_anthropic_nonstream_tool_continuation_with_variant_eff
         )
 
     respx_mock.post(KIMI_CODE_CHAT_COMPLETIONS_URL).mock(side_effect=upstream)
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._annotate_request_scope_for_adapted_access_log",
-        side_effect=lambda *_args: order.append("annotated"),
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._annotate_request_scope_for_adapted_access_log",
+            side_effect=lambda *_args: order.append("annotated"),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_adapted_route_access_log",
+        ) as emit_route_log,
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._record_adapted_completed_route_rollup_turn",
+        ) as record_completed_turn,
     ):
         response = await _handle_anthropic_kimi_chat_completions_adapter_route(
             endpoint="/v1/messages",
@@ -1307,6 +1465,17 @@ async def test_should_run_anthropic_nonstream_tool_continuation_with_variant_eff
             adapter_model="kimi_code/k3-low",
         )
 
+    emit_route_log.assert_called_once()
+    emitted_rollup_kwargs = emit_route_log.call_args.kwargs["rollup_kwargs"]
+    emitted_metadata = emitted_rollup_kwargs["litellm_params"]["metadata"]
+    assert (
+        "route:anthropic_kimi_chat_completions_adapter"
+        in emitted_metadata["tags"]
+    )
+    record_completed_turn.assert_called_once_with(
+        emitted_rollup_kwargs,
+        adapter_label="Kimi Code",
+    )
     response_text = response.body.decode()
     assert "thinking" in response_text
     assert "continue" in response_text
@@ -1342,22 +1511,38 @@ async def test_should_emit_anthropic_streaming_thinking_tool_and_terminal_events
         headers={"content-type": "text/event-stream"},
     )
 
-    response = await _handle_anthropic_kimi_chat_completions_adapter_route(
-        endpoint="/v1/messages",
-        request=_request(),
-        fastapi_response=MagicMock(spec=Response),
-        user_api_key_dict=MagicMock(),
-        prepared_request_body={
-            "model": "kimi_code/k3-max",
-            "max_tokens": 64,
-            "messages": [{"role": "user", "content": "work"}],
-            "tools": [{"name": "Write", "input_schema": {"type": "object"}}],
-            "stream": True,
-        },
-        adapter_model="kimi_code/k3-max",
-    )
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_adapted_route_access_log",
+        ) as emit_route_log,
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._record_adapted_completed_route_rollup_turn",
+        ) as record_completed_turn,
+    ):
+        response = await _handle_anthropic_kimi_chat_completions_adapter_route(
+            endpoint="/v1/messages",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": "kimi_code/k3-max",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "work"}],
+                "tools": [{"name": "Write", "input_schema": {"type": "object"}}],
+                "stream": True,
+            },
+            adapter_model="kimi_code/k3-max",
+        )
 
-    event_text = await _stream_text(response)
+        emit_route_log.assert_called_once()
+        emitted_rollup_kwargs = emit_route_log.call_args.kwargs["rollup_kwargs"]
+        record_completed_turn.assert_not_called()
+        event_text = await _stream_text(response)
+        record_completed_turn.assert_called_once_with(
+            emitted_rollup_kwargs,
+            adapter_label="Kimi Code",
+        )
+
     assert "thinking_delta" in event_text
     assert "think" in event_text
     assert "work" in event_text

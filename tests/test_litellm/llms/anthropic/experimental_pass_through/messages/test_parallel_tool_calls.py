@@ -411,9 +411,6 @@ def test_anthropic_stream_wrapper_interleaved_tool_calls_and_text():
         "content_block_delta",
         "content_block_stop",
         "content_block_start",
-        "content_block_stop",
-        "content_block_start",
-        "content_block_delta",
         "content_block_delta",
         "content_block_stop",
         "content_block_start",
@@ -421,12 +418,27 @@ def test_anthropic_stream_wrapper_interleaved_tool_calls_and_text():
         "content_block_delta",
         "content_block_stop",
         "content_block_start",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
         "content_block_stop",
         "message_delta",
         "message_stop",
     ]
 
     assert expected_types == chunk_types
+    text_deltas = [
+        chunk["delta"]["text"]
+        for chunk in chunks
+        if chunk.get("type") == "content_block_delta"
+        and chunk.get("delta", {}).get("type") == "text_delta"
+    ]
+    assert text_deltas == [
+        "The weather is nice today.",
+        "The weather is not so nice today.",
+    ]
 
     get_weather_calls = 0
 

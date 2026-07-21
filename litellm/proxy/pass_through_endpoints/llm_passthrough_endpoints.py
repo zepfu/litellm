@@ -213,6 +213,9 @@ from litellm.proxy.vector_store_endpoints.utils import (
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str
+from litellm.llms.alibaba_token_plan.adapters import (
+    adapter as _alibaba_token_plan_adapters,
+)
 from litellm.llms.kimi_code.adapters import adapter as _kimi_code_adapters
 from litellm.types.llms.openai import (
     RESPONSES_API_TERMINAL_STREAM_EVENTS,
@@ -231,7 +234,10 @@ from .aawm_alias_routing_policy import (
     ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES as _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES,
     ANTHROPIC_AAWM_READ_ALIAS as _POLICY_ANTHROPIC_AAWM_READ_ALIAS,
     ANTHROPIC_AAWM_SOTA_ALIAS as _POLICY_ANTHROPIC_AAWM_SOTA_ALIAS,
+    ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES,
     ANTHROPIC_AAWM_SOTA_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_CANDIDATES,
+    ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES,
+    ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES,
     ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES,
     ANTHROPIC_AUTO_AGENT_CANDIDATES as _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES,
     ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS as _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
@@ -245,6 +251,7 @@ from .aawm_alias_routing_policy import (
     ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS as _POLICY_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS,
     ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS as _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS,
     ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER as _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
+    ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS as _POLICY_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS,
     CODEX_AAWM_CODE_ALIAS as _POLICY_CODEX_AAWM_CODE_ALIAS,
     CODEX_AAWM_CODE_CANDIDATES as _POLICY_CODEX_AAWM_CODE_CANDIDATES,
     CODEX_AAWM_LOW_ALIAS as _POLICY_CODEX_AAWM_LOW_ALIAS,
@@ -253,7 +260,13 @@ from .aawm_alias_routing_policy import (
     CODEX_AAWM_ORCHESTRATION_CANDIDATES as _POLICY_CODEX_AAWM_ORCHESTRATION_CANDIDATES,
     CODEX_AAWM_READ_ALIAS as _POLICY_CODEX_AAWM_READ_ALIAS,
     CODEX_AAWM_SOTA_ALIAS as _POLICY_CODEX_AAWM_SOTA_ALIAS,
+    CODEX_AAWM_SOTA_ALIBABA_ALIAS as _POLICY_CODEX_AAWM_SOTA_ALIBABA_ALIAS,
+    CODEX_AAWM_SOTA_ALIBABA_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_ALIBABA_CANDIDATES,
     CODEX_AAWM_SOTA_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_CANDIDATES,
+    CODEX_AAWM_SOTA_DEEPSEEK_ALIAS as _POLICY_CODEX_AAWM_SOTA_DEEPSEEK_ALIAS,
+    CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES,
+    CODEX_AAWM_SOTA_GLM_ALIAS as _POLICY_CODEX_AAWM_SOTA_GLM_ALIAS,
+    CODEX_AAWM_SOTA_GLM_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_GLM_CANDIDATES,
     CODEX_AAWM_SOTA_OPENAI_ALIAS as _POLICY_CODEX_AAWM_SOTA_OPENAI_ALIAS,
     CODEX_AAWM_SOTA_OPENAI_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_OPENAI_CANDIDATES,
     CODEX_AAWM_SOTA_MOONSHOT_ALIAS as _POLICY_CODEX_AAWM_SOTA_MOONSHOT_ALIAS,
@@ -261,6 +274,8 @@ from .aawm_alias_routing_policy import (
     CODEX_AAWM_SOTA_XAI_ALIAS as _POLICY_CODEX_AAWM_SOTA_XAI_ALIAS,
     CODEX_AAWM_SOTA_XAI_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_XAI_CANDIDATES,
     CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER as _POLICY_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_CANDIDATES as _POLICY_CODEX_AUTO_AGENT_CANDIDATES,
     CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS as _POLICY_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS as _POLICY_CAPACITY_COOLDOWN,
@@ -459,6 +474,9 @@ _CODEX_AUTO_AGENT_MODEL_ALIAS = _POLICY_CODEX_AUTO_AGENT_MODEL_ALIAS
 _CODEX_AUTO_AGENT_NATIVE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_NATIVE_PROVIDER
 _CODEX_AUTO_AGENT_GOOGLE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_GOOGLE_PROVIDER
 _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
+_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER = (
+    _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+)
 _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER = _POLICY_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
 _CODEX_AUTO_AGENT_XAI_PROVIDER = _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER
@@ -467,6 +485,9 @@ _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_LANE
 _CODEX_AUTO_AGENT_XAI_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_LANE_KEY
 _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
 _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
+_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY = (
+    _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
+)
 _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
 _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = _POLICY_DEFAULT_COOLDOWN
 _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = _POLICY_CAPACITY_COOLDOWN
@@ -483,9 +504,15 @@ _CODEX_AAWM_SOTA_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_CANDIDATES
 _CODEX_AAWM_SOTA_OPENAI_ALIAS = _POLICY_CODEX_AAWM_SOTA_OPENAI_ALIAS
 _CODEX_AAWM_SOTA_XAI_ALIAS = _POLICY_CODEX_AAWM_SOTA_XAI_ALIAS
 _CODEX_AAWM_SOTA_MOONSHOT_ALIAS = _POLICY_CODEX_AAWM_SOTA_MOONSHOT_ALIAS
+_CODEX_AAWM_SOTA_ALIBABA_ALIAS = _POLICY_CODEX_AAWM_SOTA_ALIBABA_ALIAS
+_CODEX_AAWM_SOTA_DEEPSEEK_ALIAS = _POLICY_CODEX_AAWM_SOTA_DEEPSEEK_ALIAS
+_CODEX_AAWM_SOTA_GLM_ALIAS = _POLICY_CODEX_AAWM_SOTA_GLM_ALIAS
 _CODEX_AAWM_SOTA_OPENAI_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_OPENAI_CANDIDATES
 _CODEX_AAWM_SOTA_XAI_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_XAI_CANDIDATES
 _CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES
+_CODEX_AAWM_SOTA_ALIBABA_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_ALIBABA_CANDIDATES
+_CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES
+_CODEX_AAWM_SOTA_GLM_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_GLM_CANDIDATES
 _CODEX_AAWM_CODE_CANDIDATES = _POLICY_CODEX_AAWM_CODE_CANDIDATES
 _CODEX_AAWM_LOW_CANDIDATES = _POLICY_CODEX_AAWM_LOW_CANDIDATES
 _CODEX_AAWM_ORCHESTRATION_CANDIDATES = _POLICY_CODEX_AAWM_ORCHESTRATION_CANDIDATES
@@ -501,6 +528,13 @@ _ANTHROPIC_AAWM_LOW_ALIAS = _POLICY_ANTHROPIC_AAWM_LOW_ALIAS
 _ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_ALIAS
 _ANTHROPIC_AAWM_SOTA_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_CANDIDATES
 _ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES
+_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES = (
+    _POLICY_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES
+)
+_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES = (
+    _POLICY_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES
+)
+_ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES
 _ANTHROPIC_AAWM_CODE_CANDIDATES = _POLICY_ANTHROPIC_AAWM_CODE_CANDIDATES
 _ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES = _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES
 _ANTHROPIC_AAWM_LOW_CANDIDATES = _POLICY_ANTHROPIC_AAWM_LOW_CANDIDATES
@@ -533,6 +567,9 @@ _ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS = (
 )
 _KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS = (
     _POLICY_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS
+)
+_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS = (
+    _POLICY_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS
 )
 
 
@@ -2107,6 +2144,15 @@ def _normalize_kimi_code_chat_completions_adapter_model_name(
     )
 
 
+def _normalize_alibaba_token_plan_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    return _alibaba_token_plan_adapters.normalize_alibaba_token_plan_adapter_model_name(
+        model,
+        allowed_models=_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS,
+    )
+
+
 def _normalize_anthropic_google_completion_adapter_model_name(model: Any) -> Optional[str]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._normalize_anthropic_google_completion_adapter_model_name(model)
@@ -2144,6 +2190,17 @@ def _resolve_codex_kimi_chat_completions_adapter_model(
     return _normalize_kimi_code_chat_completions_adapter_model_name(request_body.get("model"))
 
 
+def _resolve_codex_alibaba_token_plan_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    return _normalize_alibaba_token_plan_adapter_model_name(
+        request_body.get("model")
+    )
+
+
 def _resolve_anthropic_opencode_zen_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
@@ -2165,6 +2222,19 @@ def _resolve_anthropic_kimi_chat_completions_adapter_model(
         return None
     for candidate in _get_anthropic_adapter_model_candidates(request_body):
         normalized_model = _normalize_kimi_code_chat_completions_adapter_model_name(candidate)
+        if normalized_model is not None:
+            return normalized_model
+    return None
+
+
+def _resolve_anthropic_alibaba_token_plan_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _has_anthropic_responses_adapter_endpoint(endpoint):
+        return None
+    for candidate in _get_anthropic_adapter_model_candidates(request_body):
+        normalized_model = _normalize_alibaba_token_plan_adapter_model_name(candidate)
         if normalized_model is not None:
             return normalized_model
     return None
@@ -4931,6 +5001,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
     elif candidate["provider"] == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+        lane_key = _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     else:
@@ -5036,6 +5108,7 @@ async def _get_anthropic_auto_agent_candidate_cooldown_state(
     if provider in {
         _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
         _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+        _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     }:
         return await _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
             cooldown_key
@@ -5098,6 +5171,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
     elif candidate["provider"] == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+        lane_key = _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     elif candidate["provider"] == _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER:
@@ -15354,6 +15429,48 @@ async def _perform_normalized_anthropic_completion_adapter_stream(
     )
 
 
+def _finalize_anthropic_completion_adapter_response(
+    *,
+    completion_response: object,
+    stream_flag: bool,
+    fake_stream: bool,
+    rollup_kwargs: dict[str, Any],
+    adapter_label: str,
+) -> Response:
+    from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+        FakeAnthropicMessagesStreamIterator,
+    )
+
+    if stream_flag:
+        if fake_stream:
+            if not _is_anthropic_messages_response(completion_response):
+                raise TypeError(
+                    "Fake Anthropic streaming requires a non-streaming response"
+                )
+            response_stream = FakeAnthropicMessagesStreamIterator(completion_response)
+        else:
+            response_stream = completion_response
+        streaming_response = (
+            _build_anthropic_streaming_response_from_completion_adapter_stream(
+                response_stream,
+            )
+        )
+        return _record_adapted_completed_route_rollup_after_stream(
+            streaming_response,
+            rollup_kwargs,
+            adapter_label=adapter_label,
+        )
+
+    response = _build_anthropic_response_from_completion_adapter_response(
+        completion_response,
+    )
+    _record_adapted_completed_route_rollup_turn(
+        rollup_kwargs,
+        adapter_label=adapter_label,
+    )
+    return response
+
+
 async def _perform_anthropic_completion_adapter_messages_call(
     *,
     config: "_aawm_adapter_config.AnthropicCompletionAdapterConfig",
@@ -15377,9 +15494,6 @@ async def _perform_anthropic_completion_adapter_messages_call(
     """Shared completion-adapter messages handler + response branch (RR-054 #9)."""
     from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
         LiteLLMMessagesToCompletionTransformationHandler,
-    )
-    from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
-        FakeAnthropicMessagesStreamIterator,
     )
 
     stream_flag = (
@@ -15485,26 +15599,29 @@ async def _perform_anthropic_completion_adapter_messages_call(
             **handler_extra_kwargs,
         )
 
+    litellm_metadata = prepared_request_body.get("litellm_metadata")
+    rollup_kwargs = _build_adapted_route_rollup_kwargs(
+        litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    )
     _annotate_request_scope_for_adapted_access_log(request, target_url)
+    _emit_adapted_route_access_log(
+        request=request,
+        target_url=str(target_url),
+        request_body=prepared_request_body,
+        rollup_kwargs=rollup_kwargs,
+        adapter_label=config.adapter_label,
+    )
     if operation_wrapper is not None:
         completion_response = await operation_wrapper(_operation)
     else:
         completion_response = await _operation()
 
-    if stream_flag:
-        if fake_stream:
-            if not _is_anthropic_messages_response(completion_response):
-                raise TypeError(
-                    "Fake Anthropic streaming requires a non-streaming response"
-                )
-            return _build_anthropic_streaming_response_from_completion_adapter_stream(
-                FakeAnthropicMessagesStreamIterator(completion_response),
-            )
-        return _build_anthropic_streaming_response_from_completion_adapter_stream(
-            completion_response,
-        )
-    return _build_anthropic_response_from_completion_adapter_response(
-        completion_response,
+    return _finalize_anthropic_completion_adapter_response(
+        completion_response=completion_response,
+        stream_flag=stream_flag,
+        fake_stream=fake_stream,
+        rollup_kwargs=rollup_kwargs,
+        adapter_label=config.adapter_label,
     )
 
 
@@ -16050,6 +16167,42 @@ async def _handle_anthropic_kimi_chat_completions_adapter_route(
     _ = endpoint, fastapi_response, user_api_key_dict
     return await _aawm_adapter_driver.run_completion_adapter_route(
         prepare=_prepare_anthropic_kimi_chat_completions_adapter_route,
+        perform=_perform_anthropic_completion_adapter_messages_call,
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+
+
+async def _prepare_anthropic_alibaba_token_plan_adapter_route(
+    *,
+    request: Request,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
+    return await _alibaba_token_plan_adapters.prepare_anthropic_alibaba_token_plan_adapter_route(
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+
+
+async def _handle_anthropic_alibaba_token_plan_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    _ = endpoint, fastapi_response, user_api_key_dict
+    return await _aawm_adapter_driver.run_completion_adapter_route(
+        prepare=_prepare_anthropic_alibaba_token_plan_adapter_route,
         perform=_perform_anthropic_completion_adapter_messages_call,
         request=request,
         prepared_request_body=prepared_request_body,
@@ -22365,6 +22518,17 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    async def _alibaba_token_plan() -> Response:
+        return await _handle_anthropic_alibaba_token_plan_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=True,
+        )
+
     async def _native() -> Response:
         native_candidate_body = candidate_body
         native_custom_headers = custom_headers
@@ -22403,6 +22567,7 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             _CODEX_AUTO_AGENT_GOOGLE_PROVIDER: _google,
             _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
             _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
+            _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: _alibaba_token_plan,
         },
         route_family_handlers={
             _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
@@ -22983,11 +23148,29 @@ def _prepare_anthropic_context_1m_native_passthrough(
 
 
 @router.api_route(
+    "/anthropic",
+    methods=["HEAD"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/anthropic/",
+    methods=["HEAD"],
+    include_in_schema=False,
+)
+async def anthropic_base_probe() -> Response:
+    """Claude CLI reachability probe for a configured Anthropic base URL."""
+    return Response(
+        status_code=200,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.api_route(
     "/anthropic/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     tags=["Anthropic Pass-through", "pass-through"],
 )
-async def anthropic_proxy_route(
+async def anthropic_proxy_route(  # noqa: PLR0915
     endpoint: str,
     request: Request,
     fastapi_response: Response,
@@ -23167,6 +23350,22 @@ async def anthropic_proxy_route(
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=prepared_request_body,
                 adapter_model=kimi_code_adapter_model,
+            )
+
+        alibaba_token_plan_adapter_model = (
+            _resolve_anthropic_alibaba_token_plan_adapter_model(
+                prepared_request_body,
+                endpoint=encoded_endpoint,
+            )
+        )
+        if alibaba_token_plan_adapter_model is not None:
+            return await _handle_anthropic_alibaba_token_plan_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=alibaba_token_plan_adapter_model,
             )
 
         google_adapter_model = _resolve_anthropic_google_completion_adapter_model(
@@ -25186,6 +25385,185 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
     return validated_response
 
 
+async def _prepare_codex_alibaba_token_plan_adapter_route(
+    *,
+    request: Request,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
+    prepared_request_body = (
+        _alibaba_token_plan_adapters.normalize_alibaba_token_plan_custom_tool_outputs(
+            prepared_request_body
+        )
+    )
+    adapted_request_body, _adapted_custom_tools = (
+        _adapt_codex_custom_tools_to_functions_from_request_body(
+            prepared_request_body
+        )
+    )
+    adapted_request_body, _adapted_namespace_tools = (
+        _adapt_codex_namespace_tools_to_functions_from_request_body(
+            adapted_request_body
+        )
+    )
+    (
+        adapted_request_body,
+        _codex_tool_description_patch_events,
+    ) = _apply_codex_tool_description_patches_to_request_body(adapted_request_body)
+    adapted_request_body, _unsupported_hosted_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(
+            adapted_request_body
+        )
+    )
+    adapted_request_body, _unsupported_input_items = (
+        _drop_unsupported_codex_input_items_from_request_body(
+            adapted_request_body
+        )
+    )
+    adapted_request_body, _removed_tool_choice = (
+        _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
+    )
+    return await _alibaba_token_plan_adapters.prepare_codex_alibaba_token_plan_adapter_route(
+        request=request,
+        prepared_request_body=adapted_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+
+
+async def _perform_codex_alibaba_token_plan_adapter_call(
+    *,
+    config: "_aawm_adapter_config.AnthropicCompletionAdapterConfig",
+    request: Request,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    target_url: Union[str, httpx.URL],
+    api_key: str,
+    api_base: str,
+    client_requested_stream: bool,
+    completion_kwargs: Payload,
+    request_input: Any,
+    responses_api_request: ResponsesAPIOptionalRequestParams,
+    litellm_metadata: Payload,
+    upstream_model: str,
+) -> Response:
+    """Execute Token Plan chat completions through the standard Responses wrapper."""
+    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+        LiteLLMCompletionStreamingIterator,
+    )
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    _ = config, adapter_model
+    _annotate_request_scope_for_adapted_access_log(
+        request, httpx.URL(str(target_url))
+    )
+    completion_response = await litellm.acompletion(
+        **completion_kwargs,
+        api_key=api_key,
+        api_base=api_base,
+        litellm_metadata=litellm_metadata,
+        proxy_server_request={
+            "headers": dict(request.headers),
+            "body": prepared_request_body,
+        },
+        shared_session=_get_proxy_shared_aiohttp_session(),
+    )
+    if client_requested_stream:
+        return StreamingResponse(
+            _responses_sse_from_iterator(
+                LiteLLMCompletionStreamingIterator(
+                    model=upstream_model,
+                    litellm_custom_stream_wrapper=completion_response,
+                    request_input=request_input,
+                    responses_api_request=responses_api_request,
+                    custom_llm_provider=litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value,
+                    litellm_metadata=litellm_metadata,
+                )
+            ),
+            media_type="text/event-stream",
+        )
+    responses_api_response = (
+        LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            chat_completion_response=completion_response,
+            request_input=request_input,
+            responses_api_request=responses_api_request,
+        )
+    )
+    return _build_responses_response_from_adapter_response(responses_api_response)
+
+
+async def _handle_codex_alibaba_token_plan_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: UserAPIKeyAuth,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    _ = endpoint, fastapi_response, user_api_key_dict
+    rollup_kwargs: dict[str, Any] = {}
+
+    async def _prepare_and_emit_route_log(
+        **kwargs: Any,
+    ) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
+        plan = await _prepare_codex_alibaba_token_plan_adapter_route(**kwargs)
+        metadata = plan.perform_kwargs.get("litellm_metadata")
+        if not isinstance(metadata, dict):
+            metadata = plan.prepared_request_body.get("litellm_metadata")
+        rollup_kwargs.update(
+            _build_adapted_route_rollup_kwargs(
+                metadata if isinstance(metadata, dict) else {}
+            )
+        )
+        _annotate_request_scope_for_adapted_access_log(request, plan.target_url)
+        _emit_adapted_route_access_log(
+            request=request,
+            target_url=str(plan.target_url),
+            request_body=plan.prepared_request_body,
+            rollup_kwargs=rollup_kwargs,
+            adapter_label="Alibaba Token Plan",
+        )
+        return plan
+
+    response = await _aawm_adapter_driver.run_completion_adapter_route(
+        prepare=_prepare_and_emit_route_log,
+        perform=_perform_codex_alibaba_token_plan_adapter_call,
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+    validated_response = await _validate_codex_auto_agent_responses_payload(
+        response,
+        adapter_model=adapter_model,
+        adapter="codex_alibaba_token_plan_chat_completions_adapter",
+        adapter_label="Alibaba Token Plan",
+        intake_context=_build_malformed_tool_call_intake_context(
+            request,
+            prepared_request_body,
+            adapter="codex_alibaba_token_plan_chat_completions_adapter",
+            provider="alibaba_token_plan",
+        ),
+        request_body=prepared_request_body,
+    )
+    if isinstance(validated_response, StreamingResponse):
+        return _record_adapted_completed_route_rollup_after_stream(
+            validated_response,
+            rollup_kwargs,
+            adapter_label="Alibaba Token Plan",
+        )
+    _record_adapted_completed_route_rollup_turn(
+        rollup_kwargs,
+        adapter_label="Alibaba Token Plan",
+    )
+    return validated_response
+
+
 async def _handle_codex_opencode_zen_adapter_route(
     *,
     endpoint: str,
@@ -25590,6 +25968,17 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    async def _alibaba_token_plan() -> Response:
+        return await _handle_codex_alibaba_token_plan_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=True,
+        )
+
     async def _native() -> Response:
         return await _perform_codex_auto_agent_native_openai_request(
             request=request,
@@ -25608,6 +25997,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER: _antigravity,
             _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
             _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
+            _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: _alibaba_token_plan,
         },
         route_family_handlers={
             _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
@@ -25983,6 +26373,31 @@ class BaseOpenAIPassThroughHandler:
                             user_api_key_dict=user_api_key_dict,
                             prepared_request_body=prepared_request_body,
                             adapter_model=kimi_code_adapter_model,
+                        )
+                    alibaba_token_plan_adapter_model = (
+                        _resolve_codex_alibaba_token_plan_adapter_model(
+                            prepared_request_body,
+                            endpoint=endpoint,
+                        )
+                    )
+                    if alibaba_token_plan_adapter_model is not None:
+                        prepared_request_body = (
+                            _prepare_request_body_for_passthrough_observability(
+                                request=request,
+                                request_body=prepared_request_body,
+                            )
+                        )
+                        if prepared_request_body is not request_body:
+                            _safe_set_request_parsed_body(
+                                request, prepared_request_body
+                            )
+                        return await _handle_codex_alibaba_token_plan_adapter_route(
+                            endpoint=endpoint,
+                            request=request,
+                            fastapi_response=fastapi_response,
+                            user_api_key_dict=user_api_key_dict,
+                            prepared_request_body=prepared_request_body,
+                            adapter_model=alibaba_token_plan_adapter_model,
                         )
                     antigravity_adapter_model = (
                         _resolve_codex_antigravity_code_assist_adapter_model(

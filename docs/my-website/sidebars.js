@@ -844,6 +844,7 @@ const sidebars = {
         "providers/cometapi",
         "providers/compactifai",
         "providers/custom_llm_server",
+        "providers/alibaba_token_plan",
         "providers/dashscope",
         "providers/databricks",
         "providers/datarobot",

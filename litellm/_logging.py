@@ -1181,6 +1181,7 @@ _AAWM_HEALTH_ACCESS_LOG_PATHS = frozenset(
     }
 )
 _AAWM_HEALTH_ACCESS_LOG_STATUSES = frozenset({200, 204})
+_AAWM_ANTHROPIC_BASE_PROBE_PATHS = frozenset({"/anthropic", "/anthropic/"})
 
 
 class AawmHealthAccessLogFilter(logging.Filter):
@@ -1193,13 +1194,18 @@ class AawmHealthAccessLogFilter(logging.Filter):
             return True
 
         _client_addr, method, full_path, _http_version, status_code = args[:5]
-        if str(method).upper() != "GET":
-            return True
+        normalized_method = str(method).upper()
         path = _normalize_aawm_route_access_log_replacement_path(full_path).split(
             "?",
             1,
         )[0]
-        if path not in _AAWM_HEALTH_ACCESS_LOG_PATHS:
+        is_health_probe = (
+            normalized_method == "GET" and path in _AAWM_HEALTH_ACCESS_LOG_PATHS
+        )
+        is_anthropic_base_probe = (
+            normalized_method == "HEAD" and path in _AAWM_ANTHROPIC_BASE_PROBE_PATHS
+        )
+        if not is_health_probe and not is_anthropic_base_probe:
             return True
         try:
             normalized_status_code = int(status_code)

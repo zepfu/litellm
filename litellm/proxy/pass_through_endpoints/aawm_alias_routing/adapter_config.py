@@ -189,6 +189,30 @@ ANTHROPIC_KIMI_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
     custom_llm_provider="kimi_code",
 )
 
+CODEX_ALIBABA_TOKEN_PLAN = AnthropicCompletionAdapterConfig(
+    adapter="codex_alibaba_token_plan_chat_completions_adapter",
+    adapter_label="Alibaba Token Plan",
+    route_family="codex_alibaba_token_plan_chat_completions_adapter",
+    tag_prefix="codex-alibaba-token-plan-chat-completions-adapter",
+    span_name="codex.alibaba_token_plan_chat_completions_adapter",
+    target_endpoint_label="alibaba_token_plan:/compatible-mode/v1/chat/completions",
+    credential_family="alibaba_token_plan",
+    expected_target_family="alibaba_token_plan",
+    custom_llm_provider="alibaba_token_plan",
+)
+
+ANTHROPIC_ALIBABA_TOKEN_PLAN = AnthropicCompletionAdapterConfig(
+    adapter="anthropic_alibaba_token_plan_chat_completions_adapter",
+    adapter_label="Alibaba Token Plan",
+    route_family="anthropic_alibaba_token_plan_chat_completions_adapter",
+    tag_prefix="anthropic-alibaba-token-plan-chat-completions-adapter",
+    span_name="anthropic.alibaba_token_plan_chat_completions_adapter",
+    target_endpoint_label="alibaba_token_plan:/compatible-mode/v1/chat/completions",
+    credential_family="alibaba_token_plan",
+    expected_target_family="alibaba_token_plan",
+    custom_llm_provider="alibaba_token_plan",
+)
+
 
 def responses_finalize_kwargs(
     config: AnthropicResponsesAdapterConfig,

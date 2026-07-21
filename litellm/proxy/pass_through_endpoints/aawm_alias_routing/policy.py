@@ -37,12 +37,14 @@ CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER = "antigravity"
 CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = "openrouter"
 CODEX_AUTO_AGENT_XAI_PROVIDER = "xai"
 CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER = "kimi_code"
+CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba_token_plan"
 OPENCODE_ZEN_PROVIDER = "opencode_zen"
 CODEX_AUTO_AGENT_OPENCODE_PROVIDER = OPENCODE_ZEN_PROVIDER
 CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = "openrouter"
 CODEX_AUTO_AGENT_XAI_LANE_KEY = "xai_grok_native"
 CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = "xai_oauth_managed"
 CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY = "kimi_code_managed_account"
+CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY = "alibaba_token_plan"
 CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = OPENCODE_ZEN_PROVIDER
 ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER = "anthropic"
 ANTHROPIC_AUTO_AGENT_HAIKU_MODEL = "claude-haiku-4-5-20251001"
@@ -56,6 +58,9 @@ CODEX_AAWM_ORCHESTRATION_ALIAS = "aawm-orchestration"
 CODEX_AAWM_SOTA_OPENAI_ALIAS = "aawm-sota-openai"
 CODEX_AAWM_SOTA_XAI_ALIAS = "aawm-sota-xai"
 CODEX_AAWM_SOTA_MOONSHOT_ALIAS = "aawm-sota-moonshot"
+CODEX_AAWM_SOTA_ALIBABA_ALIAS = "aawm-sota-alibaba"
+CODEX_AAWM_SOTA_DEEPSEEK_ALIAS = "aawm-sota-deepseek"
+CODEX_AAWM_SOTA_GLM_ALIAS = "aawm-sota-glm"
 ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = "aawm-anthropic-agent-auto"
 ANTHROPIC_AAWM_READ_ALIAS = "aawm-read-anthropic"
 ANTHROPIC_AAWM_SOTA_ALIAS = "aawm-sota-anthropic"
@@ -143,6 +148,36 @@ CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "metadata_gate": "think_effort",
     },
 )
+CODEX_AAWM_SOTA_ALIBABA_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/qwen3.8-max-preview",
+        "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/qwen3.7-max",
+        "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": True,
+    },
+)
+CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/deepseek-v4-pro",
+        "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": True,
+    },
+)
+CODEX_AAWM_SOTA_GLM_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/glm-5.2",
+        "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": True,
+    },
+)
 CODEX_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -221,6 +256,12 @@ CODEX_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": False,
     },
     {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/qwen3.6-flash",
+        "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": False,
+    },
+    {
         "provider": CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
         "model": "kimi_code/kimi-for-coding",
         "route_family": "codex_kimi_chat_completions_adapter",
@@ -255,6 +296,9 @@ CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {
     CODEX_AAWM_SOTA_OPENAI_ALIAS: CODEX_AAWM_SOTA_OPENAI_CANDIDATES,
     CODEX_AAWM_SOTA_XAI_ALIAS: CODEX_AAWM_SOTA_XAI_CANDIDATES,
     CODEX_AAWM_SOTA_MOONSHOT_ALIAS: CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES,
+    CODEX_AAWM_SOTA_ALIBABA_ALIAS: CODEX_AAWM_SOTA_ALIBABA_CANDIDATES,
+    CODEX_AAWM_SOTA_DEEPSEEK_ALIAS: CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES,
+    CODEX_AAWM_SOTA_GLM_ALIAS: CODEX_AAWM_SOTA_GLM_CANDIDATES,
     CODEX_AAWM_CODE_ALIAS: CODEX_AAWM_CODE_CANDIDATES,
     CODEX_AAWM_LOW_ALIAS: CODEX_AAWM_LOW_CANDIDATES,
     CODEX_AAWM_ORCHESTRATION_ALIAS: CODEX_AAWM_ORCHESTRATION_CANDIDATES,
@@ -315,6 +359,36 @@ ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "route_family": "anthropic_kimi_chat_completions_adapter",
         "last_resort": True,
         "metadata_gate": "think_effort",
+    },
+)
+ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/qwen3.8-max-preview",
+        "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": False,
+    },
+    {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/qwen3.7-max",
+        "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": True,
+    },
+)
+ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/deepseek-v4-pro",
+        "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": True,
+    },
+)
+ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES: tuple[dict[str, Any], ...] = (
+    {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/glm-5.2",
+        "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": True,
     },
 )
 ANTHROPIC_AAWM_CODE_CANDIDATES: tuple[dict[str, Any], ...] = (
@@ -402,6 +476,12 @@ ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": False,
     },
     {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": "alibaba_token_plan/qwen3.6-flash",
+        "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter",
+        "last_resort": False,
+    },
+    {
         "provider": CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
         "model": "kimi_code/kimi-for-coding",
         "route_family": "anthropic_kimi_chat_completions_adapter",
@@ -420,6 +500,9 @@ ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] 
     ANTHROPIC_AAWM_READ_ALIAS: ANTHROPIC_AUTO_AGENT_CANDIDATES,
     ANTHROPIC_AAWM_SOTA_ALIAS: ANTHROPIC_AAWM_SOTA_CANDIDATES,
     CODEX_AAWM_SOTA_MOONSHOT_ALIAS: ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES,
+    CODEX_AAWM_SOTA_ALIBABA_ALIAS: ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES,
+    CODEX_AAWM_SOTA_DEEPSEEK_ALIAS: ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES,
+    CODEX_AAWM_SOTA_GLM_ALIAS: ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES,
     ANTHROPIC_AAWM_CODE_ALIAS: ANTHROPIC_AAWM_CODE_CANDIDATES,
     ANTHROPIC_AAWM_LOW_ALIAS: ANTHROPIC_AAWM_LOW_CANDIDATES,
     ANTHROPIC_AAWM_ORCHESTRATION_ALIAS: ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES,
@@ -508,5 +591,15 @@ KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS = frozenset(
         "kimi_code/k3-max",
         "kimi_code/kimi-for-coding",
         "kimi_code/kimi-for-coding-highspeed",
+    }
+)
+ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS = frozenset(
+    {
+        "alibaba_token_plan/qwen3.8-max-preview",
+        "alibaba_token_plan/qwen3.7-plus",
+        "alibaba_token_plan/qwen3.7-max",
+        "alibaba_token_plan/qwen3.6-flash",
+        "alibaba_token_plan/deepseek-v4-pro",
+        "alibaba_token_plan/glm-5.2",
     }
 )

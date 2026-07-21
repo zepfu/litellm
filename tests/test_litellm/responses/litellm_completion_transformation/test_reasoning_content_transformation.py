@@ -152,6 +152,74 @@ class _AsyncChunkStream:
             raise StopAsyncIteration from exc
 
 
+class _SyncChunkStream:
+    def __init__(self, chunks):
+        self._chunks = iter(chunks)
+        self.logging_obj = None
+
+    def __next__(self):
+        return next(self._chunks)
+
+
+def _text_chunk(content: str = "Working on it.") -> ModelResponseStream:
+    return ModelResponseStream(
+        id="chatcmpl-kimi",
+        created=1234567890,
+        model="test-model",
+        object="chat.completion.chunk",
+        choices=[
+            StreamingChoices(
+                finish_reason=None,
+                index=0,
+                delta=Delta(content=content, role="assistant"),
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_message_content_part_opens_before_text_delta():
+    iterator = LiteLLMCompletionStreamingIterator(
+        model="test-model",
+        litellm_custom_stream_wrapper=_AsyncChunkStream([_text_chunk()]),
+        request_input="Test input",
+        responses_api_request={},
+    )
+
+    events = [await iterator.__anext__() for _ in range(5)]
+
+    assert [event.type for event in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+    ]
+    assert events[2].item.id == events[3].item_id == events[4].item_id
+    assert events[2].output_index == events[3].output_index == events[4].output_index
+
+
+def test_sync_message_content_part_opens_before_text_delta():
+    iterator = LiteLLMCompletionStreamingIterator(
+        model="test-model",
+        litellm_custom_stream_wrapper=_SyncChunkStream([_text_chunk()]),
+        request_input="Test input",
+        responses_api_request={},
+    )
+
+    events = [next(iterator) for _ in range(5)]
+
+    assert [event.type for event in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+    ]
+    assert events[2].item.id == events[3].item_id == events[4].item_id
+    assert events[2].output_index == events[3].output_index == events[4].output_index
+
+
 @pytest.mark.asyncio
 async def test_reasoning_item_closes_before_message_text_item_opens():
     reasoning_chunk = ModelResponseStream(
@@ -193,7 +261,7 @@ async def test_reasoning_item_closes_before_message_text_item_opens():
         responses_api_request={},
     )
 
-    events = [await iterator.__anext__() for _ in range(9)]
+    events = [await iterator.__anext__() for _ in range(10)]
     event_types = [event.type for event in events]
 
     assert event_types == [
@@ -205,16 +273,20 @@ async def test_reasoning_item_closes_before_message_text_item_opens():
         "response.reasoning_summary_part.done",
         "response.output_item.done",
         "response.output_item.added",
+        "response.content_part.added",
         "response.output_text.delta",
     ]
     reasoning_added = events[2]
     reasoning_delta = events[3]
     message_added = events[7]
-    text_delta = events[8]
+    content_part_added = events[8]
+    text_delta = events[9]
     assert reasoning_added.output_index == 0
     assert reasoning_delta.output_index == 0
     assert reasoning_delta.item_id == reasoning_added.item.id
     assert message_added.output_index == 1
+    assert content_part_added.output_index == 1
+    assert content_part_added.item_id == message_added.item.id
     assert text_delta.output_index == 1
     assert text_delta.item_id == message_added.item.id
 

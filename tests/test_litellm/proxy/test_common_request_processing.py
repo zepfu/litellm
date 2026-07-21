@@ -945,6 +945,34 @@ class TestProxyBaseLLMRequestProcessing:
         )
         assert access_filter.filter(_build_uvicorn_access_record()) is True
 
+    def test_health_access_log_filter_suppresses_successful_anthropic_base_head_probe(
+        self,
+    ):
+        access_filter = AawmHealthAccessLogFilter()
+
+        for path in ("/anthropic", "/anthropic/"):
+            assert (
+                access_filter.filter(
+                    _build_uvicorn_access_record(
+                        method="HEAD",
+                        full_path=path,
+                        status_code=200,
+                    )
+                )
+                is False
+            )
+
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    method="HEAD",
+                    full_path="/anthropic/",
+                    status_code=405,
+                )
+            )
+            is True
+        )
+
     def test_aawm_route_access_log_filter_suppresses_successful_arrow_passthrough_without_registration(
         self,
     ):

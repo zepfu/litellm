@@ -204,6 +204,29 @@ MS012_MOONSHOT_DECLARED_MODELS = {
     "kimi_code/k3-max",
     "kimi_code/k3-high",
 }
+ALIBABA_CODEX_COLLABORATION_CASE = (
+    "native_openai_passthrough_responses_codex_aawm_sota_alibaba_collaboration"
+)
+ALIBABA_CODEX_BASH_TIME_CASE = (
+    "native_openai_passthrough_responses_codex_aawm_sota_alibaba_bash_time"
+)
+ALIBABA_CLAUDE_STRESS_CASE = "claude_adapter_aawm_sota_alibaba_parallel_stress"
+ALIBABA_CLAUDE_BASH_TIME_CASE = (
+    "claude_adapter_aawm_sota_alibaba_child_bash_time"
+)
+ALIBABA_ALIAS = "aawm-sota-alibaba"
+ALIBABA_CODEX_ROUTE = "codex_alibaba_token_plan_chat_completions_adapter"
+ALIBABA_CLAUDE_ROUTE = "anthropic_alibaba_token_plan_chat_completions_adapter"
+ALIBABA_DECLARED_MODELS = {
+    "alibaba_token_plan/qwen3.8-max-preview",
+    "alibaba_token_plan/qwen3.7-max",
+}
+ALIBABA_MODEL_CATALOG_PATH = (
+    ROOT / "scripts" / "local-ci" / "codex_alibaba_model_catalog.json"
+)
+ALIBABA_AGENT_CONFIG_PATH = (
+    ROOT / "scripts" / "local-ci" / "codex_alibaba_agent.toml"
+)
 
 D1322_LOW_ALIAS_REPLAY_CASES = (
     "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools",
@@ -450,6 +473,40 @@ def test_generation_route_filter_excludes_anthropic_count_tokens_observations():
         ["/anthropic/v1/messages"],
     ) is True
 
+    assert harness.RA._generation_observation_matches_allowed_route(
+        {
+            "metadata": {
+                "passthrough_route_family": "codex_kimi_chat_completions_adapter",
+                "tags": ["route:codex_responses"],
+                "codex_auto_agent_audit_events": [
+                    {"incoming_endpoint": "/openai_passthrough/responses"}
+                ],
+                "aawm_alias_routing_audit_events": [
+                    {"incoming_endpoint": "/openai_passthrough/responses"}
+                ],
+            }
+        },
+        [
+            "/openai_passthrough/v1/responses",
+            "/openai_passthrough/responses",
+        ],
+    ) is True
+
+    assert harness.RA._generation_observation_matches_allowed_route(
+        {
+            "metadata": {
+                "passthrough_route_family": "anthropic_messages",
+                "anthropic_auto_agent_audit_events": [
+                    {"incoming_endpoint": "/anthropic/v1/messages/count_tokens"}
+                ],
+                "aawm_alias_routing_audit_events": [
+                    {"incoming_endpoint": "/anthropic/v1/messages"}
+                ],
+            }
+        },
+        ["/anthropic/v1/messages"],
+    ) is False
+
 
 def test_provider_unavailable_timeout_stays_hard_without_exact_log_signature(monkeypatch):
     harness = _load_harness_module()
@@ -592,6 +649,67 @@ def test_bash_stdout_report_validator_accepts_exact_codex_command_output():
     assert summary["parent_output"] == timestamp
 
 
+def test_bash_stdout_report_validator_deduplicates_codex_command_lifecycle():
+    harness = _load_harness_module()
+    timestamp = "2026-07-20T20:47:21-04:00"
+    command = "/bin/bash -lc 'date --iso-8601=seconds'"
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "id": "item_1",
+                        "type": "command_execution",
+                        "command": command,
+                        "aggregated_output": "",
+                        "status": "in_progress",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item_1",
+                        "type": "command_execution",
+                        "command": command,
+                        "aggregated_output": f"{timestamp}\n",
+                        "status": "completed",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item_2",
+                        "type": "agent_message",
+                        "text": timestamp,
+                    },
+                }
+            ),
+        ]
+    )
+
+    summary, failures = harness._validate_bash_stdout_report(
+        family="case",
+        stdout=stdout,
+        checks={
+            "expected_command": "date --iso-8601=seconds",
+            "expected_regex": (
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                r"(?:Z|[+-]\d{2}:\d{2})$"
+            ),
+        },
+        transcript_tool_use_summary={"agents": []},
+    )
+
+    assert failures == []
+    assert summary["bash_stdout"] == timestamp
+    assert summary["parent_output"] == timestamp
+
+
 def test_bash_stdout_report_validator_accepts_exact_claude_child_and_parent_output():
     harness = _load_harness_module()
     timestamp = "2026-07-20T16:06:21-04:00"
@@ -727,6 +845,120 @@ def test_generation_route_filter_accepts_route_tag_without_request_route(monkeyp
     assert failures == []
     assert raw_observations == [observation]
     assert summaries[0]["traceId"] == "trace-1"
+
+
+def test_generation_quality_accepts_explicit_subscription_reference_cost(monkeypatch):
+    harness = _load_harness_module()
+    observation = {
+        "id": "generation-kimi-1",
+        "traceId": "trace-kimi-1",
+        "type": "GENERATION",
+        "startTime": "2026-07-20T22:06:25Z",
+        "model": "k3",
+        "usageDetails": {"input": 10, "output": 2, "total": 12},
+        "costDetails": {},
+        "metadata": {
+            "actual_invoice_cost_known": False,
+            "reference_cost_total_usd": 0.0123,
+            "codex_auto_agent_audit_events": [
+                {"incoming_endpoint": "/openai_passthrough/responses"}
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        harness.RA,
+        "_recent_langfuse_generation_observations_for_trace_ids",
+        lambda **_kwargs: [observation],
+    )
+
+    _, summaries, failures = harness.RA._validate_generation_observations(
+        family="case",
+        query_url="http://127.0.0.1:3000",
+        public_key="pk",
+        secret_key="sk",
+        trace_ids=["trace-kimi-1"],
+        start_time=dt.datetime(2026, 7, 20, 22, 6, tzinfo=dt.timezone.utc),
+        allowed_request_routes=["/openai_passthrough/responses"],
+        allow_reference_cost_when_invoice_unknown=True,
+    )
+
+    assert failures == []
+    assert summaries == [
+        {
+            "id": "generation-kimi-1",
+            "traceId": "trace-kimi-1",
+            "name": None,
+            "model": "k3",
+            "promptTokens": 10,
+            "completionTokens": 2,
+            "totalTokens": 12,
+            "costDetails.total": None,
+            "calculatedTotalCost": None,
+            "actualInvoiceCostKnown": False,
+            "referenceCost.total": 0.0123,
+            "referenceCostAccepted": True,
+        }
+    ]
+
+    _, _, failures_without_opt_in = harness.RA._validate_generation_observations(
+        family="case",
+        query_url="http://127.0.0.1:3000",
+        public_key="pk",
+        secret_key="sk",
+        trace_ids=["trace-kimi-1"],
+        start_time=dt.datetime(2026, 7, 20, 22, 6, tzinfo=dt.timezone.utc),
+        allowed_request_routes=["/openai_passthrough/responses"],
+    )
+    assert failures_without_opt_in == [
+        "case generation missing calculatedTotalCost",
+        "case generation missing costDetails.total",
+    ]
+
+
+def test_generation_quality_accepts_explicit_unknown_subscription_invoice_cost(
+    monkeypatch,
+):
+    harness = _load_harness_module()
+    observation = {
+        "id": "generation-alibaba-1",
+        "traceId": "trace-alibaba-1",
+        "type": "GENERATION",
+        "startTime": "2026-07-21T00:47:15Z",
+        "model": "qwen3.8-max-preview",
+        "usageDetails": {"input": 10, "output": 2, "total": 12},
+        "costDetails": {},
+        "calculatedTotalCost": 0,
+        "metadata": {
+            "actual_invoice_cost_known": False,
+            "reference_cost_kind": (
+                "provider_token_plan_no_public_per_token_rate"
+            ),
+            "codex_auto_agent_audit_events": [
+                {"incoming_endpoint": "/openai_passthrough/responses"}
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        harness.RA,
+        "_recent_langfuse_generation_observations_for_trace_ids",
+        lambda **_kwargs: [observation],
+    )
+
+    _, summaries, failures = harness.RA._validate_generation_observations(
+        family="case",
+        query_url="http://127.0.0.1:3000",
+        public_key="pk",
+        secret_key="sk",
+        trace_ids=["trace-alibaba-1"],
+        start_time=dt.datetime(2026, 7, 21, 0, 47, tzinfo=dt.timezone.utc),
+        allowed_request_routes=["/openai_passthrough/responses"],
+        allow_unknown_cost_when_invoice_unknown=True,
+    )
+
+    assert failures == []
+    assert summaries[0]["costDetails.total"] is None
+    assert summaries[0]["calculatedTotalCost"] == 0
+    assert summaries[0]["actualInvoiceCostKnown"] is False
 
 
 def test_stream_tool_call_state_validation_accepts_recorded_responses_state():
@@ -1525,7 +1757,7 @@ def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeyp
         if item == "-c"
     ]
 
-    assert case_config["expected_user_ids"] == ["litellm"]
+    assert case_config["expected_user_ids"] == ["pytest-classifier"]
     assert case_config["expected_trace_session_id"] == "pytest-classifier.session"
     assert (
         'model_providers.litellm-dev.http_headers.x-litellm-end-user-id="pytest-classifier"'
@@ -1559,10 +1791,12 @@ def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeyp
     ] == "zepfu/litellm"
     assert session_history_validation["metadata_required_equals"][
         "aawm_original_tenant_id"
-    ] == "litellm"
+    ] == "adapter-harness-tenant"
     assert (
-        "aawm_harness_tenant_alias"
-        not in session_history_validation["metadata_required_equals"]
+        session_history_validation["metadata_required_equals"][
+            "aawm_harness_tenant_alias"
+        ]
+        is True
     )
 
 
@@ -1925,7 +2159,7 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
         in command
     )
     assert (
-        'agents.moonshot.description="Moonshot production acceptance worker"'
+        'agents.moonshot.description="Moonshot tool-usage acceptance worker"'
         in command
     )
     assert 'agents.moonshot.config_file="{codex_home}/agents/moonshot.toml"' in command
@@ -1937,15 +2171,21 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
     assert "do not include the legacy fork_context field" in prompt
     assert "Do not rely on inherited context" in prompt
     assert "prohibit further agent spawning" in prompt
+    assert "Moonshot tool-usage acceptance exercise" in prompt
+    assert "return exactly these three lines" in prompt
+    assert "CODEX_MOONSHOT_TOOL_USAGE_PASSED" in prompt
+    assert "MOONSHOT_ACCEPTANCE_FILLER" not in prompt
+    assert "10,150-character" not in prompt
+    assert case_config["allow_reference_cost_when_invoice_unknown"] is True
     assert "fork_context=false" not in prompt
     assert "omit the fork_turns field entirely" not in prompt
     assert "do not set fork_turns to none" not in prompt
 
     output_checks = case_config["command_output_text_checks"]
-    assert output_checks["minimum_chars"] == 9800
-    assert output_checks["maximum_chars"] == 10200
-    assert output_checks["required_prefix"] == "CODEX_MOONSHOT_PROD_ACCEPTANCE_START"
-    assert output_checks["required_suffix"] == "CODEX_MOONSHOT_PROD_ACCEPTANCE_END"
+    assert output_checks["minimum_chars"] == 100
+    assert output_checks["maximum_chars"] == 160
+    assert output_checks["required_prefix"] == "CODEX_MOONSHOT_TOOL_USAGE_PASSED"
+    assert output_checks["required_suffix"] == "CHILD_B_TWO_PARALLEL_BATCHES_PASSED"
     assert set(output_checks["required_substrings"]) == {
         "CHILD_A_TWO_PARALLEL_BATCHES_PASSED",
         "CHILD_B_TWO_PARALLEL_BATCHES_PASSED",
@@ -1977,7 +2217,7 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
     [session_row] = case_config["session_history_validation"]["expected_rows"]
     assert session_row["required_one_of"] == {
         "provider": ["kimi_code"],
-        "model": ["k3-max", "k3-high"],
+        "model": ["kimi_code/k3-max", "kimi_code/k3-high"],
     }
     assert session_row["metadata_required_equals"] == {
         "model_alias_label": MS012_MOONSHOT_ALIAS,
@@ -2017,6 +2257,213 @@ def test_moonshot_codex_bash_time_case_requires_exact_stdout_reporting():
         "maximum_count": 1,
         "command_text_contains": "date --iso-8601=seconds",
     }
+
+
+def test_alibaba_cases_are_default_excluded_with_exact_routes_and_cost_provenance():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    cases = {
+        ALIBABA_CODEX_COLLABORATION_CASE: (
+            ALIBABA_CODEX_ROUTE,
+            "codex_auto_agent_alias",
+        ),
+        ALIBABA_CODEX_BASH_TIME_CASE: (
+            ALIBABA_CODEX_ROUTE,
+            "codex_auto_agent_alias",
+        ),
+        ALIBABA_CLAUDE_STRESS_CASE: (
+            ALIBABA_CLAUDE_ROUTE,
+            "anthropic_auto_agent_alias",
+        ),
+        ALIBABA_CLAUDE_BASH_TIME_CASE: (
+            ALIBABA_CLAUDE_ROUTE,
+            "anthropic_auto_agent_alias",
+        ),
+    }
+
+    assert config["default_target_profile"] == "dev"
+    for case_name, (route_family, auto_agent_alias_key) in cases.items():
+        assert case_name in config["default_excluded_cases"]
+        case_config = config["cases"][case_name]
+        assert case_config["verification_alias"] == ALIBABA_ALIAS
+        assert case_config["allow_zero_cost"] is True
+        assert case_config["allow_reference_cost_when_invoice_unknown"] is True
+        assert {
+            (candidate["provider"], candidate["model"], candidate["route_family"])
+            for candidate in case_config["verification_declared_candidates"]
+        } == {
+            ("alibaba_token_plan", model, route_family)
+            for model in ALIBABA_DECLARED_MODELS
+        }
+
+        [session_row] = case_config["session_history_validation"]["expected_rows"]
+        assert session_row["required_one_of"] == {
+            "provider": ["alibaba_token_plan"],
+            "model": [
+                "alibaba_token_plan/qwen3.8-max-preview",
+                "alibaba_token_plan/qwen3.7-max",
+            ],
+        }
+        assert session_row["metadata_required_equals"] == {
+            "model_alias_label": ALIBABA_ALIAS,
+            "requested_model_alias": ALIBABA_ALIAS,
+            auto_agent_alias_key: ALIBABA_ALIAS,
+            "billing_mode": "alibaba_token_plan_subscription",
+            "actual_invoice_cost_known": False,
+            "reference_cost_kind": (
+                "provider_token_plan_no_public_per_token_rate"
+            ),
+        }
+
+
+def test_alibaba_codex_collaboration_case_locks_bounded_tool_usage_contract():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][ALIBABA_CODEX_COLLABORATION_CASE]
+    command = case_config["command"]
+
+    assert command[:2] == ["codex", "exec"]
+    assert "--ignore-user-config" in command
+    assert command.count("--enable") == 2
+    assert "multi_agent" in command
+    assert "multi_agent_v2" in command
+    assert command[command.index("-m") + 1] == ALIBABA_ALIAS
+    assert (
+        'model_catalog_json="{repository_root}/scripts/local-ci/'
+        'codex_alibaba_model_catalog.json"'
+    ) in command
+    assert (
+        'agents.alibaba.config_file="{repository_root}/scripts/local-ci/'
+        'codex_alibaba_agent.toml"'
+    ) in command
+
+    prompt = command[-1]
+    assert 'agent_type="alibaba"' in prompt
+    assert 'model="aawm-sota-alibaba"' in prompt
+    assert 'fork_turns="none"' in prompt
+    assert "spawn exactly two children concurrently" in prompt
+    assert "exactly two sequential batches of three parallel" in prompt
+    assert "return exactly these three lines" in prompt
+    assert "CODEX_ALIBABA_TOOL_USAGE_PASSED" in prompt
+    assert "filler" not in prompt.lower()
+    assert "9,800" not in prompt
+    assert "10,000" not in prompt
+
+    output_checks = case_config["command_output_text_checks"]
+    assert output_checks["minimum_chars"] == 100
+    assert output_checks["maximum_chars"] == 160
+    assert output_checks["required_prefix"] == "CODEX_ALIBABA_TOOL_USAGE_PASSED"
+    assert output_checks["required_suffix"] == (
+        "CHILD_B_TWO_PARALLEL_BATCHES_PASSED"
+    )
+
+    spawn_row, command_row = case_config["tool_activity_validation"][
+        "expected_rows"
+    ]
+    assert spawn_row["minimum_count"] == 2
+    assert spawn_row["maximum_count"] == 2
+    assert spawn_row["each_arguments_required_substrings"] == [
+        '"agent_type": "alibaba"',
+        '"model": "aawm-sota-alibaba"',
+        '"fork_turns": "none"',
+        '"message": "',
+    ]
+    assert command_row == {
+        "provider": "alibaba_token_plan",
+        "tool_name": "exec_command",
+        "tool_kind": "command",
+        "minimum_count": 12,
+        "maximum_count": 12,
+    }
+
+
+def test_alibaba_codex_fixtures_define_only_the_qwen_acceptance_alias():
+    catalog = json.loads(ALIBABA_MODEL_CATALOG_PATH.read_text(encoding="utf-8"))
+    assert [model["slug"] for model in catalog["models"]] == [ALIBABA_ALIAS]
+    [model] = catalog["models"]
+    assert model["supports_parallel_tool_calls"] is True
+    assert model["multi_agent_version"] == "v2"
+
+    agent_config = ALIBABA_AGENT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert 'name = "alibaba"' in agent_config
+    assert 'model = "aawm-sota-alibaba"' in agent_config
+    assert "Do not\nspawn additional agents." in agent_config
+    assert "return only the exact completion marker" in agent_config
+
+
+def test_alibaba_bash_cases_require_exact_system_time_stdout():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    codex_case = config["cases"][ALIBABA_CODEX_BASH_TIME_CASE]
+    assert "Use exec_command exactly once" in codex_case["command"][-1]
+    assert "date --iso-8601=seconds" in codex_case["command"][-1]
+    assert "return only the exact stdout" in codex_case["command"][-1]
+    assert codex_case["bash_stdout_report_validation"] == {
+        "expected_command": "date --iso-8601=seconds",
+        "expected_regex": (
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+            r"(?:Z|[+-]\d{2}:\d{2})$"
+        ),
+    }
+    assert codex_case["allow_unknown_cost_when_invoice_unknown"] is True
+
+    claude_case = config["cases"][ALIBABA_CLAUDE_BASH_TIME_CASE]
+    assert "Dispatch exactly one sota-alibaba-time child" in claude_case[
+        "command"
+    ][2]
+    assert "date --iso-8601=seconds" in claude_case["command"][2]
+    assert claude_case["bash_stdout_report_validation"]["transcript_agent"] == (
+        "sota-alibaba-time"
+    )
+    [agent] = claude_case["transcript_tool_use_validation"]["expected_agents"]
+    assert agent["expected_tool_counts"] == {"Bash": 1}
+    assert agent["minimum_total_tool_uses"] == 1
+    assert agent["maximum_total_tool_uses"] == 1
+    assert claude_case["allow_unknown_cost_when_invoice_unknown"] is True
+
+
+def test_alibaba_claude_stress_case_requires_two_exact_parallel_child_batches():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][ALIBABA_CLAUDE_STRESS_CASE]
+    command = case_config["command"]
+
+    assert command[0] == "claude"
+    assert "--model" not in command
+    assert command[command.index("--allowedTools") + 1] == "Agent"
+    assert "exactly two Agent tool calls" in command[2]
+    assert "exactly two sequential batches of three parallel" in command[2]
+    assert "CLAUDE_ALIBABA_TOOL_USAGE_PASSED" in command[2]
+    assert "filler" not in command[2].lower()
+
+    expected_agents = {"sota-alibaba-stress-a", "sota-alibaba-stress-b"}
+    assert set(case_config["claude_agents"]) == expected_agents
+    for agent in case_config["claude_agents"].values():
+        assert agent["model"] == ALIBABA_ALIAS
+        assert agent["tools"] == ["Read", "Glob", "Grep"]
+        assert "exactly two sequential parallel batches" in agent["prompt"]
+
+    output_checks = case_config["command_output_text_checks"]
+    assert output_checks["maximum_chars"] == 160
+    assert output_checks["required_prefix"] == (
+        "CLAUDE_ALIBABA_TOOL_USAGE_PASSED"
+    )
+    assert output_checks["required_suffix"] == (
+        "CHILD_B_TWO_PARALLEL_BATCHES_PASSED"
+    )
+
+    agent_row = case_config["tool_activity_validation"]["expected_rows"][0]
+    assert agent_row["tool_name"] == "Agent"
+    assert agent_row["minimum_count"] == 2
+    assert agent_row["maximum_count"] == 2
+    for agent in case_config["transcript_tool_use_validation"]["expected_agents"]:
+        assert agent["expected_tool_counts"] == {
+            "Read": 2,
+            "Glob": 2,
+            "Grep": 2,
+        }
+        assert agent["minimum_total_tool_uses"] == 6
+        assert agent["maximum_total_tool_uses"] == 6
+        assert agent["minimum_parallel_tool_batches"] == 2
+        assert agent["minimum_tools_per_parallel_batch"] == 3
+        assert agent["maximum_tool_uses_per_assistant_message"] == 3
 
 
 def test_command_text_checks_validate_codex_agent_message_and_stderr():
@@ -3017,13 +3464,14 @@ def test_ms012_moonshot_case_uses_the_canonical_alias_and_agentic_contract():
     session_row = case_config["session_history_validation"]["expected_rows"][0]
     assert session_row["required_one_of"] == {
         "provider": ["kimi_code"],
-        "model": ["k3-max", "k3-high"],
+        "model": ["kimi_code/k3-max", "kimi_code/k3-high"],
     }
     assert session_row["metadata_required_equals"] == {
         "model_alias_label": MS012_MOONSHOT_ALIAS,
         "requested_model_alias": MS012_MOONSHOT_ALIAS,
         "anthropic_auto_agent_alias": MS012_MOONSHOT_ALIAS,
     }
+    assert case_config["allow_reference_cost_when_invoice_unknown"] is True
 
     summary, failures = harness._validate_moonshot_anthropic_agentic_contract(
         family=MS012_MOONSHOT_AGENTIC_CASE,
@@ -3056,7 +3504,9 @@ def test_ms012_moonshot_claude_stress_case_requires_two_parallel_child_batches()
     assert command[command.index("--allowedTools") + 1] == "Agent"
     assert "exactly two Agent tool calls" in command[2]
     assert "exactly two sequential batches of three parallel" in command[2]
-    assert "between 9800 and 10200 characters" in command[2]
+    assert "return exactly these three lines" in command[2]
+    assert "CLAUDE_MOONSHOT_TOOL_USAGE_PASSED" in command[2]
+    assert "repeated filler prose" not in command[2]
 
     expected_agents = {
         "sota-moonshot-stress-a",
@@ -3071,10 +3521,10 @@ def test_ms012_moonshot_claude_stress_case_requires_two_parallel_child_batches()
         assert f"child {child_label}" in agent["prompt"]
 
     output_checks = case_config["command_output_text_checks"]
-    assert output_checks["minimum_chars"] == 9800
-    assert output_checks["maximum_chars"] == 10200
-    assert output_checks["required_prefix"] == "CLAUDE_MOONSHOT_PROD_ACCEPTANCE_START"
-    assert output_checks["required_suffix"] == "CLAUDE_MOONSHOT_PROD_ACCEPTANCE_END"
+    assert output_checks["minimum_chars"] == 100
+    assert output_checks["maximum_chars"] == 160
+    assert output_checks["required_prefix"] == "CLAUDE_MOONSHOT_TOOL_USAGE_PASSED"
+    assert output_checks["required_suffix"] == "CHILD_B_TWO_PARALLEL_BATCHES_PASSED"
     assert set(output_checks["required_substrings"]) == {
         "CHILD_A_TWO_PARALLEL_BATCHES_PASSED",
         "CHILD_B_TWO_PARALLEL_BATCHES_PASSED",

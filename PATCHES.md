@@ -36,11 +36,11 @@ and is no longer carried as a separate patch.
 Git tags use `v{upstream_version}-aawm.{patch_number}` (hyphen, since git tags aren't PEP 440).
 This file records the patch line and historical patch entries. Do not use the
 top-level orientation as the source of truth for the currently promoted image or
-overlay artifacts; those exact versions belong in `COMPLETED.md` release
-evidence and in GitHub Release/tag state. When preparing a release, derive the
-current fork version from `pyproject.toml`, the image tag from the fork release
-tag, and overlay versions from the published `cb-v*`, `cp-v*`, `h-v*`, and
-`cfg-v*` GitHub Releases.
+overlay artifacts; those exact versions belong in the local
+`.analysis/completed*.md` release evidence and in GitHub Release/tag state.
+When preparing a release, derive the current fork version from
+`pyproject.toml`, the image tag from the fork release tag, and overlay versions
+from the published `cb-v*`, `cp-v*`, `h-v*`, and `cfg-v*` GitHub Releases.
 
 **Working-tree note:** `develop` is the integration branch for the current
 carried patch set. Promotion to `main` should happen only after the full
@@ -57,6 +57,50 @@ passed the local acceptance suite with artifact
 `.analysis/artifacts/local-acceptance-20260410T232900Z.json`.
 
 ## Applied Patches
+
+### aawm.130 - Managed Alibaba Token Plan and adapter rollup hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.130`. A bounded
+`alibaba_token_plan/` provider now exposes the approved Qwen, DeepSeek, and GLM
+Token Plan models through the hard-pinned subscription endpoint. It reuses the
+existing `ALIBABA_KEY` reference or canonical Qwen settings file in place,
+rejects unapproved models and caller endpoint/key overrides, sends only the
+resolved provider model upstream, and records subscription/reference-cost
+provenance without inventing invoice cost.
+
+Dedicated Codex Responses and Anthropic Messages completion adapters support
+the `aawm-sota-alibaba`, `aawm-sota-deepseek`, and `aawm-sota-glm` aliases.
+Qwen 3.6 Flash is also available in the low-tier alias chains. The Kimi and
+Alibaba completion adapters now attach canonical route-family metadata and use
+the standard stream/non-stream route-rollup lifecycle. Shared handled-error
+logging emits bounded standard records and readable failed rows without raw
+tracebacks, JSON blobs, duplicate Uvicorn access lines, or public AAWM alias
+leakage to providers. Known Grok HTTP 403 spending-limit and HTTP 402
+balance-exhausted failures use three-hour candidate/account cooldowns.
+
+The authenticated acceptance harness adds small, tool-focused Moonshot and
+Alibaba gates for both Codex and Claude: collaboration proves child fanout and
+parallel tool batches with a concise marker response, while Bash proves one
+`date --iso-8601=seconds` call and exact stdout. The harness never copies,
+refreshes, or replaces provider or client credentials.
+
+**Why:** Alibaba Token Plan needed a first-class provider boundary rather than
+ad hoc OpenAI-compatible routing, and the shared Kimi/Alibaba adapter paths
+needed the same canonical route metadata, readable rollups, error formatting,
+alias isolation, and production-grade test contract.
+
+**Why not upstream:** The Token Plan credential ownership, AAWM aliases,
+subscription provenance, route-rollup presentation, cooldown policy, and
+authenticated Codex/Claude harness are fork-local operational behavior.
+
+**Validation status:** Focused Kimi/Alibaba provider, completion-adapter,
+acceptance-hardening, probe/logging, Ruff, JSON parsing, and diff checks pass.
+All four Moonshot cases pass on one restarted bind-mounted `litellm-dev`
+runtime with clean logs plus Langfuse and `aawm_tristore` correlation. The exact
+same bind-mounted dev gate is green for Alibaba after fixing first-text-delta
+loss on Qwen reasoning-to-text stream transitions. The exact committed image
+must still be published and re-proven on dev; all production promotion evidence
+remains required under `PROD_RELEASE.md`.
 
 ### aawm.129 - Moonshot stream diagnostics and Codex child-role routing
 

@@ -13555,7 +13555,10 @@ def _infer_usage_breakout_provider_prefix(
     route_family = metadata.get("passthrough_route_family")
     if isinstance(route_family, str) and route_family.strip():
         route_family_lower = route_family.lower()
-        if route_family_lower == "codex_responses":
+        if (
+            route_family_lower == "codex_responses"
+            or route_family_lower.startswith("codex_")
+        ):
             return "codex"
         if "gemini" in route_family_lower:
             return "gemini"

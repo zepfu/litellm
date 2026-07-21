@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import suppress
 from copy import deepcopy
 from inspect import isawaitable
+import re
 from typing import Any, AsyncIterator, Iterable, Optional, cast
 
 from fastapi import HTTPException
@@ -48,6 +49,12 @@ _K3_VARIANT_EFFORTS = {
     "kimi_code/k3-high": "high",
     "kimi_code/k3-max": "max",
 }
+_CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN = re.compile(
+    r"\AMessage Type: (?:NEW_TASK|MESSAGE)\n"
+    r"Task name: [^\n]+\n"
+    r"Sender: [^\n]+\n"
+    r"Payload:\n?\Z"
+)
 
 
 def normalize_kimi_code_chat_completions_adapter_model_name(
@@ -91,6 +98,7 @@ def _add_adapter_metadata(
     existing_tags = metadata.get("tags")
     tags = list(existing_tags) if isinstance(existing_tags, list) else []
     for tag in (
+        f"route:{config.route_family}",
         config.tag_prefix,
         f"{config.tag_prefix}-model:{adapter_key}",
         f"{config.tag_prefix}-target:{config.target_endpoint_label}",
@@ -291,6 +299,74 @@ def normalize_kimi_code_custom_tool_outputs(
     updated_body = dict(request_body)
     updated_body["input"] = updated_input_items
     return updated_body
+
+
+def _restore_kimi_codex_agent_message_payloads(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Expose only Codex collaboration payloads that Kimi can consume."""
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body, {}
+
+    updated_input_items: list[Any] = []
+    restored_count = 0
+    restored_chars = 0
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            updated_input_items.append(item)
+            continue
+
+        content = item.get("content")
+        if not isinstance(content, list) or len(content) != 2:
+            updated_input_items.append(item)
+            continue
+
+        visible_part = content[0]
+        payload_part = content[1]
+        if not isinstance(visible_part, dict) or not isinstance(payload_part, dict):
+            updated_input_items.append(item)
+            continue
+        if visible_part.get("type") not in {"input_text", "text"}:
+            updated_input_items.append(item)
+            continue
+        visible_text = visible_part.get("text")
+        if not isinstance(visible_text, str) or not (
+            _CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN.fullmatch(visible_text)
+        ):
+            updated_input_items.append(item)
+            continue
+        if payload_part.get("type") != "encrypted_content":
+            updated_input_items.append(item)
+            continue
+        payload = payload_part.get("encrypted_content")
+        if not isinstance(payload, str) or not payload:
+            updated_input_items.append(item)
+            continue
+
+        separator = "" if visible_text.endswith("\n") else "\n"
+        updated_item = dict(item)
+        updated_item["content"] = [
+            {
+                "type": visible_part.get("type"),
+                "text": f"{visible_text}{separator}{payload}",
+            }
+        ]
+        updated_input_items.append(updated_item)
+        restored_count += 1
+        restored_chars += len(payload)
+
+    if restored_count == 0:
+        return request_body, {}
+
+    updated_body = dict(request_body)
+    updated_body["input"] = updated_input_items
+    return updated_body, {
+        "kimi_code_codex_agent_task_payload_restored": True,
+        "kimi_code_codex_agent_task_payload_restored_count": restored_count,
+        "kimi_code_codex_agent_task_payload_restored_chars": restored_chars,
+    }
 
 
 def _normalize_kimi_tool_result_adjacency(messages: list[Any]) -> list[Any]:
@@ -570,6 +646,9 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
     _ = request
     upstream_model, forced_effort = _resolve_adapter_selection(adapter_model)
     config = adapter_config.CODEX_KIMI_CHAT_COMPLETIONS
+    prepared_request_body, task_payload_changes = (
+        _restore_kimi_codex_agent_message_payloads(prepared_request_body)
+    )
     request_body = _add_adapter_metadata(
         request_body=prepared_request_body,
         config=config,
@@ -577,6 +656,15 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
         upstream_model=upstream_model,
         ingress="codex",
     )
+    if task_payload_changes:
+        task_payload_metadata = dict(request_body.get("litellm_metadata") or {})
+        tags = list(task_payload_metadata.get("tags") or [])
+        tag = "codex-kimi-agent-task-payload-restored"
+        if tag not in tags:
+            tags.append(tag)
+        task_payload_metadata["tags"] = tags
+        task_payload_metadata.update(task_payload_changes)
+        request_body["litellm_metadata"] = task_payload_metadata
     request_input = request_body.get("input", "")
     responses_api_request = cast(
         ResponsesAPIOptionalRequestParams,

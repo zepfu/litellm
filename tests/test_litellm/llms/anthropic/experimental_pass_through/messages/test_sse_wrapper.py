@@ -497,6 +497,151 @@ def test_sync_wrapper_starts_thinking_block_for_reasoning_content():
     assert first_delta["delta"]["thinking"] == "I should answer directly."
 
 
+def test_sync_wrapper_preserves_first_text_delta_after_reasoning():
+    class MockCompletionStreamWithReasoningThenTimestamp:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                reasoning_content="I should return the timestamp.",
+                                content="",
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content="2026"),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content="-07-20T23:03:19-04:00"),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content=""),
+                            index=0,
+                            finish_reason="stop",
+                        )
+                    ],
+                ),
+            ]
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= len(self.responses):
+                raise StopIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    chunks = list(
+        AnthropicStreamWrapper(
+            completion_stream=MockCompletionStreamWithReasoningThenTimestamp(),
+            model="alibaba_token_plan/qwen3.8-max-preview",
+        )
+    )
+    text = "".join(
+        chunk["delta"]["text"]
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] == "text_delta"
+    )
+
+    assert text == "2026-07-20T23:03:19-04:00"
+
+
+@pytest.mark.asyncio
+async def test_async_wrapper_preserves_first_text_delta_after_reasoning():
+    class AsyncMockCompletionStreamWithReasoningThenTimestamp:
+        def __init__(self):
+            self.responses = [
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(
+                                reasoning_content="I should return the timestamp.",
+                                content="",
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content="2026"),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content="-07-20T23:03:19-04:00"),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                ),
+                ModelResponseStream(
+                    choices=[
+                        StreamingChoices(
+                            delta=Delta(content=""),
+                            index=0,
+                            finish_reason="stop",
+                        )
+                    ],
+                ),
+            ]
+            self.index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.index >= len(self.responses):
+                raise StopAsyncIteration
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+    chunks = []
+    async for chunk in AnthropicStreamWrapper(
+        completion_stream=AsyncMockCompletionStreamWithReasoningThenTimestamp(),
+        model="alibaba_token_plan/qwen3.8-max-preview",
+    ):
+        chunks.append(chunk)
+    text = "".join(
+        chunk["delta"]["text"]
+        for chunk in chunks
+        if chunk["type"] == "content_block_delta"
+        and chunk["delta"]["type"] == "text_delta"
+    )
+
+    assert text == "2026-07-20T23:03:19-04:00"
+
+
 def test_sync_wrapper_preserves_terminal_tool_call_after_text_delta():
     class MockCompletionStreamWithTextThenTerminalTool:
         def __init__(self):

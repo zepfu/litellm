@@ -206,7 +206,8 @@ def _content_text(value: Any) -> str:
 
 
 def _collect_codex_command_execution_results(stdout: str) -> list[dict[str, str]]:
-    collected: list[dict[str, str]] = []
+    collected_by_id: dict[str, dict[str, str]] = {}
+    collected_without_id: list[dict[str, str]] = []
 
     def _walk(value: Any) -> None:
         if isinstance(value, dict):
@@ -218,12 +219,18 @@ def _collect_codex_command_execution_results(stdout: str) -> list[dict[str, str]
                 if not isinstance(output, str):
                     output = value.get("output")
                 if isinstance(command, str) and isinstance(output, str):
-                    collected.append(
-                        {
-                            "command": command,
-                            "output": output,
-                        }
-                    )
+                    record = {"command": command, "output": output}
+                    execution_id = value.get("id")
+                    if isinstance(execution_id, str) and execution_id:
+                        existing = collected_by_id.get(execution_id)
+                        if (
+                            existing is None
+                            or (not existing["output"] and output)
+                            or value.get("status") == "completed"
+                        ):
+                            collected_by_id[execution_id] = record
+                    else:
+                        collected_without_id.append(record)
             for child in value.values():
                 _walk(child)
         elif isinstance(value, list):
@@ -232,7 +239,7 @@ def _collect_codex_command_execution_results(stdout: str) -> list[dict[str, str]
 
     for obj in RA._parse_stdout_json_objects(stdout):
         _walk(obj)
-    return collected
+    return [*collected_by_id.values(), *collected_without_id]
 
 
 def _validate_command_text_checks(
@@ -588,8 +595,9 @@ def _validate_moonshot_anthropic_agentic_contract(  # noqa: PLR0915
     _require(
         isinstance(required_one_of, dict)
         and set(required_one_of.get("provider") or []) == {"kimi_code"}
-        and set(required_one_of.get("model") or []) == {"k3-max", "k3-high"},
-        "must require Kimi Code k3-max or k3-high session metadata",
+        and set(required_one_of.get("model") or [])
+        == {"kimi_code/k3-max", "kimi_code/k3-high"},
+        "must require provider-prefixed Kimi Code k3-max or k3-high session metadata",
     )
     _require(
         isinstance(metadata_required_equals, dict)
@@ -739,11 +747,7 @@ def _apply_target_profile_to_config(  # noqa: PLR0915
                 repository=repository_tenant_id,
             )
         )
-        expected_original_tenant_id = (
-            _resolve_expected_codex_trace_user_id(tenant_id)
-            if cli_kind == 'codex'
-            else tenant_id
-        )
+        expected_original_tenant_id = tenant_id
         updated_case['tenant_id'] = tenant_id
         harness_run_id = str(
             updated_case.get('harness_run_id')
@@ -873,12 +877,6 @@ def _resolve_expected_session_history_tenant_id(
     if _is_harness_tenant_alias(tenant_id):
         if isinstance(repository, str) and repository.strip():
             return repository.strip()
-        return 'litellm'
-    return tenant_id
-
-
-def _resolve_expected_codex_trace_user_id(tenant_id: str) -> str:
-    if _is_harness_tenant_alias(tenant_id):
         return 'litellm'
     return tenant_id
 
@@ -1074,7 +1072,7 @@ def _ensure_cli_harness_context(
         updated['expected_user_ids'] = []
         updated['require_trace_user_id'] = False
     else:
-        updated['expected_user_ids'] = [_resolve_expected_codex_trace_user_id(tenant_id)]
+        updated['expected_user_ids'] = [harness_user_id]
     if cli_kind == 'codex':
         updated['expected_trace_session_id'] = session_id
     else:
@@ -4211,6 +4209,12 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         allowed_request_routes=config.get('allowed_generation_routes'),
         skip_quality_checks=bool(config.get('skip_generation_quality_checks')),
         allow_zero_cost=bool(config.get('allow_zero_cost')),
+        allow_reference_cost_when_invoice_unknown=bool(
+            config.get('allow_reference_cost_when_invoice_unknown')
+        ),
+        allow_unknown_cost_when_invoice_unknown=bool(
+            config.get('allow_unknown_cost_when_invoice_unknown')
+        ),
     )
     failures.extend(generation_failures)
 

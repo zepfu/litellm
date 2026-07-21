@@ -8,7 +8,7 @@ Also ensures that tool calls that only appear in the final built response still 
 before response.completed.
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from litellm.responses.litellm_completion_transformation.streaming_iterator import (
     LiteLLMCompletionStreamingIterator,
@@ -136,6 +136,72 @@ def test_tool_calls_present_only_in_final_response_are_emitted_before_completed(
     evt_final = iterator.common_done_event_logic(sync_mode=True)
     assert evt_final.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
     assert evt_final.output_index == 1
+
+
+def test_completion_responses_stream_records_bounded_tool_metadata():
+    metadata = {}
+    logging_metadata = {}
+    stream_wrapper = MagicMock()
+    stream_wrapper.logging_obj.model_call_details = {
+        "litellm_params": {"metadata": logging_metadata}
+    }
+    stream_wrapper.__next__.side_effect = StopIteration
+    iterator = LiteLLMCompletionStreamingIterator(
+        model="test-model",
+        litellm_custom_stream_wrapper=stream_wrapper,
+        request_input="Test input",
+        responses_api_request={},
+        litellm_metadata=metadata,
+    )
+    iterator.litellm_model_response = ModelResponse(
+        id="resp-tool-metadata",
+        created=123,
+        model="test-model",
+        object="chat.completion",
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_time",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": (
+                                    '{"cmd":"date --iso-8601=seconds"}'
+                                ),
+                            },
+                            "index": 0,
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+
+    event_types = []
+    while True:
+        try:
+            event_types.append(next(iterator).type)
+        except StopIteration:
+            break
+
+    assert ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED in event_types
+    assert ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE in event_types
+    assert metadata["responses_stream_tool_call_count"] == 1
+    assert metadata["responses_stream_tool_names"] == ["exec_command"]
+    [tool_state] = metadata["responses_stream_tool_state"]
+    assert tool_state["type"] == "function_call"
+    assert tool_state["call_id"] == "call_time"
+    assert tool_state["arguments_compacted"] is True
+    assert tool_state["arguments_size_bytes"] > 0
+    assert isinstance(tool_state["arguments_hash"], str)
+    assert "arguments" not in tool_state
+    assert logging_metadata == metadata
 
 
 def test_tool_call_arguments_are_chunked_to_match_openai_behavior():

@@ -724,12 +724,32 @@ def _generation_observation_matches_allowed_route(
     if not isinstance(metadata, dict):
         metadata = {}
 
+    observed_request_routes: list[str] = []
     request_route = metadata.get("user_api_key_request_route")
     if isinstance(request_route, str):
-        if request_route in allowed_request_routes:
-            return True
-        if _is_count_tokens_request_route(request_route):
-            return False
+        observed_request_routes.append(request_route)
+
+    for audit_key in (
+        "codex_auto_agent_audit_events",
+        "anthropic_auto_agent_audit_events",
+        "aawm_alias_routing_audit_events",
+    ):
+        audit_events = metadata.get(audit_key)
+        if not isinstance(audit_events, list):
+            continue
+        for event in audit_events:
+            if not isinstance(event, dict):
+                continue
+            incoming_endpoint = event.get("incoming_endpoint")
+            if isinstance(incoming_endpoint, str):
+                observed_request_routes.append(incoming_endpoint)
+
+    if any(
+        _is_count_tokens_request_route(route) for route in observed_request_routes
+    ):
+        return False
+    if any(route in allowed_request_routes for route in observed_request_routes):
+        return True
 
     tags = metadata.get("tags") or []
     if not isinstance(tags, list):
@@ -757,6 +777,8 @@ def _validate_generation_observations(
     allowed_request_routes: list[str] | None = None,
     skip_quality_checks: bool = False,
     allow_zero_cost: bool = False,
+    allow_reference_cost_when_invoice_unknown: bool = False,
+    allow_unknown_cost_when_invoice_unknown: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     failures: list[str] = []
     if not trace_ids:
@@ -833,6 +855,23 @@ def _validate_generation_observations(
         calculated_total_cost = observation.get("calculatedTotalCost")
         if calculated_total_cost is None:
             calculated_total_cost = observation.get("totalCost")
+        metadata = observation.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        actual_invoice_cost_known = metadata.get("actual_invoice_cost_known")
+        reference_cost_total = metadata.get("reference_cost_total_usd")
+        has_explicit_reference_cost = (
+            allow_reference_cost_when_invoice_unknown
+            and actual_invoice_cost_known is False
+            and isinstance(reference_cost_total, (int, float))
+            and not isinstance(reference_cost_total, bool)
+            and reference_cost_total > 0
+        )
+        has_allowed_unknown_invoice_cost = (
+            allow_unknown_cost_when_invoice_unknown
+            and actual_invoice_cost_known is False
+            and cost_total is None
+        )
         summary = {
             "id": observation.get("id"),
             "traceId": observation.get("traceId"),
@@ -843,6 +882,9 @@ def _validate_generation_observations(
             "totalTokens": total_tokens,
             "costDetails.total": cost_total,
             "calculatedTotalCost": calculated_total_cost,
+            "actualInvoiceCostKnown": actual_invoice_cost_known,
+            "referenceCost.total": reference_cost_total,
+            "referenceCostAccepted": has_explicit_reference_cost,
         }
         summaries.append(summary)
 
@@ -860,6 +902,8 @@ def _validate_generation_observations(
             failures.append(f"{family} generation missing completionTokens")
         if not isinstance(total_tokens, (int, float)) or total_tokens <= 0:
             failures.append(f"{family} generation missing totalTokens")
+        if has_explicit_reference_cost or has_allowed_unknown_invoice_cost:
+            continue
         if allow_zero_cost:
             if not isinstance(cost_total, (int, float)) or cost_total < 0:
                 failures.append(f"{family} generation missing costDetails.total")
@@ -1978,6 +2022,9 @@ def _validate_codex(
         allowed_request_routes=config.get("allowed_generation_routes"),
         skip_quality_checks=skip_quality_checks,
         allow_zero_cost=allow_zero_cost,
+        allow_reference_cost_when_invoice_unknown=bool(
+            config.get("allow_reference_cost_when_invoice_unknown")
+        ),
     )
     failures.extend(generation_failures)
     trace_enrichment_summary, trace_enrichment_failures, trace_enrichment_warnings = _validate_trace_enrichment(
@@ -2096,6 +2143,9 @@ def _validate_gemini(
         allowed_request_routes=config.get("allowed_generation_routes"),
         skip_quality_checks=skip_quality_checks,
         allow_zero_cost=allow_zero_cost,
+        allow_reference_cost_when_invoice_unknown=bool(
+            config.get("allow_reference_cost_when_invoice_unknown")
+        ),
     )
     failures.extend(generation_failures)
     filtered_trace_ids = sorted(
@@ -2272,6 +2322,9 @@ def _validate_claude(
         allowed_request_routes=effective_config.get("allowed_generation_routes"),
         skip_quality_checks=skip_quality_checks,
         allow_zero_cost=allow_zero_cost,
+        allow_reference_cost_when_invoice_unknown=bool(
+            effective_config.get("allow_reference_cost_when_invoice_unknown")
+        ),
     )
     failures.extend(generation_failures)
     observed_agents = sorted(

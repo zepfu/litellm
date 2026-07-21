@@ -70,8 +70,9 @@ Before cutting or promoting a release:
   `/mnt/e/litellm/session_history`. Do not leave this as an unmounted
   in-container directory, because spooled retry datasets must survive container
   recreation.
-- Confirm `PATCHES.md`, `TODO.md`, `COMPLETED.md`, `WHEEL.md`, and
-  `TEST_HARNESS.md` reflect the current release state when behavior changes.
+- Confirm `PATCHES.md`, `TODO.md`, `WHEEL.md`, `TEST_HARNESS.md`, and the local
+  `.analysis/completed*.md` ledger reflect the current release state when
+  behavior changes. The completion ledger is intentionally not committed.
 
 ## Pre-Promotion Validation On Dev
 
@@ -364,9 +365,10 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
 Do not use `:latest` as the prod base image pin. Production infrastructure
 should pin an exact fork image such as `ghcr.io/zepfu/litellm:<upstream>-aawm.<n>`
-or the current promoted prod line recorded in `COMPLETED.md`. Do not hard-code
-the promoted version in this runbook; use it as process documentation and keep
-exact image, overlay, container, and artifact versions in release evidence.
+or the current promoted prod line recorded in the local completion ledger. Do
+not hard-code the promoted version in this runbook; use it as process
+documentation and keep exact image, overlay, container, and artifact versions
+in release evidence.
 When artifact autobumps advance `main` after a candidate tag is cut, preserve
 the stale tag and cut a new tag from the current `main` head. Do not force-move
 published release tags.
@@ -647,11 +649,11 @@ After prod validation passes:
 - Commit and push LiteLLM release/docs/version updates to `main` and `develop`.
 - Commit and push the infrastructure image pin update to the infrastructure
   repo's `main` and `develop` branches.
-- Update `COMPLETED.md` with the promoted image version, overlay artifact
-  versions, harness artifact path, focused cases, default prod harness result,
-  and any warning-only opt-in outcomes.
+- Update the local `.analysis/completed*.md` ledger with the promoted image
+  version, overlay artifact versions, harness artifact path, focused cases,
+  default prod harness result, and any warning-only opt-in outcomes.
 - Keep unresolved follow-up hardening in `TODO.md`; move completed promotion
-  evidence out of `TODO.md` and into `COMPLETED.md`.
+  evidence out of `TODO.md` and into the local completion ledger.
 - Check durable process docs for stale "current version" wording before closing
   the release. Reusable runbooks should describe how to discover the current
   image, overlay, and harness versions instead of pinning a specific release
@@ -666,7 +668,7 @@ If prod validation fails after promotion:
 3. Confirm readiness on `:4000`.
 4. Run a focused smoke case and inspect prod logs.
 5. Record the failed image, failing cases, logs, and rollback result in
-   `TODO.md` / `COMPLETED.md`.
+   `TODO.md` and the local completion ledger.
 
 Do not force-move published release tags for rollback. Cut a new fixed release
 or repin infrastructure to a previous known-good image.

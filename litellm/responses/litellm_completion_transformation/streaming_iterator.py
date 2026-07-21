@@ -1,3 +1,4 @@
+import hashlib
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Union, cast
@@ -66,7 +67,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             responses_api_request
         )
         self.custom_llm_provider: Optional[str] = custom_llm_provider
-        self.litellm_metadata: Optional[dict] = litellm_metadata or {}
+        self.litellm_metadata: Optional[dict] = (
+            litellm_metadata if isinstance(litellm_metadata, dict) else {}
+        )
         # Store lightweight dict snapshots for stream_chunk_builder to reduce
         # repeated Pydantic attribute access in end-of-stream assembly.
         self.collected_chat_completion_chunks: List[Dict[str, Any]] = []
@@ -113,6 +116,111 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         # Per-stream accumulation of provider_specific_fields from chat-completion
         # chunks (e.g. code_interpreter_results). Instance-local to avoid leakage.
         self._accumulated_provider_specific_fields: Dict[str, Any] = {}
+        self._responses_stream_event_types: List[str] = []
+        self._responses_stream_event_counts: Dict[str, int] = {}
+        self._responses_stream_tool_state_by_call_id: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _response_event_field(value: Any, field: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(field)
+        return getattr(value, field, None)
+
+    def _response_stream_metadata_targets(self) -> List[dict]:
+        targets: List[dict] = []
+        if isinstance(self.litellm_metadata, dict):
+            targets.append(self.litellm_metadata)
+
+        model_call_details = getattr(
+            self.litellm_logging_obj, "model_call_details", None
+        )
+        if isinstance(model_call_details, dict):
+            litellm_params = model_call_details.get("litellm_params")
+            if isinstance(litellm_params, dict):
+                metadata = litellm_params.get("metadata")
+                if isinstance(metadata, dict) and all(
+                    metadata is not target for target in targets
+                ):
+                    targets.append(metadata)
+        return targets
+
+    def _record_response_stream_event(
+        self,
+        event: BaseLiteLLMOpenAIResponseObject,
+    ) -> BaseLiteLLMOpenAIResponseObject:
+        event_type = self._response_event_field(event, "type")
+        if hasattr(event_type, "value"):
+            event_type = event_type.value
+        if not isinstance(event_type, str) or not event_type:
+            return event
+
+        if event_type not in self._responses_stream_event_types:
+            self._responses_stream_event_types.append(event_type)
+        self._responses_stream_event_counts[event_type] = (
+            self._responses_stream_event_counts.get(event_type, 0) + 1
+        )
+
+        item = self._response_event_field(event, "item")
+        item_type = self._response_event_field(item, "type")
+        if item_type in {
+            "function_call",
+            "local_shell_call",
+            "apply_patch_call",
+            "custom_tool_call",
+            "mcp_call",
+        }:
+            call_id = self._response_event_field(item, "call_id")
+            if not isinstance(call_id, str) or not call_id:
+                call_id = self._response_event_field(item, "id")
+            if isinstance(call_id, str) and call_id:
+                existing = self._responses_stream_tool_state_by_call_id.get(
+                    call_id, {}
+                )
+                tool_name = self._response_event_field(item, "name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    tool_name = str(item_type)
+                arguments = self._response_event_field(item, "arguments")
+                if not isinstance(arguments, str):
+                    arguments = ""
+                updated = {
+                    "type": str(item_type),
+                    "name": tool_name,
+                    "call_id": call_id,
+                    "arguments_compacted": True,
+                    "arguments_hash": existing.get("arguments_hash"),
+                    "arguments_size_bytes": existing.get(
+                        "arguments_size_bytes", 0
+                    ),
+                }
+                if arguments:
+                    encoded_arguments = arguments.encode("utf-8")
+                    updated["arguments_hash"] = hashlib.sha256(
+                        encoded_arguments
+                    ).hexdigest()
+                    updated["arguments_size_bytes"] = len(encoded_arguments)
+                self._responses_stream_tool_state_by_call_id[call_id] = updated
+
+        tool_state = list(
+            self._responses_stream_tool_state_by_call_id.values()
+        )
+        tool_names = [
+            item["name"]
+            for item in tool_state
+            if isinstance(item.get("name"), str) and item.get("name")
+        ]
+        for metadata in self._response_stream_metadata_targets():
+            metadata["responses_stream_event_types"] = list(
+                self._responses_stream_event_types
+            )
+            metadata["responses_stream_event_counts"] = dict(
+                self._responses_stream_event_counts
+            )
+            metadata["responses_stream_tool_call_count"] = len(tool_state)
+            metadata["responses_stream_tool_names"] = tool_names
+            metadata["responses_stream_tool_state"] = [
+                dict(item) for item in tool_state
+            ]
+        return event
 
     def _get_or_assign_tool_output_index(self, call_id: str) -> int:
         existing = self._tool_output_index_by_call_id.get(call_id)
@@ -1110,6 +1218,10 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         self._pending_response_events.append(event)
         self._message_output_item_added = True
         self.sent_output_item_added_event = True
+        self.sent_content_part_added_event = True
+        self._pending_response_events.append(
+            self.create_content_part_added_event()
+        )
 
     async def __anext__(
         self,
@@ -1125,13 +1237,17 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
 
                 result = self.return_default_initial_events()
                 if result:
-                    return result
+                    return self._record_response_stream_event(result)
                 # Emit any pending output_item or other response events before reading a new chunk
                 if self._pending_response_events:
-                    return self._pending_response_events.pop(0)
+                    return self._record_response_stream_event(
+                        self._pending_response_events.pop(0)
+                    )
                 # Emit any pending tool events before reading a new chunk
                 if self._pending_tool_events:
-                    return self._pending_tool_events.pop(0)
+                    return self._record_response_stream_event(
+                        self._pending_tool_events.pop(0)
+                    )
 
                 try:
                     chunk = await self.litellm_custom_stream_wrapper.__anext__()
@@ -1161,10 +1277,14 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                             self._pending_response_events.append(response_api_chunk)
 
                     if self._pending_response_events:
-                        return self._pending_response_events.pop(0)
+                        return self._record_response_stream_event(
+                            self._pending_response_events.pop(0)
+                        )
 
                 except StopAsyncIteration:
-                    return self.common_done_event_logic(sync_mode=False)
+                    return self._record_response_stream_event(
+                        self.common_done_event_logic(sync_mode=False)
+                    )
 
         except Exception as e:
             # Handle HTTP errors
@@ -1187,13 +1307,17 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     raise StopIteration
                 result = self.return_default_initial_events()
                 if result:
-                    return result
+                    return self._record_response_stream_event(result)
                 # Emit any pending output_item or other response events before reading a new chunk
                 if self._pending_response_events:
-                    return self._pending_response_events.pop(0)
+                    return self._record_response_stream_event(
+                        self._pending_response_events.pop(0)
+                    )
                 # Emit any pending tool events before reading a new chunk
                 if self._pending_tool_events:
-                    return self._pending_tool_events.pop(0)
+                    return self._record_response_stream_event(
+                        self._pending_tool_events.pop(0)
+                    )
                 try:
                     chunk = self.litellm_custom_stream_wrapper.__next__()
                     self._accumulate_provider_specific_fields_from_chunk(
@@ -1223,12 +1347,18 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     if self._pending_response_events:
                         if response_api_chunk:
                             self._pending_response_events.append(response_api_chunk)
-                        return self._pending_response_events.pop(0)
+                        return self._record_response_stream_event(
+                            self._pending_response_events.pop(0)
+                        )
                     if response_api_chunk:
-                        return response_api_chunk
+                        return self._record_response_stream_event(
+                            response_api_chunk
+                        )
                     # Otherwise, loop to next chunk
                 except StopIteration:
-                    return self.common_done_event_logic(sync_mode=True)
+                    return self._record_response_stream_event(
+                        self.common_done_event_logic(sync_mode=True)
+                    )
         except Exception as e:
             # Handle HTTP errors
             self.finished = True

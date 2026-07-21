@@ -128,27 +128,36 @@ fanout policy text in the request, and absence of the restrictive
 request-shape based rather than requiring Codex to actually spawn subagents on
 every smoke run.
 
-### Moonshot production acceptance
+### Moonshot dev gate and production promotion
 
-Moonshot promotion is production-only. Run every instance-backed Kimi smoke,
-CLI, streaming, routing, tool-use, logging, database-correlation, and
-acceptance check against `aawm-litellm` on `:4000`; do not send Moonshot
-acceptance traffic through `litellm-dev` on `:4001`.
+Run every instance-backed Kimi smoke, CLI, streaming, routing, tool-use,
+logging, database-correlation, and acceptance check against `litellm-dev` on
+`:4001` first. Production remains prohibited until Codex collaboration, Codex
+Bash system time, Claude collaboration stress, and Claude Bash system time all
+pass through the existing authenticated harness against the same dev candidate,
+including clean Docker logs, route rollups, Langfuse, and `aawm_tristore`
+correlation. Only then promote that exact build to `aawm-litellm` on `:4000`
+through `PROD_RELEASE.md` and rerun the equivalent production cases.
+Managed Kimi subscription generations may omit invoice cost only when Langfuse
+records `actual_invoice_cost_known=false` and a positive
+`reference_cost_total_usd`; missing both invoice and reference cost still fails.
 
 The release gate uses real Codex V2 Responses and Claude CLI parents. Each
 parent must select `aawm-sota-moonshot`, dispatch multiple child agents, have
 every child complete at least two separate parallel tool-call batches, and
-return approximately 10,000 characters of block text. Correlate the run through
-production logs, Langfuse, `aawm_tristore.public.session_history`, and
+return a concise deterministic marker block capped at 160 characters. This is
+a tool-usage test, not a throughput test. Correlate the run through the target
+environment's logs, Langfuse, `aawm_tristore.public.session_history`, and
 `public.session_history_tool_activity`. Keep the canonical
 `/home/zepfu/.kimi-code/credentials` mount at the same path; acceptance must not
 copy or synthesize Kimi credentials.
 
 Run the opt-in Codex gate as
 `native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration`.
-It uses the target-selected production Codex profile and requires two completed
+It uses the target-selected Codex profile and requires two completed
 `spawn_agent` calls, at least twelve persisted child `exec_command` rows, and a
-9,800-10,200 character final block. The ignored-user-config launch explicitly
+concise three-line final marker block capped at 160 characters. The
+ignored-user-config launch explicitly
 registers the existing `~/.codex/agents/moonshot.toml` role. Both spawn calls
 must set `agent_type="moonshot"`, `model="aawm-sota-moonshot"`, and
 `fork_turns="none"` and must carry complete self-contained plaintext child
@@ -156,7 +165,11 @@ messages. The harness validates those spawn payloads through
 `public.session_history_tool_activity` because installed Codex JSON stdout can
 omit successful spawn events; stdout collaboration validation still requires
 visible completed `wait` events. Do not use the legacy `fork_context` field and
-do not rely on inherited or encrypted parent context to carry the child task.
+do not rely on inherited parent context to carry the child task. Codex may place
+the explicit `message` argument in its dedicated encrypted collaboration
+content part; the managed Kimi adapter must restore that recognized empty task
+envelope to plaintext before provider egress without rewriting ordinary
+encrypted reasoning or continuation state.
 
 Run the Claude stress gate as
 `claude_adapter_aawm_sota_moonshot_parallel_stress`. The parent uses the real
@@ -167,7 +180,7 @@ child transcript must contain exactly two separate assistant messages with
 three parallel read-only tool calls apiece. The harness requires six tool calls
 per child, at least two transcript batches with at least three tool calls each,
 twelve persisted child tool rows in total, both child completion markers, and
-the 9,800-10,200 character final block. Also run
+the concise three-line final marker block. Also run
 `claude_adapter_aawm_sota_moonshot_agentic_tool_continuation` to preserve the
 focused Read-then-Grep tool-result replay proof.
 
@@ -186,6 +199,35 @@ the configured chunk or byte limits may produce a bounded, correlated warning.
 The output-item events and terminal response must retain
 `namespace=collaboration`; a
 small-stream-only namespace test is insufficient.
+
+### Alibaba Token Plan dev gate
+
+Alibaba/Qwen uses the same authenticated harness and atomic dev-first release
+gate as Moonshot. The four default-excluded cases are:
+
+- `native_openai_passthrough_responses_codex_aawm_sota_alibaba_collaboration`
+- `native_openai_passthrough_responses_codex_aawm_sota_alibaba_bash_time`
+- `claude_adapter_aawm_sota_alibaba_parallel_stress`
+- `claude_adapter_aawm_sota_alibaba_child_bash_time`
+
+Run each with `--target dev` against `litellm-dev` before any production
+mutation. The collaboration cases require exactly two children, exactly two
+sequential batches of three parallel tools per child, and only the three
+deterministic parent markers capped at 160 characters. The Bash cases execute
+`date --iso-8601=seconds` exactly once and require the final response to equal
+the command stdout. These are tool-usage checks, not throughput checks.
+
+The cases route only through `aawm-sota-alibaba` to
+`alibaba_token_plan/qwen3.8-max-preview` or
+`alibaba_token_plan/qwen3.7-max`. They require Alibaba subscription cost
+provenance, clean Docker logs and route rollups, Langfuse correlation, and
+exact `aawm_tristore` rows. They use the existing `ALIBABA_KEY` reference and
+the already-authenticated Codex and Claude state; do not copy credentials,
+inject a replacement key, or reauthorize either client.
+
+Only after all four dev cases pass against the same candidate may that exact
+build be promoted through `PROD_RELEASE.md`. Rerun the same four cases with
+`--target prod` after promotion; dev evidence is not production evidence.
 
 OpenRouter Responses hard gates must catch both incomplete-but-useful streams
 and successful-empty streams. If OpenRouter omits `response.completed` but emits
@@ -571,6 +613,7 @@ for the bundle-local usage notes.
 Read the current local harness source version from
 `scripts/local-ci/harness-version.txt`, then verify that the matching `h-v*`
 GitHub Release exists before using it in an image build. Keep exact harness
-artifact versions in `COMPLETED.md` release evidence and in historical patch
-entries, not in this reusable harness runbook. Older `h-v*` release notes are
-historical only unless a release or rollback intentionally pins them.
+artifact versions in local `.analysis/completed*.md` release evidence and in
+historical patch entries, not in this reusable harness runbook. The local
+completion ledger is intentionally not committed. Older `h-v*` release notes
+are historical only unless a release or rollback intentionally pins them.

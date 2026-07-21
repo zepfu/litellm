@@ -16,6 +16,7 @@ services:
     volumes:
       # Mount source for live code changes (key files only)
       - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
+      - ./litellm/integrations/aawm_session_history/record.py:/app/litellm/integrations/aawm_session_history/record.py
       - ./litellm/integrations/aawm_agent_quality_rules.py:/app/litellm/integrations/aawm_agent_quality_rules.py
       - ./litellm/integrations/aawm_agent_quality_rules.json:/app/litellm/integrations/aawm_agent_quality_rules.json
       - ./litellm/integrations/aawm_payload_capture.py:/app/litellm/integrations/aawm_payload_capture.py
@@ -25,6 +26,7 @@ services:
       - ./litellm/integrations/langfuse/langfuse_prompt_management.py:/app/litellm/integrations/langfuse/langfuse_prompt_management.py
       - ./litellm/__init__.py:/app/litellm/__init__.py
       - ./litellm/_lazy_imports_registry.py:/app/litellm/_lazy_imports_registry.py
+      - ./litellm/constants.py:/app/litellm/constants.py
       - ./litellm/main.py:/app/litellm/main.py
       - ./litellm/utils.py:/app/litellm/utils.py
       - ./litellm/litellm_core_utils/get_model_cost_map.py:/app/litellm/litellm_core_utils/get_model_cost_map.py
@@ -39,6 +41,9 @@ services:
       # Keep the complete Kimi provider package coherent with the bind-mounted
       # proxy handlers during development.
       - ./litellm/llms/kimi_code:/app/litellm/llms/kimi_code:ro
+      # Keep the complete Alibaba Token Plan provider package coherent with the
+      # bind-mounted provider registration and proxy handlers.
+      - ./litellm/llms/alibaba_token_plan:/app/litellm/llms/alibaba_token_plan:ro
       - ./litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py:/app/litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py
       - ./litellm/llms/base_llm/rerank/transformation.py:/app/litellm/llms/base_llm/rerank/transformation.py
       - ./litellm/llms/hosted_vllm/embedding/transformation.py:/app/litellm/llms/hosted_vllm/embedding/transformation.py
@@ -74,11 +79,13 @@ services:
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py
       - ./litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py:/app/litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
+      - ./litellm/proxy/pass_through_endpoints/aawm_alias_routing:/app/litellm/proxy/pass_through_endpoints/aawm_alias_routing:ro
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py
       - ./litellm/proxy/response_api_endpoints/endpoints.py:/app/litellm/proxy/response_api_endpoints/endpoints.py
       - ./litellm/proxy/route_llm_request.py:/app/litellm/proxy/route_llm_request.py
       - ./litellm/litellm_core_utils/get_llm_provider_logic.py:/app/litellm/litellm_core_utils/get_llm_provider_logic.py
       - ./litellm/llms/xai/oauth.py:/app/litellm/llms/xai/oauth.py
+      - ./litellm/responses/litellm_completion_transformation/streaming_iterator.py:/app/litellm/responses/litellm_completion_transformation/streaming_iterator.py
       - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
       - ./context-replacement:/app/context-replacement
       - ./litellm-dev-config.yaml:/app/litellm-dev-config.yaml
@@ -104,6 +111,9 @@ services:
       # Kimi Code CLI credential directory. LiteLLM only reads the host CLI's
       # existing grant; the directory mount preserves atomic credential replacement.
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
+      # Qwen CLI settings are the canonical Token Plan credential owner.
+      # LiteLLM reads the existing file in place and never copies the key.
+      - /home/zepfu/.qwen/settings.json:/home/zepfu/.qwen/settings.json:ro
       # Home-level local-only analysis artifacts; raw full-payload captures may include credentials.
       - /home/zepfu/.analysis:/home/zepfu/.analysis
       # Gemini CLI install for OAuth client fallback during local adapter testing
@@ -187,6 +197,7 @@ services:
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
       - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
       - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
+      - LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE=${LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE:-/home/zepfu/.qwen/settings.json}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}

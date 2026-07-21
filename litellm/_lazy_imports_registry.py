@@ -300,6 +300,7 @@ LLM_CONFIG_NAMES = (
     "GigaChatConfig",
     "GigaChatEmbeddingConfig",
     "DashScopeChatConfig",
+    "AlibabaTokenPlanChatConfig",
     "MoonshotChatConfig",
     "DockerModelRunnerChatConfig",
     "V0ChatConfig",
@@ -1129,6 +1130,10 @@ _LLM_CONFIGS_IMPORT_MAP = {
     "DashScopeChatConfig": (
         ".llms.dashscope.chat.transformation",
         "DashScopeChatConfig",
+    ),
+    "AlibabaTokenPlanChatConfig": (
+        ".llms.alibaba_token_plan.chat.transformation",
+        "AlibabaTokenPlanChatConfig",
     ),
     "MoonshotChatConfig": (".llms.moonshot.chat.transformation", "MoonshotChatConfig"),
     "DockerModelRunnerChatConfig": (

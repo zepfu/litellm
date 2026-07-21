@@ -6,8 +6,9 @@ Use this file as the primary restart surface. For a no-context session, first re
 the current `Validated Context` and `Next` sections below, then branch into
 these docs only as needed:
 
-- [COMPLETED.md](COMPLETED.md) - recent completed work, validation results,
-  repair stats, and release/session-history context from prior sessions.
+- Local `.analysis/completed*.md` ledgers - recent completed work, validation
+  results, repair stats, and release/session-history context from prior
+  sessions. These ledgers are intentionally not committed.
 - [TEST_HARNESS.md](TEST_HARNESS.md) and
   [scripts/local-ci/README.md](scripts/local-ci/README.md) - existing adapter
   harness structure, target profiles, real CLI coverage, case selection,
@@ -29,21 +30,22 @@ these docs only as needed:
   live harness analysis, or multi-lane debugging, fan out to subagents whenever
   the subtask is concrete and can run independently. Use the main thread for
   integration, decisions, and the current critical path.
-- Keep [TODO.md](TODO.md) and [COMPLETED.md](COMPLETED.md) current while work is
-  underway, not just at the end. `TODO.md` should say what is currently
-  unresolved, what failed, and the next plan of attack. `COMPLETED.md` should
-  record what was fixed, what was validated, exact artifacts/traces when useful,
-  and any dead ends that should not be repeated.
+- Keep [TODO.md](TODO.md) and the local `.analysis/completed*.md` ledgers
+  current while work is underway, not just at the end. `TODO.md` should say
+  what is currently unresolved, what failed, and the next plan of attack. The
+  local completed ledgers should record what was fixed, what was validated,
+  exact artifacts/traces when useful, and any dead ends that should not be
+  repeated.
 - When a fix is believed to work, proactively add the evidence to
-  [COMPLETED.md](COMPLETED.md). If later validation fails, update
-  [COMPLETED.md](COMPLETED.md) with the failed result and update [TODO.md](TODO.md)
-  with the next iteration before continuing.
+  the local completed ledger. If later validation fails, update that ledger
+  with the failed result and update [TODO.md](TODO.md) with the next iteration
+  before continuing.
 - After each major feature or repair is delivered and checked in locally, commit
   it on the `develop` branch. Keep the commit boundary aligned with the proven
   behavior so later sessions can tell what code, tests, and notes belonged
   together.
-- Avoid repeating known dead ends. Before rerunning an approach, check
-  [COMPLETED.md](COMPLETED.md) for prior failures and [TODO.md](TODO.md) for the
+- Avoid repeating known dead ends. Before rerunning an approach, check the
+  local completed ledgers for prior failures and [TODO.md](TODO.md) for the
   current planned route.
 
 ## Validated Context
@@ -138,7 +140,7 @@ these docs only as needed:
   `WebSearch`, and `WebFetch`, `max_tool_uses_in_single_assistant_message=1`,
   no transcript tool-result errors, clean runtime logs, valid tenant-only
   Langfuse user ids, and durable tool activity. Keep the dead-end breadcrumbs in
-  [COMPLETED.md](COMPLETED.md): do not rerun the neutral-fixture prompt
+  the local completion ledger: do not rerun the neutral-fixture prompt
   unchanged, do not use parent `--tools Agent`, do not chase the old synthetic
   `Carvercall` text unless it recurs as live assistant output, and do not treat
   prompt hardening as the fix for the post-Bash Gemini stop.
@@ -163,7 +165,7 @@ these docs only as needed:
   `/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`.
 
 - GPT-5.5/OpenAI Claude-dispatched parallel tool calls are now validated on dev
-  `:4001`. Keep the dead-end breadcrumb in [COMPLETED.md](COMPLETED.md): context
+  `:4001`. Keep the dead-end breadcrumb in the local completion ledger: context
   compaction alone was insufficient; the passing repair also rewrites the
   adapted OpenAI Responses `instructions` to a compact function-calling policy
   when `parallel_tool_calls=true` and multiple function tools are present. Live
@@ -186,48 +188,30 @@ these docs only as needed:
 
 ## Next
 
-- Promote `v1.82.3-aawm.129` to `aawm-litellm` production for managed Kimi
-  collaboration namespace adaptation, corrected reasoning/message/tool stream
-  ordering, large-stream namespace restoration, continuation replay, handled
-  passthrough 4xx logging, exact source-error route rollups, full-row
-  failure/cooldown coloring, alias-to-provider-model enforcement, the
-  three-hour Grok quota cooldown policy, correctly classified bounded stream
-  peeks, and post-flatten Codex spawn-agent role/model schema. The production
-  provider-status
-  sidecar must also refresh the same canonical Kimi credential in place through
-  its native lock path; do not create a credential copy. Follow
-  `PROD_RELEASE.md` and recreate only the named production LiteLLM and
-  provider-status services required by this release.
-  Acceptance requires real Codex V2 Responses and Claude Anthropic ingress
-  parents selecting the Kimi route, multiple child agent dispatches, at least
-  two separate parallel tool-call batches per child, roughly 10,000 characters
-  of final block text from each parent, exact
-  `aawm_tristore.public.session_history` evidence, and an overlapping prod log
-  window with plainly correlated Kimi route records and no raw traceback or
-  JSON error blob for handled 4xx responses.
-  Use the repository acceptance harness target profiles and case patterns:
-  `--target prod` must select the `litellm` Codex profile and set only the
-  Claude `ANTHROPIC_BASE_URL`/non-secret custom-header overlay. Do not set,
-  copy, synthesize, or override `ANTHROPIC_API_KEY`; the real Claude CLI must
-  use its existing OAuth credential state. The Codex collaboration prompt must
-  register the existing `moonshot` agent role and set
-  `agent_type="moonshot"`, `model="aawm-sota-moonshot"`, and
-  `fork_turns="none"` on both child spawns while providing complete
-  self-contained plaintext child tasks. Do not use legacy `fork_context` or
-  inherited encrypted context as the child task envelope. Validate completed
-  spawn payloads through `public.session_history_tool_activity`; Codex
-  `--json` stdout is required for visible `wait` events but is not an
-  authoritative spawn ledger when the installed CLI omits those events.
-  Run the existing-harness Codex and Claude system-time gates, each executing
-  `date --iso-8601=seconds` through Bash and requiring the exact stdout as the
-  final response. The Claude stress gate must dispatch two Moonshot children,
-  require two separate three-tool parallel batches per child, persist all
-  twelve child tool rows, and return a 9,800-10,200 character parent block.
-  Handled Kimi gateway failures must replace standalone Uvicorn/nonstandard
-  error lines with one bounded standard warning or error plus the exact
-  sanitized route-rollup failure row; raw JSON and tracebacks fail acceptance.
-  Keep `litellm-dev` on its current code and monitor its logs for new signatures;
-  do not use it as the Moonshot production acceptance target.
+- Publish and promote `v1.82.3-aawm.130` only after the exact committed image
+  passes the complete Moonshot and Alibaba tool-focused gate on `litellm-dev`
+  `:4001`. Do not treat the current bind-mounted source proof as image proof.
+  Use only the existing authenticated repository harness; never inspect,
+  copy, synthesize, refresh, replace, or reauthorize Claude, Codex, Kimi, or
+  Alibaba credentials. Run each Claude case serially and stop immediately on a
+  pre-traffic authentication failure.
+  Moonshot and Alibaba each require four cases: Codex collaboration, Codex Bash
+  system time, Claude collaboration, and Claude Bash system time.
+  Collaboration must dispatch two provider-specific children and have each
+  child complete two sequential batches of three parallel tool calls; the
+  parent returns only the concise deterministic marker block capped at 160
+  characters. Bash runs `date --iso-8601=seconds` exactly once and returns its
+  exact stdout. These validate tool usage, not throughput; filler and large
+  block-text output are prohibited.
+  Require canonical provider-native egress, no public alias in upstream
+  payloads, readable route rollups, exact sanitized failed rows, red failure
+  coloring, blue cooldown coloring, three-hour Grok 403/402 cooldowns, clean
+  overlapping Docker logs, Langfuse traces, and exact
+  `aawm_tristore.public.session_history` plus tool-activity correlation.
+  After the atomic dev gate passes, follow `PROD_RELEASE.md`, promote only that
+  exact image and required overlay assets, and rerun the same scoped cases with
+  `--target prod`. Never blanket-stop containers; recreate or restart only the
+  named service required by the runbook.
 
 - Rerun the Spark/Codex-dependent prod harness cases after the upstream Codex
   quota reset at `2026-05-18 15:08:41 UTC`: at minimum
@@ -257,7 +241,7 @@ these docs only as needed:
 
 - Prod `:4000` is on `v1.82.3-aawm.43` with callback overlay `0.0.18`;
   detailed cutover, smoke, and backfill evidence lives in
-  [COMPLETED.md](COMPLETED.md). No prod restart/backfill is currently pending
+  the local completion ledger. No prod restart/backfill is currently pending
   for D1-075/D1-076/D1-077/D1-078. Next useful release follow-up is optional
   focused/default prod harness validation and normal monitoring of new prod
   Codex Responses prompt-overhead rows after the callback cutover.

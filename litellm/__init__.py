@@ -573,6 +573,7 @@ aiml_models: Set = set()
 deepgram_models: Set = set()
 elevenlabs_models: Set = set()
 dashscope_models: Set = set()
+alibaba_token_plan_models: Set = set()
 moonshot_models: Set = set()
 kimi_code_models: Set = set()
 publicai_models: Set = set()
@@ -818,6 +819,8 @@ def add_known_models(model_cost_map: Optional[Dict] = None):
             heroku_models.add(key)
         elif value.get("litellm_provider") == "dashscope":
             dashscope_models.add(key)
+        elif value.get("litellm_provider") == "alibaba_token_plan":
+            alibaba_token_plan_models.add(key)
         elif value.get("litellm_provider") == "moonshot":
             moonshot_models.add(key)
         elif value.get("litellm_provider") == "kimi_code":
@@ -963,6 +966,7 @@ model_list = list(
     | deepgram_models
     | elevenlabs_models
     | dashscope_models
+    | alibaba_token_plan_models
     | moonshot_models
     | kimi_code_models
     | publicai_models
@@ -1063,6 +1067,7 @@ models_by_provider: dict = {
     "elevenlabs": elevenlabs_models,
     "heroku": heroku_models,
     "dashscope": dashscope_models,
+    "alibaba_token_plan": alibaba_token_plan_models,
     "moonshot": moonshot_models,
     "kimi_code": kimi_code_models,
     "publicai": publicai_models,
@@ -1836,6 +1841,9 @@ if TYPE_CHECKING:
     from .llms.dashscope.chat.transformation import (
         DashScopeChatConfig as DashScopeChatConfig,
     )
+    from .llms.alibaba_token_plan.chat.transformation import (
+        AlibabaTokenPlanChatConfig as AlibabaTokenPlanChatConfig,
+    )
     from .llms.moonshot.chat.transformation import (
         MoonshotChatConfig as MoonshotChatConfig,
     )
@@ -1990,6 +1998,12 @@ def __getattr__(name: str) -> Any:
         from .llms.kimi_code.chat.transformation import KimiCodeChatConfig
 
         return KimiCodeChatConfig
+    if name == "AlibabaTokenPlanChatConfig":
+        from .llms.alibaba_token_plan.chat.transformation import (
+            AlibabaTokenPlanChatConfig,
+        )
+
+        return AlibabaTokenPlanChatConfig
 
     # Register async client cleanup on first access (only once)
     if not _async_client_cleanup_registered:

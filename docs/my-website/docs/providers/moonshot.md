@@ -65,6 +65,13 @@ request-shape rejection is returned once as a bounded client error; it is not
 retried as provider capacity and must not surface as HTTP 500 or a raw
 traceback.
 
+Codex collaboration may transport a `spawn_agent` or follow-up assignment as an
+empty `NEW_TASK`/`MESSAGE` payload wrapper plus a dedicated
+`encrypted_content` part. The Kimi Responses adapter restores that task text
+only for the recognized empty collaboration envelope before translating it to
+chat completions. Ordinary encrypted reasoning and continuation state is never
+treated as task text or sent to Kimi as plaintext.
+
 Kimi Code `0.27.0` cannot use a custom `KIMI_CODE_BASE_URL` while retaining
 the official default credential slot. It derives a separate environment-scoped
 OAuth slot for every custom base URL. Do not copy or symlink

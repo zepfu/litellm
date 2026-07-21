@@ -8065,6 +8065,10 @@ class ProviderConfigManager:
             LlmProviders.NEBIUS: (lambda: litellm.NebiusConfig(), False),
             LlmProviders.WANDB: (lambda: litellm.WandbConfig(), False),
             LlmProviders.DASHSCOPE: (lambda: litellm.DashScopeChatConfig(), False),
+            LlmProviders.ALIBABA_TOKEN_PLAN: (
+                lambda: litellm.AlibabaTokenPlanChatConfig(),
+                False,
+            ),
             LlmProviders.MOONSHOT: (lambda: litellm.MoonshotChatConfig(), False),
             LlmProviders.KIMI_CODE: (lambda: litellm.KimiCodeChatConfig(), False),
             LlmProviders.DOCKER_MODEL_RUNNER: (

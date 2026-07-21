@@ -7809,6 +7809,56 @@ def test_aawm_agent_identity_adds_codex_usage_breakout_tags_from_standard_loggin
     assert "codex-tool-calls-present" in metadata["tags"]
 
 
+def test_aawm_agent_identity_treats_codex_adapter_route_as_codex_usage() -> None:
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "qwen3.8-max-preview"
+    kwargs["custom_llm_provider"] = "alibaba_token_plan"
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
+        "codex_alibaba_token_plan_chat_completions_adapter"
+    )
+
+    result = {
+        "id": "chatcmpl-qwen-tool",
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 5,
+            "total_tokens": 25,
+        },
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_time",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": (
+                                    '{"cmd":"date --iso-8601=seconds"}'
+                                ),
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result=result,
+        call_type="completion",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    assert metadata["codex_tool_call_count"] == 1
+    assert metadata["codex_tool_names"] == ["exec_command"]
+    assert "codex-tool-calls-present" in metadata["tags"]
+
+
 def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="gemini")

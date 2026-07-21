@@ -68,6 +68,7 @@ _RECORD_API_NAMES: Tuple[str, ...] = (
     "_derive_session_history_tool_fields",
     "_derive_session_history_provider_cache_fields",
     "_build_kimi_code_reference_cost_metadata",
+    "_build_alibaba_token_plan_cost_metadata",
     "_build_session_history_record_from_spend_log_row",
     "_build_session_history_record_from_langfuse_trace_observation",
     "_build_session_history_metadata",
@@ -461,6 +462,33 @@ def _build_kimi_code_reference_cost_metadata(
     }
 
 
+def _build_alibaba_token_plan_cost_metadata(
+    *,
+    provider: Optional[str],
+    model: str,
+) -> Dict[str, Any]:
+    """Record honest cost provenance for Token Plan subscription usage."""
+    if str(provider or "").strip().lower() != "alibaba_token_plan":
+        return {}
+
+    normalized_model = str(model or "").strip()
+    if normalized_model.lower().startswith("alibaba_token_plan/"):
+        normalized_model = normalized_model.split("/", 1)[1]
+    if not normalized_model or normalized_model == "unknown":
+        return {}
+
+    return {
+        "billing_mode": "alibaba_token_plan_subscription",
+        "actual_invoice_cost_known": False,
+        "reference_cost_kind": "provider_token_plan_no_public_per_token_rate",
+        "reference_cost_currency": "USD",
+        "reference_cost_model": f"alibaba_token_plan/{normalized_model}",
+        "reference_cost_source": (
+            "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
+        ),
+    }
+
+
 # --- _build_session_history_record_from_spend_log_row ---
 def _build_session_history_record_from_spend_log_row(
     spend_log_row: Dict[str, Any],
@@ -760,6 +788,8 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
             trace.get("totalCost"),
         )
     )
+    if str(provider or "").strip().lower() == "alibaba_token_plan":
+        response_cost_usd = None
     cache_fields = _derive_session_history_provider_cache_fields(
         provider=provider,
         model=resolved_model,
@@ -1134,7 +1164,7 @@ def _build_session_history_record(  # noqa: PLR0915
                 request_tags.append(tag)
 
     response_cost_usd = None
-    if resolved_provider != "kimi_code":
+    if resolved_provider not in {"kimi_code", "alibaba_token_plan"}:
         if resolved_provider == "openrouter":
             response_cost_usd = _first_reported_openrouter_cost(metadata, usage_dict)
         if response_cost_usd is None:
@@ -1250,6 +1280,12 @@ def _build_session_history_record(  # noqa: PLR0915
     )
     if kimi_code_reference_cost_metadata:
         metadata.update(kimi_code_reference_cost_metadata)
+    alibaba_token_plan_cost_metadata = _build_alibaba_token_plan_cost_metadata(
+        provider=resolved_provider,
+        model=resolved_model,
+    )
+    if alibaba_token_plan_cost_metadata:
+        metadata.update(alibaba_token_plan_cost_metadata)
 
     runtime_identity = _build_session_runtime_identity(
         metadata=metadata,
