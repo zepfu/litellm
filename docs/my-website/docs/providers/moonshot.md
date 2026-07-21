@@ -51,6 +51,16 @@ requested reasoning effort is supported. Missing or unrecognized capability
 data does not justify inventing output ceilings, translating to another model,
 or silently substituting an effort.
 
+AAWM may use internal `k3-low`, `k3-high`, and `k3-max` labels while resolving
+capabilities and public reference pricing. Those labels are observability and
+routing identities only; they are normalized to `k3` for introspection and are
+rejected if they reach provider request transformation.
+
+Kimi subscription reference costs are not invoice spend. Callback observers
+may use the deterministic reference total as generation cost only when they
+also retain `actual_invoice_cost_known=false` and the source/model/kind
+provenance documented in `docs/aawm-session-history.md`.
+
 The raw Kimi CLI compatibility gateway is the trusted-local `/kimi/v1` route.
 It accepts only a direct `127.0.0.1` or `::1` peer; forwarded identity headers
 are ignored. Incoming authorization and forwarded/provider-specific identity

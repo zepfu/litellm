@@ -392,6 +392,8 @@ The current Anthropic-route multi-provider adapter work is split intentionally:
   - adapted access-log labeling
   - managed Kimi Codex namespace flattening/restoration and Responses stream
     item ordering
+  - shared managed-Kimi reference-cost enrichment and preservation across
+    overlapping streaming success callbacks
   - backend `session_history` / Langfuse plumbing needed for adapted traffic
 - callback wheel:
   - callback-side enrichment and `session_history` persistence

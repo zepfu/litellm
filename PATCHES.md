@@ -58,6 +58,39 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.134 - Deterministic Kimi streaming reference-cost observability
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.134`. Managed
+Kimi Code reference-cost calculation now has one shared resolver used by
+session history and callback logging. Internal `k3-low`, `k3-high`, and
+`k3-max` effort variants use the public `k3` capability and reference-price
+entry for introspection while remaining invalid provider egress model IDs.
+
+Streaming success handlers preserve a positive `response_cost` already
+calculated by another overlapping handler instead of resetting it to `None`.
+When ordinary cost calculation is unavailable, callback observers such as
+Langfuse receive the deterministic Kimi subscription reference total together
+with explicit non-invoice provenance.
+
+**Why:** Sync and async streaming success handlers share one logging object and
+can overlap. A later helper invocation could erase the positive reference cost
+before Langfuse consumed it, leaving continuation generations with usage and
+reference metadata but `costDetails.total=NULL`.
+
+**Why not upstream:** The managed Kimi subscription route, internal effort
+aliases, reference-cost provenance, and AAWM production acceptance gates are
+fork-local behavior.
+
+**Validation status:** Kimi pricing/transformation/session-history tests pass
+(`61 passed`), focused logging cost/race tests pass (`3 passed`), and the
+focused Moonshot/Alibaba harness contract slice passes (`11 passed`). Candidate
+`aawm-litellm:1.82.3-aawm.133-cb0.0.68-cp0.0.11-cfg0.0.28-kimicost.2`
+passed isolated installed-wheel preflight and the existing authenticated
+targeted Codex Moonshot dev case. Both Langfuse generations recorded positive
+totals (`0.006703199999` and `0.041268`) with the required reference-cost
+provenance. Immutable `.134` publication and matching production acceptance
+remain required under `PROD_RELEASE.md`.
+
 ### aawm.133 - Lazy streamed custom-tool restoration for coding workers
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.133`. Codex

@@ -290,6 +290,83 @@ def _get_cached_prometheus_logger():
     return _PrometheusLogger
 
 
+def _usage_value(value_obj: Any, key: str) -> Any:
+    if isinstance(value_obj, dict):
+        return value_obj.get(key)
+    return getattr(value_obj, key, None)
+
+
+def _coerce_usage_int(value: object) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _enrich_kimi_code_reference_cost_metadata(
+    *,
+    result: Any,
+    model_name: str,
+    model_call_details: Dict[str, Any],
+    litellm_params: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    provider = model_call_details.get("custom_llm_provider")
+    if provider is None:
+        provider = litellm_params.get("custom_llm_provider")
+    if not str(provider or "").strip().lower():
+        provider = str(model_name or "").split("/", maxsplit=1)[0]
+        if provider == model_name:
+            provider = None
+    if str(provider or "").strip().lower() != "kimi_code":
+        return None
+
+    usage_obj = _usage_value(result, "usage")
+    if usage_obj is None:
+        return None
+    prompt_tokens = _coerce_usage_int(_usage_value(usage_obj, "prompt_tokens"))
+    completion_tokens = _coerce_usage_int(
+        _usage_value(usage_obj, "completion_tokens")
+    )
+    if prompt_tokens is None or completion_tokens is None:
+        return None
+
+    cache_read_input_tokens = _coerce_usage_int(
+        _usage_value(usage_obj, "cache_read_input_tokens")
+    )
+    if cache_read_input_tokens is None:
+        prompt_tokens_details = _usage_value(usage_obj, "prompt_tokens_details")
+        cache_read_input_tokens = _coerce_usage_int(
+            _usage_value(prompt_tokens_details, "cached_tokens")
+        )
+
+    from litellm.llms.kimi_code.reference_cost import (
+        build_kimi_code_reference_cost_metadata,
+    )
+
+    metadata = build_kimi_code_reference_cost_metadata(
+        provider=provider,
+        model=model_name,
+        prompt_tokens=prompt_tokens,
+        cache_read_input_tokens=cache_read_input_tokens or 0,
+        completion_tokens=completion_tokens,
+    )
+    if not metadata:
+        return None
+
+    canonical_params = model_call_details.get("litellm_params")
+    if not isinstance(canonical_params, dict):
+        canonical_params = litellm_params
+        model_call_details["litellm_params"] = canonical_params
+    metadata_bucket = canonical_params.setdefault("metadata", {})
+    if not isinstance(metadata_bucket, dict):
+        metadata_bucket = {}
+        canonical_params["metadata"] = metadata_bucket
+    metadata_bucket.update(metadata)
+    return metadata
+
+
 class Logging(LiteLLMLoggingBaseClass):
     global supabaseClient, promptLayerLogger, weightsBiasesLogger, logfireLogger, capture_exception, add_breadcrumb, lunaryLogger, logfireLogger, prometheusLogger, slack_app
     custom_pricing: bool = False
@@ -1489,6 +1566,13 @@ class Logging(LiteLLMLoggingBaseClass):
         if cache_hit is True:
             return 0.0
 
+        reference_cost_metadata = _enrich_kimi_code_reference_cost_metadata(
+            result=result,
+            model_name=litellm_model_name or self.model,
+            model_call_details=self.model_call_details,
+            litellm_params=self.litellm_params,
+        )
+
         if isinstance(result, BaseModel) and hasattr(result, "_hidden_params"):
             hidden_params = getattr(result, "_hidden_params", {})
             if (
@@ -1548,6 +1632,8 @@ class Logging(LiteLLMLoggingBaseClass):
                 ),
             }
         except Exception as e:  # error creating kwargs for cost calculation
+            if isinstance(reference_cost_metadata, dict):
+                return reference_cost_metadata.get("reference_cost_total_usd")
             debug_info = StandardLoggingModelCostFailureDebugInformation(
                 error_str=str(e),
                 traceback_str=_get_traceback_str_for_error(str(e)),
@@ -1565,9 +1651,23 @@ class Logging(LiteLLMLoggingBaseClass):
                 **response_cost_calculator_kwargs
             )
 
+            if response_cost is None and isinstance(
+                reference_cost_metadata, dict
+            ):
+                response_cost = reference_cost_metadata.get("reference_cost_total_usd")
             verbose_logger.debug(f"response_cost: {response_cost}")
             return response_cost
         except Exception as e:  # error calculating cost
+            fallback_cost = None
+            if isinstance(reference_cost_metadata, dict):
+                fallback_cost = reference_cost_metadata.get("reference_cost_total_usd")
+            if fallback_cost is not None:
+                verbose_logger.debug(
+                    "response_cost: using Kimi Code reference fallback=%s",
+                    fallback_cost,
+                )
+                return fallback_cost
+
             debug_info = StandardLoggingModelCostFailureDebugInformation(
                 error_str=str(e),
                 traceback_str=_get_traceback_str_for_error(str(e)),
@@ -1876,7 +1976,10 @@ class Logging(LiteLLMLoggingBaseClass):
                     standard_logging_object
                 )
             else:
-                self.model_call_details["response_cost"] = None
+                # Sync and async streaming success handlers share this logging
+                # object and may overlap. Do not erase a cost the other handler
+                # already calculated before callbacks consume it.
+                self.model_call_details.setdefault("response_cost", None)
 
             result = self._transform_usage_objects(result=result)
 

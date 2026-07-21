@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -13,7 +14,7 @@ import time
 from litellm.constants import SENTRY_DENYLIST, SENTRY_PII_DENYLIST
 from litellm.litellm_core_utils.litellm_logging import Logging as LitellmLogging
 from litellm.litellm_core_utils.litellm_logging import set_callbacks
-from litellm.types.utils import ModelResponse, TextCompletionResponse
+from litellm.types.utils import ModelResponse, TextCompletionResponse, Usage
 
 
 @pytest.fixture
@@ -1025,6 +1026,139 @@ def test_response_cost_calculator_with_response_cost_in_hidden_params(logging_ob
 
     assert response_cost is not None
     assert response_cost > 100
+
+
+def test_response_cost_calculator_kimi_code_reference_cost_fallback_and_metadata_patch(
+    monkeypatch,
+):
+    import litellm
+
+    from litellm import NotFoundError
+
+    def _raise_not_found(**kwargs):
+        raise NotFoundError("pricing unavailable")
+
+    logging_obj = LitellmLogging(
+        model="kimi_code/k3-max",
+        messages=[{"role": "user", "content": "Optimize this function"}],
+        stream=False,
+        call_type="completion",
+        start_time=time.time(),
+        litellm_call_id="logging-cost-kimi-fallback",
+        function_id="function-kimi",
+        kwargs={
+            "custom_llm_provider": "kimi_code",
+            "metadata": {},
+        },
+    )
+    logging_obj.update_environment_variables(
+        litellm_params={"metadata": {}},
+        optional_params={},
+        custom_llm_provider="kimi_code",
+    )
+    result = ModelResponse(
+        id="response-kimi",
+        model="k3-max",
+        usage=Usage(
+            prompt_tokens=14_191,
+            completion_tokens=97,
+            total_tokens=14_288,
+            cache_read_input_tokens=13_824,
+        ),
+    )
+
+    with monkeypatch.context() as mc:
+        with open("model_prices_and_context_window.json") as model_cost_file:
+            mc.setattr(litellm, "model_cost", json.load(model_cost_file))
+        mc.setattr(litellm, "response_cost_calculator", _raise_not_found)
+        response_cost = logging_obj._response_cost_calculator(
+            result=result,
+        )
+
+    assert response_cost == pytest.approx(0.0067032)
+    metadata = logging_obj.litellm_params["metadata"]
+    assert metadata["billing_mode"] == "kimi_code_subscription"
+    assert metadata["actual_invoice_cost_known"] is False
+    assert metadata["reference_cost_kind"] == "official_public_subscription_route"
+    assert metadata["reference_cost_currency"] == "USD"
+    assert metadata["reference_cost_model"] == "kimi_code/k3-max"
+    assert metadata["reference_cost_cached_input_usd"] == pytest.approx(0.0041472)
+    assert metadata["reference_cost_uncached_input_usd"] == pytest.approx(0.001101)
+    assert metadata["reference_cost_output_usd"] == pytest.approx(0.001455)
+    assert metadata["reference_cost_total_usd"] == pytest.approx(0.0067032)
+    assert "response_cost_failure_debug_information" not in (
+        logging_obj.model_call_details
+    )
+
+
+def test_response_cost_calculator_kimi_hidden_cost_keeps_reference_provenance(
+    monkeypatch,
+):
+    import litellm
+
+    logging_obj = LitellmLogging(
+        model="kimi_code/k3-max",
+        messages=[{"role": "user", "content": "Continue"}],
+        stream=False,
+        call_type="completion",
+        start_time=time.time(),
+        litellm_call_id="logging-cost-kimi-hidden",
+        function_id="function-kimi-hidden",
+    )
+    logging_obj.update_environment_variables(
+        litellm_params={"metadata": {}},
+        optional_params={},
+        custom_llm_provider="kimi_code",
+    )
+    result = ModelResponse(
+        id="response-kimi-hidden",
+        model="k3",
+        usage=Usage(
+            prompt_tokens=14_191,
+            completion_tokens=97,
+            total_tokens=14_288,
+            cache_read_input_tokens=13_824,
+        ),
+    )
+    result._hidden_params["response_cost"] = 0.007
+
+    with open("model_prices_and_context_window.json") as model_cost_file:
+        monkeypatch.setattr(litellm, "model_cost", json.load(model_cost_file))
+    response_cost = logging_obj._response_cost_calculator(result=result)
+
+    assert response_cost == pytest.approx(0.007)
+    metadata = logging_obj.litellm_params["metadata"]
+    assert metadata["actual_invoice_cost_known"] is False
+    assert metadata["reference_cost_model"] == "kimi_code/k3-max"
+    assert metadata["reference_cost_total_usd"] == pytest.approx(0.0067032)
+
+
+def test_streaming_success_helper_preserves_concurrently_calculated_response_cost():
+    logging_obj = LitellmLogging(
+        model="kimi_code/k3-max",
+        messages=[{"role": "user", "content": "Continue"}],
+        stream=True,
+        call_type="acompletion",
+        start_time=time.time(),
+        litellm_call_id="logging-cost-stream-race",
+        function_id="function-kimi-stream-race",
+    )
+    logging_obj.model_call_details["response_cost"] = 0.0067032
+
+    logging_obj._success_handler_helper_fn(
+        result=ModelResponse(
+            id="response-kimi-stream-race",
+            model="k3",
+            usage=Usage(
+                prompt_tokens=14_191,
+                completion_tokens=97,
+                total_tokens=14_288,
+                cache_read_input_tokens=13_824,
+            ),
+        )
+    )
+
+    assert logging_obj.model_call_details["response_cost"] == pytest.approx(0.0067032)
 
 
 def test_sentry_event_scrubber_initialization(monkeypatch):

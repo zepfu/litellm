@@ -152,7 +152,9 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
 
     @classmethod
     def _supported_reasoning_efforts(cls, model: str) -> Tuple[str, ...]:
-        model_id = cls._model_id(model)
+        model_id = model.split("/", maxsplit=1)[-1]
+        if model_id in {"k3-low", "k3-high", "k3-max"}:
+            model_id = "k3"
         try:
             model_info = _get_model_info_helper(
                 model=model_id,
@@ -186,6 +188,8 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
         return KIMI_CODE_CHAT_COMPLETIONS_URL
 
     def get_supported_openai_params(self, model: str) -> list:
+        if model.split("/", maxsplit=1)[-1] not in {"k3-low", "k3-high", "k3-max"}:
+            self._model_id(model)
         supported_reasoning_efforts = self._supported_reasoning_efforts(model)
         supported_params = [
             "frequency_penalty",

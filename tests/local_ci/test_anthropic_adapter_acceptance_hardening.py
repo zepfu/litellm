@@ -2176,7 +2176,8 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
     assert "CODEX_MOONSHOT_TOOL_USAGE_PASSED" in prompt
     assert "MOONSHOT_ACCEPTANCE_FILLER" not in prompt
     assert "10,150-character" not in prompt
-    assert case_config["allow_reference_cost_when_invoice_unknown"] is True
+    assert "allow_zero_cost" not in case_config
+    assert "allow_reference_cost_when_invoice_unknown" not in case_config
     assert "fork_context=false" not in prompt
     assert "omit the fork_turns field entirely" not in prompt
     assert "do not set fork_turns to none" not in prompt
@@ -2257,6 +2258,8 @@ def test_moonshot_codex_bash_time_case_requires_exact_stdout_reporting():
         "maximum_count": 1,
         "command_text_contains": "date --iso-8601=seconds",
     }
+    assert "allow_zero_cost" not in case_config
+    assert "allow_reference_cost_when_invoice_unknown" not in case_config
 
 
 def test_alibaba_cases_are_default_excluded_with_exact_routes_and_cost_provenance():
@@ -3471,7 +3474,8 @@ def test_ms012_moonshot_case_uses_the_canonical_alias_and_agentic_contract():
         "requested_model_alias": MS012_MOONSHOT_ALIAS,
         "anthropic_auto_agent_alias": MS012_MOONSHOT_ALIAS,
     }
-    assert case_config["allow_reference_cost_when_invoice_unknown"] is True
+    assert "allow_zero_cost" not in case_config
+    assert "allow_reference_cost_when_invoice_unknown" not in case_config
 
     summary, failures = harness._validate_moonshot_anthropic_agentic_contract(
         family=MS012_MOONSHOT_AGENTIC_CASE,
@@ -3487,6 +3491,30 @@ def test_ms012_moonshot_case_uses_the_canonical_alias_and_agentic_contract():
         "declared_models": sorted(MS012_MOONSHOT_DECLARED_MODELS),
     }
     assert "aawm-sota-moonshot-anthropic" not in json.dumps(config)
+
+
+def test_all_moonshot_cases_require_positive_langfuse_generation_costs():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    for case_name in (
+        MOONSHOT_CODEX_COLLABORATION_CASE,
+        MOONSHOT_CODEX_BASH_TIME_CASE,
+        MS012_MOONSHOT_AGENTIC_CASE,
+        MS012_MOONSHOT_BASH_TIME_CASE,
+        MS012_MOONSHOT_STRESS_CASE,
+    ):
+        case_config = config["cases"][case_name]
+        assert "allow_zero_cost" not in case_config
+        assert "allow_reference_cost_when_invoice_unknown" not in case_config
+        assert {
+            "billing_mode",
+            "reference_cost_kind",
+            "reference_cost_model",
+            "reference_cost_source",
+        } <= set(case_config["required_generation_metadata_truthy"])
+        assert case_config["required_generation_metadata_minimums"][
+            "reference_cost_total_usd"
+        ] > 0
 
 
 def test_ms012_moonshot_claude_stress_case_requires_two_parallel_child_batches():

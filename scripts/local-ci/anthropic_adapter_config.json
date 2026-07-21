@@ -648,8 +648,15 @@
         "passthrough_route_family",
         "codex_auto_agent_selected_provider",
         "codex_auto_agent_selected_model",
-        "codex_auto_agent_selected_route_family"
+        "codex_auto_agent_selected_route_family",
+        "billing_mode",
+        "reference_cost_kind",
+        "reference_cost_model",
+        "reference_cost_source"
       ],
+      "required_generation_metadata_minimums": {
+        "reference_cost_total_usd": 1e-12
+      },
       "command_output_text_checks": {
         "required_prefix": "CODEX_MOONSHOT_TOOL_USAGE_PASSED",
         "required_suffix": "CHILD_B_TWO_PARALLEL_BATCHES_PASSED",
@@ -744,8 +751,7 @@
         ]
       },
       "timeout_seconds": 900,
-      "langfuse_poll_timeout_seconds": 120,
-      "allow_reference_cost_when_invoice_unknown": true
+      "langfuse_poll_timeout_seconds": 120
     },
     "native_openai_passthrough_responses_codex_aawm_sota_alibaba_collaboration": {
       "verification_alias": "aawm-sota-alibaba",
@@ -1003,11 +1009,16 @@
         "codex_auto_agent_selected_model",
         "codex_auto_agent_selected_route_family",
         "responses_stream_event_types",
-        "responses_stream_tool_state"
+        "responses_stream_tool_state",
+        "billing_mode",
+        "reference_cost_kind",
+        "reference_cost_model",
+        "reference_cost_source"
       ],
       "required_generation_metadata_minimums": {
         "responses_stream_tool_call_count": 1,
-        "codex_tool_call_count": 1
+        "codex_tool_call_count": 1,
+        "reference_cost_total_usd": 1e-12
       },
       "stream_tool_call_state_validation": {
         "required_event_types": [
@@ -1095,9 +1106,7 @@
         "docker_container_name": "litellm-dev"
       },
       "timeout_seconds": 300,
-      "langfuse_poll_timeout_seconds": 90,
-      "allow_zero_cost": true,
-      "allow_reference_cost_when_invoice_unknown": true
+      "langfuse_poll_timeout_seconds": 90
     },
     "native_openai_passthrough_responses_codex_aawm_sota_alibaba_bash_time": {
       "verification_alias": "aawm-sota-alibaba",
@@ -4215,8 +4224,15 @@
         "passthrough_route_family",
         "anthropic_auto_agent_selected_provider",
         "anthropic_auto_agent_selected_model",
-        "anthropic_auto_agent_selected_route_family"
+        "anthropic_auto_agent_selected_route_family",
+        "billing_mode",
+        "reference_cost_kind",
+        "reference_cost_model",
+        "reference_cost_source"
       ],
+      "required_generation_metadata_minimums": {
+        "reference_cost_total_usd": 1e-12
+      },
       "request_payload_checks": {
         "required_paths": [
           "model",
@@ -4331,9 +4347,7 @@
         "docker_container_name": "litellm-dev"
       },
       "timeout_seconds": 300,
-      "langfuse_poll_timeout_seconds": 90,
-      "allow_zero_cost": true,
-      "allow_reference_cost_when_invoice_unknown": true
+      "langfuse_poll_timeout_seconds": 90
     },
     "claude_adapter_aawm_sota_moonshot_child_bash_time": {
       "failure_context": "Moonshot Claude Bash system-time acceptance (anthropic_kimi_chat_completions_adapter, alias aawm-sota-moonshot)",
@@ -4414,8 +4428,15 @@
         "passthrough_route_family",
         "anthropic_auto_agent_selected_provider",
         "anthropic_auto_agent_selected_model",
-        "anthropic_auto_agent_selected_route_family"
+        "anthropic_auto_agent_selected_route_family",
+        "billing_mode",
+        "reference_cost_kind",
+        "reference_cost_model",
+        "reference_cost_source"
       ],
+      "required_generation_metadata_minimums": {
+        "reference_cost_total_usd": 1e-12
+      },
       "request_payload_checks": {
         "required_paths": [
           "model",
@@ -4527,9 +4548,7 @@
         "docker_container_name": "litellm-dev"
       },
       "timeout_seconds": 300,
-      "langfuse_poll_timeout_seconds": 90,
-      "allow_zero_cost": true,
-      "allow_reference_cost_when_invoice_unknown": true
+      "langfuse_poll_timeout_seconds": 90
     },
     "claude_adapter_aawm_sota_alibaba_child_bash_time": {
       "failure_context": "Alibaba Claude Bash system-time acceptance (anthropic_alibaba_token_plan_chat_completions_adapter, alias aawm-sota-alibaba)",
@@ -4610,7 +4629,8 @@
         "passthrough_route_family",
         "anthropic_auto_agent_selected_provider",
         "anthropic_auto_agent_selected_model",
-        "anthropic_auto_agent_selected_route_family"
+        "anthropic_auto_agent_selected_route_family",
+        "billing_mode"
       ],
       "request_payload_checks": {
         "required_paths": [
@@ -4827,8 +4847,15 @@
         "passthrough_route_family",
         "anthropic_auto_agent_selected_provider",
         "anthropic_auto_agent_selected_model",
-        "anthropic_auto_agent_selected_route_family"
+        "anthropic_auto_agent_selected_route_family",
+        "billing_mode",
+        "reference_cost_kind",
+        "reference_cost_model",
+        "reference_cost_source"
       ],
+      "required_generation_metadata_minimums": {
+        "reference_cost_total_usd": 1e-12
+      },
       "request_payload_checks": {
         "required_paths": [
           "model",
@@ -4976,9 +5003,7 @@
         "docker_container_name": "litellm-dev"
       },
       "timeout_seconds": 900,
-      "langfuse_poll_timeout_seconds": 120,
-      "allow_zero_cost": true,
-      "allow_reference_cost_when_invoice_unknown": true
+      "langfuse_poll_timeout_seconds": 120
     },
     "claude_adapter_aawm_sota_alibaba_parallel_stress": {
       "failure_context": "Alibaba Claude tool-usage acceptance (two Qwen children, two parallel tool batches each)",

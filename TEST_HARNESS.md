@@ -138,9 +138,14 @@ pass through the existing authenticated harness against the same dev candidate,
 including clean Docker logs, route rollups, Langfuse, and `aawm_tristore`
 correlation. Only then promote that exact build to `aawm-litellm` on `:4000`
 through `PROD_RELEASE.md` and rerun the equivalent production cases.
-Managed Kimi subscription generations may omit invoice cost only when Langfuse
-records `actual_invoice_cost_known=false` and a positive
-`reference_cost_total_usd`; missing both invoice and reference cost still fails.
+Every managed Kimi subscription generation must expose a positive Langfuse
+`costDetails.total`, even when the provider does not report an invoice amount.
+The same generation must record `actual_invoice_cost_known=false`, a positive
+`reference_cost_total_usd`, and the `billing_mode`, `reference_cost_kind`,
+`reference_cost_model`, and `reference_cost_source` provenance fields. Do not
+use `allow_zero_cost` or the unknown-invoice reference-cost bypass for
+Moonshot cases. These values are deterministic public reference costs, not
+proof of subscription spend.
 
 The release gate uses real Codex V2 Responses and Claude CLI parents. Each
 parent must select `aawm-sota-moonshot`, dispatch multiple child agents, have

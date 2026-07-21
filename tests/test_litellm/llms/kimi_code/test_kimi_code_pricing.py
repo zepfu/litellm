@@ -2,6 +2,7 @@ import json
 
 import litellm
 import pytest
+from litellm.llms.kimi_code.chat.transformation import KimiCodeChatConfig
 from litellm.types.utils import Usage
 
 
@@ -148,3 +149,33 @@ def test_should_calculate_kimi_code_reference_costs_without_a_second_reasoning_c
         ((prompt_tokens - cached_tokens) * input_rate) + (cached_tokens * cache_read_rate)
     )
     assert completion_cost == pytest.approx(completion_tokens * output_rate)
+
+
+def test_should_calculate_kimi_code_k3_max_cost_without_reasoning_charge_for_pricing_aliases():
+    usage = Usage(
+        prompt_tokens=14_191,
+        completion_tokens=97,
+        total_tokens=14_288,
+        cache_read_input_tokens=13_824,
+    )
+
+    response_cost = litellm.response_cost_calculator(
+        response_object={"usage": usage},
+        model="k3-max",
+        custom_llm_provider="kimi_code",
+        call_type="completion",
+        optional_params={},
+    )
+
+    assert response_cost == pytest.approx(0.0067032)
+
+
+def test_transform_request_should_reject_k3_max_alias():
+    with pytest.raises(ValueError, match="Unsupported managed Kimi Code model"):
+        KimiCodeChatConfig().transform_request(
+            model="k3-max",
+            messages=[{"role": "user", "content": "hello"}],
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )

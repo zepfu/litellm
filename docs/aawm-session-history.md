@@ -630,6 +630,15 @@ The persisted provenance includes `reference_cost_kind`,
 Consumers must not turn a reference amount into actual subscription spend
 or native quota consumption without independent evidence.
 
+Callback observers use the same resolver. If ordinary Kimi cost calculation is
+unavailable, Langfuse receives the positive deterministic reference total as
+the generation cost while retaining
+`actual_invoice_cost_known=false` and the full reference provenance above.
+Overlapping sync and async streaming success handlers must preserve an
+already-calculated positive cost so a continuation callback cannot erase it.
+This callback behavior does not change the session-history contract:
+`response_cost_usd` remains unset because the amount is not an invoice.
+
 ## Rate Limit And Billing Observations
 
 `public.rate_limit_observations` stores provider quota, rate-limit, and billing
