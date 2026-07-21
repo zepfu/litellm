@@ -865,6 +865,55 @@ class AawmErrorLogFileHandler(logging.Handler):
             self._emit_state.active = False
 
 
+def emit_aawm_error_intake_only(
+    logger: logging.Logger,
+    message: str,
+    *args: Any,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Dispatch an ERROR record only to attached AAWM JSONL intake handlers."""
+    try:
+        caller_frame = logging.currentframe()
+        if caller_frame is not None:
+            caller_frame = caller_frame.f_back
+        pathname = caller_frame.f_code.co_filename if caller_frame is not None else ""
+        lineno = caller_frame.f_lineno if caller_frame is not None else 0
+        func_name = caller_frame.f_code.co_name if caller_frame is not None else None
+        record = logger.makeRecord(
+            logger.name,
+            logging.ERROR,
+            pathname,
+            lineno,
+            message,
+            args,
+            None,
+            func=func_name,
+            extra=extra,
+        )
+    except Exception:
+        return
+
+    seen_handlers: set[int] = set()
+    current_logger: Optional[logging.Logger] = logger
+    while current_logger is not None:
+        for handler in current_logger.handlers:
+            handler_id = id(handler)
+            if handler_id in seen_handlers or not isinstance(
+                handler, AawmErrorLogFileHandler
+            ):
+                continue
+            seen_handlers.add(handler_id)
+            if record.levelno < handler.level:
+                continue
+            try:
+                handler.handle(record)
+            except Exception:
+                continue
+        if not current_logger.propagate:
+            break
+        current_logger = current_logger.parent
+
+
 _EGRESS_GUARD_ALERT_LOCK = threading.Lock()
 _EGRESS_GUARD_ALERT_STATE: Dict[str, Any] = {
     "trigger_count": 0,

@@ -38,7 +38,15 @@ from typing import (
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from starlette.websockets import WebSocketState
 from typing_extensions import NotRequired, TypeGuard, TypedDict
@@ -4026,6 +4034,42 @@ def _persist_auto_agent_alias_audit_only_events_best_effort(  # noqa: PLR0915
         return "spool_fallback_enqueue"
 
 
+def _enrich_auto_agent_alias_terminal_event_from_attempts(
+    event: dict[str, Any],
+    attempts: Optional[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    normalized_attempts = [
+        attempt for attempt in attempts or [] if isinstance(attempt, dict)
+    ]
+    if not normalized_attempts:
+        return normalized_attempts
+
+    event["attempt_count"] = len(normalized_attempts)
+    event["attempts"] = copy.deepcopy(normalized_attempts)
+    last_attempt = normalized_attempts[-1]
+    last_failure_class = last_attempt.get("error_class")
+    if last_failure_class is not None:
+        event["failure_class"] = last_failure_class
+    event["attempted_provider_call"] = any(
+        attempt.get("attempted_provider_call") is True
+        for attempt in normalized_attempts
+    )
+    if event["attempted_provider_call"]:
+        event["failure_phase"] = "provider_attempt"
+    for key in (
+        "provider",
+        "model",
+        "route_family",
+        "source_error",
+        "error_type",
+        "error_code",
+    ):
+        value = last_attempt.get(key)
+        if value is not None:
+            event[key] = value
+    return normalized_attempts
+
+
 def _emit_auto_agent_alias_no_candidate_event(
     *,
     alias_family: str,
@@ -4093,15 +4137,10 @@ def _emit_auto_agent_alias_no_candidate_event(
         request_body=request_body,
         include_activity_status=True,
     )
-    normalized_attempts = [
-        attempt for attempt in attempts or [] if isinstance(attempt, dict)
-    ]
-    if normalized_attempts:
-        event["attempt_count"] = len(normalized_attempts)
-        event["attempts"] = copy.deepcopy(normalized_attempts)
-        last_failure_class = normalized_attempts[-1].get("error_class")
-        if last_failure_class is not None:
-            event["failure_class"] = last_failure_class
+    normalized_attempts = _enrich_auto_agent_alias_terminal_event_from_attempts(
+        event,
+        attempts,
+    )
     event["terminal_outcome"] = "agent_session_terminated"
     event["fallback_result"] = "no_candidate_available"
     event["redispatch_required"] = False
@@ -5614,6 +5653,11 @@ def _add_codex_auto_agent_text_error_tokens(
         and "must have non-empty content or tool calls" in text_lower
     ):
         tokens.add("OPENROUTER_INVALID_CHAT_MESSAGE")
+    if (
+        "invalid tool call provided" in text_lower
+        and "tool arguments must be a stringified json object" in text_lower
+    ):
+        tokens.add("OPENROUTER_INVALID_TOOL_CALL_ARGUMENTS")
 
 
 def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
@@ -6387,6 +6431,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "provider_format_rejected"
     if "OPENROUTER_INVALID_CHAT_MESSAGE" in tokens:
         return "provider_format_rejected"
+    if "OPENROUTER_INVALID_TOOL_CALL_ARGUMENTS" in tokens:
+        return "provider_format_rejected"
     if "OPENROUTER_PROVIDER_RAW_ERROR" in tokens:
         return "provider_terminal_error"
     if "aawm_auto_agent_failed_responses_payload" in tokens:
@@ -6547,6 +6593,36 @@ async def _set_codex_auto_agent_candidate_cooldowns(
     )
 
 
+def _get_codex_auto_agent_source_error_summary(
+    exc: Any,
+    *,
+    status_code: Optional[int],
+) -> str:
+    raw_message = _extract_openrouter_adapter_raw_message(exc)
+    if isinstance(raw_message, str) and raw_message:
+        for parsed in _parse_json_payloads_from_text_candidates([raw_message]):
+            if not isinstance(parsed, dict):
+                continue
+            message = parsed.get("message")
+            if not isinstance(message, str):
+                error = parsed.get("error")
+                if isinstance(error, dict):
+                    message = error.get("message")
+            if isinstance(message, str) and message:
+                return _get_passthrough_handled_http_error_summary(
+                    HTTPException(
+                        status_code=status_code
+                        or status.HTTP_502_BAD_GATEWAY,
+                        detail=message,
+                    ),
+                    status_code=status_code,
+                )
+    return _get_passthrough_handled_http_error_summary(
+        exc,
+        status_code=status_code,
+    )
+
+
 def _update_codex_auto_agent_retryable_attempt_record(
     *,
     attempt_record: dict[str, Any],
@@ -6562,7 +6638,7 @@ def _update_codex_auto_agent_retryable_attempt_record(
     error_status_code = _extract_google_adapter_exception_status_code(exc)
     error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
     retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
-    source_error = _get_passthrough_handled_http_error_summary(
+    source_error = _get_codex_auto_agent_source_error_summary(
         exc,
         status_code=error_status_code,
     )
@@ -11523,6 +11599,117 @@ def _openrouter_chat_message_has_valid_content_or_tool_calls(message: Any) -> bo
     return not _is_codex_google_code_assist_empty_text_content(content)
 
 
+def _copy_openrouter_message_value(
+    value: Any,
+    *,
+    field_name: str,
+    field_value: Any,
+) -> Any:
+    if isinstance(value, dict):
+        updated = dict(value)
+        updated[field_name] = field_value
+        return updated
+
+    updated = copy.deepcopy(value)
+    setattr(updated, field_name, field_value)
+    return updated
+
+
+def _serialize_openrouter_tool_call_arguments(arguments: Any) -> tuple[str, str]:
+    if isinstance(arguments, dict):
+        argument_kind = "object"
+    elif isinstance(arguments, (list, tuple)):
+        argument_kind = "array"
+    else:
+        argument_kind = "scalar"
+
+    try:
+        serialized = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        serialized = json.dumps(
+            str(arguments),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return serialized, argument_kind
+
+
+def _normalize_openrouter_chat_message_tool_call_arguments(
+    message: Any,
+) -> tuple[Any, dict[str, int]]:
+    if isinstance(message, dict):
+        tool_calls = message.get("tool_calls")
+    else:
+        tool_calls = getattr(message, "tool_calls", None)
+    if not isinstance(tool_calls, list):
+        return message, {}
+
+    updated_tool_calls: list[Any] = []
+    normalized_counts = {
+        "object": 0,
+        "array": 0,
+        "scalar": 0,
+    }
+    changed = False
+    for tool_call in tool_calls:
+        if isinstance(tool_call, dict):
+            function = tool_call.get("function")
+        else:
+            function = getattr(tool_call, "function", None)
+        if function is None:
+            updated_tool_calls.append(tool_call)
+            continue
+
+        if isinstance(function, dict):
+            if "arguments" not in function:
+                updated_tool_calls.append(tool_call)
+                continue
+            arguments = function.get("arguments")
+        else:
+            if not hasattr(function, "arguments"):
+                updated_tool_calls.append(tool_call)
+                continue
+            arguments = getattr(function, "arguments", None)
+        if isinstance(arguments, str):
+            updated_tool_calls.append(tool_call)
+            continue
+
+        normalized_arguments, argument_kind = (
+            _serialize_openrouter_tool_call_arguments(arguments)
+        )
+        updated_function = _copy_openrouter_message_value(
+            function,
+            field_name="arguments",
+            field_value=normalized_arguments,
+        )
+        updated_tool_calls.append(
+            _copy_openrouter_message_value(
+                tool_call,
+                field_name="function",
+                field_value=updated_function,
+            )
+        )
+        normalized_counts[argument_kind] += 1
+        changed = True
+
+    if not changed:
+        return message, {}
+    return (
+        _copy_openrouter_message_value(
+            message,
+            field_name="tool_calls",
+            field_value=updated_tool_calls,
+        ),
+        normalized_counts,
+    )
+
+
 def _sanitize_openrouter_completion_messages_for_chat_completion(
     completion_kwargs: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -11539,13 +11726,31 @@ def _sanitize_openrouter_completion_messages_for_chat_completion(
 
     updated_messages: list[Any] = []
     removed_empty_message_count = 0
+    normalized_tool_argument_message_count = 0
+    normalized_tool_argument_counts = {
+        "object": 0,
+        "array": 0,
+        "scalar": 0,
+    }
     for message in messages:
-        if _openrouter_chat_message_has_valid_content_or_tool_calls(message):
-            updated_messages.append(message)
+        if not _openrouter_chat_message_has_valid_content_or_tool_calls(message):
+            removed_empty_message_count += 1
             continue
-        removed_empty_message_count += 1
+        normalized_message, normalized_counts = (
+            _normalize_openrouter_chat_message_tool_call_arguments(message)
+        )
+        updated_messages.append(normalized_message)
+        if normalized_counts:
+            normalized_tool_argument_message_count += 1
+            for key, count in normalized_counts.items():
+                normalized_tool_argument_counts[key] += count
 
-    if removed_empty_message_count == 0 and not adjacency_changes:
+    normalized_tool_argument_count = sum(normalized_tool_argument_counts.values())
+    if (
+        removed_empty_message_count == 0
+        and normalized_tool_argument_count == 0
+        and not adjacency_changes
+    ):
         return completion_kwargs, {}
 
     updated_kwargs = dict(completion_kwargs)
@@ -11558,6 +11763,27 @@ def _sanitize_openrouter_completion_messages_for_chat_completion(
             removed_empty_message_count
         ),
     }
+    if normalized_tool_argument_count:
+        changes.update(
+            {
+                "openrouter_chat_tool_arguments_sanitized": True,
+                "openrouter_chat_tool_arguments_normalized_count": (
+                    normalized_tool_argument_count
+                ),
+                "openrouter_chat_tool_arguments_message_count": (
+                    normalized_tool_argument_message_count
+                ),
+                "openrouter_chat_tool_arguments_object_count": (
+                    normalized_tool_argument_counts["object"]
+                ),
+                "openrouter_chat_tool_arguments_array_count": (
+                    normalized_tool_argument_counts["array"]
+                ),
+                "openrouter_chat_tool_arguments_scalar_count": (
+                    normalized_tool_argument_counts["scalar"]
+                ),
+            }
+        )
     if adjacency_changes:
         changes.update(adjacency_changes)
         changes["openrouter_chat_tool_adjacency_sanitized"] = True
@@ -22619,6 +22845,52 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
     # Request-scoped total for eligible native Grok continuation transient
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
+
+    def _raise_terminal_alias_failure(exc: Exception) -> Never:
+        last_attempt = attempts[-1] if attempts else {}
+        error_class = str(
+            last_attempt.get("error_class")
+            or _classify_codex_auto_agent_retryable_exhaustion(exc)
+            or "provider_terminal_error"
+        )
+        if error_class in {
+            "capacity_exhausted",
+            "rate_limited",
+            "usage_limit_reached",
+        }:
+            terminal_status_code = status.HTTP_429_TOO_MANY_REQUESTS
+        elif error_class == "safety_policy_denied":
+            terminal_status_code = status.HTTP_403_FORBIDDEN
+        elif error_class == "upstream_timeout":
+            terminal_status_code = status.HTTP_504_GATEWAY_TIMEOUT
+        elif error_class == "candidate_unavailable":
+            terminal_status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            terminal_status_code = status.HTTP_502_BAD_GATEWAY
+        source_error = _get_codex_auto_agent_source_error_summary(
+            exc,
+            status_code=_extract_google_adapter_exception_status_code(exc),
+        )
+        terminal_exc = HTTPException(
+            status_code=terminal_status_code,
+            detail={
+                "error": {
+                    "message": source_error,
+                    "type": error_class,
+                    "code": "all_candidates_unavailable",
+                }
+            },
+        )
+        _emit_auto_agent_alias_no_candidate_event(
+            alias_family=alias_family,
+            alias_model=alias_model,
+            request=request,
+            request_body=prepared_request_body,
+            exc=terminal_exc,
+            attempts=attempts,
+        )
+        raise terminal_exc from None
+
     for _attempt_number in range(max_candidate_attempts):
         try:
             selection = await select_candidate_fn(
@@ -22863,11 +23135,11 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     continue
                 if native_grok_retry_eligible:
                     # Same-candidate budget exhausted; do not switch providers.
-                    raise last_retryable_exc
+                    _raise_terminal_alias_failure(last_retryable_exc)
                 break
 
     if last_retryable_exc is not None:
-        raise last_retryable_exc
+        _raise_terminal_alias_failure(last_retryable_exc)
     raise HTTPException(
         status_code=429,
         detail=no_candidate_detail,

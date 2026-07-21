@@ -1,6 +1,7 @@
 import json
 import logging
 from pathlib import Path
+from io import StringIO
 
 import pytest
 
@@ -11,6 +12,7 @@ from litellm._logging import (
     _get_aawm_error_log_backup_count,
     _get_aawm_error_log_max_bytes,
     _get_aawm_error_log_path,
+    emit_aawm_error_intake_only,
 )
 
 
@@ -74,6 +76,54 @@ def test_aawm_error_log_filtering(aawm_error_log_setup):
     assert "test critical" in messages
     assert "test info" not in messages
     assert "test warning without traceback" not in messages
+
+
+def test_emit_aawm_error_intake_only_skips_console_handlers(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENABLED", "1")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+
+    intake_handler = AawmErrorLogFileHandler()
+    console_output = StringIO()
+    console_handler = logging.StreamHandler(console_output)
+    logger = logging.getLogger("aawm-intake-only-test")
+    logger.handlers = [intake_handler, console_handler]
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    try:
+        emit_aawm_error_intake_only(
+            logger,
+            "handled provider error status=%s error=%s",
+            400,
+            "Unsupported content type",
+            extra={"status_code": 400, "failure_kind": "handled_upstream_client_error"},
+        )
+        intake_handler.flush()
+
+        assert console_output.getvalue() == ""
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "test-error.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert len(records) == 1
+        assert records[0]["message"] == (
+            "handled provider error status=400 error=Unsupported content type"
+        )
+        assert records[0]["context"]["status_code"] == 400
+        assert (
+            records[0]["context"]["failure_kind"]
+            == "handled_upstream_client_error"
+        )
+    finally:
+        intake_handler.close()
+        console_handler.close()
+        logger.handlers = []
 
 
 def test_aawm_error_log_disabled_by_default(monkeypatch, tmp_path):

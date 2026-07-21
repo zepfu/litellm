@@ -188,30 +188,17 @@ these docs only as needed:
 
 ## Next
 
-- Publish and promote `v1.82.3-aawm.131` only after the exact committed image
-  passes the complete Moonshot and Alibaba tool-focused gate on `litellm-dev`
-  `:4001`. Do not treat the current bind-mounted source proof as image proof.
-  Use only the existing authenticated repository harness; never inspect,
-  copy, synthesize, refresh, replace, or reauthorize Claude, Codex, Kimi, or
-  Alibaba credentials. Run each Claude case serially and stop immediately on a
-  pre-traffic authentication failure.
-  Moonshot and Alibaba each require four cases: Codex collaboration, Codex Bash
-  system time, Claude collaboration, and Claude Bash system time.
-  Collaboration must dispatch two provider-specific children and have each
-  child complete two sequential batches of three parallel tool calls; the
-  parent returns only the concise deterministic marker block capped at 160
-  characters. Bash runs `date --iso-8601=seconds` exactly once and returns its
-  exact stdout. These validate tool usage, not throughput; filler and large
-  block-text output are prohibited.
-  Require canonical provider-native egress, no public alias in upstream
-  payloads, readable route rollups, exact sanitized failed rows, red failure
-  coloring, blue cooldown coloring, three-hour Grok 403/402 cooldowns, clean
-  overlapping Docker logs, Langfuse traces, and exact
-  `aawm_tristore.public.session_history` plus tool-activity correlation.
-  After the atomic dev gate passes, follow `PROD_RELEASE.md`, promote only that
-  exact image and required overlay assets, and rerun the same scoped cases with
-  `--target prod`. Never blanket-stop containers; recreate or restart only the
-  named service required by the runbook.
+- Publish and promote `v1.82.3-aawm.132`. The exact synchronized composite
+  candidate passed all eight concise Moonshot and Alibaba Codex/Claude cases on
+  `litellm-dev` `:4001` with clean logs, Langfuse traces, and
+  `aawm_tristore` correlation. The required callback `0.0.68`, control-plane
+  `0.0.11`, model-config `0.0.28`, and harness `0.0.43` GitHub Releases now
+  exist. Remaining work is to publish the `.132` core image, verify its exact
+  installed contents, follow `PROD_RELEASE.md` to promote only that image, and
+  rerun the same eight scoped cases with `--target prod`. Continue using only
+  the existing authenticated harness and canonical in-place credentials; keep
+  Claude cases serialized, keep the cases tool-focused rather than
+  throughput-oriented, and never blanket-stop containers.
 
 - Rerun the Spark/Codex-dependent prod harness cases after the upstream Codex
   quota reset at `2026-05-18 15:08:41 UTC`: at minimum

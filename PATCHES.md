@@ -58,6 +58,38 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.132 - Shared terminal-error and provider-format hardening
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.132`.
+OpenRouter chat-completion egress now serializes non-string tool arguments as
+JSON without mutating the inbound request. The exact Cohere rejection for
+non-stringified tool arguments is classified as `provider_format_rejected`, so
+alias routing can cool down that candidate and continue instead of exposing a
+raw provider exception.
+
+Terminal alias failures now return bounded HTTP errors with sanitized source
+details and persist the complete attempted-provider context. Expected handled
+429 and 4xx failures are represented by the standard route rollup without a
+duplicate standalone console warning/error or traceback. Generic handled 4xx
+events still reach structured AAWM error intake through the JSONL-only handler.
+
+**Why:** The synchronized Moonshot and Alibaba dev gate exposed shared
+OpenRouter/Cohere format failures and handled provider errors outside the
+provider-attributed case windows. Those failures must remain actionable in
+rollups and structured intake without leaking raw provider envelopes, request
+identifiers, or ASGI tracebacks into Docker logs.
+
+**Why not upstream:** The alias candidate classification, AAWM route rollups,
+structured error-intake split, and production logging contract are fork-local
+behavior.
+
+**Validation status:** The exact composite candidate passed all eight concise
+Moonshot and Alibaba Codex/Claude dev harness cases on one unchanged
+`litellm-dev` runtime. Full alias and pass-through modules, focused provider and
+handled-error slices, JSONL logging tests, Ruff, Python compilation, and
+`git diff --check` pass. Production promotion and the matching eight-case
+production acceptance remain required under `PROD_RELEASE.md`.
+
 ### aawm.131 - Artifact-converged Moonshot and Alibaba release
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.131`. This release

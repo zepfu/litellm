@@ -4574,7 +4574,7 @@ class TestPassThroughTerminalFailureLogging:
         assert payload.get("traceback") in (None, "")
 
     @pytest.mark.asyncio
-    async def test_pass_through_request_429_warns_without_error_intake_traceback(
+    async def test_pass_through_request_429_uses_rollup_without_standalone_warning(
         self,
         monkeypatch,
         tmp_path,
@@ -4620,7 +4620,12 @@ class TestPassThroughTerminalFailureLogging:
             ) as mock_sleep, patch.object(
                 verbose_proxy_logger,
                 "warning",
-            ) as mock_warning:
+            ) as mock_warning, patch.object(
+                verbose_proxy_logger,
+                "debug",
+            ) as mock_debug, patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.record_aawm_route_rollup_failure"
+            ) as mock_rollup_failure:
                 mock_client_obj = MagicMock()
                 mock_client_obj.client = MagicMock()
                 mock_get_client.return_value = mock_client_obj
@@ -4641,11 +4646,19 @@ class TestPassThroughTerminalFailureLogging:
                 assert exc_info.value.code == "429"
                 assert handler.await_count == 1
                 mock_sleep.assert_not_awaited()
-                mock_warning.assert_called_once()
+                mock_warning.assert_not_called()
+                rate_limit_debug = next(
+                    call
+                    for call in mock_debug.call_args_list
+                    if "recorded expected upstream rate limit" in str(call.args[0])
+                )
                 assert (
-                    mock_warning.call_args.kwargs["extra"]["failure_kind"]
+                    rate_limit_debug.kwargs["extra"]["failure_kind"]
                     == "expected_provider_rate_limit"
                 )
+                assert rate_limit_debug.args[2] == "Rate limited"
+                mock_rollup_failure.assert_called_once()
+                assert mock_rollup_failure.call_args.kwargs["message"] == "Rate limited"
                 mock_logging_obj.post_call_failure_hook.assert_awaited_once()
                 assert (
                     mock_logging_obj.post_call_failure_hook.await_args.kwargs[
@@ -5235,8 +5248,8 @@ class TestPassThroughTerminalFailureLogging:
             "litellm.proxy.proxy_server.proxy_logging_obj"
         ) as mock_logging_obj, patch.object(
             verbose_proxy_logger,
-            "error",
-        ) as mock_error, patch.object(
+            "debug",
+        ) as mock_debug, patch.object(
             verbose_proxy_logger,
             "exception",
         ) as mock_exception:
@@ -5261,18 +5274,17 @@ class TestPassThroughTerminalFailureLogging:
         assert exc_info.value.code == "400"
         assert str(upstream_detail, "utf-8") in str(exc_info.value.detail)
         mock_exception.assert_not_called()
-        error_call = next(
+        debug_call = next(
             call
-            for call in mock_error.call_args_list
-            if "handled client/provider error" in str(call.args[0])
+            for call in mock_debug.call_args_list
+            if "recorded handled client/provider error" in str(call.args[0])
         )
-        assert error_call.args[1] == 400
-        assert error_call.args[2] == "Unsupported content type"
+        assert debug_call.args[1] == 400
+        assert debug_call.args[2] == "Unsupported content type"
         assert (
-            error_call.kwargs["extra"]["failure_kind"]
+            debug_call.kwargs["extra"]["failure_kind"]
             == "handled_upstream_client_error"
         )
-        assert error_call.kwargs["exc_info"] is False
         mock_logging_obj.post_call_failure_hook.assert_awaited_once()
         assert (
             mock_logging_obj.post_call_failure_hook.await_args.kwargs[

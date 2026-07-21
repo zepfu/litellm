@@ -37,6 +37,7 @@ from websockets.exceptions import (
 
 import litellm
 from litellm._logging import (
+    emit_aawm_error_intake_only,
     trigger_egress_guard_alert,
     verbose_proxy_logger,
 )
@@ -4259,10 +4260,10 @@ async def pass_through_request(  # noqa: PLR0915
                 extra=error_log_context,
             )
         elif suppress_provider_rate_limit_traceback:
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced upstream rate limit status=%s error=%s",
+            verbose_proxy_logger.debug(
+                "Pass through endpoint recorded expected upstream rate limit in route rollup status=%s error=%s",
                 status_code,
-                str(e),
+                route_failure_summary,
                 extra={
                     **error_log_context,
                     "failure_kind": "expected_provider_rate_limit",
@@ -4327,18 +4328,28 @@ async def pass_through_request(  # noqa: PLR0915
                 extra=error_log_context,
             )
         elif suppress_handled_http_client_error_traceback:
-            verbose_proxy_logger.error(
+            handled_error_summary = _get_passthrough_handled_http_error_summary(
+                e,
+                status_code=status_code,
+            )
+            emit_aawm_error_intake_only(
+                verbose_proxy_logger,
                 "Pass through endpoint surfaced handled client/provider error status=%s error=%s",
                 status_code,
-                _get_passthrough_handled_http_error_summary(
-                    e,
-                    status_code=status_code,
-                ),
+                handled_error_summary,
                 extra={
                     **error_log_context,
                     "failure_kind": "handled_upstream_client_error",
                 },
-                exc_info=False,
+            )
+            verbose_proxy_logger.debug(
+                "Pass through endpoint recorded handled client/provider error in route rollup status=%s error=%s",
+                status_code,
+                route_failure_summary,
+                extra={
+                    **error_log_context,
+                    "failure_kind": "handled_upstream_client_error",
+                },
             )
         elif suppress_terminal_failure_traceback:
             hidden_retry_metadata = _ensure_passthrough_metadata(kwargs)

@@ -11192,6 +11192,98 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         assert changes["openrouter_chat_message_shape_messages_from_count"] == 6
         assert changes["openrouter_chat_message_shape_messages_to_count"] == 3
 
+    def test_openrouter_sanitizer_stringifies_non_string_tool_arguments_for_dict_and_object_messages(
+        self,
+    ):
+        object_function = SimpleNamespace(name="Read", arguments={"path": "b.txt"})
+        object_tool_call = SimpleNamespace(
+            id="call_object",
+            type="function",
+            function=object_function,
+        )
+        object_message = SimpleNamespace(
+            role="assistant",
+            content=None,
+            tool_calls=[object_tool_call],
+        )
+        completion_kwargs = {
+            "messages": [
+                {"role": "user", "content": "start"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_dict",
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "arguments": {"path": "a.txt"},
+                            },
+                        },
+                        {
+                            "id": "call_list",
+                            "type": "function",
+                            "function": {
+                                "name": "Batch",
+                                "arguments": ["a", "b"],
+                            },
+                        },
+                        {
+                            "id": "call_scalar",
+                            "type": "function",
+                            "function": {"name": "Count", "arguments": 7},
+                        },
+                        {
+                            "id": "call_string",
+                            "type": "function",
+                            "function": {
+                                "name": "Grep",
+                                "arguments": '{"pattern":"keep"}',
+                            },
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_dict", "content": "ok"},
+                {"role": "tool", "tool_call_id": "call_list", "content": "ok"},
+                {"role": "tool", "tool_call_id": "call_scalar", "content": "ok"},
+                {"role": "tool", "tool_call_id": "call_string", "content": "ok"},
+                object_message,
+                SimpleNamespace(
+                    role="tool",
+                    tool_call_id="call_object",
+                    content="ok",
+                ),
+            ]
+        }
+
+        updated_kwargs, changes = (
+            _sanitize_openrouter_completion_messages_for_chat_completion(
+                completion_kwargs
+            )
+        )
+
+        dict_tool_calls = updated_kwargs["messages"][1]["tool_calls"]
+        assert json.loads(dict_tool_calls[0]["function"]["arguments"]) == {
+            "path": "a.txt"
+        }
+        assert json.loads(dict_tool_calls[1]["function"]["arguments"]) == ["a", "b"]
+        assert json.loads(dict_tool_calls[2]["function"]["arguments"]) == 7
+        assert (
+            dict_tool_calls[3]["function"]["arguments"]
+            == '{"pattern":"keep"}'
+        )
+        updated_object_message = updated_kwargs["messages"][6]
+        assert json.loads(
+            updated_object_message.tool_calls[0].function.arguments
+        ) == {"path": "b.txt"}
+        assert object_message.tool_calls[0].function.arguments == {"path": "b.txt"}
+        assert changes["openrouter_chat_tool_arguments_sanitized"] is True
+        assert changes["openrouter_chat_tool_arguments_normalized_count"] == 4
+        assert changes["openrouter_chat_tool_arguments_message_count"] == 2
+        assert changes["openrouter_chat_tool_arguments_object_count"] == 2
+        assert changes["openrouter_chat_tool_arguments_array_count"] == 1
+        assert changes["openrouter_chat_tool_arguments_scalar_count"] == 1
+
     @pytest.mark.asyncio
     async def test_codex_openrouter_completion_route_sanitizes_empty_messages_before_egress(
         self,
@@ -11242,7 +11334,10 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                         {
                             "id": "call_ok",
                             "type": "function",
-                            "function": {"name": "Grep", "arguments": "{}"},
+                            "function": {
+                                "name": "Grep",
+                                "arguments": {"pattern": "needle"},
+                            },
                         }
                     ],
                 },
@@ -11284,6 +11379,11 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             message["role"] if isinstance(message, dict) else message.role
             for message in acompletion_kwargs["messages"]
         ] == ["user", "assistant", "tool", "user"]
+        assert json.loads(
+            acompletion_kwargs["messages"][1]["tool_calls"][0]["function"][
+                "arguments"
+            ]
+        ) == {"pattern": "needle"}
         litellm_metadata = acompletion_kwargs["litellm_metadata"]
         assert litellm_metadata["openrouter_chat_message_shape_sanitized"] is True
         assert (
@@ -11291,6 +11391,10 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 "openrouter_chat_message_shape_removed_empty_message_count"
             ]
             == 1
+        )
+        assert litellm_metadata["openrouter_chat_tool_arguments_sanitized"] is True
+        assert (
+            litellm_metadata["openrouter_chat_tool_arguments_normalized_count"] == 1
         )
         assert "openrouter-chat-message-shape-sanitized" in litellm_metadata["tags"]
         response_body = json.loads(response.body.decode("utf-8"))
@@ -11376,6 +11480,155 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         )
         assert luna_attempt["status"] == "cooldown_set"
         assert luna_attempt["error_class"] == "candidate_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_codex_auto_agent_alias_openrouter_invalid_tool_arguments_failsover(
+        self,
+        monkeypatch,
+    ):
+        request = _build_codex_auto_agent_request()
+        body = {
+            "model": "aawm-low",
+            "input": "hello",
+            "stream": False,
+            "litellm_metadata": {
+                "session_id": "codex-session",
+                "repository": "litellm",
+            },
+        }
+        monkeypatch.setitem(
+            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
+            "aawm-low",
+            (
+                {
+                    "provider": "openrouter",
+                    "model": "openrouter/cohere/north-mini-code:free",
+                    "route_family": "codex_openrouter_completion_adapter",
+                    "last_resort": False,
+                },
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
+                    "route_family": "codex_responses",
+                    "last_resort": True,
+                },
+            ),
+        )
+        openrouter_format_error = RuntimeError(
+            "OpenrouterException - "
+            '{"error":{"message":"Provider returned error","code":400,'
+            '"metadata":{"raw":"{\\"id\\":\\"provider-id\\",'
+            '\\"message\\":\\"invalid tool call provided in messages[4].'
+            'tool_calls[0]: tool arguments must be a stringified JSON object\\"}",'
+            '"provider_name":"Cohere","is_byok":false}},'
+            '"user_id":"private-user-id"}'
+        )
+        mini_success = Response(content='{"ok": true}', media_type="application/json")
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
+            new=AsyncMock(side_effect=openrouter_format_error),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(return_value=mini_success),
+        ) as mock_pass_through:
+            response = await _handle_codex_auto_agent_alias_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key=None,
+                forward_headers=True,
+            )
+
+        assert response is mini_success
+        mini_body = mock_pass_through.await_args.kwargs["custom_body"]
+        first_attempt = mini_body["litellm_metadata"]["codex_auto_agent_attempts"][0]
+        assert first_attempt["error_class"] == "provider_format_rejected"
+        assert (
+            "OPENROUTER_INVALID_TOOL_CALL_ARGUMENTS"
+            in first_attempt["error_tokens"]
+        )
+        assert first_attempt["source_error"] == (
+            "invalid tool call provided in messages[4].tool_calls[0]: "
+            "tool arguments must be a stringified JSON object"
+        )
+        assert "provider-id" not in first_attempt["source_error"]
+        assert "private-user-id" not in first_attempt["source_error"]
+
+    @pytest.mark.asyncio
+    async def test_codex_auto_agent_alias_terminal_format_failure_is_handled(
+        self,
+        monkeypatch,
+    ):
+        request = _build_codex_auto_agent_request()
+        body = {
+            "model": "aawm-low",
+            "input": "hello",
+            "stream": False,
+            "litellm_metadata": {
+                "session_id": "codex-session",
+                "repository": "litellm",
+            },
+        }
+        monkeypatch.setitem(
+            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
+            "aawm-low",
+            (
+                {
+                    "provider": "openrouter",
+                    "model": "openrouter/cohere/north-mini-code:free",
+                    "route_family": "codex_openrouter_completion_adapter",
+                    "last_resort": True,
+                },
+            ),
+        )
+        openrouter_format_error = RuntimeError(
+            "OpenrouterException - "
+            '{"error":{"message":"Provider returned error","code":400,'
+            '"metadata":{"raw":"{\\"id\\":\\"provider-id\\",'
+            '\\"message\\":\\"invalid tool call provided in messages[4].'
+            'tool_calls[0]: tool arguments must be a stringified JSON object\\"}",'
+            '"provider_name":"Cohere","is_byok":false}},'
+            '"user_id":"private-user-id"}'
+        )
+        terminal_calls = []
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
+            new=AsyncMock(side_effect=openrouter_format_error),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_auto_agent_alias_no_candidate_event",
+            side_effect=lambda **kwargs: terminal_calls.append(kwargs),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await _handle_codex_auto_agent_alias_route(
+                    endpoint="/v1/responses",
+                    request=request,
+                    fastapi_response=MagicMock(spec=Response),
+                    user_api_key_dict=MagicMock(),
+                    prepared_request_body=body,
+                    target_url="https://chatgpt.com/backend-api/codex/responses",
+                    api_key=None,
+                    forward_headers=True,
+                )
+
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.detail["error"] == {
+            "message": (
+                "invalid tool call provided in messages[4].tool_calls[0]: "
+                "tool arguments must be a stringified JSON object"
+            ),
+            "type": "provider_format_rejected",
+            "code": "all_candidates_unavailable",
+        }
+        assert len(terminal_calls) == 1
+        attempts = terminal_calls[0]["attempts"]
+        assert attempts[0]["error_class"] == "provider_format_rejected"
+        assert "provider-id" not in str(exc_info.value.detail)
+        assert "private-user-id" not in str(exc_info.value.detail)
 
     @pytest.mark.asyncio
     async def test_codex_opencode_zen_route_sanitizes_unmatched_tool_call_messages(
@@ -21461,6 +21714,7 @@ async def test_anthropic_auto_agent_alias_low_uses_default_low_candidates(
         "openrouter/owl-alpha",
         "deepseek-v4-flash",
         "big-pickle",
+        "alibaba_token_plan/qwen3.6-flash",
         "claude-haiku-4-5-20251001",
     ]
 
@@ -21495,6 +21749,12 @@ async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
             "opencode_zen",
             "big-pickle",
             "anthropic_opencode_zen_completion_adapter",
+            False,
+        ),
+        (
+            "alibaba_token_plan",
+            "alibaba_token_plan/qwen3.6-flash",
+            "anthropic_alibaba_token_plan_chat_completions_adapter",
             False,
         ),
         (
@@ -21949,7 +22209,7 @@ async def test_anthropic_read_agent_alias_openai_adapter_cooldown_survives_fresh
 
 
 @pytest.mark.asyncio
-async def test_anthropic_sota_alias_falls_back_to_opus_after_fable_high_demand(
+async def test_anthropic_sota_alias_handles_terminal_high_demand_after_fallback(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
@@ -21974,7 +22234,7 @@ async def test_anthropic_sota_alias_falls_back_to_opus_after_fable_high_demand(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_google_completion_adapter_route",
         new=AsyncMock(),
     ) as mock_antigravity:
-        with pytest.raises(RuntimeError, match="high demand"):
+        with pytest.raises(HTTPException) as exc_info:
             await _handle_anthropic_auto_agent_alias_route(
                 endpoint="/v1/messages",
                 request=request,
@@ -21985,6 +22245,15 @@ async def test_anthropic_sota_alias_falls_back_to_opus_after_fable_high_demand(
                 custom_headers={"x-api-key": "anthropic-key"},
             )
 
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"] == {
+        "message": (
+            "We're currently experiencing high demand, which may cause "
+            "temporary errors."
+        ),
+        "type": "capacity_exhausted",
+        "code": "all_candidates_unavailable",
+    }
     assert mock_native.await_count == 2
     mock_antigravity.assert_not_called()
     mock_antigravity_lane.assert_not_called()
@@ -22724,6 +22993,11 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
     ) as mock_load_opencode_key, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body",
     ) as mock_set_body, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_alibaba_token_plan_adapter_route",
+        new=AsyncMock(
+            side_effect=_build_alibaba_token_plan_candidate_unavailable_error()
+        ),
+    ) as mock_alibaba, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
         new=AsyncMock(return_value=success),
     ) as mock_native:
@@ -22740,6 +23014,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
     assert response is success
     assert mock_openrouter_key.call_count == 2
     assert mock_load_opencode_key.await_count == 2
+    mock_alibaba.assert_awaited_once()
     mock_native.assert_awaited_once()
     candidate_body = mock_set_body.call_args.args[1]
     assert candidate_body["model"] == "claude-haiku-4-5-20251001"
@@ -22782,6 +23057,14 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
         "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
         for attempt in opencode_attempts
     )
+    alibaba_attempt = next(
+        attempt
+        for attempt in metadata["anthropic_auto_agent_attempts"]
+        if attempt["provider"] == "alibaba_token_plan"
+    )
+    assert alibaba_attempt["model"] == "alibaba_token_plan/qwen3.6-flash"
+    assert alibaba_attempt["status"] == "cooldown_set"
+    assert alibaba_attempt["error_class"] == "candidate_unavailable"
     skipped_models = {
         candidate["model"]
         for candidate in metadata["anthropic_auto_agent_skipped_candidates"]
@@ -22790,6 +23073,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
     assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
+    assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
 
 @pytest.mark.asyncio
@@ -22821,6 +23105,12 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
             new=AsyncMock(side_effect=free_usage_error),
         ) as mock_completion_handler, \
         patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_alibaba_token_plan_adapter_route",
+            new=AsyncMock(
+                side_effect=_build_alibaba_token_plan_candidate_unavailable_error()
+            ),
+        ) as mock_alibaba, \
+        patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request",
             new=AsyncMock(return_value=success),
         ) as mock_native:
@@ -22839,6 +23129,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
     assert mock_opencode_key.await_count == 2
     mock_pass_through.assert_awaited_once()
     mock_completion_handler.assert_awaited_once()
+    mock_alibaba.assert_awaited_once()
     mock_native.assert_awaited_once()
     candidate_body = mock_set_body.call_args.args[1]
     assert candidate_body["model"] == "claude-haiku-4-5-20251001"
@@ -22878,6 +23169,14 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
         "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
         for attempt in opencode_attempts
     )
+    alibaba_attempt = next(
+        attempt
+        for attempt in metadata["anthropic_auto_agent_attempts"]
+        if attempt["provider"] == "alibaba_token_plan"
+    )
+    assert alibaba_attempt["model"] == "alibaba_token_plan/qwen3.6-flash"
+    assert alibaba_attempt["status"] == "cooldown_set"
+    assert alibaba_attempt["error_class"] == "candidate_unavailable"
     skipped_models = {
         candidate["model"]
         for candidate in metadata["anthropic_auto_agent_skipped_candidates"]
@@ -22886,6 +23185,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
     assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
+    assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
 
 @pytest.mark.asyncio
@@ -25502,6 +25802,7 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
             "status": "cooldown_set",
             "error_class": "safety_policy_denied",
             "error_status_code": 403,
+            "source_error": "Content violates usage guidelines",
             "cooldown_scope": "request_local",
             "attempted_provider_call": True,
         },
@@ -25549,6 +25850,9 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
     terminal_context = terminal_record["error_context"]
     assert terminal_context["failure_kind"] == "agent_alias_no_candidate"
     assert terminal_context["failure_class"] == "safety_policy_denied"
+    assert terminal_context["source_error"] == "Content violates usage guidelines"
+    assert terminal_context["attempted_provider_call"] is True
+    assert terminal_context["failure_phase"] == "provider_attempt"
     assert terminal_context["agent_id"] == "agent-safety-terminal"
     assert terminal_context["agent_name"] == "worker"
     assert terminal_context["agent_role"] == "worker"
@@ -27179,6 +27483,7 @@ async def test_codex_auto_agent_alias_low_uses_default_low_candidates(
         "deepseek-v4-flash",
         "big-pickle",
         "gpt-5.6-luna",
+        "alibaba_token_plan/qwen3.6-flash",
         "gpt-5.4-mini",
     ]
 
@@ -27218,6 +27523,12 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
             False,
         ),
         ("openai", "gpt-5.6-luna", "codex_responses", False),
+        (
+            "alibaba_token_plan",
+            "alibaba_token_plan/qwen3.6-flash",
+            "codex_alibaba_token_plan_chat_completions_adapter",
+            False,
+        ),
         ("openai", "gpt-5.4-mini", "codex_responses", True),
     ]
 
@@ -27633,6 +27944,20 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_deepseek_tool_mismatch
     )
     assert "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in _extract_codex_auto_agent_error_tokens(
         exc
+    )
+
+
+def test_codex_auto_agent_retryable_exhaustion_classifies_openrouter_tool_arguments():
+    exc = RuntimeError(
+        "OpenrouterException - invalid tool call provided in messages[4]."
+        "tool_calls[0]: tool arguments must be a stringified JSON object"
+    )
+
+    assert _classify_codex_auto_agent_retryable_exhaustion(exc) == (
+        "provider_format_rejected"
+    )
+    assert "OPENROUTER_INVALID_TOOL_CALL_ARGUMENTS" in (
+        _extract_codex_auto_agent_error_tokens(exc)
     )
 
 
@@ -28562,7 +28887,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
         new=AsyncMock(),
     ) as mock_sleep:
-        with pytest.raises(ProxyException) as exc_info:
+        with pytest.raises(HTTPException) as exc_info:
             await _handle_codex_auto_agent_alias_route(
                 endpoint="/v1/responses",
                 request=request,
@@ -28574,8 +28899,12 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same
                 forward_headers=True,
             )
 
-    assert str(exc_info.value.message) == "Temporary upstream provider failure"
-    assert str(exc_info.value.code) == "502"
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail["error"] == {
+        "message": "HTTP 502 request rejected",
+        "type": "upstream_transient_internal",
+        "code": "all_candidates_unavailable",
+    }
     assert mock_grok_native.await_count == 8
     mock_xai_oauth.assert_not_called()
     assert mock_sleep.await_count == 7
@@ -28648,7 +28977,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.asyncio.sleep",
         new=AsyncMock(),
     ) as mock_sleep:
-        with pytest.raises(ProxyException) as exc_info:
+        with pytest.raises(HTTPException) as exc_info:
             await _handle_anthropic_auto_agent_alias_route(
                 endpoint="/v1/messages",
                 request=request,
@@ -28659,8 +28988,12 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_
                 custom_headers={"x-api-key": "anthropic-key"},
             )
 
-    assert str(exc_info.value.message) == "Temporary upstream provider failure"
-    assert str(exc_info.value.code) == "502"
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail["error"] == {
+        "message": "HTTP 502 request rejected",
+        "type": "upstream_transient_internal",
+        "code": "all_candidates_unavailable",
+    }
     assert mock_grok_native.await_count == 8
     mock_spark.assert_not_called()
     mock_xai_oauth.assert_not_called()
@@ -30097,7 +30430,7 @@ async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_codex_sota_alias_falls_back_to_gpt55_after_sol_high_demand(
+async def test_codex_sota_alias_handles_terminal_high_demand_after_fallback(
     monkeypatch,
 ):
     request = _build_codex_auto_agent_request()
@@ -30124,7 +30457,7 @@ async def test_codex_sota_alias_falls_back_to_gpt55_after_sol_high_demand(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_google_code_assist_adapter_route",
         new=AsyncMock(),
     ) as mock_antigravity:
-        with pytest.raises(RuntimeError, match="high demand"):
+        with pytest.raises(HTTPException) as exc_info:
             await _handle_codex_auto_agent_alias_route(
                 endpoint="/v1/responses",
                 request=request,
@@ -30136,6 +30469,15 @@ async def test_codex_sota_alias_falls_back_to_gpt55_after_sol_high_demand(
                 forward_headers=True,
             )
 
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["error"] == {
+        "message": (
+            "We're currently experiencing high demand, which may cause "
+            "temporary errors."
+        ),
+        "type": "capacity_exhausted",
+        "code": "all_candidates_unavailable",
+    }
     assert mock_pass_through.await_count == 2
     mock_antigravity.assert_not_called()
     mock_antigravity_lane.assert_not_called()
@@ -30530,7 +30872,12 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     ) as mock_load_opencode_key, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(side_effect=[unsupported_luna, mini_success]),
-    ) as mock_pass_through:
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_alibaba_token_plan_adapter_route",
+        new=AsyncMock(
+            side_effect=_build_alibaba_token_plan_candidate_unavailable_error()
+        ),
+    ) as mock_alibaba:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -30546,6 +30893,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     assert mock_openrouter_key.call_count == 2
     assert mock_load_opencode_key.await_count == 2
     assert mock_pass_through.await_count == 2
+    mock_alibaba.assert_awaited_once()
     luna_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
     candidate_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
     assert luna_body["model"] == "gpt-5.6-luna"
@@ -30603,6 +30951,14 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"]
         for attempt in opencode_attempts
     )
+    alibaba_attempt = next(
+        attempt
+        for attempt in metadata["codex_auto_agent_attempts"]
+        if attempt["provider"] == "alibaba_token_plan"
+    )
+    assert alibaba_attempt["model"] == "alibaba_token_plan/qwen3.6-flash"
+    assert alibaba_attempt["status"] == "cooldown_set"
+    assert alibaba_attempt["error_class"] == "candidate_unavailable"
     skipped_models = {
         candidate["model"]
         for candidate in metadata["codex_auto_agent_skipped_candidates"]
@@ -30611,6 +30967,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
+    assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
 
 @pytest.mark.asyncio
@@ -30661,7 +31018,12 @@ async def test_codex_auto_agent_alias_low_owl_alpha_no_endpoints_reaches_mini(
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(side_effect=[unsupported_luna, mini_success]),
-    ) as mock_pass_through:
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_alibaba_token_plan_adapter_route",
+        new=AsyncMock(
+            side_effect=_build_alibaba_token_plan_candidate_unavailable_error()
+        ),
+    ) as mock_alibaba:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -30677,6 +31039,7 @@ async def test_codex_auto_agent_alias_low_owl_alpha_no_endpoints_reaches_mini(
     mock_acompletion.assert_awaited_once()
     assert mock_load_opencode_key.await_count == 2
     assert mock_pass_through.await_count == 2
+    mock_alibaba.assert_awaited_once()
     luna_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
     candidate_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
     assert luna_body["model"] == "gpt-5.6-luna"
@@ -30702,6 +31065,7 @@ async def test_codex_auto_agent_alias_low_owl_alpha_no_endpoints_reaches_mini(
     }
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
+    assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
 
 def _build_opencode_zen_billing_error() -> ProxyException:
@@ -30793,6 +31157,22 @@ def _build_opencode_zen_high_demand_error() -> ProxyException:
     return high_demand_error
 
 
+def _build_alibaba_token_plan_candidate_unavailable_error() -> ProxyException:
+    unavailable_error = ProxyException(
+        message="Alibaba Token Plan candidate unavailable",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    unavailable_error.detail = {
+        "error": {
+            "message": unavailable_error.message,
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    return unavailable_error
+
+
 _OPENCODE_ALIAS_FAILOVER_CASES = [
     pytest.param(
         "billing_error",
@@ -30857,7 +31237,12 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
     ) as mock_acompletion, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(side_effect=[unsupported_luna, mini_success]),
-    ) as mock_pass_through:
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_alibaba_token_plan_adapter_route",
+        new=AsyncMock(
+            side_effect=_build_alibaba_token_plan_candidate_unavailable_error()
+        ),
+    ) as mock_alibaba:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -30873,6 +31258,7 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
     assert mock_load_opencode_key.await_count == 2
     assert mock_acompletion.await_count == 2
     assert mock_pass_through.await_count == 2
+    mock_alibaba.assert_awaited_once()
     luna_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
     candidate_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
     assert luna_body["model"] == "gpt-5.6-luna"
@@ -30899,6 +31285,7 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
     assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash" in skipped_models
     assert "big-pickle" in skipped_models
+    assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
     return opencode_attempts
 
 
@@ -40261,7 +40648,12 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(side_effect=[unsupported_luna, mini_success]),
-    ) as mock_pass_through:
+    ) as mock_pass_through, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_alibaba_token_plan_adapter_route",
+        new=AsyncMock(
+            side_effect=_build_alibaba_token_plan_candidate_unavailable_error()
+        ),
+    ) as mock_alibaba:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -40275,6 +40667,7 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
 
     assert response is mini_success
     assert mock_pass_through.await_count == 2
+    mock_alibaba.assert_awaited_once()
     luna_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
     mini_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
     assert luna_body["model"] == "gpt-5.6-luna"
@@ -40285,6 +40678,7 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
     assert metadata["codex_auto_agent_selected_model"] == "gpt-5.4-mini"
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "gpt-5.6-luna",
+        "alibaba_token_plan/qwen3.6-flash",
         "gpt-5.4-mini",
     ]
     luna_attempt = metadata["codex_auto_agent_attempts"][0]
@@ -40295,6 +40689,14 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
     ]
     assert luna_attempt["cooldown_scope"] == "candidate"
     assert luna_attempt["cooldown_seconds"] > 0
+    alibaba_attempt = next(
+        attempt
+        for attempt in metadata["codex_auto_agent_attempts"]
+        if attempt["provider"] == "alibaba_token_plan"
+    )
+    assert alibaba_attempt["model"] == "alibaba_token_plan/qwen3.6-flash"
+    assert alibaba_attempt["status"] == "cooldown_set"
+    assert alibaba_attempt["error_class"] == "candidate_unavailable"
 
 
 @pytest.mark.parametrize(
