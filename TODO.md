@@ -188,16 +188,17 @@ these docs only as needed:
 
 ## Next
 
-- Publish and promote `v1.82.3-aawm.137` for file-backed Alibaba Token Plan
-  quota authentication. The candidate passed 31 focused Alibaba tests, the
-  full 154-test provider-status module, Ruff, secret-silent dev sidecar
-  validation, and exact `aawm_tristore` row verification. The dev container
-  proved the canonical read-only `~/.alibaba/token-plan-session.json` mount
-  with no `ALIBABA_WEB_KEY` fallback present, cookie-only HTTP 200 responses,
-  two inserted observations, and clean logs. Follow `PROD_RELEASE.md`, build
-  the production provider-status image from the immutable `.137` release
-  source, recreate only `aawm-provider-status-observations-prod`, and verify
-  matching production rows, mounts, restart count, and sanitized logs.
+- Publish and promote `v1.82.3-aawm.138` for Alibaba Token Plan unused-window
+  reset handling. The candidate passed 37 focused Alibaba tests, the full
+  156-test provider-status module, Ruff, Thoth dev stack acceptance, exact
+  Thoth `aawm_tristore` row verification, and workstation marker-absence proof.
+  The live 5-hour window reports zero consumption without a reset timestamp;
+  parser v2 stores that window with `remaining_pct=100`,
+  `expected_reset_at=NULL`, and explicit `absent_unused_window` evidence while
+  preserving the valid 7-day reset. Follow `PROD_RELEASE.md`, publish the
+  immutable `.138` fork release, promote the exact proven build to Thoth
+  production, and verify health, auth mounts, quota rows, restart counts, and
+  sanitized logs.
 
 - Rerun the Spark/Codex-dependent prod harness cases after the upstream Codex
   quota reset at `2026-05-18 15:08:41 UTC`: at minimum

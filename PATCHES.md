@@ -58,6 +58,33 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.138 - Alibaba unused-window quota reset handling
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.138`. Alibaba
+Token Plan usage parsing now accepts an omitted reset timestamp only when the
+same quota window reports an exactly zero consumed fraction. That unused
+window is persisted as `remaining_pct=100`, `expected_reset_at=NULL`, and
+`reset_at_state=absent_unused_window`. Missing resets for consumed windows
+remain malformed telemetry.
+
+**Why:** The live Alibaba console usage contract omits
+`per5HourResetTime` while `per5HourPercentage` is `0.0`. Rejecting that valid
+unused-window shape prevented both the 5-hour and 7-day observations from
+being persisted.
+
+**Why not upstream:** The AAWM provider-status scheduler, local
+`aawm_tristore` quota schema, and undocumented Alibaba console usage contract
+are fork-local operational behavior.
+
+**Validation status:** The full 156-test provider-status module, 37 focused
+Alibaba cases, Ruff, and `git diff --check` pass. Thoth dev runs LiteLLM and the
+provider-status sidecar from commit `c309b05ef5` with zero restarts. Its live
+Alibaba poll reported parser v2, HTTP 200, two observations, and two inserted
+rows in exact database `aawm_tristore` as role `aawm`; the 5-hour row stores a
+null reset with `absent_unused_window`, while the 7-day row retains its provider
+reset timestamp. The exact Thoth Alibaba and Kimi marker timestamps are absent
+from the workstation `aawm_tristore`.
+
 ### aawm.137 - File-backed Alibaba Token Plan quota authentication
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.137`. The
