@@ -615,6 +615,34 @@ def _select_proportional_snapshot_candidate(
     return ordered[-1]
 
 
+def _apply_snapshot_alias_distribution_strategy(
+    ordered: Sequence[_RoutingSnapshotCandidate],
+    *,
+    distribution_strategy: Optional[str],
+    rng: random.Random,
+) -> list[_RoutingSnapshotCandidate]:
+    """Reorder the top priority-tier of ``ordered`` per ``distribution_strategy``.
+
+    ``ordered`` is already sorted descending by priority with ``priority: 0``
+    last (see ``_order_snapshot_candidates_by_priority``). When the alias
+    declares ``distribution_strategy: proportional`` and more than one
+    candidate shares the top (highest, non-zero) priority tier, a weighted
+    proportional pick decides which of those tied candidates leads the
+    returned ordering -- the remaining candidates (including any other tiers)
+    keep their existing relative order as the fallback chain.
+    """
+    if distribution_strategy != "proportional" or len(ordered) < 2:
+        return list(ordered)
+    top_priority = ordered[0].priority
+    tied = [c for c in ordered if c.priority == top_priority]
+    if len(tied) < 2:
+        return list(ordered)
+    weights = {c.model: c.weight for c in tied}
+    winner = _select_proportional_snapshot_candidate(tied, weights, rng)
+    remainder = [c for c in ordered if c is not winner]
+    return [winner, *remainder]
+
+
 def _is_tui_attached_candidate_eligible(
     candidate: _RoutingSnapshotCandidate,
     *,
@@ -667,15 +695,29 @@ def _select_read_pilot_snapshot_candidates(
         if _is_tui_attached_candidate_eligible(candidate, client_product_label=client_product_label)
         and _is_snapshot_candidate_in_schedule_window(candidate, now_utc=resolved_now)
     ]
-    selected = eligible if eligible else ordered
-    return tuple(_routing_candidate_to_public_dict(c) for c in selected)
+    # Fail closed: if every candidate is currently ineligible (TUI-gated out
+    # of window, etc), do NOT silently fall back to the unfiltered ordered
+    # list -- that would dispatch to a candidate the eligibility gates just
+    # rejected. Returning empty here means the caller sees "no candidates
+    # available" for this attempt, matching every other alias-routing lane's
+    # fail-closed behavior on exhaustion.
+    if not eligible:
+        return ()
+    distributed = _apply_snapshot_alias_distribution_strategy(
+        eligible,
+        distribution_strategy=alias.distribution_strategy,
+        rng=random.Random(),
+    )
+    return tuple(_routing_candidate_to_public_dict(c) for c in distributed)
 
 
 def _get_codex_auto_agent_candidates_for_alias(
     alias_model: str,
+    *,
+    client_product_label: Optional[str] = None,
 ) -> tuple[dict[str, Any], ...]:
     if alias_model == _READ_PILOT_ALIAS_NAME:
-        return _select_read_pilot_snapshot_candidates()
+        return _select_read_pilot_snapshot_candidates(client_product_label=client_product_label)
     candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
         alias_model,
         _CODEX_AUTO_AGENT_CANDIDATES,
@@ -1182,6 +1224,11 @@ async def aawm_alias_config_refresh_route(request: Request) -> dict[str, Any]:
     except Exception:
         request_body = {}
     inline_yaml = request_body.get("yaml") if isinstance(request_body, dict) else None
+    if inline_yaml is not None and not isinstance(inline_yaml, str):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "AAWM alias-routing config 'yaml' field must be a string"},
+        )
 
     try:
         source_yaml = _load_aawm_alias_routing_source_yaml(inline_yaml=inline_yaml)
@@ -4718,8 +4765,12 @@ def _find_codex_auto_agent_candidate(
     model: Any,
     *,
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
+    client_product_label: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    for candidate in _get_codex_auto_agent_candidates_for_alias(alias_model):
+    for candidate in _get_codex_auto_agent_candidates_for_alias(
+        alias_model,
+        client_product_label=client_product_label,
+    ):
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
@@ -5152,12 +5203,16 @@ async def _build_codex_auto_agent_candidate_states(
     request: Request,
     *,
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
+    client_product_label: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     google_lane_key: Optional[str] = None
     antigravity_lane_state: Optional[dict[str, Any]] = None
     states: list[dict[str, Any]] = []
-    for candidate_template in _get_codex_auto_agent_candidates_for_alias(alias_model):
+    for candidate_template in _get_codex_auto_agent_candidates_for_alias(
+        alias_model,
+        client_product_label=client_product_label,
+    ):
         if candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER and google_lane_key is None:
             google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
         if candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER and antigravity_lane_state is None:
@@ -5195,6 +5250,7 @@ async def _select_codex_auto_agent_candidate(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
     alias_model = _normalize_codex_auto_agent_alias_model(request_body.get("model")) or _CODEX_AUTO_AGENT_MODEL_ALIAS
+    client_product_label = _extract_auto_agent_alias_client_product_label(request, request_body)
     session_key = _resolve_codex_auto_agent_session_key(
         request,
         request_body,
@@ -5210,6 +5266,7 @@ async def _select_codex_auto_agent_candidate(
             affinity.get("provider"),
             affinity.get("model"),
             alias_model=alias_model,
+            client_product_label=client_product_label,
         )
         if affinity_candidate is not None:
             affinity_state = await _build_codex_auto_agent_candidate_state(
@@ -5240,6 +5297,7 @@ async def _select_codex_auto_agent_candidate(
     states = await _build_codex_auto_agent_candidate_states(
         request,
         alias_model=alias_model,
+        client_product_label=client_product_label,
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
 
@@ -5248,6 +5306,7 @@ async def _select_codex_auto_agent_candidate(
             affinity.get("provider"),
             affinity.get("model"),
             alias_model=alias_model,
+            client_product_label=client_product_label,
         )
         if affinity_candidate is not None:
             matched_affinity_state: Optional[dict[str, Any]] = None
@@ -25197,6 +25256,7 @@ async def _handle_codex_auto_agent_alias_route(
     alias_model = (
         _normalize_codex_auto_agent_alias_model(prepared_request_body.get("model")) or _CODEX_AUTO_AGENT_MODEL_ALIAS
     )
+    client_product_label = _extract_auto_agent_alias_client_product_label(request, prepared_request_body)
 
     async def _perform_candidate_request(
         *,
@@ -25220,7 +25280,12 @@ async def _handle_codex_auto_agent_alias_route(
         alias_model=alias_model,
         request=request,
         prepared_request_body=prepared_request_body,
-        max_candidate_attempts=len(_get_codex_auto_agent_candidates_for_alias(alias_model)),
+        max_candidate_attempts=len(
+            _get_codex_auto_agent_candidates_for_alias(
+                alias_model,
+                client_product_label=client_product_label,
+            )
+        ),
         select_candidate_fn=_select_codex_auto_agent_candidate,
         add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
         perform_candidate_request_fn=_perform_candidate_request,
