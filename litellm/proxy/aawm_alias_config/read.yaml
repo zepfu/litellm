@@ -1,0 +1,67 @@
+# AAWM alias-routing config -- ``read`` pilot (Wave 3, D1-583).
+#
+# Additive pilot alias, go-forward replacement for aawm-read /
+# aawm-read-anthropic once operator-approved cutover happens (out of scope
+# for this wave). Candidate order mirrors CODEX_AAWM_LOW_CANDIDATES
+# (policy.py:227-277) with descending integer priorities, plus a
+# schedule-windowed promo candidate (alibaba_token_plan/qwen3.8-max-preview)
+# that outranks everything else while its window is open.
+#
+# Compiled by config_compiler.compile_yaml() into an immutable RoutingSnapshot.
+# priority: 0 is reserved for the last-resort candidate and is always placed
+# last in the compiled ordering, regardless of declaration order.
+
+defaults: {}
+
+aliases:
+  - name: read
+    candidates:
+      # Promo window: highest priority of the alias while active.
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen3.8-max-preview
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 1000
+        schedule:
+          start: "2026-07-01T00:00:00Z"
+          end: "2026-08-01T00:00:00Z"
+
+      - provider: openrouter
+        model: openrouter/cohere/north-mini-code:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 80
+
+      - provider: openrouter
+        model: openrouter/owl-alpha
+        route_family: codex_openrouter_completion_adapter
+        priority: 70
+
+      - provider: opencode_zen
+        model: deepseek-v4-flash
+        route_family: codex_opencode_zen_adapter
+        priority: 60
+
+      - provider: opencode_zen
+        model: big-pickle
+        route_family: codex_opencode_zen_adapter
+        priority: 50
+
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 40
+
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen3.6-flash
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 30
+
+      - provider: kimi_code
+        model: kimi_code/kimi-for-coding
+        route_family: codex_kimi_chat_completions_adapter
+        priority: 20
+
+      # Last resort -- priority 0 is always placed last regardless of order.
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
