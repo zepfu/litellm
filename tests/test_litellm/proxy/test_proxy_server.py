@@ -3944,6 +3944,28 @@ def test_store_model_in_db_in_config_general_settings():
     assert config.store_model_in_db is None
 
 
+def test_aawm_route_fields_in_config_general_settings_model_dump():
+    """Verify AAWM route attribution fields are preserved in ConfigGeneralSettings."""
+
+    from litellm.proxy._types import ConfigGeneralSettings
+
+    assert "aawm_route_use_x_forwarded_for" in ConfigGeneralSettings.model_fields
+    assert "aawm_route_trusted_proxy_ranges" in ConfigGeneralSettings.model_fields
+
+    config = ConfigGeneralSettings(
+        aawm_route_use_x_forwarded_for=True,
+        aawm_route_trusted_proxy_ranges=["172.18.0.1/32", "100.100.0.0/10"],
+    )
+
+    dumped = config.model_dump()
+
+    assert dumped["aawm_route_use_x_forwarded_for"] is True
+    assert dumped["aawm_route_trusted_proxy_ranges"] == [
+        "172.18.0.1/32",
+        "100.100.0.0/10",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_update_general_settings_store_model_in_db_true():
     """

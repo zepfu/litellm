@@ -2274,6 +2274,14 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
         None,
         description="Custom CIDR ranges that define internal/private networks for MCP access control. When set, only these ranges are treated as internal. Defaults to RFC 1918 private ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8).",
     )
+    aawm_route_use_x_forwarded_for: Optional[bool] = Field(
+        None,
+        description="AAWM route attribution only: enable X-Forwarded-For handling for this route family.",
+    )
+    aawm_route_trusted_proxy_ranges: Optional[List[str]] = Field(
+        None,
+        description="AAWM route attribution only: CIDR ranges of trusted proxies that may set X-Forwarded-For for AAWM routes.",
+    )
     mcp_trusted_proxy_ranges: Optional[List[str]] = Field(
         None,
         description="CIDR ranges of trusted reverse proxies. When set, X-Forwarded-For headers are only trusted from these IPs.",
