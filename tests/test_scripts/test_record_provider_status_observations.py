@@ -1750,6 +1750,44 @@ def test_alibaba_quota_payloads_map_consumed_fractions_and_hash_identity() -> No
     assert "security-token-secret" not in persisted_json
 
 
+def test_alibaba_quota_payloads_allow_absent_reset_for_unused_window() -> None:
+    usage = _alibaba_usage_payload()
+    usage["per5HourPercentage"] = 0.0
+    usage.pop("per5HourResetTime")
+
+    payloads = loop._build_alibaba_quota_rate_limit_payloads(
+        _alibaba_quota_poll_config(),
+        observed_at=datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc),
+        usage_payload=usage,
+        subscription=loop._parse_alibaba_subscription_payload(
+            _alibaba_subscription_payload()
+        ),
+    )
+
+    assert payloads[0][9] is None
+    assert payloads[0][10] == 100.0
+    raw_provider_fields = json.loads(payloads[0][16])
+    evidence = json.loads(payloads[0][17])
+    assert raw_provider_fields["reset_at_ms"] is None
+    assert raw_provider_fields["reset_at_state"] == "absent_unused_window"
+    assert "alibaba_token_plan_reset_absent_unused_window" in evidence["signals"]
+
+
+def test_alibaba_quota_payloads_reject_absent_reset_for_consumed_window() -> None:
+    usage = _alibaba_usage_payload()
+    usage.pop("per5HourResetTime")
+
+    with pytest.raises(ValueError, match="per5HourResetTime"):
+        loop._build_alibaba_quota_rate_limit_payloads(
+            _alibaba_quota_poll_config(),
+            observed_at=datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc),
+            usage_payload=usage,
+            subscription=loop._parse_alibaba_subscription_payload(
+                _alibaba_subscription_payload()
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [

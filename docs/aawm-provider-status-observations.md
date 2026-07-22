@@ -172,7 +172,11 @@ Alibaba reports each window as a consumed fraction. The sidecar converts that
 fraction to `remaining_pct`, preserves the provider reset timestamp, and leaves
 absolute limit/used/remaining columns null because this console response does
 not provide authoritative absolute Credit limits. It does not invent daily or
-monthly quota windows.
+monthly quota windows. Alibaba may omit a reset timestamp for a window whose
+consumed fraction is exactly zero. That unused window is persisted with
+`remaining_pct=100`, `expected_reset_at=NULL`, and explicit
+`reset_at_state=absent_unused_window` evidence. A missing reset for a consumed
+window remains malformed telemetry and is not persisted.
 
 Authentication is file-driven and reloaded on each due poll. The sidecar reads
 `AAWM_ALIBABA_WEB_AUTH_FILE` (default:

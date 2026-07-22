@@ -221,7 +221,7 @@ ALIBABA_TOKEN_PLAN_CLIENT = "qwen-cloud-console"
 ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba_token_plan"
 ALIBABA_TOKEN_PLAN_MODEL = "qwen-token-plan"
 ALIBABA_TOKEN_PLAN_SOURCE = "alibaba_token_plan_usage"
-ALIBABA_TOKEN_PLAN_PARSER_VERSION = "alibaba_token_plan_usage_v1"
+ALIBABA_TOKEN_PLAN_PARSER_VERSION = "alibaba_token_plan_usage_v2"
 ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY = "alibaba_token_plan_5h:credits"
 ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY = "alibaba_token_plan_7d:credits"
 ALIBABA_QUOTA_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
@@ -5421,6 +5421,17 @@ def _parse_alibaba_timestamp_ms(value: Any, *, field_name: str) -> datetime:
         raise ValueError(f"Alibaba {field_name} is not a valid millisecond timestamp.") from exc
 
 
+def _parse_alibaba_reset_time(
+    value: Any,
+    *,
+    field_name: str,
+    consumed_fraction: float,
+) -> tuple[Optional[datetime], str]:
+    if value is None and consumed_fraction == 0:
+        return None, "absent_unused_window"
+    return _parse_alibaba_timestamp_ms(value, field_name=field_name), "valid"
+
+
 def _parse_alibaba_subscription_payload(
     payload: Mapping[str, Any],
 ) -> Dict[str, Any]:
@@ -5491,9 +5502,10 @@ def _build_alibaba_quota_rate_limit_payloads(
             usage_payload.get(percentage_field),
             field_name=percentage_field,
         )
-        reset_at = _parse_alibaba_timestamp_ms(
+        reset_at, reset_state = _parse_alibaba_reset_time(
             usage_payload.get(reset_field),
             field_name=reset_field,
+            consumed_fraction=consumed_fraction,
         )
         remaining_pct = max(0.0, min(100.0, (1.0 - consumed_fraction) * 100.0))
         raw_provider_fields = {
@@ -5504,6 +5516,7 @@ def _build_alibaba_quota_rate_limit_payloads(
             "consumed_pct": consumed_fraction * 100.0,
             "remaining_pct": remaining_pct,
             "reset_at_ms": usage_payload.get(reset_field),
+            "reset_at_state": reset_state,
             "subscription_spec": subscription["spec_code"],
             "subscription_status": subscription["status"],
             "subscription_remaining_days": subscription.get("remaining_days"),
@@ -5515,6 +5528,7 @@ def _build_alibaba_quota_rate_limit_payloads(
                 "alibaba_token_plan_usage_payload",
                 "alibaba_token_plan_subscription_active",
                 "alibaba_token_plan_percentage_only",
+                f"alibaba_token_plan_reset_{reset_state}",
             ],
             "parser_version": ALIBABA_TOKEN_PLAN_PARSER_VERSION,
             "telemetry_status": "valid",
