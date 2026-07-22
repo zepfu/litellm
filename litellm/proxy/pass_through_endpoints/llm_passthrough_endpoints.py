@@ -30,6 +30,7 @@ from typing import (
     Mapping,
     Never,
     Optional,
+    Sequence,
     Tuple,
     TypeVar,
     Union,
@@ -310,6 +311,7 @@ from .aawm_alias_routing_policy import (
 
 from .aawm_alias_routing import adapter_config as _aawm_adapter_config
 from .aawm_alias_routing import adapter_driver as _aawm_adapter_driver
+from .aawm_alias_routing import classification as _aawm_alias_classification
 from .aawm_alias_routing import memory as _aawm_alias_memory
 from .aawm_alias_routing import provider_shaping as _aawm_provider_shaping
 from .aawm_alias_routing import responses_finalize as _aawm_responses_finalize
@@ -318,15 +320,19 @@ from .aawm_alias_routing import streaming as _aawm_alias_streaming
 from .aawm_alias_routing import google_oauth as _aawm_google_oauth
 from .aawm_alias_routing import antigravity_oauth as _aawm_antigravity_oauth
 from .aawm_alias_routing import durable as _aawm_alias_durable
+from .aawm_alias_routing.config_snapshot import (
+    RoutingCandidate as _RoutingSnapshotCandidate,
+    RoutingSnapshot as _RoutingSnapshot,
+    active_routing_snapshot_holder as _active_routing_snapshot_holder,
+)
+from .aawm_alias_routing.state import AliasFamilyState as _AliasFamilyState
 from .aawm_alias_routing.state import alias_routing_state as _alias_routing_state
 
 
 # ---------------------------------------------------------------------------
 # RR-054 early package re-exports / state ownership (must exist before use)
 # ---------------------------------------------------------------------------
-_AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE = (
-    _aawm_alias_memory.DEFAULT_MEMORY_STATE_MAX_SIZE
-)
+_AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE = _aawm_alias_memory.DEFAULT_MEMORY_STATE_MAX_SIZE
 
 # RR-054 runtime budgets/constants introduced in residual work.
 _AAWM_REQUEST_BODY_WALK_MAX_DEPTH = 64
@@ -363,9 +369,7 @@ def _should_log_aawm_alias_routing_event(log_key: str) -> bool:
     if now < until:
         return False
     _aawm_alias_routing_log_until_monotonic_by_key[log_key] = now + 30.0
-    _bound_aawm_alias_routing_memory_map(
-        _aawm_alias_routing_log_until_monotonic_by_key
-    )
+    _bound_aawm_alias_routing_memory_map(_aawm_alias_routing_log_until_monotonic_by_key)
     return True
 
 
@@ -442,30 +446,18 @@ class _ChangeAccumulator:
 
 
 # Process-local maps/locks owned by aawm_alias_routing.state.
-_codex_auto_agent_cooldown_until_monotonic_by_key = (
-    _alias_routing_state.codex.cooldown_until_monotonic_by_key
-)
-_codex_auto_agent_session_affinity_by_key = (
-    _alias_routing_state.codex.session_affinity_by_key
-)
+_codex_auto_agent_cooldown_until_monotonic_by_key = _alias_routing_state.codex.cooldown_until_monotonic_by_key
+_codex_auto_agent_session_affinity_by_key = _alias_routing_state.codex.session_affinity_by_key
 _codex_auto_agent_lock = _alias_routing_state.codex.lock
-_anthropic_auto_agent_cooldown_until_monotonic_by_key = (
-    _alias_routing_state.anthropic.cooldown_until_monotonic_by_key
-)
-_anthropic_auto_agent_session_affinity_by_key = (
-    _alias_routing_state.anthropic.session_affinity_by_key
-)
+_anthropic_auto_agent_cooldown_until_monotonic_by_key = _alias_routing_state.anthropic.cooldown_until_monotonic_by_key
+_anthropic_auto_agent_session_affinity_by_key = _alias_routing_state.anthropic.session_affinity_by_key
 _anthropic_auto_agent_lock = _alias_routing_state.anthropic.lock
-_codex_auto_agent_google_lane_key_until_monotonic_by_key = (
-    _alias_routing_state.google_lane_key_until_monotonic_by_key
-)
+_codex_auto_agent_google_lane_key_until_monotonic_by_key = _alias_routing_state.google_lane_key_until_monotonic_by_key
 _codex_auto_agent_google_lane_key_by_key = _alias_routing_state.google_lane_key_by_key
 _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key = (
     _alias_routing_state.antigravity_lane_key_until_monotonic_by_key
 )
-_codex_auto_agent_antigravity_lane_key_by_key = (
-    _alias_routing_state.antigravity_lane_key_by_key
-)
+_codex_auto_agent_antigravity_lane_key_by_key = _alias_routing_state.antigravity_lane_key_by_key
 _codex_auto_agent_lane_state_cache_lock = _alias_routing_state.lane_state_cache_lock
 _codex_auto_agent_cooldown_negative_until_monotonic_by_key = (
     _alias_routing_state.codex.cooldown_negative_until_monotonic_by_key
@@ -473,18 +465,14 @@ _codex_auto_agent_cooldown_negative_until_monotonic_by_key = (
 _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key = (
     _alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key
 )
-_aawm_alias_routing_log_until_monotonic_by_key = (
-    _alias_routing_state.log_until_monotonic_by_key
-)
+_aawm_alias_routing_log_until_monotonic_by_key = _alias_routing_state.log_until_monotonic_by_key
 
 # Policy aliases (RR-054 #11): static tables live in aawm_alias_routing.policy.
 _CODEX_AUTO_AGENT_MODEL_ALIAS = _POLICY_CODEX_AUTO_AGENT_MODEL_ALIAS
 _CODEX_AUTO_AGENT_NATIVE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_NATIVE_PROVIDER
 _CODEX_AUTO_AGENT_GOOGLE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_GOOGLE_PROVIDER
 _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
-_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER = (
-    _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-)
+_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER = _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
 _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER = _POLICY_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER
 _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
 _CODEX_AUTO_AGENT_XAI_PROVIDER = _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER
@@ -493,9 +481,7 @@ _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_LANE
 _CODEX_AUTO_AGENT_XAI_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_LANE_KEY
 _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
 _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
-_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY = (
-    _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
-)
+_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
 _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
 _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = _POLICY_DEFAULT_COOLDOWN
 _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = _POLICY_CAPACITY_COOLDOWN
@@ -536,60 +522,160 @@ _ANTHROPIC_AAWM_LOW_ALIAS = _POLICY_ANTHROPIC_AAWM_LOW_ALIAS
 _ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_ALIAS
 _ANTHROPIC_AAWM_SOTA_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_CANDIDATES
 _ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES
-_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES = (
-    _POLICY_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES
-)
-_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES = (
-    _POLICY_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES
-)
+_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES
+_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES
 _ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES
 _ANTHROPIC_AAWM_CODE_CANDIDATES = _POLICY_ANTHROPIC_AAWM_CODE_CANDIDATES
 _ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES = _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES
 _ANTHROPIC_AAWM_LOW_CANDIDATES = _POLICY_ANTHROPIC_AAWM_LOW_CANDIDATES
-_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS = (
-    _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-)
-_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS = (
-    _POLICY_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
-)
-_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS = (
-    _POLICY_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS
-)
-_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = (
-    _POLICY_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS
-)
-_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS = (
-    _POLICY_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS
-)
+_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS = _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
+_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS = _POLICY_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
+_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS = _POLICY_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS
+_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = _POLICY_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS
+_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS = _POLICY_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS
 _ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES = (
     _POLICY_ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES
 )
 _CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES = (
     _POLICY_CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES
 )
-_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER = (
-    _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
-)
-_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS = (
-    _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS
-)
-_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS = (
-    _POLICY_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS
-)
-_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS = (
-    _POLICY_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS
-)
+_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER = _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
+_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS = _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS
+_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS = _POLICY_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS
+_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS = _POLICY_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS
+
+
+# ---------------------------------------------------------------------------
+# Wave 4 (D1-583): config-snapshot-driven candidate resolution for the
+# ``read`` pilot alias only. Every other alias continues to resolve from the
+# hard-coded ``policy.py`` tables above via ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS``
+# / ``_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS``. No new session_history /
+# routing-decision persistence is introduced here -- selection stays
+# in-memory/process-local, matching the existing auto-agent alias lanes.
+# ---------------------------------------------------------------------------
+_READ_PILOT_ALIAS_NAME = "read"
+_read_pilot_cooldown_gate = _aawm_alias_classification.CooldownEvidenceGate(family_state=_AliasFamilyState())
+
+
+def get_active_routing_snapshot() -> Optional[_RoutingSnapshot]:
+    """Return the process-local active config-driven routing snapshot, if any."""
+    return _active_routing_snapshot_holder.get()
+
+
+def set_active_routing_snapshot(
+    snapshot: Optional[_RoutingSnapshot],
+) -> Optional[_RoutingSnapshot]:
+    """Atomically activate ``snapshot`` (or clear it with ``None``)."""
+    if snapshot is None:
+        return _active_routing_snapshot_holder.swap(None)  # type: ignore[arg-type]
+    return _active_routing_snapshot_holder.swap(snapshot)
+
+
+def _routing_candidate_to_public_dict(
+    candidate: _RoutingSnapshotCandidate,
+) -> dict[str, Any]:
+    """Shape a compiled ``RoutingCandidate`` into the legacy candidate-dict form."""
+    return {
+        "provider": candidate.provider,
+        "model": candidate.model,
+        "route_family": candidate.route_family,
+        "last_resort": candidate.priority == 0,
+    }
+
+
+def _order_snapshot_candidates_by_priority(
+    candidates: Sequence[_RoutingSnapshotCandidate],
+) -> list[_RoutingSnapshotCandidate]:
+    """Pure ordering: descending priority; ``priority: 0`` always placed last."""
+    non_zero = [c for c in candidates if c.priority != 0]
+    zero = [c for c in candidates if c.priority == 0]
+    non_zero_sorted = sorted(non_zero, key=lambda c: c.priority, reverse=True)
+    return non_zero_sorted + zero
+
+
+def _select_proportional_snapshot_candidate(
+    candidates: Sequence[_RoutingSnapshotCandidate],
+    weights: Mapping[str, float],
+    rng: random.Random,
+) -> _RoutingSnapshotCandidate:
+    """Pure weighted tie-break among ``candidates`` using ``weights`` (by model)."""
+    ordered = list(candidates)
+    total = sum(max(0.0, weights.get(c.model, 0.0)) for c in ordered) or 1.0
+    pick = rng.random() * total
+    cumulative = 0.0
+    for candidate in ordered:
+        cumulative += max(0.0, weights.get(candidate.model, 0.0))
+        if pick <= cumulative:
+            return candidate
+    return ordered[-1]
+
+
+def _is_tui_attached_candidate_eligible(
+    candidate: _RoutingSnapshotCandidate,
+    *,
+    client_product_label: Optional[str],
+) -> bool:
+    """Per-model TUI gate: an undetermined TUI excludes only ``tui_attached`` candidates."""
+    if not candidate.tui_attached:
+        return True
+    if not client_product_label:
+        return False
+    product_name = client_product_label.split("/", 1)[0]
+    return product_name == candidate.tui_attached
+
+
+def _is_snapshot_candidate_in_schedule_window(
+    candidate: _RoutingSnapshotCandidate,
+    *,
+    now_utc: datetime,
+) -> bool:
+    """Schedule gate: only prevents NEW affinity, never evicts existing state."""
+    schedule = candidate.schedule
+    if schedule is None:
+        return True
+    return schedule.start <= now_utc <= schedule.end
+
+
+def _select_read_pilot_snapshot_candidates(
+    *,
+    client_product_label: Optional[str] = None,
+    now_utc: Optional[datetime] = None,
+) -> tuple[dict[str, Any], ...]:
+    """Resolve the ordered ``read`` alias candidate tuple from the active snapshot.
+
+    Falls back to the hard-coded ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS`` table
+    when no snapshot has been activated (or the snapshot has no ``read`` alias),
+    so the pilot degrades gracefully instead of raising.
+    """
+    snapshot = get_active_routing_snapshot()
+    if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
+        return _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+            _READ_PILOT_ALIAS_NAME,
+            _CODEX_AUTO_AGENT_CANDIDATES,
+        )
+    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    ordered = _order_snapshot_candidates_by_priority(alias.candidates)
+    eligible = [
+        candidate
+        for candidate in ordered
+        if _is_tui_attached_candidate_eligible(candidate, client_product_label=client_product_label)
+        and _is_snapshot_candidate_in_schedule_window(candidate, now_utc=resolved_now)
+    ]
+    selected = eligible if eligible else ordered
+    return tuple(_routing_candidate_to_public_dict(c) for c in selected)
 
 
 def _get_codex_auto_agent_candidates_for_alias(
     alias_model: str,
 ) -> tuple[dict[str, Any], ...]:
+    if alias_model == _READ_PILOT_ALIAS_NAME:
+        return _select_read_pilot_snapshot_candidates()
     candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
         alias_model,
         _CODEX_AUTO_AGENT_CANDIDATES,
     )
     return candidates
-
 
 
 def _get_anthropic_auto_agent_candidates_for_alias(
@@ -602,42 +688,19 @@ def _get_anthropic_auto_agent_candidates_for_alias(
     return candidates
 
 
-
 # RR-054 durable alias-routing helpers (package-owned).
-_get_aawm_alias_routing_state_namespace = (
-    _aawm_alias_durable.get_aawm_alias_routing_state_namespace
-)
-_build_aawm_alias_routing_durable_cache_key = (
-    _aawm_alias_durable.build_aawm_alias_routing_durable_cache_key
-)
-_get_aawm_alias_routing_dual_cache = (
-    _aawm_alias_durable.get_aawm_alias_routing_dual_cache
-)
-_parse_aawm_alias_routing_durable_expiry = (
-    _aawm_alias_durable.parse_aawm_alias_routing_durable_expiry
-)
-_read_aawm_alias_routing_durable_payload = (
-    _aawm_alias_durable.read_aawm_alias_routing_durable_payload
-)
-_write_aawm_alias_routing_durable_payload = (
-    _aawm_alias_durable.write_aawm_alias_routing_durable_payload
-)
-_AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX = (
-    _aawm_alias_durable.AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX
-)
-_AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT = (
-    _aawm_alias_durable.AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT
-)
+_get_aawm_alias_routing_state_namespace = _aawm_alias_durable.get_aawm_alias_routing_state_namespace
+_build_aawm_alias_routing_durable_cache_key = _aawm_alias_durable.build_aawm_alias_routing_durable_cache_key
+_get_aawm_alias_routing_dual_cache = _aawm_alias_durable.get_aawm_alias_routing_dual_cache
+_parse_aawm_alias_routing_durable_expiry = _aawm_alias_durable.parse_aawm_alias_routing_durable_expiry
+_read_aawm_alias_routing_durable_payload = _aawm_alias_durable.read_aawm_alias_routing_durable_payload
+_write_aawm_alias_routing_durable_payload = _aawm_alias_durable.write_aawm_alias_routing_durable_payload
+_AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX = _aawm_alias_durable.AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX
+_AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT = _aawm_alias_durable.AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT
 
-_ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL
-)
-_ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS
-)
-_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS
-)
+_ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL = _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL
+_ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS = _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS
+_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS = _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS
 _ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_ID_ENV_VARS = (
     _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_ID_ENV_VARS
 )
@@ -770,9 +833,7 @@ _CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN = re.compile(
 _ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME = "google_anthropic_system_prompt_policy"
 _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION = "2026-04-27.v2"
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV = (
-    "AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY"
-)
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV = "AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY"
 _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT = "replace_compact"
 _GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT = """You are a non-interactive CLI software engineering agent.
 
@@ -793,13 +854,9 @@ Tool usage:
 
 Follow the preserved project, workspace, safety, and operator instructions
 below."""
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME = (
-    "codex_google_code_assist_tool_contract_policy"
-)
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME = "codex_google_code_assist_tool_contract_policy"
 _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION = "2026-05-12.v1"
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV = (
-    "AAWM_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY"
-)
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV = "AAWM_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY"
 _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT = "append"
 _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = """Codex tool contract:
 - Tool results are observations only. Never copy a previous tool result, terminal transcript, "Chunk ID", "Wall time", "Process exited", or "Output:" text into the arguments for a later tool call.
@@ -817,9 +874,7 @@ _CODEX_REASONING_EFFORT_TIERS = (
     "xhigh",
     "max",
 )
-_CODEX_REASONING_EFFORT_TIER_INDEX = {
-    effort: index for index, effort in enumerate(_CODEX_REASONING_EFFORT_TIERS)
-}
+_CODEX_REASONING_EFFORT_TIER_INDEX = {effort: index for index, effort in enumerate(_CODEX_REASONING_EFFORT_TIERS)}
 _CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS = (
     "reasoning_effort_requested",
     "reasoning_effort_source",
@@ -834,9 +889,7 @@ _CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS = (
     "reasoning_effort_clamped_from",
     "reasoning_effort_clamp_reason",
 )
-_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME = (
-    "codex_auto_agent_prevention_guidance"
-)
+_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME = "codex_auto_agent_prevention_guidance"
 _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION = "2026-07-21.v2"
 _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT = """Codex auto-agent completion contract:
 - Always produce a non-empty final answer after completing or stopping the task; do not end a successful request with only reasoning, tool calls, or no visible assistant text.
@@ -863,15 +916,9 @@ _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS = 30.0 * 60.0
 _CODEX_AUTO_AGENT_SPARK_MODEL = "gpt-5.3-codex-spark"
 _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = 300.0
 _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = 3 * 60 * 60.0
-_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = (
-    "GROK_BUILD_USAGE_BALANCE_EXHAUSTED"
-)
-_CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN = (
-    "GROK_PERSONAL_TEAM_SPENDING_LIMIT"
-)
-_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL = (
-    "https://cli-chat-proxy.grok.com/v1/responses"
-)
+_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = "GROK_BUILD_USAGE_BALANCE_EXHAUSTED"
+_CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN = "GROK_PERSONAL_TEAM_SPENDING_LIMIT"
+_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL = "https://cli-chat-proxy.grok.com/v1/responses"
 
 _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset({500, 502, 503, 529})
 _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS = 8
@@ -897,9 +944,7 @@ _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
 _AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV = "AAWM_ALIAS_ROUTE_VERBOSE_JSON"
 _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS = 5 * 60.0
 _CODEX_AUTO_AGENT_AUTH_DEGRADED_LOG_INTERVAL_SECONDS = 60.0
-_CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY = (
-    "antigravity:auth_degraded"
-)
+_CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY = "antigravity:auth_degraded"
 
 _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS = frozenset(
     {
@@ -919,12 +964,8 @@ _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS = frozenset(
     }
 )
 
-_GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING = (
-    "# Preserved Project And Safety Instructions"
-)
-_GOOGLE_ADAPTER_ORIGINAL_SYSTEM_PROMPT_HEADING = (
-    "# Original Claude System Instructions"
-)
+_GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING = "# Preserved Project And Safety Instructions"
+_GOOGLE_ADAPTER_ORIGINAL_SYSTEM_PROMPT_HEADING = "# Original Claude System Instructions"
 _GOOGLE_ADAPTER_CLAUDE_OVERHEAD_MARKERS = (
     "you are claude code",
     "anthropic's official cli for claude",
@@ -1042,9 +1083,7 @@ _PASSTHROUGH_REPOSITORY_TRANSCRIPT_ARTIFACT_RE = re.compile(
     r"^(?:rollout-\d{4}(?:-[A-Za-z0-9_.-]*)?|.*\.jsonl?)$",
     re.IGNORECASE,
 )
-_ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset(
-    {"/messages", "/v1/messages"}
-)
+_ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset({"/messages", "/v1/messages"})
 
 _CODEX_GOOGLE_CODE_ASSIST_DEFAULT_MAX_TOKENS = 8192
 _CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE = 2048
@@ -1076,9 +1115,7 @@ _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS = (
     "NVIDIA_NIM_API_KEY",
     "NVIDIA_API_KEY",
 )
-_ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES = frozenset(
-    {408, 429, 500, 502, 503, 504}
-)
+_ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES = sorted(
     PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES - {429}
 )
@@ -1095,8 +1132,6 @@ _ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS = (
     "~/.codex/auth.json",
     "~/.config/litellm/chatgpt/auth.json",
 )
-
-
 
 
 vertex_llm_base = VertexBase()
@@ -1125,28 +1160,14 @@ _ANTIGRAVITY_CODE_ASSIST_DEFAULT_BASE_URL = "https://daily-cloudcode-pa.googleap
 _ANTIGRAVITY_CLIENT_HEADER_DEFAULT = "antigravity-cli/1.0.4"
 # RR-054 #1: Antigravity OAuth path/client constants owned by package.
 _ANTIGRAVITY_AUTH_FILE_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_AUTH_FILE_ENV_VARS
-_ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS = (
-    _aawm_antigravity_oauth._ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS
-)
-_ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS = (
-    _aawm_antigravity_oauth._ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS
-)
+_ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS
+_ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS
 _ANTIGRAVITY_DEFAULT_AUTH_PATHS = _aawm_antigravity_oauth._ANTIGRAVITY_DEFAULT_AUTH_PATHS
-_ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS = (
-    _aawm_antigravity_oauth._ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS
-)
-_ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS = (
-    _aawm_antigravity_oauth._ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS
-)
-_ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS = (
-    _aawm_antigravity_oauth._ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS
-)
-_ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS = (
-    _aawm_antigravity_oauth._ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS
-)
-_ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN = (
-    _aawm_antigravity_oauth._ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN
-)
+_ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS
+_ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS
+_ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS
+_ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS = _aawm_antigravity_oauth._ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS
+_ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN = _aawm_antigravity_oauth._ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN
 _ANTIGRAVITY_CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN = (
     _aawm_antigravity_oauth._ANTIGRAVITY_CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN
 )
@@ -1158,26 +1179,16 @@ _CLAUDE_AGENT_SPEC_DEFAULT_DIRS = (
     "~/.claude/agents",
     "~/.claude/agents",
 )
-_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
-    Path(__file__).resolve().parents[3] / "context-replacement" / "claude-code"
-)
-_CLAUDE_AUTO_MEMORY_TEMPLATE_PATH = (
-    _CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR / "2.1.110" / "auto-memory-replacement.md"
-)
+_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = Path(__file__).resolve().parents[3] / "context-replacement" / "claude-code"
+_CLAUDE_AUTO_MEMORY_TEMPLATE_PATH = _CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR / "2.1.110" / "auto-memory-replacement.md"
 _CLAUDE_PROMPT_PATCH_MANIFEST_PATH = (
-    _CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR
-    / "prompt-patches"
-    / "roman01la-2026-04-02.json"
+    _CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR / "prompt-patches" / "roman01la-2026-04-02.json"
 )
 _CLAUDE_AUTO_MEMORY_MIN_COMPAT_VERSION = (2, 1, 110)
-_CLAUDE_AUTO_MEMORY_SECTION_PATTERN = re.compile(
-    r"(?ms)^# auto memory\n.*?(?=^# Environment\b|\Z)"
-)
+_CLAUDE_AUTO_MEMORY_SECTION_PATTERN = re.compile(r"(?ms)^# auto memory\n.*?(?=^# Environment\b|\Z)")
 _CLAUDE_TYPES_XML_BLOCK_PATTERN = re.compile(r"<types>\n.*?\n</types>", re.DOTALL)
 _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
-_CLAUDE_CC_VERSION_PATTERN = re.compile(
-    r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
-)
+_CLAUDE_CC_VERSION_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)")
 _CLAUDE_AGENT_TENANT_PATTERN = re.compile(
     r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project\b"
 )
@@ -1200,31 +1211,17 @@ _google_oauth_access_token_lock = _alias_routing_state.google_oauth.lock
 _antigravity_oauth_access_token_cache = _alias_routing_state.antigravity_oauth.tokens
 _antigravity_oauth_access_token_lock = _alias_routing_state.antigravity_oauth.lock
 # RR-054 #1/#3: Google process state is constructed only by the provider owner.
-_GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE = (
-    _anthropic_google_process_cache._GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE
-)
-_google_code_assist_project_cache = (
-    _anthropic_google_process_cache._google_code_assist_project_cache
-)
-_google_code_assist_project_lock = (
-    _anthropic_google_process_cache._google_code_assist_project_lock
-)
+_GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE = _anthropic_google_process_cache._GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE
+_google_code_assist_project_cache = _anthropic_google_process_cache._google_code_assist_project_cache
+_google_code_assist_project_lock = _anthropic_google_process_cache._google_code_assist_project_lock
 _google_code_assist_prime_until_monotonic_by_key = (
     _anthropic_google_process_cache._google_code_assist_prime_until_monotonic_by_key
 )
-_google_code_assist_prime_quota_by_key = (
-    _anthropic_google_process_cache._google_code_assist_prime_quota_by_key
-)
-_google_code_assist_prime_lock = (
-    _anthropic_google_process_cache._google_code_assist_prime_lock
-)
-_google_adapter_semaphores = (
-    _anthropic_google_process_cache._google_adapter_semaphores
-)
+_google_code_assist_prime_quota_by_key = _anthropic_google_process_cache._google_code_assist_prime_quota_by_key
+_google_code_assist_prime_lock = _anthropic_google_process_cache._google_code_assist_prime_lock
+_google_adapter_semaphores = _anthropic_google_process_cache._google_adapter_semaphores
 _google_adapter_rate_limit_lock = _alias_routing_state.google_rate_limit.lock
-_google_adapter_rate_limit_until_monotonic_by_key = (
-    _alias_routing_state.google_rate_limit.until_monotonic_by_key
-)
+_google_adapter_rate_limit_until_monotonic_by_key = _alias_routing_state.google_rate_limit.until_monotonic_by_key
 
 
 async def _post_code_assist_json(
@@ -1247,34 +1244,20 @@ def _raise_code_assist_process_cache_http_error(
 
 
 @lru_cache(maxsize=1)
-def _get_anthropic_google_process_cache_runtime() -> (
-    _anthropic_google_process_cache.Runtime
-):
+def _get_anthropic_google_process_cache_runtime() -> _anthropic_google_process_cache.Runtime:
     return _anthropic_google_process_cache.Runtime(
-        get_target_base=lambda provider: _get_code_assist_adapter_target_base(
-            provider
-        ),
-        build_headers=lambda **kwargs: _build_code_assist_adapter_native_headers(
-            **kwargs
-        ),
-        validate_egress=lambda **kwargs: (
-            HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)
-        ),
+        get_target_base=lambda provider: _get_code_assist_adapter_target_base(provider),
+        build_headers=lambda **kwargs: _build_code_assist_adapter_native_headers(**kwargs),
+        validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
         post_json=_post_code_assist_json,
         capture_shape=lambda **kwargs: capture_passthrough_shape(**kwargs),
         clean_value=lambda value: _clean_codex_auth_value(value),
         raise_http_error=_raise_code_assist_process_cache_http_error,
         get_prime_ttl_seconds=lambda: _get_google_code_assist_prime_ttl_seconds(),
-        get_prime_cache_key=lambda token, project: (
-            _get_google_code_assist_prime_cache_key(token, project)
-        ),
-        sanitize_quota=lambda value, source: (
-            _sanitize_google_code_assist_quota_for_logging(value, source=source)
-        ),
+        get_prime_cache_key=lambda token, project: (_get_google_code_assist_prime_cache_key(token, project)),
+        sanitize_quota=lambda value, source: (_sanitize_google_code_assist_quota_for_logging(value, source=source)),
         get_max_concurrent=lambda: _get_google_adapter_max_concurrent(),
-        get_rate_limit_key=lambda model, **kwargs: (
-            _get_google_adapter_rate_limit_key(model, **kwargs)
-        ),
+        get_rate_limit_key=lambda model, **kwargs: (_get_google_adapter_rate_limit_key(model, **kwargs)),
         monotonic=time.monotonic,
         debug_enabled=lambda: os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1",
         log_info=lambda message, value: verbose_proxy_logger.info(message, value),
@@ -1282,21 +1265,15 @@ def _get_anthropic_google_process_cache_runtime() -> (
     )
 
 
-def _bound_google_adapter_token_cache(
-    cache: dict, *, max_size: int = _GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE
-) -> None:
+def _bound_google_adapter_token_cache(cache: dict, *, max_size: int = _GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE) -> None:
     return _anthropic_google_process_cache._bound_google_adapter_token_cache(
         cache,
         max_size=max_size,
     )
 
 
-_google_adapter_user_prompt_turn_lock = (
-    _anthropic_google_process_cache._google_adapter_user_prompt_turn_lock
-)
-_google_adapter_user_prompt_turn_counters = (
-    _anthropic_google_process_cache._google_adapter_user_prompt_turn_counters
-)
+_google_adapter_user_prompt_turn_lock = _anthropic_google_process_cache._google_adapter_user_prompt_turn_lock
+_google_adapter_user_prompt_turn_counters = _anthropic_google_process_cache._google_adapter_user_prompt_turn_counters
 _openrouter_adapter_rate_limit_lock = _alias_routing_state.openrouter_rate_limit.lock
 _openrouter_adapter_rate_limit_until_monotonic_by_key = (
     _alias_routing_state.openrouter_rate_limit.until_monotonic_by_key
@@ -1314,9 +1291,7 @@ _CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD = "unsupported_request_params
 _CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "unsupported_input_item_types"
 _CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "rewrite_input_item_types"
 _CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = "custom_tool_function_adapters"
-_CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = (
-    "namespace_tool_function_adapters"
-)
+_CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = "namespace_tool_function_adapters"
 _CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "Use subagents to parallelize independent work while keeping one local owner "
     "on the critical path. Follow the current operator and project instructions "
@@ -1471,9 +1446,7 @@ def _is_grok_native_oauth_request_body(request_body: dict[str, Any]) -> bool:
 
 @lru_cache(maxsize=1)
 def _load_local_model_metadata() -> dict[str, Any]:
-    model_metadata_path = (
-        Path(__file__).resolve().parents[3] / "model_prices_and_context_window.json"
-    )
+    model_metadata_path = Path(__file__).resolve().parents[3] / "model_prices_and_context_window.json"
     try:
         with model_metadata_path.open("r", encoding="utf-8") as model_metadata_file:
             metadata = json.load(model_metadata_file)
@@ -1534,9 +1507,7 @@ def _xai_responses_sanitized_tool_changes(
 
     tool_changes: list[dict[str, Any]] = []
     for index, original_tool in enumerate(original_tools):
-        sanitized_tool = (
-            sanitized_tools[index] if index < len(sanitized_tools) else None
-        )
+        sanitized_tool = sanitized_tools[index] if index < len(sanitized_tools) else None
         if original_tool == sanitized_tool:
             continue
 
@@ -1546,9 +1517,7 @@ def _xai_responses_sanitized_tool_changes(
             if tool_type:
                 change["type"] = tool_type
             if isinstance(sanitized_tool, dict):
-                removed_fields = [
-                    key for key in original_tool.keys() if key not in sanitized_tool
-                ]
+                removed_fields = [key for key in original_tool.keys() if key not in sanitized_tool]
                 if removed_fields:
                     change["removed_fields"] = sorted(removed_fields)
         elif isinstance(original_tool, str):
@@ -1566,11 +1535,7 @@ def _sanitize_xai_responses_request_body(
         model=str(request_body.get("model") or ""),
         drop_params=True,
     )
-    removed_params = [
-        key
-        for key in request_body.keys()
-        if key not in sanitized_body and key != "litellm_metadata"
-    ]
+    removed_params = [key for key in request_body.keys() if key not in sanitized_body and key != "litellm_metadata"]
     tool_changes = _xai_responses_sanitized_tool_changes(
         request_body.get("tools"),
         sanitized_body.get("tools"),
@@ -1590,32 +1555,17 @@ def _sanitize_xai_responses_request_body(
         return request_body, [], []
 
     tool_types = _dedupe_sorted_str_list(
-        [
-            tool_change["type"]
-            for tool_change in tool_changes
-            if isinstance(tool_change.get("type"), str)
-        ]
+        [tool_change["type"] for tool_change in tool_changes if isinstance(tool_change.get("type"), str)]
     )
     normalized_removed_params = _dedupe_sorted_str_list(
-        [
-            normalized
-            for param in removed_params
-            if (normalized := _normalize_low_cardinality_tag_value(param))
-        ]
+        [normalized for param in removed_params if (normalized := _normalize_low_cardinality_tag_value(param))]
     )
     updated_body = _merge_litellm_metadata(
         sanitized_body,
         tags_to_add=[
             "xai-responses-request-sanitized",
-            *(
-                ["xai-responses-previous-response-id-decoded"]
-                if decoded_previous_response_id
-                else []
-            ),
-            *(
-                f"xai-responses-removed-param:{param}"
-                for param in normalized_removed_params
-            ),
+            *(["xai-responses-previous-response-id-decoded"] if decoded_previous_response_id else []),
+            *(f"xai-responses-removed-param:{param}" for param in normalized_removed_params),
             *(f"xai-responses-sanitized-tool:{tool}" for tool in tool_types),
         ],
         extra_fields={
@@ -1624,9 +1574,7 @@ def _sanitize_xai_responses_request_body(
             "xai_responses_sanitized_tool_count": len(tool_changes),
             "xai_responses_sanitized_tool_types": tool_types,
             "xai_responses_sanitized_tools": tool_changes,
-            "xai_responses_previous_response_id_decoded": (
-                decoded_previous_response_id
-            ),
+            "xai_responses_previous_response_id_decoded": (decoded_previous_response_id),
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
                     name="xai.responses_request_sanitized",
@@ -1646,13 +1594,10 @@ def _sanitize_xai_responses_request_body(
 def _coerce_grok_native_function_call_arguments_value(
     arguments_value: Any,
 ) -> tuple[dict[str, Any], Optional[str]]:
-    return _anthropic_grok_normalization.coerce_function_call_arguments_value(
-        arguments_value
-    )
+    return _anthropic_grok_normalization.coerce_function_call_arguments_value(arguments_value)
 
 
-def _get_anthropic_grok_normalization_runtime(
-) -> _anthropic_grok_normalization.Runtime:
+def _get_anthropic_grok_normalization_runtime() -> _anthropic_grok_normalization.Runtime:
     return _anthropic_grok_normalization.Runtime(
         normalize_tag=_normalize_low_cardinality_tag_value,
         dedupe_sorted=_dedupe_sorted_str_list,
@@ -1665,11 +1610,7 @@ def _get_anthropic_grok_normalization_runtime(
 def _sanitize_grok_native_function_call_arguments_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    return (
-        _anthropic_grok_normalization.sanitize_function_call_arguments_request_body(
-            request_body
-        )
-    )
+    return _anthropic_grok_normalization.sanitize_function_call_arguments_request_body(request_body)
 
 
 def _sanitize_grok_native_function_call_arguments_in_place(
@@ -1684,9 +1625,7 @@ def _sanitize_grok_native_function_call_arguments_in_place(
 def _sanitize_xai_responses_request_body_in_place(
     request_body: dict[str, Any],
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    updated_body, removed_params, tool_changes = _sanitize_xai_responses_request_body(
-        request_body
-    )
+    updated_body, removed_params, tool_changes = _sanitize_xai_responses_request_body(request_body)
     if updated_body is not request_body:
         request_body.clear()
         request_body.update(updated_body)
@@ -1698,9 +1637,7 @@ async def _prepare_oa_xai_passthrough_request(
     *,
     sanitize_responses_request: bool = False,
 ) -> tuple[bool, Optional[str], Optional[str]]:
-    if is_oa_xai_model(request_body.get("model")) and not isinstance(
-        request_body.get("litellm_metadata"), dict
-    ):
+    if is_oa_xai_model(request_body.get("model")) and not isinstance(request_body.get("litellm_metadata"), dict):
         request_body["litellm_metadata"] = {}
     prepared = await prepare_oa_xai_request(request_body)
     if not prepared:
@@ -1740,11 +1677,7 @@ async def _prepare_oa_xai_passthrough_request(
 
 
 def _get_grok_native_oauth_client_version() -> str:
-    return (
-        get_secret_str("LITELLM_XAI_GROK_CLIENT_VERSION")
-        or get_secret_str("GROK_CLIENT_VERSION")
-        or "0.1.210"
-    )
+    return get_secret_str("LITELLM_XAI_GROK_CLIENT_VERSION") or get_secret_str("GROK_CLIENT_VERSION") or "0.1.210"
 
 
 def _get_grok_native_oauth_session_id(
@@ -1797,19 +1730,13 @@ def _build_grok_native_oauth_headers(
         "accept": "application/json",
         "authorization": f"Bearer {access_token}",
         "content-type": "application/json",
-        "user-agent": (
-            get_secret_str("LITELLM_XAI_GROK_USER_AGENT") or f"grok/{client_version}"
-        ),
-        "x-grok-client-identifier": (
-            get_secret_str("LITELLM_XAI_GROK_CLIENT_IDENTIFIER") or "grok-cli"
-        ),
+        "user-agent": (get_secret_str("LITELLM_XAI_GROK_USER_AGENT") or f"grok/{client_version}"),
+        "x-grok-client-identifier": (get_secret_str("LITELLM_XAI_GROK_CLIENT_IDENTIFIER") or "grok-cli"),
         "x-grok-client-version": client_version,
         "x-grok-model-override": model,
         "x-grok-req-id": request_id,
         "x-request-id": request_id,
-        "x-xai-token-auth": (
-            get_secret_str("LITELLM_XAI_GROK_XAI_TOKEN_AUTH") or "xai-grok-cli"
-        ),
+        "x-xai-token-auth": (get_secret_str("LITELLM_XAI_GROK_XAI_TOKEN_AUTH") or "xai-grok-cli"),
     }
     session_id = _get_grok_native_oauth_session_id(
         request=request,
@@ -1843,9 +1770,7 @@ def _add_grok_native_oauth_metadata(
         **(extra_fields or {}),
     }
     if preserved_route_family:
-        merged_extra_fields.setdefault(
-            "source_passthrough_route_family", preserved_route_family
-        )
+        merged_extra_fields.setdefault("source_passthrough_route_family", preserved_route_family)
         merged_extra_fields.setdefault("source_route_family", preserved_route_family)
         merged_extra_fields["grok_cli_chat_proxy_used"] = True
     return _merge_litellm_metadata(
@@ -1920,16 +1845,11 @@ def _get_gemini_passthrough_route_family(endpoint: str) -> Optional[str]:
 def _request_has_openai_client_auth(request: Request) -> bool:
     headers = _safe_get_request_headers(request)
     return bool(
-        headers.get("authorization")
-        or headers.get("Authorization")
-        or headers.get("api-key")
-        or headers.get("Api-Key")
+        headers.get("authorization") or headers.get("Authorization") or headers.get("api-key") or headers.get("Api-Key")
     )
 
 
-def _get_request_header_or_passthrough_alias(
-    request: Request, header_name: str
-) -> Optional[str]:
+def _get_request_header_or_passthrough_alias(request: Request, header_name: str) -> Optional[str]:
     headers = _safe_get_request_headers(request)
     candidates = (
         header_name,
@@ -2009,15 +1929,11 @@ def _get_anthropic_adapter_model_candidates(request_body: dict[str, Any]) -> lis
     if requested_model is not None:
         candidates.append(requested_model)
 
-    agent_name, _tenant = _extract_claude_agent_and_tenant_from_request_body(
-        request_body
-    )
+    agent_name, _tenant = _extract_claude_agent_and_tenant_from_request_body(request_body)
     if not agent_name:
         return candidates
 
-    agent_model = _normalize_anthropic_adapter_model_name(
-        _load_claude_agent_declared_model(agent_name)
-    )
+    agent_model = _normalize_anthropic_adapter_model_name(_load_claude_agent_declared_model(agent_name))
     if agent_model is not None:
         candidates.append(agent_model)
     return candidates
@@ -2054,12 +1970,8 @@ def _normalize_anthropic_nvidia_responses_adapter_model_name(
     nvidia_model_aliases = {
         "minimax/minimax-m2.7": "minimaxai/minimax-m2.7",
     }
-    normalized_candidate = nvidia_model_aliases.get(
-        normalized_candidate, normalized_candidate
-    )
-    is_openrouter_namespace_model = (
-        requested_model in _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS
-    )
+    normalized_candidate = nvidia_model_aliases.get(normalized_candidate, normalized_candidate)
+    is_openrouter_namespace_model = requested_model in _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS
     if has_explicit_nvidia_prefix and not is_openrouter_namespace_model:
         return normalized_candidate or None
     if normalized_candidate in _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS:
@@ -2072,9 +1984,7 @@ def _normalize_anthropic_openrouter_adapter_model_name(
 ) -> Optional[str]:
     explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
     normalized_candidate = (
-        candidate
-        if explicit_provider == "openrouter"
-        else _normalize_anthropic_adapter_model_name(model)
+        candidate if explicit_provider == "openrouter" else _normalize_anthropic_adapter_model_name(model)
     )
     if normalized_candidate is None:
         return None
@@ -2082,13 +1992,9 @@ def _normalize_anthropic_openrouter_adapter_model_name(
     openrouter_model_aliases = {
         "free": "openrouter/free",
         "elephant-alpha": "openrouter/elephant-alpha",
-        "meta-llama/llama-3.3-70b-instructfree": (
-            "meta-llama/llama-3.3-70b-instruct:free"
-        ),
+        "meta-llama/llama-3.3-70b-instructfree": ("meta-llama/llama-3.3-70b-instruct:free"),
     }
-    normalized_candidate = openrouter_model_aliases.get(
-        normalized_candidate, normalized_candidate
-    )
+    normalized_candidate = openrouter_model_aliases.get(normalized_candidate, normalized_candidate)
     return normalized_candidate or None
 
 
@@ -2129,9 +2035,7 @@ async def _maybe_raise_openrouter_adapter_alias_probe_cooldown(
 ) -> None:
     if not use_alias_candidate_probe:
         return
-    cooldown_seconds = await _get_openrouter_adapter_active_cooldown_seconds(
-        adapter_model
-    )
+    cooldown_seconds = await _get_openrouter_adapter_active_cooldown_seconds(adapter_model)
     if cooldown_seconds <= 0:
         return
     rounded_wait = max(1, int(cooldown_seconds))
@@ -2215,9 +2119,7 @@ def _resolve_codex_alibaba_token_plan_adapter_model(
 ) -> Optional[str]:
     if not _is_openai_responses_endpoint(endpoint):
         return None
-    return _normalize_alibaba_token_plan_adapter_model_name(
-        request_body.get("model")
-    )
+    return _normalize_alibaba_token_plan_adapter_model_name(request_body.get("model"))
 
 
 def _resolve_anthropic_opencode_zen_adapter_model(
@@ -2264,9 +2166,7 @@ def _resolve_anthropic_antigravity_code_assist_adapter_model(
     endpoint: str,
 ) -> Optional[str]:
     _ = endpoint
-    return _normalize_antigravity_code_assist_adapter_model_name(
-        request_body.get("model")
-    )
+    return _normalize_antigravity_code_assist_adapter_model_name(request_body.get("model"))
 
 
 def _resolve_codex_google_code_assist_adapter_model(
@@ -2275,9 +2175,7 @@ def _resolve_codex_google_code_assist_adapter_model(
 ) -> Optional[str]:
     if not _is_openai_responses_endpoint(endpoint):
         return None
-    return _normalize_codex_google_code_assist_adapter_model_name(
-        request_body.get("model")
-    )
+    return _normalize_codex_google_code_assist_adapter_model_name(request_body.get("model"))
 
 
 def _resolve_codex_antigravity_code_assist_adapter_model(
@@ -2286,9 +2184,7 @@ def _resolve_codex_antigravity_code_assist_adapter_model(
 ) -> Optional[str]:
     if not _is_openai_responses_endpoint(endpoint):
         return None
-    return _normalize_antigravity_code_assist_adapter_model_name(
-        request_body.get("model")
-    )
+    return _normalize_antigravity_code_assist_adapter_model_name(request_body.get("model"))
 
 
 def _normalize_codex_auto_agent_alias_model(model: Any) -> Optional[str]:
@@ -2314,9 +2210,7 @@ def _resolve_codex_auto_agent_alias_model(
     return _normalize_codex_auto_agent_alias_model(request_body.get("model"))
 
 
-def _get_codex_auto_agent_header(
-    headers: dict[str, Any], header_name: str
-) -> Optional[str]:
+def _get_codex_auto_agent_header(headers: dict[str, Any], header_name: str) -> Optional[str]:
     for key, value in headers.items():
         if not isinstance(key, str) or key.lower() != header_name.lower():
             continue
@@ -2343,9 +2237,9 @@ def _resolve_codex_auto_agent_openai_lane_key(
     if authorization is not None:
         return f"auth:{_hash_codex_auto_agent_lane_value(authorization)}"
     if include_session_fallback:
-        session_header = _get_codex_auto_agent_header(
-            headers, "session_id"
-        ) or _get_codex_auto_agent_header(headers, "session-id")
+        session_header = _get_codex_auto_agent_header(headers, "session_id") or _get_codex_auto_agent_header(
+            headers, "session-id"
+        )
         if session_header is not None:
             return f"session:{session_header}"
     return "__default__"
@@ -2359,9 +2253,7 @@ def _resolve_codex_auto_agent_openai_cooldown_lane_key(request: Request) -> str:
 
 
 def _get_codex_auto_agent_lane_state_cache_ttl_seconds() -> float:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS"))
     if raw_value is None:
         return _CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS
     try:
@@ -2390,6 +2282,7 @@ def _invalidate_codex_auto_agent_google_lane_cache() -> None:
     _codex_auto_agent_google_lane_key_until_monotonic_by_key.pop(cache_key, None)
     _codex_auto_agent_google_lane_key_by_key.pop(cache_key, None)
 
+
 def _invalidate_codex_auto_agent_antigravity_lane_cache() -> None:
     cache_key = _get_codex_auto_agent_antigravity_lane_cache_key()
     _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.pop(
@@ -2405,30 +2298,21 @@ def _invalidate_codex_auto_agent_lane_state_caches() -> None:
 
 
 async def _resolve_codex_auto_agent_google_lane_key() -> str:
-    if (
-        time.monotonic()
-        < _alias_routing_state.google_lane_negative_until_monotonic
-    ):
+    if time.monotonic() < _alias_routing_state.google_lane_negative_until_monotonic:
         return _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY
     cache_key = _get_codex_auto_agent_google_lane_cache_key()
     ttl_seconds = _get_codex_auto_agent_lane_state_cache_ttl_seconds()
     if ttl_seconds > 0:
         async with _codex_auto_agent_lane_state_cache_lock:
-            cached_until = _codex_auto_agent_google_lane_key_until_monotonic_by_key.get(
-                cache_key, 0.0
-            )
+            cached_until = _codex_auto_agent_google_lane_key_until_monotonic_by_key.get(cache_key, 0.0)
             if cached_until > time.monotonic():
-                cached_lane_key = _codex_auto_agent_google_lane_key_by_key.get(
-                    cache_key
-                )
+                cached_lane_key = _codex_auto_agent_google_lane_key_by_key.get(cache_key)
                 if isinstance(cached_lane_key, str) and cached_lane_key:
                     return cached_lane_key
 
     try:
         google_access_token = await _load_valid_local_google_oauth_access_token()
-        google_project = await _get_or_load_google_code_assist_project(
-            google_access_token
-        )
+        google_project = await _get_or_load_google_code_assist_project(google_access_token)
         lane_key = _get_google_adapter_rate_limit_key(
             None,
             access_token=google_access_token,
@@ -2451,9 +2335,7 @@ async def _resolve_codex_auto_agent_google_lane_key() -> str:
     if ttl_seconds > 0:
         async with _codex_auto_agent_lane_state_cache_lock:
             _codex_auto_agent_google_lane_key_by_key[cache_key] = lane_key
-            _codex_auto_agent_google_lane_key_until_monotonic_by_key[cache_key] = (
-                time.monotonic() + ttl_seconds
-            )
+            _codex_auto_agent_google_lane_key_until_monotonic_by_key[cache_key] = time.monotonic() + ttl_seconds
     return lane_key
 
 
@@ -2501,15 +2383,9 @@ async def _resolve_codex_auto_agent_antigravity_lane_key() -> str:
     ttl_seconds = _get_codex_auto_agent_lane_state_cache_ttl_seconds()
     if ttl_seconds > 0:
         async with _codex_auto_agent_lane_state_cache_lock:
-            cached_until = (
-                _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.get(
-                    cache_key, 0.0
-                )
-            )
+            cached_until = _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.get(cache_key, 0.0)
             if cached_until > time.monotonic():
-                cached_lane_key = _codex_auto_agent_antigravity_lane_key_by_key.get(
-                    cache_key
-                )
+                cached_lane_key = _codex_auto_agent_antigravity_lane_key_by_key.get(cache_key)
                 if isinstance(cached_lane_key, str) and cached_lane_key:
                     return cached_lane_key
 
@@ -2541,9 +2417,7 @@ async def _resolve_codex_auto_agent_antigravity_lane_key() -> str:
     if ttl_seconds > 0 and lane_key != "__default__":
         async with _codex_auto_agent_lane_state_cache_lock:
             _codex_auto_agent_antigravity_lane_key_by_key[cache_key] = lane_key
-            _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key[cache_key] = (
-                time.monotonic() + ttl_seconds
-            )
+            _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key[cache_key] = time.monotonic() + ttl_seconds
     return lane_key
 
 
@@ -2568,23 +2442,18 @@ def _resolve_codex_auto_agent_session_key(
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
 ) -> Optional[str]:
     metadata = request_body.get("litellm_metadata")
-    metadata_session_id = (
-        metadata.get("session_id") if isinstance(metadata, dict) else None
-    )
+    metadata_session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
     session_id = _clean_codex_auth_value(metadata_session_id)
     headers = _safe_get_request_headers(request)
     if session_id is None:
-        session_id = _get_codex_auto_agent_header(
-            headers, "session_id"
-        ) or _get_codex_auto_agent_header(headers, "session-id")
+        session_id = _get_codex_auto_agent_header(headers, "session_id") or _get_codex_auto_agent_header(
+            headers, "session-id"
+        )
     if session_id is None:
         return None
     if alias_model == _CODEX_AUTO_AGENT_MODEL_ALIAS:
         return f"{session_id}:{_resolve_codex_auto_agent_openai_lane_key(request)}"
-    return (
-        f"{alias_model}:{session_id}:"
-        f"{_resolve_codex_auto_agent_openai_lane_key(request)}"
-    )
+    return f"{alias_model}:{session_id}:" f"{_resolve_codex_auto_agent_openai_lane_key(request)}"
 
 
 def _codex_auto_agent_candidate_key(
@@ -2693,15 +2562,11 @@ async def _get_openrouter_free_daily_quota_exhausted_cooldown_seconds() -> float
             if row is not None:
                 remaining_pct = row["remaining_pct"]
                 try:
-                    remaining_pct_float = (
-                        float(remaining_pct) if remaining_pct is not None else None
-                    )
+                    remaining_pct_float = float(remaining_pct) if remaining_pct is not None else None
                 except (TypeError, ValueError):
                     remaining_pct_float = None
                 if remaining_pct_float is not None and remaining_pct_float <= 0:
-                    reset_at_ts = _parse_openrouter_free_daily_quota_reset_timestamp(
-                        row["expected_reset_at"]
-                    )
+                    reset_at_ts = _parse_openrouter_free_daily_quota_reset_timestamp(row["expected_reset_at"])
         except Exception:
             verbose_proxy_logger.debug(
                 "OpenRouter durable quota check failed; failing open for alias selection",
@@ -2737,9 +2602,7 @@ async def _apply_openrouter_durable_quota_candidate_cooldown(
     if not _is_openrouter_free_quota_candidate(candidate):
         return cooldown_seconds, cooldown_state_source, skip_reason
 
-    durable_cooldown = (
-        await _get_openrouter_free_daily_quota_exhausted_cooldown_seconds()
-    )
+    durable_cooldown = await _get_openrouter_free_daily_quota_exhausted_cooldown_seconds()
     if durable_cooldown <= 0:
         return cooldown_seconds, cooldown_state_source, skip_reason
 
@@ -2864,9 +2727,7 @@ def _extract_auto_agent_alias_client_product_label(
         "x-client-name-version",
         "user-agent",
     ):
-        value = _normalize_auto_agent_alias_client_product(
-            _get_codex_auto_agent_header(headers, header_name)
-        )
+        value = _normalize_auto_agent_alias_client_product(_get_codex_auto_agent_header(headers, header_name))
         if value:
             return value
     return None
@@ -2902,9 +2763,7 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
         "anthropic_opencode_zen_responses_adapter": "opencode.ai/zen/v1/responses",
         "anthropic_opencode_zen_completion_adapter": "opencode.ai/zen/v1/chat/completions",
     }
-    return route_family_target_labels.get(
-        cleaned_route_family or "", cleaned_route_family
-    )
+    return route_family_target_labels.get(cleaned_route_family or "", cleaned_route_family)
 
 
 def _build_adapted_route_rollup_kwargs(
@@ -3004,11 +2863,7 @@ def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str
             return "Failed"
         return None
     if cooldown_scope == "request_local":
-        if (
-            event.get("error_status_code")
-            or failure_class
-            or event.get("redispatch_required")
-        ):
+        if event.get("error_status_code") or failure_class or event.get("redispatch_required"):
             return "Failed"
         return None
     if candidate_status in {
@@ -3021,9 +2876,7 @@ def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str
         and "auth_degraded" not in candidate_status
     ):
         return "Cooling Down"
-    if cooldown_scope == "candidate" or (
-        event.get("redispatch_required") and cooldown_scope != "request_local"
-    ):
+    if cooldown_scope == "candidate" or (event.get("redispatch_required") and cooldown_scope != "request_local"):
         return "Cooling Down"
     if failure_class in {"rate_limited", "capacity_exhausted", "transient_error"}:
         return "Cooling Down"
@@ -3050,9 +2903,7 @@ def _auto_agent_alias_route_status_message(event: dict[str, Any]) -> str:
             parts.append(f"{key}={value}")
     error_tokens = event.get("error_tokens")
     if isinstance(error_tokens, list) and error_tokens:
-        parts.append(
-            "error_tokens={}".format(",".join(str(v) for v in error_tokens[:5]))
-        )
+        parts.append("error_tokens={}".format(",".join(str(v) for v in error_tokens[:5])))
     return "; ".join(parts) or "route status changed"
 
 
@@ -3154,9 +3005,7 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
             message=message,
         )
 
-    group_header_label = _resolve_auto_agent_alias_route_rollup_group_header_label(
-        event
-    )
+    group_header_label = _resolve_auto_agent_alias_route_rollup_group_header_label(event)
     incoming_endpoint = _clean_codex_auth_value(event.get("incoming_endpoint"))
     outgoing_target = (
         _clean_codex_auth_value(event.get("outgoing_target"))
@@ -3186,17 +3035,12 @@ def _emit_auto_agent_alias_route_event(
     level: str = "info",
 ) -> None:
     _record_auto_agent_alias_route_status_rollup(event)
-    if not (
-        _aawm_alias_route_verbose_json_enabled()
-        or _aawm_alias_route_healthy_json_enabled()
-    ):
+    if not (_aawm_alias_route_verbose_json_enabled() or _aawm_alias_route_healthy_json_enabled()):
         return
     if not _should_emit_auto_agent_alias_route_event(event, level=level):
         return
     log_payload = {"event": "aawm_alias_route", **event}
-    message = "AAWM_ALIAS_ROUTE: {}".format(
-        json.dumps(log_payload, sort_keys=True, default=str, separators=(",", ":"))
-    )
+    message = "AAWM_ALIAS_ROUTE: {}".format(json.dumps(log_payload, sort_keys=True, default=str, separators=(",", ":")))
     verbose_aawm_route_logger.info(message)
 
 
@@ -3355,11 +3199,7 @@ def _iter_auto_agent_alias_metadata_dicts(
             "session-id",
             "x-litellm-session-id",
         }
-        filtered = {
-            key: value
-            for key, value in headers.items()
-            if isinstance(key, str) and key.lower() in allowed
-        }
+        filtered = {key: value for key, value in headers.items() if isinstance(key, str) and key.lower() in allowed}
         if filtered:
             sources.append(filtered)
     return sources
@@ -3508,10 +3348,7 @@ def _walk_auto_agent_alias_prior_tool_activity(
     if isinstance(value, dict):
         item_type = value.get("type")
         role = str(value.get("role") or "").lower()
-        if (
-            isinstance(item_type, str)
-            and item_type in _AUTO_AGENT_PRIOR_TOOL_ITEM_TYPES
-        ):
+        if isinstance(item_type, str) and item_type in _AUTO_AGENT_PRIOR_TOOL_ITEM_TYPES:
             # RR-054 #58: single membership test for call vs result item types.
             is_tool_call = item_type in {
                 "function_call",
@@ -3593,23 +3430,15 @@ def _summarize_auto_agent_alias_actual_prior_tool_activity(
                 file_edit_tool_names=file_edit_tool_names,
                 counters=counters,
             )
-    has_actual_prior_tool_activity = bool(
-        counters["prior_tool_call_count"] or counters["prior_tool_result_count"]
-    )
-    has_previous_response_id = bool(
-        _clean_codex_auth_value(request_body.get("previous_response_id"))
-    )
-    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
-        request_body
-    )
+    has_actual_prior_tool_activity = bool(counters["prior_tool_call_count"] or counters["prior_tool_result_count"])
+    has_previous_response_id = bool(_clean_codex_auth_value(request_body.get("previous_response_id")))
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(request_body)
     return {
         "has_actual_prior_tool_activity": has_actual_prior_tool_activity,
         "prior_tool_call_count": counters["prior_tool_call_count"],
         "prior_tool_result_count": counters["prior_tool_result_count"],
         "prior_tool_names": tool_names[:20],
-        "has_prior_file_edit_activity": bool(
-            counters["prior_file_edit_tool_call_count"]
-        ),
+        "has_prior_file_edit_activity": bool(counters["prior_file_edit_tool_call_count"]),
         "prior_file_edit_tool_call_count": counters["prior_file_edit_tool_call_count"],
         "prior_file_edit_tool_names": file_edit_tool_names[:20],
         "has_previous_response_id": has_previous_response_id,
@@ -3620,9 +3449,9 @@ def _summarize_auto_agent_alias_actual_prior_tool_activity(
 def _classify_auto_agent_alias_terminal_activity_status(
     prior_tool_activity_summary: Optional[dict[str, Any]],
 ) -> str:
-    if isinstance(
-        prior_tool_activity_summary, dict
-    ) and prior_tool_activity_summary.get("has_actual_prior_tool_activity"):
+    if isinstance(prior_tool_activity_summary, dict) and prior_tool_activity_summary.get(
+        "has_actual_prior_tool_activity"
+    ):
         return "failed_after_partial_activity"
     return "failed_no_activity"
 
@@ -3649,9 +3478,7 @@ def _get_or_create_auto_agent_alias_request_call_id(
         "aawm_litellm_call_id",
     )
     if litellm_call_id is None:
-        scope = (
-            request.scope if isinstance(getattr(request, "scope", None), dict) else {}
-        )
+        scope = request.scope if isinstance(getattr(request, "scope", None), dict) else {}
         for key in ("litellm_call_id", "call_id", "request_id"):
             value = _clean_codex_auth_value(scope.get(key))
             if value is not None:
@@ -3708,30 +3535,18 @@ def _normalize_auto_agent_alias_request_context(
     agent_dispatch_value = value.get("agent_dispatch")
     host_attribution_value = value.get("host_attribution")
     context: _AutoAgentAliasRequestContext = {
-        "agent_dispatch": (
-            dict(agent_dispatch_value)
-            if isinstance(agent_dispatch_value, dict)
-            else {}
-        ),
+        "agent_dispatch": (dict(agent_dispatch_value) if isinstance(agent_dispatch_value, dict) else {}),
         "session_id": _clean_optional_string(value.get("session_id")),
-        "litellm_call_id": _clean_optional_string(value.get("litellm_call_id"))
-        or str(uuid4()),
+        "litellm_call_id": _clean_optional_string(value.get("litellm_call_id")) or str(uuid4()),
         "trace_id": _clean_optional_string(value.get("trace_id")),
         "repository": _clean_optional_string(value.get("repository")),
-        "client_product_label": _clean_optional_string(
-            value.get("client_product_label")
-        ),
+        "client_product_label": _clean_optional_string(value.get("client_product_label")),
         "host_attribution": (
-            {
-                str(key): item if isinstance(item, str) else None
-                for key, item in host_attribution_value.items()
-            }
+            {str(key): item if isinstance(item, str) else None for key, item in host_attribution_value.items()}
             if isinstance(host_attribution_value, dict)
             else {}
         ),
-        "rollup_group_header_label": _clean_optional_string(
-            value.get("rollup_group_header_label")
-        ),
+        "rollup_group_header_label": _clean_optional_string(value.get("rollup_group_header_label")),
     }
     prior_activity = value.get("prior_tool_activity_summary")
     if isinstance(prior_activity, dict):
@@ -3751,9 +3566,7 @@ def _get_auto_agent_alias_request_context(
 ) -> _AutoAgentAliasRequestContext:
     request_state = getattr(request, "state", None)
     cached_value = (
-        getattr(request_state, _AUTO_AGENT_REQUEST_CONTEXT_STATE_KEY, None)
-        if request_state is not None
-        else None
+        getattr(request_state, _AUTO_AGENT_REQUEST_CONTEXT_STATE_KEY, None) if request_state is not None else None
     )
     if isinstance(cached_value, dict):
         cached = _normalize_auto_agent_alias_request_context(cached_value)
@@ -3803,9 +3616,7 @@ def _get_auto_agent_alias_request_context(
         if request_state is not None:
             setattr(request_state, _AUTO_AGENT_REQUEST_CONTEXT_STATE_KEY, cached)
     if include_activity and "prior_tool_activity_summary" not in cached:
-        cached["prior_tool_activity_summary"] = (
-            _summarize_auto_agent_alias_actual_prior_tool_activity(request_body)
-        )
+        cached["prior_tool_activity_summary"] = _summarize_auto_agent_alias_actual_prior_tool_activity(request_body)
     if request_state is not None:
         setattr(request_state, _AUTO_AGENT_REQUEST_CONTEXT_STATE_KEY, cached)
     return cached
@@ -3872,9 +3683,7 @@ def _attach_auto_agent_alias_terminal_context_fields(
         prior_summary = context.get("prior_tool_activity_summary")
         event["actual_prior_tool_activity_summary"] = prior_summary
     if include_activity_status:
-        event[
-            "terminal_activity_status"
-        ] = _classify_auto_agent_alias_terminal_activity_status(prior_summary)
+        event["terminal_activity_status"] = _classify_auto_agent_alias_terminal_activity_status(prior_summary)
     return event
 
 
@@ -4049,9 +3858,7 @@ def _enrich_auto_agent_alias_terminal_event_from_attempts(
     event: dict[str, Any],
     attempts: Optional[list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    normalized_attempts = [
-        attempt for attempt in attempts or [] if isinstance(attempt, dict)
-    ]
+    normalized_attempts = [attempt for attempt in attempts or [] if isinstance(attempt, dict)]
     if not normalized_attempts:
         return normalized_attempts
 
@@ -4062,8 +3869,7 @@ def _enrich_auto_agent_alias_terminal_event_from_attempts(
     if last_failure_class is not None:
         event["failure_class"] = last_failure_class
     event["attempted_provider_call"] = any(
-        attempt.get("attempted_provider_call") is True
-        for attempt in normalized_attempts
+        attempt.get("attempted_provider_call") is True for attempt in normalized_attempts
     )
     if event["attempted_provider_call"]:
         event["failure_phase"] = "provider_attempt"
@@ -4173,8 +3979,7 @@ def _emit_auto_agent_alias_no_candidate_event(
                 "model": last_attempt.get("model"),
                 "route_family": last_attempt.get("route_family"),
                 "failure_kind": "agent_alias_no_candidate",
-                "error_code": event.get("failure_class")
-                or "all_candidates_unavailable",
+                "error_code": event.get("failure_class") or "all_candidates_unavailable",
             },
             terminal_outcome="agent_session_terminated",
             fallback_result="no_candidate_available",
@@ -4330,9 +4135,7 @@ def _build_auto_agent_alias_audit_event(
         "attempted_provider_call": attempted_provider_call,
         "cooldown_scope": cooldown_scope,
         "cooldown_seconds": (
-            round(normalized_cooldown_seconds, 3)
-            if normalized_cooldown_seconds is not None
-            else None
+            round(normalized_cooldown_seconds, 3) if normalized_cooldown_seconds is not None else None
         ),
         "cooldown_until": _auto_agent_alias_cooldown_until(normalized_cooldown_seconds),
         "selected": selected,
@@ -4395,9 +4198,7 @@ def _build_auto_agent_alias_audit_events(
                 continue
             reason = str(skipped_candidate.get("reason") or "cooldown")
             event_type = (
-                "candidate_skipped_provider_degraded"
-                if reason == "auth_degraded"
-                else "candidate_skipped_cooldown"
+                "candidate_skipped_provider_degraded" if reason == "auth_degraded" else "candidate_skipped_cooldown"
             )
             events.append(
                 _build_auto_agent_alias_audit_event(
@@ -4415,9 +4216,7 @@ def _build_auto_agent_alias_audit_events(
                     lane_key=skipped_candidate.get("lane_key"),
                     cooldown_seconds=skipped_candidate.get("cooldown_seconds"),
                     failure_phase=skipped_candidate.get("failure_phase"),
-                    attempted_provider_call=skipped_candidate.get(
-                        "attempted_provider_call"
-                    ),
+                    attempted_provider_call=skipped_candidate.get("attempted_provider_call"),
                 )
             )
 
@@ -4456,8 +4255,7 @@ def _build_auto_agent_alias_audit_events(
                 attempt_number=index,
                 selected=True,
                 skipped=False,
-                selection_reason=attempt.get("reason")
-                or selection.get("selection_reason"),
+                selection_reason=attempt.get("reason") or selection.get("selection_reason"),
                 lane_key=attempt.get("lane_key") or selection.get("lane_key"),
                 # RR-054 #51: attach the attempt's own cooldown key (fall back to selection).
                 cooldown_key=(
@@ -4519,15 +4317,9 @@ def _codex_auto_agent_request_has_continuation_state(
             return True
         if value.get("tool_calls"):
             return True
-        return any(
-            _codex_auto_agent_request_has_continuation_state(child, _seen)
-            for child in value.values()
-        )
+        return any(_codex_auto_agent_request_has_continuation_state(child, _seen) for child in value.values())
     if isinstance(value, list):
-        return any(
-            _codex_auto_agent_request_has_continuation_state(item, _seen)
-            for item in value
-        )
+        return any(_codex_auto_agent_request_has_continuation_state(item, _seen) for item in value)
     return False
 
 
@@ -4587,9 +4379,7 @@ def _build_auto_agent_redispatch_http_exception_detail(
     retry_after = int(
         max(
             1.0,
-            float(retry_after_seconds)
-            if retry_after_seconds is not None
-            else cooldown_seconds,
+            float(retry_after_seconds) if retry_after_seconds is not None else cooldown_seconds,
         )
     )
     shaped_candidate = _codex_auto_agent_candidate_public_shape(
@@ -4702,9 +4492,7 @@ async def _get_codex_auto_agent_active_cooldown_state(
         _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
     # RR-054 #30: negative-cache durable misses so healthy keys do not Redis-hit every call.
     async with _codex_auto_agent_lock:
-        neg_until = _codex_auto_agent_cooldown_negative_until_monotonic_by_key.get(
-            cooldown_key, 0.0
-        )
+        neg_until = _codex_auto_agent_cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
         if neg_until > time.monotonic():
             return 0.0, "negative_cache"
     dual_cache = _get_aawm_alias_routing_dual_cache()
@@ -4720,9 +4508,7 @@ async def _get_codex_auto_agent_active_cooldown_state(
             _codex_auto_agent_cooldown_negative_until_monotonic_by_key[cooldown_key] = (
                 time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
             )
-            _bound_aawm_alias_routing_memory_map(
-                _codex_auto_agent_cooldown_negative_until_monotonic_by_key
-            )
+            _bound_aawm_alias_routing_memory_map(_codex_auto_agent_cooldown_negative_until_monotonic_by_key)
         return 0.0, "local_fallback"
     expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
     if expires_at_epoch is None:
@@ -4730,14 +4516,10 @@ async def _get_codex_auto_agent_active_cooldown_state(
             _codex_auto_agent_cooldown_negative_until_monotonic_by_key[cooldown_key] = (
                 time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
             )
-            _bound_aawm_alias_routing_memory_map(
-                _codex_auto_agent_cooldown_negative_until_monotonic_by_key
-            )
+            _bound_aawm_alias_routing_memory_map(_codex_auto_agent_cooldown_negative_until_monotonic_by_key)
         return 0.0, "local_fallback"
     async with _codex_auto_agent_lock:
-        _codex_auto_agent_cooldown_negative_until_monotonic_by_key.pop(
-            cooldown_key, None
-        )
+        _codex_auto_agent_cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
         _hydrate_aawm_alias_routing_cooldown_memory(
             memory_map=_codex_auto_agent_cooldown_until_monotonic_by_key,
             cooldown_key=cooldown_key,
@@ -4761,17 +4543,11 @@ async def _set_codex_auto_agent_cooldown(
     ttl_seconds = max(0.0, float(cooldown_seconds))
     async with _codex_auto_agent_lock:
         until = time.monotonic() + ttl_seconds
-        current_until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(
-            cooldown_key, 0.0
-        )
+        current_until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
         if until > current_until:
             _codex_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = until
-            _codex_auto_agent_cooldown_negative_until_monotonic_by_key.pop(
-                cooldown_key, None
-            )
-            _bound_aawm_alias_routing_memory_map(
-                _codex_auto_agent_cooldown_until_monotonic_by_key
-            )
+            _codex_auto_agent_cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
+            _bound_aawm_alias_routing_memory_map(_codex_auto_agent_cooldown_until_monotonic_by_key)
     if ttl_seconds <= 0:
         return
     await _write_aawm_alias_routing_durable_payload(
@@ -4794,9 +4570,7 @@ async def _get_codex_auto_agent_session_affinity(
             expires_at = affinity.get("expires_at_monotonic", 0.0)
             if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
                 hydrated = dict(affinity)
-                hydrated["affinity_state_source"] = affinity.get(
-                    "affinity_state_source", "memory"
-                )
+                hydrated["affinity_state_source"] = affinity.get("affinity_state_source", "memory")
                 return hydrated
             _codex_auto_agent_session_affinity_by_key.pop(session_key, None)
     dual_cache = _get_aawm_alias_routing_dual_cache()
@@ -4837,9 +4611,7 @@ async def _set_codex_auto_agent_session_affinity(
             "model": candidate["model"],
             "route_family": candidate["route_family"],
             "last_resort": bool(candidate.get("last_resort")),
-            "expires_at_monotonic": (
-                time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
-            ),
+            "expires_at_monotonic": (time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS),
             "affinity_state_source": "memory",
         }
         _bound_aawm_alias_routing_memory_map(_codex_auto_agent_session_affinity_by_key)
@@ -4883,9 +4655,7 @@ def _build_auto_agent_skipped_candidates_from_states(
         shaped = _codex_auto_agent_candidate_public_shape(
             state["candidate"],
             lane_key=state["lane_key"],
-            cooldown_seconds=(
-                state["cooldown_seconds"] if state["cooldown_seconds"] > 0 else None
-            ),
+            cooldown_seconds=(state["cooldown_seconds"] if state["cooldown_seconds"] > 0 else None),
             reason=state.get("skip_reason") or "cooldown",
         )
         for field in (
@@ -4929,18 +4699,14 @@ def _apply_codex_auto_agent_request_local_candidate_state(
         candidate=candidate,
         lane_key=lane_key,
     )
-    request_local_cooldown_seconds = (
-        _get_codex_auto_agent_request_local_cooldown_seconds(
-            request,
-            cooldown_key=request_local_cooldown_key,
-        )
+    request_local_cooldown_seconds = _get_codex_auto_agent_request_local_cooldown_seconds(
+        request,
+        cooldown_key=request_local_cooldown_key,
     )
     if request_local_cooldown_seconds > cooldown_seconds:
         cooldown_seconds = request_local_cooldown_seconds
         cooldown_state_source = "request_local"
-    if request_local_cooldown_key in _get_codex_auto_agent_request_local_excluded_keys(
-        request
-    ):
+    if request_local_cooldown_key in _get_codex_auto_agent_request_local_excluded_keys(request):
         if request_local_cooldown_seconds <= 0:
             cooldown_seconds = max(cooldown_seconds, 0.001)
         cooldown_state_source = "request_local"
@@ -4967,8 +4733,7 @@ async def _apply_codex_auto_agent_adapter_local_candidate_cooldown(
             now = time.monotonic()
             adapter_seconds = max(
                 0.0,
-                _google_adapter_rate_limit_until_monotonic_by_key.get(lane_key, 0.0)
-                - now,
+                _google_adapter_rate_limit_until_monotonic_by_key.get(lane_key, 0.0) - now,
             )
     if adapter_seconds <= 0:
         return cooldown_seconds, cooldown_state_source, skip_reason
@@ -5030,21 +4795,13 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
             attempted_provider_call = False
     elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
         if antigravity_lane_state is None:
-            antigravity_lane_state = (
-                await _resolve_codex_auto_agent_antigravity_lane_state()
-            )
+            antigravity_lane_state = await _resolve_codex_auto_agent_antigravity_lane_state()
         lane_key = str(antigravity_lane_state["lane_key"])
-        forced_cooldown_seconds = _auto_agent_alias_float(
-            antigravity_lane_state.get("forced_cooldown_seconds")
-        )
+        forced_cooldown_seconds = _auto_agent_alias_float(antigravity_lane_state.get("forced_cooldown_seconds"))
         skip_reason = cast(Optional[str], antigravity_lane_state.get("skip_reason"))
-        cooldown_state_source_override = cast(
-            Optional[str], antigravity_lane_state.get("cooldown_state_source")
-        )
+        cooldown_state_source_override = cast(Optional[str], antigravity_lane_state.get("cooldown_state_source"))
         failure_phase = cast(Optional[str], antigravity_lane_state.get("failure_phase"))
-        attempted_provider_call = cast(
-            Optional[bool], antigravity_lane_state.get("attempted_provider_call")
-        )
+        attempted_provider_call = cast(Optional[bool], antigravity_lane_state.get("attempted_provider_call"))
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
@@ -5119,18 +4876,13 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
     )
-    if (
-        forced_cooldown_seconds is not None
-        and forced_cooldown_seconds > cooldown_seconds
-    ):
+    if forced_cooldown_seconds is not None and forced_cooldown_seconds > cooldown_seconds:
         await _apply_codex_auto_agent_forced_candidate_cooldown(
             cooldown_key=cooldown_key,
             cooldown_seconds=forced_cooldown_seconds,
         )
         cooldown_seconds = forced_cooldown_seconds
-        cooldown_state_source = (
-            cooldown_state_source_override or "forced_candidate_cooldown"
-        )
+        cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
     state = {
         "candidate": candidate,
         "lane_key": lane_key,
@@ -5160,9 +4912,7 @@ async def _get_anthropic_auto_agent_candidate_cooldown_state(
         _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
         _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     }:
-        return await _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
-            cooldown_key
-        )
+        return await _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(cooldown_key)
     return await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
 
 
@@ -5180,9 +4930,7 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     if openai_lane_key is None:
         openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     if anthropic_lane_key is None:
-        anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(
-            request
-        )
+        anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
     forced_cooldown_seconds: Optional[float] = None
     skip_reason: Optional[str] = None
     cooldown_state_source_override: Optional[str] = None
@@ -5200,21 +4948,13 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
             attempted_provider_call = False
     elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
         if antigravity_lane_state is None:
-            antigravity_lane_state = (
-                await _resolve_codex_auto_agent_antigravity_lane_state()
-            )
+            antigravity_lane_state = await _resolve_codex_auto_agent_antigravity_lane_state()
         lane_key = str(antigravity_lane_state["lane_key"])
-        forced_cooldown_seconds = _auto_agent_alias_float(
-            antigravity_lane_state.get("forced_cooldown_seconds")
-        )
+        forced_cooldown_seconds = _auto_agent_alias_float(antigravity_lane_state.get("forced_cooldown_seconds"))
         skip_reason = cast(Optional[str], antigravity_lane_state.get("skip_reason"))
-        cooldown_state_source_override = cast(
-            Optional[str], antigravity_lane_state.get("cooldown_state_source")
-        )
+        cooldown_state_source_override = cast(Optional[str], antigravity_lane_state.get("cooldown_state_source"))
         failure_phase = cast(Optional[str], antigravity_lane_state.get("failure_phase"))
-        attempted_provider_call = cast(
-            Optional[bool], antigravity_lane_state.get("attempted_provider_call")
-        )
+        attempted_provider_call = cast(Optional[bool], antigravity_lane_state.get("attempted_provider_call"))
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
@@ -5299,18 +5039,13 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
     )
-    if (
-        forced_cooldown_seconds is not None
-        and forced_cooldown_seconds > cooldown_seconds
-    ):
+    if forced_cooldown_seconds is not None and forced_cooldown_seconds > cooldown_seconds:
         await _apply_anthropic_auto_agent_forced_candidate_cooldown(
             cooldown_key=cooldown_key,
             cooldown_seconds=forced_cooldown_seconds,
         )
         cooldown_seconds = forced_cooldown_seconds
-        cooldown_state_source = (
-            cooldown_state_source_override or "forced_candidate_cooldown"
-        )
+        cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
     state = {
         "candidate": candidate,
         "lane_key": lane_key,
@@ -5339,18 +5074,10 @@ async def _build_codex_auto_agent_candidate_states(
     antigravity_lane_state: Optional[dict[str, Any]] = None
     states: list[dict[str, Any]] = []
     for candidate_template in _get_codex_auto_agent_candidates_for_alias(alias_model):
-        if (
-            candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER
-            and google_lane_key is None
-        ):
+        if candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER and google_lane_key is None:
             google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
-        if (
-            candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER
-            and antigravity_lane_state is None
-        ):
-            antigravity_lane_state = (
-                await _resolve_codex_auto_agent_antigravity_lane_state()
-            )
+        if candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER and antigravity_lane_state is None:
+            antigravity_lane_state = await _resolve_codex_auto_agent_antigravity_lane_state()
         states.append(
             await _build_codex_auto_agent_candidate_state(
                 request,
@@ -5372,13 +5099,9 @@ def _attach_aawm_alias_routing_state_sources(
 ) -> dict[str, Any]:
     enriched = dict(selection)
     if affinity is not None:
-        enriched["affinity_state_source"] = affinity.get(
-            "affinity_state_source", "local_fallback"
-        )
+        enriched["affinity_state_source"] = affinity.get("affinity_state_source", "local_fallback")
     if selected_state is not None:
-        enriched["cooldown_state_source"] = selected_state.get(
-            "cooldown_state_source", "local_fallback"
-        )
+        enriched["cooldown_state_source"] = selected_state.get("cooldown_state_source", "local_fallback")
     return enriched
 
 
@@ -5387,18 +5110,13 @@ async def _select_codex_auto_agent_candidate(
     request: Request,
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
-    alias_model = (
-        _normalize_codex_auto_agent_alias_model(request_body.get("model"))
-        or _CODEX_AUTO_AGENT_MODEL_ALIAS
-    )
+    alias_model = _normalize_codex_auto_agent_alias_model(request_body.get("model")) or _CODEX_AUTO_AGENT_MODEL_ALIAS
     session_key = _resolve_codex_auto_agent_session_key(
         request,
         request_body,
         alias_model=alias_model,
     )
-    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
-        request_body
-    )
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(request_body)
 
     affinity = await _get_codex_auto_agent_session_affinity(session_key)
     if affinity is not None and not has_continuation_state:
@@ -5463,9 +5181,7 @@ async def _select_codex_auto_agent_candidate(
                             _raise_codex_auto_agent_in_flight_cooldown(
                                 candidate=affinity_candidate,
                                 lane_key=matched_affinity_state.get("lane_key"),
-                                cooldown_seconds=matched_affinity_state[
-                                    "cooldown_seconds"
-                                ],
+                                cooldown_seconds=matched_affinity_state["cooldown_seconds"],
                             )
                     skipped.append(
                         _codex_auto_agent_candidate_public_shape(
@@ -5476,8 +5192,7 @@ async def _select_codex_auto_agent_candidate(
                                 if matched_affinity_state["cooldown_seconds"] > 0
                                 else None
                             ),
-                            reason=matched_affinity_state.get("skip_reason")
-                            or "session_affinity_cooldown",
+                            reason=matched_affinity_state.get("skip_reason") or "session_affinity_cooldown",
                         )
                     )
                 else:
@@ -5494,16 +5209,13 @@ async def _select_codex_auto_agent_candidate(
                         selected_state=matched_affinity_state,
                     )
             preferred_available = any(
-                not state["candidate"].get("last_resort")
-                and _is_auto_agent_candidate_state_available(state)
+                not state["candidate"].get("last_resort") and _is_auto_agent_candidate_state_available(state)
                 for state in states
             )
             if (
                 matched_affinity_state is not None
                 and _is_auto_agent_candidate_state_available(matched_affinity_state)
-                and (
-                    not affinity_candidate.get("last_resort") or not preferred_available
-                )
+                and (not affinity_candidate.get("last_resort") or not preferred_available)
             ):
                 return _attach_aawm_alias_routing_state_sources(
                     {
@@ -5518,9 +5230,7 @@ async def _select_codex_auto_agent_candidate(
                 )
 
     for state in states:
-        if state["candidate"].get(
-            "last_resort"
-        ) or not _is_auto_agent_candidate_state_available(state):
+        if state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
             continue
         return _attach_aawm_alias_routing_state_sources(
             {
@@ -5534,9 +5244,7 @@ async def _select_codex_auto_agent_candidate(
         )
 
     for state in states:
-        if not state["candidate"].get(
-            "last_resort"
-        ) or not _is_auto_agent_candidate_state_available(state):
+        if not state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
             continue
         return _attach_aawm_alias_routing_state_sources(
             {
@@ -5553,9 +5261,7 @@ async def _select_codex_auto_agent_candidate(
         status_code=429,
         detail={
             "error": {
-                "message": (
-                    "All Codex auto-agent alias candidates are currently cooled down."
-                ),
+                "message": ("All Codex auto-agent alias candidates are currently cooled down."),
                 "type": "rate_limit_error",
                 "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
             },
@@ -5601,15 +5307,9 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("usage_limit_reached")
     if "resource_exhausted" in text_lower or "resource exhausted" in text_lower:
         tokens.add("RESOURCE_EXHAUSTED")
-    if (
-        "model_capacity_exhausted" in text_lower
-        or "model capacity exhausted" in text_lower
-    ):
+    if "model_capacity_exhausted" in text_lower or "model capacity exhausted" in text_lower:
         tokens.add("MODEL_CAPACITY_EXHAUSTED")
-    if (
-        "currently experiencing high demand" in text_lower
-        or "experiencing high demand" in text_lower
-    ):
+    if "currently experiencing high demand" in text_lower or "experiencing high demand" in text_lower:
         tokens.add("HIGH_DEMAND")
     if "selected model is at capacity" in text_lower or (
         "model is at capacity" in text_lower and "try a different model" in text_lower
@@ -5617,9 +5317,7 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("MODEL_AT_CAPACITY")
     if "model is overloaded" in text_lower or "overloaded_error" in text_lower:
         tokens.add("MODEL_OVERLOADED")
-    if "busy upstream" in text_lower or (
-        "upstream" in text_lower and "busy" in text_lower
-    ):
+    if "busy upstream" in text_lower or ("upstream" in text_lower and "busy" in text_lower):
         tokens.add("UPSTREAM_BUSY")
     if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
         tokens.add("RATE_LIMIT_EXCEEDED")
@@ -5655,19 +5353,12 @@ def _add_codex_auto_agent_text_error_tokens(
         tokens.add("safety_policy_denied")
     if (
         "error from provider (deepseek)" in text_lower
-        and "assistant message with 'tool_calls' must be followed by tool messages"
-        in text_lower
+        and "assistant message with 'tool_calls' must be followed by tool messages" in text_lower
     ) or "insufficient tool messages following tool_calls message" in text_lower:
         tokens.add("DEEPSEEK_TOOL_MESSAGE_MISMATCH")
-    if (
-        "invalid message provided" in text_lower
-        and "must have non-empty content or tool calls" in text_lower
-    ):
+    if "invalid message provided" in text_lower and "must have non-empty content or tool calls" in text_lower:
         tokens.add("OPENROUTER_INVALID_CHAT_MESSAGE")
-    if (
-        "invalid tool call provided" in text_lower
-        and "tool arguments must be a stringified json object" in text_lower
-    ):
+    if "invalid tool call provided" in text_lower and "tool arguments must be a stringified json object" in text_lower:
         tokens.add("OPENROUTER_INVALID_TOOL_CALL_ARGUMENTS")
 
 
@@ -5928,8 +5619,7 @@ def _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(
     attempt_index = max(1, int(failed_attempt))
     base_seconds = min(
         _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS,
-        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS
-        * (2 ** (attempt_index - 1)),
+        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS * (2 ** (attempt_index - 1)),
     )
     jitter_cap = min(
         _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS,
@@ -5999,7 +5689,11 @@ def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
     model: Optional[str],
     route_family: Optional[str],
     max_attempts: Optional[int] = None,
-) -> tuple[bool, Optional[float], Optional[_NativeGrokContinuationRetryMetadata],]:
+) -> tuple[
+    bool,
+    Optional[float],
+    Optional[_NativeGrokContinuationRetryMetadata],
+]:
     """Annotate attempt metadata and decide whether to retry the same candidate.
 
     ``provider_attempt`` must be the request-scoped total of eligible native Grok
@@ -6021,11 +5715,7 @@ def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
         else _get_codex_auto_agent_native_grok_continuation_transient_max_attempts()
     )
     if provider_attempt < resolved_max_attempts:
-        backoff_seconds = (
-            _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(
-                provider_attempt
-            )
-        )
+        backoff_seconds = _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(provider_attempt)
         metadata = _build_codex_auto_agent_native_grok_continuation_retry_metadata(
             status="scheduled_same_candidate_retry",
             provider_attempt=provider_attempt,
@@ -6097,9 +5787,9 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
         candidate
     ) and _is_codex_auto_agent_transient_internal_error_class(error_class):
         return "none"
-    if _is_codex_auto_agent_spark_candidate(
-        candidate
-    ) and _is_codex_auto_agent_transient_internal_error_class(error_class):
+    if _is_codex_auto_agent_spark_candidate(candidate) and _is_codex_auto_agent_transient_internal_error_class(
+        error_class
+    ):
         return "candidate"
     return _get_codex_auto_agent_cooldown_scope(error_class)
 
@@ -6253,10 +5943,7 @@ async def _apply_auto_agent_alias_cooldown(
                 candidate,
                 lane_key,
             )
-            if (
-                lane_cooldown_key is not None
-                and lane_cooldown_key != selected_cooldown_key
-            ):
+            if lane_cooldown_key is not None and lane_cooldown_key != selected_cooldown_key:
                 await set_candidate_cooldown(
                     lane_cooldown_key,
                     cooldown_seconds,
@@ -6377,9 +6064,7 @@ def _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
     candidate: Payload,
     lane_key: Optional[str],
 ) -> Optional[str]:
-    if not lane_key or not _is_codex_auto_agent_grok_account_quota_candidate(
-        candidate
-    ):
+    if not lane_key or not _is_codex_auto_agent_grok_account_quota_candidate(candidate):
         return None
     return f"{candidate.get('provider')}:__account_quota__:{lane_key}"
 
@@ -6508,8 +6193,7 @@ def _get_codex_auto_agent_cooldown_seconds(
     if header_wait is not None:
         resolved = max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
     elif (
-        error_class in {"capacity_exhausted", "upstream_overloaded"}
-        or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
+        error_class in {"capacity_exhausted", "upstream_overloaded"} or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
     ):
         resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
     elif _is_codex_auto_agent_transient_internal_error_class(error_class):
@@ -6525,17 +6209,14 @@ def _get_codex_auto_agent_cooldown_seconds(
     else:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
 
-    if _is_codex_auto_agent_spark_candidate(
-        candidate
-    ) and _is_codex_auto_agent_durable_cooldown_error_class(error_class):
-        return _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS
-    if (
-        _is_codex_auto_agent_grok_account_quota_exhaustion(
-            exc,
-            candidate=candidate,
-        )
-        and _is_codex_auto_agent_durable_cooldown_error_class(error_class)
+    if _is_codex_auto_agent_spark_candidate(candidate) and _is_codex_auto_agent_durable_cooldown_error_class(
+        error_class
     ):
+        return _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS
+    if _is_codex_auto_agent_grok_account_quota_exhaustion(
+        exc,
+        candidate=candidate,
+    ) and _is_codex_auto_agent_durable_cooldown_error_class(error_class):
         return _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS
     return resolved
 
@@ -6555,9 +6236,7 @@ def _iter_codex_auto_agent_error_blocks(exc: Any) -> list[dict[str, Any]]:
                 error_blocks.append(error)
         elif isinstance(parsed, list):
             error_blocks.extend(
-                item["error"]
-                for item in parsed
-                if isinstance(item, dict) and isinstance(item.get("error"), dict)
+                item["error"] for item in parsed if isinstance(item, dict) and isinstance(item.get("error"), dict)
             )
     return error_blocks
 
@@ -6571,9 +6250,7 @@ def _extract_codex_auto_agent_error_type_and_code(
     error_code: Optional[Any] = None
     for error in _iter_codex_auto_agent_error_blocks(exc):
         if error_type is None:
-            error_type = _clean_codex_auth_value(
-                error.get("type") or error.get("status")
-            )
+            error_type = _clean_codex_auth_value(error.get("type") or error.get("status"))
         if error_code is None:
             error_code = error.get("code") or error.get("status")
         if error_type is not None and error_code is not None:
@@ -6622,8 +6299,7 @@ def _get_codex_auto_agent_source_error_summary(
             if isinstance(message, str) and message:
                 return _get_passthrough_handled_http_error_summary(
                     HTTPException(
-                        status_code=status_code
-                        or status.HTTP_502_BAD_GATEWAY,
+                        status_code=status_code or status.HTTP_502_BAD_GATEWAY,
                         detail=message,
                     ),
                     status_code=status_code,
@@ -6673,11 +6349,7 @@ def _update_codex_auto_agent_retryable_attempt_record(
         update["error_code"] = str(error_code)
     if retry_after_seconds is not None:
         update["retry_after_seconds"] = round(float(retry_after_seconds), 3)
-    if (
-        alias_model is not None
-        and candidate is not None
-        and kimi_failure_metadata is not None
-    ):
+    if alias_model is not None and candidate is not None and kimi_failure_metadata is not None:
         update["kimi_code_failure"] = _build_safe_kimi_code_selection_telemetry(
             alias_model=alias_model,
             candidate=candidate,
@@ -6707,22 +6379,44 @@ def _record_auto_agent_alias_attempt_started(
     _safe_set_request_parsed_body(request, candidate_body)
     candidate_metadata = candidate_body.get("litellm_metadata")
     audit_events = (
-        candidate_metadata.get("aawm_alias_routing_audit_events")
-        if isinstance(candidate_metadata, dict)
-        else None
+        candidate_metadata.get("aawm_alias_routing_audit_events") if isinstance(candidate_metadata, dict) else None
     )
     if (
         isinstance(audit_events, list)
         and audit_events
-        and (
-            _aawm_alias_route_verbose_json_enabled()
-            or _aawm_alias_route_healthy_json_enabled()
-        )
+        and (_aawm_alias_route_verbose_json_enabled() or _aawm_alias_route_healthy_json_enabled())
     ):
         latest_event = audit_events[-1]
         if isinstance(latest_event, dict):
             _emit_auto_agent_alias_route_event(latest_event)
     return candidate_body
+
+
+def _record_read_pilot_cooldown_evidence(
+    *,
+    cooldown_key: Optional[str],
+    attempt_record: dict[str, Any],
+) -> None:
+    """Route the ``read``-pilot lane's cooldown writes through the N-of-M gate.
+
+    Classifies the already-extracted attempt-record error fields into a
+    ``FailureEvent`` and feeds it to ``_read_pilot_cooldown_gate``, recording
+    the three-valued ``origin`` (upstream/client/unknown; only ``upstream``
+    ever advances a key toward cooling) on the attempt record. This does not
+    replace the existing candidate cooldown application (``apply_cooldown_fn``)
+    -- it is additional, read-pilot-only evidence bookkeeping.
+    """
+    event = _aawm_alias_classification.classify_failure(
+        status_code=attempt_record.get("error_status_code"),
+        provider=None,
+        message=str(attempt_record.get("source_error") or ""),
+        retry_after_seconds=attempt_record.get("retry_after_seconds"),
+    )
+    attempt_record["origin"] = event.origin
+    _read_pilot_cooldown_gate.record(
+        cooldown_key=cooldown_key or "read_pilot:unknown",
+        event=event,
+    )
 
 
 def _record_auto_agent_alias_attempt_failure(
@@ -6738,6 +6432,11 @@ def _record_auto_agent_alias_attempt_failure(
     add_alias_metadata_fn: Callable[..., dict[str, Any]],
     redispatch_required: bool = False,
 ) -> dict[str, Any]:
+    if alias_model == _READ_PILOT_ALIAS_NAME:
+        _record_read_pilot_cooldown_evidence(
+            cooldown_key=selection.get("cooldown_key"),
+            attempt_record=attempt_record,
+        )
     failure_body = add_alias_metadata_fn(
         prepared_request_body,
         request=request,
@@ -6747,13 +6446,9 @@ def _record_auto_agent_alias_attempt_failure(
     _safe_set_request_parsed_body(request, failure_body)
     failure_metadata = failure_body.get("litellm_metadata")
     full_audit_events = (
-        failure_metadata.get("aawm_alias_routing_audit_events")
-        if isinstance(failure_metadata, dict)
-        else None
+        failure_metadata.get("aawm_alias_routing_audit_events") if isinstance(failure_metadata, dict) else None
     )
-    audit_events = [
-        event for event in full_audit_events or [] if isinstance(event, dict)
-    ]
+    audit_events = [event for event in full_audit_events or [] if isinstance(event, dict)]
     audit_event = audit_events[-1] if audit_events else None
     if audit_event is None:
         audit_event = _build_auto_agent_alias_audit_event(
@@ -6763,9 +6458,7 @@ def _record_auto_agent_alias_attempt_failure(
             request_body=prepared_request_body,
             selection=selection,
             candidate=attempt_record,
-            event_type="redispatch_required"
-            if redispatch_required
-            else "candidate_retryable_failure",
+            event_type="redispatch_required" if redispatch_required else "candidate_retryable_failure",
             candidate_status=attempt_record.get("status") or "cooldown_set",
             attempt_number=len(attempts),
             selected=True,
@@ -6844,22 +6537,12 @@ def _get_codex_reasoning_effort_ceiling(
         if isinstance(catalog_model_info, dict):
             model_info_sources.append(catalog_model_info)
 
-    if any(
-        model_info.get("supports_max_reasoning_effort") is True
-        for model_info in model_info_sources
-    ):
+    if any(model_info.get("supports_max_reasoning_effort") is True for model_info in model_info_sources):
         return "max"
-    if any(
-        model_info.get("supports_xhigh_reasoning_effort") is True
-        for model_info in model_info_sources
-    ):
+    if any(model_info.get("supports_xhigh_reasoning_effort") is True for model_info in model_info_sources):
         return "xhigh"
-    if any(
-        model_info.get("supports_reasoning") is True
-        for model_info in model_info_sources
-    ) and any(
-        model_info.get("supports_xhigh_reasoning_effort") is False
-        for model_info in model_info_sources
+    if any(model_info.get("supports_reasoning") is True for model_info in model_info_sources) and any(
+        model_info.get("supports_xhigh_reasoning_effort") is False for model_info in model_info_sources
     ):
         return "high"
     return None
@@ -6872,10 +6555,7 @@ def _normalize_codex_reasoning_effort_for_resolved_route(
     attempt_number: Optional[int] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     requested_effort, native_field = _extract_codex_reasoning_effort(request_body)
-    if (
-        requested_effort not in _CODEX_REASONING_EFFORT_TIER_INDEX
-        or native_field is None
-    ):
+    if requested_effort not in _CODEX_REASONING_EFFORT_TIER_INDEX or native_field is None:
         return request_body, {}
 
     supported_ceiling = _get_codex_reasoning_effort_ceiling(resolved_route)
@@ -6884,10 +6564,7 @@ def _normalize_codex_reasoning_effort_for_resolved_route(
 
     emitted_effort = requested_effort
     mapping_reason = "within_supported_ceiling"
-    if (
-        _CODEX_REASONING_EFFORT_TIER_INDEX[requested_effort]
-        > _CODEX_REASONING_EFFORT_TIER_INDEX[supported_ceiling]
-    ):
+    if _CODEX_REASONING_EFFORT_TIER_INDEX[requested_effort] > _CODEX_REASONING_EFFORT_TIER_INDEX[supported_ceiling]:
         emitted_effort = supported_ceiling
         mapping_reason = "requested_effort_above_model_supported_ceiling"
 
@@ -6983,9 +6660,7 @@ def _add_codex_auto_agent_alias_metadata(
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
-    default_reasoning_effort = _normalize_low_cardinality_tag_value(
-        candidate.get("default_reasoning_effort")
-    )
+    default_reasoning_effort = _normalize_low_cardinality_tag_value(candidate.get("default_reasoning_effort"))
     default_reasoning_applied = False
     if default_reasoning_effort and "reasoning_effort" not in updated_body:
         reasoning = updated_body.get("reasoning")
@@ -7036,11 +6711,7 @@ def _add_codex_auto_agent_alias_metadata(
             f"codex-auto-agent-route:{candidate['route_family']}",
             f"model-alias:{alias_model}",
             *(["codex-auto-agent-last-resort"] if candidate.get("last_resort") else []),
-            *(
-                [f"codex-auto-agent-default-effort:{default_reasoning_effort}"]
-                if default_reasoning_applied
-                else []
-            ),
+            *([f"codex-auto-agent-default-effort:{default_reasoning_effort}"] if default_reasoning_applied else []),
             f"codex-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
@@ -7053,24 +6724,17 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_selected_last_resort": bool(candidate.get("last_resort")),
             **(
                 {
-                    "codex_auto_agent_default_reasoning_effort": (
-                        default_reasoning_effort
-                    ),
+                    "codex_auto_agent_default_reasoning_effort": (default_reasoning_effort),
                     "codex_reasoning_effort": (
-                        reasoning_effort_metadata.get("codex_reasoning_effort")
-                        or default_reasoning_effort
+                        reasoning_effort_metadata.get("codex_reasoning_effort") or default_reasoning_effort
                     ),
                 }
                 if default_reasoning_applied
                 else {}
             ),
             "codex_auto_agent_selection_reason": selection.get("selection_reason"),
-            "codex_auto_agent_affinity_state_source": selection.get(
-                "affinity_state_source"
-            ),
-            "codex_auto_agent_cooldown_state_source": selection.get(
-                "cooldown_state_source"
-            ),
+            "codex_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
+            "codex_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),
             "codex_auto_agent_lane_key": selection.get("lane_key"),
             "codex_auto_agent_attempts": attempts,
             "codex_auto_agent_skipped_candidates": skipped,
@@ -7138,9 +6802,7 @@ def _resolve_anthropic_auto_agent_session_key(
     alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
 ) -> Optional[str]:
     metadata = request_body.get("litellm_metadata")
-    metadata_session_id = (
-        metadata.get("session_id") if isinstance(metadata, dict) else None
-    )
+    metadata_session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
     session_id = _clean_codex_auth_value(metadata_session_id)
     headers = _safe_get_request_headers(request)
     if session_id is None:
@@ -7153,10 +6815,7 @@ def _resolve_anthropic_auto_agent_session_key(
         return None
     if alias_model == _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS:
         return f"{session_id}:{_resolve_anthropic_auto_agent_native_lane_key(request)}"
-    return (
-        f"{alias_model}:{session_id}:"
-        f"{_resolve_anthropic_auto_agent_native_lane_key(request)}"
-    )
+    return f"{alias_model}:{session_id}:" f"{_resolve_anthropic_auto_agent_native_lane_key(request)}"
 
 
 def _format_merged_alias_family_cooldown_state_source(
@@ -7191,9 +6850,7 @@ async def _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
         anthropic_seconds,
         anthropic_source,
     ) = await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
-    codex_seconds, codex_source = await _get_codex_auto_agent_active_cooldown_state(
-        cooldown_key
-    )
+    codex_seconds, codex_source = await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
     return _format_merged_alias_family_cooldown_state_source(
         anthropic_seconds=anthropic_seconds,
         anthropic_source=anthropic_source,
@@ -7207,15 +6864,11 @@ async def _get_anthropic_auto_agent_active_cooldown_state(
 ) -> tuple[float, str]:
     async with _anthropic_auto_agent_lock:
         now = time.monotonic()
-        until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(
-            cooldown_key, 0.0
-        )
+        until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
         if until > now:
             return max(0.0, until - now), "memory"
         _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
-        neg_until = _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.get(
-            cooldown_key, 0.0
-        )
+        neg_until = _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
         if neg_until > now:
             return 0.0, "negative_cache"
     dual_cache = _get_aawm_alias_routing_dual_cache()
@@ -7228,35 +6881,27 @@ async def _get_anthropic_auto_agent_active_cooldown_state(
     )
     if durable_payload is None:
         async with _anthropic_auto_agent_lock:
-            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key[
-                cooldown_key
-            ] = (time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS)
-            _bound_aawm_alias_routing_memory_map(
-                _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key
+            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
             )
+            _bound_aawm_alias_routing_memory_map(_anthropic_auto_agent_cooldown_negative_until_monotonic_by_key)
         return 0.0, "local_fallback"
     expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
     if expires_at_epoch is None:
         async with _anthropic_auto_agent_lock:
-            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key[
-                cooldown_key
-            ] = (time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS)
-            _bound_aawm_alias_routing_memory_map(
-                _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key
+            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
             )
+            _bound_aawm_alias_routing_memory_map(_anthropic_auto_agent_cooldown_negative_until_monotonic_by_key)
         return 0.0, "local_fallback"
     async with _anthropic_auto_agent_lock:
-        _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.pop(
-            cooldown_key, None
-        )
+        _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
         _hydrate_aawm_alias_routing_cooldown_memory(
             memory_map=_anthropic_auto_agent_cooldown_until_monotonic_by_key,
             cooldown_key=cooldown_key,
             expires_at_epoch=expires_at_epoch,
         )
-        until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(
-            cooldown_key, 0.0
-        )
+        until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
         return max(0.0, until - time.monotonic()), "durable_cache"
 
 
@@ -7274,17 +6919,11 @@ async def _set_anthropic_auto_agent_cooldown(
     ttl_seconds = max(0.0, float(cooldown_seconds))
     async with _anthropic_auto_agent_lock:
         until = time.monotonic() + ttl_seconds
-        current_until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(
-            cooldown_key, 0.0
-        )
+        current_until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
         if until > current_until:
             _anthropic_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = until
-            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.pop(
-                cooldown_key, None
-            )
-            _bound_aawm_alias_routing_memory_map(
-                _anthropic_auto_agent_cooldown_until_monotonic_by_key
-            )
+            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
+            _bound_aawm_alias_routing_memory_map(_anthropic_auto_agent_cooldown_until_monotonic_by_key)
     if ttl_seconds <= 0:
         return
     await _write_aawm_alias_routing_durable_payload(
@@ -7307,9 +6946,7 @@ async def _get_anthropic_auto_agent_session_affinity(
             expires_at = affinity.get("expires_at_monotonic", 0.0)
             if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
                 hydrated = dict(affinity)
-                hydrated["affinity_state_source"] = affinity.get(
-                    "affinity_state_source", "memory"
-                )
+                hydrated["affinity_state_source"] = affinity.get("affinity_state_source", "memory")
                 return hydrated
             _anthropic_auto_agent_session_affinity_by_key.pop(session_key, None)
     dual_cache = _get_aawm_alias_routing_dual_cache()
@@ -7350,14 +6987,10 @@ async def _set_anthropic_auto_agent_session_affinity(
             "model": candidate["model"],
             "route_family": candidate["route_family"],
             "last_resort": bool(candidate.get("last_resort")),
-            "expires_at_monotonic": (
-                time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
-            ),
+            "expires_at_monotonic": (time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS),
             "affinity_state_source": "memory",
         }
-        _bound_aawm_alias_routing_memory_map(
-            _anthropic_auto_agent_session_affinity_by_key
-        )
+        _bound_aawm_alias_routing_memory_map(_anthropic_auto_agent_session_affinity_by_key)
     await _write_aawm_alias_routing_durable_payload(
         alias_family="anthropic",
         state_kind="affinity",
@@ -7394,21 +7027,11 @@ async def _build_anthropic_auto_agent_candidate_states(
     google_lane_key: Optional[str] = None
     antigravity_lane_state: Optional[dict[str, Any]] = None
     states: list[dict[str, Any]] = []
-    for candidate_template in _get_anthropic_auto_agent_candidates_for_alias(
-        alias_model
-    ):
-        if (
-            candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER
-            and google_lane_key is None
-        ):
+    for candidate_template in _get_anthropic_auto_agent_candidates_for_alias(alias_model):
+        if candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER and google_lane_key is None:
             google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
-        if (
-            candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER
-            and antigravity_lane_state is None
-        ):
-            antigravity_lane_state = (
-                await _resolve_codex_auto_agent_antigravity_lane_state()
-            )
+        if candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER and antigravity_lane_state is None:
+            antigravity_lane_state = await _resolve_codex_auto_agent_antigravity_lane_state()
         states.append(
             await _build_anthropic_auto_agent_candidate_state(
                 request,
@@ -7512,17 +7135,14 @@ async def _select_anthropic_auto_agent_candidate(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
     alias_model = (
-        _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
-        or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+        _normalize_anthropic_auto_agent_alias_model(request_body.get("model")) or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
     )
     session_key = _resolve_anthropic_auto_agent_session_key(
         request,
         request_body,
         alias_model=alias_model,
     )
-    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
-        request_body
-    )
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(request_body)
 
     affinity = await _get_anthropic_auto_agent_session_affinity(session_key)
     if affinity is not None and not has_continuation_state:
@@ -7587,9 +7207,7 @@ async def _select_anthropic_auto_agent_candidate(
                             _raise_anthropic_auto_agent_in_flight_cooldown(
                                 candidate=affinity_candidate,
                                 lane_key=matched_affinity_state.get("lane_key"),
-                                cooldown_seconds=matched_affinity_state[
-                                    "cooldown_seconds"
-                                ],
+                                cooldown_seconds=matched_affinity_state["cooldown_seconds"],
                             )
                     skipped.append(
                         _codex_auto_agent_candidate_public_shape(
@@ -7600,8 +7218,7 @@ async def _select_anthropic_auto_agent_candidate(
                                 if matched_affinity_state["cooldown_seconds"] > 0
                                 else None
                             ),
-                            reason=matched_affinity_state.get("skip_reason")
-                            or "session_affinity_cooldown",
+                            reason=matched_affinity_state.get("skip_reason") or "session_affinity_cooldown",
                         )
                     )
                 else:
@@ -7619,9 +7236,7 @@ async def _select_anthropic_auto_agent_candidate(
                     )
 
     for state in states:
-        if state["candidate"].get(
-            "last_resort"
-        ) or not _is_auto_agent_candidate_state_available(state):
+        if state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
             continue
         return _attach_aawm_alias_routing_state_sources(
             {
@@ -7636,9 +7251,7 @@ async def _select_anthropic_auto_agent_candidate(
         )
 
     for state in states:
-        if not state["candidate"].get(
-            "last_resort"
-        ) or not _is_auto_agent_candidate_state_available(state):
+        if not state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
             continue
         return _attach_aawm_alias_routing_state_sources(
             {
@@ -7656,9 +7269,7 @@ async def _select_anthropic_auto_agent_candidate(
         status_code=429,
         detail={
             "error": {
-                "message": (
-                    "All Anthropic auto-agent alias candidates are currently cooled down."
-                ),
+                "message": ("All Anthropic auto-agent alias candidates are currently cooled down."),
                 "type": "rate_limit_error",
                 "code": "aawm_anthropic_auto_agent_all_candidates_cooling_down",
             },
@@ -7699,11 +7310,7 @@ def _add_anthropic_auto_agent_alias_metadata(
             f"anthropic-auto-agent-selected:{target_model}",
             f"anthropic-auto-agent-route:{candidate['route_family']}",
             f"model-alias:{alias_model}",
-            *(
-                ["anthropic-auto-agent-last-resort"]
-                if candidate.get("last_resort")
-                else []
-            ),
+            *(["anthropic-auto-agent-last-resort"] if candidate.get("last_resort") else []),
             f"anthropic-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
@@ -7713,16 +7320,10 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic_auto_agent_selected_provider": candidate["provider"],
             "anthropic_auto_agent_selected_model": target_model,
             "anthropic_auto_agent_selected_route_family": candidate["route_family"],
-            "anthropic_auto_agent_selected_last_resort": bool(
-                candidate.get("last_resort")
-            ),
+            "anthropic_auto_agent_selected_last_resort": bool(candidate.get("last_resort")),
             "anthropic_auto_agent_selection_reason": selection.get("selection_reason"),
-            "anthropic_auto_agent_affinity_state_source": selection.get(
-                "affinity_state_source"
-            ),
-            "anthropic_auto_agent_cooldown_state_source": selection.get(
-                "cooldown_state_source"
-            ),
+            "anthropic_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
+            "anthropic_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),
             "anthropic_auto_agent_lane_key": selection.get("lane_key"),
             "anthropic_auto_agent_attempts": attempts,
             "anthropic_auto_agent_skipped_candidates": skipped,
@@ -7739,9 +7340,7 @@ def _resolve_anthropic_openai_responses_adapter_model(
     if not _has_anthropic_responses_adapter_endpoint(endpoint):
         return None
     for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_openai_responses_adapter_model_name(
-            candidate
-        )
+        normalized_model = _normalize_anthropic_openai_responses_adapter_model_name(candidate)
         if normalized_model is not None:
             return normalized_model
     return None
@@ -7792,9 +7391,7 @@ def _resolve_anthropic_nvidia_responses_adapter_model(
     if not _has_anthropic_responses_adapter_endpoint(endpoint):
         return None
     for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_nvidia_responses_adapter_model_name(
-            candidate
-        )
+        normalized_model = _normalize_anthropic_nvidia_responses_adapter_model_name(candidate)
         if normalized_model is not None:
             return normalized_model
     return None
@@ -7823,9 +7420,7 @@ def _resolve_anthropic_google_completion_adapter_model(
     if not _has_anthropic_responses_adapter_endpoint(endpoint):
         return None
     for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_google_completion_adapter_model_name(
-            candidate
-        )
+        normalized_model = _normalize_anthropic_google_completion_adapter_model_name(candidate)
         if normalized_model is not None:
             return normalized_model
     return None
@@ -7834,64 +7429,46 @@ def _resolve_anthropic_google_completion_adapter_model(
 _get_anthropic_adapter_google_auth_file_path = _aawm_google_oauth._get_anthropic_adapter_google_auth_file_path
 
 
-
-
-_extract_google_oauth_client_values_from_bundle_text = _aawm_google_oauth._extract_google_oauth_client_values_from_bundle_text
-
-
+_extract_google_oauth_client_values_from_bundle_text = (
+    _aawm_google_oauth._extract_google_oauth_client_values_from_bundle_text
+)
 
 
 _add_google_cli_bundle_candidate_files = _aawm_google_oauth._add_google_cli_bundle_candidate_files
 
 
-
-
 _iter_google_oauth_client_bundle_candidates = _aawm_google_oauth._iter_google_oauth_client_bundle_candidates
 
 
-
-
-_load_google_oauth_client_values_from_local_gemini_cli_bundle = _aawm_google_oauth._load_google_oauth_client_values_from_local_gemini_cli_bundle
-
-
+_load_google_oauth_client_values_from_local_gemini_cli_bundle = (
+    _aawm_google_oauth._load_google_oauth_client_values_from_local_gemini_cli_bundle
+)
 
 
 _load_local_google_oauth_credentials = _aawm_google_oauth._load_local_google_oauth_credentials
 
 
-
-
 _google_oauth_token_is_valid = _aawm_google_oauth._google_oauth_token_is_valid
-
-
 
 
 _google_oauth_cached_token_is_valid = _aawm_google_oauth._google_oauth_cached_token_is_valid
 
 
-
-
 _get_google_oauth_expiry_date = _aawm_google_oauth._get_google_oauth_expiry_date
-
-
 
 
 _get_google_oauth_client_value = _aawm_google_oauth._get_google_oauth_client_value
 
 
-
-
 _refresh_local_google_oauth_credentials = _aawm_google_oauth._refresh_local_google_oauth_credentials
-
-
 
 
 _load_valid_local_google_oauth_access_token = _aawm_google_oauth._load_valid_local_google_oauth_access_token
 
 
-
-
-def _extract_google_adapter_agent_name_from_completion_messages(completion_messages: list[dict[str, Any]]) -> Optional[str]:
+def _extract_google_adapter_agent_name_from_completion_messages(
+    completion_messages: list[dict[str, Any]],
+) -> Optional[str]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._extract_google_adapter_agent_name_from_completion_messages(completion_messages)
 
@@ -7919,17 +7496,11 @@ def _resolve_google_adapter_session_id(
     )
     trace_id = (
         _get_request_header_or_passthrough_alias(request, "langfuse_trace_id")
-        or _get_request_header_or_passthrough_alias(
-            request, "langfuse_existing_trace_id"
-        )
+        or _get_request_header_or_passthrough_alias(request, "langfuse_existing_trace_id")
         or _get_request_header_or_passthrough_alias(request, "trace_id")
     )
-    trace_name = _get_request_header_or_passthrough_alias(
-        request, "langfuse_trace_name"
-    )
-    agent_name = _extract_google_adapter_agent_name_from_completion_messages(
-        completion_messages
-    )
+    trace_name = _get_request_header_or_passthrough_alias(request, "langfuse_trace_name")
+    agent_name = _extract_google_adapter_agent_name_from_completion_messages(completion_messages)
 
     if isinstance(direct_session_id, str) and direct_session_id:
         seed = f"direct_session_id:{direct_session_id}|model:{google_model}"
@@ -7964,28 +7535,19 @@ def _resolve_google_adapter_user_prompt_id(
 ) -> str:
     trace_id = (
         _get_request_header_or_passthrough_alias(request, "langfuse_trace_id")
-        or _get_request_header_or_passthrough_alias(
-            request, "langfuse_existing_trace_id"
-        )
+        or _get_request_header_or_passthrough_alias(request, "langfuse_existing_trace_id")
         or _get_request_header_or_passthrough_alias(request, "trace_id")
     )
     if isinstance(trace_id, str) and trace_id:
         seed = f"user_prompt_trace_id:{trace_id}|model:{google_model}"
         return str(uuid5(NAMESPACE_URL, seed))
 
-    latest_tool_result = _extract_google_adapter_latest_tool_result_fingerprint(
-        completion_messages
-    )
+    latest_tool_result = _extract_google_adapter_latest_tool_result_fingerprint(completion_messages)
     if isinstance(latest_tool_result, str) and latest_tool_result:
-        seed = (
-            f"user_prompt_tool_result:{latest_tool_result}|"
-            f"session_id:{session_id}|model:{google_model}"
-        )
+        seed = f"user_prompt_tool_result:{latest_tool_result}|" f"session_id:{session_id}|model:{google_model}"
         return str(uuid5(NAMESPACE_URL, seed))
 
-    latest_user_prompt = _extract_google_adapter_latest_user_prompt_text(
-        completion_messages
-    )
+    latest_user_prompt = _extract_google_adapter_latest_user_prompt_text(completion_messages)
     if isinstance(latest_user_prompt, str) and latest_user_prompt:
         prompt_hash = hashlib.sha1(latest_user_prompt.encode("utf-8")).hexdigest()[:16]
         seed = f"user_prompt_hash:{prompt_hash}|session_id:{session_id}|model:{google_model}"
@@ -8032,9 +7594,7 @@ async def _get_or_load_google_code_assist_project(
 
 
 def _get_google_code_assist_prime_ttl_seconds() -> float:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS"))
     if raw_value is None:
         # Current Gemini CLI caches Code Assist user/project setup for 30s.
         # Match that default instead of re-priming on every adapted request.
@@ -8102,9 +7662,7 @@ def _get_google_adapter_rate_limit_key(
 
 
 def _get_google_adapter_rate_limit_key_from_kwargs(kwargs: dict[str, Any]) -> str:
-    explicit_rate_limit_key = _clean_codex_auth_value(
-        cast(Optional[str], kwargs.get("google_adapter_rate_limit_key"))
-    )
+    explicit_rate_limit_key = _clean_codex_auth_value(cast(Optional[str], kwargs.get("google_adapter_rate_limit_key")))
     if explicit_rate_limit_key is not None:
         return explicit_rate_limit_key
     custom_body = kwargs.get("custom_body")
@@ -8162,9 +7720,7 @@ def _coerce_non_negative_float(value: Any, default: float) -> float:
 
 
 def _get_google_adapter_post_tool_cooldown_seconds() -> float:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_POST_TOOL_COOLDOWN_SECONDS")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_POST_TOOL_COOLDOWN_SECONDS"))
     if raw_value is None:
         return 0.0
     try:
@@ -8198,9 +7754,7 @@ def _google_code_assist_unwrapped_chunk_contains_tool_call(
 
 
 def _get_google_adapter_max_output_tokens_cap() -> Optional[int]:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP"))
     if raw_value is None:
         return 8192
     try:
@@ -8213,15 +7767,11 @@ def _get_google_adapter_max_output_tokens_cap() -> Optional[int]:
 
 
 def _get_google_adapter_default_thinking_level(model: Optional[str]) -> Optional[str]:
-    disabled = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG")
-    )
+    disabled = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG"))
     if isinstance(disabled, str) and disabled.lower() in {"1", "true", "yes", "on"}:
         return None
 
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL"))
     if raw_value:
         return raw_value
 
@@ -8232,9 +7782,7 @@ def _get_google_adapter_default_thinking_level(model: Optional[str]) -> Optional
 
 
 def _get_google_adapter_max_contents_window() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_WINDOW")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_WINDOW"))
     if raw_value is None:
         return 24
     try:
@@ -8245,9 +7793,7 @@ def _get_google_adapter_max_contents_window() -> int:
 
 
 def _get_google_adapter_max_contents_text_chars() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_TEXT_CHARS")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_TEXT_CHARS"))
     if raw_value is None:
         return 12000
     try:
@@ -8275,13 +7821,9 @@ def _google_content_has_function_exchange(content_block: Any) -> bool:
     for part in parts:
         if not isinstance(part, dict):
             continue
-        if isinstance(part.get("functionCall"), dict) or isinstance(
-            part.get("function_call"), dict
-        ):
+        if isinstance(part.get("functionCall"), dict) or isinstance(part.get("function_call"), dict):
             return True
-        if isinstance(part.get("functionResponse"), dict) or isinstance(
-            part.get("function_response"), dict
-        ):
+        if isinstance(part.get("functionResponse"), dict) or isinstance(part.get("function_response"), dict):
             return True
     return False
 
@@ -8295,9 +7837,7 @@ def _google_content_has_function_call(content_block: Any) -> bool:
     for part in parts:
         if not isinstance(part, dict):
             continue
-        if isinstance(part.get("functionCall"), dict) or isinstance(
-            part.get("function_call"), dict
-        ):
+        if isinstance(part.get("functionCall"), dict) or isinstance(part.get("function_call"), dict):
             return True
     return False
 
@@ -8339,11 +7879,7 @@ def _google_content_function_response_ids(content_block: Any) -> set[str]:
         if not isinstance(function_response, dict):
             continue
         response_payload = function_response.get("response")
-        nested_tool_use_id = (
-            response_payload.get("tool_use_id")
-            if isinstance(response_payload, dict)
-            else None
-        )
+        nested_tool_use_id = response_payload.get("tool_use_id") if isinstance(response_payload, dict) else None
         for candidate in (function_response.get("id"), nested_tool_use_id):
             if isinstance(candidate, str) and candidate.strip():
                 function_response_ids.add(candidate.strip())
@@ -8352,12 +7888,18 @@ def _google_content_function_response_ids(content_block: Any) -> set[str]:
 
 def _selected_google_contents_have_paired_function_responses(contents: list[Any], selected_indices: list[int]) -> bool:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._selected_google_contents_have_paired_function_responses(contents, selected_indices)
+    return _anthropic_google_shaping._selected_google_contents_have_paired_function_responses(
+        contents, selected_indices
+    )
 
 
-def _selected_google_contents_have_complete_function_exchanges(contents: list[Any], selected_indices: list[int]) -> bool:
+def _selected_google_contents_have_complete_function_exchanges(
+    contents: list[Any], selected_indices: list[int]
+) -> bool:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._selected_google_contents_have_complete_function_exchanges(contents, selected_indices)
+    return _anthropic_google_shaping._selected_google_contents_have_complete_function_exchanges(
+        contents, selected_indices
+    )
 
 
 def _find_prior_google_function_call_content_index(
@@ -8377,15 +7919,17 @@ def _add_required_google_function_call_pair_indices(contents: list[Any], selecte
     return _anthropic_google_shaping._add_required_google_function_call_pair_indices(contents, selected_indices)
 
 
-def _trim_google_content_indices_to_window(contents: list[Any], selected_indices: list[int], *, protected_text_indices: set[int], max_window: int) -> list[int]:
+def _trim_google_content_indices_to_window(
+    contents: list[Any], selected_indices: list[int], *, protected_text_indices: set[int], max_window: int
+) -> list[int]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._trim_google_content_indices_to_window(contents, selected_indices, protected_text_indices=protected_text_indices, max_window=max_window)
+    return _anthropic_google_shaping._trim_google_content_indices_to_window(
+        contents, selected_indices, protected_text_indices=protected_text_indices, max_window=max_window
+    )
 
 
 def _get_google_adapter_oversized_text_part_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_OVERSIZED_TEXT_PART_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_OVERSIZED_TEXT_PART_CHAR_CAP"))
     if raw_value is None:
         return 6000
     try:
@@ -8396,9 +7940,7 @@ def _get_google_adapter_oversized_text_part_char_cap() -> int:
 
 
 def _get_google_adapter_pure_context_text_part_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_PURE_CONTEXT_TEXT_PART_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_PURE_CONTEXT_TEXT_PART_CHAR_CAP"))
     if raw_value is None:
         return 6000
     try:
@@ -8409,9 +7951,7 @@ def _get_google_adapter_pure_context_text_part_char_cap() -> int:
 
 
 def _get_google_adapter_subagent_context_text_part_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP"))
     if raw_value is None:
         return 2000
     try:
@@ -8422,9 +7962,7 @@ def _get_google_adapter_subagent_context_text_part_char_cap() -> int:
 
 
 def _get_google_adapter_followup_subagent_context_text_part_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP"))
     if raw_value is None:
         return 1200
     try:
@@ -8435,15 +7973,9 @@ def _get_google_adapter_followup_subagent_context_text_part_char_cap() -> int:
 
 
 def _get_google_adapter_followup_allowed_tool_names() -> set[str]:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_ALLOWED_TOOL_NAMES")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_ALLOWED_TOOL_NAMES"))
     if raw_value:
-        allowed_tool_names = {
-            item.strip()
-            for item in raw_value.split(",")
-            if isinstance(item, str) and item.strip()
-        }
+        allowed_tool_names = {item.strip() for item in raw_value.split(",") if isinstance(item, str) and item.strip()}
     else:
         allowed_tool_names = {
             "Read",
@@ -8467,9 +7999,7 @@ def _get_google_adapter_followup_allowed_tool_names() -> set[str]:
 
 
 def _get_openai_adapter_claude_context_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP"))
     if raw_value is None:
         return 1200
     try:
@@ -8492,9 +8022,7 @@ def _request_block_has_google_function_response(request_block: dict[str, Any]) -
         for part in parts:
             if not isinstance(part, dict):
                 continue
-            if isinstance(part.get("functionResponse"), dict) or isinstance(
-                part.get("function_response"), dict
-            ):
+            if isinstance(part.get("functionResponse"), dict) or isinstance(part.get("function_response"), dict):
                 return True
     return False
 
@@ -8518,12 +8046,7 @@ def _google_adapter_function_call_anchor_content() -> dict[str, Any]:
     return {
         "role": "user",
         "parts": [
-            {
-                "text": (
-                    "[Gemini adapter inserted a conversation boundary before "
-                    "a preserved historical tool call.]"
-                )
-            }
+            {"text": ("[Gemini adapter inserted a conversation boundary before " "a preserved historical tool call.]")}
         ],
     }
 
@@ -8538,9 +8061,18 @@ def _split_google_adapter_inline_context_and_prompt(request_block: dict[str, Any
     return _anthropic_google_shaping._split_google_adapter_inline_context_and_prompt(request_block)
 
 
-def _compact_google_adapter_oversized_text_part(part: Any, *, cap: int, pure_context_cap: int, head_keep: int, tail_keep: int, is_followup_request: bool) -> tuple[Any, bool, dict[str, int]]:
+def _compact_google_adapter_oversized_text_part(
+    part: Any, *, cap: int, pure_context_cap: int, head_keep: int, tail_keep: int, is_followup_request: bool
+) -> tuple[Any, bool, dict[str, int]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_oversized_text_part(part, cap=cap, pure_context_cap=pure_context_cap, head_keep=head_keep, tail_keep=tail_keep, is_followup_request=is_followup_request)
+    return _anthropic_google_shaping._compact_google_adapter_oversized_text_part(
+        part,
+        cap=cap,
+        pure_context_cap=pure_context_cap,
+        head_keep=head_keep,
+        tail_keep=tail_keep,
+        is_followup_request=is_followup_request,
+    )
 
 
 def _compact_google_adapter_oversized_text_parts(request_block: dict[str, Any]) -> dict[str, Any]:
@@ -8553,7 +8085,9 @@ def _apply_google_adapter_contents_window_policy(request_block: dict[str, Any]) 
     return _anthropic_google_shaping._apply_google_adapter_contents_window_policy(request_block)
 
 
-def _apply_google_adapter_generation_config_policy(request_block: dict[str, Any], *, model: Optional[str]) -> dict[str, Any]:
+def _apply_google_adapter_generation_config_policy(
+    request_block: dict[str, Any], *, model: Optional[str]
+) -> dict[str, Any]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._apply_google_adapter_generation_config_policy(request_block, model=model)
 
@@ -8585,15 +8119,10 @@ def _extract_adapter_upstream_headers(exc: Any) -> dict[str, Any]:
     response_headers = getattr(response, "headers", None)
     if response_headers is None:
         return {}
-    return {
-        str(header_name): str(header_value)
-        for header_name, header_value in response_headers.items()
-    }
+    return {str(header_name): str(header_value) for header_name, header_value in response_headers.items()}
 
 
-def _get_adapter_header_value(
-    headers: dict[str, Any], header_name: str
-) -> Optional[str]:
+def _get_adapter_header_value(headers: dict[str, Any], header_name: str) -> Optional[str]:
     if not headers:
         return None
     for key, value in headers.items():
@@ -8620,9 +8149,7 @@ def _parse_retry_after_seconds_from_headers(headers: dict[str, Any]) -> Optional
         return None
 
 
-def _parse_rate_limit_reset_wait_seconds_from_headers(
-    headers: dict[str, Any]
-) -> Optional[float]:
+def _parse_rate_limit_reset_wait_seconds_from_headers(headers: dict[str, Any]) -> Optional[float]:
     reset_value = _get_adapter_header_value(headers, "X-RateLimit-Reset")
     if reset_value is None:
         return None
@@ -8642,9 +8169,7 @@ def _parse_google_rate_limit_reset_seconds(exc: Any) -> float:
     retry_after_seconds = _parse_retry_after_seconds_from_headers(upstream_headers)
     if retry_after_seconds is not None:
         return max(1.0, retry_after_seconds)
-    reset_wait_seconds = _parse_rate_limit_reset_wait_seconds_from_headers(
-        upstream_headers
-    )
+    reset_wait_seconds = _parse_rate_limit_reset_wait_seconds_from_headers(upstream_headers)
     if reset_wait_seconds is not None:
         return max(1.0, reset_wait_seconds)
     detail = _extract_google_adapter_exception_detail(exc)
@@ -8694,9 +8219,7 @@ def _extract_embedded_json_payload_candidates(detail: object) -> list[str]:
     # openrouter-style ": b'...'" wrappers
     if ": b'" in detail_text or ': b"' in detail_text:
         tail = detail_text.split(": ", 1)[-1].strip()
-        if (tail.startswith("b'") and tail.endswith("'")) or (
-            tail.startswith('b"') and tail.endswith('"')
-        ):
+        if (tail.startswith("b'") and tail.endswith("'")) or (tail.startswith('b"') and tail.endswith('"')):
             try:
                 literal_value = ast.literal_eval(tail)
                 if isinstance(literal_value, bytes):
@@ -8775,15 +8298,11 @@ def _record_google_adapter_error_for_logging(
     payload["adapter_wait_seconds"] = wait_seconds
     payload["adapter_error_reason"] = error_reason
     metadata["google_generate_content_error"] = payload
-    metadata["google_generate_content_error_count"] = (
-        int(metadata.get("google_generate_content_error_count") or 0) + 1
-    )
+    metadata["google_generate_content_error_count"] = int(metadata.get("google_generate_content_error_count") or 0) + 1
 
 
 def _get_google_adapter_model_capacity_max_retries() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES"))
     if raw_value is None:
         return 3
     try:
@@ -8794,16 +8313,10 @@ def _get_google_adapter_model_capacity_max_retries() -> int:
 
 
 def _get_google_adapter_capacity_backoff_seconds(attempt: int) -> float:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS"))
     if raw_value:
         try:
-            values = [
-                max(1.0, float(item.strip()))
-                for item in raw_value.split(",")
-                if item.strip()
-            ]
+            values = [max(1.0, float(item.strip())) for item in raw_value.split(",") if item.strip()]
         except Exception:
             values = []
         if values:
@@ -8821,9 +8334,7 @@ def _get_google_adapter_hidden_retry_budget_seconds() -> float:
     )
 
 
-_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset(
-    PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES
-)
+_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset(PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES)
 
 
 def _get_google_adapter_transient_retry_max_attempts() -> int:
@@ -8834,9 +8345,13 @@ def _get_google_adapter_transient_backoff_seconds(attempt: int) -> float:
     return _get_passthrough_hidden_retry_wait_seconds(max(0, attempt - 1))
 
 
-def _is_google_adapter_transient_retryable_failure(exc: Any, *, status_code: Optional[int], error_reason: Optional[str]) -> bool:
+def _is_google_adapter_transient_retryable_failure(
+    exc: Any, *, status_code: Optional[int], error_reason: Optional[str]
+) -> bool:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._is_google_adapter_transient_retryable_failure(exc, status_code=status_code, error_reason=error_reason)
+    return _anthropic_google_shaping._is_google_adapter_transient_retryable_failure(
+        exc, status_code=status_code, error_reason=error_reason
+    )
 
 
 def _google_adapter_hidden_retry_kwargs_from_passthrough_kwargs(
@@ -8863,9 +8378,7 @@ def _record_google_adapter_hidden_retry_metadata(
     final_outcome: Optional[str] = None,
     failure_classification: Optional[str] = None,
 ) -> None:
-    kwargs = _google_adapter_hidden_retry_kwargs_from_passthrough_kwargs(
-        passthrough_kwargs
-    )
+    kwargs = _google_adapter_hidden_retry_kwargs_from_passthrough_kwargs(passthrough_kwargs)
     if not kwargs:
         return
     _record_passthrough_hidden_retry_metadata(
@@ -8943,9 +8456,13 @@ def _record_google_adapter_success_after_transient_retry(
     )
 
 
-def _build_google_adapter_terminal_error_log_context(passthrough_kwargs: dict[str, Any], *, status_code: Optional[int], failure_classification: Optional[str]) -> dict[str, Any]:
+def _build_google_adapter_terminal_error_log_context(
+    passthrough_kwargs: dict[str, Any], *, status_code: Optional[int], failure_classification: Optional[str]
+) -> dict[str, Any]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_google_adapter_terminal_error_log_context(passthrough_kwargs, status_code=status_code, failure_classification=failure_classification)
+    return _anthropic_google_shaping._build_google_adapter_terminal_error_log_context(
+        passthrough_kwargs, status_code=status_code, failure_classification=failure_classification
+    )
 
 
 def _log_google_adapter_terminal_transient_failure(
@@ -8983,9 +8500,7 @@ async def _wait_for_google_adapter_cooldown_if_needed(rate_limit_key: str) -> No
     )
 
 
-async def _set_google_adapter_cooldown(
-    rate_limit_key: str, wait_seconds: float
-) -> None:
+async def _set_google_adapter_cooldown(rate_limit_key: str, wait_seconds: float) -> None:
     # Google keeps token-keyed cache bound via _bound_google_adapter_token_cache.
     async with _google_adapter_rate_limit_lock:
         _alias_routing_state.google_rate_limit.extend(
@@ -8993,9 +8508,7 @@ async def _set_google_adapter_cooldown(
             wait_seconds,
             max_size=None,
         )
-        _bound_google_adapter_token_cache(
-            _google_adapter_rate_limit_until_monotonic_by_key
-        )
+        _bound_google_adapter_token_cache(_google_adapter_rate_limit_until_monotonic_by_key)
 
 
 async def _handle_google_adapter_rate_limit_failure(
@@ -9022,8 +8535,7 @@ async def _handle_google_adapter_rate_limit_failure(
     )
     projected_hidden_wait_seconds = accumulated_hidden_wait_seconds + wait_seconds
     within_hidden_budget = (
-        hidden_retry_budget_seconds > 0
-        and projected_hidden_wait_seconds <= hidden_retry_budget_seconds
+        hidden_retry_budget_seconds > 0 and projected_hidden_wait_seconds <= hidden_retry_budget_seconds
     )
     if attempt >= retry_limit and not within_hidden_budget:
         verbose_proxy_logger.warning(
@@ -9195,20 +8707,18 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
         else:
             wait_seconds = _parse_google_rate_limit_reset_seconds(exc)
         if is_rate_limit_retry:
-            accumulated_hidden_wait_seconds = (
-                await _handle_google_adapter_rate_limit_failure(
-                    passthrough_kwargs,
-                    exc=exc,
-                    status_code=status_code,
-                    error_reason=error_reason,
-                    attempt=attempt,
-                    retry_limit=retry_limit,
-                    wait_seconds=wait_seconds,
-                    rate_limit_key=rate_limit_key,
-                    accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
-                    hidden_retry_budget_seconds=hidden_retry_budget_seconds,
-                    is_capacity_retry=is_capacity_retry,
-                )
+            accumulated_hidden_wait_seconds = await _handle_google_adapter_rate_limit_failure(
+                passthrough_kwargs,
+                exc=exc,
+                status_code=status_code,
+                error_reason=error_reason,
+                attempt=attempt,
+                retry_limit=retry_limit,
+                wait_seconds=wait_seconds,
+                rate_limit_key=rate_limit_key,
+                accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
+                hidden_retry_budget_seconds=hidden_retry_budget_seconds,
+                is_capacity_retry=is_capacity_retry,
             )
             return True
         if is_transient_retry:
@@ -9242,59 +8752,37 @@ async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Respons
     )
 
 
-_ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME = (
-    _anthropic_openrouter_retry_transport.Runtime(
-        rate_limit=_alias_routing_state.openrouter_rate_limit,
-        failure_circuit_until_monotonic_by_key=(
-            _openrouter_adapter_failure_circuit_until_monotonic_by_key
-        ),
-        clean_secret_string=lambda value: _clean_secret_string(value),
-        extract_embedded_json_payload_candidates=(
-            _extract_embedded_json_payload_candidates
-        ),
-        parse_json_payloads_from_text_candidates=lambda values: (
-            _parse_json_payloads_from_text_candidates(list(values))
-        ),
-        extract_upstream_headers=_extract_adapter_upstream_headers,
-        parse_retry_after_seconds_from_headers=lambda headers: (
-            _parse_retry_after_seconds_from_headers(dict(headers))
-        ),
-        get_header_value=lambda headers, name: _get_adapter_header_value(
-            dict(headers),
-            name,
-        ),
-        parse_reset_wait_seconds_from_headers=lambda headers: (
-            _parse_rate_limit_reset_wait_seconds_from_headers(dict(headers))
-        ),
-        raise_candidate_unavailable=(
-            _raise_openrouter_auto_agent_candidate_unavailable
-        ),
-        maybe_raise_alias_probe_cooldown=(
-            _maybe_raise_openrouter_adapter_alias_probe_cooldown
-        ),
-        get_completion_model=_get_openrouter_completion_adapter_upstream_model,
-        pass_through_request=lambda **kwargs: pass_through_request(**kwargs),
-        wait_for_cooldown=lambda *args, **kwargs: (
-            _wait_for_openrouter_adapter_cooldown_if_needed(*args, **kwargs)
-        ),
-        set_cooldown_callback=lambda *args, **kwargs: (
-            _set_openrouter_adapter_cooldown(*args, **kwargs)
-        ),
-        maybe_raise_failure_circuit_open_callback=lambda *args, **kwargs: (
-            _maybe_raise_openrouter_adapter_failure_circuit_open(*args, **kwargs)
-        ),
-        open_failure_circuit_callback=lambda *args, **kwargs: (
-            _openrouter_adapter_open_failure_circuit(*args, **kwargs)
-        ),
-        clear_failure_circuit_callback=lambda model: (
-            _clear_openrouter_adapter_failure_circuit(model)
-        ),
-        log_debug=verbose_proxy_logger.debug,
-        log_warning=verbose_proxy_logger.warning,
-        getenv=lambda name: os.getenv(name),
-        sleep=lambda seconds: asyncio.sleep(seconds),
-        monotonic=lambda: time.monotonic(),
-    )
+_ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME = _anthropic_openrouter_retry_transport.Runtime(
+    rate_limit=_alias_routing_state.openrouter_rate_limit,
+    failure_circuit_until_monotonic_by_key=(_openrouter_adapter_failure_circuit_until_monotonic_by_key),
+    clean_secret_string=lambda value: _clean_secret_string(value),
+    extract_embedded_json_payload_candidates=(_extract_embedded_json_payload_candidates),
+    parse_json_payloads_from_text_candidates=lambda values: (_parse_json_payloads_from_text_candidates(list(values))),
+    extract_upstream_headers=_extract_adapter_upstream_headers,
+    parse_retry_after_seconds_from_headers=lambda headers: (_parse_retry_after_seconds_from_headers(dict(headers))),
+    get_header_value=lambda headers, name: _get_adapter_header_value(
+        dict(headers),
+        name,
+    ),
+    parse_reset_wait_seconds_from_headers=lambda headers: (
+        _parse_rate_limit_reset_wait_seconds_from_headers(dict(headers))
+    ),
+    raise_candidate_unavailable=(_raise_openrouter_auto_agent_candidate_unavailable),
+    maybe_raise_alias_probe_cooldown=(_maybe_raise_openrouter_adapter_alias_probe_cooldown),
+    get_completion_model=_get_openrouter_completion_adapter_upstream_model,
+    pass_through_request=lambda **kwargs: pass_through_request(**kwargs),
+    wait_for_cooldown=lambda *args, **kwargs: (_wait_for_openrouter_adapter_cooldown_if_needed(*args, **kwargs)),
+    set_cooldown_callback=lambda *args, **kwargs: (_set_openrouter_adapter_cooldown(*args, **kwargs)),
+    maybe_raise_failure_circuit_open_callback=lambda *args, **kwargs: (
+        _maybe_raise_openrouter_adapter_failure_circuit_open(*args, **kwargs)
+    ),
+    open_failure_circuit_callback=lambda *args, **kwargs: (_openrouter_adapter_open_failure_circuit(*args, **kwargs)),
+    clear_failure_circuit_callback=lambda model: (_clear_openrouter_adapter_failure_circuit(model)),
+    log_debug=verbose_proxy_logger.debug,
+    log_warning=verbose_proxy_logger.warning,
+    getenv=lambda name: os.getenv(name),
+    sleep=lambda seconds: asyncio.sleep(seconds),
+    monotonic=lambda: time.monotonic(),
 )
 
 
@@ -9378,15 +8866,13 @@ def _maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable(
     status_code: Optional[int] = None,
     raw_message: Optional[str] = None,
 ) -> None:
-    return (
-        _anthropic_openrouter_retry_transport.maybe_raise_alias_probe_no_endpoint_unavailable(
-            _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-            exc,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=use_alias_candidate_probe,
-            status_code=status_code,
-            raw_message=raw_message,
-        )
+    return _anthropic_openrouter_retry_transport.maybe_raise_alias_probe_no_endpoint_unavailable(
+        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
+        exc,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+        status_code=status_code,
+        raw_message=raw_message,
     )
 
 
@@ -9457,9 +8943,7 @@ def _get_openrouter_adapter_retry_wait_seconds(exc: Any, attempt: int) -> float:
 
 
 def _get_openrouter_adapter_max_retries() -> int:
-    return _anthropic_openrouter_retry_transport.get_max_retries(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME
-    )
+    return _anthropic_openrouter_retry_transport.get_max_retries(_ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME)
 
 
 def _get_openrouter_adapter_backoff_seconds(attempt: int) -> float:
@@ -9614,8 +9098,6 @@ async def _prime_google_code_assist_session(
 _load_local_google_oauth_access_token = _aawm_google_oauth._load_local_google_oauth_access_token
 
 
-
-
 def _get_anthropic_adapter_google_target_base() -> str:
     return os.getenv("CODE_ASSIST_ENDPOINT") or "https://cloudcode-pa.googleapis.com"
 
@@ -9625,7 +9107,7 @@ def _normalize_google_completion_adapter_model_name(model: str) -> str:
     return _anthropic_google_shaping._normalize_google_completion_adapter_model_name(model)
 
 
-def _sanitize_google_schema_array_items(schema_node: Any, *, _depth: int=0, _seen: Optional[set[int]]=None) -> int:
+def _sanitize_google_schema_array_items(schema_node: Any, *, _depth: int = 0, _seen: Optional[set[int]] = None) -> int:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._sanitize_google_schema_array_items(schema_node, _depth=_depth, _seen=_seen)
 
@@ -9650,9 +9132,7 @@ def _simplify_google_code_assist_union_schema(  # noqa: PLR0915
             continue
 
         nullable = any(variant.get("type") == "null" for variant in dict_variants)
-        non_null_variants = [
-            variant for variant in dict_variants if variant.get("type") != "null"
-        ]
+        non_null_variants = [variant for variant in dict_variants if variant.get("type") != "null"]
         if len(non_null_variants) == 1:
             replacement = copy.deepcopy(non_null_variants[0])
             _merge_google_code_assist_schema_annotations(schema_node, replacement)
@@ -9664,11 +9144,7 @@ def _simplify_google_code_assist_union_schema(  # noqa: PLR0915
             continue
 
         string_variant = next(
-            (
-                variant
-                for variant in non_null_variants
-                if variant.get("type") == "string"
-            ),
+            (variant for variant in non_null_variants if variant.get("type") == "string"),
             None,
         )
         if string_variant is not None:
@@ -9689,8 +9165,7 @@ def _simplify_google_code_assist_union_schema(  # noqa: PLR0915
         object_variants = [
             variant
             for variant in non_null_variants
-            if variant.get("type") == "object"
-            and isinstance(variant.get("properties"), dict)
+            if variant.get("type") == "object" and isinstance(variant.get("properties"), dict)
         ]
         if object_variants:
             merged_properties: dict[str, Any] = {}
@@ -9709,11 +9184,7 @@ def _simplify_google_code_assist_union_schema(  # noqa: PLR0915
             continue
 
         typed_variant = next(
-            (
-                variant
-                for variant in non_null_variants
-                if isinstance(variant.get("type"), str)
-            ),
+            (variant for variant in non_null_variants if isinstance(variant.get("type"), str)),
             None,
         )
         if typed_variant is not None:
@@ -9736,7 +9207,9 @@ def _simplify_google_code_assist_union_schema(  # noqa: PLR0915
 _GOOGLE_CODE_ASSIST_SCHEMA_SANITIZE_MAX_DEPTH = 64
 
 
-def _sanitize_google_code_assist_union_schemas(schema_node: Any, *, _depth: int=0, _seen: Optional[set[int]]=None) -> int:
+def _sanitize_google_code_assist_union_schemas(
+    schema_node: Any, *, _depth: int = 0, _seen: Optional[set[int]] = None
+) -> int:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._sanitize_google_code_assist_union_schemas(schema_node, _depth=_depth, _seen=_seen)
 
@@ -9775,9 +9248,7 @@ def _is_google_adapter_synthetic_tool_context_message(message: Any) -> bool:
 
 
 def _get_google_adapter_fallback_context_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_FALLBACK_CONTEXT_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FALLBACK_CONTEXT_CHAR_CAP"))
     if raw_value is None:
         return 2000
     try:
@@ -9787,15 +9258,17 @@ def _get_google_adapter_fallback_context_char_cap() -> int:
     return max(256, parsed)
 
 
-def _inject_google_adapter_fallback_text_context(google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]]) -> dict[str, Any]:
+def _inject_google_adapter_fallback_text_context(
+    google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]]
+) -> dict[str, Any]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._inject_google_adapter_fallback_text_context(google_request_dict, completion_messages)
+    return _anthropic_google_shaping._inject_google_adapter_fallback_text_context(
+        google_request_dict, completion_messages
+    )
 
 
 def _get_google_adapter_system_prompt_policy() -> str:
-    raw_value = _clean_codex_auth_value(
-        os.getenv(_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV)
-    )
+    raw_value = _clean_codex_auth_value(os.getenv(_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV))
     if raw_value is None:
         return _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT
     normalized_value = raw_value.strip().lower()
@@ -9807,9 +9280,7 @@ def _get_google_adapter_system_prompt_policy() -> str:
 
 
 def _get_codex_google_code_assist_tool_contract_policy() -> str:
-    raw_value = _clean_codex_auth_value(
-        os.getenv(_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV)
-    )
+    raw_value = _clean_codex_auth_value(os.getenv(_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV))
     if raw_value is None:
         return _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT
     normalized_value = raw_value.strip().lower()
@@ -9835,7 +9306,9 @@ def _append_codex_google_code_assist_tool_contract_to_system_text(system_text: s
     return _anthropic_google_shaping._append_codex_google_code_assist_tool_contract_to_system_text(system_text)
 
 
-def _apply_codex_google_code_assist_tool_contract_policy(completion_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _apply_codex_google_code_assist_tool_contract_policy(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._apply_codex_google_code_assist_tool_contract_policy(completion_kwargs)
 
@@ -9850,17 +9323,25 @@ def _strip_google_adapter_claude_system_overhead(system_text: str) -> tuple[str,
     return _anthropic_google_shaping._strip_google_adapter_claude_system_overhead(system_text)
 
 
-def _build_google_adapter_system_prompt_policy_text(*, original_text: str, policy_mode: str) -> tuple[str, dict[str, Any]]:
+def _build_google_adapter_system_prompt_policy_text(
+    *, original_text: str, policy_mode: str
+) -> tuple[str, dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_google_adapter_system_prompt_policy_text(original_text=original_text, policy_mode=policy_mode)
+    return _anthropic_google_shaping._build_google_adapter_system_prompt_policy_text(
+        original_text=original_text, policy_mode=policy_mode
+    )
 
 
-def _apply_google_adapter_system_prompt_policy(completion_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _apply_google_adapter_system_prompt_policy(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._apply_google_adapter_system_prompt_policy(completion_kwargs)
 
 
-def _normalize_codex_openai_chat_kwargs_for_google_code_assist(completion_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _normalize_codex_openai_chat_kwargs_for_google_code_assist(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._normalize_codex_openai_chat_kwargs_for_google_code_assist(completion_kwargs)
 
@@ -9873,9 +9354,7 @@ def _is_anthropic_tool_result_content_block(block: Any) -> bool:
     if not isinstance(block, dict):
         return False
     block_type = block.get("type")
-    return block_type == "tool_result" or (
-        isinstance(block_type, str) and block_type.endswith("_tool_result")
-    )
+    return block_type == "tool_result" or (isinstance(block_type, str) and block_type.endswith("_tool_result"))
 
 
 def _has_codex_google_code_assist_anthropic_tool_replay_blocks(messages: list[Any]) -> bool:
@@ -9937,9 +9416,13 @@ def _codex_google_code_assist_anthropic_tool_use_to_openai_tool_call(
     }
 
 
-def _normalize_codex_google_code_assist_anthropic_assistant_message(*, message: dict[str, Any], message_index: int) -> tuple[dict[str, Any], int]:
+def _normalize_codex_google_code_assist_anthropic_assistant_message(
+    *, message: dict[str, Any], message_index: int
+) -> tuple[dict[str, Any], int]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_anthropic_assistant_message(message=message, message_index=message_index)
+    return _anthropic_google_shaping._normalize_codex_google_code_assist_anthropic_assistant_message(
+        message=message, message_index=message_index
+    )
 
 
 def _codex_google_code_assist_anthropic_tool_result_to_openai_tool_message(
@@ -9961,9 +9444,7 @@ def _codex_google_code_assist_anthropic_tool_result_to_openai_tool_message(
     tool_message = {
         "role": "tool",
         "tool_call_id": tool_use_id.strip(),
-        "content": _codex_google_code_assist_tool_result_content_to_openai_content(
-            block.get("content")
-        ),
+        "content": _codex_google_code_assist_tool_result_content_to_openai_content(block.get("content")),
     }
     cache_control = block.get("cache_control")
     if cache_control is not None:
@@ -9971,52 +9452,93 @@ def _codex_google_code_assist_anthropic_tool_result_to_openai_tool_message(
     return tool_message
 
 
-def _normalize_codex_google_code_assist_anthropic_user_message(*, message: dict[str, Any], message_index: int) -> tuple[list[dict[str, Any]], int]:
+def _normalize_codex_google_code_assist_anthropic_user_message(
+    *, message: dict[str, Any], message_index: int
+) -> tuple[list[dict[str, Any]], int]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_anthropic_user_message(message=message, message_index=message_index)
+    return _anthropic_google_shaping._normalize_codex_google_code_assist_anthropic_user_message(
+        message=message, message_index=message_index
+    )
 
 
-def _build_codex_google_code_assist_anthropic_replay_changes(*, repaired_count: int, converted_tool_use_count: int, converted_tool_result_count: int) -> dict[str, Any]:
+def _build_codex_google_code_assist_anthropic_replay_changes(
+    *, repaired_count: int, converted_tool_use_count: int, converted_tool_result_count: int
+) -> dict[str, Any]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_google_code_assist_anthropic_replay_changes(repaired_count=repaired_count, converted_tool_use_count=converted_tool_use_count, converted_tool_result_count=converted_tool_result_count)
+    return _anthropic_google_shaping._build_codex_google_code_assist_anthropic_replay_changes(
+        repaired_count=repaired_count,
+        converted_tool_use_count=converted_tool_use_count,
+        converted_tool_result_count=converted_tool_result_count,
+    )
 
 
-def _normalize_codex_google_code_assist_anthropic_tool_replay(completion_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _normalize_codex_google_code_assist_anthropic_tool_replay(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._normalize_codex_google_code_assist_anthropic_tool_replay(completion_kwargs)
 
 
-def _deterministic_codex_google_code_assist_tool_call_id(*, message_index: int, tool_call_index: int, tool_call: dict[str, Any]) -> str:
+def _deterministic_codex_google_code_assist_tool_call_id(
+    *, message_index: int, tool_call_index: int, tool_call: dict[str, Any]
+) -> str:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._deterministic_codex_google_code_assist_tool_call_id(message_index=message_index, tool_call_index=tool_call_index, tool_call=tool_call)
+    return _anthropic_google_shaping._deterministic_codex_google_code_assist_tool_call_id(
+        message_index=message_index, tool_call_index=tool_call_index, tool_call=tool_call
+    )
 
 
-def _next_codex_google_code_assist_tool_messages(messages: list[Any], *, message_index: int) -> list[tuple[int, dict[str, Any]]]:
+def _next_codex_google_code_assist_tool_messages(
+    messages: list[Any], *, message_index: int
+) -> list[tuple[int, dict[str, Any]]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._next_codex_google_code_assist_tool_messages(messages, message_index=message_index)
 
 
-def _paired_codex_google_code_assist_tool_message(next_tool_messages: list[tuple[int, dict[str, Any]]], *, tool_call_index: int) -> tuple[int, dict[str, Any]] | None:
+def _paired_codex_google_code_assist_tool_message(
+    next_tool_messages: list[tuple[int, dict[str, Any]]], *, tool_call_index: int
+) -> tuple[int, dict[str, Any]] | None:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._paired_codex_google_code_assist_tool_message(next_tool_messages, tool_call_index=tool_call_index)
+    return _anthropic_google_shaping._paired_codex_google_code_assist_tool_message(
+        next_tool_messages, tool_call_index=tool_call_index
+    )
 
 
-def _repair_codex_google_code_assist_tool_call_id(*, message_index: int, tool_call_index: int, tool_call: dict[str, Any], paired_tool_message: tuple[int, dict[str, Any]] | None, copy_message_at: Callable[[int], Optional[dict[str, Any]]]) -> bool:
+def _repair_codex_google_code_assist_tool_call_id(
+    *,
+    message_index: int,
+    tool_call_index: int,
+    tool_call: dict[str, Any],
+    paired_tool_message: tuple[int, dict[str, Any]] | None,
+    copy_message_at: Callable[[int], Optional[dict[str, Any]]],
+) -> bool:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._repair_codex_google_code_assist_tool_call_id(message_index=message_index, tool_call_index=tool_call_index, tool_call=tool_call, paired_tool_message=paired_tool_message, copy_message_at=copy_message_at)
+    return _anthropic_google_shaping._repair_codex_google_code_assist_tool_call_id(
+        message_index=message_index,
+        tool_call_index=tool_call_index,
+        tool_call=tool_call,
+        paired_tool_message=paired_tool_message,
+        copy_message_at=copy_message_at,
+    )
 
 
-def _repair_codex_google_code_assist_openai_tool_call_ids(completion_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _repair_codex_google_code_assist_openai_tool_call_ids(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._repair_codex_google_code_assist_openai_tool_call_ids(completion_kwargs)
 
 
-def _normalize_codex_google_code_assist_reasoning_effort(mappable_params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _normalize_codex_google_code_assist_reasoning_effort(
+    mappable_params: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._normalize_codex_google_code_assist_reasoning_effort(mappable_params)
 
 
-def _normalize_google_code_assist_thinking_max_tokens(completion_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _normalize_google_code_assist_thinking_max_tokens(
+    completion_kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._normalize_google_code_assist_thinking_max_tokens(completion_kwargs)
 
@@ -10089,10 +9611,7 @@ def _prune_codex_google_code_assist_tool_call_caches(
         _codex_google_code_assist_tool_call_arguments_cache.pop(key, None)
     # FIFO eviction on insertion order once TTL prune is insufficient (#13).
     # Keep at most MAX_SIZE entries (strict > so a full cache can still insert one).
-    while (
-        len(_codex_google_code_assist_tool_call_name_cache)
-        > _CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE
-    ):
+    while len(_codex_google_code_assist_tool_call_name_cache) > _CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE:
         try:
             oldest_key = next(iter(_codex_google_code_assist_tool_call_name_cache))
         except StopIteration:
@@ -10110,9 +9629,7 @@ def _remember_codex_google_code_assist_tool_call_name(
 ) -> None:
     if not isinstance(tool_call_id, str) or not tool_call_id:
         return
-    cache_key = _codex_google_code_assist_tool_call_cache_key(
-        tool_call_id, scope_key=scope_key
-    )
+    cache_key = _codex_google_code_assist_tool_call_cache_key(tool_call_id, scope_key=scope_key)
     now = time.monotonic()
     _prune_codex_google_code_assist_tool_call_caches(now)
     expires_at = now + float(_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_TTL_SECONDS)
@@ -10133,17 +9650,11 @@ def _remember_codex_google_code_assist_tool_call_name(
         expires_at,
     )
     _prune_codex_google_code_assist_tool_call_caches(now)
-    normalized_arguments = _normalize_codex_google_code_assist_tool_call_arguments(
-        function_arguments
-    )
+    normalized_arguments = _normalize_codex_google_code_assist_tool_call_arguments(function_arguments)
     if normalized_arguments is None:
         return
     existing_entry = _codex_google_code_assist_tool_call_arguments_cache.get(cache_key)
-    existing_arguments = (
-        existing_entry[0]
-        if isinstance(existing_entry, tuple) and existing_entry
-        else ""
-    )
+    existing_arguments = existing_entry[0] if isinstance(existing_entry, tuple) and existing_entry else ""
     if not existing_arguments:
         merged = normalized_arguments
     elif normalized_arguments.startswith(existing_arguments):
@@ -10173,9 +9684,7 @@ def _lookup_codex_google_code_assist_tool_call_name(
         return None
     now = time.monotonic()
     _prune_codex_google_code_assist_tool_call_caches(now)
-    cache_key = _codex_google_code_assist_tool_call_cache_key(
-        tool_call_id, scope_key=scope_key
-    )
+    cache_key = _codex_google_code_assist_tool_call_cache_key(tool_call_id, scope_key=scope_key)
     cached = _codex_google_code_assist_tool_call_name_cache.get(cache_key)
     if isinstance(cached, tuple) and cached and float(cached[1]) > now:
         return cached[0]
@@ -10198,9 +9707,7 @@ def _lookup_codex_google_code_assist_tool_call_arguments(
         return None
     now = time.monotonic()
     _prune_codex_google_code_assist_tool_call_caches(now)
-    cache_key = _codex_google_code_assist_tool_call_cache_key(
-        tool_call_id, scope_key=scope_key
-    )
+    cache_key = _codex_google_code_assist_tool_call_cache_key(tool_call_id, scope_key=scope_key)
     cached = _codex_google_code_assist_tool_call_arguments_cache.get(cache_key)
     if isinstance(cached, tuple) and cached and float(cached[1]) > now:
         return cached[0]
@@ -10226,17 +9733,27 @@ def _is_codex_google_code_assist_empty_text_content(content: Any) -> bool:
 
 def _previous_codex_google_code_assist_assistant_index(messages: list[Any], *, before_index: int) -> Optional[int]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._previous_codex_google_code_assist_assistant_index(messages, before_index=before_index)
+    return _anthropic_google_shaping._previous_codex_google_code_assist_assistant_index(
+        messages, before_index=before_index
+    )
 
 
-def _previous_codex_google_code_assist_contiguous_assistant_index(messages: list[Any], *, before_index: int) -> Optional[int]:
+def _previous_codex_google_code_assist_contiguous_assistant_index(
+    messages: list[Any], *, before_index: int
+) -> Optional[int]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._previous_codex_google_code_assist_contiguous_assistant_index(messages, before_index=before_index)
+    return _anthropic_google_shaping._previous_codex_google_code_assist_contiguous_assistant_index(
+        messages, before_index=before_index
+    )
 
 
-def _previous_codex_google_code_assist_tool_call(messages: list[Any], *, before_index: int, tool_call_id: str) -> Optional[dict[str, Any]]:
+def _previous_codex_google_code_assist_tool_call(
+    messages: list[Any], *, before_index: int, tool_call_id: str
+) -> Optional[dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._previous_codex_google_code_assist_tool_call(messages, before_index=before_index, tool_call_id=tool_call_id)
+    return _anthropic_google_shaping._previous_codex_google_code_assist_tool_call(
+        messages, before_index=before_index, tool_call_id=tool_call_id
+    )
 
 
 def _codex_google_code_assist_tool_call_function_name(
@@ -10259,35 +9776,43 @@ def _codex_google_code_assist_tool_call_function_arguments(
     function = tool_call.get("function")
     if not isinstance(function, dict):
         return None
-    return _normalize_codex_google_code_assist_tool_call_arguments(
-        function.get("arguments")
+    return _normalize_codex_google_code_assist_tool_call_arguments(function.get("arguments"))
+
+
+def _build_codex_google_code_assist_synthetic_tool_call(
+    *, tool_call_id: str, function_name: str, function_arguments: str
+) -> dict[str, Any]:
+    _anthropic_google_shaping.bind_runtime(globals())
+    return _anthropic_google_shaping._build_codex_google_code_assist_synthetic_tool_call(
+        tool_call_id=tool_call_id, function_name=function_name, function_arguments=function_arguments
     )
 
 
-def _build_codex_google_code_assist_synthetic_tool_call(*, tool_call_id: str, function_name: str, function_arguments: str) -> dict[str, Any]:
+def _append_codex_google_code_assist_tool_call_to_assistant(
+    *, assistant_message: dict[str, Any], synthetic_tool_call: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_google_code_assist_synthetic_tool_call(tool_call_id=tool_call_id, function_name=function_name, function_arguments=function_arguments)
+    return _anthropic_google_shaping._append_codex_google_code_assist_tool_call_to_assistant(
+        assistant_message=assistant_message, synthetic_tool_call=synthetic_tool_call
+    )
 
 
-def _append_codex_google_code_assist_tool_call_to_assistant(*, assistant_message: dict[str, Any], synthetic_tool_call: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+def _build_codex_google_code_assist_tool_pair_repair_changes(
+    *, repaired_count: int, inserted_count: int, blank_text_suppressed_count: int, repaired_names: set[str]
+) -> dict[str, Any]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._append_codex_google_code_assist_tool_call_to_assistant(assistant_message=assistant_message, synthetic_tool_call=synthetic_tool_call)
-
-
-def _build_codex_google_code_assist_tool_pair_repair_changes(*, repaired_count: int, inserted_count: int, blank_text_suppressed_count: int, repaired_names: set[str]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_google_code_assist_tool_pair_repair_changes(repaired_count=repaired_count, inserted_count=inserted_count, blank_text_suppressed_count=blank_text_suppressed_count, repaired_names=repaired_names)
+    return _anthropic_google_shaping._build_codex_google_code_assist_tool_pair_repair_changes(
+        repaired_count=repaired_count,
+        inserted_count=inserted_count,
+        blank_text_suppressed_count=blank_text_suppressed_count,
+        repaired_names=repaired_names,
+    )
 
 
 def _codex_google_code_assist_tool_result_message_content(
     message: dict[str, Any],
 ) -> str:
-    return str(
-        _codex_google_code_assist_tool_result_content_to_openai_content(
-            message.get("content")
-        )
-        or ""
-    ).strip()
+    return str(_codex_google_code_assist_tool_result_content_to_openai_content(message.get("content")) or "").strip()
 
 
 def _codex_google_code_assist_orphan_tool_result_context_text(
@@ -10297,38 +9822,59 @@ def _codex_google_code_assist_orphan_tool_result_context_text(
 ) -> str:
     normalized_content = content.strip()
     if not normalized_content:
-        return (
-            "Previous tool result context (unmapped tool call "
-            f"{tool_call_id}): no output was recorded."
-        )
-    return (
-        "Previous tool result context (unmapped tool call "
-        f"{tool_call_id}):\n{normalized_content}"
-    )
+        return "Previous tool result context (unmapped tool call " f"{tool_call_id}): no output was recorded."
+    return "Previous tool result context (unmapped tool call " f"{tool_call_id}):\n{normalized_content}"
 
 
 def _codex_google_code_assist_display_tool_call_id(tool_call_id: str) -> str:
     return tool_call_id.split("__thought__", 1)[0]
 
 
-def _append_codex_google_code_assist_orphan_tool_result_context(*, messages: list[Any], index: int, context_text: str) -> None:
+def _append_codex_google_code_assist_orphan_tool_result_context(
+    *, messages: list[Any], index: int, context_text: str
+) -> None:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._append_codex_google_code_assist_orphan_tool_result_context(messages=messages, index=index, context_text=context_text)
+    return _anthropic_google_shaping._append_codex_google_code_assist_orphan_tool_result_context(
+        messages=messages, index=index, context_text=context_text
+    )
 
 
-def _sanitize_codex_google_code_assist_orphan_tool_results(completion_kwargs: dict[str, Any], *, scope_key: Optional[str]=None) -> tuple[dict[str, Any], dict[str, Any]]:
+def _sanitize_codex_google_code_assist_orphan_tool_results(
+    completion_kwargs: dict[str, Any], *, scope_key: Optional[str] = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._sanitize_codex_google_code_assist_orphan_tool_results(completion_kwargs, scope_key=scope_key)
+    return _anthropic_google_shaping._sanitize_codex_google_code_assist_orphan_tool_results(
+        completion_kwargs, scope_key=scope_key
+    )
 
 
-def _ensure_codex_google_code_assist_tool_results_have_calls(completion_kwargs: dict[str, Any], *, scope_key: Optional[str]=None) -> tuple[dict[str, Any], dict[str, Any]]:
+def _ensure_codex_google_code_assist_tool_results_have_calls(
+    completion_kwargs: dict[str, Any], *, scope_key: Optional[str] = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._ensure_codex_google_code_assist_tool_results_have_calls(completion_kwargs, scope_key=scope_key)
+    return _anthropic_google_shaping._ensure_codex_google_code_assist_tool_results_have_calls(
+        completion_kwargs, scope_key=scope_key
+    )
 
 
-async def _build_google_code_assist_request_from_completion_kwargs(*, completion_kwargs: dict[str, Any], adapter_model: str, project: str, request: Request, completion_kwargs_are_openai_chat: bool=False, scope_key: Optional[str]=None) -> tuple[dict[str, Any], dict[str, str], list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
+async def _build_google_code_assist_request_from_completion_kwargs(
+    *,
+    completion_kwargs: dict[str, Any],
+    adapter_model: str,
+    project: str,
+    request: Request,
+    completion_kwargs_are_openai_chat: bool = False,
+    scope_key: Optional[str] = None,
+) -> tuple[dict[str, Any], dict[str, str], list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._build_google_code_assist_request_from_completion_kwargs(completion_kwargs=completion_kwargs, adapter_model=adapter_model, project=project, request=request, completion_kwargs_are_openai_chat=completion_kwargs_are_openai_chat, scope_key=scope_key)
+    return await _anthropic_google_shaping._build_google_code_assist_request_from_completion_kwargs(
+        completion_kwargs=completion_kwargs,
+        adapter_model=adapter_model,
+        project=project,
+        request=request,
+        completion_kwargs_are_openai_chat=completion_kwargs_are_openai_chat,
+        scope_key=scope_key,
+    )
 
 
 def _drop_codex_google_code_assist_non_function_tools(request_body: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -10336,14 +9882,29 @@ def _drop_codex_google_code_assist_non_function_tools(request_body: dict[str, An
     return _anthropic_google_shaping._drop_codex_google_code_assist_non_function_tools(request_body)
 
 
-def _build_codex_google_code_assist_completion_kwargs(prepared_request_body: dict[str, Any], *, adapter_model: str) -> tuple[dict[str, Any], Any, ResponsesAPIOptionalRequestParams]:
+def _build_codex_google_code_assist_completion_kwargs(
+    prepared_request_body: dict[str, Any], *, adapter_model: str
+) -> tuple[dict[str, Any], Any, ResponsesAPIOptionalRequestParams]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_google_code_assist_completion_kwargs(prepared_request_body, adapter_model=adapter_model)
+    return _anthropic_google_shaping._build_codex_google_code_assist_completion_kwargs(
+        prepared_request_body, adapter_model=adapter_model
+    )
 
 
-async def _prepare_codex_google_code_assist_adapter_request(*, request: Request, prepared_request_body: dict[str, Any], adapter_model: str, adapter_provider: str=litellm.LlmProviders.GEMINI.value) -> SimpleNamespace:
+async def _prepare_codex_google_code_assist_adapter_request(
+    *,
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
+) -> SimpleNamespace:
     _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._prepare_codex_google_code_assist_adapter_request(request=request, prepared_request_body=prepared_request_body, adapter_model=adapter_model, adapter_provider=adapter_provider)
+    return await _anthropic_google_shaping._prepare_codex_google_code_assist_adapter_request(
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        adapter_provider=adapter_provider,
+    )
 
 
 def _get_google_code_assist_native_tool_aliases() -> dict[str, str]:
@@ -10359,35 +9920,51 @@ def _get_google_code_assist_native_tool_aliases() -> dict[str, str]:
     }
 
 
-def _apply_google_code_assist_alias_to_function_block(function_block: dict[str, Any], *, aliases: dict[str, str], tool_name_mapping: dict[str, str]) -> tuple[dict[str, Any], Optional[str]]:
+def _apply_google_code_assist_alias_to_function_block(
+    function_block: dict[str, Any], *, aliases: dict[str, str], tool_name_mapping: dict[str, str]
+) -> tuple[dict[str, Any], Optional[str]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_alias_to_function_block(function_block, aliases=aliases, tool_name_mapping=tool_name_mapping)
+    return _anthropic_google_shaping._apply_google_code_assist_alias_to_function_block(
+        function_block, aliases=aliases, tool_name_mapping=tool_name_mapping
+    )
 
 
-def _apply_google_code_assist_alias_to_tool(tool: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]) -> tuple[Any, Optional[str]]:
+def _apply_google_code_assist_alias_to_tool(
+    tool: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]
+) -> tuple[Any, Optional[str]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_alias_to_tool(tool, aliases=aliases, tool_name_mapping=tool_name_mapping)
+    return _anthropic_google_shaping._apply_google_code_assist_alias_to_tool(
+        tool, aliases=aliases, tool_name_mapping=tool_name_mapping
+    )
 
 
-def _apply_google_code_assist_aliases_to_tool_calls(tool_calls: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]) -> tuple[Any, set[str]]:
+def _apply_google_code_assist_aliases_to_tool_calls(
+    tool_calls: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]
+) -> tuple[Any, set[str]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_aliases_to_tool_calls(tool_calls, aliases=aliases, tool_name_mapping=tool_name_mapping)
+    return _anthropic_google_shaping._apply_google_code_assist_aliases_to_tool_calls(
+        tool_calls, aliases=aliases, tool_name_mapping=tool_name_mapping
+    )
 
 
-def _apply_google_code_assist_aliases_to_message(message: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]) -> tuple[Any, set[str]]:
+def _apply_google_code_assist_aliases_to_message(
+    message: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]
+) -> tuple[Any, set[str]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_aliases_to_message(message, aliases=aliases, tool_name_mapping=tool_name_mapping)
+    return _anthropic_google_shaping._apply_google_code_assist_aliases_to_message(
+        message, aliases=aliases, tool_name_mapping=tool_name_mapping
+    )
 
 
-def _apply_google_code_assist_native_tool_aliases(completion_kwargs: dict[str, Any], tool_name_mapping: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _apply_google_code_assist_native_tool_aliases(
+    completion_kwargs: dict[str, Any], tool_name_mapping: dict[str, str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._apply_google_code_assist_native_tool_aliases(completion_kwargs, tool_name_mapping)
 
 
 def _get_google_adapter_max_completion_messages_window() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW"))
     if raw_value is None:
         return 12
     try:
@@ -10413,7 +9990,9 @@ def _completion_message_has_visible_text(message: Any) -> bool:
     return False
 
 
-def _inject_google_adapter_tool_call_context_text(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _inject_google_adapter_tool_call_context_text(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._inject_google_adapter_tool_call_context_text(messages)
 
@@ -10511,9 +10090,7 @@ def _trim_completion_message_tail_preserving_tool_pairs(
 
     tail_start = max(0, len(messages) - tail_budget)
     boundary_adjustments = 0
-    while tail_start < len(messages) and _completion_message_has_tool_result(
-        messages[tail_start]
-    ):
+    while tail_start < len(messages) and _completion_message_has_tool_result(messages[tail_start]):
         tail_start += 1
         boundary_adjustments += 1
 
@@ -10530,24 +10107,18 @@ def _trim_completion_message_tail_preserving_tool_pairs(
             break
         tail_start = orphan_index + 1
         boundary_adjustments += 1
-        while tail_start < len(messages) and _completion_message_has_tool_result(
-            messages[tail_start]
-        ):
+        while tail_start < len(messages) and _completion_message_has_tool_result(messages[tail_start]):
             tail_start += 1
             boundary_adjustments += 1
 
     changes: dict[str, Any] = {}
     if boundary_adjustments:
-        changes[
-            "trimmed_completion_messages_tool_pair_boundary_adjustments"
-        ] = boundary_adjustments
+        changes["trimmed_completion_messages_tool_pair_boundary_adjustments"] = boundary_adjustments
     return messages[tail_start:], changes
 
 
 def _get_google_adapter_preserved_task_state_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_PRESERVED_TASK_STATE_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_PRESERVED_TASK_STATE_CHAR_CAP"))
     if raw_value is None:
         return 6000
     try:
@@ -10562,12 +10133,16 @@ def _extract_google_adapter_preserved_task_excerpt(text: str) -> str:
     return _anthropic_google_shaping._extract_google_adapter_preserved_task_excerpt(text)
 
 
-def _build_google_adapter_preserved_task_state_message(messages: list[dict[str, Any]]) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+def _build_google_adapter_preserved_task_state_message(
+    messages: list[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._build_google_adapter_preserved_task_state_message(messages)
 
 
-def _apply_google_adapter_completion_message_window(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _apply_google_adapter_completion_message_window(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._apply_google_adapter_completion_message_window(messages)
 
@@ -10604,12 +10179,8 @@ def _google_code_assist_duplicate_tool_results_from_completion_messages(
                 if not isinstance(function_name, str) or not function_name:
                     continue
                 pending_tool_calls_by_id[tool_call_id] = function_name
-                tool_call_name_counts[function_name] = (
-                    tool_call_name_counts.get(function_name, 0) + 1
-                )
-            duplicate_tool_call_names = {
-                name for name, count in tool_call_name_counts.items() if count > 1
-            }
+                tool_call_name_counts[function_name] = tool_call_name_counts.get(function_name, 0) + 1
+            duplicate_tool_call_names = {name for name, count in tool_call_name_counts.items() if count > 1}
             continue
 
         if role != "tool":
@@ -10627,14 +10198,22 @@ def _google_code_assist_duplicate_tool_results_from_completion_messages(
     return duplicate_tool_results
 
 
-def _annotate_google_code_assist_duplicate_tool_response_parts(contents: list[Any], duplicate_tool_results: list[tuple[str, str]], *, annotate_function_response_id: bool=False) -> int:
+def _annotate_google_code_assist_duplicate_tool_response_parts(
+    contents: list[Any], duplicate_tool_results: list[tuple[str, str]], *, annotate_function_response_id: bool = False
+) -> int:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._annotate_google_code_assist_duplicate_tool_response_parts(contents, duplicate_tool_results, annotate_function_response_id=annotate_function_response_id)
+    return _anthropic_google_shaping._annotate_google_code_assist_duplicate_tool_response_parts(
+        contents, duplicate_tool_results, annotate_function_response_id=annotate_function_response_id
+    )
 
 
-def _annotate_google_code_assist_duplicate_tool_responses(google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]]) -> dict[str, Any]:
+def _annotate_google_code_assist_duplicate_tool_responses(
+    google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]]
+) -> dict[str, Any]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._annotate_google_code_assist_duplicate_tool_responses(google_request_dict, completion_messages)
+    return _anthropic_google_shaping._annotate_google_code_assist_duplicate_tool_responses(
+        google_request_dict, completion_messages
+    )
 
 
 def _google_code_assist_tool_results_from_completion_messages(
@@ -10676,20 +10255,20 @@ def _google_code_assist_tool_results_from_completion_messages(
     return tool_results
 
 
-def _annotate_google_code_assist_claude_tool_response_ids(google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]], *, google_model: str) -> dict[str, Any]:
+def _annotate_google_code_assist_claude_tool_response_ids(
+    google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]], *, google_model: str
+) -> dict[str, Any]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._annotate_google_code_assist_claude_tool_response_ids(google_request_dict, completion_messages, google_model=google_model)
+    return _anthropic_google_shaping._annotate_google_code_assist_claude_tool_response_ids(
+        google_request_dict, completion_messages, google_model=google_model
+    )
 
 
 def _google_code_assist_function_response_id(
     function_response: dict[str, Any],
 ) -> Optional[str]:
     response_payload = function_response.get("response")
-    response_tool_use_id = (
-        response_payload.get("tool_use_id")
-        if isinstance(response_payload, dict)
-        else None
-    )
+    response_tool_use_id = response_payload.get("tool_use_id") if isinstance(response_payload, dict) else None
     for candidate in (function_response.get("id"), response_tool_use_id):
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
@@ -10714,9 +10293,13 @@ def _google_code_assist_function_call_args_for_id(
     return parsed_arguments if isinstance(parsed_arguments, dict) else {}
 
 
-def _insert_google_code_assist_missing_claude_function_call_pairs(google_request_dict: dict[str, Any], *, google_model: str, scope_key: Optional[str]=None) -> dict[str, Any]:
+def _insert_google_code_assist_missing_claude_function_call_pairs(
+    google_request_dict: dict[str, Any], *, google_model: str, scope_key: Optional[str] = None
+) -> dict[str, Any]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._insert_google_code_assist_missing_claude_function_call_pairs(google_request_dict, google_model=google_model, scope_key=scope_key)
+    return _anthropic_google_shaping._insert_google_code_assist_missing_claude_function_call_pairs(
+        google_request_dict, google_model=google_model, scope_key=scope_key
+    )
 
 
 def _extract_google_code_assist_text_metrics(content_block: Any) -> tuple[int, int]:
@@ -10729,12 +10312,16 @@ def _summarize_google_code_assist_content_preview_entry(content_entry: dict[str,
     return _anthropic_google_shaping._summarize_google_code_assist_content_preview_entry(content_entry)
 
 
-def _summarize_google_code_assist_request_contents_shape(request_block: dict[str, Any], summary: dict[str, Any]) -> None:
+def _summarize_google_code_assist_request_contents_shape(
+    request_block: dict[str, Any], summary: dict[str, Any]
+) -> None:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._summarize_google_code_assist_request_contents_shape(request_block, summary)
 
 
-def _summarize_google_code_assist_generation_config_shape(request_block: dict[str, Any], summary: dict[str, Any]) -> None:
+def _summarize_google_code_assist_generation_config_shape(
+    request_block: dict[str, Any], summary: dict[str, Any]
+) -> None:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._summarize_google_code_assist_generation_config_shape(request_block, summary)
 
@@ -10754,40 +10341,90 @@ def _unwrap_google_code_assist_response_payload(payload: Any) -> Optional[dict[s
     return _anthropic_google_shaping._unwrap_google_code_assist_response_payload(payload)
 
 
-async def _translate_google_code_assist_response_to_anthropic(*, response: Response, adapter_model: str, tool_name_mapping: dict[str, str], completion_messages: list[dict[str, Any]], gemini_optional_params: dict[str, Any], litellm_params: dict[str, Any], logging_obj: Any) -> Response:
+async def _translate_google_code_assist_response_to_anthropic(
+    *,
+    response: Response,
+    adapter_model: str,
+    tool_name_mapping: dict[str, str],
+    completion_messages: list[dict[str, Any]],
+    gemini_optional_params: dict[str, Any],
+    litellm_params: dict[str, Any],
+    logging_obj: Any,
+) -> Response:
     _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._translate_google_code_assist_response_to_anthropic(response=response, adapter_model=adapter_model, tool_name_mapping=tool_name_mapping, completion_messages=completion_messages, gemini_optional_params=gemini_optional_params, litellm_params=litellm_params, logging_obj=logging_obj)
+    return await _anthropic_google_shaping._translate_google_code_assist_response_to_anthropic(
+        response=response,
+        adapter_model=adapter_model,
+        tool_name_mapping=tool_name_mapping,
+        completion_messages=completion_messages,
+        gemini_optional_params=gemini_optional_params,
+        litellm_params=litellm_params,
+        logging_obj=logging_obj,
+    )
 
 
-def _iterate_google_code_assist_unwrapped_stream(body_iterator: Any, *, adapter_model: Optional[str]=None, rate_limit_key: Optional[str]=None) -> Any:
+def _iterate_google_code_assist_unwrapped_stream(
+    body_iterator: Any, *, adapter_model: Optional[str] = None, rate_limit_key: Optional[str] = None
+) -> Any:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._iterate_google_code_assist_unwrapped_stream(body_iterator, adapter_model=adapter_model, rate_limit_key=rate_limit_key)
+    return _anthropic_google_shaping._iterate_google_code_assist_unwrapped_stream(
+        body_iterator, adapter_model=adapter_model, rate_limit_key=rate_limit_key
+    )
 
 
-def _build_anthropic_streaming_response_from_google_code_assist_stream(*, response: StreamingResponse, adapter_model: str, tool_name_mapping: dict[str, str], gemini_optional_params: dict[str, Any], rate_limit_key: Optional[str]=None) -> StreamingResponse:
+def _build_anthropic_streaming_response_from_google_code_assist_stream(
+    *,
+    response: StreamingResponse,
+    adapter_model: str,
+    tool_name_mapping: dict[str, str],
+    gemini_optional_params: dict[str, Any],
+    rate_limit_key: Optional[str] = None,
+) -> StreamingResponse:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_anthropic_streaming_response_from_google_code_assist_stream(response=response, adapter_model=adapter_model, tool_name_mapping=tool_name_mapping, gemini_optional_params=gemini_optional_params, rate_limit_key=rate_limit_key)
+    return _anthropic_google_shaping._build_anthropic_streaming_response_from_google_code_assist_stream(
+        response=response,
+        adapter_model=adapter_model,
+        tool_name_mapping=tool_name_mapping,
+        gemini_optional_params=gemini_optional_params,
+        rate_limit_key=rate_limit_key,
+    )
 
 
-def _restore_google_adapter_tool_call_names(response_obj: Any, tool_name_mapping: dict[str, str], *, scope_key: Optional[str]=None) -> Any:
+def _restore_google_adapter_tool_call_names(
+    response_obj: Any, tool_name_mapping: dict[str, str], *, scope_key: Optional[str] = None
+) -> Any:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._restore_google_adapter_tool_call_names(response_obj, tool_name_mapping, scope_key=scope_key)
+    return _anthropic_google_shaping._restore_google_adapter_tool_call_names(
+        response_obj, tool_name_mapping, scope_key=scope_key
+    )
 
 
-async def _restore_google_adapter_tool_call_names_stream(completion_stream: Any, tool_name_mapping: dict[str, str], *, scope_key: Optional[str]=None) -> Any:
+async def _restore_google_adapter_tool_call_names_stream(
+    completion_stream: Any, tool_name_mapping: dict[str, str], *, scope_key: Optional[str] = None
+) -> Any:
     _anthropic_google_shaping.bind_runtime(globals())
-    async for _provider_item in _anthropic_google_shaping._restore_google_adapter_tool_call_names_stream(completion_stream, tool_name_mapping, scope_key=scope_key):
+    async for _provider_item in _anthropic_google_shaping._restore_google_adapter_tool_call_names_stream(
+        completion_stream, tool_name_mapping, scope_key=scope_key
+    ):
         yield _provider_item
 
 
-async def _collect_google_code_assist_model_response_from_stream(*, response: StreamingResponse, adapter_model: str, logging_obj: Any) -> Any:
+async def _collect_google_code_assist_model_response_from_stream(
+    *, response: StreamingResponse, adapter_model: str, logging_obj: Any
+) -> Any:
     _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._collect_google_code_assist_model_response_from_stream(response=response, adapter_model=adapter_model, logging_obj=logging_obj)
+    return await _anthropic_google_shaping._collect_google_code_assist_model_response_from_stream(
+        response=response, adapter_model=adapter_model, logging_obj=logging_obj
+    )
 
 
-async def _collect_google_code_assist_response_from_stream(*, response: StreamingResponse, adapter_model: str, tool_name_mapping: dict[str, str], logging_obj: Any) -> Response:
+async def _collect_google_code_assist_response_from_stream(
+    *, response: StreamingResponse, adapter_model: str, tool_name_mapping: dict[str, str], logging_obj: Any
+) -> Response:
     _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._collect_google_code_assist_response_from_stream(response=response, adapter_model=adapter_model, tool_name_mapping=tool_name_mapping, logging_obj=logging_obj)
+    return await _anthropic_google_shaping._collect_google_code_assist_response_from_stream(
+        response=response, adapter_model=adapter_model, tool_name_mapping=tool_name_mapping, logging_obj=logging_obj
+    )
 
 
 def _serialize_responses_adapter_response(response_obj: Any) -> str:
@@ -10846,9 +10483,13 @@ async def _responses_sse_from_iterator(
                 )
 
 
-def _build_codex_streaming_response_from_google_code_assist_stream(*, response: StreamingResponse, adapter_request: SimpleNamespace) -> StreamingResponse:
+def _build_codex_streaming_response_from_google_code_assist_stream(
+    *, response: StreamingResponse, adapter_request: SimpleNamespace
+) -> StreamingResponse:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_streaming_response_from_google_code_assist_stream(response=response, adapter_request=adapter_request)
+    return _anthropic_google_shaping._build_codex_streaming_response_from_google_code_assist_stream(
+        response=response, adapter_request=adapter_request
+    )
 
 
 def _wrap_streaming_response_with_release_callback(
@@ -10865,9 +10506,7 @@ def _wrap_streaming_response_with_release_callback(
         try:
             release_callback()
         except Exception:
-            verbose_proxy_logger.exception(
-                "Failed to release adapted streaming response guard callback"
-            )
+            verbose_proxy_logger.exception("Failed to release adapted streaming response guard callback")
 
     original_iterator = getattr(response, "body_iterator", None)
     if original_iterator is None:
@@ -10923,9 +10562,7 @@ def _get_nvidia_adapter_max_retries() -> int:
 def _get_nvidia_adapter_request_timeout_seconds(
     adapter_model: Optional[str] = None,
 ) -> float:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_NVIDIA_ADAPTER_REQUEST_TIMEOUT_SECONDS")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_REQUEST_TIMEOUT_SECONDS"))
     if raw_value is None:
         if _should_force_fake_stream_for_nvidia_adapter_model(adapter_model):
             return 240.0
@@ -10940,9 +10577,7 @@ def _get_nvidia_adapter_request_timeout_seconds(
 
 
 def _get_nvidia_adapter_inner_max_retries() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_NVIDIA_ADAPTER_INNER_MAX_RETRIES")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_INNER_MAX_RETRIES"))
     if raw_value is None:
         return 0
     try:
@@ -10955,15 +10590,11 @@ def _get_nvidia_adapter_inner_max_retries() -> int:
 def _should_force_fake_stream_for_nvidia_adapter_model(
     adapter_model: Optional[str],
 ) -> bool:
-    configured_models = _clean_codex_auth_value(
-        os.getenv("AAWM_NVIDIA_ADAPTER_FORCE_FAKE_STREAM_MODELS")
-    )
+    configured_models = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_FORCE_FAKE_STREAM_MODELS"))
     if configured_models is None:
         normalized_models = {"minimaxai/minimax-m2.7"}
     else:
-        normalized_models = {
-            item.strip() for item in configured_models.split(",") if item.strip()
-        }
+        normalized_models = {item.strip() for item in configured_models.split(",") if item.strip()}
     return bool(adapter_model and adapter_model in normalized_models)
 
 
@@ -11016,10 +10647,7 @@ async def _perform_nvidia_completion_adapter_operation(
         except Exception as exc:
             status_code = _extract_nvidia_adapter_exception_status_code(exc)
             raw_message = str(exc)
-            if (
-                status_code not in _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES
-                or attempt >= total_attempts
-            ):
+            if status_code not in _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES or attempt >= total_attempts:
                 verbose_proxy_logger.warning(
                     "NVIDIA completion adapter upstream attempt %s failed with %s (%s, raw=%s) and will not be retried",
                     attempt,
@@ -11044,10 +10672,7 @@ async def _perform_nvidia_completion_adapter_operation(
 
 
 def _get_openrouter_target_base() -> str:
-    cleaned = (
-        _clean_secret_string(os.getenv("OPENROUTER_API_BASE"))
-        or "https://openrouter.ai/api"
-    ).rstrip("/")
+    cleaned = (_clean_secret_string(os.getenv("OPENROUTER_API_BASE")) or "https://openrouter.ai/api").rstrip("/")
     if cleaned.endswith("/api/v1"):
         return cleaned[: -len("/v1")]
     return cleaned
@@ -11100,34 +10725,19 @@ async def _load_local_opencode_zen_api_key() -> str:
     try:
         auth_data = json.loads(auth_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        raise ValueError(
-            f"Unable to read OpenCode Zen auth file at {auth_path}"
-        ) from exc
+        raise ValueError(f"Unable to read OpenCode Zen auth file at {auth_path}") from exc
 
     provider_auth = auth_data.get("opencode") if isinstance(auth_data, dict) else None
-    api_key = (
-        _clean_secret_string(provider_auth.get("key"))
-        if isinstance(provider_auth, dict)
-        else None
-    )
-    auth_type = (
-        _clean_secret_string(provider_auth.get("type"))
-        if isinstance(provider_auth, dict)
-        else None
-    )
+    api_key = _clean_secret_string(provider_auth.get("key")) if isinstance(provider_auth, dict) else None
+    auth_type = _clean_secret_string(provider_auth.get("type")) if isinstance(provider_auth, dict) else None
     if api_key is None or auth_type not in {None, "api"}:
-        raise ValueError(
-            "OpenCode Zen auth file must contain provider 'opencode' with API-key auth."
-        )
+        raise ValueError("OpenCode Zen auth file must contain provider 'opencode' with API-key auth.")
     return api_key
 
 
 def _raise_opencode_zen_auto_agent_candidate_unavailable(exc: Exception) -> None:
     proxy_exc = ProxyException(
-        message=(
-            "OpenCode Zen auto-agent candidate requires a valid OpenCode API-key "
-            f"credential: {exc}"
-        ),
+        message=("OpenCode Zen auto-agent candidate requires a valid OpenCode API-key " f"credential: {exc}"),
         type="rate_limit_error",
         param="model",
         code=429,
@@ -11234,10 +10844,7 @@ def _antigravity_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
 def _raise_antigravity_auto_agent_candidate_unavailable(exc: Exception) -> None:
     detail = _antigravity_candidate_unavailable_detail(exc) or str(exc)
     proxy_exc = ProxyException(
-        message=(
-            "Antigravity auto-agent candidate requires a valid Antigravity OAuth "
-            f"credential: {detail}"
-        ),
+        message=("Antigravity auto-agent candidate requires a valid Antigravity OAuth " f"credential: {detail}"),
         type="invalid_request_error",
         param="model",
         code=502,
@@ -11295,10 +10902,7 @@ def _codex_native_openai_candidate_unavailable_detail(exc: Any) -> Optional[str]
     normalized = detail_text.lower()
     if "not supported when using codex with a chatgpt account" not in normalized:
         return None
-    if (
-        "model is not supported" not in normalized
-        and "is not supported" not in normalized
-    ):
+    if "model is not supported" not in normalized and "is not supported" not in normalized:
         return None
     return detail_text
 
@@ -11306,10 +10910,7 @@ def _codex_native_openai_candidate_unavailable_detail(exc: Any) -> Optional[str]
 def _raise_codex_native_openai_auto_agent_candidate_unavailable(exc: Exception) -> None:
     detail = _codex_native_openai_candidate_unavailable_detail(exc) or str(exc)
     proxy_exc = ProxyException(
-        message=(
-            "ChatGPT/Codex native OpenAI auto-agent candidate is unavailable for "
-            f"this account: {detail}"
-        ),
+        message=("ChatGPT/Codex native OpenAI auto-agent candidate is unavailable for " f"this account: {detail}"),
         type="rate_limit_error",
         param="model",
         code=429,
@@ -11347,10 +10948,7 @@ def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
         status_code == 403
         and "permission-denied" in normalized
         and "access to the chat endpoint is denied" in normalized
-        and (
-            "correct credentials" in normalized
-            or "update the permissions" in normalized
-        )
+        and ("correct credentials" in normalized or "update the permissions" in normalized)
     ):
         return detail_text
     if (
@@ -11391,10 +10989,7 @@ def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
 def _raise_xai_oauth_auto_agent_candidate_unavailable(exc: Exception) -> Never:
     detail = _xai_oauth_candidate_unavailable_detail(exc) or str(exc)
     proxy_exc = ProxyException(
-        message=(
-            "xAI OAuth auto-agent candidate requires a valid managed xAI OAuth "
-            f"credential: {detail}"
-        ),
+        message=("xAI OAuth auto-agent candidate requires a valid managed xAI OAuth " f"credential: {detail}"),
         type="rate_limit_error",
         param="model",
         code=429,
@@ -11415,10 +11010,7 @@ def _raise_xai_oauth_auto_agent_candidate_unavailable(exc: Exception) -> Never:
 def _raise_grok_native_auto_agent_candidate_unavailable(exc: Exception) -> Never:
     detail = _grok_native_candidate_unavailable_detail(exc) or str(exc)
     proxy_exc = ProxyException(
-        message=(
-            "Grok native auto-agent candidate requires a valid managed xAI/Grok "
-            f"credential: {detail}"
-        ),
+        message=("Grok native auto-agent candidate requires a valid managed xAI/Grok " f"credential: {detail}"),
         type="rate_limit_error",
         param="model",
         code=429,
@@ -11498,31 +11090,23 @@ def _add_opencode_zen_logging_metadata(
 
 
 @lru_cache(maxsize=1)
-def _get_anthropic_opencode_zen_normalization_runtime() -> (
-    _anthropic_opencode_zen_normalization.Runtime
-):
+def _get_anthropic_opencode_zen_normalization_runtime() -> _anthropic_opencode_zen_normalization.Runtime:
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
 
     return _anthropic_opencode_zen_normalization.Runtime(
-        clean_secret_string=lambda value: _clean_secret_string(
-            value if isinstance(value, str) else None
-        ),
+        clean_secret_string=lambda value: _clean_secret_string(value if isinstance(value, str) else None),
         merge_metadata=_merge_litellm_metadata,
         add_logging_metadata=_add_opencode_zen_logging_metadata,
         build_span=_build_langfuse_span_descriptor,
         transform_responses_api_request_to_chat_completion_request=(
             LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request
         ),
-        async_responses_api_session_handler=(
-            LiteLLMCompletionResponsesConfig.async_responses_api_session_handler
-        ),
+        async_responses_api_session_handler=(LiteLLMCompletionResponsesConfig.async_responses_api_session_handler),
         iterate_responses_sse_events=_iterate_responses_sse_events,
         coerce_namespace_to_mapping=_coerce_namespace_to_mapping,
-        responses_output_item_has_meaningful_content=(
-            _responses_output_item_has_meaningful_content
-        ),
+        responses_output_item_has_meaningful_content=(_responses_output_item_has_meaningful_content),
         streaming_response_factory=StreamingResponse,
     )
 
@@ -11582,9 +11166,7 @@ def _collect_opencode_zen_following_tool_block(
 def _sanitize_opencode_zen_completion_messages_for_chat_completion(
     completion_kwargs: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    return _anthropic_opencode_zen_normalization.sanitize_completion_messages_for_chat_completion(
-        completion_kwargs
-    )
+    return _anthropic_opencode_zen_normalization.sanitize_completion_messages_for_chat_completion(completion_kwargs)
 
 
 def _openrouter_chat_message_function_call(message: Any) -> Any:
@@ -11691,9 +11273,7 @@ def _normalize_openrouter_chat_message_tool_call_arguments(
             updated_tool_calls.append(tool_call)
             continue
 
-        normalized_arguments, argument_kind = (
-            _serialize_openrouter_tool_call_arguments(arguments)
-        )
+        normalized_arguments, argument_kind = _serialize_openrouter_tool_call_arguments(arguments)
         updated_function = _copy_openrouter_message_value(
             function,
             field_name="arguments",
@@ -11727,9 +11307,7 @@ def _sanitize_openrouter_completion_messages_for_chat_completion(
     (
         completion_kwargs,
         adjacency_changes,
-    ) = _sanitize_opencode_zen_completion_messages_for_chat_completion(
-        completion_kwargs
-    )
+    ) = _sanitize_opencode_zen_completion_messages_for_chat_completion(completion_kwargs)
 
     messages = completion_kwargs.get("messages")
     if not isinstance(messages, list):
@@ -11747,9 +11325,7 @@ def _sanitize_openrouter_completion_messages_for_chat_completion(
         if not _openrouter_chat_message_has_valid_content_or_tool_calls(message):
             removed_empty_message_count += 1
             continue
-        normalized_message, normalized_counts = (
-            _normalize_openrouter_chat_message_tool_call_arguments(message)
-        )
+        normalized_message, normalized_counts = _normalize_openrouter_chat_message_tool_call_arguments(message)
         updated_messages.append(normalized_message)
         if normalized_counts:
             normalized_tool_argument_message_count += 1
@@ -11757,11 +11333,7 @@ def _sanitize_openrouter_completion_messages_for_chat_completion(
                 normalized_tool_argument_counts[key] += count
 
     normalized_tool_argument_count = sum(normalized_tool_argument_counts.values())
-    if (
-        removed_empty_message_count == 0
-        and normalized_tool_argument_count == 0
-        and not adjacency_changes
-    ):
+    if removed_empty_message_count == 0 and normalized_tool_argument_count == 0 and not adjacency_changes:
         return completion_kwargs, {}
 
     updated_kwargs = dict(completion_kwargs)
@@ -11770,29 +11342,17 @@ def _sanitize_openrouter_completion_messages_for_chat_completion(
         "openrouter_chat_message_shape_sanitized": True,
         "openrouter_chat_message_shape_messages_from_count": len(messages),
         "openrouter_chat_message_shape_messages_to_count": len(updated_messages),
-        "openrouter_chat_message_shape_removed_empty_message_count": (
-            removed_empty_message_count
-        ),
+        "openrouter_chat_message_shape_removed_empty_message_count": (removed_empty_message_count),
     }
     if normalized_tool_argument_count:
         changes.update(
             {
                 "openrouter_chat_tool_arguments_sanitized": True,
-                "openrouter_chat_tool_arguments_normalized_count": (
-                    normalized_tool_argument_count
-                ),
-                "openrouter_chat_tool_arguments_message_count": (
-                    normalized_tool_argument_message_count
-                ),
-                "openrouter_chat_tool_arguments_object_count": (
-                    normalized_tool_argument_counts["object"]
-                ),
-                "openrouter_chat_tool_arguments_array_count": (
-                    normalized_tool_argument_counts["array"]
-                ),
-                "openrouter_chat_tool_arguments_scalar_count": (
-                    normalized_tool_argument_counts["scalar"]
-                ),
+                "openrouter_chat_tool_arguments_normalized_count": (normalized_tool_argument_count),
+                "openrouter_chat_tool_arguments_message_count": (normalized_tool_argument_message_count),
+                "openrouter_chat_tool_arguments_object_count": (normalized_tool_argument_counts["object"]),
+                "openrouter_chat_tool_arguments_array_count": (normalized_tool_argument_counts["array"]),
+                "openrouter_chat_tool_arguments_scalar_count": (normalized_tool_argument_counts["scalar"]),
             }
         )
     if adjacency_changes:
@@ -11897,12 +11457,10 @@ async def _normalize_opencode_zen_responses_stream_for_codex(
     *,
     adapter_model: str,
 ) -> Any:
-    async for chunk in (
-        _anthropic_opencode_zen_normalization.normalize_responses_stream_for_codex(
-            _get_anthropic_opencode_zen_normalization_runtime(),
-            response,
-            adapter_model=adapter_model,
-        )
+    async for chunk in _anthropic_opencode_zen_normalization.normalize_responses_stream_for_codex(
+        _get_anthropic_opencode_zen_normalization_runtime(),
+        response,
+        adapter_model=adapter_model,
     ):
         yield chunk
 
@@ -11935,8 +11493,7 @@ def _join_opencode_zen_passthrough_url(base_target_url: str, endpoint: str) -> s
 
 def _build_openrouter_default_headers() -> dict[str, str]:
     headers = {
-        "HTTP-Referer": _clean_secret_string(get_secret_str("OR_SITE_URL"))
-        or "https://litellm.ai",
+        "HTTP-Referer": _clean_secret_string(get_secret_str("OR_SITE_URL")) or "https://litellm.ai",
         "X-Title": _clean_secret_string(get_secret_str("OR_APP_NAME")) or "liteLLM",
     }
     return headers
@@ -12045,9 +11602,7 @@ def _anthropic_adapter_request_has_openai_client_auth(request: Request) -> bool:
 
 
 def _anthropic_adapter_request_uses_codex_native_auth(request: Request) -> bool:
-    chatgpt_account_id = _get_request_header_or_passthrough_alias(
-        request, "ChatGPT-Account-Id"
-    )
+    chatgpt_account_id = _get_request_header_or_passthrough_alias(request, "ChatGPT-Account-Id")
     originator = _get_request_header_or_passthrough_alias(request, "originator")
     user_agent = _get_request_header_or_passthrough_alias(request, "user-agent")
     session_id = _get_request_header_or_passthrough_alias(request, "session_id")
@@ -12074,6 +11629,7 @@ def _clean_codex_auth_value(value: Any) -> Optional[str]:
     cleaned = value.strip()
     return cleaned or None
 
+
 _aawm_alias_durable.configure_durable_runtime(
     clean_value=_clean_codex_auth_value,
     get_dual_cache_override=lambda: (
@@ -12099,9 +11655,7 @@ def _build_google_debug_header_summary(headers: dict[str, Any]) -> dict[str, Any
 
 
 def _get_google_adapter_native_user_agent(model: Optional[str]) -> str:
-    configured = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_NATIVE_USER_AGENT")
-    )
+    configured = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_NATIVE_USER_AGENT"))
     if configured:
         return configured
     model_name = model or "gemini-3-flash-preview"
@@ -12109,9 +11663,7 @@ def _get_google_adapter_native_user_agent(model: Optional[str]) -> str:
 
 
 def _get_google_adapter_native_api_client_header() -> str:
-    configured = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_NATIVE_X_GOOG_API_CLIENT")
-    )
+    configured = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_NATIVE_X_GOOG_API_CLIENT"))
     if configured:
         return configured
     return "gl-node/24.13.1"
@@ -12119,7 +11671,9 @@ def _get_google_adapter_native_api_client_header() -> str:
 
 def _build_google_adapter_native_headers(*, access_token: str, model: Optional[str], accept: str) -> dict[str, str]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_google_adapter_native_headers(access_token=access_token, model=model, accept=accept)
+    return _anthropic_google_shaping._build_google_adapter_native_headers(
+        access_token=access_token, model=model, accept=accept
+    )
 
 
 def _get_anthropic_adapter_codex_auth_file_path() -> Optional[Path]:
@@ -12265,9 +11819,7 @@ async def _load_local_codex_auth_headers(request: Request) -> Optional[dict[str,
             ),
         )
 
-    account_id = _clean_codex_auth_value(
-        token_data.get("account_id")
-    ) or _extract_codex_account_id_from_token(
+    account_id = _clean_codex_auth_value(token_data.get("account_id")) or _extract_codex_account_id_from_token(
         _clean_codex_auth_value(token_data.get("id_token")) or access_token
     )
 
@@ -12290,10 +11842,7 @@ def _get_anthropic_adapter_openai_target_base(
     *,
     prefer_chatgpt_codex_backend: bool = False,
 ) -> str:
-    if (
-        prefer_chatgpt_codex_backend
-        or _anthropic_adapter_request_uses_codex_native_auth(request)
-    ):
+    if prefer_chatgpt_codex_backend or _anthropic_adapter_request_uses_codex_native_auth(request):
         return os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
     return os.getenv("OPENAI_API_BASE") or "https://api.openai.com/"
 
@@ -12311,23 +11860,15 @@ def _add_codex_native_tool_alias_adapter_metadata(
 
 
 _ANTHROPIC_PROVIDER_SHAPING_RUNTIME = _anthropic_provider_common.ShapingRuntime(
-    normalize_function_tool_schemas=lambda body: (
-        _normalize_openai_function_tool_schemas(body)
-    ),
+    normalize_function_tool_schemas=lambda body: (_normalize_openai_function_tool_schemas(body)),
     add_native_tool_metadata=lambda tags, fields, **kwargs: (
         _add_codex_native_tool_alias_adapter_metadata(tags, fields, **kwargs)
     ),
-    apply_tool_description_patches=lambda body: (
-        _apply_codex_tool_description_patches_to_request_body(body)
-    ),
+    apply_tool_description_patches=lambda body: (_apply_codex_tool_description_patches_to_request_body(body)),
     merge_metadata=lambda body, **kwargs: _merge_litellm_metadata(body, **kwargs),
-    add_route_family_metadata=lambda body, family: (
-        _add_route_family_logging_metadata(body, family)
-    ),
+    add_route_family_metadata=lambda body, family: (_add_route_family_logging_metadata(body, family)),
     build_span=lambda **kwargs: _build_langfuse_span_descriptor(**kwargs),
-    apply_openai_parallel_policy=lambda body: (
-        _apply_openai_adapter_parallel_instruction_policy(body)
-    ),
+    apply_openai_parallel_policy=lambda body: (_apply_openai_adapter_parallel_instruction_policy(body)),
     apply_forced_responses_tool_choice=lambda source, translated: (
         _apply_forced_bash_tool_choice_for_responses_adapter(source, translated)
     ),
@@ -12403,17 +11944,11 @@ def _apply_responses_adapter_parallel_instruction_policy(
     rewritten_instructions = f"{policy_block}\n\n{existing_instructions}"
     updated_body = dict(request_body)
     updated_body["instructions"] = rewritten_instructions
-    original_hash = hashlib.sha256(
-        existing_instructions.encode("utf-8", errors="replace")
-    ).hexdigest()
+    original_hash = hashlib.sha256(existing_instructions.encode("utf-8", errors="replace")).hexdigest()
     changes = {
         f"{metadata_prefix}_parallel_instruction_policy_applied": True,
-        f"{metadata_prefix}_parallel_instruction_original_chars": len(
-            existing_instructions
-        ),
-        f"{metadata_prefix}_parallel_instruction_rewritten_chars": len(
-            rewritten_instructions
-        ),
+        f"{metadata_prefix}_parallel_instruction_original_chars": len(existing_instructions),
+        f"{metadata_prefix}_parallel_instruction_rewritten_chars": len(rewritten_instructions),
         f"{metadata_prefix}_parallel_instruction_original_hash": original_hash,
         f"{metadata_prefix}_parallel_instruction_tool_names": function_tool_names,
         f"{metadata_prefix}_parallel_instruction_mode": "prepend",
@@ -12491,15 +12026,11 @@ def _drop_anthropic_grok_native_prior_function_call_replay(
             continue
         item_type = item.get("type")
         call_id = item.get("call_id")
-        cleaned_call_id = (
-            call_id.strip() if isinstance(call_id, str) and call_id.strip() else None
-        )
+        cleaned_call_id = call_id.strip() if isinstance(call_id, str) and call_id.strip() else None
         # RR-054 #21: drop prior function_call items and any paired outputs so the
         # provider does not see orphaned function_call_output rows.
         if item_type == "function_call" or (
-            item_type == "function_call_output"
-            and cleaned_call_id is not None
-            and cleaned_call_id in drop_call_ids
+            item_type == "function_call_output" and cleaned_call_id is not None and cleaned_call_id in drop_call_ids
         ):
             metadata_item: dict[str, Any] = {
                 "type": item_type,
@@ -12522,11 +12053,7 @@ def _drop_anthropic_grok_native_prior_function_call_replay(
     updated_body = dict(request_body)
     updated_body["input"] = updated_input_items
     dropped_names = _dedupe_sorted_str_list(
-        [
-            item["name"]
-            for item in dropped_items
-            if isinstance(item.get("name"), str) and item["name"]
-        ]
+        [item["name"] for item in dropped_items if isinstance(item.get("name"), str) and item["name"]]
     )
     updated_body = _merge_litellm_metadata(
         updated_body,
@@ -12534,9 +12061,7 @@ def _drop_anthropic_grok_native_prior_function_call_replay(
             "anthropic-grok-native-prior-function-call-replay-dropped",
         ],
         extra_fields={
-            "anthropic_grok_native_prior_function_call_replay_dropped_count": len(
-                dropped_items
-            ),
+            "anthropic_grok_native_prior_function_call_replay_dropped_count": len(dropped_items),
             "anthropic_grok_native_prior_function_call_replay_dropped_items": dropped_items,
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
@@ -12572,8 +12097,7 @@ def _build_anthropic_response_from_responses_response(
     if _is_failed_responses_body(response_body):
         _raise_responses_adapter_failed_response(
             response_body=response_body,
-            adapter_model=failed_response_adapter_model
-            or str(response_body.get("model") or "unknown-model"),
+            adapter_model=failed_response_adapter_model or str(response_body.get("model") or "unknown-model"),
             adapter=failed_response_adapter,
             adapter_label=failed_response_adapter_label,
             retryable_alias_candidate=retryable_failed_response,
@@ -12582,8 +12106,7 @@ def _build_anthropic_response_from_responses_response(
     if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
         _raise_codex_auto_agent_malformed_tool_call_text_payload(
             response_body=response_body,
-            adapter_model=failed_response_adapter_model
-            or str(response_body.get("model") or "unknown-model"),
+            adapter_model=failed_response_adapter_model or str(response_body.get("model") or "unknown-model"),
             adapter=failed_response_adapter,
             adapter_label=failed_response_adapter_label,
             intake_context=malformed_intake_context,
@@ -12694,9 +12217,7 @@ def _normalize_openai_function_tool_parameters(parameters: Any) -> dict[str, Any
 def _sanitize_openai_object_schema_properties(schema_node: Any) -> int:
     fix_count = 0
     if isinstance(schema_node, dict):
-        if schema_node.get("type") == "object" and not isinstance(
-            schema_node.get("properties"), dict
-        ):
+        if schema_node.get("type") == "object" and not isinstance(schema_node.get("properties"), dict):
             schema_node["properties"] = {}
             fix_count += 1
         for value in schema_node.values():
@@ -12717,15 +12238,11 @@ def _normalize_openai_function_tool_schemas(translated_body: dict[str, Any]) -> 
             continue
 
         if "parameters" in tool:
-            tool["parameters"] = _normalize_openai_function_tool_parameters(
-                tool.get("parameters")
-            )
+            tool["parameters"] = _normalize_openai_function_tool_parameters(tool.get("parameters"))
 
         function_block = tool.get("function")
         if isinstance(function_block, dict):
-            function_block["parameters"] = _normalize_openai_function_tool_parameters(
-                function_block.get("parameters")
-            )
+            function_block["parameters"] = _normalize_openai_function_tool_parameters(function_block.get("parameters"))
 
 
 def _copy_translated_anthropic_adapter_response_headers(
@@ -12792,11 +12309,9 @@ def _apply_forced_bash_tool_choice_for_responses_adapter(
     request_body: dict[str, Any],
     translated_body: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    forced_tool_choice_changes = (
-        _maybe_force_explicit_bash_tool_choice_for_responses_adapter(
-            request_body,
-            translated_body,
-        )
+    forced_tool_choice_changes = _maybe_force_explicit_bash_tool_choice_for_responses_adapter(
+        request_body,
+        translated_body,
     )
     if not forced_tool_choice_changes:
         return translated_body, {}
@@ -12857,17 +12372,12 @@ def _coerce_mapping_to_namespace(
     if isinstance(value, dict):
         return SimpleNamespace(
             **{
-                key: _coerce_mapping_to_namespace(
-                    val, _depth=_depth + 1, _max_depth=_max_depth
-                )
+                key: _coerce_mapping_to_namespace(val, _depth=_depth + 1, _max_depth=_max_depth)
                 for key, val in value.items()
             }
         )
     if isinstance(value, list):
-        return [
-            _coerce_mapping_to_namespace(item, _depth=_depth + 1, _max_depth=_max_depth)
-            for item in value
-        ]
+        return [_coerce_mapping_to_namespace(item, _depth=_depth + 1, _max_depth=_max_depth) for item in value]
     return value
 
 
@@ -12916,16 +12426,11 @@ def _coerce_namespace_to_mapping(
         return value
     if isinstance(value, SimpleNamespace):
         return {
-            key: _coerce_namespace_to_mapping(
-                val, _depth=_depth + 1, _max_depth=_max_depth
-            )
+            key: _coerce_namespace_to_mapping(val, _depth=_depth + 1, _max_depth=_max_depth)
             for key, val in vars(value).items()
         }
     if isinstance(value, list):
-        return [
-            _coerce_namespace_to_mapping(item, _depth=_depth + 1, _max_depth=_max_depth)
-            for item in value
-        ]
+        return [_coerce_namespace_to_mapping(item, _depth=_depth + 1, _max_depth=_max_depth) for item in value]
     return value
 
 
@@ -12989,20 +12494,12 @@ def _responses_stream_event_summary(event: Any) -> dict[str, Any]:
                     "response_status": response_dict.get("status"),
                     "response_model": response_dict.get("model"),
                     "output_count": len(output) if isinstance(output, list) else 0,
-                    "output_types": [
-                        item.get("type")
-                        for item in output[:20]
-                        if isinstance(item, dict)
-                    ]
+                    "output_types": [item.get("type") for item in output[:20] if isinstance(item, dict)]
                     if isinstance(output, list)
                     else [],
                     "usage": {
-                        "input_tokens": usage.get("input_tokens", 0)
-                        if isinstance(usage, dict)
-                        else 0,
-                        "output_tokens": usage.get("output_tokens", 0)
-                        if isinstance(usage, dict)
-                        else 0,
+                        "input_tokens": usage.get("input_tokens", 0) if isinstance(usage, dict) else 0,
+                        "output_tokens": usage.get("output_tokens", 0) if isinstance(usage, dict) else 0,
                     },
                 }
             )
@@ -13056,10 +12553,7 @@ def _is_empty_success_responses_body(response_body: dict[str, Any]) -> bool:
 
 
 def _is_failed_responses_body(response_body: dict[str, Any]) -> bool:
-    return (
-        response_body.get("status") == "failed"
-        or response_body.get("error") is not None
-    )
+    return response_body.get("status") == "failed" or response_body.get("error") is not None
 
 
 def _build_malformed_tool_call_intake_context(
@@ -13155,15 +12649,9 @@ def _build_malformed_tool_call_intake_context(
     return {key: value for key, value in context.items() if value is not None}
 
 
-_GROK_COMPOSER_LITERAL_TOOL_LABEL_LINE_RE = re.compile(
-    r"(?im)^Tool label:\s*(?P<name>[^\n]+)\s*$"
-)
-_GROK_COMPOSER_LITERAL_CORRELATION_REF_LINE_RE = re.compile(
-    r"(?im)^Correlation ref:\s*(?P<call_id>[^\n]+)\s*$"
-)
-_GROK_COMPOSER_LITERAL_INPUT_PAYLOAD_LINE_RE = re.compile(
-    r"(?im)^Input payload:\s*(?P<payload>.+?)\s*$"
-)
+_GROK_COMPOSER_LITERAL_TOOL_LABEL_LINE_RE = re.compile(r"(?im)^Tool label:\s*(?P<name>[^\n]+)\s*$")
+_GROK_COMPOSER_LITERAL_CORRELATION_REF_LINE_RE = re.compile(r"(?im)^Correlation ref:\s*(?P<call_id>[^\n]+)\s*$")
+_GROK_COMPOSER_LITERAL_INPUT_PAYLOAD_LINE_RE = re.compile(r"(?im)^Input payload:\s*(?P<payload>.+?)\s*$")
 _GROK_COMPOSER_LITERAL_TOOL_END_MARKER_RE = re.compile(
     r"^\s*(?:<\|tool_call_end\|>|<\|tool_calls_end\|>|<｜tool▁call▁end｜>|<｜tool▁calls▁end｜>)+\s*$"
 )
@@ -13174,20 +12662,14 @@ _GROK_COMPOSER_LITERAL_CONTEXT_NOTE_LINE_RE = re.compile(
 
 
 @lru_cache(maxsize=1)
-def _get_anthropic_grok_composer_repair_runtime() -> (
-    _anthropic_grok_composer_repair.Runtime
-):
+def _get_anthropic_grok_composer_repair_runtime() -> _anthropic_grok_composer_repair.Runtime:
     return _anthropic_grok_composer_repair.Runtime(
         decode_json_prefix=_aawm_provider_shaping.decode_json_prefix,
         strip_text_spans=_strip_text_spans,
-        build_advertised_function_tools_index=(
-            _build_advertised_openai_function_tools_index
-        ),
+        build_advertised_function_tools_index=(_build_advertised_openai_function_tools_index),
         validate_tool_arguments=_validate_tool_arguments_against_openai_parameters,
         is_malformed_composer_literal_text=is_malformed_composer_call_literal_text,
-        is_malformed_tool_call_text_output=(
-            _is_codex_auto_agent_malformed_tool_call_text_output
-        ),
+        is_malformed_tool_call_text_output=(_is_codex_auto_agent_malformed_tool_call_text_output),
     )
 
 
@@ -13251,11 +12733,7 @@ def _escape_unescaped_newlines_in_json_payload(payload: str) -> str:
 def _strip_text_spans(text: str, spans: list[tuple[int, int]]) -> str:
     if not spans:
         return text
-    normalized_spans = [
-        (start, end)
-        for start, end in spans
-        if isinstance(start, int) and isinstance(end, int)
-    ]
+    normalized_spans = [(start, end) for start, end in spans if isinstance(start, int) and isinstance(end, int)]
     if not normalized_spans:
         return text
     merged_spans: list[tuple[int, int]] = []
@@ -13295,9 +12773,7 @@ def _build_advertised_openai_function_tools_index(
             if not isinstance(tool_name, str) or not tool_name.strip():
                 continue
             parameters = _tool_definition_parameters(tool)
-            tools_index[tool_name] = _normalize_openai_function_tool_parameters(
-                parameters
-            )
+            tools_index[tool_name] = _normalize_openai_function_tool_parameters(parameters)
     return tools_index
 
 
@@ -13338,9 +12814,7 @@ def _validate_tool_arguments_against_openai_parameters(
     required = parameters.get("required")
     required_fields: list[str] = []
     if isinstance(required, list):
-        required_fields = [
-            field for field in required if isinstance(field, str) and field.strip()
-        ]
+        required_fields = [field for field in required if isinstance(field, str) and field.strip()]
 
     for field in required_fields:
         if field not in arguments:
@@ -13367,9 +12841,7 @@ def _validate_tool_arguments_against_openai_parameters(
             ):
                 return f"argument_type_mismatch:{key}"
             continue
-        if isinstance(schema_type, str) and not _json_schema_value_matches_type(
-            value, schema_type
-        ):
+        if isinstance(schema_type, str) and not _json_schema_value_matches_type(value, schema_type):
             return f"argument_type_mismatch:{key}"
 
     return None
@@ -13523,9 +12995,7 @@ def _restore_adapted_custom_tool_calls_in_response_body(
             restored_output.append(item)
             continue
 
-        raw_input, error_reason = _parse_adapted_custom_tool_function_arguments(
-            item.get("arguments")
-        )
+        raw_input, error_reason = _parse_adapted_custom_tool_function_arguments(item.get("arguments"))
         if error_reason is not None or raw_input is None:
             return (
                 response_body,
@@ -13561,9 +13031,7 @@ def _advertised_namespace_tool_function_adapter_map(
     if not isinstance(request_body, dict):
         return {}
 
-    adapter_names = _get_namespace_tool_function_adapter_names_for_model(
-        adapter_model
-    )
+    adapter_names = _get_namespace_tool_function_adapter_names_for_model(adapter_model)
     if not adapter_names:
         return {}
 
@@ -13574,8 +13042,7 @@ def _advertised_namespace_tool_function_adapter_map(
     return {
         str(item["name"]): str(item["namespace"])
         for item in adapted_tools
-        if isinstance(item.get("name"), str)
-        and isinstance(item.get("namespace"), str)
+        if isinstance(item.get("name"), str) and isinstance(item.get("namespace"), str)
     }
 
 
@@ -13617,11 +13084,9 @@ def _restore_adapted_namespace_tool_calls_in_response_body(
     restored_output: list[Any] = []
     restored_count = 0
     for item in output:
-        restored_item, item_restored_count = (
-            _restore_adapted_namespace_tool_call_item(
-                item,
-                namespace_by_name=namespace_by_name,
-            )
+        restored_item, item_restored_count = _restore_adapted_namespace_tool_call_item(
+            item,
+            namespace_by_name=namespace_by_name,
         )
         restored_output.append(restored_item)
         restored_count += item_restored_count
@@ -13694,11 +13159,7 @@ def _restore_adapted_custom_tool_calls_in_stream_event_payload(
     event_type = event_payload.get("type")
     item = event_payload.get("item")
 
-    if (
-        event_type == "response.output_item.added"
-        and isinstance(item, dict)
-        and item.get("type") == "function_call"
-    ):
+    if event_type == "response.output_item.added" and isinstance(item, dict) and item.get("type") == "function_call":
         item_name = _normalize_low_cardinality_tag_value(item.get("name"))
         if item_name in adapted_names:
             _remember_adapted_custom_tool_stream_state(
@@ -13728,9 +13189,7 @@ def _restore_adapted_custom_tool_calls_in_stream_event_payload(
         arguments = event_payload.get("arguments")
         if not isinstance(arguments, str):
             arguments = str(state.get("arguments") or "")
-        raw_input, error_reason = _parse_adapted_custom_tool_function_arguments(
-            arguments
-        )
+        raw_input, error_reason = _parse_adapted_custom_tool_function_arguments(arguments)
         if error_reason is None and raw_input is not None:
             restored_payload = dict(event_payload)
             restored_payload["type"] = "response.custom_tool_call_input.done"
@@ -13739,12 +13198,10 @@ def _restore_adapted_custom_tool_calls_in_stream_event_payload(
             return restored_payload, 1
 
     if event_type == "response.output_item.done" and isinstance(item, dict):
-        restored_body, restored_count, adapter_error = (
-            _restore_adapted_custom_tool_calls_in_response_body(
-                {"output": [item]},
-                request_body=request_body,
-                adapter_model=adapter_model,
-            )
+        restored_body, restored_count, adapter_error = _restore_adapted_custom_tool_calls_in_response_body(
+            {"output": [item]},
+            request_body=request_body,
+            adapter_model=adapter_model,
         )
         if restored_count and adapter_error is None:
             restored_payload = dict(event_payload)
@@ -13753,12 +13210,10 @@ def _restore_adapted_custom_tool_calls_in_stream_event_payload(
 
     response_body = event_payload.get("response")
     if isinstance(response_body, dict):
-        restored_body, restored_count, adapter_error = (
-            _restore_adapted_custom_tool_calls_in_response_body(
-                response_body,
-                request_body=request_body,
-                adapter_model=adapter_model,
-            )
+        restored_body, restored_count, adapter_error = _restore_adapted_custom_tool_calls_in_response_body(
+            response_body,
+            request_body=request_body,
+            adapter_model=adapter_model,
         )
         if restored_count and adapter_error is None:
             restored_payload = dict(event_payload)
@@ -13777,16 +13232,11 @@ def _restore_adapted_custom_tool_calls_in_sse_event_block(
     state_by_key: dict[str, dict[str, Any]],
 ) -> tuple[Optional[str], int]:
     lines = event_block.splitlines()
-    data_line_indexes = [
-        index for index, line in enumerate(lines) if line.startswith("data:")
-    ]
+    data_line_indexes = [index for index, line in enumerate(lines) if line.startswith("data:")]
     if not data_line_indexes:
         return event_block, 0
 
-    raw_data = "\n".join(
-        lines[index].removeprefix("data:").lstrip(" ")
-        for index in data_line_indexes
-    )
+    raw_data = "\n".join(lines[index].removeprefix("data:").lstrip(" ") for index in data_line_indexes)
     if not raw_data or raw_data == "[DONE]":
         return event_block, 0
     try:
@@ -13796,14 +13246,12 @@ def _restore_adapted_custom_tool_calls_in_sse_event_block(
     if not isinstance(event_payload, dict):
         return event_block, 0
 
-    restored_payload, restored_count = (
-        _restore_adapted_custom_tool_calls_in_stream_event_payload(
-            event_payload,
-            request_body=request_body,
-            adapter_model=adapter_model,
-            adapted_names=adapted_names,
-            state_by_key=state_by_key,
-        )
+    restored_payload, restored_count = _restore_adapted_custom_tool_calls_in_stream_event_payload(
+        event_payload,
+        request_body=request_body,
+        adapter_model=adapter_model,
+        adapted_names=adapted_names,
+        state_by_key=state_by_key,
     )
     if restored_payload is None:
         return None, restored_count
@@ -13855,28 +13303,24 @@ def _restore_adapted_custom_tool_calls_in_streaming_response(
 
             while "\n\n" in buffer:
                 event_block, buffer = buffer.split("\n\n", 1)
-                restored_block, _ = (
-                    _restore_adapted_custom_tool_calls_in_sse_event_block(
-                        event_block,
-                        request_body=request_body,
-                        adapter_model=adapter_model,
-                        adapted_names=adapted_names,
-                        state_by_key=state_by_key,
-                    )
+                restored_block, _ = _restore_adapted_custom_tool_calls_in_sse_event_block(
+                    event_block,
+                    request_body=request_body,
+                    adapter_model=adapter_model,
+                    adapted_names=adapted_names,
+                    state_by_key=state_by_key,
                 )
                 if restored_block is not None:
                     yield f"{restored_block}\n\n"
 
         buffer += decoder.decode(b"", final=True)
         if buffer:
-            restored_block, _ = (
-                _restore_adapted_custom_tool_calls_in_sse_event_block(
-                    buffer,
-                    request_body=request_body,
-                    adapter_model=adapter_model,
-                    adapted_names=adapted_names,
-                    state_by_key=state_by_key,
-                )
+            restored_block, _ = _restore_adapted_custom_tool_calls_in_sse_event_block(
+                buffer,
+                request_body=request_body,
+                adapter_model=adapter_model,
+                adapted_names=adapted_names,
+                state_by_key=state_by_key,
             )
             if restored_block is not None:
                 yield restored_block
@@ -13913,11 +13357,9 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
             restored_output: list[Any] = []
             response_restored_count = 0
             for output_item in output:
-                restored_item, output_item_restored_count = (
-                    _restore_adapted_namespace_tool_call_item(
-                        output_item,
-                        namespace_by_name=namespace_by_name,
-                    )
+                restored_item, output_item_restored_count = _restore_adapted_namespace_tool_call_item(
+                    output_item,
+                    namespace_by_name=namespace_by_name,
                 )
                 restored_output.append(restored_item)
                 response_restored_count += output_item_restored_count
@@ -13938,16 +13380,11 @@ def _restore_adapted_namespace_tool_calls_in_sse_event_block(
     namespace_by_name: dict[str, str],
 ) -> tuple[str, int]:
     lines = event_block.splitlines()
-    data_line_indexes = [
-        index for index, line in enumerate(lines) if line.startswith("data:")
-    ]
+    data_line_indexes = [index for index, line in enumerate(lines) if line.startswith("data:")]
     if not data_line_indexes:
         return event_block, 0
 
-    raw_data = "\n".join(
-        lines[index].removeprefix("data:").lstrip(" ")
-        for index in data_line_indexes
-    )
+    raw_data = "\n".join(lines[index].removeprefix("data:").lstrip(" ") for index in data_line_indexes)
     if not raw_data or raw_data == "[DONE]":
         return event_block, 0
     try:
@@ -13957,11 +13394,9 @@ def _restore_adapted_namespace_tool_calls_in_sse_event_block(
     if not isinstance(event_payload, dict):
         return event_block, 0
 
-    restored_payload, restored_count = (
-        _restore_adapted_namespace_tool_calls_in_stream_event_payload(
-            event_payload,
-            namespace_by_name=namespace_by_name,
-        )
+    restored_payload, restored_count = _restore_adapted_namespace_tool_calls_in_stream_event_payload(
+        event_payload,
+        namespace_by_name=namespace_by_name,
     )
     if not restored_count:
         return event_block, 0
@@ -14006,21 +13441,17 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
 
             while "\n\n" in buffer:
                 event_block, buffer = buffer.split("\n\n", 1)
-                restored_block, _ = (
-                    _restore_adapted_namespace_tool_calls_in_sse_event_block(
-                        event_block,
-                        namespace_by_name=namespace_by_name,
-                    )
+                restored_block, _ = _restore_adapted_namespace_tool_calls_in_sse_event_block(
+                    event_block,
+                    namespace_by_name=namespace_by_name,
                 )
                 yield f"{restored_block}\n\n"
 
         buffer += decoder.decode(b"", final=True)
         if buffer:
-            restored_block, _ = (
-                _restore_adapted_namespace_tool_calls_in_sse_event_block(
-                    buffer,
-                    namespace_by_name=namespace_by_name,
-                )
+            restored_block, _ = _restore_adapted_namespace_tool_calls_in_sse_event_block(
+                buffer,
+                namespace_by_name=namespace_by_name,
             )
             yield restored_block
 
@@ -14050,8 +13481,7 @@ def _raise_codex_auto_agent_malformed_adapted_custom_tool_call(
     diagnostic["custom_tool_function_adapter_error"] = adapter_error
     exc = ProxyException(
         message=(
-            f"Codex auto-agent {adapter_label} candidate returned invalid "
-            "arguments for an adapted custom tool."
+            f"Codex auto-agent {adapter_label} candidate returned invalid " "arguments for an adapted custom tool."
         ),
         type="invalid_request_error",
         param="model",
@@ -14242,8 +13672,7 @@ def _build_malformed_intake_context_for_anthropic_responses_adapter(
         provider=provider,
         model_alias=(
             request_body.get("model")
-            if isinstance(request_body, dict)
-            and isinstance(request_body.get("model"), str)
+            if isinstance(request_body, dict) and isinstance(request_body.get("model"), str)
             else None
         ),
     )
@@ -14344,19 +13773,12 @@ def _raise_codex_auto_agent_empty_success_response(
         diagnostic_context={
             "adapter": adapter,
             "adapter_model": adapter_model,
-            **(
-                {"stream_events": stream_event_summaries}
-                if stream_event_summaries is not None
-                else {}
-            ),
+            **({"stream_events": stream_event_summaries} if stream_event_summaries is not None else {}),
         },
     )
     # RR-054 #23: empty successful payload is retryable upstream emptiness, not rate limit.
     exc = ProxyException(
-        message=(
-            f"Codex auto-agent {adapter_label} candidate returned an empty successful "
-            "Responses payload."
-        ),
+        message=(f"Codex auto-agent {adapter_label} candidate returned an empty successful " "Responses payload."),
         type="upstream_error",
         param="model",
         code=502,
@@ -14394,9 +13816,7 @@ def _build_failed_responses_diagnostic(
         "error": response_body.get("error"),
         "incomplete_details": response_body.get("incomplete_details"),
         "output_count": len(output) if isinstance(output, list) else 0,
-        "output_types": [
-            item.get("type") for item in output[:20] if isinstance(item, dict)
-        ]
+        "output_types": [item.get("type") for item in output[:20] if isinstance(item, dict)]
         if isinstance(output, list)
         else [],
     }
@@ -14428,9 +13848,7 @@ def _raise_codex_auto_agent_malformed_tool_call_text_payload(
         )
     except Exception:
         # RR-054 #38: intake must stay best-effort, but never become silent.
-        verbose_proxy_logger.exception(
-            "Failed to schedule malformed tool-call detection intake"
-        )
+        verbose_proxy_logger.exception("Failed to schedule malformed tool-call detection intake")
     diagnostic = _build_failed_responses_diagnostic(
         response_body=response_body,
         adapter=adapter,
@@ -14439,10 +13857,7 @@ def _raise_codex_auto_agent_malformed_tool_call_text_payload(
     )
     # RR-054 #23: malformed tool-call text is not a rate limit.
     exc = ProxyException(
-        message=(
-            f"Codex auto-agent {adapter_label} candidate returned a malformed "
-            "Responses marker payload."
-        ),
+        message=(f"Codex auto-agent {adapter_label} candidate returned a malformed " "Responses marker payload."),
         type="invalid_request_error",
         param="model",
         code=502,
@@ -14479,10 +13894,7 @@ def _raise_codex_auto_agent_failed_responses_payload(
     )
     # RR-054 #23: failed upstream Responses status is a bad gateway / upstream error.
     exc = ProxyException(
-        message=(
-            f"Auto-agent {adapter_label} candidate returned a failed Responses "
-            "payload."
-        ),
+        message=(f"Auto-agent {adapter_label} candidate returned a failed Responses " "payload."),
         type="upstream_error",
         param="model",
         code=502,
@@ -14577,9 +13989,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     litellm_call_id or "<missing>",
                     trace_id or "<missing>",
                 )
-            elif _should_log_aawm_alias_routing_event(
-                f"validate-stream-limit:{adapter}:{peek.stop_reason}"
-            ):
+            elif _should_log_aawm_alias_routing_event(f"validate-stream-limit:{adapter}:{peek.stop_reason}"):
                 verbose_proxy_logger.warning(
                     "Codex auto-agent responses validation bypassed after bounded "
                     "peek limit (reason=%s chunks=%s bytes=%s max_chunks=%s "
@@ -14598,12 +14008,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     litellm_call_id or "<missing>",
                     trace_id or "<missing>",
                 )
-            restored_response = (
-                _restore_adapted_custom_tool_calls_in_streaming_response(
-                    peek.response,
-                    request_body=request_body,
-                    adapter_model=adapter_model,
-                )
+            restored_response = _restore_adapted_custom_tool_calls_in_streaming_response(
+                peek.response,
+                request_body=request_body,
+                adapter_model=adapter_model,
             )
             return _restore_adapted_namespace_tool_calls_in_streaming_response(
                 restored_response,
@@ -14682,6 +14090,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 status_code=response.status_code,
                 media_type=response.media_type or "text/event-stream",
             )
+
         async def _replay_iterator() -> Any:
             for raw_chunk in peek.buffered_chunks:
                 yield raw_chunk
@@ -14753,11 +14162,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     adapter_label=adapter_label,
                     intake_context=intake_context,
                 )
-            if (
-                isinstance(repaired_body, dict)
-                or restored_custom_tool_count
-                or restored_namespace_tool_count
-            ):
+            if isinstance(repaired_body, dict) or restored_custom_tool_count or restored_namespace_tool_count:
                 return Response(
                     content=json.dumps(response_body),
                     media_type=response.media_type or "application/json",
@@ -14813,8 +14218,7 @@ def _merge_responses_output_lists(
             continue
         key = (
             streamed_ordered_keys[index]
-            if streamed_ordered_keys is not None
-            and index < len(streamed_ordered_keys)
+            if streamed_ordered_keys is not None and index < len(streamed_ordered_keys)
             else _responses_output_stream_key(item=item, fallback_index=index)
         )
         if key not in ordered_keys:
@@ -14829,9 +14233,7 @@ def _merge_responses_output_lists(
         if not isinstance(item, dict):
             continue
         item_aliases = [
-            value.strip()
-            for value in (item.get("call_id"), item.get("id"))
-            if isinstance(value, str) and value.strip()
+            value.strip() for value in (item.get("call_id"), item.get("id")) if isinstance(value, str) and value.strip()
         ]
         terminal_key: Optional[str] = next(
             (aliases[value] for value in item_aliases if value in aliases),
@@ -14839,9 +14241,7 @@ def _merge_responses_output_lists(
         )
         if terminal_key is None:
             terminal_key = index_keys.get(index)
-        if terminal_key is None and streamed_ordered_keys is not None and index < len(
-            streamed_ordered_keys
-        ):
+        if terminal_key is None and streamed_ordered_keys is not None and index < len(streamed_ordered_keys):
             terminal_key = streamed_ordered_keys[index]
         if terminal_key is None and index < len(ordered_keys):
             terminal_key = ordered_keys[index]
@@ -14999,9 +14399,7 @@ def _finalize_collected_responses_stream_response(
         and not _responses_output_has_message_text(streamed_output)
         and not _responses_output_has_message_text(completed_output)
     ):
-        streamed_output.append(
-            _build_collected_responses_text_output_item("".join(output_text_parts))
-        )
+        streamed_output.append(_build_collected_responses_text_output_item("".join(output_text_parts)))
     if streamed_output:
         response_dict["output"] = _merge_responses_output_lists(
             completed_output if isinstance(completed_output, list) else [],
@@ -15011,9 +14409,7 @@ def _finalize_collected_responses_stream_response(
             key_by_output_index=key_by_output_index,
         )
     elif not response_dict.get("output") and output_text_parts:
-        response_dict["output"] = [
-            _build_collected_responses_text_output_item("".join(output_text_parts))
-        ]
+        response_dict["output"] = [_build_collected_responses_text_output_item("".join(output_text_parts))]
     return response_dict
 
 
@@ -15029,9 +14425,7 @@ def _build_empty_success_responses_diagnostic(
         "status": response_body.get("status"),
         "model": response_body.get("model"),
         "output_count": len(output) if isinstance(output, list) else 0,
-        "output_types": [
-            item.get("type") for item in output[:20] if isinstance(item, dict)
-        ]
+        "output_types": [item.get("type") for item in output[:20] if isinstance(item, dict)]
         if isinstance(output, list)
         else [],
         "usage": usage if isinstance(usage, dict) else {},
@@ -15081,11 +14475,7 @@ async def _collect_responses_response_from_stream(
             if event_type == "response.output_text.done":
                 text = _mapping_or_attr_get(event, "text")
                 text_key = _responses_event_text_key(event)
-                if (
-                    isinstance(text, str)
-                    and text
-                    and text_key not in text_done_keys_seen
-                ):
+                if isinstance(text, str) and text and text_key not in text_done_keys_seen:
                     output_text_parts.append(text)
                     text_done_keys_seen.add(text_key)
             if event_type in {
@@ -15168,9 +14558,7 @@ def _get_anthropic_adapter_access_log_target_label(
     return f"{hostname}{path}{query}"
 
 
-def _annotate_request_scope_for_adapted_access_log(
-    request: Request, target_url: Union[str, httpx.URL]
-) -> None:
+def _annotate_request_scope_for_adapted_access_log(request: Request, target_url: Union[str, httpx.URL]) -> None:
     """Record adapted target for access logs without mutating live query_string.
 
     RR-054 #39: cosmetic logging must not corrupt ASGI ``query_string`` / path
@@ -15198,11 +14586,7 @@ def _annotate_request_scope_for_adapted_access_log(
             original_query = str(raw_query_string or "")
     if isinstance(original_query, bytes):
         original_query = original_query.decode("utf-8", errors="replace")
-    display_query = (
-        f"{original_query} -> {target_label}"
-        if original_query
-        else f"adapted_to={target_label}"
-    )
+    display_query = f"{original_query} -> {target_label}" if original_query else f"adapted_to={target_label}"
     scope["_aawm_adapted_access_log_display_path"] = (
         f"{original_path}?{display_query}" if original_path else display_query
     )
@@ -15265,16 +14649,10 @@ def _log_google_completion_adapter_debug(
 
     try:
         debug_shape = _summarize_google_code_assist_request_shape(wrapped_request_body)
-        request_payload = (
-            wrapped_request_body.get("request")
-            if isinstance(wrapped_request_body, dict)
-            else None
-        )
+        request_payload = wrapped_request_body.get("request") if isinstance(wrapped_request_body, dict) else None
         function_names = _extract_google_code_assist_function_names(request_payload)
         litellm_metadata = (
-            prepared_request_body.get("litellm_metadata")
-            if isinstance(prepared_request_body, dict)
-            else None
+            prepared_request_body.get("litellm_metadata") if isinstance(prepared_request_body, dict) else None
         )
         google_persisted_output_compacted_count = (
             litellm_metadata.get("google_adapter_persisted_output_compacted_count")
@@ -15301,9 +14679,20 @@ def _log_google_completion_adapter_debug(
         verbose_proxy_logger.exception("Gemini adapter debug logging failed")
 
 
-async def _prepare_anthropic_google_completion_adapter_request(*, request: Request, prepared_request_body: dict[str, Any], adapter_model: str, adapter_provider: str=litellm.LlmProviders.GEMINI.value) -> SimpleNamespace:
+async def _prepare_anthropic_google_completion_adapter_request(
+    *,
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
+) -> SimpleNamespace:
     _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._prepare_anthropic_google_completion_adapter_request(request=request, prepared_request_body=prepared_request_body, adapter_model=adapter_model, adapter_provider=adapter_provider)
+    return await _anthropic_google_shaping._prepare_anthropic_google_completion_adapter_request(
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        adapter_provider=adapter_provider,
+    )
 
 
 def _release_google_adapter_semaphore_once(
@@ -15371,12 +14760,8 @@ async def _perform_anthropic_google_completion_adapter_request(
             expected_target_family="google",
             google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
             google_adapter_max_retries=0 if use_alias_candidate_probe else None,
-            google_adapter_model_capacity_max_retries=(
-                0 if use_alias_candidate_probe else None
-            ),
-            google_adapter_hidden_retry_budget_seconds=(
-                0 if use_alias_candidate_probe else None
-            ),
+            google_adapter_model_capacity_max_retries=(0 if use_alias_candidate_probe else None),
+            google_adapter_hidden_retry_budget_seconds=(0 if use_alias_candidate_probe else None),
         )
 
         if not isinstance(upstream_response, StreamingResponse):
@@ -15386,14 +14771,12 @@ async def _perform_anthropic_google_completion_adapter_request(
             )
 
         if adapter_request.client_requested_stream:
-            streaming_response = (
-                _build_anthropic_streaming_response_from_google_code_assist_stream(
-                    response=upstream_response,
-                    adapter_model=adapter_request.google_model,
-                    tool_name_mapping=adapter_request.tool_name_mapping,
-                    gemini_optional_params=adapter_request.gemini_optional_params,
-                    rate_limit_key=adapter_request.google_adapter_rate_limit_key,
-                )
+            streaming_response = _build_anthropic_streaming_response_from_google_code_assist_stream(
+                response=upstream_response,
+                adapter_model=adapter_request.google_model,
+                tool_name_mapping=adapter_request.tool_name_mapping,
+                gemini_optional_params=adapter_request.gemini_optional_params,
+                rate_limit_key=adapter_request.google_adapter_rate_limit_key,
             )
             stream_release_attached = True
             return _wrap_streaming_response_with_release_callback(
@@ -15509,12 +14892,8 @@ async def _perform_codex_google_code_assist_adapter_request(
             expected_target_family="google",
             google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
             google_adapter_max_retries=0 if use_alias_candidate_probe else None,
-            google_adapter_model_capacity_max_retries=(
-                0 if use_alias_candidate_probe else None
-            ),
-            google_adapter_hidden_retry_budget_seconds=(
-                0 if use_alias_candidate_probe else None
-            ),
+            google_adapter_model_capacity_max_retries=(0 if use_alias_candidate_probe else None),
+            google_adapter_hidden_retry_budget_seconds=(0 if use_alias_candidate_probe else None),
         )
 
         if not isinstance(upstream_response, StreamingResponse):
@@ -15524,11 +14903,9 @@ async def _perform_codex_google_code_assist_adapter_request(
             )
 
         if adapter_request.client_requested_stream:
-            streaming_response = (
-                _build_codex_streaming_response_from_google_code_assist_stream(
-                    response=upstream_response,
-                    adapter_request=adapter_request,
-                )
+            streaming_response = _build_codex_streaming_response_from_google_code_assist_stream(
+                response=upstream_response,
+                adapter_request=adapter_request,
             )
             stream_release_attached = True
             return _wrap_streaming_response_with_release_callback(
@@ -15559,12 +14936,7 @@ async def _perform_codex_google_code_assist_adapter_request(
             model_response,
             adapter_request.tool_name_mapping,
         )
-        if (
-            use_alias_candidate_probe
-            and _is_codex_google_code_assist_empty_success_model_response(
-                model_response
-            )
-        ):
+        if use_alias_candidate_probe and _is_codex_google_code_assist_empty_success_model_response(model_response):
             _raise_codex_auto_agent_empty_success_response(
                 response_body={
                     "id": _mapping_or_attr_get(model_response, "id"),
@@ -15575,18 +14947,18 @@ async def _perform_codex_google_code_assist_adapter_request(
                     ),
                     "status": "completed",
                     "output": [],
-                    "usage": _model_response_usage_dict(
-                        _mapping_or_attr_get(model_response, "usage")
-                    ),
+                    "usage": _model_response_usage_dict(_mapping_or_attr_get(model_response, "usage")),
                 },
                 adapter_model=adapter_request.google_model,
                 adapter="codex_auto_agent_google_code_assist",
                 adapter_label="Gemini Code Assist",
             )
-        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-            chat_completion_response=model_response,
-            request_input=adapter_request.codex_request_input,
-            responses_api_request=adapter_request.responses_api_request,
+        responses_api_response = (
+            LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+                chat_completion_response=model_response,
+                request_input=adapter_request.codex_request_input,
+                responses_api_request=adapter_request.responses_api_request,
+            )
         )
         return _build_responses_response_from_adapter_response(responses_api_response)
     finally:
@@ -15661,9 +15033,7 @@ async def _resolve_anthropic_openai_responses_adapter_auth_context(
         )
         forward_headers = False
 
-    use_chatgpt_codex_defaults = (
-        uses_codex_native_auth or local_codex_headers is not None
-    )
+    use_chatgpt_codex_defaults = uses_codex_native_auth or local_codex_headers is not None
     egress_credential_family = "openai" if local_codex_headers is not None else None
     return (
         custom_headers,
@@ -15675,31 +15045,17 @@ async def _resolve_anthropic_openai_responses_adapter_auth_context(
 
 _aawm_responses_finalize.configure_responses_finalize_runtime(
     _aawm_responses_finalize.ResponsesFinalizeRuntime(
-        annotate_request=lambda *args, **kwargs: (
-            _annotate_request_scope_for_adapted_access_log(*args, **kwargs)
-        ),
-        validate_stream=lambda *args, **kwargs: (
-            _validate_alias_candidate_responses_stream_if_needed(*args, **kwargs)
-        ),
-        collect_stream=lambda *args, **kwargs: (
-            _collect_responses_response_from_stream(*args, **kwargs)
-        ),
-        build_response=lambda *args, **kwargs: (
-            _build_anthropic_response_from_responses_response(*args, **kwargs)
-        ),
-        copy_headers=lambda *args, **kwargs: (
-            _copy_translated_anthropic_adapter_response_headers(*args, **kwargs)
-        ),
+        annotate_request=lambda *args, **kwargs: (_annotate_request_scope_for_adapted_access_log(*args, **kwargs)),
+        validate_stream=lambda *args, **kwargs: (_validate_alias_candidate_responses_stream_if_needed(*args, **kwargs)),
+        collect_stream=lambda *args, **kwargs: (_collect_responses_response_from_stream(*args, **kwargs)),
+        build_response=lambda *args, **kwargs: (_build_anthropic_response_from_responses_response(*args, **kwargs)),
+        copy_headers=lambda *args, **kwargs: (_copy_translated_anthropic_adapter_response_headers(*args, **kwargs)),
         build_streaming_response=lambda *args, **kwargs: (
             _build_anthropic_streaming_response_from_responses_stream(*args, **kwargs)
         ),
-        decode_response_body=lambda *args, **kwargs: (
-            _decode_http_response_body(*args, **kwargs)
-        ),
+        decode_response_body=lambda *args, **kwargs: (_decode_http_response_body(*args, **kwargs)),
         build_malformed_context=lambda *args, **kwargs: (
-            _build_malformed_intake_context_for_anthropic_responses_adapter(
-                *args, **kwargs
-            )
+            _build_malformed_intake_context_for_anthropic_responses_adapter(*args, **kwargs)
         ),
     )
 )
@@ -15743,6 +15099,7 @@ async def _finalize_anthropic_responses_adapter_upstream_response(
         malformed_upstream_url=malformed_upstream_url,
         skip_stream_probe_validation=skip_stream_probe_validation,
     )
+
 
 def _prepare_anthropic_completion_adapter_request_body(
     prepared_request_body: Payload,
@@ -15887,9 +15244,7 @@ async def _perform_anthropic_responses_adapter_pass_through(
     if allowed_forward_headers is not None:
         pt_kwargs["allowed_forward_headers"] = allowed_forward_headers
     if allowed_pass_through_prefixed_headers is not None:
-        pt_kwargs["allowed_pass_through_prefixed_headers"] = (
-            allowed_pass_through_prefixed_headers
-        )
+        pt_kwargs["allowed_pass_through_prefixed_headers"] = allowed_pass_through_prefixed_headers
     if extra_pass_through_kwargs:
         pt_kwargs.update(extra_pass_through_kwargs)
     upstream_response = await transport(**pt_kwargs)
@@ -15943,16 +15298,12 @@ def _finalize_anthropic_completion_adapter_response(
     if stream_flag:
         if fake_stream:
             if not _is_anthropic_messages_response(completion_response):
-                raise TypeError(
-                    "Fake Anthropic streaming requires a non-streaming response"
-                )
+                raise TypeError("Fake Anthropic streaming requires a non-streaming response")
             response_stream = FakeAnthropicMessagesStreamIterator(completion_response)
         else:
             response_stream = completion_response
-        streaming_response = (
-            _build_anthropic_streaming_response_from_completion_adapter_stream(
-                response_stream,
-            )
+        streaming_response = _build_anthropic_streaming_response_from_completion_adapter_stream(
+            response_stream,
         )
         return _record_adapted_completed_route_rollup_after_stream(
             streaming_response,
@@ -16019,26 +15370,19 @@ async def _perform_anthropic_completion_adapter_messages_call(
         handler_extra_kwargs.update(extra_handler_kwargs)
 
     raw_max_tokens = prepared_request_body.get("max_tokens")
-    max_tokens = (
-        raw_max_tokens
-        if isinstance(raw_max_tokens, int) and not isinstance(raw_max_tokens, bool)
-        else 1024
-    )
+    max_tokens = raw_max_tokens if isinstance(raw_max_tokens, int) and not isinstance(raw_max_tokens, bool) else 1024
     raw_messages = prepared_request_body.get("messages")
     messages = raw_messages if isinstance(raw_messages, list) else []
     raw_stop_sequences = prepared_request_body.get("stop_sequences")
     stop_sequences = (
-        [item for item in raw_stop_sequences if isinstance(item, str)]
-        if isinstance(raw_stop_sequences, list)
-        else None
+        [item for item in raw_stop_sequences if isinstance(item, str)] if isinstance(raw_stop_sequences, list) else None
     )
     raw_system = prepared_request_body.get("system")
     system = raw_system if isinstance(raw_system, str) else None
     raw_temperature = prepared_request_body.get("temperature")
     temperature = (
         float(raw_temperature)
-        if isinstance(raw_temperature, (int, float))
-        and not isinstance(raw_temperature, bool)
+        if isinstance(raw_temperature, (int, float)) and not isinstance(raw_temperature, bool)
         else None
     )
     raw_thinking = prepared_request_body.get("thinking")
@@ -16048,25 +15392,13 @@ async def _perform_anthropic_completion_adapter_messages_call(
     raw_tools = prepared_request_body.get("tools")
     tools = raw_tools if isinstance(raw_tools, list) else None
     raw_top_k = prepared_request_body.get("top_k")
-    top_k = (
-        raw_top_k
-        if isinstance(raw_top_k, int) and not isinstance(raw_top_k, bool)
-        else None
-    )
+    top_k = raw_top_k if isinstance(raw_top_k, int) and not isinstance(raw_top_k, bool) else None
     raw_top_p = prepared_request_body.get("top_p")
-    top_p = (
-        float(raw_top_p)
-        if isinstance(raw_top_p, (int, float)) and not isinstance(raw_top_p, bool)
-        else None
-    )
+    top_p = float(raw_top_p) if isinstance(raw_top_p, (int, float)) and not isinstance(raw_top_p, bool) else None
     raw_output_format = prepared_request_body.get("output_format")
-    output_format = (
-        raw_output_format if isinstance(raw_output_format, dict) else None
-    )
+    output_format = raw_output_format if isinstance(raw_output_format, dict) else None
     raw_output_config = prepared_request_body.get("output_config")
-    output_config = (
-        raw_output_config if isinstance(raw_output_config, dict) else None
-    )
+    output_config = raw_output_config if isinstance(raw_output_config, dict) else None
     handler_call_kwargs = {
         "max_tokens": max_tokens,
         "messages": messages,
@@ -16099,9 +15431,7 @@ async def _perform_anthropic_completion_adapter_messages_call(
         )
 
     litellm_metadata = prepared_request_body.get("litellm_metadata")
-    rollup_kwargs = _build_adapted_route_rollup_kwargs(
-        litellm_metadata if isinstance(litellm_metadata, dict) else {}
-    )
+    rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata if isinstance(litellm_metadata, dict) else {})
     _annotate_request_scope_for_adapted_access_log(request, target_url)
     _emit_adapted_route_access_log(
         request=request,
@@ -16174,54 +15504,30 @@ _ANTHROPIC_XAI_PROVIDER_RUNTIME = _anthropic_xai_provider.Runtime(
 )
 
 _ANTHROPIC_GROK_PROVIDER_RUNTIME = _anthropic_grok_provider.Runtime(
-    build_request_body=lambda body, **kwargs: (
-        _build_anthropic_responses_adapter_request_body(body, **kwargs)
-    ),
+    build_request_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
     apply_policies=lambda source, translated, **kwargs: (
-        _apply_anthropic_responses_adapter_policies_from_config(
-            source, translated, **kwargs
-        )
+        _apply_anthropic_responses_adapter_policies_from_config(source, translated, **kwargs)
     ),
-    drop_unsupported_params=lambda body: (
-        _drop_unsupported_codex_request_params_from_request_body(body)
-    ),
-    drop_prior_replay=lambda body: (
-        _drop_anthropic_grok_native_prior_function_call_replay(body)
-    ),
-    prepare_passthrough_request=lambda body, **kwargs: (
-        _prepare_grok_native_oauth_passthrough_request(body, **kwargs)
-    ),
+    drop_unsupported_params=lambda body: (_drop_unsupported_codex_request_params_from_request_body(body)),
+    drop_prior_replay=lambda body: (_drop_anthropic_grok_native_prior_function_call_replay(body)),
+    prepare_passthrough_request=lambda body, **kwargs: (_prepare_grok_native_oauth_passthrough_request(body, **kwargs)),
     unavailable_detail=lambda exc: _grok_native_candidate_unavailable_detail(exc),
-    raise_candidate_unavailable=lambda exc: (
-        _raise_grok_native_auto_agent_candidate_unavailable(exc)
-    ),
+    raise_candidate_unavailable=lambda exc: (_raise_grok_native_auto_agent_candidate_unavailable(exc)),
     join_url=lambda **kwargs: _join_grok_passthrough_url(**kwargs),
     provider=litellm.LlmProviders.XAI.value,
 )
 
 _ANTHROPIC_NVIDIA_PROVIDER_RUNTIME = _anthropic_nvidia_provider.Runtime(
-    should_force_fake_stream=lambda model: (
-        _should_force_fake_stream_for_nvidia_adapter_model(model)
-    ),
-    prepare_request_body=lambda body, **kwargs: (
-        _prepare_anthropic_completion_adapter_request_body(body, **kwargs)
-    ),
+    should_force_fake_stream=lambda model: (_should_force_fake_stream_for_nvidia_adapter_model(model)),
+    prepare_request_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
     get_api_key=lambda: _get_anthropic_adapter_nvidia_api_key(),
     get_target_base=lambda: _get_anthropic_adapter_nvidia_target_base(),
-    normalize_endpoint=lambda **kwargs: (
-        BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)
-    ),
+    normalize_endpoint=lambda **kwargs: (BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)),
     join_url=lambda *args: BaseOpenAIPassThroughHandler._join_url_paths(*args),
     url_factory=httpx.URL,
-    validate_egress=lambda **kwargs: (
-        HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)
-    ),
-    perform_operation=lambda **kwargs: (
-        _perform_nvidia_completion_adapter_operation(**kwargs)
-    ),
-    get_timeout_seconds=lambda model: (
-        _get_nvidia_adapter_request_timeout_seconds(model)
-    ),
+    validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
+    perform_operation=lambda **kwargs: (_perform_nvidia_completion_adapter_operation(**kwargs)),
+    get_timeout_seconds=lambda model: (_get_nvidia_adapter_request_timeout_seconds(model)),
     get_inner_max_retries=lambda: _get_nvidia_adapter_inner_max_retries(),
     provider=litellm.LlmProviders.NVIDIA_NIM.value,
     provider_target=litellm.LlmProviders.NVIDIA_NIM,
@@ -16229,97 +15535,53 @@ _ANTHROPIC_NVIDIA_PROVIDER_RUNTIME = _anthropic_nvidia_provider.Runtime(
 
 _ANTHROPIC_OPENROUTER_PROVIDER_RUNTIME = _anthropic_openrouter_provider.Runtime(
     compact_context=lambda body, **kwargs: (
-        _compact_openai_adapter_claude_context_in_anthropic_request_body(
-            body, **kwargs
-        )
+        _compact_openai_adapter_claude_context_in_anthropic_request_body(body, **kwargs)
     ),
     log_debug=lambda message, *args: verbose_proxy_logger.debug(message, *args),
-    build_responses_body=lambda body, **kwargs: (
-        _build_anthropic_responses_adapter_request_body(body, **kwargs)
-    ),
-    apply_parallel_policy=lambda body: (
-        _apply_openrouter_adapter_parallel_instruction_policy(body)
-    ),
+    build_responses_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
+    apply_parallel_policy=lambda body: (_apply_openrouter_adapter_parallel_instruction_policy(body)),
     apply_forced_tool_choice=lambda source, translated: (
         _apply_forced_bash_tool_choice_for_responses_adapter(source, translated)
     ),
     contains_mcp_tools=lambda body: _responses_request_contains_mcp_tools(body),
     get_api_key=lambda: _get_anthropic_adapter_openrouter_api_key(),
-    raise_candidate_unavailable=lambda detail: (
-        _raise_openrouter_auto_agent_candidate_unavailable(str(detail))
-    ),
+    raise_candidate_unavailable=lambda detail: (_raise_openrouter_auto_agent_candidate_unavailable(str(detail))),
     get_target_base=lambda: _get_anthropic_adapter_openrouter_target_base(),
-    normalize_endpoint=lambda **kwargs: (
-        BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)
-    ),
+    normalize_endpoint=lambda **kwargs: (BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)),
     join_url=lambda *args: BaseOpenAIPassThroughHandler._join_url_paths(*args),
     url_factory=httpx.URL,
-    assemble_headers=lambda **kwargs: (
-        BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)
-    ),
+    assemble_headers=lambda **kwargs: (BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)),
     build_default_headers=lambda: _build_openrouter_default_headers(),
-    perform_responses_request=lambda **kwargs: (
-        _perform_openrouter_adapter_pass_through_request(**kwargs)
-    ),
-    get_completion_model=lambda model: (
-        _get_openrouter_completion_adapter_upstream_model(model)
-    ),
-    prepare_completion_body=lambda body, **kwargs: (
-        _prepare_anthropic_completion_adapter_request_body(body, **kwargs)
-    ),
-    validate_egress=lambda **kwargs: (
-        HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)
-    ),
-    perform_completion_operation=lambda **kwargs: (
-        _perform_openrouter_completion_adapter_operation(**kwargs)
-    ),
+    perform_responses_request=lambda **kwargs: (_perform_openrouter_adapter_pass_through_request(**kwargs)),
+    get_completion_model=lambda model: (_get_openrouter_completion_adapter_upstream_model(model)),
+    prepare_completion_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
+    validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
+    perform_completion_operation=lambda **kwargs: (_perform_openrouter_completion_adapter_operation(**kwargs)),
     provider=litellm.LlmProviders.OPENROUTER.value,
     provider_target=litellm.LlmProviders.OPENROUTER.value,
 )
 
-_ANTHROPIC_OPENCODE_ZEN_PROVIDER_RUNTIME = (
-    _anthropic_opencode_zen_provider.Runtime(
-        build_responses_body=lambda body, **kwargs: (
-            _build_anthropic_responses_adapter_request_body(body, **kwargs)
-        ),
-        add_logging_metadata=lambda body, **kwargs: (
-            _add_opencode_zen_logging_metadata(body, **kwargs)
-        ),
-        apply_parallel_policy=lambda body: (
-            _apply_openrouter_adapter_parallel_instruction_policy(body)
-        ),
-        apply_forced_tool_choice=lambda source, translated: (
-            _apply_forced_bash_tool_choice_for_responses_adapter(source, translated)
-        ),
-        log_debug=lambda message, *args: verbose_proxy_logger.debug(message, *args),
-        contains_mcp_tools=lambda body: _responses_request_contains_mcp_tools(body),
-        get_target_base=lambda: _get_opencode_zen_target_base(),
-        join_url=lambda **kwargs: _join_opencode_zen_passthrough_url(**kwargs),
-        build_headers=lambda request, **kwargs: (
-            _build_opencode_zen_headers(request, **kwargs)
-        ),
-        unavailable_detail=lambda exc: (
-            _opencode_zen_candidate_unavailable_detail(exc)
-        ),
-        raise_candidate_unavailable=lambda exc: (
-            _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
-        ),
-        url_factory=httpx.URL,
-        prepare_completion_body=lambda body, **kwargs: (
-            _prepare_anthropic_completion_adapter_request_body(body, **kwargs)
-        ),
-        load_api_key=lambda **kwargs: (
-            _load_opencode_zen_api_key_for_candidate(**kwargs)
-        ),
-        assemble_headers=lambda **kwargs: (
-            BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)
-        ),
-        validate_egress=lambda **kwargs: (
-            HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)
-        ),
-        provider=_OPENCODE_ZEN_PROVIDER,
-        completion_provider=litellm.LlmProviders.OPENAI.value,
-    )
+_ANTHROPIC_OPENCODE_ZEN_PROVIDER_RUNTIME = _anthropic_opencode_zen_provider.Runtime(
+    build_responses_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
+    add_logging_metadata=lambda body, **kwargs: (_add_opencode_zen_logging_metadata(body, **kwargs)),
+    apply_parallel_policy=lambda body: (_apply_openrouter_adapter_parallel_instruction_policy(body)),
+    apply_forced_tool_choice=lambda source, translated: (
+        _apply_forced_bash_tool_choice_for_responses_adapter(source, translated)
+    ),
+    log_debug=lambda message, *args: verbose_proxy_logger.debug(message, *args),
+    contains_mcp_tools=lambda body: _responses_request_contains_mcp_tools(body),
+    get_target_base=lambda: _get_opencode_zen_target_base(),
+    join_url=lambda **kwargs: _join_opencode_zen_passthrough_url(**kwargs),
+    build_headers=lambda request, **kwargs: (_build_opencode_zen_headers(request, **kwargs)),
+    unavailable_detail=lambda exc: (_opencode_zen_candidate_unavailable_detail(exc)),
+    raise_candidate_unavailable=lambda exc: (_raise_opencode_zen_auto_agent_candidate_unavailable(exc)),
+    url_factory=httpx.URL,
+    prepare_completion_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
+    load_api_key=lambda **kwargs: (_load_opencode_zen_api_key_for_candidate(**kwargs)),
+    assemble_headers=lambda **kwargs: (BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)),
+    validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
+    provider=_OPENCODE_ZEN_PROVIDER,
+    completion_provider=litellm.LlmProviders.OPENAI.value,
 )
 
 
@@ -16835,9 +16097,7 @@ def _resolve_claude_persisted_output_path(path_str: str) -> Optional[Path]:
     return candidate
 
 
-def _build_claude_persisted_output_source_metadata(
-    *, resolved_path: Path, file_text: str
-) -> dict[str, Any]:
+def _build_claude_persisted_output_source_metadata(*, resolved_path: Path, file_text: str) -> dict[str, Any]:
     file_bytes = file_text.encode("utf-8")
     return {
         "path": str(resolved_path),
@@ -16848,9 +16108,7 @@ def _build_claude_persisted_output_source_metadata(
 
 
 def _get_google_adapter_persisted_output_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_PERSISTED_OUTPUT_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_PERSISTED_OUTPUT_CHAR_CAP"))
     if raw_value is None:
         return 2000
     try:
@@ -16861,9 +16119,7 @@ def _get_google_adapter_persisted_output_char_cap() -> int:
 
 
 def _get_google_adapter_auxiliary_context_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_AUXILIARY_CONTEXT_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_AUXILIARY_CONTEXT_CHAR_CAP"))
     if raw_value is None:
         return 4000
     try:
@@ -16874,9 +16130,7 @@ def _get_google_adapter_auxiliary_context_char_cap() -> int:
 
 
 def _get_google_adapter_followup_persisted_output_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_PERSISTED_OUTPUT_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_PERSISTED_OUTPUT_CHAR_CAP"))
     if raw_value is None:
         return 512
     try:
@@ -16887,9 +16141,7 @@ def _get_google_adapter_followup_persisted_output_char_cap() -> int:
 
 
 def _get_google_adapter_followup_auxiliary_context_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(
-        os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_AUXILIARY_CONTEXT_CHAR_CAP")
-    )
+    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_AUXILIARY_CONTEXT_CHAR_CAP"))
     if raw_value is None:
         return 1024
     try:
@@ -16899,17 +16151,25 @@ def _get_google_adapter_followup_auxiliary_context_char_cap() -> int:
     return max(256, parsed)
 
 
-def _compact_google_adapter_persisted_output_preview_and_expanded_text(text: str, *, cap: int) -> tuple[str, int, set[str], list[dict[str, Any]]]:
+def _compact_google_adapter_persisted_output_preview_and_expanded_text(
+    text: str, *, cap: int
+) -> tuple[str, int, set[str], list[dict[str, Any]]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._compact_google_adapter_persisted_output_preview_and_expanded_text(text, cap=cap)
 
 
-def _compact_expanded_claude_persisted_output_text_for_google_adapter(text: str, *, persisted_output_char_cap: Optional[int]=None, auxiliary_context_char_cap: Optional[int]=None) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
+def _compact_expanded_claude_persisted_output_text_for_google_adapter(
+    text: str, *, persisted_output_char_cap: Optional[int] = None, auxiliary_context_char_cap: Optional[int] = None
+) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
     _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_expanded_claude_persisted_output_text_for_google_adapter(text, persisted_output_char_cap=persisted_output_char_cap, auxiliary_context_char_cap=auxiliary_context_char_cap)
+    return _anthropic_google_shaping._compact_expanded_claude_persisted_output_text_for_google_adapter(
+        text, persisted_output_char_cap=persisted_output_char_cap, auxiliary_context_char_cap=auxiliary_context_char_cap
+    )
 
 
-def _compact_google_adapter_text_part_sequence(parts: list[Any]) -> Tuple[list[Any], int, set[str], list[dict[str, Any]], bool]:
+def _compact_google_adapter_text_part_sequence(
+    parts: list[Any],
+) -> Tuple[list[Any], int, set[str], list[dict[str, Any]], bool]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._compact_google_adapter_text_part_sequence(parts)
 
@@ -16924,7 +16184,9 @@ def _compact_google_adapter_persisted_output_value(value: Any) -> Tuple[Any, int
     return _anthropic_google_shaping._compact_google_adapter_persisted_output_value(value)
 
 
-def _compact_google_adapter_persisted_output_in_anthropic_request_body(request_body: dict[str, Any]) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
+def _compact_google_adapter_persisted_output_in_anthropic_request_body(
+    request_body: dict[str, Any],
+) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
     _anthropic_google_shaping.bind_runtime(globals())
     return _anthropic_google_shaping._compact_google_adapter_persisted_output_in_anthropic_request_body(request_body)
 
@@ -16979,9 +16241,7 @@ def _build_openai_adapter_compacted_claude_context_block(
         "The current child task, tool schemas, and latest user instructions remain authoritative.]"
     )
     summary_budget = max(0, cap - len(heading) - 64)
-    summary_text = "\n".join(
-        _select_openai_adapter_context_summary_lines(original_block)
-    ).strip()
+    summary_text = "\n".join(_select_openai_adapter_context_summary_lines(original_block)).strip()
     if len(summary_text) > summary_budget:
         summary_text = summary_text[:summary_budget].rstrip()
     if summary_text:
@@ -17018,9 +16278,7 @@ def _compact_openai_adapter_claude_context_text(
             markers=markers,
             cap=effective_cap,
         )
-        updated_text = (
-            updated_text[: span.start] + compacted_block + updated_text[span.end :]
-        )
+        updated_text = updated_text[: span.start] + compacted_block + updated_text[span.end :]
         compacted_count += 1
         combined_markers.update(markers)
         metadata_items.append(
@@ -17103,14 +16361,10 @@ def _add_openai_adapter_claude_context_compaction_logging_metadata(
     span_name: str = "openai_adapter.claude_context_compaction",
 ) -> dict[str, Any]:
     original_chars = sum(
-        item.get("original_chars", 0)
-        for item in metadata_items
-        if isinstance(item.get("original_chars"), int)
+        item.get("original_chars", 0) for item in metadata_items if isinstance(item.get("original_chars"), int)
     )
     compacted_chars = sum(
-        item.get("kept_chars", 0)
-        for item in metadata_items
-        if isinstance(item.get("kept_chars"), int)
+        item.get("kept_chars", 0) for item in metadata_items if isinstance(item.get("kept_chars"), int)
     )
     sorted_markers = sorted(markers)
     tags = [
@@ -17126,9 +16380,7 @@ def _add_openai_adapter_claude_context_compaction_logging_metadata(
             f"{metadata_prefix}_claude_context_markers": sorted_markers,
             f"{metadata_prefix}_claude_context_original_chars": original_chars,
             f"{metadata_prefix}_claude_context_compacted_chars": compacted_chars,
-            f"{metadata_prefix}_claude_context_saved_chars": max(
-                0, original_chars - compacted_chars
-            ),
+            f"{metadata_prefix}_claude_context_saved_chars": max(0, original_chars - compacted_chars),
             f"{metadata_prefix}_claude_context_compaction_events": metadata_items,
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
@@ -17209,9 +16461,7 @@ def _expand_claude_persisted_output_text(
         return text, False, None, None
 
     try:
-        file_text = resolved_path.read_text(encoding="utf-8", errors="replace").rstrip(
-            "\n"
-        )
+        file_text = resolved_path.read_text(encoding="utf-8", errors="replace").rstrip("\n")
     except Exception:
         return text, False, None, None
 
@@ -17333,9 +16583,7 @@ def _merge_litellm_metadata(
         incoming_spans = extra_fields.get("langfuse_spans")
         if isinstance(existing_spans, list) and isinstance(incoming_spans, list):
             merged_extra_fields = dict(extra_fields)
-            merged_extra_fields["langfuse_spans"] = list(existing_spans) + list(
-                incoming_spans
-            )
+            merged_extra_fields["langfuse_spans"] = list(existing_spans) + list(incoming_spans)
             litellm_metadata.update(merged_extra_fields)
         else:
             litellm_metadata.update(extra_fields)
@@ -17390,9 +16638,7 @@ def _get_nested_str_value(source: Any, path: tuple[str, ...]) -> Optional[str]:
     return None
 
 
-def _extract_passthrough_session_id(
-    request: Request, request_body: Optional[dict[str, Any]] = None
-) -> Optional[str]:
+def _extract_passthrough_session_id(request: Request, request_body: Optional[dict[str, Any]] = None) -> Optional[str]:
     if isinstance(request_body, dict):
         for path in (
             ("session_id",),
@@ -17533,9 +16779,7 @@ def _extract_passthrough_repository_from_body_text(value: Any) -> Optional[str]:
     return _walk_request_value_with_budget(value, visitor=_visitor)
 
 
-def _extract_passthrough_repository(
-    request: Request, request_body: Optional[dict[str, Any]] = None
-) -> Optional[str]:
+def _extract_passthrough_repository(request: Request, request_body: Optional[dict[str, Any]] = None) -> Optional[str]:
     if isinstance(request_body, dict):
         for path in (
             ("repository",),
@@ -17618,12 +16862,8 @@ def _add_passthrough_trace_context_metadata(
     if trace_environment:
         existing_trace_environment = litellm_metadata.get("trace_environment")
         if existing_trace_environment != trace_environment:
-            if existing_trace_environment and not litellm_metadata.get(
-                "source_trace_environment"
-            ):
-                litellm_metadata[
-                    "source_trace_environment"
-                ] = existing_trace_environment
+            if existing_trace_environment and not litellm_metadata.get("source_trace_environment"):
+                litellm_metadata["source_trace_environment"] = existing_trace_environment
             litellm_metadata["trace_environment"] = trace_environment
             changed = True
 
@@ -17661,9 +16901,7 @@ _AAWM_TOOL_DEFINITION_SECRET_VALUE_RES = (
     re.compile(r"\bAIza[0-9A-Za-z\-_]{20,}\b"),
     re.compile(r"\bya29\.[0-9A-Za-z\-_.]{20,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
-    re.compile(
-        r"(?i)\b(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?([^\s'\"]{8,})"
-    ),
+    re.compile(r"(?i)\b(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?([^\s'\"]{8,})"),
 )
 
 
@@ -17706,12 +16944,7 @@ def _sanitize_tool_definition_value(
             truncated = truncated or item_truncated
             sanitized_items.append(sanitized_item)
         if len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS:
-            sanitized_items.append(
-                {
-                    "__truncated_items__": len(value)
-                    - _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
-                }
-            )
+            sanitized_items.append({"__truncated_items__": len(value) - _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS})
         return sanitized_items, truncated
     if isinstance(value, dict):
         truncated = len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
@@ -17727,9 +16960,7 @@ def _sanitize_tool_definition_value(
             truncated = truncated or item_truncated
             sanitized_dict[str(key)] = sanitized_item
         if len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS:
-            sanitized_dict["__truncated_keys__"] = (
-                len(value) - _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
-            )
+            sanitized_dict["__truncated_keys__"] = len(value) - _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
         return sanitized_dict, truncated
     return str(value), False
 
@@ -17738,9 +16969,7 @@ def _tool_definition_name(tool: dict[str, Any]) -> Optional[str]:
     function_definition = tool.get("function")
     for candidate in (
         tool.get("name"),
-        function_definition.get("name")
-        if isinstance(function_definition, dict)
-        else None,
+        function_definition.get("name") if isinstance(function_definition, dict) else None,
         tool.get("tool_name"),
     ):
         if isinstance(candidate, str) and candidate.strip():
@@ -17752,9 +16981,7 @@ def _tool_definition_description(tool: dict[str, Any]) -> Optional[str]:
     function_definition = tool.get("function")
     for candidate in (
         tool.get("description"),
-        function_definition.get("description")
-        if isinstance(function_definition, dict)
-        else None,
+        function_definition.get("description") if isinstance(function_definition, dict) else None,
     ):
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
@@ -17781,9 +17008,7 @@ def _build_tool_definition_snapshot_entry(
         return None, False
 
     sanitized_definition, definition_truncated = _sanitize_tool_definition_value(tool)
-    sanitized_parameters, parameters_truncated = _sanitize_tool_definition_value(
-        _tool_definition_parameters(tool)
-    )
+    sanitized_parameters, parameters_truncated = _sanitize_tool_definition_value(_tool_definition_parameters(tool))
     description, description_truncated = _truncate_tool_definition_string(
         _redact_tool_definition_string(_tool_definition_description(tool) or "")
     )
@@ -17796,9 +17021,7 @@ def _build_tool_definition_snapshot_entry(
         "parameters": sanitized_parameters,
         "definition": sanitized_definition,
     }
-    return entry, bool(
-        definition_truncated or parameters_truncated or description_truncated
-    )
+    return entry, bool(definition_truncated or parameters_truncated or description_truncated)
 
 
 def _tool_definition_snapshot_hash(snapshot: list[dict[str, Any]]) -> str:
@@ -17846,20 +17069,15 @@ def _build_passthrough_tool_definition_metadata(
     if not snapshot:
         return {}
 
-    names = [
-        entry["name"]
-        for entry in snapshot
-        if isinstance(entry.get("name"), str) and entry.get("name")
-    ]
-    tool_types = [
-        entry["type"]
-        for entry in snapshot
-        if isinstance(entry.get("type"), str) and entry.get("type")
-    ]
+    names = [entry["name"] for entry in snapshot if isinstance(entry.get("name"), str) and entry.get("name")]
+    tool_types = [entry["type"] for entry in snapshot if isinstance(entry.get("type"), str) and entry.get("type")]
     # RR-054 #40: keep full snapshots opt-in; default metadata is names/types/hash only.
-    include_full_snapshot = os.getenv(
-        "AAWM_TOOL_DEFINITION_INCLUDE_FULL_SNAPSHOT", ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    include_full_snapshot = os.getenv("AAWM_TOOL_DEFINITION_INCLUDE_FULL_SNAPSHOT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     metadata = {
         "aawm_tool_definition_capture_version": (_AAWM_TOOL_DEFINITION_CAPTURE_VERSION),
         "aawm_tool_definition_capture_source": "passthrough_request_body",
@@ -17868,17 +17086,10 @@ def _build_passthrough_tool_definition_metadata(
         "aawm_tool_definition_sources": source_names,
         "aawm_tool_definition_names": names,
         "aawm_tool_definition_types": tool_types,
-        "aawm_tool_definition_snapshot_hash": (
-            _tool_definition_snapshot_hash(snapshot)
-        ),
-        "aawm_tool_definition_snapshot_truncated": truncated
-        or available_count > len(snapshot),
-        "aawm_tool_definition_snapshot_storage": (
-            "session_history_tool_definition_snapshots"
-        ),
-        "aawm_tool_definition_snapshot_storage_key": (
-            "session_id,aawm_tool_definition_snapshot_hash"
-        ),
+        "aawm_tool_definition_snapshot_hash": (_tool_definition_snapshot_hash(snapshot)),
+        "aawm_tool_definition_snapshot_truncated": truncated or available_count > len(snapshot),
+        "aawm_tool_definition_snapshot_storage": ("session_history_tool_definition_snapshots"),
+        "aawm_tool_definition_snapshot_storage_key": ("session_id,aawm_tool_definition_snapshot_hash"),
     }
     if include_full_snapshot:
         metadata["aawm_tool_definition_snapshot"] = snapshot
@@ -17900,12 +17111,8 @@ def _add_passthrough_tool_definition_metadata(
 def _prepare_request_body_for_passthrough_observability(
     request: Request, request_body: dict[str, Any]
 ) -> dict[str, Any]:
-    session_id = _extract_passthrough_session_id(
-        request=request, request_body=request_body
-    )
-    repository = _extract_passthrough_repository(
-        request=request, request_body=request_body
-    )
+    session_id = _extract_passthrough_session_id(request=request, request_body=request_body)
+    repository = _extract_passthrough_repository(request=request, request_body=request_body)
     trace_environment = _get_passthrough_trace_environment()
     prepared_body = _add_passthrough_trace_context_metadata(
         request_body,
@@ -17916,9 +17123,7 @@ def _prepare_request_body_for_passthrough_observability(
     return _add_passthrough_tool_definition_metadata(prepared_body)
 
 
-def _add_route_family_logging_metadata(
-    request_body: dict[str, Any], route_family: str
-) -> dict[str, Any]:
+def _add_route_family_logging_metadata(request_body: dict[str, Any], route_family: str) -> dict[str, Any]:
     normalized_route_family = _normalize_low_cardinality_tag_value(route_family)
     if not normalized_route_family:
         return request_body
@@ -17932,16 +17137,12 @@ def _add_route_family_logging_metadata(
 def _append_codex_auto_agent_prevention_guidance_to_instructions(
     instructions: Optional[str],
 ) -> str:
-    existing_instructions = (
-        instructions.strip() if isinstance(instructions, str) else ""
-    )
+    existing_instructions = instructions.strip() if isinstance(instructions, str) else ""
     if _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT in existing_instructions:
         return existing_instructions
     if not existing_instructions:
         return _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT
-    return (
-        f"{existing_instructions}\n\n" f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT}"
-    )
+    return f"{existing_instructions}\n\n" f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT}"
 
 
 def _is_aawm_read_agent_alias_model(alias_model: Any) -> bool:
@@ -18009,25 +17210,19 @@ def _apply_aawm_read_agent_guidance_to_request_body(
     original_chars = 0
     if target_field == "instructions":
         existing_instructions = request_body.get("instructions")
-        if existing_instructions is not None and not isinstance(
-            existing_instructions, str
-        ):
+        if existing_instructions is not None and not isinstance(existing_instructions, str):
             return request_body, {}
         updated_value = _append_aawm_read_agent_guidance_to_text(existing_instructions)
         if updated_value == existing_instructions:
             return request_body, {}
         updated_body["instructions"] = updated_value
-        original_chars = (
-            len(existing_instructions) if isinstance(existing_instructions, str) else 0
-        )
+        original_chars = len(existing_instructions) if isinstance(existing_instructions, str) else 0
     elif target_field == "system":
         (
             updated_system,
             changed,
             original_chars,
-        ) = _append_aawm_read_agent_guidance_to_anthropic_system(
-            request_body.get("system")
-        )
+        ) = _append_aawm_read_agent_guidance_to_anthropic_system(request_body.get("system"))
         if not changed:
             return request_body, {}
         updated_body["system"] = updated_system
@@ -18036,9 +17231,7 @@ def _apply_aawm_read_agent_guidance_to_request_body(
 
     guidance_metadata = {
         "aawm_read_agent_guidance_policy_name": (_AAWM_READ_AGENT_GUIDANCE_POLICY_NAME),
-        "aawm_read_agent_guidance_policy_version": (
-            _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
-        ),
+        "aawm_read_agent_guidance_policy_version": (_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION),
         "aawm_read_agent_guidance_applied": True,
         "aawm_read_agent_guidance_alias": alias_model,
         "aawm_read_agent_guidance_target_field": target_field,
@@ -18072,40 +17265,25 @@ def _apply_codex_auto_agent_prevention_guidance_to_request_body(
     if existing_instructions is not None and not isinstance(existing_instructions, str):
         return request_body, {}
 
-    updated_instructions = _append_codex_auto_agent_prevention_guidance_to_instructions(
-        existing_instructions
-    )
+    updated_instructions = _append_codex_auto_agent_prevention_guidance_to_instructions(existing_instructions)
     if updated_instructions == existing_instructions:
         return request_body, {}
 
     updated_body = dict(request_body)
     updated_body["instructions"] = updated_instructions
-    original_chars = (
-        len(existing_instructions) if isinstance(existing_instructions, str) else 0
-    )
+    original_chars = len(existing_instructions) if isinstance(existing_instructions, str) else 0
     guidance_metadata = {
-        "codex_auto_agent_prevention_guidance_policy_name": (
-            _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME
-        ),
-        "codex_auto_agent_prevention_guidance_policy_version": (
-            _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION
-        ),
+        "codex_auto_agent_prevention_guidance_policy_name": (_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME),
+        "codex_auto_agent_prevention_guidance_policy_version": (_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION),
         "codex_auto_agent_prevention_guidance_applied": True,
-        "codex_auto_agent_prevention_guidance_original_instruction_chars": (
-            original_chars
-        ),
-        "codex_auto_agent_prevention_guidance_prompt_chars": len(
-            _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT
-        ),
+        "codex_auto_agent_prevention_guidance_original_instruction_chars": (original_chars),
+        "codex_auto_agent_prevention_guidance_prompt_chars": len(_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT),
     }
     updated_body = _merge_litellm_metadata(
         updated_body,
         tags_to_add=[
             "codex-auto-agent-prevention-guidance",
-            (
-                "codex-auto-agent-prevention-guidance:"
-                f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION}"
-            ),
+            ("codex-auto-agent-prevention-guidance:" f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION}"),
         ],
         extra_fields={
             **guidance_metadata,
@@ -18182,18 +17360,12 @@ def _extract_claude_request_breakout_fields(
     if edit_types:
         extra_fields["claude_context_edit_types"] = _dedupe_sorted_str_list(edit_types)
     if keep_values:
-        extra_fields["claude_context_keep_values"] = _dedupe_sorted_str_list(
-            keep_values
-        )
+        extra_fields["claude_context_keep_values"] = _dedupe_sorted_str_list(keep_values)
 
-    account_uuid = _get_nested_str_value(
-        request_body, ("metadata", "user_id", "account_uuid")
-    )
+    account_uuid = _get_nested_str_value(request_body, ("metadata", "user_id", "account_uuid"))
     if account_uuid:
         extra_fields["claude_account_uuid"] = account_uuid
-    device_id = _get_nested_str_value(
-        request_body, ("metadata", "user_id", "device_id")
-    )
+    device_id = _get_nested_str_value(request_body, ("metadata", "user_id", "device_id"))
     if device_id:
         extra_fields["claude_device_id"] = device_id
 
@@ -18216,9 +17388,7 @@ def _add_claude_request_breakout_logging_metadata(
 def _is_anthropic_web_search_tool(value: dict[str, Any]) -> bool:
     tool_type = value.get("type")
     tool_name = value.get("name")
-    return (
-        isinstance(tool_type, str) and tool_type.startswith("web_search")
-    ) or tool_name == "web_search"
+    return (isinstance(tool_type, str) and tool_type.startswith("web_search")) or tool_name == "web_search"
 
 
 def _sanitize_anthropic_web_search_empty_domain_lists_in_value(
@@ -18230,11 +17400,7 @@ def _sanitize_anthropic_web_search_empty_domain_lists_in_value(
         sanitized_count = 0
         is_web_search_tool = _is_anthropic_web_search_tool(value)
         for key, child in value.items():
-            if (
-                is_web_search_tool
-                and key in {"allowed_domains", "blocked_domains"}
-                and child == []
-            ):
+            if is_web_search_tool and key in {"allowed_domains", "blocked_domains"} and child == []:
                 updated_dict[key] = None
                 changed = True
                 sanitized_count += 1
@@ -18318,9 +17484,7 @@ def _extract_gemini_request_breakout_fields(
                 extra_fields["gemini_include_thoughts"] = include_thoughts
 
             thinking_level = thinking_config.get("thinkingLevel")
-            normalized_thinking_level = _normalize_low_cardinality_tag_value(
-                thinking_level
-            )
+            normalized_thinking_level = _normalize_low_cardinality_tag_value(thinking_level)
             if normalized_thinking_level:
                 tags_to_add.extend(
                     [
@@ -18434,16 +17598,12 @@ def _patch_codex_spawn_agent_payload_parameters(
     for field_name in _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER:
         if field_name in properties:
             continue
-        properties[field_name] = copy.deepcopy(
-            _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS[field_name]
-        )
+        properties[field_name] = copy.deepcopy(_CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS[field_name])
         added_fields.append(field_name)
 
     required = updated_parameters.get("required")
     if isinstance(required, list) and "fork_context" in required:
-        updated_parameters["required"] = [
-            field_name for field_name in required if field_name != "fork_context"
-        ]
+        updated_parameters["required"] = [field_name for field_name in required if field_name != "fork_context"]
 
     if not added_fields and not removed_fields:
         return parameters, [], []
@@ -18545,16 +17705,12 @@ def _get_unsupported_hosted_tool_types_for_model(model: Any) -> set[str]:
             if not isinstance(model_info, dict):
                 continue
 
-            unsupported_tools = model_info.get(
-                _CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD
-            )
+            unsupported_tools = model_info.get(_CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD)
             if not isinstance(unsupported_tools, list):
                 continue
 
             return {
-                normalized
-                for value in unsupported_tools
-                if (normalized := _normalize_low_cardinality_tag_value(value))
+                normalized for value in unsupported_tools if (normalized := _normalize_low_cardinality_tag_value(value))
             }
 
     return set()
@@ -18575,9 +17731,7 @@ def _get_unsupported_request_param_names_for_model(model: Any) -> set[str]:
             if not isinstance(model_info, dict):
                 continue
 
-            unsupported_params = model_info.get(
-                _CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD
-            )
+            unsupported_params = model_info.get(_CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD)
             if not isinstance(unsupported_params, list):
                 continue
 
@@ -18605,9 +17759,7 @@ def _get_unsupported_input_item_types_for_model(model: Any) -> set[str]:
             if not isinstance(model_info, dict):
                 continue
 
-            unsupported_input_item_types = model_info.get(
-                _CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD
-            )
+            unsupported_input_item_types = model_info.get(_CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD)
             if not isinstance(unsupported_input_item_types, list):
                 continue
 
@@ -18635,9 +17787,7 @@ def _get_rewrite_input_item_types_for_model(model: Any) -> set[str]:
             if not isinstance(model_info, dict):
                 continue
 
-            rewrite_input_item_types = model_info.get(
-                _CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD
-            )
+            rewrite_input_item_types = model_info.get(_CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD)
             if not isinstance(rewrite_input_item_types, list):
                 continue
 
@@ -18665,16 +17815,12 @@ def _get_custom_tool_function_adapter_names_for_model(model: Any) -> set[str]:
             if not isinstance(model_info, dict):
                 continue
 
-            adapter_names = model_info.get(
-                _CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD
-            )
+            adapter_names = model_info.get(_CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD)
             if not isinstance(adapter_names, list):
                 continue
 
             return {
-                normalized
-                for value in adapter_names
-                if (normalized := _normalize_low_cardinality_tag_value(value))
+                normalized for value in adapter_names if (normalized := _normalize_low_cardinality_tag_value(value))
             }
 
     return set()
@@ -18697,9 +17843,7 @@ def _get_namespace_tool_function_adapter_names_for_model(
             if not isinstance(model_info, dict):
                 continue
 
-            configured_adapters = model_info.get(
-                _CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD
-            )
+            configured_adapters = model_info.get(_CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD)
             if not isinstance(configured_adapters, dict):
                 continue
 
@@ -18709,9 +17853,7 @@ def _get_namespace_tool_function_adapter_names_for_model(
                 if normalized_namespace is None or not isinstance(tool_names, list):
                     continue
                 normalized_names = {
-                    normalized
-                    for value in tool_names
-                    if (normalized := _normalize_low_cardinality_tag_value(value))
+                    normalized for value in tool_names if (normalized := _normalize_low_cardinality_tag_value(value))
                 }
                 if normalized_names:
                     normalized_adapters[normalized_namespace] = normalized_names
@@ -18823,17 +17965,11 @@ def _adapt_codex_custom_tool_input_items(
 
         item_type = item.get("type")
         call_id = item.get("call_id")
-        normalized_call_id = (
-            call_id.strip() if isinstance(call_id, str) and call_id.strip() else None
-        )
+        normalized_call_id = call_id.strip() if isinstance(call_id, str) and call_id.strip() else None
         if item_type == "custom_tool_call":
             item_name = _normalize_low_cardinality_tag_value(item.get("name"))
             raw_input = item.get("input")
-            if (
-                item_name in adapter_names
-                and normalized_call_id in adapted_call_ids
-                and isinstance(raw_input, str)
-            ):
+            if item_name in adapter_names and normalized_call_id in adapted_call_ids and isinstance(raw_input, str):
                 adapted_item = dict(item)
                 adapted_item["type"] = "function_call"
                 adapted_item["arguments"] = json.dumps(
@@ -18851,10 +17987,7 @@ def _adapt_codex_custom_tool_input_items(
                     }
                 )
                 continue
-        elif (
-            item_type == "custom_tool_call_output"
-            and normalized_call_id in adapted_call_ids
-        ):
+        elif item_type == "custom_tool_call_output" and normalized_call_id in adapted_call_ids:
             adapted_item = dict(item)
             adapted_item["type"] = "function_call_output"
             updated_input_items.append(adapted_item)
@@ -18899,11 +18032,7 @@ def _add_codex_custom_tool_function_adapter_logging_metadata(
     adapted_tool_choice: bool,
 ) -> dict[str, Any]:
     adapted_names = _dedupe_sorted_str_list(
-        [
-            str(item["name"])
-            for item in adapted_tools
-            if isinstance(item.get("name"), str)
-        ]
+        [str(item["name"]) for item in adapted_tools if isinstance(item.get("name"), str)]
     )
     updated_body = _merge_litellm_metadata(
         request_body,
@@ -18915,9 +18044,7 @@ def _add_codex_custom_tool_function_adapter_logging_metadata(
             "codex_custom_tool_function_adapter_count": len(adapted_tools),
             "codex_custom_tool_function_adapter_names": adapted_names,
             "codex_custom_tool_function_adapter_tools": adapted_tools,
-            "codex_custom_tool_function_adapter_input_item_count": len(
-                adapted_input_items
-            ),
+            "codex_custom_tool_function_adapter_input_item_count": len(adapted_input_items),
             "codex_custom_tool_function_adapter_input_items": adapted_input_items,
             "codex_custom_tool_function_adapter_tool_choice": adapted_tool_choice,
             "langfuse_spans": [
@@ -18939,9 +18066,7 @@ def _add_codex_custom_tool_function_adapter_logging_metadata(
 def _adapt_codex_custom_tools_to_functions_from_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    adapter_names = _get_custom_tool_function_adapter_names_for_model(
-        request_body.get("model")
-    )
+    adapter_names = _get_custom_tool_function_adapter_names_for_model(request_body.get("model"))
     if not adapter_names:
         return request_body, []
 
@@ -18992,13 +18117,8 @@ def _adapt_codex_namespace_tool_definitions(
         normalized_name
         for tool in tools
         if isinstance(tool, dict)
-        and _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
-        != "namespace"
-        and (
-            normalized_name := _normalize_low_cardinality_tag_value(
-                _get_openai_tool_name(tool)
-            )
-        )
+        and _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool)) != "namespace"
+        and (normalized_name := _normalize_low_cardinality_tag_value(_get_openai_tool_name(tool)))
     }
     updated_tools: list[Any] = []
     adapted_tools: list[dict[str, Any]] = []
@@ -19011,9 +18131,7 @@ def _adapt_codex_namespace_tool_definitions(
             continue
 
         tool_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
-        namespace = _normalize_low_cardinality_tag_value(
-            _get_openai_tool_name(tool)
-        )
+        namespace = _normalize_low_cardinality_tag_value(_get_openai_tool_name(tool))
         allowed_names = adapter_names.get(namespace or "")
         if tool_type != "namespace" or allowed_names is None:
             updated_tools.append(tool)
@@ -19038,17 +18156,11 @@ def _adapt_codex_namespace_tool_definitions(
                 "child_index": child_index,
             }
             if not isinstance(child, dict):
-                skipped_tools.append(
-                    {**skip_detail, "reason": "child_not_object"}
-                )
+                skipped_tools.append({**skip_detail, "reason": "child_not_object"})
                 continue
 
-            child_type = _normalize_low_cardinality_tag_value(
-                _get_openai_tool_type(child)
-            )
-            child_name = _normalize_low_cardinality_tag_value(
-                _get_openai_tool_name(child)
-            )
+            child_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(child))
+            child_name = _normalize_low_cardinality_tag_value(_get_openai_tool_name(child))
             if child_type != "function":
                 skipped_tools.append(
                     {
@@ -19197,24 +18309,13 @@ def _add_codex_namespace_tool_function_adapter_logging_metadata(
     skipped_tools: list[dict[str, Any]],
 ) -> dict[str, Any]:
     adapted_namespaces = _dedupe_sorted_str_list(
-        [
-            str(item["namespace"])
-            for item in adapted_tools
-            if isinstance(item.get("namespace"), str)
-        ]
+        [str(item["namespace"]) for item in adapted_tools if isinstance(item.get("namespace"), str)]
     )
     adapted_names = _dedupe_sorted_str_list(
-        [
-            str(item["name"])
-            for item in adapted_tools
-            if isinstance(item.get("name"), str)
-        ]
+        [str(item["name"]) for item in adapted_tools if isinstance(item.get("name"), str)]
     )
     tags_to_add = ["codex-namespace-tool-function-adapted"]
-    tags_to_add.extend(
-        f"codex-namespace-tool-function:{namespace}"
-        for namespace in adapted_namespaces
-    )
+    tags_to_add.extend(f"codex-namespace-tool-function:{namespace}" for namespace in adapted_namespaces)
     if skipped_tools:
         tags_to_add.append("codex-namespace-tool-function-skipped")
 
@@ -19234,14 +18335,10 @@ def _add_codex_namespace_tool_function_adapter_logging_metadata(
             "codex_namespace_tool_function_adapter_namespaces": adapted_namespaces,
             "codex_namespace_tool_function_adapter_names": adapted_names,
             "codex_namespace_tool_function_adapter_tools": adapted_tools,
-            "codex_namespace_tool_function_adapter_input_item_count": len(
-                adapted_input_items
-            ),
+            "codex_namespace_tool_function_adapter_input_item_count": len(adapted_input_items),
             "codex_namespace_tool_function_adapter_input_items": adapted_input_items,
             "codex_namespace_tool_function_adapter_tool_choice": adapted_tool_choice,
-            "codex_namespace_tool_function_adapter_skipped_count": len(
-                skipped_tools
-            ),
+            "codex_namespace_tool_function_adapter_skipped_count": len(skipped_tools),
             "codex_namespace_tool_function_adapter_skipped_tools": skipped_tools,
             "langfuse_spans": [
                 _build_langfuse_span_descriptor(
@@ -19256,17 +18353,13 @@ def _add_codex_namespace_tool_function_adapter_logging_metadata(
 def _adapt_codex_namespace_tools_to_functions_from_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    adapter_names = _get_namespace_tool_function_adapter_names_for_model(
-        request_body.get("model")
-    )
+    adapter_names = _get_namespace_tool_function_adapter_names_for_model(request_body.get("model"))
     if not adapter_names:
         return request_body, []
 
-    updated_tools, adapted_tools, skipped_tools = (
-        _adapt_codex_namespace_tool_definitions(
-            request_body.get("tools"),
-            adapter_names=adapter_names,
-        )
+    updated_tools, adapted_tools, skipped_tools = _adapt_codex_namespace_tool_definitions(
+        request_body.get("tools"),
+        adapter_names=adapter_names,
     )
     active_adapter_names = adapter_names
     if isinstance(request_body.get("tools"), list):
@@ -19284,12 +18377,7 @@ def _adapt_codex_namespace_tools_to_functions_from_request_body(
         request_body.get("tool_choice"),
         adapter_names=active_adapter_names,
     )
-    if (
-        updated_tools is None
-        and updated_input is None
-        and adapted_tool_choice is None
-        and not skipped_tools
-    ):
+    if updated_tools is None and updated_input is None and adapted_tool_choice is None and not skipped_tools:
         return request_body, []
 
     updated_body = dict(request_body)
@@ -19339,11 +18427,7 @@ def _add_codex_unsupported_hosted_tool_logging_metadata(
     removed_tool_choice: Optional[Any],
 ) -> dict[str, Any]:
     removed_tool_types = _dedupe_sorted_str_list(
-        [
-            tool["type"]
-            for tool in removed_tools
-            if isinstance(tool.get("type"), str) and tool["type"]
-        ]
+        [tool["type"] for tool in removed_tools if isinstance(tool.get("type"), str) and tool["type"]]
     )
     span_metadata: dict[str, Any] = {
         "removed_count": len(removed_tools),
@@ -19353,9 +18437,7 @@ def _add_codex_unsupported_hosted_tool_logging_metadata(
         span_metadata["removed_tool_choice"] = removed_tool_choice
 
     tags_to_add = ["codex-unsupported-hosted-tool-removed"]
-    tags_to_add.extend(
-        f"codex-unsupported-hosted-tool:{tool_type}" for tool_type in removed_tool_types
-    )
+    tags_to_add.extend(f"codex-unsupported-hosted-tool:{tool_type}" for tool_type in removed_tool_types)
     if removed_tool_choice is not None:
         tags_to_add.append("codex-unsupported-hosted-tool-choice-removed")
 
@@ -19371,9 +18453,7 @@ def _add_codex_unsupported_hosted_tool_logging_metadata(
         ],
     }
     if removed_tool_choice is not None:
-        extra_fields[
-            "codex_unsupported_hosted_tool_choice_removed"
-        ] = removed_tool_choice
+        extra_fields["codex_unsupported_hosted_tool_choice_removed"] = removed_tool_choice
 
     return _merge_litellm_metadata(
         request_body,
@@ -19450,20 +18530,14 @@ def _add_codex_unsupported_request_param_logging_metadata(
     removed_params: list[str],
 ) -> dict[str, Any]:
     normalized_params = _dedupe_sorted_str_list(
-        [
-            normalized
-            for param in removed_params
-            if (normalized := _normalize_low_cardinality_tag_value(param))
-        ]
+        [normalized for param in removed_params if (normalized := _normalize_low_cardinality_tag_value(param))]
     )
     span_metadata: dict[str, Any] = {
         "removed_count": len(removed_params),
         "removed_params": normalized_params,
     }
     tags_to_add = ["codex-unsupported-request-param-removed"]
-    tags_to_add.extend(
-        f"codex-unsupported-request-param:{param}" for param in normalized_params
-    )
+    tags_to_add.extend(f"codex-unsupported-request-param:{param}" for param in normalized_params)
     return _merge_litellm_metadata(
         request_body,
         tags_to_add=tags_to_add,
@@ -19483,9 +18557,7 @@ def _add_codex_unsupported_request_param_logging_metadata(
 def _drop_unsupported_codex_request_params_from_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
-    unsupported_params = _get_unsupported_request_param_names_for_model(
-        request_body.get("model")
-    )
+    unsupported_params = _get_unsupported_request_param_names_for_model(request_body.get("model"))
     if not unsupported_params:
         return request_body, []
 
@@ -19504,27 +18576,18 @@ def _drop_unsupported_codex_request_params_from_request_body(
             changed = False
             for key, child_value in value.items():
                 normalized_key = _normalize_low_cardinality_tag_value(key)
-                normalized_path = (
-                    ".".join([*path, normalized_key])
-                    if normalized_key is not None
-                    else None
-                )
-                if normalized_key in unsupported_params or (
-                    normalized_path in unsupported_params
-                ):
+                normalized_path = ".".join([*path, normalized_key]) if normalized_key is not None else None
+                if normalized_key in unsupported_params or (normalized_path in unsupported_params):
                     removed.append(
                         normalized_path
-                        if normalized_key not in unsupported_params
-                        and normalized_path in unsupported_params
+                        if normalized_key not in unsupported_params and normalized_path in unsupported_params
                         else key
                     )
                     changed = True
                     continue
                 updated_child, child_removed, child_changed = _drop_from_value(
                     child_value,
-                    path=(
-                        (*path, normalized_key) if normalized_key is not None else path
-                    ),
+                    path=((*path, normalized_key) if normalized_key is not None else path),
                     _depth=_depth + 1,
                 )
                 updated_dict[key] = updated_child
@@ -19553,11 +18616,7 @@ def _drop_unsupported_codex_request_params_from_request_body(
     if not removed_params:
         return request_body, []
 
-    updated_body = (
-        updated_value
-        if changed and isinstance(updated_value, dict)
-        else dict(request_body)
-    )
+    updated_body = updated_value if changed and isinstance(updated_value, dict) else dict(request_body)
 
     updated_body = _add_codex_unsupported_request_param_logging_metadata(
         updated_body,
@@ -19572,11 +18631,7 @@ def _add_codex_unsupported_input_item_logging_metadata(
     removed_items: list[dict[str, Any]],
 ) -> dict[str, Any]:
     removed_item_types = _dedupe_sorted_str_list(
-        [
-            item["type"]
-            for item in removed_items
-            if isinstance(item.get("type"), str) and item["type"]
-        ]
+        [item["type"] for item in removed_items if isinstance(item.get("type"), str) and item["type"]]
     )
     span_metadata: dict[str, Any] = {
         "removed_count": len(removed_items),
@@ -19584,9 +18639,7 @@ def _add_codex_unsupported_input_item_logging_metadata(
     }
 
     tags_to_add = ["codex-unsupported-input-item-removed"]
-    tags_to_add.extend(
-        f"codex-unsupported-input-item:{item_type}" for item_type in removed_item_types
-    )
+    tags_to_add.extend(f"codex-unsupported-input-item:{item_type}" for item_type in removed_item_types)
 
     return _merge_litellm_metadata(
         request_body,
@@ -19608,19 +18661,10 @@ def _add_codex_unsupported_input_item_logging_metadata(
 def _drop_unsupported_codex_input_items_from_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if (
-        _normalize_kimi_code_chat_completions_adapter_model_name(
-            request_body.get("model")
-        )
-        is not None
-    ):
-        request_body = _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(
-            request_body
-        )
+    if _normalize_kimi_code_chat_completions_adapter_model_name(request_body.get("model")) is not None:
+        request_body = _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(request_body)
 
-    unsupported_input_item_types = _get_unsupported_input_item_types_for_model(
-        request_body.get("model")
-    )
+    unsupported_input_item_types = _get_unsupported_input_item_types_for_model(request_body.get("model"))
     if not unsupported_input_item_types:
         return request_body, []
 
@@ -19641,9 +18685,7 @@ def _drop_unsupported_codex_input_items_from_request_body(
                 "type": item_type,
                 "index": index,
             }
-            if item_type == "reasoning" and isinstance(
-                item.get("encrypted_content"), str
-            ):
+            if item_type == "reasoning" and isinstance(item.get("encrypted_content"), str):
                 removed_item["encrypted_content"] = True
             removed_items.append(removed_item)
             continue
@@ -19704,9 +18746,7 @@ def _rewrite_grok_native_input_item_for_model_input(
 def _is_anthropic_grok_native_responses_adapter_body(
     request_body: dict[str, Any],
 ) -> bool:
-    return _anthropic_grok_normalization.is_anthropic_responses_adapter_body(
-        request_body
-    )
+    return _anthropic_grok_normalization.is_anthropic_responses_adapter_body(request_body)
 
 
 def _add_grok_native_input_item_rewrite_logging_metadata(
@@ -19725,8 +18765,7 @@ def _rewrite_grok_native_unsupported_input_items_from_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return _anthropic_grok_normalization.rewrite_unsupported_input_items_from_request_body(
-        _get_anthropic_grok_normalization_runtime(),
-        request_body
+        _get_anthropic_grok_normalization_runtime(), request_body
     )
 
 
@@ -19742,9 +18781,7 @@ def _rewrite_grok_native_unsupported_input_items_in_place(
 def _drop_unsupported_codex_hosted_tools_from_request_body(
     request_body: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    unsupported_tool_types = _get_unsupported_hosted_tool_types_for_model(
-        request_body.get("model")
-    )
+    unsupported_tool_types = _get_unsupported_hosted_tool_types_for_model(request_body.get("model"))
     if not unsupported_tool_types:
         return request_body, []
 
@@ -19779,11 +18816,7 @@ def _drop_unsupported_codex_hosted_tools_from_request_body(
     updated_body = dict(request_body)
     updated_body["tools"] = updated_tools
 
-    removed_tool_types = {
-        tool["type"]
-        for tool in removed_tools
-        if isinstance(tool.get("type"), str) and tool["type"]
-    }
+    removed_tool_types = {tool["type"] for tool in removed_tools if isinstance(tool.get("type"), str) and tool["type"]}
     removed_tool_choice = None
     if _openai_tool_choice_references_tool_type(
         updated_body.get("tool_choice"),
@@ -19857,9 +18890,7 @@ def _patch_codex_spawn_agent_tool_description(
     parameter_targets: list[tuple[str, str]] = []
     function = updated_tool.get("function")
     if isinstance(function, dict):
-        parameter_targets.append(
-            ("function", f"tools.{tool_index}.function.parameters")
-        )
+        parameter_targets.append(("function", f"tools.{tool_index}.function.parameters"))
     if "parameters" in updated_tool or not parameter_targets:
         parameter_targets.append(("tool", f"tools.{tool_index}.parameters"))
 
@@ -19913,9 +18944,7 @@ def _patch_codex_multi_agent_tool_search_description(
     *,
     tool_index: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if _normalize_low_cardinality_tag_value(tool.get("type")) != (
-        _CODEX_MULTI_AGENT_TOOL_SEARCH_TYPE
-    ):
+    if _normalize_low_cardinality_tag_value(tool.get("type")) != (_CODEX_MULTI_AGENT_TOOL_SEARCH_TYPE):
         return tool, []
 
     description = tool.get("description")
@@ -19923,16 +18952,11 @@ def _patch_codex_multi_agent_tool_search_description(
         return tool, []
     if _CODEX_SPAWN_AGENT_FANOUT_POLICY in description:
         return tool, []
-    if (
-        "Multi-agent tools" not in description
-        and "Spawn and manage sub-agents" not in description
-    ):
+    if "Multi-agent tools" not in description and "Spawn and manage sub-agents" not in description:
         return tool, []
 
     updated_tool = dict(tool)
-    updated_tool[
-        "description"
-    ] = f"{description.rstrip()}\n\n{_CODEX_SPAWN_AGENT_FANOUT_POLICY}"
+    updated_tool["description"] = f"{description.rstrip()}\n\n{_CODEX_SPAWN_AGENT_FANOUT_POLICY}"
     return updated_tool, [
         {
             "id": _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID,
@@ -19968,9 +18992,7 @@ def _patch_codex_core_tool_description(
             )
         )
     if "description" in tool or not description_targets:
-        description_targets.append(
-            (tool, "description", f"tools.{tool_index}.description")
-        )
+        description_targets.append((tool, "description", f"tools.{tool_index}.description"))
 
     for container, key, path in description_targets:
         updated_description, changed = _append_codex_core_tool_guidance_to_description(
@@ -19990,9 +19012,7 @@ def _patch_codex_core_tool_description(
             updated_function[key] = updated_description
             updated_tool["function"] = updated_function
 
-        normalized_tool_name = (
-            _normalize_low_cardinality_tag_value(tool_name) or "unknown"
-        )
+        normalized_tool_name = _normalize_low_cardinality_tag_value(tool_name) or "unknown"
         patch_events.append(
             {
                 "id": f"{_CODEX_CORE_TOOL_GUIDANCE_PATCH_PREFIX}-{normalized_tool_name}",
@@ -20012,17 +19032,9 @@ def _add_codex_tool_description_patch_logging_metadata(
     patch_events: list[dict[str, Any]],
 ) -> dict[str, Any]:
     patch_ids = _dedupe_sorted_str_list(
-        [
-            event["id"]
-            for event in patch_events
-            if isinstance(event.get("id"), str) and event["id"]
-        ]
+        [event["id"] for event in patch_events if isinstance(event.get("id"), str) and event["id"]]
     )
-    replacement_count = sum(
-        event["occurrences"]
-        for event in patch_events
-        if isinstance(event.get("occurrences"), int)
-    )
+    replacement_count = sum(event["occurrences"] for event in patch_events if isinstance(event.get("occurrences"), int))
     span_metadata: dict[str, Any] = {
         "patch_count": len(patch_events),
         "replacement_count": replacement_count,
@@ -20031,9 +19043,7 @@ def _add_codex_tool_description_patch_logging_metadata(
         span_metadata["patch_ids"] = patch_ids
 
     tags_to_add = ["codex-tool-description-patch"]
-    tags_to_add.extend(
-        f"codex-tool-description-patch:{patch_id}" for patch_id in patch_ids
-    )
+    tags_to_add.extend(f"codex-tool-description-patch:{patch_id}" for patch_id in patch_ids)
 
     return _merge_litellm_metadata(
         request_body,
@@ -20125,18 +19135,14 @@ def _extract_codex_request_breakout_fields(
             tags_to_add.extend([f"codex-effort:{effort}", f"effort:{effort}"])
             extra_fields["codex_reasoning_effort"] = effort
 
-    tool_choice = _extract_openai_passthrough_tool_choice(
-        request_body.get("tool_choice")
-    )
+    tool_choice = _extract_openai_passthrough_tool_choice(request_body.get("tool_choice"))
     if tool_choice:
         tags_to_add.append(f"codex-tool-choice:{tool_choice}")
         extra_fields["codex_tool_choice"] = tool_choice
 
     parallel_tool_calls = request_body.get("parallel_tool_calls")
     if isinstance(parallel_tool_calls, bool):
-        tags_to_add.append(
-            f"codex-parallel-tools:{'true' if parallel_tool_calls else 'false'}"
-        )
+        tags_to_add.append(f"codex-parallel-tools:{'true' if parallel_tool_calls else 'false'}")
         extra_fields["codex_parallel_tool_calls"] = parallel_tool_calls
 
     include = request_body.get("include")
@@ -20185,24 +19191,16 @@ def _add_claude_persisted_output_logging_metadata(
     if source_metadata_items:
         span_metadata["source_count"] = len(source_metadata_items)
         span_metadata["source_paths"] = [
-            item["path"]
-            for item in source_metadata_items
-            if isinstance(item.get("path"), str)
+            item["path"] for item in source_metadata_items if isinstance(item.get("path"), str)
         ]
         span_metadata["source_content_hashes"] = [
-            item["content_hash"]
-            for item in source_metadata_items
-            if isinstance(item.get("content_hash"), str)
+            item["content_hash"] for item in source_metadata_items if isinstance(item.get("content_hash"), str)
         ]
         span_metadata["source_bytes"] = [
-            item["bytes"]
-            for item in source_metadata_items
-            if isinstance(item.get("bytes"), int)
+            item["bytes"] for item in source_metadata_items if isinstance(item.get("bytes"), int)
         ]
     tags_to_add = ["claude-persisted-output-expanded"]
-    tags_to_add.extend(
-        f"claude-persisted-output-hook:{hook}" for hook in sorted(hooks) if hook
-    )
+    tags_to_add.extend(f"claude-persisted-output-hook:{hook}" for hook in sorted(hooks) if hook)
     extra_fields: dict[str, Any] = {
         "claude_persisted_output_expanded": True,
         "claude_persisted_output_expanded_count": expanded_count,
@@ -20217,24 +19215,16 @@ def _add_claude_persisted_output_logging_metadata(
         extra_fields["claude_persisted_output_hooks"] = sorted(hooks)
     if source_metadata_items:
         extra_fields["claude_persisted_output_source_paths"] = [
-            item["path"]
-            for item in source_metadata_items
-            if isinstance(item.get("path"), str)
+            item["path"] for item in source_metadata_items if isinstance(item.get("path"), str)
         ]
         extra_fields["claude_persisted_output_source_basenames"] = [
-            item["basename"]
-            for item in source_metadata_items
-            if isinstance(item.get("basename"), str)
+            item["basename"] for item in source_metadata_items if isinstance(item.get("basename"), str)
         ]
         extra_fields["claude_persisted_output_source_content_hashes"] = [
-            item["content_hash"]
-            for item in source_metadata_items
-            if isinstance(item.get("content_hash"), str)
+            item["content_hash"] for item in source_metadata_items if isinstance(item.get("content_hash"), str)
         ]
         extra_fields["claude_persisted_output_source_bytes"] = [
-            item["bytes"]
-            for item in source_metadata_items
-            if isinstance(item.get("bytes"), int)
+            item["bytes"] for item in source_metadata_items if isinstance(item.get("bytes"), int)
         ]
     return _merge_litellm_metadata(
         request_body,
@@ -20282,9 +19272,7 @@ def _extract_anthropic_billing_header_fields(value: Any) -> dict[str, str]:
     return parsed_fields
 
 
-def _extract_anthropic_billing_header_fields_from_request_body(
-    request_body: dict[str, Any]
-) -> dict[str, str]:
+def _extract_anthropic_billing_header_fields_from_request_body(request_body: dict[str, Any]) -> dict[str, str]:
     return _extract_anthropic_billing_header_fields(request_body.get("system"))
 
 
@@ -20330,9 +19318,7 @@ def _load_claude_context_replacement_template(template_path: Path) -> str:
 
     template_text = template_path.read_text(encoding="utf-8").strip()
     if not template_text:
-        raise ValueError(
-            f"Claude context replacement template is empty: {template_path}"
-        )
+        raise ValueError(f"Claude context replacement template is empty: {template_path}")
 
     cached_template = template_text + "\n"
     _claude_context_replacement_template_cache[template_path] = cached_template
@@ -20350,31 +19336,21 @@ def _load_claude_prompt_patch_manifest(template_path: Path) -> dict[str, Any]:
 
     patches = manifest.get("patches")
     if not isinstance(patches, list) or not patches:
-        raise ValueError(
-            f"Claude prompt patch manifest has no patches: {template_path}"
-        )
+        raise ValueError(f"Claude prompt patch manifest has no patches: {template_path}")
 
     normalized_patches: list[dict[str, str]] = []
     for patch_descriptor in patches:
         if not isinstance(patch_descriptor, dict):
-            raise ValueError(
-                f"Invalid Claude prompt patch descriptor in {template_path}"
-            )
+            raise ValueError(f"Invalid Claude prompt patch descriptor in {template_path}")
         patch_id = patch_descriptor.get("id")
         before_text = patch_descriptor.get("before")
         after_text = patch_descriptor.get("after")
         if not isinstance(patch_id, str) or not patch_id:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing patch id in {template_path}"
-            )
+            raise ValueError(f"Claude prompt patch manifest is missing patch id in {template_path}")
         if not isinstance(before_text, str) or not before_text:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing before text for {patch_id}"
-            )
+            raise ValueError(f"Claude prompt patch manifest is missing before text for {patch_id}")
         if not isinstance(after_text, str) or not after_text:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing after text for {patch_id}"
-            )
+            raise ValueError(f"Claude prompt patch manifest is missing after text for {patch_id}")
         normalized_patches.append(
             {
                 "id": patch_id,
@@ -20399,14 +19375,10 @@ def _extract_markdown_section(markdown_text: str, heading: str) -> str:
     return match.group(0).rstrip()
 
 
-def _render_claude_auto_memory_replacement(
-    auto_memory_section: str, cc_version: str
-) -> tuple[str, Path]:
+def _render_claude_auto_memory_replacement(auto_memory_section: str, cc_version: str) -> tuple[str, Path]:
     template_path = _resolve_claude_auto_memory_template_path(cc_version)
     if template_path is None:
-        raise ValueError(
-            f"Unsupported Claude Code version for auto-memory override: {cc_version}"
-        )
+        raise ValueError(f"Unsupported Claude Code version for auto-memory override: {cc_version}")
 
     template_text = _load_claude_context_replacement_template(template_path)
     rendered_text = template_text
@@ -20414,9 +19386,7 @@ def _render_claude_auto_memory_replacement(
         types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(auto_memory_section)
         if types_match is None:
             raise ValueError("Missing Claude auto-memory <types> block")
-        rendered_text = rendered_text.replace(
-            "{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip()
-        )
+        rendered_text = rendered_text.replace("{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip())
 
     section_placeholders = {
         "{{WHAT_NOT_TO_SAVE_SECTION}}": "What NOT to save in memory",
@@ -20425,25 +19395,18 @@ def _render_claude_auto_memory_replacement(
     }
     for placeholder, heading in section_placeholders.items():
         if placeholder in rendered_text:
-            rendered_text = rendered_text.replace(
-                placeholder, _extract_markdown_section(auto_memory_section, heading)
-            )
+            rendered_text = rendered_text.replace(placeholder, _extract_markdown_section(auto_memory_section, heading))
 
-    unresolved_placeholders = _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN.findall(
-        rendered_text
-    )
+    unresolved_placeholders = _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN.findall(rendered_text)
     if unresolved_placeholders:
         raise ValueError(
-            "Unresolved Claude context replacement placeholders: "
-            + ", ".join(sorted(unresolved_placeholders))
+            "Unresolved Claude context replacement placeholders: " + ", ".join(sorted(unresolved_placeholders))
         )
 
     return rendered_text.rstrip() + "\n", template_path
 
 
-def _replace_claude_auto_memory_section_in_text(
-    text: str, cc_version: str
-) -> tuple[str, Optional[dict[str, Any]]]:
+def _replace_claude_auto_memory_section_in_text(text: str, cc_version: str) -> tuple[str, Optional[dict[str, Any]]]:
     if "# auto memory" not in text:
         return text, None
 
@@ -20459,9 +19422,7 @@ def _replace_claude_auto_memory_section_in_text(
         "id": "auto-memory",
         "status": "resolved",
         "cc_version": cc_version,
-        "template_path": str(
-            template_path.relative_to(Path(__file__).resolve().parents[3])
-        ),
+        "template_path": str(template_path.relative_to(Path(__file__).resolve().parents[3])),
         "output_chars": len(replacement_text),
     }
     return (
@@ -20470,17 +19431,13 @@ def _replace_claude_auto_memory_section_in_text(
     )
 
 
-def _replace_claude_system_prompt_override_in_value(
-    value: Any, cc_version: str
-) -> tuple[Any, list[dict[str, Any]]]:
+def _replace_claude_system_prompt_override_in_value(value: Any, cc_version: str) -> tuple[Any, list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
             if "# auto memory" not in value["text"]:
                 return value, []
             try:
-                updated_text, event = _replace_claude_auto_memory_section_in_text(
-                    value["text"], cc_version
-                )
+                updated_text, event = _replace_claude_auto_memory_section_in_text(value["text"], cc_version)
             except Exception as exc:
                 return value, [
                     {
@@ -20539,25 +19496,17 @@ def _add_claude_system_prompt_override_logging_metadata(
     request_body: dict[str, Any], override_events: list[dict[str, Any]]
 ) -> dict[str, Any]:
     override_ids = sorted(
-        {
-            event["id"]
-            for event in override_events
-            if isinstance(event.get("id"), str) and event["id"]
-        }
+        {event["id"] for event in override_events if isinstance(event.get("id"), str) and event["id"]}
     )
     failure_ids = sorted(
         {
             event["id"]
             for event in override_events
-            if event.get("status") == "failed"
-            and isinstance(event.get("id"), str)
-            and event["id"]
+            if event.get("status") == "failed" and isinstance(event.get("id"), str) and event["id"]
         }
     )
     statuses = [
-        event["status"]
-        for event in override_events
-        if isinstance(event.get("status"), str) and event["status"]
+        event["status"] for event in override_events if isinstance(event.get("status"), str) and event["status"]
     ]
     cc_versions = sorted(
         {
@@ -20575,9 +19524,7 @@ def _add_claude_system_prompt_override_logging_metadata(
     )
 
     tags_to_add = ["claude-system-prompt-override"]
-    tags_to_add.extend(
-        f"claude-system-prompt-override:{override_id}" for override_id in override_ids
-    )
+    tags_to_add.extend(f"claude-system-prompt-override:{override_id}" for override_id in override_ids)
     if failure_ids:
         tags_to_add.append("claude-system-prompt-override-failed")
 
@@ -20641,29 +19588,18 @@ def _replace_claude_system_prompt_in_anthropic_request_body(
         langfuse_spans = litellm_metadata.get("langfuse_spans")
         if isinstance(langfuse_spans, list):
             for span_descriptor in langfuse_spans:
-                if (
-                    isinstance(span_descriptor, dict)
-                    and span_descriptor.get("name") == "claude.system_prompt_override"
-                ):
-                    span_descriptor["start_time"] = _format_langfuse_span_timestamp(
-                        span_started_at
-                    )
-                    span_descriptor["end_time"] = _format_langfuse_span_timestamp(
-                        datetime.now(timezone.utc)
-                    )
+                if isinstance(span_descriptor, dict) and span_descriptor.get("name") == "claude.system_prompt_override":
+                    span_descriptor["start_time"] = _format_langfuse_span_timestamp(span_started_at)
+                    span_descriptor["end_time"] = _format_langfuse_span_timestamp(datetime.now(timezone.utc))
     return updated_body, override_events
 
 
-def _apply_claude_prompt_patches_in_text(
-    text: str, cc_version: str
-) -> tuple[str, list[dict[str, Any]]]:
+def _apply_claude_prompt_patches_in_text(text: str, cc_version: str) -> tuple[str, list[dict[str, Any]]]:
     manifest_path = _CLAUDE_PROMPT_PATCH_MANIFEST_PATH
     manifest = _load_claude_prompt_patch_manifest(manifest_path)
     updated_text = text
     patch_events: list[dict[str, Any]] = []
-    relative_manifest_path = str(
-        manifest_path.relative_to(Path(__file__).resolve().parents[3])
-    )
+    relative_manifest_path = str(manifest_path.relative_to(Path(__file__).resolve().parents[3]))
 
     for patch_descriptor in manifest["patches"]:
         before_text = patch_descriptor["before"]
@@ -20686,15 +19622,11 @@ def _apply_claude_prompt_patches_in_text(
     return updated_text, patch_events
 
 
-def _replace_claude_prompt_patches_in_value(
-    value: Any, cc_version: str
-) -> tuple[Any, list[dict[str, Any]]]:
+def _replace_claude_prompt_patches_in_value(value: Any, cc_version: str) -> tuple[Any, list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
             try:
-                updated_text, patch_events = _apply_claude_prompt_patches_in_text(
-                    value["text"], cc_version
-                )
+                updated_text, patch_events = _apply_claude_prompt_patches_in_text(value["text"], cc_version)
             except Exception as exc:
                 return value, [
                     {
@@ -20745,27 +19677,15 @@ def _replace_claude_prompt_patches_in_value(
 def _add_claude_prompt_patch_logging_metadata(
     request_body: dict[str, Any], patch_events: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    patch_ids = sorted(
-        {
-            event["id"]
-            for event in patch_events
-            if isinstance(event.get("id"), str) and event["id"]
-        }
-    )
+    patch_ids = sorted({event["id"] for event in patch_events if isinstance(event.get("id"), str) and event["id"]})
     failure_ids = sorted(
         {
             event["id"]
             for event in patch_events
-            if event.get("status") == "failed"
-            and isinstance(event.get("id"), str)
-            and event["id"]
+            if event.get("status") == "failed" and isinstance(event.get("id"), str) and event["id"]
         }
     )
-    statuses = [
-        event["status"]
-        for event in patch_events
-        if isinstance(event.get("status"), str) and event["status"]
-    ]
+    statuses = [event["status"] for event in patch_events if isinstance(event.get("status"), str) and event["status"]]
     cc_versions = sorted(
         {
             event["cc_version"]
@@ -20780,11 +19700,7 @@ def _add_claude_prompt_patch_logging_metadata(
             if isinstance(event.get("manifest_path"), str) and event["manifest_path"]
         }
     )
-    total_occurrences = sum(
-        event["occurrences"]
-        for event in patch_events
-        if isinstance(event.get("occurrences"), int)
-    )
+    total_occurrences = sum(event["occurrences"] for event in patch_events if isinstance(event.get("occurrences"), int))
 
     tags_to_add = ["claude-prompt-patch"]
     tags_to_add.extend(f"claude-prompt-patch:{patch_id}" for patch_id in patch_ids)
@@ -20851,16 +19767,9 @@ def _apply_claude_prompt_patches_to_anthropic_request_body(
         langfuse_spans = litellm_metadata.get("langfuse_spans")
         if isinstance(langfuse_spans, list):
             for span_descriptor in langfuse_spans:
-                if (
-                    isinstance(span_descriptor, dict)
-                    and span_descriptor.get("name") == "claude.prompt_patch"
-                ):
-                    span_descriptor["start_time"] = _format_langfuse_span_timestamp(
-                        span_started_at
-                    )
-                    span_descriptor["end_time"] = _format_langfuse_span_timestamp(
-                        datetime.now(timezone.utc)
-                    )
+                if isinstance(span_descriptor, dict) and span_descriptor.get("name") == "claude.prompt_patch":
+                    span_descriptor["start_time"] = _format_langfuse_span_timestamp(span_started_at)
+                    span_descriptor["end_time"] = _format_langfuse_span_timestamp(datetime.now(timezone.utc))
     return updated_body, patch_events
 
 
@@ -20886,7 +19795,7 @@ def _add_anthropic_billing_header_logging_metadata(
 
 
 def _expand_claude_persisted_output_in_anthropic_request_body(
-    request_body: dict[str, Any]
+    request_body: dict[str, Any],
 ) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
     span_started_at = datetime.now(timezone.utc)
     (
@@ -20910,17 +19819,10 @@ def _expand_claude_persisted_output_in_anthropic_request_body(
                     for span_descriptor in langfuse_spans:
                         if (
                             isinstance(span_descriptor, dict)
-                            and span_descriptor.get("name")
-                            == "claude.persisted_output_expand"
+                            and span_descriptor.get("name") == "claude.persisted_output_expand"
                         ):
-                            span_descriptor[
-                                "start_time"
-                            ] = _format_langfuse_span_timestamp(span_started_at)
-                            span_descriptor[
-                                "end_time"
-                            ] = _format_langfuse_span_timestamp(
-                                datetime.now(timezone.utc)
-                            )
+                            span_descriptor["start_time"] = _format_langfuse_span_timestamp(span_started_at)
+                            span_descriptor["end_time"] = _format_langfuse_span_timestamp(datetime.now(timezone.utc))
         return updated_body, expanded_count, hooks, source_metadata_items
     return request_body, 0, set(), []
 
@@ -20944,7 +19846,7 @@ def _iter_anthropic_text_fragments(value: Any):
 
 
 def _extract_claude_agent_and_tenant_from_request_body(
-    request_body: dict[str, Any]
+    request_body: dict[str, Any],
 ) -> tuple[Optional[str], Optional[str]]:
     for top_level_key in ("messages", "system"):
         for fragment in _iter_anthropic_text_fragments(request_body.get(top_level_key)):
@@ -20993,14 +19895,10 @@ def _add_claude_child_agent_observability_metadata(
         extra_fields["aawm_claude_project"] = tenant
         existing_trace_user_id = litellm_metadata.get("trace_user_id")
         if existing_trace_user_id != tenant_for_identity:
-            if existing_trace_user_id and not litellm_metadata.get(
-                "source_trace_user_id"
-            ):
+            if existing_trace_user_id and not litellm_metadata.get("source_trace_user_id"):
                 extra_fields["source_trace_user_id"] = existing_trace_user_id
             extra_fields["trace_user_id"] = tenant_for_identity
-        tags_to_add.append(
-            f"claude-project:{_normalize_low_cardinality_tag_value(tenant) or 'unknown'}"
-        )
+        tags_to_add.append(f"claude-project:{_normalize_low_cardinality_tag_value(tenant) or 'unknown'}")
 
     return _merge_litellm_metadata(
         request_body,
@@ -21009,9 +19907,7 @@ def _add_claude_child_agent_observability_metadata(
     )
 
 
-def _detect_claude_post_rewrite_context_files(
-    request_body: dict[str, Any]
-) -> list[str]:
+def _detect_claude_post_rewrite_context_files(request_body: dict[str, Any]) -> list[str]:
     present_files: list[str] = []
     seen_files: set[str] = set()
 
@@ -21027,9 +19923,7 @@ def _detect_claude_post_rewrite_context_files(
     return present_files
 
 
-def _add_claude_post_rewrite_context_file_logging_metadata(
-    request_body: dict[str, Any]
-) -> dict[str, Any]:
+def _add_claude_post_rewrite_context_file_logging_metadata(request_body: dict[str, Any]) -> dict[str, Any]:
     present_files = _detect_claude_post_rewrite_context_files(request_body)
     if not present_files:
         return request_body
@@ -21134,9 +20028,7 @@ async def _prepare_anthropic_request_body_for_passthrough(
         hooks,
         _source_metadata_items,
     ) = _expand_claude_persisted_output_in_anthropic_request_body(request_body)
-    billing_header_fields = _extract_anthropic_billing_header_fields_from_request_body(
-        updated_body
-    )
+    billing_header_fields = _extract_anthropic_billing_header_fields_from_request_body(updated_body)
     (
         updated_body,
         _claude_system_prompt_override_events,
@@ -21148,12 +20040,8 @@ async def _prepare_anthropic_request_body_for_passthrough(
     (
         updated_body,
         _aawm_injection_events,
-    ) = await _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body(
-        updated_body
-    )
-    updated_body = _aawm_add_claude_post_rewrite_context_file_logging_metadata(
-        updated_body
-    )
+    ) = await _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body(updated_body)
+    updated_body = _aawm_add_claude_post_rewrite_context_file_logging_metadata(updated_body)
     (
         updated_body,
         _web_search_domain_filter_sanitized_count,
@@ -21167,9 +20055,7 @@ async def _prepare_anthropic_request_body_for_passthrough(
             updated_body,
             billing_header_fields,
         )
-    updated_body = _add_route_family_logging_metadata(
-        updated_body, "anthropic_messages"
-    )
+    updated_body = _add_route_family_logging_metadata(updated_body, "anthropic_messages")
     updated_body = _add_claude_request_breakout_logging_metadata(updated_body)
     updated_body = _prepare_request_body_for_passthrough_observability(
         request=request,
@@ -21185,9 +20071,7 @@ async def _prepare_anthropic_request_body_for_passthrough(
 
 def _request_uses_codex_native_auth(request: Request) -> bool:
     headers = _safe_get_request_headers(request)
-    chatgpt_account_id = headers.get("chatgpt-account-id") or headers.get(
-        "ChatGPT-Account-Id"
-    )
+    chatgpt_account_id = headers.get("chatgpt-account-id") or headers.get("ChatGPT-Account-Id")
     originator = headers.get("originator") or headers.get("Originator")
     user_agent = headers.get("user-agent") or headers.get("User-Agent")
     session_id = headers.get("session_id") or headers.get("Session_Id")
@@ -21216,10 +20100,7 @@ def _should_preserve_openai_client_auth(request: Request, endpoint: str) -> bool
     if _is_openai_responses_endpoint(endpoint):
         return _request_has_openai_client_auth(request)
     if _is_openai_models_endpoint(endpoint):
-        return (
-            _request_has_openai_client_auth(request)
-            and _request_uses_codex_native_auth(request)
-        )
+        return _request_has_openai_client_auth(request) and _request_uses_codex_native_auth(request)
     return False
 
 
@@ -21235,9 +20116,7 @@ def _is_gemini_code_assist_endpoint(endpoint: str) -> bool:
     return normalized_endpoint.startswith("v1internal:")
 
 
-_GEMINI_CODE_ASSIST_ENDPOINT_ACTION_RE = re.compile(
-    r"^v1internal:[A-Za-z][A-Za-z0-9_]*$"
-)
+_GEMINI_CODE_ASSIST_ENDPOINT_ACTION_RE = re.compile(r"^v1internal:[A-Za-z][A-Za-z0-9_]*$")
 
 
 def _normalize_gemini_code_assist_endpoint_path(endpoint: str) -> str:
@@ -21275,9 +20154,7 @@ def _get_gemini_passthrough_target_base(
     has_google_oauth_bearer: bool,
 ) -> str:
     if has_google_oauth_bearer and _is_gemini_code_assist_endpoint(endpoint):
-        return (
-            os.getenv("CODE_ASSIST_ENDPOINT") or "https://cloudcode-pa.googleapis.com"
-        )
+        return os.getenv("CODE_ASSIST_ENDPOINT") or "https://cloudcode-pa.googleapis.com"
 
     return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
 
@@ -21285,46 +20162,28 @@ def _get_gemini_passthrough_target_base(
 _iter_antigravity_auth_file_path_candidates = _aawm_antigravity_oauth._iter_antigravity_auth_file_path_candidates
 
 
-
-
 _get_antigravity_auth_file_path = _aawm_antigravity_oauth._get_antigravity_auth_file_path
-
-
 
 
 _load_antigravity_oauth_token_data_from_path = _aawm_antigravity_oauth._load_antigravity_oauth_token_data_from_path
 
 
-
-
 _load_local_antigravity_oauth_token_data = _aawm_antigravity_oauth._load_local_antigravity_oauth_token_data
-
-
 
 
 _parse_antigravity_token_expiry = _aawm_antigravity_oauth._parse_antigravity_token_expiry
 
 
-
-
 _antigravity_access_token_is_valid = _aawm_antigravity_oauth._antigravity_access_token_is_valid
-
-
 
 
 _antigravity_access_token_is_unexpired = _aawm_antigravity_oauth._antigravity_access_token_is_unexpired
 
 
-
-
 _antigravity_oauth_cached_token_is_valid = _aawm_antigravity_oauth._antigravity_oauth_cached_token_is_valid
 
 
-
-
 _get_antigravity_oauth_expiry_date = _aawm_antigravity_oauth._get_antigravity_oauth_expiry_date
-
-
 
 
 def _iter_antigravity_cli_binary_candidates() -> list[Path]:
@@ -21353,39 +20212,35 @@ def _iter_antigravity_cli_binary_candidates() -> list[Path]:
     return candidate_files
 
 
-_extract_antigravity_oauth_client_values_from_cli_text = _aawm_antigravity_oauth._extract_antigravity_oauth_client_values_from_cli_text
-
-
+_extract_antigravity_oauth_client_values_from_cli_text = (
+    _aawm_antigravity_oauth._extract_antigravity_oauth_client_values_from_cli_text
+)
 
 
 _add_antigravity_oauth_client_candidate = _aawm_antigravity_oauth._add_antigravity_oauth_client_candidate
 
 
+_extract_antigravity_oauth_client_value_candidates_from_cli_text = (
+    _aawm_antigravity_oauth._extract_antigravity_oauth_client_value_candidates_from_cli_text
+)
 
 
-_extract_antigravity_oauth_client_value_candidates_from_cli_text = _aawm_antigravity_oauth._extract_antigravity_oauth_client_value_candidates_from_cli_text
+_load_antigravity_oauth_client_values_from_local_cli_binary = (
+    _aawm_antigravity_oauth._load_antigravity_oauth_client_values_from_local_cli_binary
+)
 
 
+_load_antigravity_oauth_client_value_candidates_from_local_cli_binary = (
+    _aawm_antigravity_oauth._load_antigravity_oauth_client_value_candidates_from_local_cli_binary
+)
 
 
-_load_antigravity_oauth_client_values_from_local_cli_binary = _aawm_antigravity_oauth._load_antigravity_oauth_client_values_from_local_cli_binary
-
-
-
-
-_load_antigravity_oauth_client_value_candidates_from_local_cli_binary = _aawm_antigravity_oauth._load_antigravity_oauth_client_value_candidates_from_local_cli_binary
-
-
-
-
-_get_antigravity_oauth_client_value_from_token_data = _aawm_antigravity_oauth._get_antigravity_oauth_client_value_from_token_data
-
-
+_get_antigravity_oauth_client_value_from_token_data = (
+    _aawm_antigravity_oauth._get_antigravity_oauth_client_value_from_token_data
+)
 
 
 _get_antigravity_oauth_client_value_candidates = _aawm_antigravity_oauth._get_antigravity_oauth_client_value_candidates
-
-
 
 
 def _get_oauth_token_error_code(response: httpx.Response) -> Optional[str]:
@@ -21404,16 +20259,13 @@ def _format_oauth_refresh_failure_detail(
     response: httpx.Response,
 ) -> str:
     error_code = _get_oauth_token_error_code(response)
-    suffix = (
-        f"status={response.status_code}, error={error_code}"
-        if error_code
-        else f"status={response.status_code}"
-    )
+    suffix = f"status={response.status_code}, error={error_code}" if error_code else f"status={response.status_code}"
     return (
         f"Failed to refresh {provider_label} OAuth access token ({suffix}). "
         f"Re-authenticate {provider_label} CLI or configure valid OAuth client "
         "environment overrides."
     )
+
 
 # RR-054 #1: wire Antigravity OAuth package runtime deps after helpers exist.
 _aawm_antigravity_oauth.configure_antigravity_oauth_runtime(
@@ -21430,31 +20282,21 @@ _aawm_antigravity_oauth.configure_antigravity_oauth_runtime(
 _write_antigravity_oauth_token_data_atomic = _aawm_antigravity_oauth._write_antigravity_oauth_token_data_atomic
 
 
-
-
 _get_antigravity_cli_refresh_home = _aawm_antigravity_oauth._get_antigravity_cli_refresh_home
-
-
 
 
 _get_antigravity_cli_refresh_timeout_seconds = _aawm_antigravity_oauth._get_antigravity_cli_refresh_timeout_seconds
 
 
-
-
-_refresh_local_antigravity_oauth_token_data_via_cli = _aawm_antigravity_oauth._refresh_local_antigravity_oauth_token_data_via_cli
-
-
+_refresh_local_antigravity_oauth_token_data_via_cli = (
+    _aawm_antigravity_oauth._refresh_local_antigravity_oauth_token_data_via_cli
+)
 
 
 _refresh_local_antigravity_oauth_token_data = _aawm_antigravity_oauth._refresh_local_antigravity_oauth_token_data
 
 
-
-
 _load_valid_local_antigravity_access_token = _aawm_antigravity_oauth._load_valid_local_antigravity_access_token
-
-
 
 
 def _get_antigravity_passthrough_target_base() -> str:
@@ -21466,10 +20308,7 @@ def _get_antigravity_passthrough_target_base() -> str:
 
 
 def _get_antigravity_client_header() -> str:
-    return (
-        _clean_codex_auth_value(os.getenv("AAWM_ANTIGRAVITY_CLIENT_HEADER"))
-        or _ANTIGRAVITY_CLIENT_HEADER_DEFAULT
-    )
+    return _clean_codex_auth_value(os.getenv("AAWM_ANTIGRAVITY_CLIENT_HEADER")) or _ANTIGRAVITY_CLIENT_HEADER_DEFAULT
 
 
 @lru_cache(maxsize=1)
@@ -21477,9 +20316,7 @@ def _get_anthropic_antigravity_runtime() -> _anthropic_antigravity_provider.Runt
     return _anthropic_antigravity_provider.Runtime(
         get_client_header=lambda: _get_antigravity_client_header(),
         merge_metadata=_merge_litellm_metadata,
-        prepare_observability=lambda **kwargs: (
-            _prepare_request_body_for_passthrough_observability(**kwargs)
-        ),
+        prepare_observability=lambda **kwargs: (_prepare_request_body_for_passthrough_observability(**kwargs)),
         split_provider_prefix=_split_anthropic_adapter_provider_prefix,
         allowed_models=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS,
         http_exception_type=HTTPException,
@@ -21542,9 +20379,7 @@ def _get_antigravity_passthrough_logging_metadata(
 
 
 def _normalize_antigravity_endpoint_for_target(endpoint: str) -> str:
-    return _anthropic_antigravity_provider._normalize_antigravity_endpoint_for_target(
-        endpoint
-    )
+    return _anthropic_antigravity_provider._normalize_antigravity_endpoint_for_target(endpoint)
 
 
 def _join_antigravity_passthrough_url(base_target_url: str, endpoint: str) -> str:
@@ -21594,9 +20429,7 @@ def _join_grok_passthrough_url(base_target_url: str, endpoint: str) -> str:
     )
 
 
-def _get_case_insensitive_header(
-    headers: dict[str, Any], header_name: str
-) -> Optional[str]:
+def _get_case_insensitive_header(headers: dict[str, Any], header_name: str) -> Optional[str]:
     wanted = header_name.lower()
     for key, value in headers.items():
         if str(key).lower() == wanted and value is not None:
@@ -21625,9 +20458,7 @@ def _get_grok_litellm_auth_header(request: Request) -> str:
         return _format_litellm_passthrough_api_key(query_key)
 
     # RR-054 #48: normalize Authorization the same way as explicit key sources.
-    authorization = request.headers.get("Authorization") or request.headers.get(
-        "authorization"
-    )
+    authorization = request.headers.get("Authorization") or request.headers.get("authorization")
     if authorization:
         return _format_litellm_passthrough_api_key(authorization)
     return ""
@@ -21658,9 +20489,7 @@ def _prepare_grok_logging_body_for_passthrough(
     }
     tags_to_add = ["grok-build", "route:grok_cli_chat_proxy"]
     if model_override:
-        normalized_model_override = (
-            normalize_grok_native_oauth_model(model_override) or model_override
-        )
+        normalized_model_override = normalize_grok_native_oauth_model(model_override) or model_override
         extra_fields["grok_model_override"] = normalized_model_override
         extra_fields["model_group"] = normalized_model_override
         tags_to_add.append(f"grok-model:{normalized_model_override}")
@@ -21718,11 +20547,7 @@ def _get_grok_passthrough_logging_metadata(request: Request) -> dict[str, Any]:
 
 def _is_grok_json_request(request: Request) -> bool:
     content_type = request.headers.get("content-type", "").lower()
-    return (
-        not content_type
-        or "application/json" in content_type
-        or content_type.endswith("+json")
-    )
+    return not content_type or "application/json" in content_type or content_type.endswith("+json")
 
 
 def _is_grok_storage_endpoint(endpoint: str) -> bool:
@@ -21752,15 +20577,11 @@ def _get_grok_side_channel_endpoint_type(endpoint: str) -> Optional[str]:
     endpoint_path = _normalize_grok_endpoint_path(endpoint)
     if endpoint_path == "/sessions/register":
         return "sessions_register"
-    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith(
-        "/replicas/update"
-    ):
+    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith("/replicas/update"):
         return "sessions_replicas_update"
     if endpoint_path.startswith("/sessions/") and endpoint_path.endswith("/signals"):
         return "sessions_signals"
-    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith(
-        "/turn-deltas"
-    ):
+    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith("/turn-deltas"):
         return "sessions_turn_deltas"
     if endpoint_path == "/traces":
         return "traces"
@@ -21841,11 +20662,7 @@ def _stable_grok_side_channel_body_digest(
         body_bytes = raw_body
         digest_source = "raw_body"
     elif isinstance(parsed_body, dict):
-        upstream_body = {
-            key: value
-            for key, value in parsed_body.items()
-            if str(key) != "litellm_metadata"
-        }
+        upstream_body = {key: value for key, value in parsed_body.items() if str(key) != "litellm_metadata"}
         body_bytes = json.dumps(
             upstream_body,
             sort_keys=True,
@@ -21893,21 +20710,15 @@ def _build_grok_side_channel_request_shape_metadata(
     metadata: dict[str, Any] = {
         "grok_side_channel": True,
         "grok_side_channel_endpoint_type": endpoint_type,
-        "grok_side_channel_endpoint_path_template": (
-            _get_grok_side_channel_endpoint_path_template(endpoint_type)
-        ),
+        "grok_side_channel_endpoint_path_template": (_get_grok_side_channel_endpoint_path_template(endpoint_type)),
         "grok_side_channel_request_content_type": content_type,
         "grok_side_channel_request_body_byte_length": body_byte_length,
         "grok_side_channel_request_body_sha256": body_sha256,
         "grok_side_channel_request_body_digest_source": digest_source,
-        "grok_side_channel_request_json_container_type": json_shape.get(
-            "json_container_type"
-        ),
+        "grok_side_channel_request_json_container_type": json_shape.get("json_container_type"),
     }
     if "top_level_key_types" in json_shape:
-        metadata["grok_side_channel_request_top_level_key_types"] = json_shape[
-            "top_level_key_types"
-        ]
+        metadata["grok_side_channel_request_top_level_key_types"] = json_shape["top_level_key_types"]
     if "array_length" in json_shape:
         metadata["grok_side_channel_request_array_length"] = json_shape["array_length"]
 
@@ -21943,17 +20754,13 @@ def _log_grok_forward_header_compare(
     endpoint: str,
     request: Request,
 ) -> None:
-    incoming_headers = {
-        str(header_name).lower()
-        for header_name in _safe_get_request_headers(request).keys()
-    }
+    incoming_headers = {str(header_name).lower() for header_name in _safe_get_request_headers(request).keys()}
     allowed_headers = {header.lower() for header in _GROK_CLI_FORWARD_HEADER_ALLOWLIST}
     forwarded_headers = sorted(incoming_headers & allowed_headers)
     stripped_headers = sorted(
         header
         for header in incoming_headers - allowed_headers
-        if header not in _GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE
-        and not header.startswith("x-pass-")
+        if header not in _GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE and not header.startswith("x-pass-")
     )
 
     if not stripped_headers and os.getenv("AAWM_GROK_ROUTE_DEBUG") != "1":
@@ -21977,9 +20784,7 @@ def create_request_copy(request: Request):
     }
 
 
-def is_passthrough_request_using_router_model(
-    request_body: dict, llm_router: Optional[litellm.Router]
-) -> bool:
+def is_passthrough_request_using_router_model(request_body: dict, llm_router: Optional[litellm.Router]) -> bool:
     """
     Returns True if the model is in the llm_router model names
     """
@@ -22015,16 +20820,12 @@ async def llm_passthrough_factory_proxy_route(
         model=None,
     )
     if provider_config is None:
-        raise HTTPException(
-            status_code=404, detail=f"Provider {custom_llm_provider} not found"
-        )
+        raise HTTPException(status_code=404, detail=f"Provider {custom_llm_provider} not found")
 
     base_target_url = provider_config.get_api_base()
 
     if base_target_url is None:
-        raise HTTPException(
-            status_code=404, detail=f"Provider {custom_llm_provider} api base not found"
-        )
+        raise HTTPException(status_code=404, detail=f"Provider {custom_llm_provider} api base not found")
 
     if _is_gemini_code_assist_endpoint(endpoint):
         encoded_endpoint = _normalize_gemini_code_assist_endpoint_path(endpoint)
@@ -22106,17 +20907,13 @@ async def gemini_proxy_route(
     [Docs](https://docs.litellm.ai/docs/pass_through/google_ai_studio)
     """
     ## CHECK FOR LITELLM API KEY IN THE QUERY PARAMS - ?..key=LITELLM_API_KEY
-    google_ai_studio_api_key = request.query_params.get("key") or request.headers.get(
-        "x-goog-api-key"
-    )
+    google_ai_studio_api_key = request.query_params.get("key") or request.headers.get("x-goog-api-key")
     # RR-054 #41: never synthesize "Bearer None" when the client omitted both key sources.
     auth_api_key: Optional[str]
     if isinstance(google_ai_studio_api_key, str) and google_ai_studio_api_key.strip():
         auth_api_key = f"Bearer {google_ai_studio_api_key.strip()}"
     else:
-        auth_api_key = request.headers.get("Authorization") or request.headers.get(
-            "authorization"
-        )
+        auth_api_key = request.headers.get("Authorization") or request.headers.get("authorization")
     if not isinstance(auth_api_key, str) or not auth_api_key.strip():
         raise HTTPException(
             status_code=401,
@@ -22171,13 +20968,10 @@ async def gemini_proxy_route(
         request_body = await get_request_body(request)
         if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and _is_google_oauth:
             debug_headers = _build_google_debug_header_summary(dict(request.headers))
-            debug_body_summary = _summarize_google_code_assist_request_shape(
-                request_body
-            )
+            debug_body_summary = _summarize_google_code_assist_request_shape(request_body)
             request_block = (
                 request_body.get("request")
-                if isinstance(request_body, dict)
-                and isinstance(request_body.get("request"), dict)
+                if isinstance(request_body, dict) and isinstance(request_body.get("request"), dict)
                 else request_body
             )
             function_names = _extract_google_code_assist_function_names(request_block)
@@ -22188,9 +20982,7 @@ async def gemini_proxy_route(
                 debug_body_summary,
                 function_names,
             )
-        prepared_request_body = _add_gemini_request_breakout_logging_metadata(
-            request_body
-        )
+        prepared_request_body = _add_gemini_request_breakout_logging_metadata(request_body)
         gemini_route_family = _get_gemini_passthrough_route_family(endpoint)
         if gemini_route_family is not None:
             prepared_request_body = _add_route_family_logging_metadata(
@@ -22214,9 +21006,7 @@ async def gemini_proxy_route(
         query_params=merged_params,
         egress_credential_family="google" if _is_google_oauth else None,
         expected_target_family="google",
-        allowed_forward_headers=(
-            list(_GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST) if _is_google_oauth else None
-        ),
+        allowed_forward_headers=(list(_GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST) if _is_google_oauth else None),
     )  # dynamically construct pass-through endpoint based on incoming path
     received_value = await endpoint_func(
         request,
@@ -22253,11 +21043,7 @@ async def opencode_zen_proxy_route(
         base_target_url=_get_opencode_zen_target_base(),
         endpoint=endpoint,
     )
-    query_params = {
-        key: value
-        for key, value in dict(request.query_params).items()
-        if str(key).lower() != "key"
-    }
+    query_params = {key: value for key, value in dict(request.query_params).items() if str(key).lower() != "key"}
 
     custom_body: Optional[dict[str, Any]] = None
     stream = False
@@ -22336,27 +21122,17 @@ async def antigravity_proxy_route(
     if has_google_oauth_bearer:
         custom_headers = {}
     else:
-        local_antigravity_access_token = (
-            await _load_valid_local_antigravity_access_token()
-        )
-        custom_headers = _build_antigravity_native_headers(
-            local_antigravity_access_token
-        )
+        local_antigravity_access_token = await _load_valid_local_antigravity_access_token()
+        custom_headers = _build_antigravity_native_headers(local_antigravity_access_token)
 
     target_url = _join_antigravity_passthrough_url(
         base_target_url=_get_antigravity_passthrough_target_base(),
         endpoint=endpoint,
     )
-    query_params = {
-        key: value
-        for key, value in dict(request.query_params).items()
-        if str(key).lower() != "key"
-    }
+    query_params = {key: value for key, value in dict(request.query_params).items() if str(key).lower() != "key"}
 
     custom_body: Optional[dict[str, Any]] = None
-    passthrough_logging_metadata = _get_antigravity_passthrough_logging_metadata(
-        request
-    )
+    passthrough_logging_metadata = _get_antigravity_passthrough_logging_metadata(request)
     if request.method in {"POST", "PUT", "PATCH"}:
         request_body = await get_request_body(request)
         if isinstance(request_body, dict):
@@ -22365,10 +21141,7 @@ async def antigravity_proxy_route(
                 request_body=request_body,
             )
             request_project = _get_antigravity_request_project(request_body)
-            if (
-                local_antigravity_access_token is not None
-                and request_project is not None
-            ):
+            if local_antigravity_access_token is not None and request_project is not None:
                 google_quota_observation = await _prime_google_code_assist_session(
                     local_antigravity_access_token,
                     request_project,
@@ -22380,9 +21153,7 @@ async def antigravity_proxy_route(
                         {},
                     )
                     if isinstance(litellm_metadata, dict):
-                        litellm_metadata[
-                            "google_retrieve_user_quota"
-                        ] = google_quota_observation
+                        litellm_metadata["google_retrieve_user_quota"] = google_quota_observation
             if custom_body is not request_body:
                 _safe_set_request_parsed_body(request, custom_body)
             custom_metadata = custom_body.get("litellm_metadata")
@@ -22401,11 +21172,7 @@ async def antigravity_proxy_route(
         custom_llm_provider="antigravity",
         egress_credential_family="google",
         expected_target_family="google",
-        allowed_forward_headers=(
-            list(_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST)
-            if has_google_oauth_bearer
-            else None
-        ),
+        allowed_forward_headers=(list(_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST) if has_google_oauth_bearer else None),
         passthrough_logging_metadata=passthrough_logging_metadata,
     )
 
@@ -22428,13 +21195,9 @@ async def grok_proxy_route(
     `key` query parameter so the upstream Authorization header can remain intact.
     """
     is_storage_endpoint = _is_grok_storage_endpoint(endpoint)
-    is_coding_data_retention_endpoint = _is_grok_coding_data_retention_endpoint(
-        endpoint
-    )
+    is_coding_data_retention_endpoint = _is_grok_coding_data_retention_endpoint(endpoint)
     raw_body_passthrough = request.method in {"POST", "PUT", "PATCH"} and (
-        is_storage_endpoint
-        or is_coding_data_retention_endpoint
-        or not _is_grok_json_request(request)
+        is_storage_endpoint or is_coding_data_retention_endpoint or not _is_grok_json_request(request)
     )
     if raw_body_passthrough:
         _safe_set_request_parsed_body(request, {})
@@ -22485,15 +21248,10 @@ async def grok_proxy_route(
                 custom_metadata = custom_body.get("litellm_metadata")
                 if isinstance(custom_metadata, dict):
                     passthrough_logging_metadata = dict(custom_metadata)
-                    grok_model_override = normalize_grok_native_oauth_model(
-                        custom_metadata.get("grok_model_override")
-                    )
-                    if (
-                        grok_model_override is not None
-                        and not _get_case_insensitive_header(
-                            _safe_get_request_headers(request),
-                            "x-grok-model-override",
-                        )
+                    grok_model_override = normalize_grok_native_oauth_model(custom_metadata.get("grok_model_override"))
+                    if grok_model_override is not None and not _get_case_insensitive_header(
+                        _safe_get_request_headers(request),
+                        "x-grok-model-override",
                     ):
                         custom_headers["x-grok-model-override"] = grok_model_override
         elif _get_grok_side_channel_endpoint_type(endpoint) is not None:
@@ -22506,40 +21264,24 @@ async def grok_proxy_route(
         raw_body=upstream_raw_body_for_shape,
     )
     if side_channel_shape_metadata:
-        passthrough_logging_metadata = (
-            _merge_grok_side_channel_shape_into_passthrough_logging_metadata(
-                passthrough_logging_metadata,
-                shape_metadata=side_channel_shape_metadata,
-            )
+        passthrough_logging_metadata = _merge_grok_side_channel_shape_into_passthrough_logging_metadata(
+            passthrough_logging_metadata,
+            shape_metadata=side_channel_shape_metadata,
         )
         side_channel_shape_log = (
-            verbose_proxy_logger.info
-            if os.getenv("AAWM_GROK_ROUTE_DEBUG") == "1"
-            else verbose_proxy_logger.debug
+            verbose_proxy_logger.info if os.getenv("AAWM_GROK_ROUTE_DEBUG") == "1" else verbose_proxy_logger.debug
         )
         side_channel_shape_log(
             "Grok passthrough side-channel request shape: endpoint_type=%s body_byte_length=%s body_sha256=%s json_container_type=%s top_level_key_types=%s",
             side_channel_shape_metadata.get("grok_side_channel_endpoint_type"),
-            side_channel_shape_metadata.get(
-                "grok_side_channel_request_body_byte_length"
-            ),
+            side_channel_shape_metadata.get("grok_side_channel_request_body_byte_length"),
             side_channel_shape_metadata.get("grok_side_channel_request_body_sha256"),
-            side_channel_shape_metadata.get(
-                "grok_side_channel_request_json_container_type"
-            ),
-            side_channel_shape_metadata.get(
-                "grok_side_channel_request_top_level_key_types"
-            ),
+            side_channel_shape_metadata.get("grok_side_channel_request_json_container_type"),
+            side_channel_shape_metadata.get("grok_side_channel_request_top_level_key_types"),
         )
 
-    query_params = {
-        key: value
-        for key, value in dict(request.query_params).items()
-        if str(key).lower() != "key"
-    }
-    grok_side_channel_retryable_status_codes = (
-        _get_grok_side_channel_retryable_status_codes(endpoint)
-    )
+    query_params = {key: value for key, value in dict(request.query_params).items() if str(key).lower() != "key"}
+    grok_side_channel_retryable_status_codes = _get_grok_side_channel_retryable_status_codes(endpoint)
 
     return await pass_through_request(
         request=request,
@@ -22630,9 +21372,7 @@ async def vllm_proxy_route(
     from litellm.proxy.proxy_server import llm_router
 
     request_body = await get_request_body(request)
-    is_router_model = is_passthrough_request_using_router_model(
-        request_body, llm_router
-    )
+    is_router_model = is_passthrough_request_using_router_model(request_body, llm_router)
     is_streaming_request = is_passthrough_request_streaming(request_body)
     if is_router_model and llm_router:
         result = cast(
@@ -22647,11 +21387,7 @@ async def vllm_proxy_route(
                 content=None,
                 data=None,
                 files=None,
-                json=(
-                    request_body
-                    if request.headers.get("content-type") == "application/json"
-                    else None
-                ),
+                json=(request_body if request.headers.get("content-type") == "application/json" else None),
                 params=None,
                 headers=None,
                 cookies=None,
@@ -22757,9 +21493,7 @@ async def milvus_proxy_route(
     Enable using Milvus `/vectors` endpoint as a pass-through endpoint.
     """
 
-    provider_config = ProviderConfigManager.get_provider_vector_stores_config(
-        provider=LlmProviders.MILVUS
-    )
+    provider_config = ProviderConfigManager.get_provider_vector_stores_config(provider=LlmProviders.MILVUS)
     if not provider_config:
         raise HTTPException(
             status_code=500,
@@ -22805,11 +21539,7 @@ async def milvus_proxy_route(
     # get the vector store name from index registry
 
     index_object = (
-        (
-            litellm.vector_store_index_registry.get_vector_store_index_by_name(
-                vector_store_index_name=collection_name
-            )
-        )
+        (litellm.vector_store_index_registry.get_vector_store_index_by_name(vector_store_index_name=collection_name))
         if litellm.vector_store_index_registry is not None
         else None
     )
@@ -22830,9 +21560,7 @@ async def milvus_proxy_route(
     if vector_store is None:
         raise Exception(f"Vector store not found for {vector_store_name}")
     litellm_params = vector_store.get("litellm_params") or {}
-    auth_credentials = provider_config.get_auth_credentials(
-        litellm_params=litellm_params
-    )
+    auth_credentials = provider_config.get_auth_credentials(litellm_params=litellm_params)
 
     extra_headers = auth_credentials.get("headers") or {}
 
@@ -22843,9 +21571,7 @@ async def milvus_proxy_route(
     )
 
     if base_target_url is None:
-        raise Exception(
-            f"api_base not found in vector store configuration for {vector_store_name}"
-        )
+        raise Exception(f"api_base not found in vector store configuration for {vector_store_name}")
 
     encoded_endpoint = httpx.URL(endpoint).path
 
@@ -22888,9 +21614,7 @@ async def _dispatch_auto_agent_alias_candidate_request(
     candidate: Payload,
     provider_handlers: Mapping[str, Callable[[], Awaitable[Response]]],
     default_handler: Callable[[], Awaitable[Response]],
-    route_family_handlers: Optional[
-        Mapping[str, Mapping[str, Callable[[], Awaitable[Response]]]]
-    ] = None,
+    route_family_handlers: Optional[Mapping[str, Mapping[str, Callable[[], Awaitable[Response]]]]] = None,
 ) -> Response:
     """Table-driven provider/route_family candidate dispatch (RR-054 #10).
 
@@ -23115,9 +21839,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
     register_aawm_route_rollup_access_log_replacement(request)
     attempts: list[dict[str, Any]] = []
     last_retryable_exc: Optional[Exception] = None
-    has_continuation_state = _codex_auto_agent_request_has_continuation_state(
-        prepared_request_body
-    )
+    has_continuation_state = _codex_auto_agent_request_has_continuation_state(prepared_request_body)
     native_grok_continuation_transient_max_attempts = (
         _get_codex_auto_agent_native_grok_continuation_transient_max_attempts()
     )
@@ -23177,10 +21899,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                 request_body=prepared_request_body,
             )
         except HTTPException as exc:
-            if (
-                exc.status_code == 429
-                and not _is_auto_agent_alias_in_flight_cooldown_http_exception(exc)
-            ):
+            if exc.status_code == 429 and not _is_auto_agent_alias_in_flight_cooldown_http_exception(exc):
                 _emit_auto_agent_alias_no_candidate_event(
                     alias_family=alias_family,
                     alias_model=alias_model,
@@ -23216,11 +21935,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                 skip_after_probe_wait = False
                 await probe_lock.acquire()
                 try:
-                    active_seconds, _active_source = (
-                        await get_active_cooldown_state_fn(
-                            selection["cooldown_key"]
-                        )
-                    )
+                    active_seconds, _active_source = await get_active_cooldown_state_fn(selection["cooldown_key"])
                     if active_seconds > 0:
                         skip_after_probe_wait = True
                         attempt_record["status"] = "skipped_single_flight_cooldown"
@@ -23244,19 +21959,15 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     exc,
                     candidate=candidate,
                 )
-                error_class = _classify_kimi_code_auto_agent_probe_failure(
-                    kimi_failure_metadata
-                )
+                error_class = _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
                 if error_class is None:
                     error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
                 if error_class is None:
                     raise
                 last_retryable_exc = exc
-                grok_account_quota_exhausted = (
-                    _is_codex_auto_agent_grok_account_quota_exhaustion(
-                        exc,
-                        candidate=candidate,
-                    )
+                grok_account_quota_exhausted = _is_codex_auto_agent_grok_account_quota_exhaustion(
+                    exc,
+                    candidate=candidate,
                 )
                 cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
                     exc,
@@ -23332,18 +22043,14 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                         skipped_candidates=failure_metadata.get(skipped_candidates_metadata_key),
                     )
                 native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
-                    is_native_grok_4_5_candidate=(
-                        _is_codex_auto_agent_native_grok_4_5_candidate(candidate)
-                    ),
+                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
                     has_continuation_state=has_continuation_state,
                     error_class=error_class,
                     cooldown_scope=cooldown_scope,
                 )
                 if native_grok_retry_eligible:
                     native_grok_continuation_transient_provider_attempts += 1
-                    native_grok_provider_attempt = (
-                        native_grok_continuation_transient_provider_attempts
-                    )
+                    native_grok_provider_attempt = native_grok_continuation_transient_provider_attempts
                 else:
                     native_grok_provider_attempt = 0
                 (
@@ -23362,9 +22069,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     max_attempts=native_grok_continuation_transient_max_attempts,
                 )
                 if native_grok_retry_metadata is not None:
-                    attempt_record[
-                        "native_grok_continuation_retry"
-                    ] = native_grok_retry_metadata
+                    attempt_record["native_grok_continuation_retry"] = native_grok_retry_metadata
                 _record_auto_agent_alias_attempt_failure(
                     alias_family=alias_family,
                     alias_model=alias_model,
@@ -23377,8 +22082,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     add_alias_metadata_fn=add_alias_metadata_fn,
                 )
                 verbose_proxy_logger.debug(
-                    "%s auto-agent alias %s target %s/%s hit %s on attempt %s; "
-                    "cooldown %.1fs scope=%s tokens=%s",
+                    "%s auto-agent alias %s target %s/%s hit %s on attempt %s; " "cooldown %.1fs scope=%s tokens=%s",
                     log_label,
                     alias_model,
                     candidate["provider"],
@@ -23390,10 +22094,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     sorted(error_tokens),
                 )
                 if should_retry_same_candidate:
-                    if (
-                        same_candidate_backoff_seconds
-                        and same_candidate_backoff_seconds > 0
-                    ):
+                    if same_candidate_backoff_seconds and same_candidate_backoff_seconds > 0:
                         await asyncio.sleep(same_candidate_backoff_seconds)
                     attempt_record = _codex_auto_agent_candidate_public_shape(
                         candidate,
@@ -23461,15 +22162,11 @@ async def _handle_anthropic_auto_agent_alias_route(
         alias_model=alias_model,
         request=request,
         prepared_request_body=prepared_request_body,
-        max_candidate_attempts=len(
-            _get_anthropic_auto_agent_candidates_for_alias(alias_model)
-        ),
+        max_candidate_attempts=len(_get_anthropic_auto_agent_candidates_for_alias(alias_model)),
         select_candidate_fn=_select_anthropic_auto_agent_candidate,
         add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
         perform_candidate_request_fn=_perform_candidate_request,
-        get_active_cooldown_state_fn=(
-            _get_anthropic_auto_agent_active_cooldown_state
-        ),
+        get_active_cooldown_state_fn=(_get_anthropic_auto_agent_active_cooldown_state),
         set_session_affinity_fn=_set_anthropic_auto_agent_session_affinity,
         apply_cooldown_fn=_apply_anthropic_auto_agent_alias_cooldown,
         raise_redispatch_required_fn=_raise_anthropic_auto_agent_redispatch_required,
@@ -23511,9 +22208,7 @@ _ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX = "[1m]"
 _ANTHROPIC_CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07"
 _ANTHROPIC_BETA_HEADER_NAME = "anthropic-beta"
 _ANTHROPIC_BETA_XPASS_HEADER_NAME = f"x-pass-{_ANTHROPIC_BETA_HEADER_NAME}"
-_ANTHROPIC_DANGEROUS_DIRECT_BROWSER_ACCESS_HEADER_NAME = (
-    "anthropic-dangerous-direct-browser-access"
-)
+_ANTHROPIC_DANGEROUS_DIRECT_BROWSER_ACCESS_HEADER_NAME = "anthropic-dangerous-direct-browser-access"
 _ANTHROPIC_NATIVE_PASSTHROUGH_MODEL_ALIASES = {
     "opus": "claude-opus-4-6",
     "opus-4-6": "claude-opus-4-6",
@@ -23551,23 +22246,15 @@ def _append_anthropic_beta_header_value(
     beta_value: str,
 ) -> dict[str, Any]:
     existing_header_name = next(
-        (
-            header_name
-            for header_name in headers
-            if str(header_name).lower() == _ANTHROPIC_BETA_HEADER_NAME
-        ),
+        (header_name for header_name in headers if str(header_name).lower() == _ANTHROPIC_BETA_HEADER_NAME),
         None,
     )
-    existing_beta = (
-        headers.pop(existing_header_name) if existing_header_name is not None else None
-    )
+    existing_beta = headers.pop(existing_header_name) if existing_header_name is not None else None
     if existing_beta is None:
         headers[_ANTHROPIC_BETA_HEADER_NAME] = beta_value
         return headers
 
-    existing_values = [
-        value.strip() for value in str(existing_beta).split(",") if value.strip()
-    ]
+    existing_values = [value.strip() for value in str(existing_beta).split(",") if value.strip()]
     if beta_value not in existing_values:
         existing_values.append(beta_value)
     headers[_ANTHROPIC_BETA_HEADER_NAME] = ", ".join(existing_values)
@@ -23621,9 +22308,7 @@ def _normalize_anthropic_native_passthrough_model_alias(
         suffix = stripped_model[-len(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX) :]
         alias_model = stripped_model[: -len(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX)].strip()
 
-    normalized_model = _ANTHROPIC_NATIVE_PASSTHROUGH_MODEL_ALIASES.get(
-        alias_model.lower()
-    )
+    normalized_model = _ANTHROPIC_NATIVE_PASSTHROUGH_MODEL_ALIASES.get(alias_model.lower())
     if normalized_model is None:
         return request_body, False
 
@@ -23748,11 +22433,7 @@ async def anthropic_proxy_route(  # noqa: PLR0915
     )
 
     custom_headers = {}
-    if (
-        "authorization" not in request.headers
-        and "x-api-key" not in request.headers
-        and anthropic_api_key is not None
-    ):
+    if "authorization" not in request.headers and "x-api-key" not in request.headers and anthropic_api_key is not None:
         custom_headers["x-api-key"] = "{}".format(anthropic_api_key)
     (
         custom_headers,
@@ -23826,11 +22507,9 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 adapter_model=xai_oauth_adapter_model,
             )
 
-        grok_native_oauth_adapter_model = (
-            _resolve_anthropic_grok_native_oauth_adapter_model(
-                prepared_request_body,
-                endpoint=encoded_endpoint,
-            )
+        grok_native_oauth_adapter_model = _resolve_anthropic_grok_native_oauth_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
         )
         if grok_native_oauth_adapter_model is not None:
             return await _handle_anthropic_grok_native_oauth_responses_adapter_route(
@@ -23856,11 +22535,9 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 adapter_model=adapter_model,
             )
 
-        antigravity_adapter_model = (
-            _resolve_anthropic_antigravity_code_assist_adapter_model(
-                prepared_request_body,
-                endpoint=encoded_endpoint,
-            )
+        antigravity_adapter_model = _resolve_anthropic_antigravity_code_assist_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
         )
         if antigravity_adapter_model is not None:
             return await _handle_anthropic_google_completion_adapter_route(
@@ -23887,11 +22564,9 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 adapter_model=opencode_zen_adapter_model,
             )
 
-        kimi_code_adapter_model = (
-            _resolve_anthropic_kimi_chat_completions_adapter_model(
-                prepared_request_body,
-                endpoint=encoded_endpoint,
-            )
+        kimi_code_adapter_model = _resolve_anthropic_kimi_chat_completions_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
         )
         if kimi_code_adapter_model is not None:
             return await _handle_anthropic_kimi_chat_completions_adapter_route(
@@ -23903,11 +22578,9 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 adapter_model=kimi_code_adapter_model,
             )
 
-        alibaba_token_plan_adapter_model = (
-            _resolve_anthropic_alibaba_token_plan_adapter_model(
-                prepared_request_body,
-                endpoint=encoded_endpoint,
-            )
+        alibaba_token_plan_adapter_model = _resolve_anthropic_alibaba_token_plan_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
         )
         if alibaba_token_plan_adapter_model is not None:
             return await _handle_anthropic_alibaba_token_plan_adapter_route(
@@ -23947,11 +22620,9 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 adapter_model=nvidia_adapter_model,
             )
 
-        openrouter_completion_adapter_model = (
-            _resolve_anthropic_openrouter_completion_adapter_model(
-                prepared_request_body,
-                endpoint=encoded_endpoint,
-            )
+        openrouter_completion_adapter_model = _resolve_anthropic_openrouter_completion_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
         )
         if openrouter_completion_adapter_model is not None:
             return await _handle_anthropic_openrouter_completion_adapter_route(
@@ -23963,11 +22634,9 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 adapter_model=openrouter_completion_adapter_model,
             )
 
-        openrouter_adapter_model = (
-            _resolve_anthropic_openrouter_responses_adapter_model(
-                prepared_request_body,
-                endpoint=encoded_endpoint,
-            )
+        openrouter_adapter_model = _resolve_anthropic_openrouter_responses_adapter_model(
+            prepared_request_body,
+            endpoint=encoded_endpoint,
         )
         if openrouter_adapter_model is not None:
             return await _handle_anthropic_openrouter_responses_adapter_route(
@@ -24216,9 +22885,7 @@ async def handle_bedrock_count_tokens(
         # Extract model from request body
         model = request_body.get("model")
         if not model:
-            raise HTTPException(
-                status_code=400, detail={"error": "Model is required in request body"}
-            )
+            raise HTTPException(status_code=400, detail={"error": "Model is required in request body"})
 
         # Get model parameters from router
         litellm_params = {"user_api_key_dict": user_api_key_dict}
@@ -24254,18 +22921,14 @@ async def handle_bedrock_count_tokens(
 
     except BedrockError as e:
         # Convert BedrockError to HTTPException for FastAPI
-        verbose_proxy_logger.error(
-            f"BedrockError in handle_bedrock_count_tokens: {str(e)}"
-        )
+        verbose_proxy_logger.error(f"BedrockError in handle_bedrock_count_tokens: {str(e)}")
         raise HTTPException(status_code=e.status_code, detail={"error": e.message})
     except HTTPException:
         # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
         verbose_proxy_logger.error(f"Error in handle_bedrock_count_tokens: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail={"error": f"CountTokens processing error: {str(e)}"}
-        )
+        raise HTTPException(status_code=500, detail={"error": f"CountTokens processing error: {str(e)}"})
 
 
 async def bedrock_llm_proxy_route(
@@ -24323,9 +22986,7 @@ async def bedrock_llm_proxy_route(
         )
 
     # Check if this is a router model (from config.yaml)
-    is_router_model = is_passthrough_request_using_router_model(
-        request_body={"model": model}, llm_router=llm_router
-    )
+    is_router_model = is_passthrough_request_using_router_model(request_body={"model": model}, llm_router=llm_router)
 
     # If router model, use dedicated router passthrough handler
     # This uses the same common processing path as non-router models
@@ -24350,9 +23011,7 @@ async def bedrock_llm_proxy_route(
         )
 
     # Fall back to existing implementation for direct Bedrock models
-    verbose_proxy_logger.debug(
-        f"Bedrock passthrough: Using direct Bedrock model '{model}' for endpoint '{endpoint}'"
-    )
+    verbose_proxy_logger.debug(f"Bedrock passthrough: Using direct Bedrock model '{model}' for endpoint '{endpoint}'")
 
     data: Dict[str, Any] = {}
     base_llm_response_processor = ProxyBaseLLMRequestProcessing(data=data)
@@ -24417,9 +23076,7 @@ async def bedrock_proxy_route(
 
     aws_region_name = litellm.utils.get_secret(secret_name="AWS_REGION_NAME")
     if _is_bedrock_agent_runtime_route(endpoint=endpoint):  # handle bedrock agents
-        base_target_url = (
-            f"https://bedrock-agent-runtime.{aws_region_name}.amazonaws.com"
-        )
+        base_target_url = f"https://bedrock-agent-runtime.{aws_region_name}.amazonaws.com"
     else:
         return await bedrock_llm_proxy_route(
             endpoint=endpoint,
@@ -24449,9 +23106,7 @@ async def bedrock_proxy_route(
         data = await request.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": e})
-    _request = AWSRequest(
-        method="POST", url=str(updated_url), data=json.dumps(data), headers=headers
-    )
+    _request = AWSRequest(method="POST", url=str(updated_url), data=json.dumps(data), headers=headers)
     sigv4.add_auth(_request)
     prepped = _request.prepare()
 
@@ -24505,9 +23160,7 @@ def _resolve_vertex_model_from_router(
         return encoded_endpoint, endpoint, vertex_project, vertex_location
 
     try:
-        deployment = llm_router.get_available_deployment_for_pass_through(
-            model=model_id
-        )
+        deployment = llm_router.get_available_deployment_for_pass_through(model=model_id)
         if not deployment:
             return encoded_endpoint, endpoint, vertex_project, vertex_location
 
@@ -24528,9 +23181,7 @@ def _resolve_vertex_model_from_router(
             # get_llm_provider returns (model, custom_llm_provider, dynamic_api_key, api_base)
             # For "vertex_ai/gemini-2.0-flash-exp" it returns:
             # model="gemini-2.0-flash-exp", custom_llm_provider="vertex_ai"
-            actual_model, custom_llm_provider, _, _ = get_llm_provider(
-                model=model_from_config
-            )
+            actual_model, custom_llm_provider, _, _ = get_llm_provider(model=model_from_config)
 
             # Log only non-sensitive information (model names and provider), never API keys or secrets.
             safe_actual_model = actual_model
@@ -24555,9 +23206,7 @@ def _resolve_vertex_model_from_router(
                 endpoint = endpoint.replace(model_id, actual_model)
 
     except Exception as e:
-        verbose_proxy_logger.debug(
-            f"Error resolving vertex model from router for model {model_id}: {e}"
-        )
+        verbose_proxy_logger.debug(f"Error resolving vertex model from router for model {model_id}: {e}")
 
     return encoded_endpoint, endpoint, vertex_project, vertex_location
 
@@ -24596,14 +23245,8 @@ async def assemblyai_proxy_route(
     [Docs](https://api.assemblyai.com)
     """
     # Set base URL based on the route
-    assembly_region = AssemblyAIPassthroughLoggingHandler._get_assembly_region_from_url(
-        url=str(request.url)
-    )
-    base_target_url = (
-        AssemblyAIPassthroughLoggingHandler._get_assembly_base_url_from_region(
-            region=assembly_region
-        )
-    )
+    assembly_region = AssemblyAIPassthroughLoggingHandler._get_assembly_region_from_url(url=str(request.url))
+    base_target_url = AssemblyAIPassthroughLoggingHandler._get_assembly_base_url_from_region(region=assembly_region)
     encoded_endpoint = httpx.URL(endpoint).path
     # Ensure endpoint starts with '/' for proper URL construction
     if not encoded_endpoint.startswith("/"):
@@ -24680,11 +23323,7 @@ async def azure_proxy_route(
             )
             # check if vector store index
             is_vector_store_index = (
-                (
-                    litellm.vector_store_index_registry.is_vector_store_index(
-                        vector_store_index_name=part
-                    )
-                )
+                (litellm.vector_store_index_registry.is_vector_store_index(vector_store_index_name=part))
                 if litellm.vector_store_index_registry is not None
                 else False
             )
@@ -24702,11 +23341,7 @@ async def azure_proxy_route(
                     content=None,
                     data=None,
                     files=None,
-                    json=(
-                        request_body
-                        if request.headers.get("content-type") == "application/json"
-                        else None
-                    ),
+                    json=(request_body if request.headers.get("content-type") == "application/json" else None),
                     params=None,
                     headers=None,
                     cookies=None,
@@ -24748,10 +23383,8 @@ async def azure_proxy_route(
                 )
             elif is_vector_store_index:
                 # get the api key from the provider config
-                provider_config = (
-                    ProviderConfigManager.get_provider_vector_stores_config(
-                        provider=litellm.LlmProviders.AZURE_AI
-                    )
+                provider_config = ProviderConfigManager.get_provider_vector_stores_config(
+                    provider=litellm.LlmProviders.AZURE_AI
                 )
                 if provider_config is None:
                     raise Exception("Provider config not found for Azure AI")
@@ -24767,11 +23400,7 @@ async def azure_proxy_route(
                 )
                 # get the vector store name from index registry
                 index_object = (
-                    (
-                        litellm.vector_store_index_registry.get_vector_store_index_by_name(
-                            vector_store_index_name=part
-                        )
-                    )
+                    (litellm.vector_store_index_registry.get_vector_store_index_by_name(vector_store_index_name=part))
                     if litellm.vector_store_index_registry is not None
                     else None
                 )
@@ -24786,9 +23415,7 @@ async def azure_proxy_route(
                 if vector_store is None:
                     raise Exception(f"Vector store not found for {vector_store_name}")
                 litellm_params = vector_store.get("litellm_params") or {}
-                auth_credentials = provider_config.get_auth_credentials(
-                    litellm_params=litellm_params
-                )
+                auth_credentials = provider_config.get_auth_credentials(litellm_params=litellm_params)
 
                 extra_headers = auth_credentials.get("headers") or {}
 
@@ -24808,18 +23435,14 @@ async def azure_proxy_route(
 
     base_target_url = get_secret_str(secret_name="AZURE_API_BASE")
     if base_target_url is None:
-        raise Exception(
-            "Required 'AZURE_API_BASE' in environment to make pass-through calls to Azure."
-        )
+        raise Exception("Required 'AZURE_API_BASE' in environment to make pass-through calls to Azure.")
     # Add or update query parameters
     azure_api_key = passthrough_endpoint_router.get_credentials(
         custom_llm_provider=litellm.LlmProviders.AZURE.value,
         region_name=None,
     )
     if azure_api_key is None:
-        raise Exception(
-            "Required 'AZURE_API_KEY' in environment to make pass-through calls to Azure."
-        )
+        raise Exception("Required 'AZURE_API_KEY' in environment to make pass-through calls to Azure.")
 
     return await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
         endpoint=endpoint,
@@ -24843,9 +23466,7 @@ class BaseVertexAIPassThroughHandler(ABC):
 
     @staticmethod
     @abstractmethod
-    def update_base_target_url_with_credential_location(
-        base_target_url: str, vertex_location: Optional[str]
-    ) -> str:
+    def update_base_target_url_with_credential_location(base_target_url: str, vertex_location: Optional[str]) -> str:
         pass
 
 
@@ -24855,9 +23476,7 @@ class VertexAIDiscoveryPassThroughHandler(BaseVertexAIPassThroughHandler):
         return "https://discoveryengine.googleapis.com/"
 
     @staticmethod
-    def update_base_target_url_with_credential_location(
-        base_target_url: str, vertex_location: Optional[str]
-    ) -> str:
+    def update_base_target_url_with_credential_location(base_target_url: str, vertex_location: Optional[str]) -> str:
         return base_target_url
 
 
@@ -24867,9 +23486,7 @@ class VertexAIPassThroughHandler(BaseVertexAIPassThroughHandler):
         return get_vertex_base_url(vertex_location)
 
     @staticmethod
-    def update_base_target_url_with_credential_location(
-        base_target_url: str, vertex_location: Optional[str]
-    ) -> str:
+    def update_base_target_url_with_credential_location(base_target_url: str, vertex_location: Optional[str]) -> str:
         return get_vertex_base_url(vertex_location)
 
 
@@ -24933,15 +23550,11 @@ def _override_vertex_params_from_router_credentials(
     if router_credentials is None:
         return vertex_project, vertex_location
 
-    verbose_proxy_logger.debug(
-        "Using vector store credentials to override vertex project and location"
-    )
+    verbose_proxy_logger.debug("Using vector store credentials to override vertex project and location")
 
     litellm_params = router_credentials.get("litellm_params", {})
     if not litellm_params:
-        verbose_proxy_logger.warning(
-            "Vector store credentials found but litellm_params is empty"
-        )
+        verbose_proxy_logger.warning("Vector store credentials found but litellm_params is empty")
         return vertex_project, vertex_location
 
     # Extract vertex_project and vertex_location from litellm_params
@@ -24956,9 +23569,7 @@ def _override_vertex_params_from_router_credentials(
         )
         vertex_project = vector_store_project
     else:
-        verbose_proxy_logger.warning(
-            "Vector store credentials found but missing vertex_project in litellm_params"
-        )
+        verbose_proxy_logger.warning("Vector store credentials found but missing vertex_project in litellm_params")
 
     if vector_store_location:
         verbose_proxy_logger.debug(
@@ -24968,9 +23579,7 @@ def _override_vertex_params_from_router_credentials(
         )
         vertex_location = vector_store_location
     else:
-        verbose_proxy_logger.warning(
-            "Vector store credentials found but missing vertex_location in litellm_params"
-        )
+        verbose_proxy_logger.warning("Vector store credentials found but missing vertex_location in litellm_params")
 
     return vertex_project, vertex_location
 
@@ -25008,14 +23617,10 @@ async def _prepare_vertex_auth_headers(
     headers_passed_through = False
 
     # Use headers from the incoming request if no vertex credentials are found
-    if (
-        vertex_credentials is None or vertex_credentials.vertex_project is None
-    ) and router_credentials is None:
+    if (vertex_credentials is None or vertex_credentials.vertex_project is None) and router_credentials is None:
         headers = _safe_get_request_headers(request).copy()
         headers_passed_through = True
-        verbose_proxy_logger.debug(
-            "default_vertex_config  not set, incoming request headers %s", headers
-        )
+        verbose_proxy_logger.debug("default_vertex_config  not set, incoming request headers %s", headers)
         headers.pop("content-length", None)
         headers.pop("host", None)
     else:
@@ -25145,9 +23750,7 @@ async def _base_vertex_proxy_route(
         location=vertex_location,
     )
 
-    base_target_url = get_vertex_pass_through_handler.get_default_base_target_url(
-        vertex_location
-    )
+    base_target_url = get_vertex_pass_through_handler.get_default_base_target_url(vertex_location)
 
     # Prepare authentication headers
     (
@@ -25242,21 +23845,15 @@ async def vertex_discovery_proxy_route(
 
     if vector_store_id_match:
         vector_store_id = vector_store_id_match.group(1)
-        verbose_proxy_logger.debug(
-            "Extracted vector store ID from endpoint: %s", vector_store_id
-        )
+        verbose_proxy_logger.debug("Extracted vector store ID from endpoint: %s", vector_store_id)
 
         # Retrieve vector store credentials from the registry
-        vector_store_credentials = (
-            passthrough_endpoint_router.get_vector_store_credentials(
-                vector_store_id=vector_store_id
-            )
+        vector_store_credentials = passthrough_endpoint_router.get_vector_store_credentials(
+            vector_store_id=vector_store_id
         )
 
         if vector_store_credentials:
-            verbose_proxy_logger.debug(
-                "Found vector store credentials for ID: %s", vector_store_id
-            )
+            verbose_proxy_logger.debug("Found vector store credentials for ID: %s", vector_store_id)
         else:
             verbose_proxy_logger.warning(
                 "Vector store ID %s found in endpoint but no credentials found in registry",
@@ -25351,9 +23948,9 @@ async def openai_proxy_route(
     if request.method == "POST":
         request_body = await get_request_body(request)
         is_oa_xai_request = _is_oa_xai_request_body(request_body)
-        is_grok_native_oauth_request = _is_openai_responses_endpoint(
-            endpoint
-        ) and _is_grok_native_oauth_request_body(request_body)
+        is_grok_native_oauth_request = _is_openai_responses_endpoint(endpoint) and _is_grok_native_oauth_request_body(
+            request_body
+        )
 
     base_target_url = _get_openai_passthrough_target_base(
         request=request,
@@ -25377,9 +23974,7 @@ async def openai_proxy_route(
             region_name=None,
         )
         if openai_api_key is None:
-            raise Exception(
-                "Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI."
-            )
+            raise Exception("Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI.")
 
     return await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
         endpoint=endpoint,
@@ -25420,9 +24015,7 @@ async def _perform_codex_auto_agent_native_openai_request(
             egress_credential_family="openai" if forward_headers else None,
             expected_target_family="openai",
             # RR-054 #24
-            retryable_upstream_status_codes=list(
-                _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT
-            ),
+            retryable_upstream_status_codes=list(_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT),
             caller_managed_hidden_retry=False,
         )
     except Exception as exc:
@@ -25455,10 +24048,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         raise
     if grok_context is None:
         _raise_grok_native_auto_agent_candidate_unavailable(
-            Exception(
-                "Grok native Codex auto-agent candidate requires a managed "
-                "Grok OIDC credential."
-            )
+            Exception("Grok native Codex auto-agent candidate requires a managed " "Grok OIDC credential.")
         )
     assert grok_context is not None
     _, grok_headers, grok_prepared_body, updated_url = grok_context
@@ -25486,11 +24076,7 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         raise
     return await _validate_codex_auto_agent_responses_payload(
         response,
-        adapter_model=str(
-            grok_prepared_body.get("model")
-            or request_body.get("model")
-            or "unknown-model"
-        ),
+        adapter_model=str(grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_grok_native_responses",
         adapter_label="Grok native",
         intake_context=_build_malformed_tool_call_intake_context(
@@ -25516,11 +24102,9 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         _adapted_custom_tools,
     ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
     try:
-        oa_xai_context = (
-            await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
-                endpoint=endpoint,
-                request_body=adapted_request_body,
-            )
+        oa_xai_context = await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
+            endpoint=endpoint,
+            request_body=adapted_request_body,
         )
     except Exception as exc:
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
@@ -25528,10 +24112,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         raise
     if oa_xai_context is None:
         _raise_xai_oauth_auto_agent_candidate_unavailable(
-            Exception(
-                "Codex auto-agent xAI OAuth candidate requires a managed xAI "
-                "OAuth credential."
-            )
+            Exception("Codex auto-agent xAI OAuth candidate requires a managed xAI " "OAuth credential.")
         )
     assert oa_xai_context is not None
     _, oa_xai_api_key, oa_xai_prepared_body, updated_url = oa_xai_context
@@ -25562,11 +24143,7 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         raise
     return await _validate_codex_auto_agent_responses_payload(
         response,
-        adapter_model=str(
-            oa_xai_prepared_body.get("model")
-            or request_body.get("model")
-            or "unknown-model"
-        ),
+        adapter_model=str(oa_xai_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_xai_oauth_responses",
         adapter_label="xAI OAuth",
         intake_context=_build_malformed_tool_call_intake_context(
@@ -25602,8 +24179,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
     except HTTPException as exc:
         if (
             exc.status_code == 502
-            and str(exc.detail)
-            == "OpenAI Responses stream completed without a response payload."
+            and str(exc.detail) == "OpenAI Responses stream completed without a response payload."
         ):
             _raise_codex_auto_agent_empty_success_response(
                 response_body={
@@ -25664,8 +24240,7 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
     if openrouter_api_key is None:
         exc = ProxyException(
             message=(
-                "OpenRouter Codex auto-agent candidate requires "
-                "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
+                "OpenRouter Codex auto-agent candidate requires " "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
             ),
             type="rate_limit_error",
             param="model",
@@ -25734,16 +24309,12 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
             response_body = json.loads(_decode_http_response_body(response.body))
         except Exception:
             return response
-        if isinstance(
-            response_body, dict
-        ) and _is_codex_auto_agent_empty_success_responses_body(response_body):
+        if isinstance(response_body, dict) and _is_codex_auto_agent_empty_success_responses_body(response_body):
             _raise_codex_auto_agent_empty_success_response(
                 response_body=response_body,
                 adapter_model=adapter_model,
             )
-        if isinstance(
-            response_body, dict
-        ) and _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
+        if isinstance(response_body, dict) and _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
             _raise_codex_auto_agent_malformed_tool_call_text_payload(
                 response_body=response_body,
                 adapter_model=adapter_model,
@@ -25774,30 +24345,24 @@ async def _prepare_codex_kimi_chat_completions_adapter_route(
     adapter_model: str,
     use_alias_candidate_probe: bool = False,
 ) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
-    prepared_request_body = _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(
+    prepared_request_body = _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(prepared_request_body)
+    adapted_request_body, _adapted_custom_tools = _adapt_codex_custom_tools_to_functions_from_request_body(
         prepared_request_body
     )
-    adapted_request_body, _adapted_custom_tools = (
-        _adapt_codex_custom_tools_to_functions_from_request_body(prepared_request_body)
-    )
-    adapted_request_body, _adapted_namespace_tools = (
-        _adapt_codex_namespace_tools_to_functions_from_request_body(
-            adapted_request_body
-        )
+    adapted_request_body, _adapted_namespace_tools = _adapt_codex_namespace_tools_to_functions_from_request_body(
+        adapted_request_body
     )
     (
         adapted_request_body,
         _codex_tool_description_patch_events,
     ) = _apply_codex_tool_description_patches_to_request_body(adapted_request_body)
-    adapted_request_body, _unsupported_hosted_tools = (
-        _drop_unsupported_codex_hosted_tools_from_request_body(adapted_request_body)
+    adapted_request_body, _unsupported_hosted_tools = _drop_unsupported_codex_hosted_tools_from_request_body(
+        adapted_request_body
     )
-    adapted_request_body, _unsupported_input_items = (
-        _drop_unsupported_codex_input_items_from_request_body(adapted_request_body)
+    adapted_request_body, _unsupported_input_items = _drop_unsupported_codex_input_items_from_request_body(
+        adapted_request_body
     )
-    adapted_request_body, _removed_tool_choice = (
-        _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
-    )
+    adapted_request_body, _removed_tool_choice = _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
     return await _kimi_code_adapters.prepare_codex_kimi_chat_completions_adapter_route(
         request=request,
         prepared_request_body=adapted_request_body,
@@ -25887,11 +24452,7 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
         metadata = plan.perform_kwargs.get("litellm_metadata")
         if not isinstance(metadata, dict):
             metadata = plan.prepared_request_body.get("litellm_metadata")
-        rollup_kwargs.update(
-            _build_adapted_route_rollup_kwargs(
-                metadata if isinstance(metadata, dict) else {}
-            )
-        )
+        rollup_kwargs.update(_build_adapted_route_rollup_kwargs(metadata if isinstance(metadata, dict) else {}))
         _annotate_request_scope_for_adapted_access_log(request, plan.target_url)
         _emit_adapted_route_access_log(
             request=request,
@@ -25943,38 +24504,26 @@ async def _prepare_codex_alibaba_token_plan_adapter_route(
     adapter_model: str,
     use_alias_candidate_probe: bool = False,
 ) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
-    prepared_request_body = (
-        _alibaba_token_plan_adapters.normalize_alibaba_token_plan_custom_tool_outputs(
-            prepared_request_body
-        )
+    prepared_request_body = _alibaba_token_plan_adapters.normalize_alibaba_token_plan_custom_tool_outputs(
+        prepared_request_body
     )
-    adapted_request_body, _adapted_custom_tools = (
-        _adapt_codex_custom_tools_to_functions_from_request_body(
-            prepared_request_body
-        )
+    adapted_request_body, _adapted_custom_tools = _adapt_codex_custom_tools_to_functions_from_request_body(
+        prepared_request_body
     )
-    adapted_request_body, _adapted_namespace_tools = (
-        _adapt_codex_namespace_tools_to_functions_from_request_body(
-            adapted_request_body
-        )
+    adapted_request_body, _adapted_namespace_tools = _adapt_codex_namespace_tools_to_functions_from_request_body(
+        adapted_request_body
     )
     (
         adapted_request_body,
         _codex_tool_description_patch_events,
     ) = _apply_codex_tool_description_patches_to_request_body(adapted_request_body)
-    adapted_request_body, _unsupported_hosted_tools = (
-        _drop_unsupported_codex_hosted_tools_from_request_body(
-            adapted_request_body
-        )
+    adapted_request_body, _unsupported_hosted_tools = _drop_unsupported_codex_hosted_tools_from_request_body(
+        adapted_request_body
     )
-    adapted_request_body, _unsupported_input_items = (
-        _drop_unsupported_codex_input_items_from_request_body(
-            adapted_request_body
-        )
+    adapted_request_body, _unsupported_input_items = _drop_unsupported_codex_input_items_from_request_body(
+        adapted_request_body
     )
-    adapted_request_body, _removed_tool_choice = (
-        _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
-    )
+    adapted_request_body, _removed_tool_choice = _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
     return await _alibaba_token_plan_adapters.prepare_codex_alibaba_token_plan_adapter_route(
         request=request,
         prepared_request_body=adapted_request_body,
@@ -26008,9 +24557,7 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
     )
 
     _ = config, adapter_model
-    _annotate_request_scope_for_adapted_access_log(
-        request, httpx.URL(str(target_url))
-    )
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
     completion_response = await litellm.acompletion(
         **completion_kwargs,
         api_key=api_key,
@@ -26066,11 +24613,7 @@ async def _handle_codex_alibaba_token_plan_adapter_route(
         metadata = plan.perform_kwargs.get("litellm_metadata")
         if not isinstance(metadata, dict):
             metadata = plan.prepared_request_body.get("litellm_metadata")
-        rollup_kwargs.update(
-            _build_adapted_route_rollup_kwargs(
-                metadata if isinstance(metadata, dict) else {}
-            )
-        )
+        rollup_kwargs.update(_build_adapted_route_rollup_kwargs(metadata if isinstance(metadata, dict) else {}))
         _annotate_request_scope_for_adapted_access_log(request, plan.target_url)
         _emit_adapted_route_access_log(
             request=request,
@@ -26210,14 +24753,14 @@ async def _handle_codex_opencode_zen_adapter_route(
             media_type="text/event-stream",
         )
 
-    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-        chat_completion_response=completion_response,
-        request_input=request_input,
-        responses_api_request=responses_api_request,
+    responses_api_response = (
+        LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            chat_completion_response=completion_response,
+            request_input=request_input,
+            responses_api_request=responses_api_request,
+        )
     )
-    response_body = json.loads(
-        _serialize_responses_adapter_response(responses_api_response)
-    )
+    response_body = json.loads(_serialize_responses_adapter_response(responses_api_response))
     if _is_codex_auto_agent_empty_success_responses_body(response_body):
         _raise_codex_auto_agent_empty_success_response(
             response_body=response_body,
@@ -26247,8 +24790,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     if openrouter_api_key is None:
         exc = ProxyException(
             message=(
-                "OpenRouter Codex auto-agent candidate requires "
-                "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
+                "OpenRouter Codex auto-agent candidate requires " "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
             ),
             type="rate_limit_error",
             param="model",
@@ -26267,10 +24809,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         raise exc
 
     requested_model = request_body.get("model")
-    upstream_adapter_model = (
-        _get_openrouter_completion_adapter_upstream_model(adapter_model)
-        or adapter_model
-    )
+    upstream_adapter_model = _get_openrouter_completion_adapter_upstream_model(adapter_model) or adapter_model
     route_family = "codex_openrouter_completion_adapter"
     request_body = _merge_litellm_metadata(
         _add_route_family_logging_metadata(request_body, route_family),
@@ -26300,11 +24839,7 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     request_input = request_body.get("input") or ""
     responses_api_request = cast(
         ResponsesAPIOptionalRequestParams,
-        {
-            key: value
-            for key, value in request_body.items()
-            if key not in {"input", "model", "litellm_metadata"}
-        },
+        {key: value for key, value in request_body.items() if key not in {"input", "model", "litellm_metadata"}},
     )
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
@@ -26390,14 +24925,14 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             media_type="text/event-stream",
         )
 
-    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-        chat_completion_response=completion_response,
-        request_input=request_input,
-        responses_api_request=responses_api_request,
+    responses_api_response = (
+        LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            chat_completion_response=completion_response,
+            request_input=request_input,
+            responses_api_request=responses_api_request,
+        )
     )
-    response_body = json.loads(
-        _serialize_responses_adapter_response(responses_api_response)
-    )
+    response_body = json.loads(_serialize_responses_adapter_response(responses_api_response))
     if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
         _raise_codex_auto_agent_malformed_tool_call_text_payload(
             response_body=response_body,
@@ -26576,8 +25111,7 @@ async def _handle_codex_auto_agent_alias_route(
     forward_headers: bool,
 ) -> Response:
     alias_model = (
-        _normalize_codex_auto_agent_alias_model(prepared_request_body.get("model"))
-        or _CODEX_AUTO_AGENT_MODEL_ALIAS
+        _normalize_codex_auto_agent_alias_model(prepared_request_body.get("model")) or _CODEX_AUTO_AGENT_MODEL_ALIAS
     )
 
     async def _perform_candidate_request(
@@ -26635,9 +25169,7 @@ class BaseOpenAIPassThroughHandler:
         if not prepared_oa_xai:
             return None
         if oa_xai_api_base is None or oa_xai_api_key is None:
-            raise Exception(
-                "OpenAI passthrough requests for xAI OAuth models require a managed xAI OAuth credential."
-            )
+            raise Exception("OpenAI passthrough requests for xAI OAuth models require a managed xAI OAuth credential.")
 
         request_body["model"] = _to_xai_native_passthrough_model(request_body.get("model"))
         openai_route_family = _get_openai_passthrough_route_family(endpoint)
@@ -26686,18 +25218,14 @@ class BaseOpenAIPassThroughHandler:
                 "openai-grok-native-responses-adapter",
             ],
             extra_fields={
-                "openai_passthrough_route_family": (
-                    _get_openai_passthrough_route_family(endpoint)
-                ),
+                "openai_passthrough_route_family": (_get_openai_passthrough_route_family(endpoint)),
                 "grok_native_entrypoint": "openai_responses",
             },
         )
         if not prepared_grok_native:
             return None
         if grok_target_base_url is None:
-            raise Exception(
-                "OpenAI passthrough requests for Grok native OAuth models require a Grok target base URL."
-            )
+            raise Exception("OpenAI passthrough requests for Grok native OAuth models require a Grok target base URL.")
 
         merged_headers = {
             **(extra_headers or {}),
@@ -26746,13 +25274,16 @@ class BaseOpenAIPassThroughHandler:
             request_body = await get_request_body(request)
             prepared_request_body = request_body
             body_was_prepared = False
-            is_codex_responses_request = _request_uses_codex_native_auth(
-                request
-            ) and _is_openai_responses_endpoint(endpoint)
-            if _resolve_codex_auto_agent_alias_model(
-                prepared_request_body,
-                endpoint=endpoint,
-            ) is not None:
+            is_codex_responses_request = _request_uses_codex_native_auth(request) and _is_openai_responses_endpoint(
+                endpoint
+            )
+            if (
+                _resolve_codex_auto_agent_alias_model(
+                    prepared_request_body,
+                    endpoint=endpoint,
+                )
+                is not None
+            ):
                 is_codex_responses_request = True
             if is_codex_responses_request:
                 prepared_request_body = _add_route_family_logging_metadata(
@@ -26762,46 +25293,30 @@ class BaseOpenAIPassThroughHandler:
                 (
                     prepared_request_body,
                     _codex_tool_description_patch_events,
-                ) = _apply_codex_tool_description_patches_to_request_body(
-                    prepared_request_body
-                )
+                ) = _apply_codex_tool_description_patches_to_request_body(prepared_request_body)
                 (
                     prepared_request_body,
                     _codex_unsupported_hosted_tools,
-                ) = _drop_unsupported_codex_hosted_tools_from_request_body(
-                    prepared_request_body
-                )
+                ) = _drop_unsupported_codex_hosted_tools_from_request_body(prepared_request_body)
                 (
                     prepared_request_body,
                     _codex_unsupported_request_params,
-                ) = _drop_unsupported_codex_request_params_from_request_body(
-                    prepared_request_body
-                )
+                ) = _drop_unsupported_codex_request_params_from_request_body(prepared_request_body)
                 (
                     prepared_request_body,
                     _codex_unsupported_input_items,
-                ) = _drop_unsupported_codex_input_items_from_request_body(
+                ) = _drop_unsupported_codex_input_items_from_request_body(prepared_request_body)
+                if _is_oa_xai_request_body(prepared_request_body) or _is_grok_native_oauth_request_body(
                     prepared_request_body
-                )
-                if _is_oa_xai_request_body(
-                    prepared_request_body
-                ) or _is_grok_native_oauth_request_body(prepared_request_body):
+                ):
                     (
                         prepared_request_body,
                         _codex_removed_empty_tool_choice,
-                    ) = _drop_tool_choice_without_tools_from_request_body(
-                        prepared_request_body
-                    )
-                prepared_request_body = _add_codex_request_breakout_logging_metadata(
-                    prepared_request_body
-                )
-            oa_xai_context = (
-                await (
-                    BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
-                        endpoint=endpoint,
-                        request_body=prepared_request_body,
-                    )
-                )
+                    ) = _drop_tool_choice_without_tools_from_request_body(prepared_request_body)
+                prepared_request_body = _add_codex_request_breakout_logging_metadata(prepared_request_body)
+            oa_xai_context = await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
+                endpoint=endpoint,
+                request_body=prepared_request_body,
             )
             if oa_xai_context is not None:
                 body_was_prepared = True
@@ -26844,9 +25359,7 @@ class BaseOpenAIPassThroughHandler:
                         (
                             prepared_request_body,
                             _codex_auto_agent_guidance_changes,
-                        ) = _apply_codex_auto_agent_prevention_guidance_to_request_body(
-                            prepared_request_body
-                        )
+                        ) = _apply_codex_auto_agent_prevention_guidance_to_request_body(prepared_request_body)
                         (
                             prepared_request_body,
                             _codex_read_guidance_changes,
@@ -26855,16 +25368,12 @@ class BaseOpenAIPassThroughHandler:
                             alias_model=codex_auto_agent_alias,
                             target_field="instructions",
                         )
-                        prepared_request_body = (
-                            _prepare_request_body_for_passthrough_observability(
-                                request=request,
-                                request_body=prepared_request_body,
-                            )
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
                         )
                         if prepared_request_body is not request_body:
-                            _safe_set_request_parsed_body(
-                                request, prepared_request_body
-                            )
+                            _safe_set_request_parsed_body(request, prepared_request_body)
                         return await _handle_codex_auto_agent_alias_route(
                             endpoint=endpoint,
                             request=request,
@@ -26875,23 +25384,17 @@ class BaseOpenAIPassThroughHandler:
                             api_key=api_key,
                             forward_headers=forward_headers,
                         )
-                    opencode_zen_adapter_model = (
-                        _resolve_codex_opencode_zen_adapter_model(
-                            prepared_request_body,
-                            endpoint=endpoint,
-                        )
+                    opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
+                        prepared_request_body,
+                        endpoint=endpoint,
                     )
                     if opencode_zen_adapter_model is not None:
-                        prepared_request_body = (
-                            _prepare_request_body_for_passthrough_observability(
-                                request=request,
-                                request_body=prepared_request_body,
-                            )
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
                         )
                         if prepared_request_body is not request_body:
-                            _safe_set_request_parsed_body(
-                                request, prepared_request_body
-                            )
+                            _safe_set_request_parsed_body(request, prepared_request_body)
                         return await _handle_codex_opencode_zen_adapter_route(
                             endpoint=endpoint,
                             request=request,
@@ -26900,23 +25403,17 @@ class BaseOpenAIPassThroughHandler:
                             prepared_request_body=prepared_request_body,
                             adapter_model=opencode_zen_adapter_model,
                         )
-                    kimi_code_adapter_model = (
-                        _resolve_codex_kimi_chat_completions_adapter_model(
-                            prepared_request_body,
-                            endpoint=endpoint,
-                        )
+                    kimi_code_adapter_model = _resolve_codex_kimi_chat_completions_adapter_model(
+                        prepared_request_body,
+                        endpoint=endpoint,
                     )
                     if kimi_code_adapter_model is not None:
-                        prepared_request_body = (
-                            _prepare_request_body_for_passthrough_observability(
-                                request=request,
-                                request_body=prepared_request_body,
-                            )
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
                         )
                         if prepared_request_body is not request_body:
-                            _safe_set_request_parsed_body(
-                                request, prepared_request_body
-                            )
+                            _safe_set_request_parsed_body(request, prepared_request_body)
                         return await _handle_codex_kimi_chat_completions_adapter_route(
                             endpoint=endpoint,
                             request=request,
@@ -26925,23 +25422,17 @@ class BaseOpenAIPassThroughHandler:
                             prepared_request_body=prepared_request_body,
                             adapter_model=kimi_code_adapter_model,
                         )
-                    alibaba_token_plan_adapter_model = (
-                        _resolve_codex_alibaba_token_plan_adapter_model(
-                            prepared_request_body,
-                            endpoint=endpoint,
-                        )
+                    alibaba_token_plan_adapter_model = _resolve_codex_alibaba_token_plan_adapter_model(
+                        prepared_request_body,
+                        endpoint=endpoint,
                     )
                     if alibaba_token_plan_adapter_model is not None:
-                        prepared_request_body = (
-                            _prepare_request_body_for_passthrough_observability(
-                                request=request,
-                                request_body=prepared_request_body,
-                            )
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
                         )
                         if prepared_request_body is not request_body:
-                            _safe_set_request_parsed_body(
-                                request, prepared_request_body
-                            )
+                            _safe_set_request_parsed_body(request, prepared_request_body)
                         return await _handle_codex_alibaba_token_plan_adapter_route(
                             endpoint=endpoint,
                             request=request,
@@ -26950,23 +25441,17 @@ class BaseOpenAIPassThroughHandler:
                             prepared_request_body=prepared_request_body,
                             adapter_model=alibaba_token_plan_adapter_model,
                         )
-                    antigravity_adapter_model = (
-                        _resolve_codex_antigravity_code_assist_adapter_model(
-                            prepared_request_body,
-                            endpoint=endpoint,
-                        )
+                    antigravity_adapter_model = _resolve_codex_antigravity_code_assist_adapter_model(
+                        prepared_request_body,
+                        endpoint=endpoint,
                     )
                     if antigravity_adapter_model is not None:
-                        prepared_request_body = (
-                            _prepare_request_body_for_passthrough_observability(
-                                request=request,
-                                request_body=prepared_request_body,
-                            )
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
                         )
                         if prepared_request_body is not request_body:
-                            _safe_set_request_parsed_body(
-                                request, prepared_request_body
-                            )
+                            _safe_set_request_parsed_body(request, prepared_request_body)
                         return await _handle_codex_google_code_assist_adapter_route(
                             endpoint=endpoint,
                             request=request,
@@ -26977,23 +25462,17 @@ class BaseOpenAIPassThroughHandler:
                             adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
                         )
 
-                    google_adapter_model = (
-                        _resolve_codex_google_code_assist_adapter_model(
-                            prepared_request_body,
-                            endpoint=endpoint,
-                        )
+                    google_adapter_model = _resolve_codex_google_code_assist_adapter_model(
+                        prepared_request_body,
+                        endpoint=endpoint,
                     )
                     if google_adapter_model is not None:
-                        prepared_request_body = (
-                            _prepare_request_body_for_passthrough_observability(
-                                request=request,
-                                request_body=prepared_request_body,
-                            )
+                        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+                            request=request,
+                            request_body=prepared_request_body,
                         )
                         if prepared_request_body is not request_body:
-                            _safe_set_request_parsed_body(
-                                request, prepared_request_body
-                            )
+                            _safe_set_request_parsed_body(request, prepared_request_body)
                         return await _handle_codex_google_code_assist_adapter_route(
                             endpoint=endpoint,
                             request=request,
@@ -27058,17 +25537,12 @@ class BaseOpenAIPassThroughHandler:
         """
         Appends the OpenAI-Beta header to the headers if the request is an OpenAI Assistants API request
         """
-        if (
-            RouteChecks._is_assistants_api_request(request) is True
-            and "OpenAI-Beta" not in headers
-        ):
+        if RouteChecks._is_assistants_api_request(request) is True and "OpenAI-Beta" not in headers:
             headers["OpenAI-Beta"] = "assistants=v2"
         return headers
 
     @staticmethod
-    def _assemble_headers(
-        api_key: Optional[str], request: Request, extra_headers: Optional[dict] = None
-    ) -> dict:
+    def _assemble_headers(api_key: Optional[str], request: Request, extra_headers: Optional[dict] = None) -> dict:
         base_headers = {}
         if api_key is not None:
             base_headers = {
@@ -27103,14 +25577,9 @@ class BaseOpenAIPassThroughHandler:
             joined_path_str = str(base_url.copy_with(path=full_path))
 
         # Apply OpenAI-specific path handling for both branches
-        if (
-            custom_llm_provider == litellm.LlmProviders.OPENAI
-            and "/v1/" not in joined_path_str
-        ):
+        if custom_llm_provider == litellm.LlmProviders.OPENAI and "/v1/" not in joined_path_str:
             # Insert v1 after api.openai.com for OpenAI requests
-            joined_path_str = joined_path_str.replace(
-                "api.openai.com/", "api.openai.com/v1/"
-            )
+            joined_path_str = joined_path_str.replace("api.openai.com/", "api.openai.com/v1/")
 
         return joined_path_str
 
@@ -27128,9 +25597,7 @@ class BaseOpenAIPassThroughHandler:
             and normalized_endpoint.startswith("/v1/")
         ):
             return normalized_endpoint[len("/v1") :]
-        if base_url.path.rstrip("/") == "/v1" and normalized_endpoint.startswith(
-            "/v1/"
-        ):
+        if base_url.path.rstrip("/") == "/v1" and normalized_endpoint.startswith("/v1/"):
             return normalized_endpoint[len("/v1") :]
         return normalized_endpoint
 
@@ -27179,10 +25646,7 @@ async def cursor_proxy_route(
 
     if cursor_api_key is None:
         for credential in litellm.credential_list:
-            if (
-                credential.credential_info
-                and credential.credential_info.get("custom_llm_provider") == "cursor"
-            ):
+            if credential.credential_info and credential.credential_info.get("custom_llm_provider") == "cursor":
                 cursor_api_key = credential.credential_values.get("api_key")
                 credential_api_base = credential.credential_values.get("api_base")
                 if credential_api_base:
@@ -27287,9 +25751,7 @@ async def vertex_ai_live_websocket_passthrough(
         )
 
     try:
-        resolved_location = resolved_location or (
-            vertex_llm_base.get_default_vertex_location()
-        )
+        resolved_location = resolved_location or (vertex_llm_base.get_default_vertex_location())
         if model:
             resolved_location = vertex_llm_base.get_vertex_region(
                 vertex_region=resolved_location,
@@ -27305,9 +25767,7 @@ async def vertex_ai_live_websocket_passthrough(
             custom_llm_provider="vertex_ai_beta",
         )
     except Exception as e:
-        verbose_proxy_logger.exception(
-            "Failed to prepare Vertex AI credentials for live passthrough"
-        )
+        verbose_proxy_logger.exception("Failed to prepare Vertex AI credentials for live passthrough")
         # Log the authentication failure using proxy_logging_obj
         if proxy_logging_obj and user_api_key_dict:
             await proxy_logging_obj.post_call_failure_hook(
@@ -27325,14 +25785,8 @@ async def vertex_ai_live_websocket_passthrough(
     await websocket.accept()
 
     host_location = resolved_location or vertex_llm_base.get_default_vertex_location()
-    host = (
-        "aiplatform.googleapis.com"
-        if host_location == "global"
-        else f"{host_location}-aiplatform.googleapis.com"
-    )
-    service_url = (
-        f"wss://{host}/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
-    )
+    host = "aiplatform.googleapis.com" if host_location == "global" else f"{host_location}-aiplatform.googleapis.com"
+    service_url = f"wss://{host}/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
 
     upstream_headers = {
         "Authorization": f"Bearer {access_token}",
