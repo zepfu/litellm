@@ -1042,7 +1042,29 @@ def _extract_aawm_route_request_client_ip(
 ) -> tuple[Optional[str], Optional[str]]:
     from litellm.proxy.auth.ip_address_utils import IPAddressUtils
 
-    raw_ip = IPAddressUtils.get_mcp_client_ip(request, general_settings)
+    if general_settings is None:
+        try:
+            from litellm.proxy.proxy_server import (
+                general_settings as proxy_general_settings,
+            )
+
+            general_settings = proxy_general_settings
+        except ImportError:
+            general_settings = {}
+
+    effective_general_settings = dict(general_settings or {})
+    if "aawm_route_use_x_forwarded_for" in effective_general_settings:
+        effective_general_settings["use_x_forwarded_for"] = (
+            effective_general_settings["aawm_route_use_x_forwarded_for"]
+        )
+        effective_general_settings["mcp_trusted_proxy_ranges"] = (
+            effective_general_settings.get("aawm_route_trusted_proxy_ranges")
+        )
+
+    raw_ip = IPAddressUtils.get_mcp_client_ip(
+        request,
+        effective_general_settings,
+    )
     if not raw_ip:
         scope = getattr(request, "scope", None)
         client = scope.get("client") if isinstance(scope, dict) else None

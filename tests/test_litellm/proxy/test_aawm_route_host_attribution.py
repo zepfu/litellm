@@ -108,6 +108,66 @@ def test_resolve_aawm_route_host_attribution_docker_gateway_resolves_local_magic
     assert attribution["host_name_source"] == "magicdns_local"
 
 
+def test_resolve_aawm_route_host_attribution_trusted_docker_gateway_xff_uses_magicdns_host(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    request = Mock(spec=Request)
+    request.headers = {"x-forwarded-for": "100.100.7.5"}
+    request.client = SimpleNamespace(host="172.18.0.1", port=54321)
+    request.scope = {"client": ("172.18.0.1", 54321)}
+
+    general_settings = {
+        "aawm_route_use_x_forwarded_for": True,
+        "aawm_route_trusted_proxy_ranges": ["172.18.0.1/32"],
+    }
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        Mock(side_effect=OSError("reverse dns not used for cgnat test")),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="desktop-qjhrj1m-wsl"),
+    )
+
+    attribution = resolve_aawm_route_host_attribution(
+        request,
+        general_settings=general_settings,
+        allow_blocking_lookup=True,
+    )
+    assert attribution["client_ip"] == "100.100.7.5"
+    assert attribution["client_ip_source"] == "x_forwarded_for"
+    assert attribution["host_name"] == "desktop-qjhrj1m-wsl"
+    assert attribution["host_name_source"] == "magicdns_reverse"
+
+
+def test_resolve_aawm_route_host_attribution_untrusted_xff_source_is_ignored(
+    monkeypatch,
+):
+    request = Mock(spec=Request)
+    request.headers = {"x-forwarded-for": "100.100.7.5"}
+    request.client = SimpleNamespace(host="203.0.113.19", port=54321)
+    request.scope = {"client": ("203.0.113.19", 54321)}
+
+    general_settings = {
+        "aawm_route_use_x_forwarded_for": True,
+        "aawm_route_trusted_proxy_ranges": ["172.18.0.1/32"],
+    }
+
+    attribution = resolve_aawm_route_host_attribution(
+        request,
+        general_settings=general_settings,
+    )
+    assert attribution["client_ip"] == "203.0.113.19"
+    assert attribution["client_ip_source"] == "request_client"
+    assert attribution["host_name"] == "203.0.113.19"
+    assert attribution["host_name_source"] == "ip_literal"
+
+
 def test_resolve_aawm_route_host_attribution_keeps_lan_ip_fallback(monkeypatch):
     request = Mock(spec=Request)
     request.headers = {}
@@ -1055,4 +1115,3 @@ def test_aresolve_host_attribution_fast_path_skips_to_thread(monkeypatch):
     )
     assert attribution["host_name"] == "192.168.1.42"
     assert attribution["host_name_source"] == "ip_literal"
-

@@ -119,6 +119,39 @@ Consumer docs (`LOCAL_LLM_CONSUMER.md`, `LOCAL_EMBED_RERANK_CONSUMER.md`,
 `OPENROUTER_EMBED_RERANK_CONSUMER.md`) already document both headers as
 distinct fields.
 
+## Route Host Attribution and X-Forwarded-For Trust Boundary
+
+`aawm_route_logging` derives `client_ip` from `IPAddressUtils.get_mcp_client_ip`.
+Forwarded identity is opt-in only for AAWM route attribution through these
+`general_settings` keys:
+
+- `aawm_route_use_x_forwarded_for: true`
+- `aawm_route_trusted_proxy_ranges: ["172.18.0.1/32"]`
+
+`_extract_aawm_route_request_client_ip` copies the active settings, maps the
+route-specific values to the existing `IPAddressUtils` XFF/trusted-proxy keys,
+and passes that effective copy to `get_mcp_client_ip`. It does not mutate global
+settings or enable XFF for authentication, MCP access control, or other IP-based
+paths. Do not enable global `use_x_forwarded_for` for this tunnel.
+
+This config is intentionally narrow:
+- Only connections from `172.18.0.1/32` (the Thoth Docker gateway for the SSH
+  local-forward tunnel path) can provide a usable `x-forwarded-for`.
+- All other direct IPs (including untrusted public/private peers) are rejected as
+  forwarding sources, and attribution falls back to the direct socket IP.
+- Untrusted forwarded headers cannot make a request look like a tailscale/WSL
+  client.
+
+For the SSH tunnel flow, request origin drops from WSL source address to the
+Docker gateway IP (`172.18.0.1`) at the transport layer. The only remaining way
+to preserve originating WSL identity is to send `x-forwarded-for: 100.100.7.5`
+through that trusted gateway and let `100.100.7.5` resolve via MagicDNS to
+`desktop-qjhrj1m-wsl`.
+
+Local Thoth-originating requests still rely on direct loopback and Tailscale
+self-snapshot behavior (`tailscale_self`), so this trust-boundary change should
+not replace the existing direct local attribution path.
+
 ## Anthropic / Claude Context Window Selection
 
 LiteLLM records **requested** Claude/Anthropic context-window mode in
