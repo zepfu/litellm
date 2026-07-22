@@ -262,6 +262,8 @@ services:
       # native proper-lockfile parent for the oauth/kimi-code sentinel.
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials
       - /home/zepfu/.kimi-code/oauth:/home/zepfu/.kimi-code/oauth
+      # Alibaba Token Plan sidecar session file source for quota polling.
+      - /home/zepfu/.alibaba:/home/zepfu/.alibaba:ro
     environment:
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}
@@ -337,8 +339,10 @@ services:
       - AAWM_KIMI_USAGE_POLL_ENABLED=${AAWM_KIMI_USAGE_POLL_ENABLED:-1}
       - AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS=${AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS:-3600}
       - AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS:-30}
-      # Alibaba quota polling reuses the operator-provided web session
-      # envelope. Do not mount or source the complete host ~/.env.
+      # Alibaba quota polling reads operator-managed session state from a file.
+      # Keep env fallback only for migration until runtime proof deprecates it.
+      - AAWM_ALIBABA_WEB_AUTH_FILE=${AAWM_ALIBABA_WEB_AUTH_FILE:-/home/zepfu/.alibaba/token-plan-session.json}
+      # Migration fallback only: do not rely on this once file-based auth is proven.
       - ALIBABA_WEB_KEY=${ALIBABA_WEB_KEY:-}
       - AAWM_ALIBABA_QUOTA_POLL_ENABLED=${AAWM_ALIBABA_QUOTA_POLL_ENABLED:-1}
       - AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS:-300}

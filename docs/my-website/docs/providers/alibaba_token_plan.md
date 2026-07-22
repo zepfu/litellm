@@ -98,9 +98,11 @@ Token Plan generations record:
 AAWM deployments may enable the provider-status sidecar's read-only
 ModelStudio quota poll. It records the Token Plan 5-hour and 7-day Credit
 windows without sending model traffic or using the plan-specific inference API
-key. See `docs/aawm-provider-status-observations.md` for the private
-`ALIBABA_WEB_KEY` session envelope, polling cadence, stored quota keys, and
-degraded-session behavior.
+key. See `docs/aawm-provider-status-observations.md` for the
+`AAWM_ALIBABA_WEB_AUTH_FILE` session-file contract, polling cadence, stored
+quota keys, and degraded-session behavior. During migration, `ALIBABA_WEB_KEY`
+remains a fallback while `AAWM_ALIBABA_WEB_AUTH_FILE` is proven in dev; remove
+that fallback after proof.
 
 LiteLLM does not invent a per-token price for this subscription. Consumers must
 not interpret a null invoice cost as a free request.

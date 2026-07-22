@@ -188,15 +188,16 @@ these docs only as needed:
 
 ## Next
 
-- Publish and promote `v1.82.3-aawm.136` for Alibaba Token Plan quota
-  observations. The candidate passed the focused and full provider-status test
-  modules, secret-silent live console replay, dev image dependency preflight,
-  structured sidecar-log validation, and exact `aawm_tristore` row
-  verification for separate 5-hour and 7-day Credit windows. Follow
-  `PROD_RELEASE.md`, build the production provider-status image from the
-  immutable `.136` fork image, pass the same dependency preflight, recreate
-  only `aawm-provider-status-observations-prod` with the existing
-  `ALIBABA_WEB_KEY`, and verify matching production rows and sanitized logs.
+- Publish and promote `v1.82.3-aawm.137` for file-backed Alibaba Token Plan
+  quota authentication. The candidate passed 31 focused Alibaba tests, the
+  full 154-test provider-status module, Ruff, secret-silent dev sidecar
+  validation, and exact `aawm_tristore` row verification. The dev container
+  proved the canonical read-only `~/.alibaba/token-plan-session.json` mount
+  with no `ALIBABA_WEB_KEY` fallback present, cookie-only HTTP 200 responses,
+  two inserted observations, and clean logs. Follow `PROD_RELEASE.md`, build
+  the production provider-status image from the immutable `.137` release
+  source, recreate only `aawm-provider-status-observations-prod`, and verify
+  matching production rows, mounts, restart count, and sanitized logs.
 
 - Rerun the Spark/Codex-dependent prod harness cases after the upstream Codex
   quota reset at `2026-05-18 15:08:41 UTC`: at minimum

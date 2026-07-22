@@ -58,6 +58,44 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.137 - File-backed Alibaba Token Plan quota authentication
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.137`. The
+provider-status sidecar now reads the Alibaba ModelStudio login ticket from the
+private `AAWM_ALIBABA_WEB_AUTH_FILE` JSON contract on every due poll. The
+mounted directory is read-only in the sidecar so an operator can atomically
+replace `token-plan-session.json` without recreating the container.
+
+Subscription and usage calls are cookie-only first. If the provider explicitly
+reports that `sec_token` is required, the sidecar performs one bounded
+in-memory discovery attempt through the authenticated dashboard and then
+`/tool/user/info.json`, retries that endpoint once, and never persists the
+derived token. Missing, malformed, symlinked, non-regular, or non-`0600`
+credential files degrade through sanitized handled events. `ALIBABA_WEB_KEY`
+remains a migration fallback only when the canonical file is absent.
+
+**Why:** The original `.136` environment envelope coupled a finite browser
+session to container creation and persisted a derived `sec_token` that the
+quota endpoints do not normally require. A private mounted login-ticket file
+provides a smaller replacement boundary and lets the existing sidecar own the
+complete quota-monitoring lifecycle without a browser daemon or secondary CLI.
+
+**Why not upstream:** The AAWM provider-status scheduler, local
+`aawm_tristore` observation schema, Alibaba console-session contract, and
+operator-managed host mount are fork-local operational behavior.
+
+**Validation status:** Thirty-one focused Alibaba tests and the full 154-test
+provider-status module pass; Ruff and `git diff --check` pass. Dev sidecar image
+`sha256:d8e66f35b66191736a33f6753f27df5eaac3e54d78b80afd754d6c01fa555b19`
+mounted `/home/zepfu/.alibaba` read-only with zero restarts and no legacy
+environment value. Its startup poll reported `auth_source=auth_file`,
+`credential_reloaded=true`, cookie-only success for subscription and usage,
+two inserted observations, no token fallback, and no error or traceback. Exact
+`aawm_tristore` rows stored both quota keys with
+`evidence.auth_source=auth_file`; active error-intake counts were unchanged.
+Production promotion must use the immutable `.137` release source and recreate
+only `aawm-provider-status-observations-prod`.
+
 ### aawm.136 - Alibaba Token Plan console quota observations
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.136`. The

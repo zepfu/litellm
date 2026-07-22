@@ -174,12 +174,33 @@ absolute limit/used/remaining columns null because this console response does
 not provide authoritative absolute Credit limits. It does not invent daily or
 monthly quota windows.
 
-Authentication is supplied through `ALIBABA_WEB_KEY`, a URL-safe base64 JSON
-envelope containing only the existing `login_aliyunid_ticket` cookie value and
-the console `sec_token`. The sidecar does not copy the Token Plan inference API
-key, open a browser, reauthorize, refresh, or rotate this web session. When the
-session expires, the poll emits a sanitized degraded event until an operator
-replaces `ALIBABA_WEB_KEY`.
+Authentication is file-driven and reloaded on each due poll. The sidecar reads
+`AAWM_ALIBABA_WEB_AUTH_FILE` (default:
+`/home/zepfu/.alibaba/token-plan-session.json`) and requires a JSON payload in
+this exact shape:
+
+```json
+{"version":1,"login_ticket":"..."}
+```
+
+The auth file must be a regular file at the mounted path, not a symlink, and
+mode `0600`. The file payload is treated as cookie-only session bootstrap
+material for subscription and usage calls.
+
+The sidecar attempts cookie-only subscription/usage calls first. If `sec_token`
+is required, discovery is bounded and in-memory only: first through the
+dashboard endpoint, then through `/tool/user/info.json`, with exactly one retry.
+The discovered `sec_token` is never persisted and is discarded after the poll
+cycle.
+
+The sidecar does not copy the Token Plan inference API key, run browser
+flows, launch secondary CLIs, ask for passwords, or automate MFA. Session
+lifetime is finite: expired sessions are surfaced as degraded events until
+`AAWM_ALIBABA_WEB_AUTH_FILE` is replaced.
+
+The replacement procedure is atomic write-to-temp plus rename to the configured
+path. A replaced file is picked up automatically on the next due poll without
+container restart.
 
 The usage request runs at startup and then on the configured usage cadence.
 Subscription metadata is refreshed at startup and independently on the
@@ -190,8 +211,10 @@ persisted.
 
 Relevant environment variables:
 
-- `ALIBABA_WEB_KEY`: private compact web-session envelope. Never log or persist
-  its decoded values in database fields.
+- `AAWM_ALIBABA_WEB_AUTH_FILE`: file-backed session bootstrap for quota polling.
+  Defaults to `/home/zepfu/.alibaba/token-plan-session.json`.
+- `ALIBABA_WEB_KEY`: legacy migration fallback only. Never log or persist its
+  decoded values in database fields. Remove this fallback after dev proof.
 - `AAWM_ALIBABA_QUOTA_POLL_ENABLED`: enables the scheduled poll.
 - `AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS`: minimum seconds between usage
   polls; the managed sidecar default is `300`.

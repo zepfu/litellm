@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
+import html
 import importlib
 import json
 import math
 import os
 import re
 import signal
+import stat
 import sys
 import time
 import traceback
@@ -202,11 +205,17 @@ DEFAULT_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_ALIBABA_QUOTA_GATEWAY_URL = "https://bailian-singapore-cs.alibabacloud.com/data/api.json"
 DEFAULT_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS = 2
 DEFAULT_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS = 0.5
+DEFAULT_ALIBABA_WEB_AUTH_FILE = "/home/zepfu/.alibaba/token-plan-session.json"
+ALIBABA_WEB_AUTH_FILE_VERSION = 1
+ALIBABA_WEB_AUTH_FILE_MAX_BYTES = 16_384
 ALIBABA_TOKEN_PLAN_USAGE_API = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage"
 ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription"
 ALIBABA_TOKEN_PLAN_COMMODITY_CODE = "sfm_tokenplansolo_public_intl"
 ALIBABA_TOKEN_PLAN_CONSOLE_URL = (
     "https://modelstudio.console.alibabacloud.com/ap-southeast-1" "?tab=plan#/efm/subscription/token-plan/personal"
+)
+ALIBABA_TOKEN_PLAN_USER_INFO_URL = (
+    "https://modelstudio.console.alibabacloud.com/tool/user/info.json"
 )
 ALIBABA_TOKEN_PLAN_CLIENT = "qwen-cloud-console"
 ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba_token_plan"
@@ -390,6 +399,10 @@ class AlibabaQuotaPollError(ValueError):
         attempt_count: int,
         retry_count: int,
         endpoint: str,
+        cookie_only_attempted: bool = True,
+        token_fallback_attempted: bool = False,
+        token_fallback_succeeded: bool = False,
+        token_fallback_source: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -397,10 +410,41 @@ class AlibabaQuotaPollError(ValueError):
         self.attempt_count = max(1, attempt_count)
         self.retry_count = max(0, retry_count)
         self.endpoint = endpoint
+        self.cookie_only_attempted = cookie_only_attempted
+        self.token_fallback_attempted = token_fallback_attempted
+        self.token_fallback_succeeded = token_fallback_succeeded
+        self.token_fallback_source = token_fallback_source
 
 
 class AlibabaWebAuthError(ValueError):
     """Invalid or unavailable Alibaba web-session configuration."""
+
+
+@dataclass
+class AlibabaQuotaFetchState:
+    """Mutable metadata for one bounded Alibaba endpoint fetch."""
+
+    request_auth: Dict[str, str]
+    attempt_count: int = 0
+    retry_count: int = 0
+    token_fallback_attempted: bool = False
+    token_fallback_succeeded: bool = False
+    token_fallback_source: Optional[str] = None
+
+    def error_metadata(self) -> Dict[str, Any]:
+        return {
+            "attempt_count": self.attempt_count,
+            "retry_count": self.retry_count,
+            "token_fallback_attempted": self.token_fallback_attempted,
+            "token_fallback_succeeded": self.token_fallback_succeeded,
+            "token_fallback_source": self.token_fallback_source,
+        }
+
+    def result_metadata(self) -> Dict[str, Any]:
+        return {
+            **self.error_metadata(),
+            "cookie_only_attempted": True,
+        }
 
 
 GROK_BILLING_RATE_LIMIT_INSERT_SQL = """
@@ -1146,6 +1190,7 @@ class ProviderStatusLoopConfig:
     alibaba_subscription_poll_interval_seconds: float = DEFAULT_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS
     alibaba_quota_poll_http_timeout_seconds: float = DEFAULT_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS
     alibaba_quota_gateway_url: str = DEFAULT_ALIBABA_QUOTA_GATEWAY_URL
+    alibaba_web_auth_file: str = DEFAULT_ALIBABA_WEB_AUTH_FILE
     alibaba_quota_poll_max_attempts: int = DEFAULT_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS
     alibaba_quota_poll_retry_backoff_seconds: float = DEFAULT_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS
     grok_billing_poll_enabled: bool = DEFAULT_GROK_BILLING_POLL_ENABLED
@@ -1203,6 +1248,7 @@ class SidecarTaskState:
     alibaba_quota_last_attempt_monotonic: Optional[float] = None
     alibaba_subscription_last_attempt_monotonic: Optional[float] = None
     alibaba_subscription_payload: Optional[Dict[str, Any]] = None
+    alibaba_auth_fingerprint: Optional[str] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
     codex_reset_credit_last_attempt_monotonic: Optional[float] = None
     observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
@@ -1881,6 +1927,18 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
     )
     parser.add_argument(
+        "--alibaba-web-auth-file",
+        default=os.getenv(
+            "AAWM_ALIBABA_WEB_AUTH_FILE",
+            DEFAULT_ALIBABA_WEB_AUTH_FILE,
+        ),
+        help=(
+            "Private Alibaba Token Plan login-ticket JSON file. Defaults to "
+            "AAWM_ALIBABA_WEB_AUTH_FILE or "
+            f"{DEFAULT_ALIBABA_WEB_AUTH_FILE}."
+        ),
+    )
+    parser.add_argument(
         "--alibaba-quota-poll-max-attempts",
         type=int,
         default=_env_int(
@@ -2278,6 +2336,8 @@ def _validate_alibaba_quota_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--alibaba-quota-poll-http-timeout-seconds must be greater than 0")
     if not str(args.alibaba_quota_gateway_url).strip():
         raise SystemExit("--alibaba-quota-gateway-url must not be empty")
+    if not str(args.alibaba_web_auth_file).strip():
+        raise SystemExit("--alibaba-web-auth-file must not be empty")
     if args.alibaba_quota_poll_max_attempts <= 0:
         raise SystemExit("--alibaba-quota-poll-max-attempts must be greater than 0")
     if args.alibaba_quota_poll_retry_backoff_seconds < 0:
@@ -2421,6 +2481,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         alibaba_subscription_poll_interval_seconds=(args.alibaba_subscription_poll_interval_seconds),
         alibaba_quota_poll_http_timeout_seconds=(args.alibaba_quota_poll_http_timeout_seconds),
         alibaba_quota_gateway_url=str(args.alibaba_quota_gateway_url).strip(),
+        alibaba_web_auth_file=str(args.alibaba_web_auth_file).strip(),
         alibaba_quota_poll_max_attempts=args.alibaba_quota_poll_max_attempts,
         alibaba_quota_poll_retry_backoff_seconds=(args.alibaba_quota_poll_retry_backoff_seconds),
         grok_billing_poll_enabled=args.grok_billing_poll_enabled,
@@ -4727,10 +4788,92 @@ def _persist_kimi_usage_observations(
     return inserted_count
 
 
-def _load_alibaba_web_auth() -> Dict[str, str]:
+def _validate_alibaba_login_ticket(value: Any, *, source: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AlibabaWebAuthError(
+            f"{source} does not contain a usable login_ticket."
+        )
+    ticket = value.strip()
+    if "\r" in ticket or "\n" in ticket:
+        raise AlibabaWebAuthError(f"{source} contains an invalid login_ticket.")
+    return ticket
+
+
+def _read_alibaba_web_auth_file(auth_file: str) -> Dict[str, Any]:
+    path = Path(auth_file).expanduser()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise AlibabaWebAuthError(
+                "Alibaba web auth file must not be a symlink."
+            ) from None
+        raise AlibabaWebAuthError("Alibaba web auth file could not be opened.") from exc
+
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise AlibabaWebAuthError(
+                "Alibaba web auth file must be a regular file."
+            )
+        if stat.S_IMODE(file_stat.st_mode) != 0o600:
+            raise AlibabaWebAuthError(
+                "Alibaba web auth file must use mode 0600."
+            )
+        if file_stat.st_size > ALIBABA_WEB_AUTH_FILE_MAX_BYTES:
+            raise AlibabaWebAuthError("Alibaba web auth file is too large.")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw_payload = handle.read(ALIBABA_WEB_AUTH_FILE_MAX_BYTES + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    if len(raw_payload) > ALIBABA_WEB_AUTH_FILE_MAX_BYTES:
+        raise AlibabaWebAuthError("Alibaba web auth file is too large.")
+    try:
+        payload = json.loads(raw_payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AlibabaWebAuthError(
+            "Alibaba web auth file is not valid JSON."
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise AlibabaWebAuthError("Alibaba web auth file must contain a JSON object.")
+    if set(payload) != {"version", "login_ticket"}:
+        raise AlibabaWebAuthError(
+            "Alibaba web auth file must contain only version and login_ticket."
+        )
+    if payload.get("version") != ALIBABA_WEB_AUTH_FILE_VERSION:
+        raise AlibabaWebAuthError(
+            "Alibaba web auth file uses an unsupported version."
+        )
+    return {
+        "login_ticket": _validate_alibaba_login_ticket(
+            payload.get("login_ticket"),
+            source="Alibaba web auth file",
+        ),
+        "auth_source": "auth_file",
+        "credential_reloaded": True,
+    }
+
+
+def _load_alibaba_web_key_fallback() -> Dict[str, Any]:
     raw_key = os.getenv("ALIBABA_WEB_KEY", "").strip()
     if not raw_key:
-        raise AlibabaWebAuthError("ALIBABA_WEB_KEY is not configured.")
+        raise AlibabaWebAuthError(
+            "Alibaba web auth file is unavailable and ALIBABA_WEB_KEY "
+            "migration fallback is not configured."
+        )
     try:
         padding = "=" * (-len(raw_key) % 4)
         decoded = base64.urlsafe_b64decode(raw_key + padding)
@@ -4740,15 +4883,23 @@ def _load_alibaba_web_auth() -> Dict[str, str]:
     if not isinstance(payload, Mapping) or payload.get("v") != 1:
         raise AlibabaWebAuthError("ALIBABA_WEB_KEY uses an unsupported envelope version.")
 
-    auth: Dict[str, str] = {}
-    for field_name in ("login_ticket", "sec_token"):
-        value = payload.get(field_name)
-        if not isinstance(value, str) or not value.strip():
-            raise AlibabaWebAuthError(f"ALIBABA_WEB_KEY does not contain a usable {field_name}.")
-        if "\r" in value or "\n" in value:
-            raise AlibabaWebAuthError(f"ALIBABA_WEB_KEY contains an invalid {field_name} value.")
-        auth[field_name] = value.strip()
-    return auth
+    return {
+        "login_ticket": _validate_alibaba_login_ticket(
+            payload.get("login_ticket"),
+            source="ALIBABA_WEB_KEY",
+        ),
+        "auth_source": "ALIBABA_WEB_KEY",
+        "credential_reloaded": False,
+    }
+
+
+def _load_alibaba_web_auth(
+    config: ProviderStatusLoopConfig,
+) -> Dict[str, Any]:
+    try:
+        return _read_alibaba_web_auth_file(config.alibaba_web_auth_file)
+    except FileNotFoundError:
+        return _load_alibaba_web_key_fallback()
 
 
 def _alibaba_quota_request_url(
@@ -4810,13 +4961,14 @@ def _build_alibaba_quota_request(
         "V": "1.0",
         "Data": data,
     }
-    body = urlencode(
-        [
-            ("params", json.dumps(request_params, separators=(",", ":"))),
-            ("region", "ap-southeast-1"),
-            ("sec_token", auth["sec_token"]),
-        ]
-    ).encode("utf-8")
+    body_fields = [
+        ("params", json.dumps(request_params, separators=(",", ":"))),
+        ("region", "ap-southeast-1"),
+    ]
+    sec_token = auth.get("sec_token")
+    if isinstance(sec_token, str) and sec_token.strip():
+        body_fields.append(("sec_token", sec_token.strip()))
+    body = urlencode(body_fields).encode("utf-8")
     return urllib_request.Request(
         _alibaba_quota_request_url(config, api_name=api_name),
         data=body,
@@ -4848,6 +5000,10 @@ def _alibaba_quota_poll_error(
     attempt_count: int,
     retry_count: int,
     message: Optional[str] = None,
+    cookie_only_attempted: bool = True,
+    token_fallback_attempted: bool = False,
+    token_fallback_succeeded: bool = False,
+    token_fallback_source: Optional[str] = None,
 ) -> AlibabaQuotaPollError:
     if message is None:
         message = f"Alibaba Token Plan {endpoint} poll failed"
@@ -4861,6 +5017,127 @@ def _alibaba_quota_poll_error(
         attempt_count=attempt_count,
         retry_count=retry_count,
         endpoint=endpoint,
+        cookie_only_attempted=cookie_only_attempted,
+        token_fallback_attempted=token_fallback_attempted,
+        token_fallback_succeeded=token_fallback_succeeded,
+        token_fallback_source=token_fallback_source,
+    )
+
+
+def _alibaba_session_request(url: str, auth: Mapping[str, str]) -> urllib_request.Request:
+    return urllib_request.Request(
+        url,
+        headers={
+            "Cookie": f"login_aliyunid_ticket={auth['login_ticket']}",
+            "Referer": ALIBABA_TOKEN_PLAN_CONSOLE_URL,
+            "User-Agent": "Mozilla/5.0",
+        },
+        method="GET",
+    )
+
+
+def _valid_alibaba_sec_token(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    token = value.strip()
+    if not token or len(token) > 4096 or "\r" in token or "\n" in token:
+        return None
+    return token
+
+
+def _extract_alibaba_sec_token_from_payload(value: Any) -> Optional[str]:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized_key == "sectoken":
+                token = _valid_alibaba_sec_token(child)
+                if token is not None:
+                    return token
+        for child in value.values():
+            token = _extract_alibaba_sec_token_from_payload(child)
+            if token is not None:
+                return token
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for child in value:
+            token = _extract_alibaba_sec_token_from_payload(child)
+            if token is not None:
+                return token
+    return None
+
+
+def _extract_alibaba_sec_token_from_text(value: str) -> Optional[str]:
+    decoded = html.unescape(value)
+    try:
+        payload = json.loads(decoded)
+    except json.JSONDecodeError:
+        payload = None
+    token = _extract_alibaba_sec_token_from_payload(payload)
+    if token is not None:
+        return token
+    match = re.search(
+        r"""(?ix)
+        (?:["']?(?:sec_token|secToken)["']?)
+        \s*[:=]\s*
+        ["']([^"'\r\n]+)["']
+        """,
+        decoded,
+    )
+    return _valid_alibaba_sec_token(match.group(1)) if match else None
+
+
+def _resolve_alibaba_sec_token(
+    config: ProviderStatusLoopConfig,
+    auth: Mapping[str, str],
+) -> tuple[str, str]:
+    console_url = urlsplit(ALIBABA_TOKEN_PLAN_CONSOLE_URL)._replace(fragment="").geturl()
+    candidates = (
+        ("dashboard", console_url),
+        ("user_info", ALIBABA_TOKEN_PLAN_USER_INFO_URL),
+    )
+    for source, url in candidates:
+        try:
+            with urllib_request.urlopen(
+                _alibaba_session_request(url, auth),
+                timeout=config.alibaba_quota_poll_http_timeout_seconds,
+            ) as response:
+                status_code = int(
+                    getattr(response, "status", None) or response.getcode()
+                )
+                response_body = response.read(1_048_577)
+        except (
+            urllib_error.HTTPError,
+            urllib_error.URLError,
+            TimeoutError,
+            OSError,
+        ):
+            continue
+        if status_code < 200 or status_code >= 300 or len(response_body) > 1_048_576:
+            continue
+        token = _extract_alibaba_sec_token_from_text(
+            response_body.decode("utf-8", errors="replace")
+        )
+        if token is not None:
+            return token, source
+    raise AlibabaWebAuthError(
+        "Alibaba web session did not expose a usable security token."
+    )
+
+
+def _alibaba_quota_response_requires_sec_token(
+    *,
+    status_code: Optional[int],
+    response_body: Optional[str],
+) -> bool:
+    del status_code
+    normalized = (response_body or "").lower()
+    return any(
+        hint in normalized
+        for hint in (
+            "sec_token",
+            "sectoken",
+            "security token",
+            "csrf token",
+        )
     )
 
 
@@ -4890,21 +5167,190 @@ def _extract_alibaba_console_data(
     return provider_data
 
 
+def _apply_alibaba_sec_token_fallback(
+    config: ProviderStatusLoopConfig,
+    state: AlibabaQuotaFetchState,
+    *,
+    endpoint: str,
+    status_code: Optional[int],
+) -> None:
+    state.token_fallback_attempted = True
+    try:
+        sec_token, source = _resolve_alibaba_sec_token(
+            config,
+            state.request_auth,
+        )
+    except AlibabaWebAuthError:
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=status_code,
+            telemetry_class="auth",
+            **state.error_metadata(),
+        ) from None
+    state.request_auth["sec_token"] = sec_token
+    state.token_fallback_succeeded = True
+    state.token_fallback_source = source
+
+
+def _handle_alibaba_quota_http_error(
+    config: ProviderStatusLoopConfig,
+    state: AlibabaQuotaFetchState,
+    exc: urllib_error.HTTPError,
+    *,
+    endpoint: str,
+) -> None:
+    try:
+        response_body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        response_body = None
+    token_required = _alibaba_quota_response_requires_sec_token(
+        status_code=exc.code,
+        response_body=response_body,
+    )
+    if not state.token_fallback_attempted and token_required:
+        _apply_alibaba_sec_token_fallback(
+            config,
+            state,
+            endpoint=endpoint,
+            status_code=exc.code,
+        )
+        return
+    if token_required:
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=exc.code,
+            telemetry_class="auth",
+            **state.error_metadata(),
+        ) from None
+    if (
+        exc.code in ALIBABA_QUOTA_RETRYABLE_HTTP_STATUS_CODES
+        and state.retry_count < max(1, config.alibaba_quota_poll_max_attempts) - 1
+    ):
+        state.retry_count += 1
+        ALIBABA_QUOTA_POLL_SLEEP_FN(
+            config.alibaba_quota_poll_retry_backoff_seconds
+            * (2 ** (state.retry_count - 1))
+        )
+        return
+    raise _alibaba_quota_poll_error(
+        endpoint=endpoint,
+        status_code=exc.code,
+        telemetry_class=_alibaba_quota_http_telemetry_class(exc.code),
+        **state.error_metadata(),
+    ) from None
+
+
+def _handle_alibaba_quota_transport_error(
+    config: ProviderStatusLoopConfig,
+    state: AlibabaQuotaFetchState,
+    exc: BaseException,
+    *,
+    endpoint: str,
+) -> None:
+    if state.retry_count < max(1, config.alibaba_quota_poll_max_attempts) - 1:
+        state.retry_count += 1
+        ALIBABA_QUOTA_POLL_SLEEP_FN(
+            config.alibaba_quota_poll_retry_backoff_seconds
+            * (2 ** (state.retry_count - 1))
+        )
+        return
+    raise _alibaba_quota_poll_error(
+        endpoint=endpoint,
+        status_code=None,
+        telemetry_class="transport",
+        message=(
+            f"Alibaba Token Plan {endpoint} poll failed while contacting "
+            "the console gateway."
+        ),
+        **state.error_metadata(),
+    ) from exc
+
+
+def _parse_alibaba_quota_success(
+    config: ProviderStatusLoopConfig,
+    state: AlibabaQuotaFetchState,
+    *,
+    endpoint: str,
+    status_code: Optional[int],
+    response_body: Optional[str],
+) -> Optional[Mapping[str, Any]]:
+    if status_code is None or status_code < 200 or status_code >= 300:
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=status_code,
+            telemetry_class="http_error",
+            **state.error_metadata(),
+        )
+    try:
+        payload = json.loads(response_body or "")
+    except json.JSONDecodeError as exc:
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=status_code,
+            telemetry_class="malformed_telemetry",
+            message=(
+                f"Alibaba Token Plan {endpoint} endpoint returned invalid JSON."
+            ),
+            **state.error_metadata(),
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=status_code,
+            telemetry_class="malformed_telemetry",
+            message=(
+                f"Alibaba Token Plan {endpoint} endpoint returned a "
+                "non-object payload."
+            ),
+            **state.error_metadata(),
+        )
+    token_required = _alibaba_quota_response_requires_sec_token(
+        status_code=status_code,
+        response_body=response_body,
+    )
+    if not state.token_fallback_attempted and token_required:
+        _apply_alibaba_sec_token_fallback(
+            config,
+            state,
+            endpoint=endpoint,
+            status_code=status_code,
+        )
+        return None
+    if token_required:
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=status_code,
+            telemetry_class="auth",
+            **state.error_metadata(),
+        )
+    try:
+        return _extract_alibaba_console_data(payload, endpoint=endpoint)
+    except AlibabaQuotaPollError as exc:
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=exc.status_code,
+            telemetry_class=exc.telemetry_class,
+            message=str(exc),
+            **state.error_metadata(),
+        ) from exc
+
+
 def _fetch_alibaba_quota_payload(
     config: ProviderStatusLoopConfig,
     *,
     api_name: str,
     endpoint: str,
+    auth: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    max_attempts = max(1, config.alibaba_quota_poll_max_attempts)
-    attempt_count = 0
-    retry_count = 0
-    while attempt_count < max_attempts:
-        attempt_count += 1
+    state = AlibabaQuotaFetchState(
+        request_auth={"login_ticket": str(auth["login_ticket"])},
+    )
+    while True:
+        state.attempt_count += 1
         request = _build_alibaba_quota_request(
             config,
             api_name=api_name,
-            auth=_load_alibaba_web_auth(),
+            auth=state.request_auth,
         )
         status_code: Optional[int] = None
         response_body: Optional[str] = None
@@ -4916,74 +5362,36 @@ def _fetch_alibaba_quota_payload(
                 status_code = int(getattr(response, "status", None) or response.getcode())
                 response_body = response.read().decode("utf-8")
         except urllib_error.HTTPError as exc:
-            status_code = exc.code
-            if status_code in ALIBABA_QUOTA_RETRYABLE_HTTP_STATUS_CODES and attempt_count < max_attempts:
-                retry_count += 1
-                ALIBABA_QUOTA_POLL_SLEEP_FN(
-                    config.alibaba_quota_poll_retry_backoff_seconds * (2 ** (attempt_count - 1))
-                )
-                continue
-            raise _alibaba_quota_poll_error(
+            _handle_alibaba_quota_http_error(
+                config,
+                state,
+                exc,
                 endpoint=endpoint,
-                status_code=status_code,
-                telemetry_class=_alibaba_quota_http_telemetry_class(status_code),
-                attempt_count=attempt_count,
-                retry_count=retry_count,
-            ) from None
+            )
+            continue
         except (urllib_error.URLError, TimeoutError, OSError) as exc:
-            if attempt_count < max_attempts:
-                retry_count += 1
-                ALIBABA_QUOTA_POLL_SLEEP_FN(
-                    config.alibaba_quota_poll_retry_backoff_seconds * (2 ** (attempt_count - 1))
-                )
-                continue
-            raise _alibaba_quota_poll_error(
+            _handle_alibaba_quota_transport_error(
+                config,
+                state,
+                exc,
                 endpoint=endpoint,
-                status_code=None,
-                telemetry_class="transport",
-                attempt_count=attempt_count,
-                retry_count=retry_count,
-                message=(f"Alibaba Token Plan {endpoint} poll failed while " "contacting the console gateway."),
-            ) from exc
+            )
+            continue
 
-        if status_code is None or status_code < 200 or status_code >= 300:
-            raise _alibaba_quota_poll_error(
-                endpoint=endpoint,
-                status_code=status_code,
-                telemetry_class="http_error",
-                attempt_count=attempt_count,
-                retry_count=retry_count,
-            )
-        try:
-            payload = json.loads(response_body or "")
-        except json.JSONDecodeError as exc:
-            raise _alibaba_quota_poll_error(
-                endpoint=endpoint,
-                status_code=status_code,
-                telemetry_class="malformed_telemetry",
-                attempt_count=attempt_count,
-                retry_count=retry_count,
-                message=(f"Alibaba Token Plan {endpoint} endpoint returned invalid JSON."),
-            ) from exc
-        if not isinstance(payload, Mapping):
-            raise _alibaba_quota_poll_error(
-                endpoint=endpoint,
-                status_code=status_code,
-                telemetry_class="malformed_telemetry",
-                attempt_count=attempt_count,
-                retry_count=retry_count,
-                message=(f"Alibaba Token Plan {endpoint} endpoint returned a " "non-object payload."),
-            )
+        provider_payload = _parse_alibaba_quota_success(
+            config,
+            state,
+            endpoint=endpoint,
+            status_code=status_code,
+            response_body=response_body,
+        )
+        if provider_payload is None:
+            continue
         return {
             "status_code": status_code,
-            "payload": _extract_alibaba_console_data(
-                payload,
-                endpoint=endpoint,
-            ),
-            "attempt_count": attempt_count,
-            "retry_count": retry_count,
+            "payload": provider_payload,
+            **state.result_metadata(),
         }
-    raise AssertionError("bounded Alibaba quota retry loop unexpectedly exhausted")
 
 
 def _parse_alibaba_consumed_fraction(value: Any, *, field_name: str) -> float:
@@ -5060,6 +5468,7 @@ def _build_alibaba_quota_rate_limit_payloads(
     observed_at: datetime,
     usage_payload: Mapping[str, Any],
     subscription: Mapping[str, Any],
+    auth_source: str = "unknown",
 ) -> list[tuple[Any, ...]]:
     del config
     definitions = (
@@ -5110,7 +5519,7 @@ def _build_alibaba_quota_rate_limit_payloads(
             "parser_version": ALIBABA_TOKEN_PLAN_PARSER_VERSION,
             "telemetry_status": "valid",
             "window": window,
-            "auth_source": "ALIBABA_WEB_KEY",
+            "auth_source": auth_source,
             "unit_note": (
                 "Alibaba reports a consumed Credit fraction; absolute Credit "
                 "limits are not present in this console response."
@@ -5208,8 +5617,11 @@ def _alibaba_quota_request_contract_summary(
         "usage_contract": ALIBABA_TOKEN_PLAN_USAGE_API,
         "subscription_contract": ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
         "parser_version": ALIBABA_TOKEN_PLAN_PARSER_VERSION,
-        "auth_source": "ALIBABA_WEB_KEY",
+        "configured_auth_file": bool(config.alibaba_web_auth_file),
+        "auth_source": None,
         "header_names": ["content-type", "cookie", "referer", "user-agent"],
+        "cookie_only_first": True,
+        "sec_token_persisted": False,
         "usage_interval_seconds": config.alibaba_quota_poll_interval_seconds,
         "subscription_interval_seconds": (config.alibaba_subscription_poll_interval_seconds),
         "poll_max_attempts": max(1, config.alibaba_quota_poll_max_attempts),
@@ -6834,6 +7246,74 @@ def _run_kimi_usage_poll_task(
     }
 
 
+def _alibaba_subscription_refresh_due(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+    login_ticket: str,
+) -> bool:
+    auth_fingerprint = hashlib.sha256(login_ticket.encode("utf-8")).hexdigest()
+    auth_changed = state.alibaba_auth_fingerprint != auth_fingerprint
+    state.alibaba_auth_fingerprint = auth_fingerprint
+    return bool(
+        auth_changed
+        or state.alibaba_subscription_payload is None
+        or state.alibaba_subscription_last_attempt_monotonic is None
+        or now_monotonic - state.alibaba_subscription_last_attempt_monotonic
+        >= config.alibaba_subscription_poll_interval_seconds
+    )
+
+
+def _merge_alibaba_fetch_summary(
+    summary: Dict[str, Any],
+    fetched: Mapping[str, Any],
+    *,
+    endpoint: str,
+) -> None:
+    summary[f"{endpoint}_status_code"] = fetched["status_code"]
+    summary[f"{endpoint}_attempt_count"] = fetched.get("attempt_count", 1)
+    summary[f"{endpoint}_retry_count"] = fetched.get("retry_count", 0)
+    summary["token_fallback_attempted"] = bool(
+        summary["token_fallback_attempted"]
+        or fetched.get("token_fallback_attempted")
+    )
+    summary["token_fallback_succeeded"] = bool(
+        summary["token_fallback_succeeded"]
+        or fetched.get("token_fallback_succeeded")
+    )
+    if fetched.get("token_fallback_source"):
+        summary["token_fallback_source"] = fetched["token_fallback_source"]
+
+
+def _record_alibaba_poll_failure(
+    summary: Dict[str, Any],
+    exc: BaseException,
+) -> None:
+    summary["telemetry_status"] = "degraded"
+    summary["error_class"] = exc.__class__.__name__
+    summary["error_message"] = _redacted_failure_message(str(exc))
+    if isinstance(exc, AlibabaQuotaPollError):
+        summary["telemetry_class"] = exc.telemetry_class
+        summary["error_endpoint"] = exc.endpoint
+        summary[f"{exc.endpoint}_status_code"] = exc.status_code
+        summary[f"{exc.endpoint}_attempt_count"] = exc.attempt_count
+        summary[f"{exc.endpoint}_retry_count"] = exc.retry_count
+        summary["token_fallback_attempted"] = exc.token_fallback_attempted
+        summary["token_fallback_succeeded"] = exc.token_fallback_succeeded
+        summary["token_fallback_source"] = exc.token_fallback_source
+    elif isinstance(exc, probes.ProviderStatusDatabaseWriteSkipped):
+        summary["telemetry_class"] = "database_write_skipped"
+        summary["error_endpoint"] = "database"
+    elif isinstance(exc, AlibabaWebAuthError):
+        summary["telemetry_class"] = "auth"
+        summary["error_endpoint"] = "authentication"
+    elif isinstance(exc, ValueError):
+        summary["telemetry_class"] = "malformed_telemetry"
+    else:
+        summary["telemetry_class"] = "internal"
+
+
 def _run_alibaba_quota_poll_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -6847,12 +7327,6 @@ def _run_alibaba_quota_poll_task(
         return None
 
     state.alibaba_quota_last_attempt_monotonic = now_monotonic
-    subscription_due = (
-        state.alibaba_subscription_payload is None
-        or state.alibaba_subscription_last_attempt_monotonic is None
-        or now_monotonic - state.alibaba_subscription_last_attempt_monotonic
-        >= config.alibaba_subscription_poll_interval_seconds
-    )
     observed_at = datetime.now(timezone.utc)
     summary: Dict[str, Any] = {
         "attempted": True,
@@ -6872,9 +7346,22 @@ def _run_alibaba_quota_poll_task(
         "error_endpoint": None,
         "error_class": None,
         "error_message": None,
+        "credential_reloaded": False,
+        "token_fallback_attempted": False,
+        "token_fallback_succeeded": False,
+        "token_fallback_source": None,
         **_alibaba_quota_request_contract_summary(config),
     }
     try:
+        auth = _load_alibaba_web_auth(config)
+        summary["auth_source"] = auth["auth_source"]
+        summary["credential_reloaded"] = bool(auth["credential_reloaded"])
+        subscription_due = _alibaba_subscription_refresh_due(
+            config,
+            state,
+            now_monotonic=now_monotonic,
+            login_ticket=str(auth["login_ticket"]),
+        )
         if subscription_due:
             state.alibaba_subscription_last_attempt_monotonic = now_monotonic
             state.alibaba_subscription_payload = None
@@ -6882,10 +7369,13 @@ def _run_alibaba_quota_poll_task(
                 config,
                 api_name=ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
                 endpoint="subscription",
+                auth=auth,
             )
-            summary["subscription_status_code"] = fetched_subscription["status_code"]
-            summary["subscription_attempt_count"] = fetched_subscription.get("attempt_count", 1)
-            summary["subscription_retry_count"] = fetched_subscription.get("retry_count", 0)
+            _merge_alibaba_fetch_summary(
+                summary,
+                fetched_subscription,
+                endpoint="subscription",
+            )
             state.alibaba_subscription_payload = _parse_alibaba_subscription_payload(
                 fetched_subscription["payload"],
             )
@@ -6899,15 +7389,15 @@ def _run_alibaba_quota_poll_task(
             config,
             api_name=ALIBABA_TOKEN_PLAN_USAGE_API,
             endpoint="usage",
+            auth=auth,
         )
-        summary["usage_status_code"] = fetched_usage["status_code"]
-        summary["usage_attempt_count"] = fetched_usage.get("attempt_count", 1)
-        summary["usage_retry_count"] = fetched_usage.get("retry_count", 0)
+        _merge_alibaba_fetch_summary(summary, fetched_usage, endpoint="usage")
         payloads = _build_alibaba_quota_rate_limit_payloads(
             config,
             observed_at=observed_at,
             usage_payload=fetched_usage["payload"],
             subscription=subscription,
+            auth_source=str(auth["auth_source"]),
         )
         summary["observation_count"] = len(payloads)
         if config.apply:
@@ -6918,25 +7408,7 @@ def _run_alibaba_quota_poll_task(
             summary["persisted"] = bool(payloads)
         summary["telemetry_status"] = "valid"
     except Exception as exc:
-        summary["telemetry_status"] = "degraded"
-        summary["error_class"] = exc.__class__.__name__
-        summary["error_message"] = _redacted_failure_message(str(exc))
-        if isinstance(exc, AlibabaQuotaPollError):
-            summary["telemetry_class"] = exc.telemetry_class
-            summary["error_endpoint"] = exc.endpoint
-            summary[f"{exc.endpoint}_status_code"] = exc.status_code
-            summary[f"{exc.endpoint}_attempt_count"] = exc.attempt_count
-            summary[f"{exc.endpoint}_retry_count"] = exc.retry_count
-        elif isinstance(exc, probes.ProviderStatusDatabaseWriteSkipped):
-            summary["telemetry_class"] = "database_write_skipped"
-            summary["error_endpoint"] = "database"
-        elif isinstance(exc, AlibabaWebAuthError):
-            summary["telemetry_class"] = "auth"
-            summary["error_endpoint"] = "authentication"
-        elif isinstance(exc, ValueError):
-            summary["telemetry_class"] = "malformed_telemetry"
-        else:
-            summary["telemetry_class"] = "internal"
+        _record_alibaba_poll_failure(summary, exc)
 
     return {
         "event": "alibaba_quota_poll",
