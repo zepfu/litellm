@@ -106,6 +106,66 @@ class KimiOAuthSummary:
         }
 
 
+def inspect_kimi_oauth_credential_health(auth_file: str | Path) -> Dict[str, Any]:
+    """Read and classify Kimi OAuth state without touching its native lock."""
+    resolved_auth_file = Path(auth_file).expanduser()
+    try:
+        credential = _read_credential_payload(resolved_auth_file)
+        scope = _credential_scope(credential, DEFAULT_KIMI_OAUTH_SCOPE)
+        access_token = credential.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise KimiOAuthError("Kimi OAuth credential is missing access_token.")
+        expires_at = _as_finite_number(credential.get("expires_at"))
+        if expires_at is None:
+            return _kimi_health_summary(
+                resolved_auth_file,
+                scope,
+                "degraded",
+                error_class="CredentialExpiryUnavailable",
+                error_message="Kimi OAuth credential expires_at is missing or invalid.",
+            )
+        if expires_at <= time.time():
+            return _kimi_health_summary(
+                resolved_auth_file,
+                scope,
+                "expired",
+                expires_at,
+                error_class="CredentialExpiredError",
+                error_message="Kimi OAuth credential is expired.",
+            )
+        return _kimi_health_summary(resolved_auth_file, scope, "fresh", expires_at)
+    except Exception as exc:
+        return _kimi_health_summary(
+            resolved_auth_file,
+            DEFAULT_KIMI_OAUTH_SCOPE,
+            "malformed",
+            error_class=exc.__class__.__name__,
+            error_message=_redacted_error_message(exc),
+        )
+
+
+def _kimi_health_summary(
+    auth_file: Path,
+    scope: str,
+    health_status: str,
+    expires_at: Optional[float] = None,
+    error_class: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "attempted": True,
+        "refreshed": False,
+        "skipped": False,
+        "auth_file": str(auth_file),
+        "scope": scope,
+        "health_status": health_status,
+        "expires_at": _format_expires_at(expires_at),
+        "auth_degraded": health_status != "fresh",
+        "error_class": error_class,
+        "error_message": error_message,
+    }
+
+
 class _KimiCodeLock:
     """Directory lock interoperable with Kimi Code's proper-lockfile layout."""
 

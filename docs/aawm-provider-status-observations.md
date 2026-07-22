@@ -31,6 +31,29 @@ summary cap, `failure_summaries_omitted_count` records how many failed rows were
 not included in the log payload. All-green cycles omit the summary fields so
 normal logs stay compact.
 
+## Passive OAuth Credential Health
+
+The sidecar can inspect the existing Grok OIDC, Codex OAuth, xAI OAuth, and
+Kimi OAuth credential files without refreshing or modifying them. This mode is
+intended for read-only consumers such as Thoth, where another host remains the
+single credential writer but `provider_auth_observations` and
+`provider_auth_current` still need fresh health state.
+
+The inspection performs local file reads only. It does not acquire credential
+locks, repair metadata, write files, or make network calls. Each provider emits
+one sanitized event with a health status of `fresh`, `expired`, `degraded`, or
+`malformed`; the event omits the credential path and all token values. Persisted
+rows use `source_task=provider_auth_health_poll` and metadata flags
+`passive_read_only=true`, `network_calls=false`, and
+`credential_file_mutated=false`.
+
+Relevant environment variables:
+
+- `AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED`: enables the passive inspection.
+  Defaults to disabled so existing credential-refresh ownership is unchanged.
+- `AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS`: minimum seconds between
+  inspections; defaults to `3600`.
+
 ## Grok OIDC Refresh Task
 
 The same sidecar can also own the scheduled Grok native OIDC credential refresh.
@@ -460,6 +483,8 @@ Relevant environment variables:
   scan attempts. Defaults to `3600`.
 - `AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS`: recent database window
   scanned for anomalies. Defaults to `4`.
+- `AAWM_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS`: bounded statement
+  timeout for each analytical query. Defaults to `15000`.
 - `AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR`: directory for
   `<environment>-error.jsonl` anomaly intake. Defaults to
   `LITELLM_AAWM_ERROR_LOG_DIR` when set, otherwise `/app/.analysis`.

@@ -69,6 +69,70 @@ class XaiOAuthRefreshSummary:
         }
 
 
+def inspect_xai_oauth_credential_health(
+    auth_file: str | Path, *, scope: Optional[str] = None
+) -> Dict[str, Any]:
+    """Read and classify xAI OAuth state without locks, writes, or HTTP."""
+    resolved_auth_file = Path(auth_file).expanduser()
+    resolved_scope = _resolve_scope(scope)
+    try:
+        credential = _select_credential_record(
+            _read_credential_payload(resolved_auth_file), resolved_scope
+        )
+        if not _looks_like_credential_record(credential):
+            raise ValueError("xAI OAuth credential has no usable access credential.")
+        expires_at = _parse_expires_at(credential.get("expires_at"))
+        if expires_at is None:
+            return _xai_health_summary(
+                resolved_auth_file,
+                resolved_scope,
+                "degraded",
+                error_class="CredentialExpiryUnavailable",
+                error_message="xAI OAuth credential expires_at is missing or invalid.",
+            )
+        if expires_at <= datetime.now(timezone.utc):
+            return _xai_health_summary(
+                resolved_auth_file,
+                resolved_scope,
+                "expired",
+                expires_at,
+                error_class="CredentialExpiredError",
+                error_message="xAI OAuth credential is expired.",
+            )
+        return _xai_health_summary(
+            resolved_auth_file, resolved_scope, "fresh", expires_at
+        )
+    except Exception as exc:
+        return _xai_health_summary(
+            resolved_auth_file,
+            resolved_scope,
+            "malformed",
+            error_class=exc.__class__.__name__,
+            error_message=_sanitize_error_message(str(exc)),
+        )
+
+
+def _xai_health_summary(
+    auth_file: Path,
+    scope: str,
+    health_status: str,
+    expires_at: Optional[datetime] = None,
+    error_class: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "attempted": True,
+        "refreshed": False,
+        "skipped": False,
+        "auth_file": str(auth_file),
+        "scope": scope,
+        "health_status": health_status,
+        "expires_at": _format_expires_at(expires_at),
+        "error_class": error_class,
+        "error_message": error_message,
+    }
+
+
 def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
     """Thin wrapper over shared private write (no umask window, symlink-safe)."""
     write_private_file_text(

@@ -58,6 +58,37 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+### aawm.139 - Read-only provider health parity for remote collectors
+
+**What changed:** The fork metadata advances to `1.82.3+aawm.139`. The
+provider-status sidecar can now inspect the existing Grok OIDC, Codex OAuth,
+xAI OAuth, and Kimi OAuth credential files and persist fresh auth-health rows
+without refreshing credentials, acquiring locks, repairing metadata, writing
+files, or making network calls. Emitted events omit credential paths and token
+values. The anomaly scan now has a dedicated bounded 15-second statement
+timeout instead of inheriting the 5-second timeout used by normal sidecar
+database writes.
+
+**Why:** Thoth is a read-only credential consumer but still needs parity with
+the workstation's portable endpoint, auth, quota, reset-credit, anomaly, and
+error/rate-limit health surfaces. Disabling OAuth refresh correctly preserved
+single-writer ownership, but it also left `provider_auth_current` stale. The
+separate anomaly timeout prevents a valid bounded analytical scan from
+intermittently degrading under normal database load.
+
+**Why not upstream:** The cross-host credential ownership model, AAWM
+`aawm_tristore` health schema, provider-status scheduler, and Thoth deployment
+contract are fork-local operational behavior.
+
+**Validation status:** The full 163-test provider-status module, Ruff, Mypy
+with explicit package bases, and `git diff --check` pass. The isolated Thoth
+infrastructure stack smoke passes. A rebuilt WSL dev sidecar emitted fresh
+passive auth observations for all four credential families, 24 successful
+DNS/TCP/TLS/ICMP endpoint rows, valid Alibaba parser-v2 quota telemetry, a
+successful Codex reset-credit poll, and a healthy anomaly scan. The post-recreate
+log window contained zero non-JSON lines, structured errors, or tracebacks, and
+the sidecar restart count remained zero.
+
 ### aawm.138 - Alibaba unused-window quota reset handling
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.138`. Alibaba

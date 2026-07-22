@@ -16,6 +16,8 @@ import pytest
 from litellm.integrations import aawm_agent_identity
 from scripts import antigravity_oauth_refresh
 from scripts import codex_oauth_refresh
+from scripts import grok_oidc_refresh
+from scripts import kimi_oauth_refresh
 from scripts import record_provider_status_observations as probes
 from scripts import run_provider_status_observations_loop as loop
 from scripts import xai_oauth_refresh
@@ -735,7 +737,10 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         "AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED",
         "AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS",
         "AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS",
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS",
         "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR",
+        "AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED",
+        "AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS",
         "LITELLM_XAI_GROK_CLIENT_VERSION",
         "LITELLM_XAI_GROK_CLIENT_IDENTIFIER",
         "LITELLM_XAI_GROK_XAI_TOKEN_AUTH",
@@ -776,7 +781,10 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.observability_anomaly_scan_enabled is False
     assert config.observability_anomaly_scan_interval_seconds == 3600.0
     assert config.observability_anomaly_scan_lookback_hours == 4.0
+    assert config.observability_anomaly_scan_statement_timeout_ms == 15000
     assert config.observability_anomaly_scan_error_log_dir == "/app/.analysis"
+    assert config.provider_auth_health_poll_enabled is False
+    assert config.provider_auth_health_poll_interval_seconds == 3600.0
 
 
 def test_loop_config_uses_explicit_direct_schema_dsn(monkeypatch) -> None:
@@ -953,7 +961,25 @@ def test_provider_status_compose_wires_observability_anomaly_scan() -> None:
         in compose_text
     )
     assert (
+        "AAWM_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS=${AAWM_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS:-15000}"
+        in compose_text
+    )
+    assert (
         "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR=${AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR:-/app/.analysis}"
+        in compose_text
+    )
+
+
+def test_provider_status_compose_wires_passive_auth_health_disabled_by_default() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    compose_text = (repo_root / "docker-compose.dev.yml").read_text()
+
+    assert (
+        "AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED=${AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED:-0}"
+        in compose_text
+    )
+    assert (
+        "AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS=${AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS:-3600}"
         in compose_text
     )
 
@@ -3627,7 +3653,7 @@ def test_collect_observability_anomalies_runs_read_only_queries(monkeypatch) -> 
             ("aawm-provider-status-observations-anomaly-scan",),
         ),
         ("SELECT set_config('lock_timeout', %s, true)", ("1000ms",)),
-        ("SELECT set_config('statement_timeout', %s, true)", ("5000ms",)),
+        ("SELECT set_config('statement_timeout', %s, true)", ("15000ms",)),
         ("SELECT set_config('jit', 'off', true)", None),
     ]
     assert fake_conn.cursor_instance.execute_calls[4:] == [
@@ -4225,6 +4251,103 @@ def test_refresh_xai_oauth_auth_file_reports_missing_refresh_token(tmp_path) -> 
     assert "has no refresh_token" in err
 
 
+@pytest.mark.parametrize("provider_name", ["grok", "codex", "xai", "kimi"])
+def test_passive_oauth_health_inspectors_are_read_only_and_offline(
+    provider_name,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    auth_path = tmp_path / f"{provider_name}-auth.json"
+    future_timestamp = time.time() + 3600
+    future_iso = (
+        datetime.fromtimestamp(future_timestamp, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    if provider_name == "grok":
+        module = grok_oidc_refresh
+        inspector = module.inspect_grok_oidc_credential_health
+        payload = {"access_token": "grok-secret", "expires_at": future_iso}
+        inspector_kwargs = {}
+    elif provider_name == "codex":
+        module = codex_oauth_refresh
+        inspector = module.inspect_codex_oauth_credential_health
+        payload = {
+            "tokens": {
+                "access_token": _build_test_jwt({"exp": int(future_timestamp)}),
+                "account_id": "acct_test",
+            }
+        }
+        inspector_kwargs = {}
+    elif provider_name == "xai":
+        module = xai_oauth_refresh
+        inspector = module.inspect_xai_oauth_credential_health
+        payload = {"access_token": "xai-secret", "expires_at": future_iso}
+        inspector_kwargs = {}
+    else:
+        module = kimi_oauth_refresh
+        inspector = module.inspect_kimi_oauth_credential_health
+        payload = {
+            "access_token": "kimi-secret",
+            "expires_at": future_timestamp,
+            "scope": "kimi-code",
+        }
+        inspector_kwargs = {}
+
+    auth_path.write_text(json.dumps(payload), encoding="utf-8")
+    auth_path.chmod(0o600)
+    before_content = auth_path.read_bytes()
+    before_stat = auth_path.stat()
+    before_children = sorted(path.name for path in tmp_path.iterdir())
+
+    def fail_network(*_args, **_kwargs):
+        raise AssertionError("passive credential inspection must not use the network")
+
+    monkeypatch.setattr(module.urllib_request, "urlopen", fail_network)
+
+    summary = inspector(auth_path, **inspector_kwargs)
+
+    after_stat = auth_path.stat()
+    assert summary["health_status"] == "fresh"
+    assert summary["refreshed"] is False
+    assert auth_path.read_bytes() == before_content
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+    assert after_stat.st_mode == before_stat.st_mode
+    assert sorted(path.name for path in tmp_path.iterdir()) == before_children
+
+
+def test_passive_oauth_health_inspection_classifies_expired_and_malformed(
+    tmp_path,
+) -> None:
+    expired_path = tmp_path / "expired-codex.json"
+    expired_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt(
+                        {"exp": int(time.time()) - 60}
+                    )
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    malformed_path = tmp_path / "malformed-codex.json"
+    malformed_path.write_text("{not-json", encoding="utf-8")
+
+    expired = codex_oauth_refresh.inspect_codex_oauth_credential_health(
+        expired_path
+    )
+    malformed = codex_oauth_refresh.inspect_codex_oauth_credential_health(
+        malformed_path
+    )
+
+    assert expired["health_status"] == "expired"
+    assert expired["error_class"] == "CredentialExpiredError"
+    assert malformed["health_status"] == "malformed"
+    assert malformed["error_class"] == "ValueError"
+
+
 def _grok_oidc_auth_persist_config(**overrides):
     from dataclasses import replace
 
@@ -4254,6 +4377,115 @@ def _grok_oidc_auth_persist_config(**overrides):
     if overrides:
         config = replace(config, **overrides)
     return config
+
+
+def test_passive_auth_health_poll_persists_four_sanitized_rows_on_cadence(
+    monkeypatch,
+) -> None:
+    config = _grok_oidc_auth_persist_config(
+        grok_oidc_refresh_enabled=False,
+        codex_oauth_refresh_enabled=False,
+        xai_oauth_refresh_enabled=False,
+        kimi_oauth_refresh_enabled=False,
+        provider_auth_health_poll_enabled=True,
+        provider_auth_health_poll_interval_seconds=3600.0,
+    )
+    state = loop.SidecarTaskState()
+    persisted = []
+    future = "2026-07-22T18:00:00Z"
+
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "inspect_grok_oidc_credential_health",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.grok_oidc_auth_file,
+            "scope": grok_oidc_refresh.DEFAULT_GROK_OIDC_SCOPE,
+            "health_status": "fresh",
+            "expires_at": future,
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+    monkeypatch.setattr(
+        loop.codex_oauth_refresh,
+        "inspect_codex_oauth_credential_health",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.codex_auth_file,
+            "account_id": "acct_test",
+            "health_status": "fresh",
+            "expires_at": future,
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+    monkeypatch.setattr(
+        loop.xai_oauth_refresh,
+        "inspect_xai_oauth_credential_health",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.xai_oauth_auth_file,
+            "scope": config.xai_oauth_scope,
+            "health_status": "fresh",
+            "expires_at": future,
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+    monkeypatch.setattr(
+        loop.kimi_oauth_refresh,
+        "inspect_kimi_oauth_credential_health",
+        lambda *_args, **_kwargs: {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.kimi_oauth_auth_file,
+            "scope": kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_SCOPE,
+            "health_status": "fresh",
+            "expires_at": future,
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+
+    def fake_persist(_config, observation):
+        persisted.append(dict(observation))
+        return True, 1, None, None
+
+    monkeypatch.setattr(
+        loop,
+        "_persist_passive_provider_auth_observation",
+        fake_persist,
+    )
+
+    first_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    early_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
+    due_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3700.0)
+
+    assert len(first_events) == 4
+    assert early_events == []
+    assert len(due_events) == 4
+    assert len(persisted) == 8
+    assert {row["auth_family"] for row in persisted} == {
+        "grok_oidc",
+        "codex_oauth",
+        "xai_oauth",
+        "kimi_oauth",
+    }
+    assert all(row["source_task"] == "provider_auth_health_poll" for row in persisted)
+    assert all(row["metadata"]["passive_read_only"] is True for row in persisted)
+    assert all(row["metadata"]["network_calls"] is False for row in persisted)
+    assert all(
+        row["metadata"]["credential_file_mutated"] is False for row in persisted
+    )
+    assert all("auth_file" not in event for event in first_events + due_events)
 
 
 def _grok_oidc_refresh_sidecar_event(**overrides) -> dict:

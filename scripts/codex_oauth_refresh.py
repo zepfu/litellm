@@ -70,6 +70,67 @@ class CodexOAuthRefreshSummary:
         }
 
 
+def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, Any]:
+    """Read and classify Codex OAuth state without locks, writes, or HTTP."""
+    resolved_auth_file = Path(auth_file).expanduser()
+    try:
+        token_data = _get_token_data(_read_auth_data(resolved_auth_file))
+        if _clean_string(token_data.get("access_token")) is None:
+            raise ValueError("Codex OAuth credential is missing access_token.")
+        expires_at = _get_token_expiry(token_data)
+        account_id = _extract_account_id(token_data)
+        if expires_at is None:
+            return _codex_health_summary(
+                resolved_auth_file,
+                account_id,
+                "degraded",
+                error_class="CredentialExpiryUnavailable",
+                error_message="Codex OAuth credential expiry is unavailable.",
+            )
+        expires_at_text = _format_expires_at(expires_at)
+        if expires_at <= time.time():
+            return _codex_health_summary(
+                resolved_auth_file,
+                account_id,
+                "expired",
+                expires_at_text,
+                error_class="CredentialExpiredError",
+                error_message="Codex OAuth credential is expired.",
+            )
+        return _codex_health_summary(
+            resolved_auth_file, account_id, "fresh", expires_at_text
+        )
+    except Exception as exc:
+        return _codex_health_summary(
+            resolved_auth_file,
+            None,
+            "malformed",
+            error_class=exc.__class__.__name__,
+            error_message=_sanitize_error_message(str(exc)),
+        )
+
+
+def _codex_health_summary(
+    auth_file: Path,
+    account_id: Optional[str],
+    health_status: str,
+    expires_at: Optional[str] = None,
+    error_class: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "attempted": True,
+        "refreshed": False,
+        "skipped": False,
+        "auth_file": str(auth_file),
+        "account_id": account_id,
+        "health_status": health_status,
+        "expires_at": expires_at,
+        "error_class": error_class,
+        "error_message": error_message,
+    }
+
+
 def refresh_codex_oauth_auth_file(
     auth_file: str | Path,
     *,

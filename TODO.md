@@ -188,17 +188,17 @@ these docs only as needed:
 
 ## Next
 
-- Publish and promote `v1.82.3-aawm.138` for Alibaba Token Plan unused-window
-  reset handling. The candidate passed 37 focused Alibaba tests, the full
-  156-test provider-status module, Ruff, Thoth dev stack acceptance, exact
-  Thoth `aawm_tristore` row verification, and workstation marker-absence proof.
-  The live 5-hour window reports zero consumption without a reset timestamp;
-  parser v2 stores that window with `remaining_pct=100`,
-  `expected_reset_at=NULL`, and explicit `absent_unused_window` evidence while
-  preserving the valid 7-day reset. Follow `PROD_RELEASE.md`, publish the
-  immutable `.138` fork release, promote the exact proven build to Thoth
-  production, and verify health, auth mounts, quota rows, restart counts, and
-  sanitized logs.
+- Publish and promote `v1.82.3-aawm.139` for complete portable provider-health
+  parity on Thoth. The candidate adds read-only Grok/Codex/xAI/Kimi auth-health
+  observations and a bounded anomaly-scan timeout; the infrastructure candidate
+  adds exact Codex credential sync/read-only mounting, ICMP `NET_RAW`, Codex
+  reset-credit, and anomaly polling while retaining workstation-only OAuth
+  refresh ownership. WSL dev proof passed all 163 provider-status tests, Ruff,
+  Mypy, the full Thoth infrastructure smoke, fresh endpoint/auth/quota/reset
+  rows, clean structured logs, and zero sidecar restarts. Follow
+  `PROD_RELEASE.md`, publish the immutable `.139` release, deploy only the named
+  Thoth services, and prove fresh rows in all eight Thoth health surfaces with
+  workstation marker isolation.
 
 - Rerun the Spark/Codex-dependent prod harness cases after the upstream Codex
   quota reset at `2026-05-18 15:08:41 UTC`: at minimum

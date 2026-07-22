@@ -104,6 +104,8 @@ DEFAULT_KIMI_OAUTH_AUTH_FILE = "~/.kimi-code/credentials/kimi-code.json"
 DEFAULT_KIMI_OAUTH_LOCK_FILE = "~/.kimi-code/oauth/kimi-code"
 DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS = kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS
+DEFAULT_PROVIDER_AUTH_HEALTH_POLL_ENABLED = False
+DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_USAGE_POLL_ENABLED = False
 DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -276,6 +278,7 @@ CODEX_RESET_CREDIT_SANITIZED_RAW_FIELD_KEYS = frozenset(
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ENABLED = False
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS = 3600.0
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS = 4.0
+DEFAULT_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS = 15_000
 DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR = "/app/.analysis"
 DEFAULT_OBSERVABILITY_ANOMALY_ERROR_LOG_MAX_BYTES = 10 * 1024 * 1024
 OBSERVABILITY_ANOMALY_SAMPLE_LIMIT = 5
@@ -1182,6 +1185,10 @@ class ProviderStatusLoopConfig:
     kimi_oauth_refresh_interval_seconds: float = DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS
     kimi_oauth_force_refresh: bool = False
     kimi_oauth_http_timeout_seconds: float = DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS
+    provider_auth_health_poll_enabled: bool = DEFAULT_PROVIDER_AUTH_HEALTH_POLL_ENABLED
+    provider_auth_health_poll_interval_seconds: float = (
+        DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS
+    )
     kimi_usage_poll_enabled: bool = DEFAULT_KIMI_USAGE_POLL_ENABLED
     kimi_usage_poll_interval_seconds: float = DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS
     kimi_usage_poll_http_timeout_seconds: float = DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS
@@ -1232,6 +1239,9 @@ class ProviderStatusLoopConfig:
     observability_anomaly_scan_lookback_hours: float = (
         DEFAULT_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS
     )
+    observability_anomaly_scan_statement_timeout_ms: int = (
+        DEFAULT_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS
+    )
     observability_anomaly_scan_error_log_dir: str = (
         DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR
     )
@@ -1243,6 +1253,7 @@ class SidecarTaskState:
     codex_oauth_last_attempt_monotonic: Optional[float] = None
     xai_oauth_last_attempt_monotonic: Optional[float] = None
     kimi_oauth_last_attempt_monotonic: Optional[float] = None
+    provider_auth_health_poll_last_attempt_monotonic: Optional[float] = None
     kimi_usage_last_attempt_monotonic: Optional[float] = None
     kimi_usage_refresh_pending: bool = False
     alibaba_quota_last_attempt_monotonic: Optional[float] = None
@@ -1768,6 +1779,35 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         action="store_false",
         help="Disable the Kimi OAuth auth-file refresh task.",
     )
+    provider_auth_health_group = parser.add_mutually_exclusive_group()
+    provider_auth_health_group.add_argument(
+        "--provider-auth-health-poll-enabled",
+        dest="provider_auth_health_poll_enabled",
+        action="store_true",
+        default=_env_bool("AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED", False),
+        help=(
+            "Read configured OAuth credential files and persist sanitized health "
+            "observations without refreshing, locks, metadata repair, or HTTP."
+        ),
+    )
+    provider_auth_health_group.add_argument(
+        "--no-provider-auth-health-poll",
+        dest="provider_auth_health_poll_enabled",
+        action="store_false",
+        help="Disable passive provider OAuth credential health observations.",
+    )
+    parser.add_argument(
+        "--provider-auth-health-poll-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS",
+            DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between passive OAuth credential health polls. "
+            "Defaults to AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS or 3600."
+        ),
+    )
     parser.add_argument(
         "--kimi-oauth-auth-file",
         default=os.getenv("AAWM_KIMI_OAUTH_AUTH_FILE", DEFAULT_KIMI_OAUTH_AUTH_FILE),
@@ -2235,6 +2275,19 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
     )
     parser.add_argument(
+        "--observability-anomaly-scan-statement-timeout-ms",
+        type=int,
+        default=_env_int(
+            "AAWM_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS",
+            DEFAULT_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS,
+        ),
+        help=(
+            "Statement timeout for each bounded anomaly-scan database query. "
+            "Defaults to AAWM_OBSERVABILITY_ANOMALY_SCAN_STATEMENT_TIMEOUT_MS "
+            "or 15000."
+        ),
+    )
+    parser.add_argument(
         "--observability-anomaly-scan-error-log-dir",
         default=os.getenv(
             "AAWM_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR",
@@ -2260,6 +2313,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_codex_config_args(args)
     _validate_xai_oauth_config_args(args)
     _validate_kimi_oauth_config_args(args)
+    _validate_provider_auth_health_poll_config_args(args)
     _validate_kimi_usage_config_args(args)
     _validate_alibaba_quota_config_args(args)
     _validate_grok_billing_config_args(args)
@@ -2320,6 +2374,13 @@ def _validate_kimi_oauth_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--kimi-oauth-http-timeout-seconds must be greater than 0")
 
 
+def _validate_provider_auth_health_poll_config_args(args: argparse.Namespace) -> None:
+    if args.provider_auth_health_poll_interval_seconds <= 0:
+        raise SystemExit(
+            "--provider-auth-health-poll-interval-seconds must be greater than 0"
+        )
+
+
 def _validate_kimi_usage_config_args(args: argparse.Namespace) -> None:
     if args.kimi_usage_poll_interval_seconds <= 0:
         raise SystemExit("--kimi-usage-poll-interval-seconds must be greater than 0")
@@ -2378,6 +2439,10 @@ def _validate_observability_anomaly_scan_config_args(args: argparse.Namespace) -
     if args.observability_anomaly_scan_lookback_hours <= 0:
         raise SystemExit(
             "--observability-anomaly-scan-lookback-hours must be greater than 0"
+        )
+    if args.observability_anomaly_scan_statement_timeout_ms <= 0:
+        raise SystemExit(
+            "--observability-anomaly-scan-statement-timeout-ms must be greater than 0"
         )
     if not str(args.observability_anomaly_scan_error_log_dir).strip():
         raise SystemExit("--observability-anomaly-scan-error-log-dir must not be empty")
@@ -2473,6 +2538,10 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         kimi_oauth_refresh_interval_seconds=args.kimi_oauth_refresh_interval_seconds,
         kimi_oauth_force_refresh=args.kimi_oauth_force_refresh,
         kimi_oauth_http_timeout_seconds=args.kimi_oauth_http_timeout_seconds,
+        provider_auth_health_poll_enabled=args.provider_auth_health_poll_enabled,
+        provider_auth_health_poll_interval_seconds=(
+            args.provider_auth_health_poll_interval_seconds
+        ),
         kimi_usage_poll_enabled=args.kimi_usage_poll_enabled,
         kimi_usage_poll_interval_seconds=args.kimi_usage_poll_interval_seconds,
         kimi_usage_poll_http_timeout_seconds=args.kimi_usage_poll_http_timeout_seconds,
@@ -2505,6 +2574,9 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         observability_anomaly_scan_enabled=(args.observability_anomaly_scan_enabled),
         observability_anomaly_scan_interval_seconds=(args.observability_anomaly_scan_interval_seconds),
         observability_anomaly_scan_lookback_hours=(args.observability_anomaly_scan_lookback_hours),
+        observability_anomaly_scan_statement_timeout_ms=(
+            args.observability_anomaly_scan_statement_timeout_ms
+        ),
         observability_anomaly_scan_error_log_dir=(args.observability_anomaly_scan_error_log_dir),
     )
 
@@ -2640,6 +2712,9 @@ def _parse_sidecar_timestamp(value: Any) -> Optional[datetime]:
 
 
 def _provider_auth_status_from_event(event: Mapping[str, Any]) -> str:
+    health_status = event.get("health_status")
+    if health_status in {"fresh", "expired", "degraded", "malformed"}:
+        return str(health_status)
     if event.get("error_class"):
         return "failed"
     if event.get("refreshed"):
@@ -2649,6 +2724,69 @@ def _provider_auth_status_from_event(event: Mapping[str, Any]) -> str:
     if event.get("attempted"):
         return "attempted"
     return "not_applicable"
+
+
+def _build_passive_provider_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+    *,
+    provider: str,
+    auth_family: str,
+    auth_file: str,
+    auth_file_source: str,
+    credential_scope: Optional[str],
+) -> Dict[str, Any]:
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
+        timezone.utc
+    )
+    status = _provider_auth_status_from_event(event)
+    return {
+        "observed_at": observed_at,
+        "environment": event.get("environment") or config.environment,
+        "provider": provider,
+        "auth_family": auth_family,
+        "credential_scope": _redacted_summary_field(credential_scope, limit=512),
+        "auth_file_hash": probes.auth_file_identity_hash(auth_file),
+        "status": status,
+        "attempted": bool(event.get("attempted")),
+        "refreshed": False,
+        "skipped": False,
+        "expires_at": _parse_sidecar_timestamp(event.get("expires_at")),
+        "last_success_at": observed_at if status == "fresh" else None,
+        "source_task": "provider_auth_health_poll",
+        "error_class": _redacted_summary_field(event.get("error_class")),
+        "error_message": _redacted_failure_message(event.get("error_message")),
+        "metadata": {
+            "auth_file_hash_algorithm": "sha256",
+            "auth_file_source": auth_file_source,
+            "passive_read_only": True,
+            "network_calls": False,
+            "credential_file_mutated": False,
+            "health_poll_interval_seconds": (
+                config.provider_auth_health_poll_interval_seconds
+            ),
+        },
+    }
+
+
+def _persist_passive_provider_auth_observation(
+    config: ProviderStatusLoopConfig,
+    observation: Mapping[str, Any],
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    if not config.apply:
+        return False, 0, None, "apply_disabled"
+    try:
+        inserted_count = probes.insert_provider_auth_observations(
+            _resolve_dsn(config),
+            [dict(observation)],
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return False, 0, exc.error_class, _redacted_failure_message(str(exc))
+    except Exception as exc:
+        return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
+    return True, inserted_count, None, None
 
 
 def _build_grok_oidc_auth_observation(
@@ -6451,7 +6589,9 @@ def _collect_observability_anomalies(
                     _set_observability_anomaly_scan_database_timeouts(
                         cur,
                         lock_timeout_ms=config.db_lock_timeout_ms,
-                        statement_timeout_ms=config.db_statement_timeout_ms,
+                        statement_timeout_ms=(
+                            config.observability_anomaly_scan_statement_timeout_ms
+                        ),
                     )
                     cur.execute(
                         OBSERVABILITY_SESSION_HISTORY_ANOMALY_SQL,
@@ -7170,6 +7310,122 @@ def _run_kimi_oauth_refresh_task(
     return event
 
 
+def _run_provider_auth_health_poll_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> list[Dict[str, Any]]:
+    """Persist one read-only local credential-health observation per provider."""
+    if not config.provider_auth_health_poll_enabled:
+        return []
+    last_attempt = state.provider_auth_health_poll_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt
+        < config.provider_auth_health_poll_interval_seconds
+    ):
+        return []
+
+    state.provider_auth_health_poll_last_attempt_monotonic = now_monotonic
+    inspections: tuple[tuple[Any, ...], ...] = (
+        (
+            "grok_oidc_passive_health_inspection",
+            grok_oidc_refresh.inspect_grok_oidc_credential_health,
+            (config.grok_oidc_auth_file,),
+            {"scope": None},
+            "xai",
+            "grok_oidc",
+            config.grok_oidc_auth_file,
+            config.grok_oidc_auth_file_source,
+            "scope",
+        ),
+        (
+            "codex_oauth_passive_health_inspection",
+            codex_oauth_refresh.inspect_codex_oauth_credential_health,
+            (config.codex_auth_file,),
+            {},
+            "openai",
+            "codex_oauth",
+            config.codex_auth_file,
+            config.codex_auth_file_source,
+            "account_id",
+        ),
+        (
+            "xai_oauth_passive_health_inspection",
+            xai_oauth_refresh.inspect_xai_oauth_credential_health,
+            (config.xai_oauth_auth_file,),
+            {"scope": config.xai_oauth_scope},
+            "xai",
+            "xai_oauth",
+            config.xai_oauth_auth_file,
+            config.xai_oauth_auth_file_source,
+            "scope",
+        ),
+        (
+            "kimi_oauth_passive_health_inspection",
+            kimi_oauth_refresh.inspect_kimi_oauth_credential_health,
+            (config.kimi_oauth_auth_file,),
+            {},
+            "kimi_code",
+            "kimi_oauth",
+            config.kimi_oauth_auth_file,
+            config.kimi_oauth_auth_file_source,
+            "scope",
+        ),
+    )
+    events: list[Dict[str, Any]] = []
+    for (
+        event_name,
+        inspector,
+        inspector_args,
+        inspector_kwargs,
+        provider,
+        auth_family,
+        auth_file,
+        auth_file_source,
+        scope_field,
+    ) in inspections:
+        try:
+            summary = inspector(*inspector_args, **inspector_kwargs)
+        except Exception as exc:
+            summary = {
+                "attempted": True,
+                "refreshed": False,
+                "skipped": False,
+                "auth_file": auth_file,
+                "health_status": "malformed",
+                "error_class": exc.__class__.__name__,
+                "error_message": _redacted_failure_message(str(exc)),
+            }
+        event = {
+            "event": event_name,
+            "source_task": "provider_auth_health_poll",
+            "observed_at": _utc_timestamp(),
+            "environment": config.environment,
+            **{key: value for key, value in summary.items() if key != "auth_file"},
+        }
+        observation = _build_passive_provider_auth_observation(
+            config,
+            event,
+            provider=provider,
+            auth_family=auth_family,
+            auth_file=auth_file,
+            auth_file_source=auth_file_source,
+            credential_scope=summary.get(scope_field),
+        )
+        persisted, inserted_count, skip_error_class, skip_reason = (
+            _persist_passive_provider_auth_observation(config, observation)
+        )
+        event["auth_observation_status"] = observation["status"]
+        event["auth_observation_persisted"] = persisted
+        event["auth_observation_inserted_count"] = inserted_count
+        event["auth_observation_skip_error_class"] = skip_error_class
+        event["auth_observation_skip_reason"] = skip_reason
+        events.append(event)
+    return events
+
+
 def _run_kimi_usage_poll_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -7610,6 +7866,13 @@ def run_due_sidecar_tasks(
             }
         if event is not None:
             events.append(event)
+    events.extend(
+        _run_provider_auth_health_poll_task(
+            config,
+            state,
+            now_monotonic=now,
+        )
+    )
     return events
 
 

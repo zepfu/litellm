@@ -50,6 +50,7 @@ __all__ = (
     "CredentialPathIsSymlinkError",
     "GrokOidcMetadataRepairSummary",
     "GrokOidcRefreshSummary",
+    "inspect_grok_oidc_credential_health",
     "refresh_grok_oidc_auth_file",
     "repair_grok_oidc_auth_file_metadata",
 )
@@ -95,6 +96,70 @@ class GrokOidcMetadataRepairSummary:
             "error_class": self.error_class,
             "error_message": self.error_message,
         }
+
+
+def inspect_grok_oidc_credential_health(
+    auth_file: str | Path, *, scope: Optional[str] = None
+) -> Dict[str, Any]:
+    """Read and classify Grok OIDC state without locks, writes, or HTTP."""
+    resolved_auth_file = Path(auth_file).expanduser()
+    resolved_scope = _resolve_scope(scope)
+    try:
+        credential = _select_credential_record(
+            _read_credential_payload(resolved_auth_file), resolved_scope
+        )
+        if not _looks_like_credential_record(credential):
+            raise ValueError("Grok OIDC credential has no usable access credential.")
+        expires_at = _parse_expires_at(credential.get("expires_at"))
+        if expires_at is None:
+            return _grok_health_summary(
+                resolved_auth_file,
+                resolved_scope,
+                "degraded",
+                error_class="CredentialExpiryUnavailable",
+                error_message="Grok OIDC credential expires_at is missing or invalid.",
+            )
+        if expires_at <= datetime.now(timezone.utc):
+            return _grok_health_summary(
+                resolved_auth_file,
+                resolved_scope,
+                "expired",
+                expires_at,
+                error_class="CredentialExpiredError",
+                error_message="Grok OIDC credential is expired.",
+            )
+        return _grok_health_summary(
+            resolved_auth_file, resolved_scope, "fresh", expires_at
+        )
+    except Exception as exc:
+        return _grok_health_summary(
+            resolved_auth_file,
+            resolved_scope,
+            "malformed",
+            error_class=exc.__class__.__name__,
+            error_message=_sanitize_error_message(str(exc)),
+        )
+
+
+def _grok_health_summary(
+    auth_file: Path,
+    scope: str,
+    health_status: str,
+    expires_at: Optional[datetime] = None,
+    error_class: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "attempted": True,
+        "refreshed": False,
+        "skipped": False,
+        "auth_file": str(auth_file),
+        "scope": scope,
+        "health_status": health_status,
+        "expires_at": _format_expires_at(expires_at),
+        "error_class": error_class,
+        "error_message": error_message,
+    }
 
 
 def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> None:
