@@ -276,12 +276,23 @@ aliases:
     snapshot = compiler.compile_yaml(raw)
     lpe.set_active_routing_snapshot(snapshot)
 
-    # Live getter: no way to pass client_product_label through this call site
-    # today, so it must default to "no known TUI" -- excluding the
-    # tui_attached candidate.
+    # No client_product_label supplied -- must default to "no known TUI",
+    # excluding the tui_attached candidate.
     candidates = lpe._get_codex_auto_agent_candidates_for_alias("read")
     models = [c["model"] for c in candidates]
     assert "claude-only-model" not in models
+
+    # INCLUSION: once the live getter actually threads a request's
+    # client_product_label through, a tui_attached: Claude candidate IS
+    # eligible when the request presents a matching Claude/x.y label. This
+    # proves the threading is real (not just an exclusion default that would
+    # pass vacuously even if client_product_label were silently dropped).
+    candidates_with_claude_label = lpe._get_codex_auto_agent_candidates_for_alias(
+        "read",
+        client_product_label="Claude/1.2",
+    )
+    models_with_claude_label = [c["model"] for c in candidates_with_claude_label]
+    assert "claude-only-model" in models_with_claude_label
 
 
 def test_all_ineligible_candidates_fail_closed_not_unfiltered() -> None:
