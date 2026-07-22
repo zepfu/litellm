@@ -46,11 +46,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
 )
 
 PACKAGE_DIR = Path(package.__file__).resolve().parent
-PACKAGE_MODULES = tuple(
-    sorted(
-        {path.stem for path in PACKAGE_DIR.glob("*.py") if path.name != "__init__.py"}
-    )
-)
+PACKAGE_MODULES = tuple(sorted({path.stem for path in PACKAGE_DIR.glob("*.py") if path.name != "__init__.py"}))
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +56,7 @@ PACKAGE_MODULES = tuple(
 
 @pytest.mark.parametrize("module_name", PACKAGE_MODULES)
 def test_rr054_package_module_imports_and_is_under_package(module_name: str) -> None:
-    mod = importlib.import_module(
-        f"litellm.proxy.pass_through_endpoints.aawm_alias_routing.{module_name}"
-    )
+    mod = importlib.import_module(f"litellm.proxy.pass_through_endpoints.aawm_alias_routing.{module_name}")
     assert Path(mod.__file__).resolve().parent == PACKAGE_DIR
     assert mod.__name__.endswith(f".aawm_alias_routing.{module_name}")
 
@@ -268,10 +262,7 @@ def test_rr054_state_manager_families_and_monotonic_maps() -> None:
     assert manager.family("codex") is manager.codex
     assert manager.family("other") is manager.codex
     assert manager.google_oauth is oauth_token_cache.google_oauth_access_token_cache
-    assert (
-        manager.antigravity_oauth
-        is oauth_token_cache.antigravity_oauth_access_token_cache
-    )
+    assert manager.antigravity_oauth is oauth_token_cache.antigravity_oauth_access_token_cache
 
     cmap = MonotonicCooldownMap()
     cmap.extend("r1", 1.5, max_size=8)
@@ -286,15 +277,9 @@ def test_rr054_state_manager_families_and_monotonic_maps() -> None:
 @pytest.mark.asyncio
 async def test_rr054_state_candidate_probe_lock_is_stable_per_key() -> None:
     manager = AliasRoutingStateManager()
-    first = await manager.candidate_probe_lock(
-        alias_family="codex", cooldown_key="lane:1"
-    )
-    second = await manager.candidate_probe_lock(
-        alias_family="codex", cooldown_key="lane:1"
-    )
-    other = await manager.candidate_probe_lock(
-        alias_family="codex", cooldown_key="lane:2"
-    )
+    first = await manager.candidate_probe_lock(alias_family="codex", cooldown_key="lane:1")
+    second = await manager.candidate_probe_lock(alias_family="codex", cooldown_key="lane:1")
+    other = await manager.candidate_probe_lock(alias_family="codex", cooldown_key="lane:2")
     assert first is second
     assert first is not other
     assert isinstance(first, asyncio.Lock)
@@ -306,29 +291,33 @@ async def test_rr054_state_candidate_probe_lock_is_stable_per_key() -> None:
 
 
 def test_rr054_durable_cache_key_and_expiry_parse() -> None:
-    durable.configure_durable_runtime(clean_value=lambda v: str(v).strip() if v else None)
-    key = durable.build_aawm_alias_routing_durable_cache_key(
-        alias_family="Codex",
-        state_kind="Cooldown",
-        state_key="session-or-lane",
-    )
-    assert key.startswith(f"{durable.AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX}:")
-    assert ":codex:cooldown:" in key
-    # opaque hashed state key (not raw)
-    assert "session-or-lane" not in key
-
-    assert durable.parse_aawm_alias_routing_durable_expiry("nope") is None
-    assert durable.parse_aawm_alias_routing_durable_expiry({}) is None
-    assert (
-        durable.parse_aawm_alias_routing_durable_expiry(
-            {"expires_at_epoch": time.time() - 5}
+    # configure_durable_runtime mutates module-level globals (_clean_value,
+    # _dual_cache_override). Production wiring (llm_passthrough_endpoints.py)
+    # sets these at import time; calling configure_durable_runtime here without
+    # restoring afterward would leak state into later tests (e.g. clobbering
+    # get_dual_cache_override to None), so snapshot and restore both globals.
+    previous_clean_value = durable._clean_value
+    previous_dual_cache_override = durable._dual_cache_override
+    try:
+        durable.configure_durable_runtime(clean_value=lambda v: str(v).strip() if v else None)
+        key = durable.build_aawm_alias_routing_durable_cache_key(
+            alias_family="Codex",
+            state_kind="Cooldown",
+            state_key="session-or-lane",
         )
-        is None
-    )
-    future = time.time() + 100
-    assert durable.parse_aawm_alias_routing_durable_expiry(
-        {"expires_at_epoch": future}
-    ) == pytest.approx(future)
+        assert key.startswith(f"{durable.AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX}:")
+        assert ":codex:cooldown:" in key
+        # opaque hashed state key (not raw)
+        assert "session-or-lane" not in key
+
+        assert durable.parse_aawm_alias_routing_durable_expiry("nope") is None
+        assert durable.parse_aawm_alias_routing_durable_expiry({}) is None
+        assert durable.parse_aawm_alias_routing_durable_expiry({"expires_at_epoch": time.time() - 5}) is None
+        future = time.time() + 100
+        assert durable.parse_aawm_alias_routing_durable_expiry({"expires_at_epoch": future}) == pytest.approx(future)
+    finally:
+        durable._clean_value = previous_clean_value
+        durable._dual_cache_override = previous_dual_cache_override
 
 
 def test_rr054_durable_namespace_and_failure_log_throttle() -> None:
@@ -391,9 +380,7 @@ async def test_rr054_durable_read_write_max_expiry_and_missing_cache() -> None:
     assert written["reason"] == "transient"
     assert written["extra"] == 1
 
-    dual.async_get_cache = AsyncMock(
-        return_value={"expires_at_epoch": time.time() + 50, "ok": True}
-    )
+    dual.async_get_cache = AsyncMock(return_value={"expires_at_epoch": time.time() + 50, "ok": True})
     with patch.object(durable, "get_aawm_alias_routing_dual_cache", return_value=dual):
         payload = await durable.read_aawm_alias_routing_durable_payload(
             alias_family="codex",
@@ -417,10 +404,7 @@ def test_rr054_oauth_token_cache_get_set_clear() -> None:
     cache.set("lane", "tok-2", int((now + 10) * 1000))
     assert cache.get_if_valid("lane", now=now, skew_seconds=30.0) is None
     cache.set("lane", "tok-3", int(now + 120))  # seconds mode
-    assert (
-        cache.get_if_valid("lane", now=now, skew_seconds=1.0, expiry_is_millis=False)
-        == "tok-3"
-    )
+    assert cache.get_if_valid("lane", now=now, skew_seconds=1.0, expiry_is_millis=False) == "tok-3"
     cache.clear("lane")
     assert cache.get_if_valid("lane", now=now) is None
     cache.set("a", "t", int((now + 60) * 1000))
@@ -440,22 +424,10 @@ def test_rr054_google_oauth_pure_validation_helpers() -> None:
 
     future_ms = int((time.time() + 120) * 1000)
     past_ms = int((time.time() - 5) * 1000)
-    assert (
-        google_oauth._google_oauth_token_is_valid(
-            {"access_token": "abc", "expiry_date": future_ms}
-        )
-        is True
-    )
-    assert (
-        google_oauth._google_oauth_token_is_valid(
-            {"access_token": "abc", "expiry_date": past_ms}
-        )
-        is False
-    )
+    assert google_oauth._google_oauth_token_is_valid({"access_token": "abc", "expiry_date": future_ms}) is True
+    assert google_oauth._google_oauth_token_is_valid({"access_token": "abc", "expiry_date": past_ms}) is False
     assert google_oauth._google_oauth_token_is_valid({"access_token": ""}) is False
-    assert (
-        google_oauth._google_oauth_cached_token_is_valid(("tok", future_ms)) is True
-    )
+    assert google_oauth._google_oauth_cached_token_is_valid(("tok", future_ms)) is True
     assert google_oauth._get_google_oauth_expiry_date({"expiry_date": 12.5}) == 12
     assert google_oauth._get_google_oauth_expiry_date({}) is None
     assert (
@@ -481,21 +453,14 @@ def test_rr054_antigravity_oauth_pure_validation_helpers() -> None:
     assert antigravity_oauth._antigravity_access_token_is_unexpired(valid) is True
     expiry_ms = antigravity_oauth._get_antigravity_oauth_expiry_date(valid)
     assert isinstance(expiry_ms, int) and expiry_ms > 0
-    assert (
-        antigravity_oauth._antigravity_oauth_cached_token_is_valid(
-            ("tok", int((time.time() + 120) * 1000))
-        )
-        is True
-    )
+    assert antigravity_oauth._antigravity_oauth_cached_token_is_valid(("tok", int((time.time() + 120) * 1000))) is True
 
     # Package fallback is safe without a response; god-file import may have
     # already installed production hooks, so isolate both contract branches.
     previous_format = antigravity_oauth._format_refresh_failure_fn
     try:
         antigravity_oauth._format_refresh_failure_fn = None
-        msg = antigravity_oauth._format_refresh_failure(
-            provider_label="Antigravity", response=None
-        )
+        msg = antigravity_oauth._format_refresh_failure(provider_label="Antigravity", response=None)
         assert "Antigravity" in msg
         assert "Failed to refresh" in msg
 
@@ -537,30 +502,12 @@ def test_rr054_retry_normalize_keys_and_env_parsers() -> None:
     assert retry.normalize_cooldown_keys([]) == ["__default__"]
 
     env = {"F": "1.5", "I": "3", "BAD": "x", "NEG": "-2", "BIG": "99"}
-    assert (
-        retry.parse_non_negative_float_env(
-            "F", default=0.0, getenv=env.get, maximum=10.0
-        )
-        == 1.5
-    )
+    assert retry.parse_non_negative_float_env("F", default=0.0, getenv=env.get, maximum=10.0) == 1.5
     assert retry.parse_non_negative_float_env("BAD", default=9.0, getenv=env.get) == 9.0
-    assert (
-        retry.parse_non_negative_float_env(
-            "NEG", default=1.0, minimum=0.0, getenv=env.get
-        )
-        == 0.0
-    )
-    assert (
-        retry.parse_non_negative_int_env("I", default=0, getenv=env.get, maximum=10)
-        == 3
-    )
+    assert retry.parse_non_negative_float_env("NEG", default=1.0, minimum=0.0, getenv=env.get) == 0.0
+    assert retry.parse_non_negative_int_env("I", default=0, getenv=env.get, maximum=10) == 3
     assert retry.parse_non_negative_int_env("BAD", default=4, getenv=env.get) == 4
-    assert (
-        retry.parse_non_negative_int_env(
-            "BIG", default=1, maximum=5, getenv=env.get
-        )
-        == 5
-    )
+    assert retry.parse_non_negative_int_env("BIG", default=1, maximum=5, getenv=env.get) == 5
 
     projected, within = retry.projected_hidden_retry_within_budget(
         accumulated_hidden_wait_seconds=2.0,
@@ -574,9 +521,7 @@ def test_rr054_retry_normalize_keys_and_env_parsers() -> None:
         hidden_retry_budget_seconds=10.0,
     )
     assert over is False
-    delay = retry.exponential_backoff_seconds(
-        3, base_seconds=1.0, max_seconds=10.0, jitter_seconds=0.0
-    )
+    delay = retry.exponential_backoff_seconds(3, base_seconds=1.0, max_seconds=10.0, jitter_seconds=0.0)
     assert delay == 4.0
 
 
@@ -625,9 +570,7 @@ async def test_rr054_retry_wait_set_and_policy_loop() -> None:
 
 
 def test_rr054_adapter_config_descriptors_and_finalize_kwargs() -> None:
-    assert adapter_config.OPENAI_RESPONSES.adapter == (
-        "anthropic_openai_responses_adapter"
-    )
+    assert adapter_config.OPENAI_RESPONSES.adapter == ("anthropic_openai_responses_adapter")
     assert adapter_config.OPENAI_RESPONSES.default_use_codex_native_tools is True
     assert adapter_config.OPENROUTER_RESPONSES.reject_empty_success is True
     assert adapter_config.NVIDIA_COMPLETION.custom_llm_provider == "nvidia_nim"
@@ -639,10 +582,7 @@ def test_rr054_adapter_config_descriptors_and_finalize_kwargs() -> None:
     )
     assert kwargs["adapter"] == adapter_config.OPENROUTER_RESPONSES.adapter
     assert kwargs["response_builder_kwargs"]["reject_empty_success"] is True
-    assert (
-        kwargs["response_builder_kwargs"]["diagnostic_context"]["adapter_model"]
-        == "or-model"
-    )
+    assert kwargs["response_builder_kwargs"]["diagnostic_context"]["adapter_model"] == "or-model"
 
     openai_kwargs = adapter_config.responses_finalize_kwargs(
         adapter_config.OPENAI_RESPONSES,
@@ -735,7 +675,7 @@ def test_rr054_provider_shaping_json_prefix_and_delimited_spans() -> None:
         provider_shaping.decode_json_prefix("not-json")
 
     transformed_payload, end2 = provider_shaping.decode_json_prefix(
-        "x{\"a\": 1}",
+        'x{"a": 1}',
         fallback_transform=lambda s: s[1:] if s.startswith("x") else s,
     )
     assert json.loads(transformed_payload) == {"a": 1}
@@ -755,15 +695,8 @@ def test_rr054_task_state_markers_and_selection() -> None:
     custom = task_state.resolve_task_state_markers("alpha, beta\ngamma")
     assert custom == ("alpha", "beta", "gamma")
 
-    assert (
-        task_state.message_has_structured_task_state_flag(
-            {"metadata": {"preserve_task_state": True}}
-        )
-        is True
-    )
-    assert (
-        task_state.message_has_structured_task_state_flag({"task_state": "yes"}) is True
-    )
+    assert task_state.message_has_structured_task_state_flag({"metadata": {"preserve_task_state": True}}) is True
+    assert task_state.message_has_structured_task_state_flag({"task_state": "yes"}) is True
     assert task_state.message_has_structured_task_state_flag({"content": "x"}) is False
 
     messages = [
@@ -907,12 +840,8 @@ async def test_rr054_responses_finalize_nonstream_and_requires_runtime() -> None
                 media_type="application/json",
             )
 
-        def copy_headers(
-            *, translated_response: Response, upstream_response: Response
-        ) -> None:
-            translated_response.headers["x-copied"] = upstream_response.headers.get(
-                "x-up", "1"
-            )
+        def copy_headers(*, translated_response: Response, upstream_response: Response) -> None:
+            translated_response.headers["x-copied"] = upstream_response.headers.get("x-up", "1")
 
         def decode(body: Any) -> str:
             return bytes(body).decode("utf-8")
