@@ -38406,6 +38406,107 @@ class TestOpenAIPassthroughRoute:
             assert result == {"id": "resp_123", "status": "completed"}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("endpoint", "expected_client_version", "expected_target"),
+        [
+            ("models", "0.145.0", "https://chatgpt.com/backend-api/codex/models"),
+            (
+                "v1/models",
+                "0.145.0",
+                "https://chatgpt.com/backend-api/codex/models",
+            ),
+        ],
+    )
+    async def test_openai_passthrough_codex_native_models_gets_inbound_auth(
+        self,
+        endpoint,
+        expected_client_version,
+        expected_target,
+    ):
+        """
+        GET /models and /v1/models from a Codex-native authenticated client should use
+        inbound headers and the ChatGPT passthrough backend.
+        """
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer codex-client-token",
+            "chatgpt-account-id": "acct_123",
+            "originator": "codex_exec",
+            "session_id": "sess_123",
+            "user-agent": "codex_exec/0.145.0",
+        }
+        mock_request.query_params = {"client_version": expected_client_version}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials"
+        ) as mock_get_credentials, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_endpoint_func = AsyncMock(return_value={"data": []})
+            mock_create_route.return_value = mock_endpoint_func
+
+            result = await openai_proxy_route(
+                endpoint=endpoint,
+                request=mock_request,
+                fastapi_response=mock_response,
+                user_api_key_dict=mock_user_api_key_dict,
+            )
+
+            mock_get_credentials.assert_not_called()
+            mock_create_route.assert_called_once()
+            call_args = mock_create_route.call_args[1]
+            assert call_args["target"] == expected_target
+            assert call_args["endpoint"] == endpoint
+            assert call_args["custom_headers"] == {}
+            assert call_args["_forward_headers"] is True
+            assert result == {"data": []}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("endpoint", ["models", "v1/models"])
+    async def test_openai_passthrough_non_codex_models_does_not_preserve_auth(self, endpoint):
+        """
+        Non-Codex bearer-authenticated /models requests should not preserve inbound auth
+        and must require server-side OPENAI_API_KEY.
+        """
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer external-client-token",
+            "user-agent": "some-client/1.0",
+        }
+        mock_request.query_params = {"client_version": "0.145.0"}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+            return_value=None,
+        ) as mock_get_credentials:
+            with pytest.raises(Exception) as exc_info:
+                await openai_proxy_route(
+                    endpoint=endpoint,
+                    request=mock_request,
+                    fastapi_response=mock_response,
+                    user_api_key_dict=mock_user_api_key_dict,
+                )
+
+            mock_get_credentials.assert_called_once()
+            assert "Required 'OPENAI_API_KEY'" in str(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_openai_passthrough_missing_api_key(self):
         """
         Test that missing OPENAI_API_KEY raises an exception
@@ -38425,6 +38526,38 @@ class TestOpenAIPassthroughRoute:
             with pytest.raises(Exception) as exc_info:
                 await openai_proxy_route(
                     endpoint="v1/chat/completions",
+                    request=mock_request,
+                    fastapi_response=mock_response,
+                    user_api_key_dict=mock_user_api_key_dict,
+                )
+
+            assert "Required 'OPENAI_API_KEY'" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("endpoint", ["models", "v1/models"])
+    async def test_openai_passthrough_models_missing_api_key(self, endpoint):
+        """
+        Ensure model-list endpoints still fail closed when no inbound auth
+        and no server-side OPENAI_API_KEY is configured.
+        """
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "GET"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {"client_version": "0.145.0"}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+            return_value=None,
+        ):
+            with pytest.raises(Exception) as exc_info:
+                await openai_proxy_route(
+                    endpoint=endpoint,
                     request=mock_request,
                     fastapi_response=mock_response,
                     user_api_key_dict=mock_user_api_key_dict,

@@ -1443,6 +1443,13 @@ def _is_openai_responses_endpoint(endpoint: str) -> bool:
     )
 
 
+def _is_openai_models_endpoint(endpoint: str) -> bool:
+    normalized_path = httpx.URL(endpoint).path.rstrip("/")
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+    return normalized_path == "/models" or normalized_path == "/v1/models"
+
+
 def _get_openai_passthrough_route_family(endpoint: str) -> str:
     normalized_path = httpx.URL(endpoint).path.rstrip("/")
     if not normalized_path.startswith("/"):
@@ -21199,15 +21206,21 @@ def _request_uses_codex_native_auth(request: Request) -> bool:
 
 def _should_preserve_openai_client_auth(request: Request, endpoint: str) -> bool:
     """
-    Preserve inbound client auth only for OpenAI Responses passthrough traffic.
+    Preserve inbound client auth only for OpenAI Responses and model-list
+    passthrough traffic.
 
     This keeps Codex-style already-authenticated requests as close to native
     behavior as possible while leaving the existing server-authenticated
     passthrough behavior intact for other OpenAI endpoints.
     """
-    return _is_openai_responses_endpoint(endpoint) and _request_has_openai_client_auth(
-        request
-    )
+    if _is_openai_responses_endpoint(endpoint):
+        return _request_has_openai_client_auth(request)
+    if _is_openai_models_endpoint(endpoint):
+        return (
+            _request_has_openai_client_auth(request)
+            and _request_uses_codex_native_auth(request)
+        )
+    return False
 
 
 def _get_openai_passthrough_target_base(request: Request, endpoint: str) -> str:

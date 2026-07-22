@@ -37,6 +37,8 @@ Simply replace `https://api.openai.com` with `LITELLM_PROXY_BASE_URL/openai_pass
 Requirements:
 Set `OPENAI_API_KEY` in your environment variables.
 
+> **Maintainer note:** Codex-native authenticated `GET /models` and `GET /v1/models` requests preserve inbound OpenAI auth and use `CHATGPT_API_BASE`. Generic or non-Codex requests retain the server-side `OPENAI_API_KEY` behavior.
+
 ### Assistants API
 
 #### Create OpenAI Client
@@ -110,4 +112,3 @@ messages = client.beta.threads.messages.list(
 # Delete the assistant when done
 client.beta.assistants.delete(assistant.id)
 ```
-
