@@ -1065,13 +1065,18 @@ def _extract_aawm_route_request_client_ip(
         request,
         effective_general_settings,
     )
+    scope = getattr(request, "scope", None)
+    client = scope.get("client") if isinstance(scope, dict) else None
+    if isinstance(client, (list, tuple)) and client:
+        request_client_ip = str(client[0])
+    elif getattr(request, "client", None) is not None:
+        request_client_ip = getattr(request.client, "host", None)
+    else:
+        request_client_ip = None
+    request_client_normalized_ip = _normalize_aawm_route_client_ip(request_client_ip)
+
     if not raw_ip:
-        scope = getattr(request, "scope", None)
-        client = scope.get("client") if isinstance(scope, dict) else None
-        if isinstance(client, (list, tuple)) and client:
-            raw_ip = str(client[0])
-        elif getattr(request, "client", None) is not None:
-            raw_ip = getattr(request.client, "host", None)
+        raw_ip = request_client_ip
     normalized_ip = _normalize_aawm_route_client_ip(raw_ip)
     if not raw_ip:
         return normalized_ip, None
@@ -1080,8 +1085,18 @@ def _extract_aawm_route_request_client_ip(
         headers,
         ("x-forwarded-for",),
     )
-    if x_forwarded_for and _clean_aawm_route_client_ip(x_forwarded_for) == normalized_ip:
-        return normalized_ip, "x_forwarded_for"
+    if x_forwarded_for:
+        x_forwarded_for_normalized = _normalize_aawm_route_client_ip(x_forwarded_for)
+        if x_forwarded_for_normalized:
+            try:
+                # Treat malformed/non-IP XFF values as untrusted and preserve the
+                # actual request-socket client attribution.
+                ipaddress.ip_address(x_forwarded_for_normalized)
+            except ValueError:
+                return request_client_normalized_ip, "request_client"
+            if x_forwarded_for_normalized == normalized_ip:
+                return normalized_ip, "x_forwarded_for"
+
     return normalized_ip, "request_client"
 
 

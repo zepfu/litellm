@@ -168,6 +168,48 @@ def test_resolve_aawm_route_host_attribution_untrusted_xff_source_is_ignored(
     assert attribution["host_name_source"] == "ip_literal"
 
 
+def test_resolve_aawm_route_host_attribution_malformed_trusted_xff_falls_back_to_request_client(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    request = Mock(spec=Request)
+    request.headers = {"x-forwarded-for": "not-an-ip"}
+    request.client = SimpleNamespace(host="172.18.0.1", port=54321)
+    request.scope = {"client": ("172.18.0.1", 54321)}
+
+    general_settings = {
+        "aawm_route_use_x_forwarded_for": True,
+        "aawm_route_trusted_proxy_ranges": ["172.18.0.1/32"],
+    }
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        Mock(side_effect=OSError("reverse dns not used for local paths")),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_discover_local_tailscale_ipv4_candidates",
+        Mock(return_value=["100.99.1.5"]),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="thoth"),
+    )
+
+    attribution = resolve_aawm_route_host_attribution(
+        request,
+        general_settings=general_settings,
+        allow_blocking_lookup=True,
+    )
+    assert attribution["client_ip"] == "172.18.0.1"
+    assert attribution["client_ip_source"] == "request_client"
+    assert attribution["host_name"] == "thoth"
+    assert attribution["host_name_source"] == "magicdns_local"
+
+
 def test_resolve_aawm_route_host_attribution_keeps_lan_ip_fallback(monkeypatch):
     request = Mock(spec=Request)
     request.headers = {}
