@@ -32,10 +32,9 @@ class AliasFamilyState:
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     cooldown_until_monotonic_by_key: dict[str, float] = field(default_factory=dict)
-    cooldown_negative_until_monotonic_by_key: dict[str, float] = field(
-        default_factory=dict
-    )
+    cooldown_negative_until_monotonic_by_key: dict[str, float] = field(default_factory=dict)
     session_affinity_by_key: dict[str, Payload] = field(default_factory=dict)
+    evidence_events_by_key: dict[str, list[float]] = field(default_factory=dict)
 
     def get_memory_cooldown_remaining(self, cooldown_key: str) -> float:
         now = time.monotonic()
@@ -57,12 +56,8 @@ class AliasFamilyState:
         ttl_seconds: float,
         max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
     ) -> None:
-        self.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-            time.monotonic() + max(0.0, float(ttl_seconds))
-        )
-        bound_memory_map(
-            self.cooldown_negative_until_monotonic_by_key, max_size=max_size
-        )
+        self.cooldown_negative_until_monotonic_by_key[cooldown_key] = time.monotonic() + max(0.0, float(ttl_seconds))
+        bound_memory_map(self.cooldown_negative_until_monotonic_by_key, max_size=max_size)
 
     def clear_negative_cache(self, cooldown_key: str) -> None:
         self.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
@@ -95,22 +90,58 @@ class AliasFamilyState:
             expires_at_epoch=expires_at_epoch,
             max_size=max_size,
         )
-        return remaining_cooldown_seconds(
-            self.cooldown_until_monotonic_by_key, cooldown_key
-        )
+        return remaining_cooldown_seconds(self.cooldown_until_monotonic_by_key, cooldown_key)
 
-    def get_affinity_memory(
-        self, session_key: str
-    ) -> Optional[Payload]:
+    def record_failure_evidence(
+        self,
+        *,
+        cooldown_key: str,
+        confidence: str,
+        window_seconds: float,
+        max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
+        now_monotonic: Optional[float] = None,
+    ) -> int:
+        """Record one failure-evidence timestamp for ``cooldown_key``.
+
+        Trims events outside ``window_seconds`` and bounds the overall
+        key-space to ``max_size`` (FIFO), mirroring ``bound_memory_map``.
+        Returns the number of events currently within the window.
+        """
+        now = now_monotonic if now_monotonic is not None else time.monotonic()
+        events = self.evidence_events_by_key.setdefault(cooldown_key, [])
+        events.append(now)
+        cutoff = now - max(0.0, float(window_seconds))
+        events[:] = [timestamp for timestamp in events if timestamp >= cutoff]
+        bound_memory_map(self.evidence_events_by_key, max_size=max_size)
+        # confidence is accepted for call-site symmetry with the cooldown
+        # evidence gate; only marker-tier evidence needs sliding-window
+        # counting, but recording is confidence-agnostic here.
+        _ = confidence
+        return len(events)
+
+    def evidence_count_within_window(
+        self,
+        *,
+        cooldown_key: str,
+        window_seconds: float,
+        now_monotonic: Optional[float] = None,
+    ) -> int:
+        now = now_monotonic if now_monotonic is not None else time.monotonic()
+        events = self.evidence_events_by_key.get(cooldown_key, [])
+        cutoff = now - max(0.0, float(window_seconds))
+        return len([timestamp for timestamp in events if timestamp >= cutoff])
+
+    def evidence_map_size(self) -> int:
+        return len(self.evidence_events_by_key)
+
+    def get_affinity_memory(self, session_key: str) -> Optional[Payload]:
         affinity = self.session_affinity_by_key.get(session_key)
         if not isinstance(affinity, dict):
             return None
         expires_at = affinity.get("expires_at_monotonic", 0.0)
         if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
             hydrated = dict(affinity)
-            hydrated["affinity_state_source"] = affinity.get(
-                "affinity_state_source", "memory"
-            )
+            hydrated["affinity_state_source"] = affinity.get("affinity_state_source", "memory")
             return hydrated
         self.session_affinity_by_key.pop(session_key, None)
         return None
