@@ -49,6 +49,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from starlette.websockets import WebSocketState
 from typing_extensions import NotRequired, TypeGuard, TypedDict
 
@@ -320,6 +321,10 @@ from .aawm_alias_routing import streaming as _aawm_alias_streaming
 from .aawm_alias_routing import google_oauth as _aawm_google_oauth
 from .aawm_alias_routing import antigravity_oauth as _aawm_antigravity_oauth
 from .aawm_alias_routing import durable as _aawm_alias_durable
+from .aawm_alias_routing.config_compiler import (
+    ConfigCompileError as _AawmAliasConfigCompileError,
+    compile_yaml as _compile_aawm_alias_routing_yaml,
+)
 from .aawm_alias_routing.config_snapshot import (
     RoutingCandidate as _RoutingSnapshotCandidate,
     RoutingSnapshot as _RoutingSnapshot,
@@ -1139,6 +1144,85 @@ router = APIRouter()
 default_vertex_config = None
 
 passthrough_endpoint_router = PassthroughEndpointRouter()
+
+
+# ---------------------------------------------------------------------------
+# Wave 5 (D1-583): operator alias-config refresh endpoint. Reads/validates/
+# compiles the AAWM alias-routing YAML and atomically activates it via the
+# Wave 3 snapshot holder (``get_active_routing_snapshot``/
+# ``set_active_routing_snapshot``, defined below). Intentionally no auth
+# dependency -- matches this instance's no-auth posture. Never echoes raw
+# YAML/secrets back; only compiled snapshot identity fields
+# (hash/version/changed) are returned.
+# ---------------------------------------------------------------------------
+_DEFAULT_AAWM_ALIAS_CONFIG_PATH = Path(__file__).resolve().parents[1] / "aawm_alias_config" / "read.yaml"
+
+
+def _load_aawm_alias_routing_source_yaml(*, inline_yaml: Optional[str]) -> str:
+    """Return the raw YAML to compile: an inline override, or the default file."""
+    if inline_yaml is not None:
+        return inline_yaml
+    return _DEFAULT_AAWM_ALIAS_CONFIG_PATH.read_text(encoding="utf-8")
+
+
+@router.post(
+    "/aawm/alias-config/refresh",
+    tags=["AAWM Alias Routing"],
+)
+async def aawm_alias_config_refresh_route(request: Request) -> dict[str, Any]:
+    """Validate + compile the AAWM alias-routing config and atomically activate it.
+
+    Fails closed: a compile/validation error preserves the previously active
+    (last-known-good) snapshot untouched and returns a secret-safe error body.
+    A no-op re-post (identical content hash) is a successful 200 with
+    ``changed: False``.
+    """
+    try:
+        request_body = await request.json()
+    except Exception:
+        request_body = {}
+    inline_yaml = request_body.get("yaml") if isinstance(request_body, dict) else None
+
+    try:
+        source_yaml = _load_aawm_alias_routing_source_yaml(inline_yaml=inline_yaml)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "failed to read AAWM alias-routing config source"},
+        ) from exc
+
+    try:
+        attempted_snapshot = _compile_aawm_alias_routing_yaml(source_yaml)
+    except (_AawmAliasConfigCompileError, ValidationError):
+        last_known_good = get_active_routing_snapshot()
+        error_detail: dict[str, Any] = {
+            "error": "AAWM alias-routing config failed to compile; last-known-good snapshot remains active",
+        }
+        if last_known_good is not None:
+            error_detail["active_config_hash"] = last_known_good.config_hash
+            error_detail["config_version"] = last_known_good.config_version
+        raise HTTPException(status_code=400, detail=error_detail)
+
+    previous_snapshot = get_active_routing_snapshot()
+    changed = previous_snapshot is None or previous_snapshot.config_hash != attempted_snapshot.config_hash
+    active_snapshot: _RoutingSnapshot
+    if changed:
+        set_active_routing_snapshot(attempted_snapshot)
+        active_snapshot = attempted_snapshot
+    else:
+        # No-op: identical content already active. Do not replace the
+        # snapshot object -- in-flight readers holding a reference to the
+        # active snapshot must keep observing the exact same object.
+        assert previous_snapshot is not None
+        active_snapshot = previous_snapshot
+
+    return {
+        "changed": changed,
+        "attempted_config_hash": attempted_snapshot.config_hash,
+        "active_config_hash": active_snapshot.config_hash,
+        "config_version": active_snapshot.config_version,
+        "activated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _decode_http_response_body(body: Any) -> str:

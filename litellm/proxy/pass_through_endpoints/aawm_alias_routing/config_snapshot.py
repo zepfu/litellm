@@ -101,3 +101,13 @@ class RoutingSnapshotHolder:
 
 # Module-level singleton holder for the process's active routing snapshot.
 active_routing_snapshot_holder = RoutingSnapshotHolder()
+
+
+def get_active_snapshot() -> Optional[RoutingSnapshot]:
+    """Return the process-local active ``RoutingSnapshot``, if any.
+
+    Thin convenience wrapper over ``active_routing_snapshot_holder.get()`` --
+    surfaced at module scope so callers (e.g. the Wave 5 refresh endpoint and
+    its tests) don't need to reach through the holder singleton directly.
+    """
+    return active_routing_snapshot_holder.get()
