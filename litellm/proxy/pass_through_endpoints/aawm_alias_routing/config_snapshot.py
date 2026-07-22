@@ -15,7 +15,8 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from types import MappingProxyType
+from typing import Mapping, Optional
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,10 +70,21 @@ class RoutingSnapshot:
     identity fields surfaced by the (Wave 5) refresh endpoint response.
     """
 
-    aliases: dict[str, RoutingAlias]
+    aliases: Mapping[str, RoutingAlias]
     config_epoch: int
     config_hash: str
     config_version: str
+
+    def __post_init__(self) -> None:
+        # ``aliases`` is typed as ``Mapping`` for callers, but callers may
+        # still pass a plain ``dict`` at construction time (as
+        # ``config_compiler.py`` does). Wrap it in a read-only view here so
+        # ``snapshot.aliases["x"] = ...`` raises regardless of what concrete
+        # mapping type the caller constructed the snapshot with. The frozen
+        # dataclass blocks attribute *reassignment*; this closes the
+        # remaining inner-mapping-mutability gap.
+        if not isinstance(self.aliases, MappingProxyType):
+            object.__setattr__(self, "aliases", MappingProxyType(dict(self.aliases)))
 
 
 class RoutingSnapshotHolder:

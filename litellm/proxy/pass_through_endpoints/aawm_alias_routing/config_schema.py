@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import policy
 
@@ -94,6 +94,12 @@ class ScheduleWindowConfig(BaseModel):
             raise ValueError("schedule window times must be UTC (offset zero)")
         return value
 
+    @model_validator(mode="after")
+    def _require_end_after_start(self) -> "ScheduleWindowConfig":
+        if self.end < self.start:
+            raise ValueError(f"schedule window end ({self.end!r}) must not precede start ({self.start!r})")
+        return self
+
 
 class ErrorRuleConfig(BaseModel):
     """A candidate-scoped error-class reference. Open vocabulary by design."""
@@ -128,6 +134,13 @@ class CandidateConfig(BaseModel):
     def _validate_route_family(cls, value: Optional[str]) -> Optional[str]:
         return _require_registered_route_family(value)
 
+    @field_validator("weight")
+    @classmethod
+    def _require_non_negative_weight(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError(f"candidate weight {value!r} must not be negative")
+        return value
+
 
 class AliasConfig(BaseModel):
     """A single alias (e.g. ``read``) with its ordered candidate set."""
@@ -143,6 +156,23 @@ class AliasConfig(BaseModel):
     @classmethod
     def _validate_route_family(cls, value: Optional[str]) -> Optional[str]:
         return _require_registered_route_family(value)
+
+    @field_validator("candidates")
+    @classmethod
+    def _require_non_empty_candidates(cls, value: list[CandidateConfig]) -> list[CandidateConfig]:
+        if not value:
+            raise ValueError("alias candidates must not be empty -- at least one candidate is required")
+        return value
+
+    @field_validator("candidates")
+    @classmethod
+    def _require_unique_models(cls, value: list[CandidateConfig]) -> list[CandidateConfig]:
+        seen: set[str] = set()
+        for candidate in value:
+            if candidate.model in seen:
+                raise ValueError(f"duplicate model {candidate.model!r} within a single alias's candidate list")
+            seen.add(candidate.model)
+        return value
 
 
 class DefaultsConfig(BaseModel):
@@ -165,6 +195,16 @@ class RoutingConfigDocument(BaseModel):
 
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     aliases: list[AliasConfig]
+
+    @field_validator("aliases")
+    @classmethod
+    def _require_unique_alias_names(cls, value: list[AliasConfig]) -> list[AliasConfig]:
+        seen: set[str] = set()
+        for alias in value:
+            if alias.name in seen:
+                raise ValueError(f"duplicate alias name {alias.name!r} in routing config document")
+            seen.add(alias.name)
+        return value
 
 
 def order_candidates_by_priority(
