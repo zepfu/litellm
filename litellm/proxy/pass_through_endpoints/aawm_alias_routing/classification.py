@@ -223,6 +223,8 @@ class _KeyCooldownState:
     attempt: int = 0
     cooled_until_monotonic: float = 0.0
     probe_in_flight: bool = False
+    last_scope: Optional[str] = None
+    last_class_name: Optional[str] = None
 
 
 class CooldownEvidenceGate:
@@ -296,12 +298,40 @@ class CooldownEvidenceGate:
         duration = self._resolve_duration(event, attempt=key_state.attempt)
         cooled_until = now + duration
         key_state.cooled_until_monotonic = cooled_until
+        key_state.last_scope = event.scope
+        key_state.last_class_name = event.class_name
         return CooldownDecision(
             should_cool=True,
             duration_seconds=duration,
             cooled_until_monotonic=cooled_until,
             scope=event.scope,
             class_name=event.class_name,
+        )
+
+    def current_decision(
+        self,
+        *,
+        cooldown_key: str,
+        now_monotonic: Optional[float] = None,
+    ) -> CooldownDecision:
+        """Reconstruct the gate's current authoritative decision for ``cooldown_key``.
+
+        Unlike :meth:`record`, this does not consume new evidence -- it
+        reports the outcome of the most recent ``record()`` call for this
+        key (should-cool + remaining duration + scope/class), so callers
+        that already fed evidence via ``record()`` can later apply the
+        gate's decision without re-classifying a failure.
+        """
+        now = now_monotonic if now_monotonic is not None else time.monotonic()
+        state = self._key_state.get(cooldown_key)
+        if state is None or state.cooled_until_monotonic <= now:
+            return CooldownDecision(should_cool=False)
+        return CooldownDecision(
+            should_cool=True,
+            duration_seconds=max(0.0, state.cooled_until_monotonic - now),
+            cooled_until_monotonic=state.cooled_until_monotonic,
+            scope=state.last_scope,
+            class_name=state.last_class_name,
         )
 
     def _resolve_duration(self, event: fv.FailureEvent, *, attempt: int) -> float:

@@ -6109,6 +6109,9 @@ async def _apply_auto_agent_alias_cooldown(
     return cooldown_scope
 
 
+_READ_PILOT_COOLDOWN_KEY_PREFIX = "read_pilot:"
+
+
 async def _apply_codex_auto_agent_alias_cooldown(
     *,
     request: Request,
@@ -6120,6 +6123,11 @@ async def _apply_codex_auto_agent_alias_cooldown(
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
+    if selected_cooldown_key.startswith(_READ_PILOT_COOLDOWN_KEY_PREFIX):
+        return await _apply_read_pilot_gated_cooldown(
+            selected_cooldown_key=selected_cooldown_key,
+            set_candidate_cooldown=_set_codex_auto_agent_cooldown,
+        )
     return await _apply_auto_agent_alias_cooldown(
         request=request,
         candidate=candidate,
@@ -6131,6 +6139,29 @@ async def _apply_codex_auto_agent_alias_cooldown(
         grok_account_quota_exhausted=grok_account_quota_exhausted,
         kimi_failure_metadata=kimi_failure_metadata,
     )
+
+
+async def _apply_read_pilot_gated_cooldown(
+    *,
+    selected_cooldown_key: str,
+    set_candidate_cooldown: Callable[[str, float], Awaitable[object]],
+) -> str:
+    """Apply the ``CooldownEvidenceGate``'s decision for the read-pilot lane.
+
+    The read-pilot lane's cooldown-worthiness is decided by
+    ``_read_pilot_cooldown_gate`` (fed via ``_record_read_pilot_cooldown_evidence``
+    on failure). This makes that decision authoritative for what cooldown is
+    actually applied -- when the gate says "do not cool yet" (marker-only
+    evidence below the N-of-M threshold, or a non-coolable origin), no
+    cooldown is applied at all; when it says cool, the gate's own
+    duration/scope drives the applied candidate cooldown instead of the
+    legacy flat ``cooldown_seconds`` value.
+    """
+    decision = _read_pilot_cooldown_gate.current_decision(cooldown_key=selected_cooldown_key)
+    if not decision.should_cool:
+        return "none"
+    await set_candidate_cooldown(selected_cooldown_key, decision.duration_seconds)
+    return decision.scope or "candidate"
 
 
 async def _apply_anthropic_auto_agent_alias_cooldown(
