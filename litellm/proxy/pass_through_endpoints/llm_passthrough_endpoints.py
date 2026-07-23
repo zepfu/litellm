@@ -615,30 +615,62 @@ def _select_proportional_snapshot_candidate(
     return ordered[-1]
 
 
+# Process-local rotation cursor for ``distribution_strategy: round_robin``,
+# keyed per alias name so each alias rotates independently across proxy calls.
+_round_robin_cursor_by_alias: dict[str, int] = {}
+
+
+def _select_round_robin_snapshot_candidate(
+    tied: Sequence[_RoutingSnapshotCandidate],
+    *,
+    alias_name: str,
+) -> _RoutingSnapshotCandidate:
+    """Pick the next tied candidate by rotating a per-alias process-local cursor.
+
+    Distinct from ``proportional``: this is a deterministic round-robin over the
+    equal-top-priority candidates (in their stable priority ordering), advancing
+    one position per selection so successive live selections cycle through the
+    tied candidates rather than weighting a random pick.
+    """
+    cursor = _round_robin_cursor_by_alias.get(alias_name, 0)
+    winner = tied[cursor % len(tied)]
+    _round_robin_cursor_by_alias[alias_name] = (cursor + 1) % len(tied)
+    return winner
+
+
 def _apply_snapshot_alias_distribution_strategy(
     ordered: Sequence[_RoutingSnapshotCandidate],
     *,
     distribution_strategy: Optional[str],
     rng: random.Random,
+    alias_name: str = "",
 ) -> list[_RoutingSnapshotCandidate]:
     """Reorder the top priority-tier of ``ordered`` per ``distribution_strategy``.
 
     ``ordered`` is already sorted descending by priority with ``priority: 0``
-    last (see ``_order_snapshot_candidates_by_priority``). When the alias
-    declares ``distribution_strategy: proportional`` and more than one
-    candidate shares the top (highest, non-zero) priority tier, a weighted
-    proportional pick decides which of those tied candidates leads the
-    returned ordering -- the remaining candidates (including any other tiers)
-    keep their existing relative order as the fallback chain.
+    last (see ``_order_snapshot_candidates_by_priority``). When more than one
+    candidate shares the top (highest, non-zero) priority tier:
+
+    - ``proportional`` uses a weighted random pick to decide which tied
+      candidate leads the returned ordering.
+    - ``round_robin`` rotates a per-alias process-local cursor across the tied
+      candidates so successive selections cycle through them deterministically.
+
+    In both cases the remaining candidates (including any other tiers) keep
+    their existing relative order as the fallback chain. Any other/absent
+    strategy leaves the ordering untouched.
     """
-    if distribution_strategy != "proportional" or len(ordered) < 2:
+    if distribution_strategy not in ("proportional", "round_robin") or len(ordered) < 2:
         return list(ordered)
     top_priority = ordered[0].priority
     tied = [c for c in ordered if c.priority == top_priority]
     if len(tied) < 2:
         return list(ordered)
-    weights = {c.model: c.weight for c in tied}
-    winner = _select_proportional_snapshot_candidate(tied, weights, rng)
+    if distribution_strategy == "round_robin":
+        winner = _select_round_robin_snapshot_candidate(tied, alias_name=alias_name)
+    else:
+        weights = {c.model: c.weight for c in tied}
+        winner = _select_proportional_snapshot_candidate(tied, weights, rng)
     remainder = [c for c in ordered if c is not winner]
     return [winner, *remainder]
 
@@ -707,6 +739,7 @@ def _select_read_pilot_snapshot_candidates(
         eligible,
         distribution_strategy=alias.distribution_strategy,
         rng=random.Random(),
+        alias_name=_READ_PILOT_ALIAS_NAME,
     )
     return tuple(_routing_candidate_to_public_dict(c) for c in distributed)
 
@@ -6122,8 +6155,14 @@ async def _apply_codex_auto_agent_alias_cooldown(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
 ) -> str:
-    if selected_cooldown_key.startswith(_READ_PILOT_COOLDOWN_KEY_PREFIX):
+    # Route the read-alias lane to the N-of-M evidence gate by ALIAS identity
+    # (``is_read_pilot_lane``), not by a synthetic ``read_pilot:`` key prefix.
+    # The live selector builds ordinary ``provider:model:lane`` cooldown keys,
+    # so the gate now drives the applied cooldown for the read lane using that
+    # exact live key -- the same key the retry loop fed evidence to.
+    if is_read_pilot_lane:
         return await _apply_read_pilot_gated_cooldown(
             selected_cooldown_key=selected_cooldown_key,
             set_candidate_cooldown=_set_codex_auto_agent_cooldown,
@@ -6178,7 +6217,11 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
 ) -> str:
+    # The read pilot lane is Codex-only; the Anthropic applicator accepts the
+    # flag for call-site symmetry with the shared retry loop and ignores it.
+    _ = is_read_pilot_lane
     return await _apply_auto_agent_alias_cooldown(
         request=request,
         candidate=candidate,
@@ -6446,6 +6489,7 @@ async def _set_codex_auto_agent_candidate_cooldowns(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
 ) -> str:
     return await _apply_codex_auto_agent_alias_cooldown(
         request=request,
@@ -6456,6 +6500,7 @@ async def _set_codex_auto_agent_candidate_cooldowns(
         error_class=error_class,
         grok_account_quota_exhausted=grok_account_quota_exhausted,
         kimi_failure_metadata=kimi_failure_metadata,
+        is_read_pilot_lane=is_read_pilot_lane,
     )
 
 
@@ -6573,26 +6618,35 @@ def _record_auto_agent_alias_attempt_started(
 def _record_read_pilot_cooldown_evidence(
     *,
     cooldown_key: Optional[str],
+    exc: Any,
     attempt_record: dict[str, Any],
 ) -> None:
-    """Route the ``read``-pilot lane's cooldown writes through the N-of-M gate.
+    """Classify + record the CURRENT read-pilot attempt's failure evidence.
 
-    Classifies the already-extracted attempt-record error fields into a
-    ``FailureEvent`` and feeds it to ``_read_pilot_cooldown_gate``, recording
-    the three-valued ``origin`` (upstream/client/unknown; only ``upstream``
-    ever advances a key toward cooling) on the attempt record. This does not
-    replace the existing candidate cooldown application (``apply_cooldown_fn``)
-    -- it is additional, read-pilot-only evidence bookkeeping.
+    Called from the retry loop BEFORE the cooldown is applied for the same
+    attempt, so a structured failure cools immediately (N=1) and a marker
+    failure counts toward its N-of-M threshold on this attempt. The evidence
+    is keyed on the live ``provider:model:lane`` cooldown key so the gate and
+    the applied cooldown share one authoritative key. Classification inputs
+    (status code, source-error text, retry-after) are extracted directly from
+    the raised exception rather than the post-apply attempt record, because
+    those record fields are not populated until after the cooldown decision.
+
+    ``origin`` (upstream/client/unknown; only ``upstream`` ever advances a key
+    toward cooling) is stamped on the attempt record for downstream audit.
     """
+    error_status_code = _extract_google_adapter_exception_status_code(exc)
+    source_error = _get_codex_auto_agent_source_error_summary(exc, status_code=error_status_code)
+    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
     event = _aawm_alias_classification.classify_failure(
-        status_code=attempt_record.get("error_status_code"),
+        status_code=error_status_code,
         provider=None,
-        message=str(attempt_record.get("source_error") or ""),
-        retry_after_seconds=attempt_record.get("retry_after_seconds"),
+        message=str(source_error or ""),
+        retry_after_seconds=retry_after_seconds,
     )
     attempt_record["origin"] = event.origin
     _read_pilot_cooldown_gate.record(
-        cooldown_key=cooldown_key or "read_pilot:unknown",
+        cooldown_key=cooldown_key or f"{_READ_PILOT_COOLDOWN_KEY_PREFIX}unknown",
         event=event,
     )
 
@@ -6610,11 +6664,10 @@ def _record_auto_agent_alias_attempt_failure(
     add_alias_metadata_fn: Callable[..., dict[str, Any]],
     redispatch_required: bool = False,
 ) -> dict[str, Any]:
-    if alias_model == _READ_PILOT_ALIAS_NAME:
-        _record_read_pilot_cooldown_evidence(
-            cooldown_key=selection.get("cooldown_key"),
-            attempt_record=attempt_record,
-        )
+    # Read-pilot cooldown evidence is recorded in the retry loop BEFORE the
+    # cooldown is applied (see ``_record_read_pilot_cooldown_evidence``), so it
+    # is intentionally NOT re-recorded here -- doing so would double-count
+    # marker evidence and double-advance the structured attempt counter.
     failure_body = add_alias_metadata_fn(
         prepared_request_body,
         request=request,
@@ -22151,6 +22204,22 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     exc,
                     candidate=candidate,
                 )
+                # For the read lane only, classify + record this attempt's
+                # failure evidence into the N-of-M gate BEFORE applying the
+                # cooldown, keyed on the live ``provider:model:lane`` key, so
+                # the gate's decision drives the applied cooldown for the same
+                # attempt. Every other lane keeps its existing ordering. The
+                # ``is_read_pilot_lane`` signal is only threaded to the apply
+                # site on the read lane (always the real Codex applicator),
+                # leaving the generic ``apply_cooldown_fn`` contract untouched
+                # for every other lane and every test-provided stub.
+                is_read_pilot_lane = alias_model == _READ_PILOT_ALIAS_NAME
+                if is_read_pilot_lane:
+                    _record_read_pilot_cooldown_evidence(
+                        cooldown_key=selection["cooldown_key"],
+                        exc=exc,
+                        attempt_record=attempt_record,
+                    )
                 cooldown_scope = await apply_cooldown_fn(
                     request=request,
                     candidate=candidate,
@@ -22160,6 +22229,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
                     error_class=error_class,
                     grok_account_quota_exhausted=grok_account_quota_exhausted,
                     kimi_failure_metadata=kimi_failure_metadata,
+                    **({"is_read_pilot_lane": True} if is_read_pilot_lane else {}),
                 )
                 error_tokens = _update_codex_auto_agent_retryable_attempt_record(
                     attempt_record=attempt_record,

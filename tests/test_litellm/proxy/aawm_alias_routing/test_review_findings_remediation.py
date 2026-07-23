@@ -22,6 +22,9 @@ from fastapi.testclient import TestClient
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    classification as lpe_classification,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
@@ -118,90 +121,47 @@ def test_recognized_read_routes_to_snapshot_derived_candidates() -> None:
 # Finding #2: the N-of-M cooldown-evidence gate decision is discarded -- the
 # legacy ``apply_cooldown_fn`` path stays authoritative for what cooldown is
 # actually applied, regardless of what the gate decided.
+#
+# ROUND 2 update: the original reproductions here hand-built ``read_pilot:``
+# keys and called ``_record_read_pilot_cooldown_evidence`` directly -- exactly
+# the shell the live path never exercised. The authoritative live-path
+# reproductions now live in ``test_round2_live_path_remediation.py``
+# (``test_live_read_lane_structured_429_cools_with_gate_duration`` and
+# ``test_live_read_lane_single_marker_failure_does_not_cool``), which drive the
+# real Codex retry handler so the live sequence builds the
+# ``provider:model:lane`` key and records evidence on its own. The two
+# gate-unit checks below are retained only as direct-gate assertions and no
+# longer hand-build a ``read_pilot:`` key or assert applied-cooldown behavior.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_marker_only_single_failure_does_not_apply_a_cooldown() -> None:
-    """A single marker-only (non-structured) failure must NOT cool the read-pilot
-    candidate -- the N-of-M gate requires multiple marker events within its
-    window before a key advances toward cooling. The legacy applicator
-    currently cools unconditionally on the first retryable failure."""
-    request = _minimal_request()
-    candidate = {
-        "provider": "openrouter",
-        "model": "openrouter/snapshot-only-model",
-        "route_family": "codex_openrouter_completion_adapter",
-        "last_resort": False,
-    }
-    cooldown_key = "read_pilot:marker-only-key"
-    attempt_record = {
-        "source_error": "capacity exceeded, try again later",
-        "error_status_code": None,
-    }
-
-    # Feed the same evidence the live failure-recording path would produce.
-    lpe._record_read_pilot_cooldown_evidence(
-        cooldown_key=cooldown_key,
-        attempt_record=attempt_record,
+def test_gate_marker_only_single_failure_is_not_cooled() -> None:
+    """A single marker-tier event must not advance a key to cooled in the gate."""
+    gate = lpe_classification.CooldownEvidenceGate()
+    event = lpe_classification.classify_failure(
+        status_code=None,
+        provider=None,
+        message="Selected model is at capacity. Please try a different model.",
     )
-    assert lpe._read_pilot_cooldown_gate.is_cooled(cooldown_key=cooldown_key) is False
+    assert event.confidence == "marker"
+    gate.record(cooldown_key="unit-marker-key", event=event)
+    assert gate.is_cooled(cooldown_key="unit-marker-key") is False
 
-    await lpe._apply_codex_auto_agent_alias_cooldown(
-        request=request,
-        candidate=candidate,
-        lane_key=None,
-        selected_cooldown_key=cooldown_key,
-        cooldown_seconds=30.0,
-        error_class="capacity_exhausted",
+
+def test_gate_structured_429_cools_with_retry_after_duration() -> None:
+    """A single structured 429 event cools immediately, using the retry-after duration."""
+    gate = lpe_classification.CooldownEvidenceGate()
+    event = lpe_classification.classify_failure(
+        status_code=429,
+        provider=None,
+        message="rate limited",
+        retry_after_seconds=12.0,
     )
-
-    # The APPLIED state -- what the selector will actually observe -- must
-    # reflect the gate's "do not cool yet" decision, not the legacy path's
-    # unconditional single-failure cooldown.
-    applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(cooldown_key)
-    assert applied_remaining == 0.0
-
-
-@pytest.mark.asyncio
-async def test_structured_429_cools_with_gate_scope_and_duration() -> None:
-    """A single structured 429 event cools immediately per the gate policy, and the
-    APPLIED cooldown's scope/duration must reflect the gate's decision."""
-    request = _minimal_request()
-    candidate = {
-        "provider": "openrouter",
-        "model": "openrouter/snapshot-only-model",
-        "route_family": "codex_openrouter_completion_adapter",
-        "last_resort": False,
-    }
-    cooldown_key = "read_pilot:structured-429-key"
-    attempt_record = {
-        "source_error": "rate limited",
-        "error_status_code": 429,
-        "retry_after_seconds": 12.0,
-    }
-
-    lpe._record_read_pilot_cooldown_evidence(
-        cooldown_key=cooldown_key,
-        attempt_record=attempt_record,
-    )
-    gate_decision_is_cooled = lpe._read_pilot_cooldown_gate.is_cooled(cooldown_key=cooldown_key)
-    assert gate_decision_is_cooled is True
-
-    await lpe._apply_codex_auto_agent_alias_cooldown(
-        request=request,
-        candidate=candidate,
-        lane_key=None,
-        selected_cooldown_key=cooldown_key,
-        cooldown_seconds=30.0,
-        error_class="rate_limit",
-    )
-
-    # The gate resolved a 12s retry-after-derived duration; the APPLIED
-    # cooldown state must match the gate's duration, not the legacy
-    # applicator's independently-computed 30s value.
-    applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(cooldown_key)
-    assert applied_remaining == pytest.approx(12.0, abs=1.0)
+    assert event.confidence == "structured"
+    decision = gate.record(cooldown_key="unit-structured-key", event=event)
+    assert decision.should_cool is True
+    assert decision.duration_seconds == pytest.approx(12.0, abs=0.001)
+    assert gate.is_cooled(cooldown_key="unit-structured-key") is True
 
 
 # ---------------------------------------------------------------------------
