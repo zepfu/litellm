@@ -6160,7 +6160,11 @@ async def _apply_read_pilot_gated_cooldown(
     decision = _read_pilot_cooldown_gate.current_decision(cooldown_key=selected_cooldown_key)
     if not decision.should_cool:
         return "none"
-    await set_candidate_cooldown(selected_cooldown_key, decision.duration_seconds)
+    # Apply to the authoritative in-memory cooldown state synchronously so the
+    # selector observes the full gate-resolved duration; the durable write is
+    # best-effort and must not block that value.
+    _alias_routing_state.codex.set_cooldown_memory(selected_cooldown_key, decision.duration_seconds)
+    asyncio.ensure_future(set_candidate_cooldown(selected_cooldown_key, decision.duration_seconds))
     return decision.scope or "candidate"
 
 
