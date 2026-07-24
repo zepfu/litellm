@@ -28,6 +28,7 @@ from typing import (
     Awaitable,
     Callable,
     Mapping,
+    NamedTuple,
     Never,
     Optional,
     Sequence,
@@ -617,7 +618,34 @@ def _select_proportional_snapshot_candidate(
 
 # Process-local rotation cursor for ``distribution_strategy: round_robin``,
 # keyed per alias name so each alias rotates independently across proxy calls.
+# Wave 3 seam: the key becomes ``(semantic_epoch_tag, alias_name)`` once epoch
+# keying lands; for now it stays ``(alias_name)`` and epoch tags are carried on
+# the commit token but not yet folded into this map's key.
 _round_robin_cursor_by_alias: dict[str, int] = {}
+
+
+class RoundRobinCommitToken(NamedTuple):
+    """Immutable receipt describing how a round-robin rotation must commit.
+
+    Captured once per request (in the selection context) at enumeration time so
+    the actual selection -- not any getter call multiplicity -- drives the single
+    cursor advance. ``tied_candidate_ids`` is the stable, priority-ordered tied
+    top-tier identity tuple; ``start_index`` is the cursor value read when the
+    enumeration resolved (Wave 3 seam / diagnostics -- the commit itself keys off
+    the actually selected member's position, never blindly ``start_index + 1``).
+    """
+
+    alias_name: str
+    epoch_tag: str
+    tied_candidate_ids: Tuple[Tuple[str, str], ...]
+    start_index: int
+
+
+class SelectionEnumeration(NamedTuple):
+    """Per-request memoized alias enumeration + optional round-robin commit token."""
+
+    candidates: Tuple[dict[str, Any], ...]
+    commit_token: Optional[RoundRobinCommitToken]
 
 
 def _select_round_robin_snapshot_candidate(
@@ -625,17 +653,41 @@ def _select_round_robin_snapshot_candidate(
     *,
     alias_name: str,
 ) -> _RoutingSnapshotCandidate:
-    """Pick the next tied candidate by rotating a per-alias process-local cursor.
+    """Pick the next tied candidate by READING the per-alias rotation cursor.
 
     Distinct from ``proportional``: this is a deterministic round-robin over the
-    equal-top-priority candidates (in their stable priority ordering), advancing
-    one position per selection so successive live selections cycle through the
-    tied candidates rather than weighting a random pick.
+    equal-top-priority candidates (in their stable priority ordering). It is a
+    PURE read of the cursor -- it does NOT advance it. The cursor only advances
+    via ``_commit_round_robin_selection`` once per request, keyed on the member
+    that is actually selected, so repeated enumeration getter calls within a
+    single request cannot desync the rotation from live traffic.
     """
     cursor = _round_robin_cursor_by_alias.get(alias_name, 0)
-    winner = tied[cursor % len(tied)]
-    _round_robin_cursor_by_alias[alias_name] = (cursor + 1) % len(tied)
-    return winner
+    return tied[cursor % len(tied)]
+
+
+def _commit_round_robin_selection(
+    token: Optional[RoundRobinCommitToken],
+    *,
+    selected_candidate: dict[str, Any],
+) -> None:
+    """Advance the rotation cursor to the slot AFTER the actually selected member.
+
+    No-op when ``token`` is ``None`` (non-round-robin alias) or when the selected
+    candidate is not a member of the rotated tied tier (affinity, last-resort, or
+    lower-priority fallback selections must never consume top-tier rotation). The
+    next cursor points immediately after the actual selected candidate's stable
+    position -- never a blind ``start_index + 1`` -- so a fallback pick inside the
+    tier (e.g. B chosen while A cools) rotates to C, not back to B.
+    """
+    if token is None:
+        return
+    identity = (selected_candidate.get("provider"), selected_candidate.get("model"))
+    try:
+        index = token.tied_candidate_ids.index(identity)
+    except ValueError:
+        return
+    _round_robin_cursor_by_alias[token.alias_name] = (index + 1) % len(token.tied_candidate_ids)
 
 
 def reset_module_singletons() -> None:
@@ -732,6 +784,32 @@ def _is_snapshot_candidate_in_schedule_window(
     return schedule.start <= now_utc <= schedule.end
 
 
+def _resolve_read_pilot_eligible_candidates(
+    *,
+    client_product_label: Optional[str],
+    now_utc: datetime,
+) -> Optional[list[_RoutingSnapshotCandidate]]:
+    """Return the eligibility-filtered, priority-ordered ``read`` alias candidates.
+
+    ``None`` means there is no active snapshot ``read`` alias (callers use the
+    static fallback table). An empty list means every candidate was gated out
+    (TUI/schedule) -- callers fail closed rather than dispatching a rejected
+    candidate. Shared by the enumeration getter and the round-robin commit-token
+    derivation so both observe the identical tied top-tier ordering.
+    """
+    snapshot = get_active_routing_snapshot()
+    if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
+        return None
+    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    ordered = _order_snapshot_candidates_by_priority(alias.candidates)
+    return [
+        candidate
+        for candidate in ordered
+        if _is_tui_attached_candidate_eligible(candidate, client_product_label=client_product_label)
+        and _is_snapshot_candidate_in_schedule_window(candidate, now_utc=now_utc)
+    ]
+
+
 def _select_read_pilot_snapshot_candidates(
     *,
     client_product_label: Optional[str] = None,
@@ -743,21 +821,16 @@ def _select_read_pilot_snapshot_candidates(
     when no snapshot has been activated (or the snapshot has no ``read`` alias),
     so the pilot degrades gracefully instead of raising.
     """
-    snapshot = get_active_routing_snapshot()
-    if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
+    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+    eligible = _resolve_read_pilot_eligible_candidates(
+        client_product_label=client_product_label,
+        now_utc=resolved_now,
+    )
+    if eligible is None:
         return _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
             _READ_PILOT_ALIAS_NAME,
             _CODEX_AUTO_AGENT_CANDIDATES,
         )
-    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
-    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
-    ordered = _order_snapshot_candidates_by_priority(alias.candidates)
-    eligible = [
-        candidate
-        for candidate in ordered
-        if _is_tui_attached_candidate_eligible(candidate, client_product_label=client_product_label)
-        and _is_snapshot_candidate_in_schedule_window(candidate, now_utc=resolved_now)
-    ]
     # Fail closed: if every candidate is currently ineligible (TUI-gated out
     # of window, etc), do NOT silently fall back to the unfiltered ordered
     # list -- that would dispatch to a candidate the eligibility gates just
@@ -766,6 +839,7 @@ def _select_read_pilot_snapshot_candidates(
     # fail-closed behavior on exhaustion.
     if not eligible:
         return ()
+    alias = get_active_routing_snapshot().aliases[_READ_PILOT_ALIAS_NAME]  # type: ignore[union-attr]
     distributed = _apply_snapshot_alias_distribution_strategy(
         eligible,
         distribution_strategy=alias.distribution_strategy,
@@ -773,6 +847,95 @@ def _select_read_pilot_snapshot_candidates(
         alias_name=_READ_PILOT_ALIAS_NAME,
     )
     return tuple(_routing_candidate_to_public_dict(c) for c in distributed)
+
+
+def _derive_round_robin_commit_token(
+    alias_model: str,
+    *,
+    client_product_label: Optional[str],
+    now_utc: Optional[datetime] = None,
+) -> Optional[RoundRobinCommitToken]:
+    """Build the commit token for a ``round_robin`` snapshot alias, else ``None``.
+
+    Only the snapshot-driven ``read`` alias participates in round-robin rotation;
+    every other alias (static-table lanes, non-round-robin strategies, single-
+    candidate tiers) yields ``None`` so the commit path is a no-op for them.
+    """
+    if alias_model != _READ_PILOT_ALIAS_NAME:
+        return None
+    snapshot = get_active_routing_snapshot()
+    if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
+        return None
+    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    if alias.distribution_strategy != "round_robin":
+        return None
+    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+    eligible = _resolve_read_pilot_eligible_candidates(
+        client_product_label=client_product_label,
+        now_utc=resolved_now,
+    )
+    if not eligible or len(eligible) < 2:
+        return None
+    top_priority = eligible[0].priority
+    tied = [c for c in eligible if c.priority == top_priority]
+    if len(tied) < 2:
+        return None
+    start_index = _round_robin_cursor_by_alias.get(_READ_PILOT_ALIAS_NAME, 0)
+    return RoundRobinCommitToken(
+        alias_name=_READ_PILOT_ALIAS_NAME,
+        epoch_tag="",
+        tied_candidate_ids=tuple((c.provider, c.model) for c in tied),
+        start_index=start_index,
+    )
+
+
+def _get_aawm_alias_selection_context(
+    request: Request,
+) -> dict[str, SelectionEnumeration]:
+    """Per-request cache of ``alias_model -> SelectionEnumeration`` on ``request.state``.
+
+    Mirrors the ``aawm_alias_request_local_*`` request-state cache pattern so the
+    alias enumeration resolves exactly once per request even though the wrapper,
+    the candidate-state builder, and the affinity resolver each need it.
+    """
+    context = getattr(request.state, "aawm_alias_selection_context", None)
+    if isinstance(context, dict):
+        return context
+    context = {}
+    setattr(request.state, "aawm_alias_selection_context", context)
+    return context
+
+
+def _resolve_aawm_alias_selection_enumeration(
+    request: Request,
+    alias_model: str,
+    *,
+    client_product_label: Optional[str] = None,
+) -> SelectionEnumeration:
+    """Resolve (and memoize) the ordered candidate enumeration + commit token.
+
+    The underlying getter ``_get_codex_auto_agent_candidates_for_alias`` is
+    invoked exactly once per ``(request, alias_model)`` -- every subsequent call
+    site consumes the cached enumeration, so cursor reads stay consistent and the
+    getter cannot advance rotation multiple times per live request.
+    """
+    context = _get_aawm_alias_selection_context(request)
+    cached = context.get(alias_model)
+    if cached is not None:
+        return cached
+    candidates = tuple(
+        _get_codex_auto_agent_candidates_for_alias(
+            alias_model,
+            client_product_label=client_product_label,
+        )
+    )
+    token = _derive_round_robin_commit_token(
+        alias_model,
+        client_product_label=client_product_label,
+    )
+    enumeration = SelectionEnumeration(candidates=candidates, commit_token=token)
+    context[alias_model] = enumeration
+    return enumeration
 
 
 def _get_codex_auto_agent_candidates_for_alias(
@@ -4830,11 +4993,20 @@ def _find_codex_auto_agent_candidate(
     *,
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
     client_product_label: Optional[str] = None,
+    request: Optional[Request] = None,
 ) -> Optional[dict[str, Any]]:
-    for candidate in _get_codex_auto_agent_candidates_for_alias(
-        alias_model,
-        client_product_label=client_product_label,
-    ):
+    if request is not None:
+        candidates: Sequence[dict[str, Any]] = _resolve_aawm_alias_selection_enumeration(
+            request,
+            alias_model,
+            client_product_label=client_product_label,
+        ).candidates
+    else:
+        candidates = _get_codex_auto_agent_candidates_for_alias(
+            alias_model,
+            client_product_label=client_product_label,
+        )
+    for candidate in candidates:
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
@@ -5273,10 +5445,11 @@ async def _build_codex_auto_agent_candidate_states(
     google_lane_key: Optional[str] = None
     antigravity_lane_state: Optional[dict[str, Any]] = None
     states: list[dict[str, Any]] = []
-    for candidate_template in _get_codex_auto_agent_candidates_for_alias(
+    for candidate_template in _resolve_aawm_alias_selection_enumeration(
+        request,
         alias_model,
         client_product_label=client_product_label,
-    ):
+    ).candidates:
         if candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER and google_lane_key is None:
             google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
         if candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER and antigravity_lane_state is None:
@@ -5322,6 +5495,13 @@ async def _select_codex_auto_agent_candidate(
     )
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(request_body)
 
+    enumeration = _resolve_aawm_alias_selection_enumeration(
+        request,
+        alias_model,
+        client_product_label=client_product_label,
+    )
+    commit_token = enumeration.commit_token
+
     affinity = await _get_codex_auto_agent_session_affinity(session_key)
     if affinity is not None and not has_continuation_state:
         affinity = None
@@ -5331,6 +5511,7 @@ async def _select_codex_auto_agent_candidate(
             affinity.get("model"),
             alias_model=alias_model,
             client_product_label=client_product_label,
+            request=request,
         )
         if affinity_candidate is not None:
             affinity_state = await _build_codex_auto_agent_candidate_state(
@@ -5371,6 +5552,7 @@ async def _select_codex_auto_agent_candidate(
             affinity.get("model"),
             alias_model=alias_model,
             client_product_label=client_product_label,
+            request=request,
         )
         if affinity_candidate is not None:
             matched_affinity_state: Optional[dict[str, Any]] = None
@@ -5439,6 +5621,7 @@ async def _select_codex_auto_agent_candidate(
     for state in states:
         if state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
             continue
+        _commit_round_robin_selection(commit_token, selected_candidate=state["candidate"])
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
@@ -25417,10 +25600,11 @@ async def _handle_codex_auto_agent_alias_route(
         request=request,
         prepared_request_body=prepared_request_body,
         max_candidate_attempts=len(
-            _get_codex_auto_agent_candidates_for_alias(
+            _resolve_aawm_alias_selection_enumeration(
+                request,
                 alias_model,
                 client_product_label=client_product_label,
-            )
+            ).candidates
         ),
         select_candidate_fn=_select_codex_auto_agent_candidate,
         add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
