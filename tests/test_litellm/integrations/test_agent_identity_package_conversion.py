@@ -134,6 +134,71 @@ def test_scripts_import_surface() -> None:
     )
 
 
+def test_patched_repo_normalizer_intercepts_record_api() -> None:
+    """Wave A2 `__globals__` contract, exercised NOW (must pass pre- and
+    post-move) and again after the extraction: monkeypatching
+    `_normalize_repository_identity` on the identity namespace intercepts a
+    record API that consumes it via free-name lookup.
+
+    `_build_session_history_record` -> `_extract_repository_identity_from_kwargs_with_source`
+    -> `_extract_repository_identity_from_metadata_sources_with_source` ->
+    `_normalize_repository_identity` is the live call chain today. After A2
+    moves `_normalize_repository_identity` into `identity_repository.py`,
+    the facade binding on the identity namespace must still be the object
+    consulted by that chain (whether the chain itself also moves into
+    `identity_repository.py` or stays reachable via the record-API
+    `__globals__` rebind), so this test must keep passing unchanged.
+    """
+    import litellm.integrations.aawm_agent_identity as identity_module
+    from litellm.integrations.aawm_agent_identity import _build_session_history_record
+
+    sentinel = {"called_with": None}
+    original = identity_module._normalize_repository_identity
+
+    def _stub_normalize_repository_identity(value: Any) -> Any:
+        sentinel["called_with"] = value
+        return original(value)
+
+    identity_module._normalize_repository_identity = _stub_normalize_repository_identity
+    try:
+        kwargs = {
+            "litellm_call_id": "call-a2-repo-normalizer-probe",
+            "model": "openai/gpt-5.4-mini",
+            "custom_llm_provider": "openai",
+            "call_type": "pass_through_endpoint",
+            "litellm_params": {
+                "metadata": {
+                    "session_id": "session-a2-repo-normalizer-probe",
+                    "repository": "litellm",
+                    "trace_user_id": "codex",
+                }
+            },
+            "messages": [{"role": "user", "content": "probe"}],
+        }
+        result = {
+            "id": "resp-a2-repo-normalizer-probe",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "output": [],
+        }
+
+        record = _build_session_history_record(
+            kwargs=kwargs,
+            result=result,
+            start_time=None,
+            end_time=None,
+        )
+
+        assert record is not None
+        assert sentinel["called_with"] is not None, (
+            "expected _build_session_history_record's repository-extraction "
+            "path to call the (patched) _normalize_repository_identity at "
+            "least once via free-name / attribute lookup on the identity "
+            "namespace"
+        )
+    finally:
+        identity_module._normalize_repository_identity = original
+
+
 @pytest.mark.integration
 def test_installed_wheel_smoke(tmp_path: Path) -> None:
     """HARD GATE for Wave A2+: the built-and-installed wheel must still expose
