@@ -41,7 +41,7 @@ from litellm.proxy.aawm_route_logging import (
     register_aawm_route_rollup_access_log_replacement,
 )
 
-from .interfaces import AliasRouteServices, CooldownPublicationPlan
+from .interfaces import AliasRouteServices, CooldownPublicationPlan, GetActiveCooldownStateFn
 from .state import alias_routing_state
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -59,7 +59,7 @@ async def handle_alias_route(  # noqa: PLR0915
     request: "Request",
     prepared_request_body: "Payload",
     max_candidate_attempts: int,
-    get_active_cooldown_state_fn: Any,
+    get_active_cooldown_state_fn: GetActiveCooldownStateFn,
     attempts_metadata_key: str,
     skipped_candidates_metadata_key: str,
     no_candidate_detail: str,
@@ -235,25 +235,31 @@ async def handle_alias_route(  # noqa: PLR0915
                 # Resolve the publication plan + publish its memory keys
                 # BEFORE releasing the lock so the single-flight invariant
                 # holds across any suspension in the publish path.
-                if probe_failure_exc is not None:
-                    probe_failure_plan, probe_applied_scope = await _resolve_and_publish_failure_memory(
-                        resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
-                        publish_cooldown_memory_fn=publish_cooldown_memory_fn,
-                        record_read_pilot_evidence_fn=_record_read_pilot_cooldown_evidence,
-                        request=request,
-                        candidate=candidate,
-                        selection=selection,
-                        alias_model=alias_model,
-                        attempt_record=attempt_record,
-                        exc=probe_failure_exc,
-                        is_read_pilot_lane=(alias_model == _READ_PILOT_ALIAS_NAME),
-                        kimi_failure_metadata_fn=_get_safe_kimi_code_probe_failure_metadata,
-                        classify_kimi_fn=_classify_kimi_code_auto_agent_probe_failure,
-                        classify_retryable_fn=_classify_codex_auto_agent_retryable_exhaustion,
-                        grok_quota_fn=_is_codex_auto_agent_grok_account_quota_exhaustion,
-                        cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
-                    )
-                probe_lock.release()
+                # The nested try/finally guarantees the lock is released
+                # even if the resolver or publisher raises or is cancelled,
+                # preventing a permanent lock leak that would hang all
+                # subsequent same-key requests.
+                try:
+                    if probe_failure_exc is not None:
+                        probe_failure_plan, probe_applied_scope = await _resolve_and_publish_failure_memory(
+                            resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
+                            publish_cooldown_memory_fn=publish_cooldown_memory_fn,
+                            record_read_pilot_evidence_fn=_record_read_pilot_cooldown_evidence,
+                            request=request,
+                            candidate=candidate,
+                            selection=selection,
+                            alias_model=alias_model,
+                            attempt_record=attempt_record,
+                            exc=probe_failure_exc,
+                            is_read_pilot_lane=(alias_model == _READ_PILOT_ALIAS_NAME),
+                            kimi_failure_metadata_fn=_get_safe_kimi_code_probe_failure_metadata,
+                            classify_kimi_fn=_classify_kimi_code_auto_agent_probe_failure,
+                            classify_retryable_fn=_classify_codex_auto_agent_retryable_exhaustion,
+                            grok_quota_fn=_is_codex_auto_agent_grok_account_quota_exhaustion,
+                            cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
+                        )
+                finally:
+                    probe_lock.release()
             if skip_after_probe_wait:
                 break
             if probe_failure_exc is None:

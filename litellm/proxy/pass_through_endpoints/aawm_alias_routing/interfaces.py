@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Optional,
     Protocol,
     Sequence,
@@ -138,6 +139,19 @@ class CooldownPublicationPlan:
 # ---------------------------------------------------------------------------
 # Typed seam protocols (explicit keyword parameters -- no ``**kwargs``)
 # ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class GetActiveCooldownStateFn(Protocol):
+    """Query active cooldown remaining for a key (may await durable cache).
+
+    Returns ``(remaining_seconds, source_label)`` where ``source_label`` is
+    one of ``"memory"``, ``"negative_cache"``, ``"durable"``, or
+    ``"local_fallback"``.
+    """
+
+    def __call__(self, cooldown_key: str) -> Awaitable[tuple[float, str]]:
+        ...
 
 
 @runtime_checkable
