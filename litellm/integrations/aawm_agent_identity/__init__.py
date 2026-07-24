@@ -62,6 +62,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
+
 try:
     from litellm.integrations.aawm_agent_quality_rules import (
         AgentQualityCommand,
@@ -111,22 +112,19 @@ def _get_response_api_logging_utils() -> Any:
         _response_api_logging_utils_loaded = True
     return _response_api_logging_utils
 
+
 _CLAUDE_PERMISSION_CHECK_OUTPUT_RE = re.compile(
     r"^<block>\s*(?P<decision>yes|no)\s*$",
     re.IGNORECASE,
 )
 _AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
-_AGENT_TENANT_RE = re.compile(
-    r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project"
-)
+_AGENT_TENANT_RE = re.compile(r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project")
 _AGENT_ROLE_RE = re.compile(
     r"^[ \t]*You are a '(?P<agent>explorer|worker|default)' agent\.[ \t]*$",
     re.MULTILINE,
 )
 _DEFAULT_AGENT = "orchestrator"
-_CLAUDE_EXPERIMENT_ID_RE = re.compile(
-    rb"(?<![A-Za-z0-9._-])([A-Za-z][A-Za-z0-9._-]{11,})(?![A-Za-z0-9._-])"
-)
+_CLAUDE_EXPERIMENT_ID_RE = re.compile(rb"(?<![A-Za-z0-9._-])([A-Za-z][A-Za-z0-9._-]{11,})(?![A-Za-z0-9._-])")
 _GEMINI_MARKER = bytes.fromhex("8f3d6b5f")
 _AAWM_DB_HOST_ENV_VARS = (
     "AAWM_DB_HOST",
@@ -224,12 +222,10 @@ _AAWM_ASSOCIATED_VERSION_ENV_VARS = {
     ),
 }
 _USER_AGENT_PRODUCT_RE = re.compile(
-    r"(?P<name>[A-Za-z][A-Za-z0-9._-]{1,63})/"
-    r"(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]{0,127})"
+    r"(?P<name>[A-Za-z][A-Za-z0-9._-]{1,63})/" r"(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]{0,127})"
 )
 _USER_AGENT_PAREN_PRODUCT_RE = re.compile(
-    r"\((?P<name>[A-Za-z][A-Za-z0-9._-]{1,63})\s*;\s*"
-    r"(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]{0,127})\)"
+    r"\((?P<name>[A-Za-z][A-Za-z0-9._-]{1,63})\s*;\s*" r"(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]{0,127})\)"
 )
 _RESET_AFTER_SECONDS_RE = re.compile(
     r"\breset(?:s|ting)?\s+after\s+(?P<seconds>\d+)s\b",
@@ -411,6 +407,7 @@ def _bind_session_history_record_apis() -> None:
     _aawm_session_history_record._ensure_installed()
     for _name in _aawm_session_history_record._RECORD_API_NAMES:
         globals()[_name] = getattr(_aawm_session_history_record, _name)
+
 
 _ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX = "[1m]"
 _ANTHROPIC_CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07"
@@ -843,9 +840,7 @@ _SESSION_HISTORY_OUTPUT_CONTRACT_INT_FIELDS = (
     "output_contract_failure_count",
     "output_contract_final_text_chars",
 )
-_SESSION_HISTORY_OUTPUT_CONTRACT_JSON_FIELDS = (
-    "output_contract_setup_only_markers",
-)
+_SESSION_HISTORY_OUTPUT_CONTRACT_JSON_FIELDS = ("output_contract_setup_only_markers",)
 _PROMPT_OVERHEAD_CLASSIFIER_VERSION = "deterministic-v2"
 _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH = 16
 _AAWM_REQUEST_PAYLOAD_SCAN_MAX_ITEMS = 5000
@@ -932,8 +927,7 @@ def _normalize_configured_root_path(value: Any) -> Optional[str]:
 def _get_aawm_workspace_root() -> str:
     try:
         configured = _normalize_configured_root_path(
-            get_secret_str(_AAWM_WORKSPACE_ROOT_ENV)
-            or os.environ.get(_AAWM_WORKSPACE_ROOT_ENV)
+            get_secret_str(_AAWM_WORKSPACE_ROOT_ENV) or os.environ.get(_AAWM_WORKSPACE_ROOT_ENV)
         )
     except Exception:
         configured = None
@@ -943,8 +937,7 @@ def _get_aawm_workspace_root() -> str:
 def _get_codex_memory_root_path() -> str:
     try:
         configured = _normalize_configured_root_path(
-            get_secret_str(_AAWM_CODEX_MEMORY_ROOT_ENV)
-            or os.environ.get(_AAWM_CODEX_MEMORY_ROOT_ENV)
+            get_secret_str(_AAWM_CODEX_MEMORY_ROOT_ENV) or os.environ.get(_AAWM_CODEX_MEMORY_ROOT_ENV)
         )
     except Exception:
         configured = None
@@ -1001,12 +994,8 @@ def _aawm_repository_text_markers(
 
 
 # Import-time snapshots use defaults so module import stays free of secret lookups.
-_AAWM_REPOSITORY_TEXT_PATTERNS = _build_aawm_repository_text_patterns(
-    _AAWM_WORKSPACE_ROOT_DEFAULT
-)
-_AAWM_REPOSITORY_TEXT_MARKERS = _aawm_repository_text_markers(
-    _AAWM_WORKSPACE_ROOT_DEFAULT
-)
+_AAWM_REPOSITORY_TEXT_PATTERNS = _build_aawm_repository_text_patterns(_AAWM_WORKSPACE_ROOT_DEFAULT)
+_AAWM_REPOSITORY_TEXT_MARKERS = _aawm_repository_text_markers(_AAWM_WORKSPACE_ROOT_DEFAULT)
 _CODEX_MEMORY_ROOT_PATH = _AAWM_CODEX_MEMORY_ROOT_DEFAULT
 _AAWM_REPOSITORY_UNTRUSTED_TEXT_ITEM_TYPES = {
     "custom_tool_call",
@@ -1148,9 +1137,7 @@ _CLAUDE_AUTO_REVIEW_TRACE_NAME = "claude-code.auto-reviewer"
 _CLAUDE_AUTO_REVIEW_AGENT_NAME = "auto-reviewer"
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
 _CODEX_MEMORY_ROOT_REPOSITORY = "codex-memories"
-_AAWM_REPOSITORY_ID_PATTERN = re.compile(
-    r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$"
-)
+_AAWM_REPOSITORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
 _AAWM_REPOSITORY_TRANSCRIPT_ARTIFACT_RE = re.compile(
     r"^(?:rollout-\d{4}(?:-[A-Za-z0-9_.-]*)?|.*\.jsonl?)$",
     re.IGNORECASE,
@@ -1232,8 +1219,7 @@ def _build_aawm_dsn() -> Optional[str]:
     password = _get_first_secret_value(_AAWM_DB_PASSWORD_ENV_VARS)
     database = _get_first_secret_value(_AAWM_DB_NAME_ENV_VARS)
     sslmode = _normalize_aawm_sslmode(
-        _get_first_secret_value(_AAWM_DB_SSLMODE_ENV_VARS)
-        or _get_first_secret_value(_AAWM_DB_SSL_BOOL_ENV_VARS)
+        _get_first_secret_value(_AAWM_DB_SSLMODE_ENV_VARS) or _get_first_secret_value(_AAWM_DB_SSL_BOOL_ENV_VARS)
     )
 
     has_component_config = any((host, port, user, password, database, sslmode))
@@ -1244,10 +1230,7 @@ def _build_aawm_dsn() -> Optional[str]:
         credentials = quote(user, safe="")
         if password:
             credentials += f":{quote(password, safe='')}"
-        dsn = (
-            f"postgresql://{credentials}@{host}:{port or '5432'}/"
-            f"{quote(database, safe='')}"
-        )
+        dsn = f"postgresql://{credentials}@{host}:{port or '5432'}/" f"{quote(database, safe='')}"
         if sslmode:
             dsn += f"?{urlencode({'sslmode': sslmode})}"
         return dsn
@@ -1279,14 +1262,6 @@ def _append_aawm_dsn_query_params(
             parsed.fragment,
         )
     )
-
-
-
-
-
-
-
-
 
 
 def _clean_non_empty_string(value: Any) -> Optional[str]:
@@ -1418,20 +1393,22 @@ def _extract_claude_trace_user_identity_from_metadata_sources(
             continue
 
         trace_user_id = _normalize_repository_identity(source.get("trace_user_id"))
-        if trace_user_id and _clean_non_empty_string(
-            source.get("trace_name")
-        ) and str(source.get("trace_name")).startswith("claude-code"):
+        if (
+            trace_user_id
+            and _clean_non_empty_string(source.get("trace_name"))
+            and str(source.get("trace_name")).startswith("claude-code")
+        ):
             return trace_user_id, f"{source_name}.trace_user_id"
 
         nested_source = _coerce_mapping(source.get("metadata"))
         if not nested_source:
             continue
-        trace_user_id = _normalize_repository_identity(
-            nested_source.get("trace_user_id")
-        )
-        if trace_user_id and _clean_non_empty_string(
-            nested_source.get("trace_name")
-        ) and str(nested_source.get("trace_name")).startswith("claude-code"):
+        trace_user_id = _normalize_repository_identity(nested_source.get("trace_user_id"))
+        if (
+            trace_user_id
+            and _clean_non_empty_string(nested_source.get("trace_name"))
+            and str(nested_source.get("trace_name")).startswith("claude-code")
+        ):
             return trace_user_id, f"{source_name}.metadata.trace_user_id"
 
     return None, None
@@ -1467,32 +1444,30 @@ def _extract_tenant_identity_from_kwargs(
         kwargs,
         metadata=metadata_mapping,
     ):
-        trace_user_id = _normalize_repository_identity(
-            metadata_mapping.get("trace_user_id")
-        )
+        trace_user_id = _normalize_repository_identity(metadata_mapping.get("trace_user_id"))
         tenant_source = _clean_non_empty_string(metadata_mapping.get("tenant_id_source"))
-        if _is_codex_trace_user_tenant_source(source) or _is_codex_trace_user_tenant_source(
-            tenant_source
-        ):
+        if _is_codex_trace_user_tenant_source(source) or _is_codex_trace_user_tenant_source(tenant_source):
             tenant_id, source = None, None
         elif isinstance(source, str) and source.endswith(".trace_user_id"):
             tenant_id, source = None, None
-        elif trace_user_id and tenant_id == trace_user_id and not _is_repository_source_trusted_for_codex_tenant(
-            metadata_mapping.get("repository_source")
+        elif (
+            trace_user_id
+            and tenant_id == trace_user_id
+            and not _is_repository_source_trusted_for_codex_tenant(metadata_mapping.get("repository_source"))
         ):
             tenant_id, source = None, None
-        elif isinstance(source, str) and any(
-            source.endswith(marker)
-            for marker in (".tenant_id", ".aawm_tenant_id")
-        ) and trace_user_id and tenant_id == trace_user_id:
+        elif (
+            isinstance(source, str)
+            and any(source.endswith(marker) for marker in (".tenant_id", ".aawm_tenant_id"))
+            and trace_user_id
+            and tenant_id == trace_user_id
+        ):
             tenant_id, source = None, None
     if tenant_id:
         return tenant_id, source
 
     headers = _extract_request_headers_from_kwargs(kwargs)
-    tenant_id = _normalize_tenant_identity(
-        _get_header_value(headers, *_AAWM_TENANT_ID_HEADER_NAMES)
-    )
+    tenant_id = _normalize_tenant_identity(_get_header_value(headers, *_AAWM_TENANT_ID_HEADER_NAMES))
     if tenant_id:
         return tenant_id, "request_headers"
 
@@ -1528,9 +1503,7 @@ def _extract_tenant_identity_from_langfuse_trace_observation(
     )
     if tenant_id:
         return tenant_id, source
-    trace_user_id = _normalize_tenant_identity(
-        trace.get("userId") if isinstance(trace, dict) else None
-    )
+    trace_user_id = _normalize_tenant_identity(trace.get("userId") if isinstance(trace, dict) else None)
     if trace_user_id:
         return trace_user_id, "trace.userId"
     return None, None
@@ -1792,9 +1765,7 @@ def _is_known_aawm_workspace_repository(value: Any) -> bool:
         return True
     # env allowlist (comma-separated additional known repos)
     try:
-        env_val = get_secret_str("AAWM_KNOWN_WORKSPACE_REPOS") or os.environ.get(
-            "AAWM_KNOWN_WORKSPACE_REPOS", ""
-        )
+        env_val = get_secret_str("AAWM_KNOWN_WORKSPACE_REPOS") or os.environ.get("AAWM_KNOWN_WORKSPACE_REPOS", "")
     except Exception:
         env_val = os.environ.get("AAWM_KNOWN_WORKSPACE_REPOS", "")
     if env_val:
@@ -1899,9 +1870,7 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
         except Exception:
             pass
     elif cleaned.startswith("/"):
-        cleaned = _normalize_repository_identity_from_absolute_path(
-            cleaned.rstrip("/")
-        )
+        cleaned = _normalize_repository_identity_from_absolute_path(cleaned.rstrip("/"))
         if cleaned is None:
             return None
 
@@ -1915,11 +1884,7 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
         return None
     if _is_bare_dot_directory(cleaned):
         return None
-    if (
-        not cleaned
-        or not _is_valid_repository_identity(cleaned)
-        or _is_disallowed_repository_identity(cleaned)
-    ):
+    if not cleaned or not _is_valid_repository_identity(cleaned) or _is_disallowed_repository_identity(cleaned):
         return None
     return cleaned
 
@@ -2083,9 +2048,7 @@ def _extract_repository_identity_from_metadata_sources_with_source(
             repository = _normalize_repository_identity(source.get(key))
             if repository:
                 source_detail = (
-                    _clean_non_empty_string(source.get("repository_source"))
-                    if key == "repository"
-                    else None
+                    _clean_non_empty_string(source.get("repository_source")) if key == "repository" else None
                 )
                 return repository, source_detail or f"{source_name}.{key}"
 
@@ -2102,9 +2065,7 @@ def _extract_repository_identity_from_metadata_sources_with_source(
                 repository = _normalize_repository_identity(nested_source.get(key))
                 if repository:
                     source_detail = (
-                        _clean_non_empty_string(nested_source.get("repository_source"))
-                        if key == "repository"
-                        else None
+                        _clean_non_empty_string(nested_source.get("repository_source")) if key == "repository" else None
                     )
                     return (
                         repository,
@@ -2147,9 +2108,7 @@ def _extract_repository_identity_from_metadata_sources_with_source(
 def _extract_repository_identity_from_metadata_sources(
     *sources: Tuple[str, Any],
 ) -> Optional[str]:
-    repository, _source = _extract_repository_identity_from_metadata_sources_with_source(
-        *sources
-    )
+    repository, _source = _extract_repository_identity_from_metadata_sources_with_source(*sources)
     return repository
 
 
@@ -2162,9 +2121,7 @@ def _extract_repository_identity_from_kwargs_with_source(
     litellm_params = kwargs.get("litellm_params") or {}
     standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
     standard_metadata = _coerce_mapping(standard_logging_object.get("metadata"))
-    requester_custom_headers = _coerce_mapping(
-        standard_metadata.get("requester_custom_headers")
-    )
+    requester_custom_headers = _coerce_mapping(standard_metadata.get("requester_custom_headers"))
     passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
     proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
     proxy_body = _coerce_mapping(proxy_request.get("body"))
@@ -2172,9 +2129,7 @@ def _extract_repository_identity_from_kwargs_with_source(
 
     headers = _extract_request_headers_from_kwargs(kwargs)
     for header_name in _AAWM_REPOSITORY_HEADER_NAMES:
-        repository = _normalize_repository_identity(
-            _get_header_value(headers, header_name)
-        )
+        repository = _normalize_repository_identity(_get_header_value(headers, header_name))
         if repository:
             return repository, f"request_headers.{header_name}"
 
@@ -2274,10 +2229,7 @@ def _payload_contains_codex_memory_workflow_markers(value: Any) -> bool:
             normalized = child.lower()
             if _CODEX_MEMORY_WORKFLOW_REQUIRED_MARKER in normalized:
                 found_required_marker = True
-            if any(
-                marker in normalized
-                for marker in _CODEX_MEMORY_WORKFLOW_CONTEXT_MARKERS
-            ):
+            if any(marker in normalized for marker in _CODEX_MEMORY_WORKFLOW_CONTEXT_MARKERS):
                 found_context_marker = True
             return
         if isinstance(child, (dict, list)):
@@ -2348,9 +2300,7 @@ def _apply_codex_memory_workflow_repository(
     metadata["workload_subtype"] = "codex_memory_writer"
     metadata["source_repository"] = source_repository
     metadata["repository"] = source_repository
-    metadata["memory_workload_label"] = _format_memory_repository_identity(
-        source_repository
-    )
+    metadata["memory_workload_label"] = _format_memory_repository_identity(source_repository)
     _merge_tags(metadata, ["codex-memory-workflow", "agent-memory-workload"])
     return source_repository
 
@@ -2446,6 +2396,7 @@ def _extract_claude_code_version_from_metadata(
         _first_non_empty_string(metadata.get("cc_entrypoint"), billing_header_fields.get("cc_entrypoint")),
     )
 
+
 _SESSION_HISTORY_LOOPBACK_HOST_LABEL = "localhost"
 
 
@@ -2502,9 +2453,7 @@ def _extract_session_host_attribution(
         route_rollup_context.get("host_name_source"),
     )
     if host_name is None and client_ip is not None:
-        host_name, resolved_source = _resolve_session_history_host_name_from_ip(
-            client_ip
-        )
+        host_name, resolved_source = _resolve_session_history_host_name_from_ip(client_ip)
         if host_name_source is None:
             host_name_source = resolved_source
 
@@ -2535,9 +2484,7 @@ def _build_session_runtime_identity(
         _get_header_value(headers, "user-agent", "User-Agent"),
     )
 
-    parsed_client_name, parsed_client_version = _parse_client_identity_from_user_agent(
-        user_agent
-    )
+    parsed_client_name, parsed_client_version = _parse_client_identity_from_user_agent(user_agent)
     cc_version, cc_entrypoint = _extract_claude_code_version_from_metadata(metadata)
     client_name = _first_non_empty_string(metadata.get("client_name"), parsed_client_name)
     client_version = _first_non_empty_string(
@@ -2550,11 +2497,7 @@ def _build_session_runtime_identity(
     if cc_entrypoint and client_name is None:
         client_name = cc_entrypoint
 
-    runtime_environment = (
-        _get_first_secret_value(_AAWM_LITELLM_ENVIRONMENT_ENV_VARS)
-        if allow_runtime
-        else None
-    )
+    runtime_environment = _get_first_secret_value(_AAWM_LITELLM_ENVIRONMENT_ENV_VARS) if allow_runtime else None
     litellm_environment = _first_non_empty_string(
         runtime_environment,
         metadata.get("litellm_environment"),
@@ -2637,17 +2580,11 @@ def _extract_agent_context_from_mapping(
 ) -> Tuple[Optional[str], Optional[str]]:
     if not isinstance(source, dict):
         return None, None
-    agent_name = _clean_non_empty_string(
-        source.get("agent_name") or source.get("aawm_claude_agent_name")
-    )
+    agent_name = _clean_non_empty_string(source.get("agent_name") or source.get("aawm_claude_agent_name"))
     if agent_name is None and is_codex_client:
-        agent_name = _clean_non_empty_string(
-            source.get("agent_role") or source.get("agent_nickname")
-        )
+        agent_name = _clean_non_empty_string(source.get("agent_role") or source.get("agent_nickname"))
     tenant_id = _clean_non_empty_string(
-        source.get("tenant_id")
-        or source.get("aawm_tenant_id")
-        or source.get("aawm_claude_project")
+        source.get("tenant_id") or source.get("aawm_tenant_id") or source.get("aawm_claude_project")
     )
     if agent_name:
         return agent_name, explicit_tenant_id or tenant_id
@@ -2780,7 +2717,8 @@ def _is_generic_codex_trace_user_id(value: Any) -> bool:
     normalized = _clean_non_empty_string(value)
     return normalized is not None and (
         _is_numeric_identity_placeholder(normalized)
-        or normalized.lower() in {
+        or normalized.lower()
+        in {
             "codex",
             "codex-cli",
             "codex-tui",
@@ -2788,9 +2726,7 @@ def _is_generic_codex_trace_user_id(value: Any) -> bool:
     )
 
 
-def _is_native_codex_passthrough_context(
-    metadata: Dict[str, Any], headers: Dict[str, Any]
-) -> bool:
+def _is_native_codex_passthrough_context(metadata: Dict[str, Any], headers: Dict[str, Any]) -> bool:
     route_family = _clean_non_empty_string(metadata.get("passthrough_route_family"))
     if route_family and route_family.lower() == "codex_responses":
         return True
@@ -2800,12 +2736,7 @@ def _is_native_codex_passthrough_context(
         _get_header_value(headers, "langfuse_trace_name"),
     )
     user_agent = _get_header_value(headers, "user-agent")
-    return bool(
-        trace_name
-        and trace_name.lower() == "codex"
-        and user_agent
-        and "codex" in user_agent.lower()
-    )
+    return bool(trace_name and trace_name.lower() == "codex" and user_agent and "codex" in user_agent.lower())
 
 
 def _is_codex_client_identity(metadata: Dict[str, Any], headers: Dict[str, Any]) -> bool:
@@ -2815,14 +2746,9 @@ def _is_codex_client_identity(metadata: Dict[str, Any], headers: Dict[str, Any])
         metadata.get("http_user_agent"),
         _get_header_value(headers, "user-agent", "User-Agent"),
     )
-    parsed_client_name, _parsed_client_version = _parse_client_identity_from_user_agent(
-        user_agent
-    )
+    parsed_client_name, _parsed_client_version = _parse_client_identity_from_user_agent(user_agent)
     client_name = _first_non_empty_string(metadata.get("client_name"), parsed_client_name)
-    return bool(
-        (client_name and "codex" in client_name.lower())
-        or (user_agent and "codex" in user_agent.lower())
-    )
+    return bool((client_name and "codex" in client_name.lower()) or (user_agent and "codex" in user_agent.lower()))
 
 
 def _is_codex_default_agent_context(
@@ -2868,9 +2794,7 @@ def _is_codex_subagent_context(
         if thread_source and thread_source.lower() == "subagent":
             return True
         nested_source = _coerce_mapping(source.get("source"))
-        nested_thread_source = _clean_non_empty_string(
-            nested_source.get("thread_source")
-        )
+        nested_thread_source = _clean_non_empty_string(nested_source.get("thread_source"))
         if nested_thread_source and nested_thread_source.lower() == "subagent":
             return True
         if nested_source.get("subagent"):
@@ -2894,14 +2818,10 @@ def _is_generic_grok_trace_name(value: Any) -> bool:
     if normalized is None:
         return True
     normalized_lower = normalized.lower()
-    return normalized_lower in {"grok", "grok-build", "xai"} or normalized_lower.startswith(
-        "grok-build."
-    )
+    return normalized_lower in {"grok", "grok-build", "xai"} or normalized_lower.startswith("grok-build.")
 
 
-def _is_native_grok_passthrough_context(
-    metadata: Dict[str, Any], headers: Dict[str, Any]
-) -> bool:
+def _is_native_grok_passthrough_context(metadata: Dict[str, Any], headers: Dict[str, Any]) -> bool:
     route_family = str(metadata.get("passthrough_route_family") or "").lower()
     if "grok" in route_family or "xai" in route_family:
         return True
@@ -2918,8 +2838,7 @@ def _is_native_grok_passthrough_context(
         return True
 
     return any(
-        str(header_name).lower().startswith("x-grok-")
-        or str(header_name).lower() == "x-xai-token-auth"
+        str(header_name).lower().startswith("x-grok-") or str(header_name).lower() == "x-xai-token-auth"
         for header_name in headers
     )
 
@@ -2959,13 +2878,9 @@ def _promote_grok_repository_trace_identity(
     if not desired_trace_user_id:
         return
 
-    if metadata_trace_user_id is None or _is_generic_grok_trace_user_id(
-        metadata_trace_user_id
-    ):
+    if metadata_trace_user_id is None or _is_generic_grok_trace_user_id(metadata_trace_user_id):
         metadata["trace_user_id"] = desired_trace_user_id
-    if header_trace_user_id is None or _is_generic_grok_trace_user_id(
-        header_trace_user_id
-    ):
+    if header_trace_user_id is None or _is_generic_grok_trace_user_id(header_trace_user_id):
         headers["langfuse_trace_user_id"] = desired_trace_user_id
 
 
@@ -2984,14 +2899,10 @@ def _promote_codex_repository_trace_user_id(
         metadata.pop("tenant_id_source", None)
     if _is_numeric_identity_placeholder(metadata.get("trace_user_id")):
         metadata.pop("trace_user_id", None)
-    if _is_numeric_identity_placeholder(
-        _get_header_value(headers, "langfuse_trace_user_id")
-    ):
+    if _is_numeric_identity_placeholder(_get_header_value(headers, "langfuse_trace_user_id")):
         headers.pop("langfuse_trace_user_id", None)
 
-    metadata_trace_user_id = _normalize_repository_identity(
-        metadata.get("trace_user_id")
-    )
+    metadata_trace_user_id = _normalize_repository_identity(metadata.get("trace_user_id"))
     header_trace_user_id = _get_header_value(headers, "langfuse_trace_user_id")
     repository, repository_source = _extract_repository_identity_from_kwargs_with_source(
         kwargs,
@@ -3009,21 +2920,13 @@ def _promote_codex_repository_trace_user_id(
         metadata["repository_source"] = repository_source
 
     desired_trace_user_id: Optional[str] = None
-    if metadata_trace_user_id and not _is_generic_codex_trace_user_id(
-        metadata_trace_user_id
-    ):
+    if metadata_trace_user_id and not _is_generic_codex_trace_user_id(metadata_trace_user_id):
         desired_trace_user_id = metadata_trace_user_id
     elif (
         repository
         and _is_repository_source_trusted_for_tenant(repository_source)
-        and (
-            metadata_trace_user_id is None
-            or _is_generic_codex_trace_user_id(metadata_trace_user_id)
-        )
-        and (
-            header_trace_user_id is None
-            or _is_generic_codex_trace_user_id(header_trace_user_id)
-        )
+        and (metadata_trace_user_id is None or _is_generic_codex_trace_user_id(metadata_trace_user_id))
+        and (header_trace_user_id is None or _is_generic_codex_trace_user_id(header_trace_user_id))
     ):
         desired_trace_user_id = repository
 
@@ -3031,9 +2934,7 @@ def _promote_codex_repository_trace_user_id(
         return
 
     metadata["trace_user_id"] = desired_trace_user_id
-    if header_trace_user_id is None or _is_generic_codex_trace_user_id(
-        header_trace_user_id
-    ):
+    if header_trace_user_id is None or _is_generic_codex_trace_user_id(header_trace_user_id):
         headers["langfuse_trace_user_id"] = desired_trace_user_id
 
 
@@ -3084,7 +2985,6 @@ def _maybe_get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-
 def _maybe_get_path(obj: Any, *keys: str, default: Any = None) -> Any:
     current = obj
     for key in keys:
@@ -3094,7 +2994,6 @@ def _maybe_get_path(obj: Any, *keys: str, default: Any = None) -> Any:
         if current is default:
             return default
     return current
-
 
 
 def _extract_first_response_message(result: Any) -> Any:
@@ -3237,9 +3136,7 @@ def _extract_claude_permission_check_decision_from_value(
             return match.group("decision").lower()
         parsed_value = _maybe_parse_json_text(stripped_value)
         if parsed_value is not None:
-            return _extract_claude_permission_check_decision_from_value(
-                parsed_value, _depth=_depth + 1
-            )
+            return _extract_claude_permission_check_decision_from_value(parsed_value, _depth=_depth + 1)
         return None
 
     if isinstance(value, list):
@@ -3248,9 +3145,7 @@ def _extract_claude_permission_check_decision_from_value(
         if match is not None:
             return match.group("decision").lower()
         for item in value:
-            decision = _extract_claude_permission_check_decision_from_value(
-                item, _depth=_depth + 1
-            )
+            decision = _extract_claude_permission_check_decision_from_value(item, _depth=_depth + 1)
             if decision is not None:
                 return decision
         return None
@@ -3260,25 +3155,19 @@ def _extract_claude_permission_check_decision_from_value(
 
     content = _maybe_get(value, "content")
     if content is not None and content is not value:
-        decision = _extract_claude_permission_check_decision_from_value(
-            content, _depth=_depth + 1
-        )
+        decision = _extract_claude_permission_check_decision_from_value(content, _depth=_depth + 1)
         if decision is not None:
             return decision
 
     message = _extract_first_response_message(value)
     if message is not None and message is not value:
-        decision = _extract_claude_permission_check_decision_from_value(
-            message, _depth=_depth + 1
-        )
+        decision = _extract_claude_permission_check_decision_from_value(message, _depth=_depth + 1)
         if decision is not None:
             return decision
 
     response = _maybe_get(value, "response")
     if response is not None and response is not value:
-        decision = _extract_claude_permission_check_decision_from_value(
-            response, _depth=_depth + 1
-        )
+        decision = _extract_claude_permission_check_decision_from_value(response, _depth=_depth + 1)
         if decision is not None:
             return decision
 
@@ -3312,9 +3201,7 @@ def _extract_claude_permission_check_models(
     result: Any,
 ) -> Tuple[Optional[str], Optional[str]]:
     request_model = _first_non_empty_string(
-        _maybe_get_path(
-            kwargs.get("passthrough_logging_payload"), "request_body", "model"
-        ),
+        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
         _maybe_get_path(
             kwargs.get("litellm_params"),
             "proxy_server_request",
@@ -3340,9 +3227,7 @@ def _enrich_claude_permission_check_metadata(
     *,
     standard_logging_object: Optional[Dict[str, Any]] = None,
 ) -> None:
-    standard_logging_object = standard_logging_object or kwargs.get(
-        "standard_logging_object"
-    ) or {}
+    standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
     decision = _extract_claude_permission_check_decision(
         result,
         standard_logging_object=standard_logging_object,
@@ -3374,19 +3259,14 @@ def _enrich_claude_permission_check_metadata(
             "claude-internal-check",
             "claude-permission-check",
             f"claude-permission-check:{decision}",
-            "claude-permission-check:block"
-            if blocked
-            else "claude-permission-check:allow",
+            "claude-permission-check:block" if blocked else "claude-permission-check:allow",
         ],
     )
 
     existing_spans = metadata.get("langfuse_spans") or []
     if not isinstance(existing_spans, list):
         existing_spans = []
-    if any(
-        isinstance(span, dict) and span.get("name") == "claude.permission_check"
-        for span in existing_spans
-    ):
+    if any(isinstance(span, dict) and span.get("name") == "claude.permission_check" for span in existing_spans):
         return
 
     span_metadata: Dict[str, Any] = {
@@ -3448,9 +3328,7 @@ def _is_claude_permission_check_metadata(metadata: Any) -> bool:
     if _metadata_bool(metadata.get("claude_permission_check")):
         return True
     for tag in _metadata_request_tags(metadata):
-        if tag == "claude-permission-check" or tag.startswith(
-            "claude-permission-check:"
-        ):
+        if tag == "claude-permission-check" or tag.startswith("claude-permission-check:"):
             return True
     return False
 
@@ -3495,10 +3373,7 @@ def _apply_claude_auto_review_metadata(
         metadata,
         source_model,
     )
-    if (
-        resolved_source_model
-        and resolved_source_model != _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
-    ):
+    if resolved_source_model and resolved_source_model != _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL:
         metadata["source_model"] = resolved_source_model
 
     normalized_repository = _normalize_repository_identity(repository)
@@ -3618,9 +3493,7 @@ def _apply_claude_auto_review_parent_identity(
     )
     metadata["claude_auto_review_parent_identity_source"] = identity.get("source")
     if identity.get("source_row_id") is not None:
-        metadata["claude_auto_review_parent_identity_source_row_id"] = identity[
-            "source_row_id"
-        ]
+        metadata["claude_auto_review_parent_identity_source_row_id"] = identity["source_row_id"]
     payload["metadata"] = metadata
 
 
@@ -3770,9 +3643,7 @@ def _elapsed_ms_from_times(start_time: Any, end_time: Any) -> Optional[float]:
     normalized_end = _coerce_session_latency_datetime(end_time)
     if normalized_start is None or normalized_end is None:
         return None
-    return _nonnegative_float_or_none(
-        (normalized_end - normalized_start).total_seconds() * 1000.0
-    )
+    return _nonnegative_float_or_none((normalized_end - normalized_start).total_seconds() * 1000.0)
 
 
 def _metadata_nonnegative_float(
@@ -3830,9 +3701,7 @@ def _build_session_history_latency_breakdown(
     llm_upstream_time_to_first_byte_ms = upstream_first_chunk_ms
     llm_upstream_stream_ms = None
     if upstream_first_chunk_ms is not None and upstream_stream_complete_ms is not None:
-        llm_upstream_stream_ms = _nonnegative_float_or_none(
-            upstream_stream_complete_ms - upstream_first_chunk_ms
-        )
+        llm_upstream_stream_ms = _nonnegative_float_or_none(upstream_stream_complete_ms - upstream_first_chunk_ms)
 
     total_server_elapsed_ms = _first_non_none(
         _metadata_nonnegative_float(metadata, "aawm_total_proxy_duration_ms"),
@@ -3847,12 +3716,8 @@ def _build_session_history_latency_breakdown(
     if total_server_elapsed_ms is not None and (
         litellm_processing_ms is not None or llm_upstream_elapsed_ms is not None
     ):
-        classified_ms = (litellm_processing_ms or 0.0) + (
-            llm_upstream_elapsed_ms or 0.0
-        )
-        latency_unclassified_ms = _nonnegative_float_or_none(
-            total_server_elapsed_ms - classified_ms
-        )
+        classified_ms = (litellm_processing_ms or 0.0) + (llm_upstream_elapsed_ms or 0.0)
+        latency_unclassified_ms = _nonnegative_float_or_none(total_server_elapsed_ms - classified_ms)
         if latency_unclassified_ms is None:
             latency_unclassified_ms = 0.0
 
@@ -4015,17 +3880,12 @@ def _resolve_rate_limit_reset_at(
     if (
         provider_resets_at is not None
         and observed_dt is not None
-        and provider_resets_at
-        < observed_dt - _AAWM_RATE_LIMIT_STALE_RESET_TOLERANCE
+        and provider_resets_at < observed_dt - _AAWM_RATE_LIMIT_STALE_RESET_TOLERANCE
     ):
         if reset_hint_seconds is not None:
             return observed_dt + timedelta(seconds=reset_hint_seconds), False
         return None, True
-    if (
-        provider_resets_at is None
-        and reset_hint_seconds is not None
-        and observed_dt is not None
-    ):
+    if provider_resets_at is None and reset_hint_seconds is not None and observed_dt is not None:
         return observed_dt + timedelta(seconds=reset_hint_seconds), False
     return provider_resets_at, False
 
@@ -4108,10 +3968,7 @@ def _coerce_rate_limit_payload(value: Any) -> Any:
         return value
     if hasattr(value, "items"):
         try:
-            return {
-                str(key): nested_value
-                for key, nested_value in list(value.items())
-            }
+            return {str(key): nested_value for key, nested_value in list(value.items())}
         except Exception:
             return None
     if isinstance(value, bytes):
@@ -4298,13 +4155,7 @@ def _infer_model_family_and_tier(*values: Any) -> Tuple[Optional[str], Optional[
     # Prefer explicit OpenAI/Codex markers over tier-based gemini inference so
     # names like gpt-5-pro / o1-pro and metadata containing "project"/"prod"
     # do not get misclassified as gemini solely because of a "pro" token.
-    if (
-        "gpt" in text
-        or "openai" in text
-        or _has_token("o1")
-        or _has_token("o3")
-        or _has_token("o4")
-    ):
+    if "gpt" in text or "openai" in text or _has_token("o1") or _has_token("o3") or _has_token("o4"):
         return "openai", model_tier
     if "codex" in text:
         return "codex", model_tier
@@ -4377,20 +4228,13 @@ def _infer_rate_limit_client_family(
         or "grok-build" in client_text
     ):
         return "grok-build"
-    if (
-        "claude" in source_lower
-        or "claude" in route_family
-        or "claude" in client_text
-        or "cc_version" in metadata
-    ):
+    if "claude" in source_lower or "claude" in route_family or "claude" in client_text or "cc_version" in metadata:
         return "claude"
     return provider
 
 
 def _openrouter_free_daily_request_limit() -> int:
-    configured_limit = _safe_int(
-        get_secret_str("AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT")
-    )
+    configured_limit = _safe_int(get_secret_str("AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT"))
     if configured_limit is not None and configured_limit > 0:
         return configured_limit
     return _AAWM_OPENROUTER_FREE_DAILY_REQUEST_LIMIT_DEFAULT
@@ -4587,11 +4431,7 @@ async def _build_openrouter_free_daily_observations_for_records(
                 used_requests=used_requests,
                 total_requests=total_requests,
                 signal="local_session_history_openrouter_free_count",
-                status=(
-                    "quota_exhausted"
-                    if used_requests >= total_requests
-                    else "observed"
-                ),
+                status=("quota_exhausted" if used_requests >= total_requests else "observed"),
                 exhausted=used_requests >= total_requests,
             )
         )
@@ -4614,11 +4454,7 @@ def _build_rate_limit_key(
     identity = (
         _clean_non_empty_string(limit_id)
         or _clean_non_empty_string(limit_name)
-        or (
-            _clean_non_empty_string(model)
-            if str(limit_scope or "").startswith("model")
-            else None
-        )
+        or (_clean_non_empty_string(model) if str(limit_scope or "").startswith("model") else None)
         or _clean_non_empty_string(model_family)
         or "default"
     )
@@ -4631,8 +4467,7 @@ def _build_rate_limit_key(
         str(window_minutes or "unknown_window"),
     )
     normalized_parts = [
-        re.sub(r"[^a-z0-9_.-]+", "_", str(part).strip().lower()).strip("_") or "unknown"
-        for part in parts
+        re.sub(r"[^a-z0-9_.-]+", "_", str(part).strip().lower()).strip("_") or "unknown" for part in parts
     ]
     return ":".join(normalized_parts)
 
@@ -4761,13 +4596,9 @@ def _finalize_rate_limit_observation(
     finalized = dict(context)
     finalized.update(observation)
     finalized["observed_at"] = (
-        _normalize_datetime(finalized.get("observed_at"))
-        or context.get("observed_at")
-        or datetime.now(timezone.utc)
+        _normalize_datetime(finalized.get("observed_at")) or context.get("observed_at") or datetime.now(timezone.utc)
     )
-    finalized["provider_resets_at"] = _parse_provider_timestamp(
-        finalized.get("provider_resets_at")
-    )
+    finalized["provider_resets_at"] = _parse_provider_timestamp(finalized.get("provider_resets_at"))
     window_minutes = _safe_int(finalized.get("window_minutes"))
     finalized["window_minutes"] = window_minutes
     if finalized.get("quota_period") is None:
@@ -4791,9 +4622,7 @@ def _finalize_rate_limit_observation(
     finalized_metadata = finalized.get("metadata")
     if not isinstance(finalized_metadata, dict):
         finalized_metadata = {}
-    finalized["client_family"] = finalized.get(
-        "client_family"
-    ) or _infer_rate_limit_client_family(
+    finalized["client_family"] = finalized.get("client_family") or _infer_rate_limit_client_family(
         finalized.get("provider"),
         str(finalized.get("model") or ""),
         finalized_metadata,
@@ -4875,9 +4704,7 @@ def _rate_limit_snapshot_signature(
         _clean_non_empty_string(observation.get("status")),
         bool(observation.get("exhausted")),
         _clean_non_empty_string(observation.get("exhaustion_kind")),
-        None
-        if provider_resets_at is not None
-        else _safe_int(observation.get("reset_hint_seconds")),
+        None if provider_resets_at is not None else _safe_int(observation.get("reset_hint_seconds")),
     )
     if include_reset:
         return (provider_resets_at, *body)
@@ -4893,19 +4720,14 @@ def _rate_limit_observation_has_meaningful_change(
 
     previous_reset = _parse_provider_timestamp(previous.get("provider_resets_at"))
     current_reset = _parse_provider_timestamp(current.get("provider_resets_at"))
-    previous_without_reset = _rate_limit_snapshot_signature(
-        previous, include_reset=False
-    )
-    current_without_reset = _rate_limit_snapshot_signature(
-        current, include_reset=False
-    )
+    previous_without_reset = _rate_limit_snapshot_signature(previous, include_reset=False)
+    current_without_reset = _rate_limit_snapshot_signature(current, include_reset=False)
     if previous_without_reset != current_without_reset:
         return True
     if previous_reset is None or current_reset is None:
         return previous_reset != current_reset
     return (
-        abs((current_reset - previous_reset).total_seconds())
-        >= _AAWM_RATE_LIMIT_MEANINGFUL_RESET_SHIFT.total_seconds()
+        abs((current_reset - previous_reset).total_seconds()) >= _AAWM_RATE_LIMIT_MEANINGFUL_RESET_SHIFT.total_seconds()
     )
 
 
@@ -4925,12 +4747,8 @@ def _rate_limit_candidate_roots(kwargs: Dict[str, Any], result: Any) -> List[Any
     ]
     for candidate in (
         result,
-        standard_logging_object.get("response")
-        if isinstance(standard_logging_object, dict)
-        else None,
-        standard_logging_object.get("output")
-        if isinstance(standard_logging_object, dict)
-        else None,
+        standard_logging_object.get("response") if isinstance(standard_logging_object, dict) else None,
+        standard_logging_object.get("output") if isinstance(standard_logging_object, dict) else None,
     ):
         for attr_name in (
             "_hidden_params",
@@ -4977,10 +4795,7 @@ def _extract_codex_rate_limit_observations(
         rate_limits = candidate.get("rate_limits")
         if not isinstance(rate_limits, dict):
             continue
-        if not (
-            isinstance(rate_limits.get("primary"), dict)
-            or isinstance(rate_limits.get("secondary"), dict)
-        ):
+        if not (isinstance(rate_limits.get("primary"), dict) or isinstance(rate_limits.get("secondary"), dict)):
             continue
         limit_id = _clean_non_empty_string(rate_limits.get("limit_id"))
         limit_name = _clean_non_empty_string(rate_limits.get("limit_name"))
@@ -5004,9 +4819,7 @@ def _extract_codex_rate_limit_observations(
                         "window_minutes": window_minutes,
                         "provider_resets_at": provider_resets_at,
                         "used_percentage": used_percentage,
-                        "exhausted": bool(
-                            used_percentage is not None and used_percentage >= 100
-                        ),
+                        "exhausted": bool(used_percentage is not None and used_percentage >= 100),
                         "exhaustion_kind": (
                             rate_limits.get("rate_limit_reached_type")
                             if rate_limits.get("rate_limit_reached_type")
@@ -5053,8 +4866,7 @@ def _extract_codex_header_rate_limit_observations(
         lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
         has_codex_header = any(
-            isinstance(key, str) and key.lower().startswith("x-codex-")
-            for key in list(candidate.keys())
+            isinstance(key, str) and key.lower().startswith("x-codex-") for key in list(candidate.keys())
         )
         if not has_codex_header and source != "codex_response_headers":
             continue
@@ -5068,9 +4880,7 @@ def _extract_codex_header_rate_limit_observations(
             {
                 "header_prefix": "x-codex",
                 "limit_id": "codex",
-                "limit_name": (
-                    f"Codex {active_limit}" if active_limit else "Codex"
-                ),
+                "limit_name": (f"Codex {active_limit}" if active_limit else "Codex"),
             }
         ]
         bengalfox_limit_name = _clean_non_empty_string(
@@ -5099,44 +4909,23 @@ def _extract_codex_header_rate_limit_observations(
                 reset_after_key = f"{header_prefix}-{limit_scope}-reset-after-seconds"
                 used_percent_key = f"{header_prefix}-{limit_scope}-used-percent"
                 window_minutes_key = f"{header_prefix}-{limit_scope}-window-minutes"
-                over_limit_key = (
-                    f"{header_prefix}-{limit_scope}-over-secondary-limit-percent"
-                )
-                reset_value = _get_rate_limit_header_value(
-            candidate, reset_key,
-            lower_headers=lower_headers
-        )
+                over_limit_key = f"{header_prefix}-{limit_scope}-over-secondary-limit-percent"
+                reset_value = _get_rate_limit_header_value(candidate, reset_key, lower_headers=lower_headers)
                 reset_hint_seconds = _safe_int(
-                    _get_rate_limit_header_value(
-            candidate, reset_after_key,
-            lower_headers=lower_headers
-        )
+                    _get_rate_limit_header_value(candidate, reset_after_key, lower_headers=lower_headers)
                 )
                 used_percentage = _safe_float(
-                    _get_rate_limit_header_value(
-            candidate, used_percent_key,
-            lower_headers=lower_headers
-        )
+                    _get_rate_limit_header_value(candidate, used_percent_key, lower_headers=lower_headers)
                 )
                 raw_window_minutes = _get_rate_limit_header_value(
-            candidate,
-                    window_minutes_key,
-            lower_headers=lower_headers
-        )
-                parsed_window_minutes = _safe_int(raw_window_minutes)
-                if raw_window_minutes is not None and (
-                    parsed_window_minutes is None or parsed_window_minutes <= 0
-                ):
-                    continue
-                observed_window_minutes = (
-                    parsed_window_minutes
-                    or window_minutes
+                    candidate, window_minutes_key, lower_headers=lower_headers
                 )
+                parsed_window_minutes = _safe_int(raw_window_minutes)
+                if raw_window_minutes is not None and (parsed_window_minutes is None or parsed_window_minutes <= 0):
+                    continue
+                observed_window_minutes = parsed_window_minutes or window_minutes
                 over_limit_percent = _safe_float(
-                    _get_rate_limit_header_value(
-            candidate, over_limit_key,
-            lower_headers=lower_headers
-        )
+                    _get_rate_limit_header_value(candidate, over_limit_key, lower_headers=lower_headers)
                 )
                 if (
                     reset_value is None
@@ -5168,43 +4957,28 @@ def _extract_codex_header_rate_limit_observations(
                             "reset_hint_seconds": reset_hint_seconds,
                             "exhausted": (
                                 (used_percentage is not None and used_percentage >= 100)
-                                or (
-                                    over_limit_percent is not None
-                                    and over_limit_percent > 0
-                                )
+                                or (over_limit_percent is not None and over_limit_percent > 0)
                             ),
                             "raw_provider_fields": {
                                 reset_key: reset_value,
                                 reset_after_key: _get_rate_limit_header_value(
-            candidate,
-                                    reset_after_key,
-            lower_headers=lower_headers
-        ),
+                                    candidate, reset_after_key, lower_headers=lower_headers
+                                ),
                                 over_limit_key: _get_rate_limit_header_value(
-            candidate,
-                                    over_limit_key,
-            lower_headers=lower_headers
-        ),
+                                    candidate, over_limit_key, lower_headers=lower_headers
+                                ),
                                 used_percent_key: _get_rate_limit_header_value(
-            candidate,
-                                    used_percent_key,
-            lower_headers=lower_headers
-        ),
+                                    candidate, used_percent_key, lower_headers=lower_headers
+                                ),
                                 window_minutes_key: _get_rate_limit_header_value(
-            candidate,
-                                    window_minutes_key,
-            lower_headers=lower_headers
-        ),
+                                    candidate, window_minutes_key, lower_headers=lower_headers
+                                ),
                                 "x-codex-active-limit": _get_rate_limit_header_value(
-            candidate,
-                                    "x-codex-active-limit",
-            lower_headers=lower_headers
-        ),
+                                    candidate, "x-codex-active-limit", lower_headers=lower_headers
+                                ),
                                 "x-codex-credits-unlimited": _get_rate_limit_header_value(
-            candidate,
-                                    "x-codex-credits-unlimited",
-            lower_headers=lower_headers
-        ),
+                                    candidate, "x-codex-credits-unlimited", lower_headers=lower_headers
+                                ),
                             },
                             "evidence": {
                                 "signals": ["codex_response_rate_limit_headers"],
@@ -5272,13 +5046,9 @@ def _extract_codex_usage_limit_error_observations(
         error = candidate.get("error") if isinstance(candidate.get("error"), dict) else candidate
         if not isinstance(error, dict):
             continue
-        error_type = _clean_non_empty_string(error.get("type")) or _clean_non_empty_string(
-            error.get("code")
-        )
+        error_type = _clean_non_empty_string(error.get("type")) or _clean_non_empty_string(error.get("code"))
         message = _clean_non_empty_string(error.get("message"))
-        if error_type != "usage_limit_reached" and not (
-            isinstance(message, str) and "usage limit" in message.lower()
-        ):
+        if error_type != "usage_limit_reached" and not (isinstance(message, str) and "usage limit" in message.lower()):
             continue
         reset_hint_seconds = _parse_reset_hint_seconds(
             error.get("resets_in_seconds"),
@@ -5286,13 +5056,9 @@ def _extract_codex_usage_limit_error_observations(
         )
         provider_resets_at = _parse_provider_timestamp(error.get("resets_at"))
         if provider_resets_at is None and reset_hint_seconds is not None:
-            provider_resets_at = context["observed_at"] + timedelta(
-                seconds=reset_hint_seconds
-            )
+            provider_resets_at = context["observed_at"] + timedelta(seconds=reset_hint_seconds)
         limit_name = (
-            _clean_non_empty_string(error.get("limit_name"))
-            or _clean_non_empty_string(context.get("model"))
-            or "codex"
+            _clean_non_empty_string(error.get("limit_name")) or _clean_non_empty_string(context.get("model")) or "codex"
         )
         observations.append(
             _finalize_rate_limit_observation(
@@ -5303,10 +5069,7 @@ def _extract_codex_usage_limit_error_observations(
                     "client_family": "codex",
                     "limit_id": _clean_non_empty_string(error.get("limit_id")),
                     "limit_name": limit_name,
-                    "limit_scope": _clean_non_empty_string(
-                        error.get("rate_limit_reached_type")
-                    )
-                    or "usage_limit",
+                    "limit_scope": _clean_non_empty_string(error.get("rate_limit_reached_type")) or "usage_limit",
                     "provider_resets_at": provider_resets_at,
                     "used_percentage": 100.0,
                     "status": "exhausted",
@@ -5338,11 +5101,7 @@ def _extract_codex_usage_limit_error_observations(
 
 def _rate_limit_header_map(candidate: Dict[str, Any]) -> Dict[str, Any]:
     """Lowercase header keys once per candidate for repeated lookups."""
-    return {
-        str(key).lower(): value
-        for key, value in list(candidate.items())
-        if isinstance(key, str)
-    }
+    return {str(key).lower(): value for key, value in list(candidate.items()) if isinstance(key, str)}
 
 
 def _get_rate_limit_header_value(
@@ -5396,9 +5155,7 @@ def _extract_anthropic_header_rate_limit_observations(
         "anthropic_response_headers",
     )
     observations: List[Dict[str, Any]] = []
-    client_family = (
-        "claude" if _looks_like_claude_rate_limit_context(context) else "anthropic"
-    )
+    client_family = "claude" if _looks_like_claude_rate_limit_context(context) else "anthropic"
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
         lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
@@ -5420,34 +5177,16 @@ def _extract_anthropic_header_rate_limit_observations(
         ):
             reset_key = f"anthropic-ratelimit-unified-{limit_scope}-reset"
             status_key = f"anthropic-ratelimit-unified-{limit_scope}-status"
-            utilization_key = (
-                f"anthropic-ratelimit-unified-{limit_scope}-utilization"
-            )
-            threshold_key = (
-                f"anthropic-ratelimit-unified-{limit_scope}-surpassed-threshold"
-            )
-            reset_value = _get_rate_limit_header_value(
-            candidate, reset_key,
-            lower_headers=lower_headers
-        )
+            utilization_key = f"anthropic-ratelimit-unified-{limit_scope}-utilization"
+            threshold_key = f"anthropic-ratelimit-unified-{limit_scope}-surpassed-threshold"
+            reset_value = _get_rate_limit_header_value(candidate, reset_key, lower_headers=lower_headers)
             status_value = _clean_non_empty_string(
-                _get_rate_limit_header_value(
-            candidate, status_key,
-            lower_headers=lower_headers
-        )
+                _get_rate_limit_header_value(candidate, status_key, lower_headers=lower_headers)
             )
             utilization = _safe_float(
-                _get_rate_limit_header_value(
-            candidate, utilization_key,
-            lower_headers=lower_headers
-        )
+                _get_rate_limit_header_value(candidate, utilization_key, lower_headers=lower_headers)
             )
-            threshold = _safe_float(
-                _get_rate_limit_header_value(
-            candidate, threshold_key,
-            lower_headers=lower_headers
-        )
-            )
+            threshold = _safe_float(_get_rate_limit_header_value(candidate, threshold_key, lower_headers=lower_headers))
             if reset_value is None and status_value is None and utilization is None:
                 continue
             provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
@@ -5456,11 +5195,7 @@ def _extract_anthropic_header_rate_limit_observations(
             )
             if stale_reset:
                 continue
-            used_percentage = (
-                utilization * 100
-                if utilization is not None and utilization <= 1
-                else utilization
-            )
+            used_percentage = utilization * 100 if utilization is not None and utilization <= 1 else utilization
             observations.append(
                 _finalize_rate_limit_observation(
                     {
@@ -5480,26 +5215,20 @@ def _extract_anthropic_header_rate_limit_observations(
                             reset_key: reset_value,
                             status_key: status_value,
                             utilization_key: _get_rate_limit_header_value(
-            candidate,
-                                utilization_key,
-            lower_headers=lower_headers
-        ),
+                                candidate, utilization_key, lower_headers=lower_headers
+                            ),
                             threshold_key: _get_rate_limit_header_value(
-            candidate,
-                                threshold_key,
-            lower_headers=lower_headers
-        ),
+                                candidate, threshold_key, lower_headers=lower_headers
+                            ),
                             "surpassed_threshold": threshold,
                             "anthropic-ratelimit-unified-representative-claim": _get_rate_limit_header_value(
-            candidate,
+                                candidate,
                                 "anthropic-ratelimit-unified-representative-claim",
-            lower_headers=lower_headers
-        ),
+                                lower_headers=lower_headers,
+                            ),
                             "anthropic-ratelimit-unified-overage-status": _get_rate_limit_header_value(
-            candidate,
-                                "anthropic-ratelimit-unified-overage-status",
-            lower_headers=lower_headers
-        ),
+                                candidate, "anthropic-ratelimit-unified-overage-status", lower_headers=lower_headers
+                            ),
                         },
                         "evidence": {
                             "signals": ["anthropic_unified_rate_limit_headers"],
@@ -5528,20 +5257,9 @@ def _extract_anthropic_header_rate_limit_observations(
                 "anthropic-ratelimit-tokens-reset",
             ),
         ):
-            total = _safe_int(_get_rate_limit_header_value(
-            candidate, total_key,
-            lower_headers=lower_headers
-        ))
-            remaining = _safe_int(
-                _get_rate_limit_header_value(
-            candidate, remaining_key,
-            lower_headers=lower_headers
-        )
-            )
-            reset_value = _get_rate_limit_header_value(
-            candidate, reset_key,
-            lower_headers=lower_headers
-        )
+            total = _safe_int(_get_rate_limit_header_value(candidate, total_key, lower_headers=lower_headers))
+            remaining = _safe_int(_get_rate_limit_header_value(candidate, remaining_key, lower_headers=lower_headers))
+            reset_value = _get_rate_limit_header_value(candidate, reset_key, lower_headers=lower_headers)
             if total is None and remaining is None and reset_value is None:
                 continue
             provider_resets_at, stale_reset = _resolve_rate_limit_reset_at(
@@ -5550,16 +5268,8 @@ def _extract_anthropic_header_rate_limit_observations(
             )
             if stale_reset:
                 continue
-            used = (
-                max(0, total - remaining)
-                if total is not None and remaining is not None
-                else None
-            )
-            used_percentage = (
-                (used / total) * 100
-                if used is not None and total is not None and total > 0
-                else None
-            )
+            used = max(0, total - remaining) if total is not None and remaining is not None else None
+            used_percentage = (used / total) * 100 if used is not None and total is not None and total > 0 else None
             observations.append(
                 _finalize_rate_limit_observation(
                     {
@@ -5576,15 +5286,10 @@ def _extract_anthropic_header_rate_limit_observations(
                         "used_requests": used,
                         "total_requests": total,
                         "raw_provider_fields": {
-                            total_key: _get_rate_limit_header_value(
-            candidate, total_key,
-            lower_headers=lower_headers
-        ),
+                            total_key: _get_rate_limit_header_value(candidate, total_key, lower_headers=lower_headers),
                             remaining_key: _get_rate_limit_header_value(
-            candidate,
-                                remaining_key,
-            lower_headers=lower_headers
-        ),
+                                candidate, remaining_key, lower_headers=lower_headers
+                            ),
                             reset_key: reset_value,
                         },
                         "evidence": {
@@ -5624,10 +5329,7 @@ def _looks_like_xai_oauth_rate_limit_context(context: Dict[str, Any]) -> bool:
         metadata = {}
     credential_family = str(metadata.get("credential_family") or "").lower()
     route_family = str(
-        metadata.get("passthrough_route_family")
-        or metadata.get("route_family")
-        or context.get("route_family")
-        or ""
+        metadata.get("passthrough_route_family") or metadata.get("route_family") or context.get("route_family") or ""
     ).lower()
     model = str(context.get("model") or "").lower()
     request_model = str(context.get("request_model") or "").lower()
@@ -5678,13 +5380,8 @@ def _next_utc_month_start(value: Any) -> Optional[datetime]:
 
 
 def _is_xai_oauth_subscription_quota_context(metadata: Dict[str, Any]) -> bool:
-    quota_family = str(
-        metadata.get("xai_quota_family") or metadata.get("shared_quota_family") or ""
-    ).strip().lower()
-    return (
-        quota_family == "xai_grok_subscription"
-        or metadata.get("grok_subscription_quota_shared") is True
-    )
+    quota_family = str(metadata.get("xai_quota_family") or metadata.get("shared_quota_family") or "").strip().lower()
+    return quota_family == "xai_grok_subscription" or metadata.get("grok_subscription_quota_shared") is True
 
 
 def _extract_xai_oauth_billing_period_end(
@@ -5728,25 +5425,20 @@ def _extract_xai_oauth_header_rate_limit_observations(
         observed_at,
         "xai_oauth_response_headers",
     )
-    if context.get("provider") != "xai" or not _looks_like_xai_oauth_rate_limit_context(
-        context
-    ):
+    if context.get("provider") != "xai" or not _looks_like_xai_oauth_rate_limit_context(context):
         return []
     raw_metadata = context.get("metadata")
     metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
     account_hash = _extract_xai_oauth_account_hash(metadata)
     model = _clean_non_empty_string(metadata.get("xai_oauth_public_model")) or (
-        _clean_non_empty_string(context.get("model"))
-        if context.get("model") != "unknown"
-        else None
+        _clean_non_empty_string(context.get("model")) if context.get("model") != "unknown" else None
     )
     observations: List[Dict[str, Any]] = []
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
         lower_headers = _rate_limit_header_map(candidate)
         source = str(candidate.get("source") or "").lower()
         has_xai_header = any(
-            isinstance(key, str) and key.lower().startswith("x-ratelimit-")
-            for key in list(candidate.keys())
+            isinstance(key, str) and key.lower().startswith("x-ratelimit-") for key in list(candidate.keys())
         )
         if not has_xai_header and source != "xai_oauth_response_headers":
             continue
@@ -5773,30 +5465,13 @@ def _extract_xai_oauth_header_rate_limit_observations(
                 ),
             ),
         ):
-            total = _safe_int(_get_rate_limit_header_value(
-            candidate, total_key,
-            lower_headers=lower_headers
-        ))
-            remaining = _safe_int(_get_rate_limit_header_value(
-            candidate, remaining_key,
-            lower_headers=lower_headers
-        ))
-            reset_value = _get_rate_limit_header_value(
-            candidate, *reset_keys,
-            lower_headers=lower_headers
-        )
+            total = _safe_int(_get_rate_limit_header_value(candidate, total_key, lower_headers=lower_headers))
+            remaining = _safe_int(_get_rate_limit_header_value(candidate, remaining_key, lower_headers=lower_headers))
+            reset_value = _get_rate_limit_header_value(candidate, *reset_keys, lower_headers=lower_headers)
             reset_hint_seconds = _parse_reset_hint_seconds(
-                _get_rate_limit_header_value(
-            candidate, "retry-after",
-            lower_headers=lower_headers
-        )
+                _get_rate_limit_header_value(candidate, "retry-after", lower_headers=lower_headers)
             )
-            if (
-                total is None
-                and remaining is None
-                and reset_value is None
-                and reset_hint_seconds is None
-            ):
+            if total is None and remaining is None and reset_value is None and reset_hint_seconds is None:
                 continue
             if total is not None and total <= 0:
                 continue
@@ -5816,16 +5491,10 @@ def _extract_xai_oauth_header_rate_limit_observations(
                 )
             elif reset_hint_seconds is not None and provider_resets_at is not None:
                 reset_source = "retry_after"
-            used = (
-                max(0, total - remaining)
-                if total is not None and remaining is not None
-                else None
-            )
+            used = max(0, total - remaining) if total is not None and remaining is not None else None
             remaining_pct = _xai_oauth_header_remaining_pct(total, remaining)
             used_percentage = (
-                round(max(0.0, min(100.0, 100.0 - remaining_pct)), 3)
-                if remaining_pct is not None
-                else None
+                round(max(0.0, min(100.0, 100.0 - remaining_pct)), 3) if remaining_pct is not None else None
             )
             exhausted = remaining is not None and remaining <= 0
             observations.append(
@@ -5856,9 +5525,7 @@ def _extract_xai_oauth_header_rate_limit_observations(
                         "remaining_pct": remaining_pct,
                         "quota_limit": float(total) if total is not None else None,
                         "quota_used": float(used) if used is not None else None,
-                        "quota_remaining": (
-                            float(remaining) if remaining is not None else None
-                        ),
+                        "quota_remaining": (float(remaining) if remaining is not None else None),
                         "billing_period_end_at": provider_resets_at
                         if reset_source
                         in {
@@ -5880,21 +5547,14 @@ def _extract_xai_oauth_header_rate_limit_observations(
                         "model": model,
                         "model_family": "grok",
                         "raw_provider_fields": {
-                            total_key: _get_rate_limit_header_value(
-            candidate, total_key,
-            lower_headers=lower_headers
-        ),
+                            total_key: _get_rate_limit_header_value(candidate, total_key, lower_headers=lower_headers),
                             remaining_key: _get_rate_limit_header_value(
-            candidate,
-                                remaining_key,
-            lower_headers=lower_headers
-        ),
+                                candidate, remaining_key, lower_headers=lower_headers
+                            ),
                             "reset": reset_value,
                             "retry-after": _get_rate_limit_header_value(
-            candidate,
-                                "retry-after",
-            lower_headers=lower_headers
-        ),
+                                candidate, "retry-after", lower_headers=lower_headers
+                            ),
                             "billingPeriodEnd": _json_safe_rate_limit_value(
                                 _maybe_get_path(candidate, "config", "billingPeriodEnd")
                                 or candidate.get("billingPeriodEnd")
@@ -5913,9 +5573,7 @@ def _extract_xai_oauth_header_rate_limit_observations(
                                 "retry-after",
                             ],
                             "reset_absent": provider_resets_at is None,
-                            "reset_header_absent": (
-                                reset_value is None and reset_hint_seconds is None
-                            ),
+                            "reset_header_absent": (reset_value is None and reset_hint_seconds is None),
                             "reset_source": reset_source,
                         },
                     },
@@ -5952,12 +5610,8 @@ def _grok_billing_period_bounds(
     config: Dict[str, Any],
 ) -> Tuple[Optional[datetime], Optional[datetime]]:
     current_period = _grok_billing_current_period(config)
-    billing_period_start_at = _parse_provider_timestamp(
-        config.get("billingPeriodStart") or current_period.get("start")
-    )
-    billing_period_end_at = _parse_provider_timestamp(
-        config.get("billingPeriodEnd") or current_period.get("end")
-    )
+    billing_period_start_at = _parse_provider_timestamp(config.get("billingPeriodStart") or current_period.get("start"))
+    billing_period_end_at = _parse_provider_timestamp(config.get("billingPeriodEnd") or current_period.get("end"))
     return billing_period_start_at, billing_period_end_at
 
 
@@ -5976,26 +5630,16 @@ def _is_grok_billing_context(
         )
         if value is not None
     ).lower()
-    if "/billing" in route_text and (
-        "grok" in route_text or "xai" in route_text or "x.ai" in route_text
-    ):
+    if "/billing" in route_text and ("grok" in route_text or "xai" in route_text or "x.ai" in route_text):
         return True
-    if (
-        metadata.get("grok_cli_chat_proxy") is True
-        or metadata.get("xai_cli_chat_proxy") is True
-    ):
+    if metadata.get("grok_cli_chat_proxy") is True or metadata.get("xai_cli_chat_proxy") is True:
         return True
     headers = _extract_headers_from_kwargs(kwargs)
-    return any(
-        header_name.startswith("x-grok-") or header_name == "x-xai-token-auth"
-        for header_name in headers
-    )
+    return any(header_name.startswith("x-grok-") or header_name == "x-xai-token-auth" for header_name in headers)
 
 
 def _extract_grok_billing_config(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    config = (
-        candidate.get("config") if isinstance(candidate.get("config"), dict) else candidate
-    )
+    config = candidate.get("config") if isinstance(candidate.get("config"), dict) else candidate
     if not isinstance(config, dict):
         return None
     has_absolute_quota = isinstance(config.get("monthlyLimit"), dict) and isinstance(
@@ -6005,14 +5649,8 @@ def _extract_grok_billing_config(candidate: Dict[str, Any]) -> Optional[Dict[str
     has_percentage_quota = _safe_float(config.get("creditUsagePercent")) is not None
     has_weekly_period = _grok_billing_is_weekly_period(config)
     billing_period_start_at, billing_period_end_at = _grok_billing_period_bounds(config)
-    has_period_bounds = (
-        billing_period_start_at is not None or billing_period_end_at is not None
-    )
-    if (
-        not has_absolute_quota
-        and not has_percentage_quota
-        and not (has_weekly_period and has_period_bounds)
-    ):
+    has_period_bounds = billing_period_start_at is not None or billing_period_end_at is not None
+    if not has_absolute_quota and not has_percentage_quota and not (has_weekly_period and has_period_bounds):
         return None
     return config
 
@@ -6022,20 +5660,16 @@ def _grok_billing_model(
     metadata: Dict[str, Any],
 ) -> str:
     return (
-        _clean_non_empty_string(context.get("model"))
-        if context.get("model") != "unknown"
-        else None
-    ) or _clean_non_empty_string(
-        metadata.get("grok_model_override")
-    ) or "grok-build"
+        (_clean_non_empty_string(context.get("model")) if context.get("model") != "unknown" else None)
+        or _clean_non_empty_string(metadata.get("grok_model_override"))
+        or "grok-build"
+    )
 
 
 def _grok_billing_request_contract_evidence(
     metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
-    fingerprint = _clean_non_empty_string(
-        metadata.get("grok_billing_passthrough_request_contract_fingerprint")
-    )
+    fingerprint = _clean_non_empty_string(metadata.get("grok_billing_passthrough_request_contract_fingerprint"))
     if not fingerprint:
         return {}
 
@@ -6059,11 +5693,7 @@ def _grok_billing_request_contract_evidence(
     ):
         value = metadata.get(metadata_key)
         if isinstance(value, list):
-            evidence[evidence_key] = [
-                str(item)
-                for item in value
-                if isinstance(item, (str, int, float)) and str(item)
-            ]
+            evidence[evidence_key] = [str(item) for item in value if isinstance(item, (str, int, float)) and str(item)]
 
     configured = metadata.get("grok_billing_passthrough_x_xai_token_auth_configured")
     if configured is not None:
@@ -6094,9 +5724,7 @@ def _grok_billing_snapshot_parts(
 
     if monthly_limit is not None and monthly_limit > 0 and used is not None and used >= 0:
         used_percentage = max(0.0, min(100.0, (used / monthly_limit) * 100.0))
-        remaining_pct = float(
-            int(math.floor(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5))
-        )
+        remaining_pct = float(int(math.floor(max(0.0, min(100.0, 100.0 - used_percentage)) + 0.5)))
         quota_remaining = max(0.0, monthly_limit - used)
         if "grok_billing_monthly_counter" not in signals:
             signals.append("grok_billing_monthly_counter")
@@ -6131,10 +5759,7 @@ def _grok_billing_snapshot_parts(
                     "config.billingPeriodEnd",
                 ],
                 "rounding": "whole_remaining_percentage",
-                "unit_note": (
-                    "Grok billing does not label used.val; observed tool "
-                    "traffic behaves request-like."
-                ),
+                "unit_note": ("Grok billing does not label used.val; observed tool " "traffic behaves request-like."),
             },
         }
 
@@ -6162,9 +5787,7 @@ def _grok_billing_snapshot_parts(
             "billing_period_start_at": billing_period_start_at,
             "billing_period_end_at": billing_period_end_at,
             "raw_provider_fields": {
-                "creditUsagePercent": _json_safe_rate_limit_value(
-                    config.get("creditUsagePercent")
-                ),
+                "creditUsagePercent": _json_safe_rate_limit_value(config.get("creditUsagePercent")),
                 "productUsage": _json_safe_rate_limit_value(config.get("productUsage")),
                 "currentPeriod": _json_safe_rate_limit_value(config.get("currentPeriod")),
                 "billingPeriodStart": config.get("billingPeriodStart"),
@@ -6188,9 +5811,7 @@ def _grok_billing_snapshot_parts(
             },
         }
 
-    if is_weekly and (
-        billing_period_start_at is not None or billing_period_end_at is not None
-    ):
+    if is_weekly and (billing_period_start_at is not None or billing_period_end_at is not None):
         if "grok_billing_weekly_fresh_period" not in signals:
             signals.append("grok_billing_weekly_fresh_period")
         return {
@@ -6252,9 +5873,7 @@ def _grok_billing_snapshot_parts(
             "billing_period_start_at": billing_period_start_at,
             "billing_period_end_at": billing_period_end_at,
             "raw_provider_fields": {
-                "creditUsagePercent": _json_safe_rate_limit_value(
-                    config.get("creditUsagePercent")
-                ),
+                "creditUsagePercent": _json_safe_rate_limit_value(config.get("creditUsagePercent")),
                 "productUsage": _json_safe_rate_limit_value(config.get("productUsage")),
                 "billingPeriodStart": config.get("billingPeriodStart"),
                 "billingPeriodEnd": config.get("billingPeriodEnd"),
@@ -6357,9 +5976,7 @@ def _extract_openrouter_free_error_reset_at(
         error_text=error_text,
     )
     reset_hint_seconds = (
-        int(retry_after_seconds)
-        if retry_after_seconds is not None and retry_after_seconds >= 0
-        else None
+        int(retry_after_seconds) if retry_after_seconds is not None and retry_after_seconds >= 0 else None
     )
     reset_value = _first_non_empty_string(
         headers.get("x-ratelimit-reset"),
@@ -6480,9 +6097,7 @@ def _looks_like_google_quota_candidate(candidate: Dict[str, Any]) -> bool:
     if request_quota_keys.intersection(candidate_keys):
         return True
     source = str(candidate.get("source") or "").lower()
-    return bool(weak_quota_keys.intersection(candidate_keys)) and (
-        "google" in source or "gemini" in source
-    )
+    return bool(weak_quota_keys.intersection(candidate_keys)) and ("google" in source or "gemini" in source)
 
 
 def _antigravity_quota_pool_for_model(model: Optional[str]) -> Tuple[str, str, str]:
@@ -6514,16 +6129,12 @@ def _extract_google_quota_observations(  # noqa: PLR0915
     observations: List[Dict[str, Any]] = []
     raw_metadata = context.get("metadata")
     metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
-    default_quota_source = _clean_non_empty_string(
-        _maybe_get(metadata.get("google_retrieve_user_quota"), "source")
-    )
+    default_quota_source = _clean_non_empty_string(_maybe_get(metadata.get("google_retrieve_user_quota"), "source"))
     for candidate in _iter_rate_limit_dicts(*_rate_limit_candidate_roots(kwargs, result)):
         if not _looks_like_google_quota_candidate(candidate):
             continue
         quota_source = (
-            _clean_non_empty_string(candidate.get("source"))
-            or default_quota_source
-            or "google_retrieve_user_quota"
+            _clean_non_empty_string(candidate.get("source")) or default_quota_source or "google_retrieve_user_quota"
         )
         remaining_requests = _first_quota_number(
             candidate,
@@ -6607,13 +6218,10 @@ def _extract_google_quota_observations(  # noqa: PLR0915
         )
         if is_antigravity_quota and provider_resets_at is None:
             continue
-        explicit_quota_period = (
-            _normalize_quota_period(candidate.get("quotaPeriod"))
-            or _normalize_quota_period(candidate.get("period"))
+        explicit_quota_period = _normalize_quota_period(candidate.get("quotaPeriod")) or _normalize_quota_period(
+            candidate.get("period")
         )
-        quota_period = explicit_quota_period or (
-            "five_hour" if is_antigravity_quota else "daily"
-        )
+        quota_period = explicit_quota_period or ("five_hour" if is_antigravity_quota else "daily")
         window_minutes = None
         for window_candidate in (
             candidate.get("windowMinutes"),
@@ -6624,13 +6232,9 @@ def _extract_google_quota_observations(  # noqa: PLR0915
             if parsed_window_minutes is not None and parsed_window_minutes > 0:
                 window_minutes = parsed_window_minutes
                 break
-        window_minutes = window_minutes or _window_minutes_from_quota_period(
-            quota_period
-        )
+        window_minutes = window_minutes or _window_minutes_from_quota_period(quota_period)
         if is_antigravity_quota:
-            limit_scope, limit_name, model_family = _antigravity_quota_pool_for_model(
-                model
-            )
+            limit_scope, limit_name, model_family = _antigravity_quota_pool_for_model(model)
             limit_id = "antigravity_code_assist"
             stored_model = None
             quota_type = "wtus"
@@ -6640,8 +6244,7 @@ def _extract_google_quota_observations(  # noqa: PLR0915
         else:
             limit_scope = (
                 "model_requests"
-                if _clean_non_empty_string(candidate.get("modelId"))
-                or _clean_non_empty_string(candidate.get("model"))
+                if _clean_non_empty_string(candidate.get("modelId")) or _clean_non_empty_string(candidate.get("model"))
                 else "daily_request_pool"
             )
             limit_id = (
@@ -6649,11 +6252,7 @@ def _extract_google_quota_observations(  # noqa: PLR0915
                 if limit_scope == "model_requests" and model
                 else "google_code_assist_requests"
             )
-            limit_name = (
-                f"Google Code Assist {model} requests"
-                if model
-                else "Google Code Assist requests"
-            )
+            limit_name = f"Google Code Assist {model} requests" if model else "Google Code Assist requests"
             stored_model = model
             quota_type = None
         observations.append(
@@ -6668,8 +6267,7 @@ def _extract_google_quota_observations(  # noqa: PLR0915
                     else _clean_non_empty_string(candidate.get("quotaId")) or limit_id,
                     "limit_name": limit_name
                     if is_antigravity_quota
-                    else _clean_non_empty_string(candidate.get("quotaName"))
-                    or limit_name,
+                    else _clean_non_empty_string(candidate.get("quotaName")) or limit_name,
                     "limit_scope": limit_scope,
                     "window_minutes": window_minutes,
                     "quota_period": quota_period,
@@ -6755,9 +6353,7 @@ def _extract_google_error_observations(
         raw_details = error.get("details")
         details: List[Any] = raw_details if isinstance(raw_details, list) else []
         reasons = [
-            _clean_non_empty_string(_maybe_get(detail, "reason"))
-            for detail in details
-            if isinstance(detail, dict)
+            _clean_non_empty_string(_maybe_get(detail, "reason")) for detail in details if isinstance(detail, dict)
         ]
         reasons = [reason for reason in reasons if reason]
         metadata_models = [
@@ -6776,9 +6372,7 @@ def _extract_google_error_observations(
         is_capacity = any(reason == "MODEL_CAPACITY_EXHAUSTED" for reason in reasons)
         reset_hint_seconds = _parse_reset_hint_seconds(message)
         provider_resets_at = (
-            context["observed_at"] + timedelta(seconds=reset_hint_seconds)
-            if reset_hint_seconds is not None
-            else None
+            context["observed_at"] + timedelta(seconds=reset_hint_seconds) if reset_hint_seconds is not None else None
         )
         model = metadata_models[0] if metadata_models else context.get("model")
         model_family, model_tier = _infer_model_family_and_tier(model)
@@ -6786,38 +6380,18 @@ def _extract_google_error_observations(
             _finalize_rate_limit_observation(
                 {
                     "observed_at": context["observed_at"],
-                    "source": (
-                        "google_model_capacity_error"
-                        if is_capacity
-                        else "google_generate_content_error"
-                    ),
+                    "source": ("google_model_capacity_error" if is_capacity else "google_generate_content_error"),
                     "provider": "gemini",
                     "client_family": "google_code_assist",
-                    "limit_id": (
-                        "google_model_capacity"
-                        if is_capacity
-                        else "google_code_assist_requests"
-                    ),
-                    "limit_name": (
-                        "Google model capacity"
-                        if is_capacity
-                        else "Google Code Assist requests"
-                    ),
+                    "limit_id": ("google_model_capacity" if is_capacity else "google_code_assist_requests"),
+                    "limit_name": ("Google model capacity" if is_capacity else "Google Code Assist requests"),
                     "limit_scope": "model_capacity" if is_capacity else "daily_request_pool",
                     "quota_period": None if is_capacity else "daily",
                     "window_minutes": None if is_capacity else 1440,
                     "provider_resets_at": provider_resets_at,
-                    "status": (
-                        "model_capacity_exhausted"
-                        if is_capacity
-                        else "quota_exhausted"
-                    ),
+                    "status": ("model_capacity_exhausted" if is_capacity else "quota_exhausted"),
                     "exhausted": not is_capacity,
-                    "exhaustion_kind": (
-                        "model_capacity"
-                        if is_capacity
-                        else "request_quota"
-                    ),
+                    "exhaustion_kind": ("model_capacity" if is_capacity else "request_quota"),
                     "reset_hint_seconds": reset_hint_seconds,
                     "model": model,
                     "model_family": model_family,
@@ -6849,11 +6423,7 @@ def _build_rate_limit_observations(
     start_time: Any,
     end_time: Any,
 ) -> List[Dict[str, Any]]:
-    observed_at = (
-        _parse_datetime_value(end_time)
-        or _parse_datetime_value(start_time)
-        or datetime.now(timezone.utc)
-    )
+    observed_at = _parse_datetime_value(end_time) or _parse_datetime_value(start_time) or datetime.now(timezone.utc)
     observations: List[Dict[str, Any]] = []
     observations.extend(_extract_codex_rate_limit_observations(kwargs, result, observed_at))
     observations.extend(_extract_codex_header_rate_limit_observations(kwargs, result, observed_at))
@@ -7080,16 +6650,13 @@ def _extract_provider_error_retry_after_seconds(
     return float(reset_hint) if reset_hint is not None else None
 
 
-_LITELLM_PROVIDER_ERROR_MODEL_GROUP_RE = re.compile(
-    r"Received Model Group=(?P<model_group>[^\n\r]+)"
-)
+_LITELLM_PROVIDER_ERROR_MODEL_GROUP_RE = re.compile(r"Received Model Group=(?P<model_group>[^\n\r]+)")
 _LITELLM_PROVIDER_ERROR_FALLBACKS_RE = re.compile(
     r"Available Model Group Fallbacks=(?P<fallbacks>.*?)(?:\s+LiteLLM Retried:|$)",
     re.DOTALL,
 )
 _LITELLM_PROVIDER_ERROR_RETRIES_RE = re.compile(
-    r"LiteLLM Retried:\s*(?P<retry_count>\d+)\s*times,\s*"
-    r"LiteLLM Max Retries:\s*(?P<max_retries>\d+)"
+    r"LiteLLM Retried:\s*(?P<retry_count>\d+)\s*times,\s*" r"LiteLLM Max Retries:\s*(?P<max_retries>\d+)"
 )
 
 
@@ -7134,9 +6701,7 @@ def _extract_litellm_provider_error_retry_context(error_text: str) -> Dict[str, 
 
     fallbacks_match = _LITELLM_PROVIDER_ERROR_FALLBACKS_RE.search(error_text)
     if fallbacks_match:
-        fallbacks = _clean_litellm_provider_error_fallbacks(
-            fallbacks_match.group("fallbacks")
-        )
+        fallbacks = _clean_litellm_provider_error_fallbacks(fallbacks_match.group("fallbacks"))
         if fallbacks is not None:
             metadata["available_model_group_fallbacks"] = fallbacks
             metadata["no_model_group_fallbacks"] = fallbacks.lower() in {
@@ -7272,15 +6837,11 @@ def _enrich_provider_error_observation_metadata(
     if upstream_is_byok is not None:
         observation_metadata["upstream_is_byok"] = _metadata_bool(upstream_is_byok)
 
-    upstream_error_raw = _redact_upstream_error_raw(
-        _extract_provider_error_payload_metadata_value(dicts, "raw")
-    )
+    upstream_error_raw = _redact_upstream_error_raw(_extract_provider_error_payload_metadata_value(dicts, "raw"))
     if upstream_error_raw is not None:
         observation_metadata["upstream_error_raw"] = upstream_error_raw[:1000]
 
-    observation_metadata.update(
-        _extract_litellm_provider_error_retry_context(error_text)
-    )
+    observation_metadata.update(_extract_litellm_provider_error_retry_context(error_text))
 
 
 def _classify_provider_error(
@@ -7355,11 +6916,7 @@ def _build_provider_error_observation(
     start_time: Any,
     end_time: Any,
 ) -> Optional[Dict[str, Any]]:
-    observed_at = (
-        _parse_datetime_value(end_time)
-        or _parse_datetime_value(start_time)
-        or datetime.now(timezone.utc)
-    )
+    observed_at = _parse_datetime_value(end_time) or _parse_datetime_value(start_time) or datetime.now(timezone.utc)
     metadata = _merged_rate_limit_metadata(kwargs)
     standard_logging_object = kwargs.get("standard_logging_object") or {}
     if not isinstance(standard_logging_object, dict):
@@ -7409,9 +6966,7 @@ def _build_provider_error_observation(
         error_text=error_text,
     )
     expected_reset_at = (
-        observed_at + timedelta(seconds=retry_after_seconds)
-        if retry_after_seconds is not None
-        else None
+        observed_at + timedelta(seconds=retry_after_seconds) if retry_after_seconds is not None else None
     )
     runtime_identity = _build_session_runtime_identity(
         metadata=metadata,
@@ -7436,8 +6991,7 @@ def _build_provider_error_observation(
         )
         observation_metadata["structured_output_attempted"] = True
         observation_metadata["structured_output_failed"] = bool(
-            structured_output_state.get("structured_output_failed")
-            or structured_failure_reason
+            structured_output_state.get("structured_output_failed") or structured_failure_reason
         )
         for key in (
             "structured_output_mode",
@@ -7447,9 +7001,7 @@ def _build_provider_error_observation(
             if value is not None:
                 observation_metadata[key] = value
         if structured_failure_reason is not None:
-            observation_metadata[
-                "structured_output_failure_reason"
-            ] = structured_failure_reason
+            observation_metadata["structured_output_failure_reason"] = structured_failure_reason
     _enrich_provider_error_observation_metadata(
         observation_metadata=observation_metadata,
         dicts=dicts,
@@ -7503,17 +7055,15 @@ def _build_provider_error_observation(
         error_text=error_text,
         model=model,
     )
-    observation_metadata["provider_error_fingerprint"] = (
-        _build_provider_error_fingerprint(
-            provider=provider,
-            model=model if model != "unknown" else None,
-            model_group=model_group,
-            status_code=status_code,
-            error_code=error_code,
-            error_type=error_type,
-            error_class=error_class,
-            observation_metadata=observation_metadata,
-        )
+    observation_metadata["provider_error_fingerprint"] = _build_provider_error_fingerprint(
+        provider=provider,
+        model=model if model != "unknown" else None,
+        model_group=model_group,
+        status_code=status_code,
+        error_code=error_code,
+        error_type=error_type,
+        error_class=error_class,
+        observation_metadata=observation_metadata,
     )
     return {
         "observed_at": observed_at,
@@ -7560,9 +7110,7 @@ def _build_alias_routing_audit_only_record(
     ``aawm_alias_routing_audit`` events best-effort while avoiding a duplicate
     session_history row or a normal success/fallback double-write.
     """
-    normalized_events = [
-        event for event in events if isinstance(event, dict)
-    ]
+    normalized_events = [event for event in events if isinstance(event, dict)]
     primary = normalized_events[-1] if normalized_events else {}
     record_metadata: Dict[str, Any] = {
         "aawm_alias_routing_audit_only": True,
@@ -7662,8 +7210,7 @@ def _classify_rate_limit_transition(
     if (
         previous_used_percentage is not None
         and current_used_percentage is not None
-        and previous_used_percentage - current_used_percentage
-        >= _AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP
+        and previous_used_percentage - current_used_percentage >= _AAWM_RATE_LIMIT_MEANINGFUL_PERCENT_DROP
     ):
         signals.append("usage_percent_drop")
         transition_type = transition_type or "usage_percent_drop"
@@ -7693,9 +7240,7 @@ def _classify_rate_limit_transition(
 
 def _rate_limit_observation_json(observation: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        key: _json_safe_rate_limit_value(value)
-        for key, value in list(observation.items())
-        if key not in {"metadata"}
+        key: _json_safe_rate_limit_value(value) for key, value in list(observation.items()) if key not in {"metadata"}
     }
 
 
@@ -7738,9 +7283,7 @@ def _build_rate_limit_transition(
         "new_used_requests": _safe_int(current.get("used_requests")),
         "old_total_requests": _safe_int(previous.get("total_requests")),
         "new_total_requests": _safe_int(current.get("total_requests")),
-        "inferred_window_start_at": _parse_provider_timestamp(
-            current.get("inferred_window_start_at")
-        ),
+        "inferred_window_start_at": _parse_provider_timestamp(current.get("inferred_window_start_at")),
         "detection_window_start_at": _parse_provider_timestamp(previous.get("observed_at")),
         "detection_window_end_at": _parse_provider_timestamp(current.get("observed_at")),
         "session_usage_summary": {},
@@ -7810,15 +7353,12 @@ def _extract_responses_completed_payload_from_passthrough_fallback_text(
     }
 
 
-
 def _build_usage_object_from_metadata(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(metadata, dict):
         return None
 
     usage_object = metadata.get("usage_object")
-    reconstructed: Dict[str, Any] = (
-        dict(usage_object) if isinstance(usage_object, dict) and usage_object else {}
-    )
+    reconstructed: Dict[str, Any] = dict(usage_object) if isinstance(usage_object, dict) and usage_object else {}
 
     input_tokens = _safe_int(metadata.get("usage_input_tokens"))
     output_tokens = _safe_int(metadata.get("usage_output_tokens"))
@@ -7930,9 +7470,7 @@ def _extract_responses_completed_response_from_langfuse_output(
         if isinstance(output_payload.get("raw_output"), str):
             raw_text = output_payload["raw_output"]
 
-    completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
-        raw_text
-    )
+    completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(raw_text)
     if not isinstance(completed_payload, dict):
         return None
     response_payload = completed_payload.get("response")
@@ -7949,9 +7487,7 @@ def _build_usage_object_from_langfuse_output(output_payload: Any) -> Optional[Di
     if token_count_usage is not None:
         return token_count_usage
 
-    response_payload = _extract_responses_completed_response_from_langfuse_output(
-        output_payload
-    )
+    response_payload = _extract_responses_completed_response_from_langfuse_output(output_payload)
     if not isinstance(response_payload, dict):
         return None
     usage = response_payload.get("usage")
@@ -7963,9 +7499,7 @@ def _extract_codex_model_from_response_headers(metadata: Dict[str, Any]) -> Opti
     if not isinstance(headers, dict):
         return None
 
-    limit_name = _clean_non_empty_string(
-        _get_rate_limit_header_value(headers, "x-codex-bengalfox-limit-name")
-    )
+    limit_name = _clean_non_empty_string(_get_rate_limit_header_value(headers, "x-codex-bengalfox-limit-name"))
     if not limit_name:
         return None
 
@@ -8027,9 +7561,7 @@ def _extract_model_from_langfuse_output(output_payload: Any) -> Optional[str]:
         if isinstance(model, str) and model.strip():
             return model.strip()
 
-    response_payload = _extract_responses_completed_response_from_langfuse_output(
-        output_payload
-    )
+    response_payload = _extract_responses_completed_response_from_langfuse_output(output_payload)
     model = _maybe_get(response_payload, "model")
     if isinstance(model, str) and model.strip():
         return model.strip()
@@ -8052,9 +7584,7 @@ def _first_explicit_openrouter_model_string(*candidates: Any) -> Optional[str]:
         if not isinstance(candidate, str):
             continue
         cleaned = candidate.strip()
-        if cleaned.lower().startswith("openrouter/") and len(cleaned) > len(
-            "openrouter/"
-        ):
+        if cleaned.lower().startswith("openrouter/") and len(cleaned) > len("openrouter/"):
             return cleaned
     return None
 
@@ -8129,7 +7659,6 @@ def _merge_usage_object_with_metadata(
     return merged_usage
 
 
-
 def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
     usage_obj = _maybe_get(result, "usage")
     metadata_usage_object = _extract_metadata_usage_object(kwargs)
@@ -8142,9 +7671,7 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
             token_count_usage,
             metadata_usage_object,
         )
-    token_count_usage = _build_usage_object_from_token_count_payload(
-        _maybe_get(result, "response")
-    )
+    token_count_usage = _build_usage_object_from_token_count_payload(_maybe_get(result, "response"))
     if token_count_usage is not None:
         return _merge_usage_object_with_metadata(
             token_count_usage,
@@ -8196,9 +7723,7 @@ def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any:
                 token_count_usage,
                 metadata_usage_object,
             )
-        token_count_usage = _build_usage_object_from_token_count_payload(
-            standard_logging_object.get("output")
-        )
+        token_count_usage = _build_usage_object_from_token_count_payload(standard_logging_object.get("output"))
         if token_count_usage is not None:
             return _merge_usage_object_with_metadata(
                 token_count_usage,
@@ -8230,9 +7755,7 @@ def _enrich_token_count_usage_metadata(kwargs: Dict[str, Any], result: Any) -> N
         standard_logging_object = {}
 
     passthrough_logging_payload = kwargs.get("passthrough_logging_payload")
-    standard_passthrough_logging_payload = kwargs.get(
-        "standard_pass_through_logging_payload"
-    )
+    standard_passthrough_logging_payload = kwargs.get("standard_pass_through_logging_payload")
     candidates = (
         result,
         _maybe_get(result, "response"),
@@ -8501,19 +8024,13 @@ def _session_history_adapter_target_provider(
 def _session_history_auto_agent_selected_provider(
     metadata: Dict[str, Any],
 ) -> Optional[str]:
-    selected_provider = _normalize_session_history_provider_name(
-        metadata.get("codex_auto_agent_selected_provider")
-    )
+    selected_provider = _normalize_session_history_provider_name(metadata.get("codex_auto_agent_selected_provider"))
     if selected_provider is not None:
         return selected_provider
-    selected_provider = _normalize_session_history_provider_name(
-        metadata.get("anthropic_auto_agent_selected_provider")
-    )
+    selected_provider = _normalize_session_history_provider_name(metadata.get("anthropic_auto_agent_selected_provider"))
     if selected_provider is not None:
         return selected_provider
-    return _normalize_session_history_provider_name(
-        metadata.get("aawm_auto_agent_selected_provider")
-    )
+    return _normalize_session_history_provider_name(metadata.get("aawm_auto_agent_selected_provider"))
 
 
 def _session_history_adapter_model(metadata: Dict[str, Any]) -> Optional[str]:
@@ -8574,11 +8091,7 @@ def _normalize_provider_cache_family(
         return "opencode_zen"
     if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
         return "antigravity"
-    if (
-        "gemini" in model_lower
-        or "gemma" in model_lower
-        or model_lower.startswith("google/")
-    ):
+    if "gemini" in model_lower or "gemma" in model_lower or model_lower.startswith("google/"):
         return "gemini"
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
         return "anthropic"
@@ -8616,9 +8129,7 @@ def _normalize_session_history_provider(
     ):
         return "xai"
 
-    route_provider = _session_history_provider_from_route_family(
-        metadata.get("passthrough_route_family")
-    )
+    route_provider = _session_history_provider_from_route_family(metadata.get("passthrough_route_family"))
     if route_provider is not None and route_provider != "anthropic":
         return route_provider
 
@@ -8770,10 +8281,7 @@ def _iter_tool_result_error_candidates(message: Any) -> Iterator[Any]:
 
     message_type = _clean_non_empty_string(parsed_message.get("type"))
     message_role = _clean_non_empty_string(parsed_message.get("role"))
-    if (
-        message_type in _TOOL_RESULT_ERROR_BLOCK_TYPES
-        or (message_role or "").lower() == "tool"
-    ):
+    if message_type in _TOOL_RESULT_ERROR_BLOCK_TYPES or (message_role or "").lower() == "tool":
         yield parsed_message
 
     content = _safe_json_load(parsed_message.get("content"), parsed_message.get("content"))
@@ -8896,8 +8404,7 @@ def _merge_structured_output_state(
 
     current["structured_output_attempted"] = True
     current["structured_output_failed"] = bool(
-        current.get("structured_output_failed")
-        or candidate.get("structured_output_failed")
+        current.get("structured_output_failed") or candidate.get("structured_output_failed")
     )
     for key in (
         "structured_output_mode",
@@ -8964,20 +8471,13 @@ def _structured_output_state_from_format(
     )
     has_json_mime = bool(mime_type and "json" in mime_type.lower())
     has_json_mode = bool(
-        dict_mode
-        and (
-            dict_mode in _STRUCTURED_OUTPUT_JSON_MODE_VALUES
-            or "json" in dict_mode
-            or "schema" in dict_mode
-        )
+        dict_mode and (dict_mode in _STRUCTURED_OUTPUT_JSON_MODE_VALUES or "json" in dict_mode or "schema" in dict_mode)
     )
     if schema is None and not has_json_mode and not has_json_mime:
         return state
 
     state["structured_output_attempted"] = True
-    state["structured_output_mode"] = dict_mode or (
-        "response_schema" if schema is not None else "json_mime_type"
-    )
+    state["structured_output_mode"] = dict_mode or ("response_schema" if schema is not None else "json_mime_type")
     state["structured_output_schema_hash"] = _structured_output_schema_hash(schema)
     return state
 
@@ -9000,9 +8500,7 @@ def _structured_output_state_from_generation_config(value: Any) -> Dict[str, Any
         return state
 
     state["structured_output_attempted"] = True
-    state["structured_output_mode"] = (
-        "response_schema" if schema is not None else "json_mime_type"
-    )
+    state["structured_output_mode"] = "response_schema" if schema is not None else "json_mime_type"
     state["structured_output_schema_hash"] = _structured_output_schema_hash(schema)
     return state
 
@@ -9191,6 +8689,7 @@ def _classify_structured_output_failure(value: Any) -> Optional[str]:
             return reason
     return None
 
+
 def _extract_request_body_from_langfuse_input(value: Any) -> Optional[Dict[str, Any]]:
     parsed = _safe_json_load(value, value)
     if not isinstance(parsed, dict):
@@ -9254,11 +8753,7 @@ def _request_payload_contains(
 
             if depth >= _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH:
                 continue
-            pending.extend(
-                (item, depth + 1)
-                for item in list(value)
-                if isinstance(item, (dict, list, tuple))
-            )
+            pending.extend((item, depth + 1) for item in list(value) if isinstance(item, (dict, list, tuple)))
 
     return False
 
@@ -9266,8 +8761,7 @@ def _request_payload_contains(
 def _request_contains_cache_control(payload: Any) -> bool:
     return _request_payload_contains(
         payload,
-        lambda item: item.get("cache_control") is not None
-        or item.get("cacheControl") is not None,
+        lambda item: item.get("cache_control") is not None or item.get("cacheControl") is not None,
     )
 
 
@@ -9277,9 +8771,7 @@ def _request_contains_cached_content(payload: Any) -> bool:
         if isinstance(cached_content, str) and cached_content.strip():
             return True
         cached_content_alias = item.get("cached_content")
-        return isinstance(cached_content_alias, str) and bool(
-            cached_content_alias.strip()
-        )
+        return isinstance(cached_content_alias, str) and bool(cached_content_alias.strip())
 
     return _request_payload_contains(payload, _has_cached_content)
 
@@ -9291,9 +8783,7 @@ def _request_contains_prompt_cache_key(payload: Any) -> bool:
     return isinstance(prompt_cache_key, str) and bool(prompt_cache_key.strip())
 
 
-_CODEX_THREAD_ID_RE = re.compile(
-    r"\bCODEX_THREAD_ID=(?P<thread_id>[A-Za-z0-9][A-Za-z0-9._:-]{7,})\b"
-)
+_CODEX_THREAD_ID_RE = re.compile(r"\bCODEX_THREAD_ID=(?P<thread_id>[A-Za-z0-9][A-Za-z0-9._:-]{7,})\b")
 _GEMINI_COMPACT_PROMPT_ID_RE = re.compile(r"^compress-[A-Za-z0-9._:-]+$")
 _CLAUDE_CODE_COMPACT_REQUEST_MARKERS = (
     "your task is to create a detailed summary of the conversation so far",
@@ -9439,11 +8929,7 @@ def _is_codex_compact_context(metadata: Dict[str, Any]) -> bool:
     client_name = str(metadata.get("client_name") or "").strip().lower()
     trace_name = str(metadata.get("trace_name") or "").strip().lower()
     route_family = str(metadata.get("passthrough_route_family") or "").strip().lower()
-    return (
-        client_name == "codex-tui"
-        or trace_name.startswith("codex")
-        or route_family == "codex_responses"
-    )
+    return client_name == "codex-tui" or trace_name.startswith("codex") or route_family == "codex_responses"
 
 
 def _is_gemini_cli_compact_context(metadata: Dict[str, Any]) -> bool:
@@ -9477,9 +8963,7 @@ def _classify_compact_summary_state(
             request_body,
             request_text,
         )
-        if (
-            "context checkpoint compaction" in request_text_lower
-        ):
+        if "context checkpoint compaction" in request_text_lower:
             return {
                 "is_compact_summary": True,
                 "compact_summary_source": "codex",
@@ -9513,12 +8997,9 @@ def _classify_compact_summary_state(
 
     if _is_claude_code_compact_context(metadata):
         has_compact_tags = "<analysis>" in request_text_lower and "<summary>" in request_text_lower
-        strict_prompt_shape = all(
-            marker in request_text_lower for marker in _CLAUDE_CODE_COMPACT_REQUEST_MARKERS
-        )
+        strict_prompt_shape = all(marker in request_text_lower for marker in _CLAUDE_CODE_COMPACT_REQUEST_MARKERS)
         compact_summary_phrase = (
-            "summarize the current context" in request_text_lower
-            or "context compacted" in request_text_lower
+            "summarize the current context" in request_text_lower or "context compacted" in request_text_lower
         )
         if has_compact_tags and (strict_prompt_shape or compact_summary_phrase):
             compact_id = litellm_call_id or trace_id or session_id
@@ -9585,9 +9066,7 @@ def _usage_has_gemini_style_cached_content_field(usage_obj: Any) -> bool:
     return _has_nested_path(usage_obj, "cachedContentTokenCount")
 
 
-def _openai_cache_attempt_source(
-    usage_obj: Any, request_body: Optional[Dict[str, Any]]
-) -> Optional[Tuple[str, str]]:
+def _openai_cache_attempt_source(usage_obj: Any, request_body: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
     if _request_contains_prompt_cache_key(request_body):
         return "prompt_cache_key_requested_without_hit", "request.prompt_cache_key"
     cached_tokens_source = _openai_style_cached_tokens_source(usage_obj)
@@ -9623,15 +9102,9 @@ def _compute_provider_cache_miss_cost_state(  # noqa: PLR0915
     response_cost_usd: Optional[float] = None,
 ) -> Dict[str, Any]:
     existing_miss_token_count = (
-        _safe_int(cache_state.get("miss_token_count"))
-        if isinstance(cache_state, dict)
-        else None
+        _safe_int(cache_state.get("miss_token_count")) if isinstance(cache_state, dict) else None
     )
-    existing_miss_cost_usd = (
-        _safe_float(cache_state.get("miss_cost_usd"))
-        if isinstance(cache_state, dict)
-        else None
-    )
+    existing_miss_cost_usd = _safe_float(cache_state.get("miss_cost_usd")) if isinstance(cache_state, dict) else None
     existing_miss_cost_basis = (
         str(cache_state.get("miss_cost_basis")).strip()
         if isinstance(cache_state, dict)
@@ -9661,9 +9134,7 @@ def _compute_provider_cache_miss_cost_state(  # noqa: PLR0915
             custom_llm_provider=cost_provider_family,
         )
         input_cost_per_token = (
-            _safe_float(model_info.get("input_cost_per_token"))
-            if isinstance(model_info, dict)
-            else None
+            _safe_float(model_info.get("input_cost_per_token")) if isinstance(model_info, dict) else None
         )
         if input_cost_per_token is not None:
             return (
@@ -9756,8 +9227,7 @@ def _compute_provider_cache_miss_cost_state(  # noqa: PLR0915
                 return result
 
             miss_cost = max(
-                (float(prompt_base_cost) - float(cache_read_cost))
-                * float(miss_token_count),
+                (float(prompt_base_cost) - float(cache_read_cost)) * float(miss_token_count),
                 0.0,
             )
             result["miss_cost_usd"] = miss_cost
@@ -9770,11 +9240,7 @@ def _compute_provider_cache_miss_cost_state(  # noqa: PLR0915
                 result["miss_cost_basis"] = fallback_basis
             return result
 
-    if (
-        cache_status == "hit"
-        and cache_missed
-        and cache_miss_reason == "partial_cache_hit"
-    ):
+    if cache_status == "hit" and cache_missed and cache_miss_reason == "partial_cache_hit":
         miss_token_count = (
             existing_miss_token_count
             if existing_miss_token_count is not None and existing_miss_token_count > 0
@@ -9797,9 +9263,7 @@ def _compute_provider_cache_miss_cost_state(  # noqa: PLR0915
                 result["miss_token_count"] = existing_miss_token_count
                 if result["miss_cost_usd"] is not None:
                     return result
-                fallback_cost, fallback_basis = _fallback_miss_cost(
-                    existing_miss_token_count
-                )
+                fallback_cost, fallback_basis = _fallback_miss_cost(existing_miss_token_count)
                 if fallback_cost is not None:
                     result["miss_cost_usd"] = fallback_cost
                     result["miss_cost_basis"] = fallback_basis
@@ -9835,12 +9299,8 @@ def _compute_provider_cache_miss_cost_state(  # noqa: PLR0915
         prompt_tokens_details = _extract_prompt_tokens_details(usage_obj)
         cache_creation_token_details = None
         if isinstance(prompt_tokens_details, dict):
-            detail_5m = _safe_int(
-                _maybe_get(prompt_tokens_details, "ephemeral_5m_input_tokens")
-            )
-            detail_1h = _safe_int(
-                _maybe_get(prompt_tokens_details, "ephemeral_1h_input_tokens")
-            )
+            detail_5m = _safe_int(_maybe_get(prompt_tokens_details, "ephemeral_5m_input_tokens"))
+            detail_1h = _safe_int(_maybe_get(prompt_tokens_details, "ephemeral_1h_input_tokens"))
             if detail_5m is not None or detail_1h is not None:
                 cache_creation_token_details = CacheCreationTokenDetails(
                     ephemeral_5m_input_tokens=detail_5m,
@@ -9924,20 +9384,18 @@ def _provider_cache_state_from_metadata(
         return None
     normalized_status = str(status).strip() if isinstance(status, str) and status.strip() else None
     return {
-        "attempted": bool(attempted) if attempted is not None else bool(normalized_status and normalized_status != "not_attempted"),
+        "attempted": bool(attempted)
+        if attempted is not None
+        else bool(normalized_status and normalized_status != "not_attempted"),
         "status": normalized_status,
         "miss": bool(miss) if miss is not None else normalized_status in {"miss", "write"},
         "miss_reason": (
-            str(miss_reason).strip()
-            if isinstance(miss_reason, str) and str(miss_reason).strip()
-            else None
+            str(miss_reason).strip() if isinstance(miss_reason, str) and str(miss_reason).strip() else None
         ),
         "miss_token_count": _safe_int(miss_token_count),
         "miss_cost_usd": _safe_float(miss_cost_usd),
         "miss_cost_basis": (
-            str(miss_cost_basis).strip()
-            if isinstance(miss_cost_basis, str) and str(miss_cost_basis).strip()
-            else None
+            str(miss_cost_basis).strip() if isinstance(miss_cost_basis, str) and str(miss_cost_basis).strip() else None
         ),
         "source": str(source).strip() if isinstance(source, str) and str(source).strip() else None,
     }
@@ -10052,9 +9510,7 @@ def _resolve_provider_cache_state(  # noqa: PLR0915
             miss_reason = miss_reason or "cached_tokens_reported_zero"
             source = source or "usage.cached_content_token_count"
     elif provider_family == "openai":
-        openai_cache_attempt_source = _openai_cache_attempt_source(
-            usage_obj, request_body
-        )
+        openai_cache_attempt_source = _openai_cache_attempt_source(usage_obj, request_body)
         if openai_cache_attempt_source:
             attempted = True
             source_miss_reason, source_name = openai_cache_attempt_source
@@ -10134,22 +9590,16 @@ def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
     return None
 
 
-def _fallback_gemini_reasoning_tokens_from_signatures(
-    metadata: Dict[str, Any], message: Any = None
-) -> Optional[int]:
+def _fallback_gemini_reasoning_tokens_from_signatures(metadata: Dict[str, Any], message: Any = None) -> Optional[int]:
     signature_count = _safe_int(metadata.get("gemini_thought_signature_count"))
     if signature_count is not None and signature_count > 0:
         return signature_count
 
-    provider_specific_fields = (
-        _extract_provider_specific_fields(message) if message is not None else {}
-    )
+    provider_specific_fields = _extract_provider_specific_fields(message) if message is not None else {}
     thought_signatures = provider_specific_fields.get("thought_signatures")
     if isinstance(thought_signatures, list):
         non_empty_signatures = [
-            signature
-            for signature in thought_signatures
-            if isinstance(signature, str) and signature.strip()
+            signature for signature in thought_signatures if isinstance(signature, str) and signature.strip()
         ]
         if non_empty_signatures:
             return len(non_empty_signatures)
@@ -10212,10 +9662,7 @@ def _extract_rerank_request_payload(kwargs: Dict[str, Any]) -> Optional[Dict[str
         if (
             isinstance(candidate, dict)
             and candidate.get("query") is not None
-            and (
-                candidate.get("documents") is not None
-                or candidate.get("texts") is not None
-            )
+            and (candidate.get("documents") is not None or candidate.get("texts") is not None)
         ):
             return candidate
     return None
@@ -10229,9 +9676,7 @@ def _coerce_rerank_text(value: Any) -> str:
     if isinstance(value, (int, float, bool)):
         return str(value)
     if isinstance(value, list):
-        return "\n".join(
-            text for item in value if (text := _coerce_rerank_text(item).strip())
-        )
+        return "\n".join(text for item in value if (text := _coerce_rerank_text(item).strip()))
     if isinstance(value, dict):
         try:
             return json.dumps(value, sort_keys=True, default=str)
@@ -10249,9 +9694,7 @@ def _extract_rerank_document_text(
     if isinstance(document, dict):
         if rank_fields:
             return "\n".join(
-                text
-                for field in rank_fields
-                if (text := _coerce_rerank_text(document.get(field)).strip())
+                text for field in rank_fields if (text := _coerce_rerank_text(document.get(field)).strip())
             )
         if "text" in document:
             return _coerce_rerank_text(document.get("text"))
@@ -10314,11 +9757,7 @@ def _extract_prompt_text_blocks(
     if value is None:
         return []
     if isinstance(value, str):
-        return [
-            block.strip()
-            for block in re.split(r"\n{2,}", value)
-            if block.strip()
-        ]
+        return [block.strip() for block in re.split(r"\n{2,}", value) if block.strip()]
     if isinstance(value, (int, float, bool)):
         return [str(value)]
     if isinstance(value, list):
@@ -10739,8 +10178,7 @@ def _extract_prompt_overhead_components(
             components,
             "system",
             path="request.systemInstruction",
-            value=nested_request_block.get("systemInstruction")
-            or nested_request_block.get("system_instruction"),
+            value=nested_request_block.get("systemInstruction") or nested_request_block.get("system_instruction"),
         )
         _append_prompt_component(
             components,
@@ -10761,8 +10199,7 @@ def _extract_prompt_overhead_components(
             components,
             "system",
             path="systemInstruction",
-            value=request_body.get("systemInstruction")
-            or request_body.get("system_instruction"),
+            value=request_body.get("systemInstruction") or request_body.get("system_instruction"),
         )
         _append_prompt_component(
             components,
@@ -10817,9 +10254,7 @@ def _extract_prompt_overhead_components(
                 else "chat_messages_with_top_level_system"
             )
         else:
-            system_messages, conversation_messages = _split_chat_prompt_messages(
-                request_body.get("messages")
-            )
+            system_messages, conversation_messages = _split_chat_prompt_messages(request_body.get("messages"))
             _append_prompt_component(
                 components,
                 "system",
@@ -10881,18 +10316,13 @@ def _build_prompt_overhead_breakdown(
         system_components=components["system"],
     )
     system_tokens = sum(bucket_tokens.values())
-    tool_tokens = sum(
-        _estimate_prompt_overhead_tokens(model, component["value"])
-        for component in components["tools"]
-    )
+    tool_tokens = sum(_estimate_prompt_overhead_tokens(model, component["value"]) for component in components["tools"])
     conversation_tokens = sum(
-        _estimate_prompt_overhead_tokens(model, component["value"])
-        for component in components["conversation"]
+        _estimate_prompt_overhead_tokens(model, component["value"]) for component in components["conversation"]
     )
     excluded_components = components.get("excluded", [])
     opaque_state_tokens = sum(
-        _estimate_prompt_overhead_tokens(model, component["value"])
-        for component in excluded_components
+        _estimate_prompt_overhead_tokens(model, component["value"]) for component in excluded_components
     )
     component_total = system_tokens + tool_tokens + conversation_tokens
     residual_tokens = prompt_tokens - component_total
@@ -10914,13 +10344,9 @@ def _build_prompt_overhead_breakdown(
     component_paths = {
         "system": system_paths,
         "tools": [str(component.get("path")) for component in components["tools"]],
-        "conversation": [
-            str(component.get("path")) for component in components["conversation"]
-        ],
+        "conversation": [str(component.get("path")) for component in components["conversation"]],
     }
-    excluded_component_paths = [
-        str(component.get("path")) for component in excluded_components
-    ]
+    excluded_component_paths = [str(component.get("path")) for component in excluded_components]
     metadata.update(
         {
             "prompt_overhead_breakdown_source": "request_body_estimate",
@@ -10957,9 +10383,7 @@ def _estimate_rerank_request_tokens(
     raw_rank_fields = request_payload.get("rank_fields")
     rank_fields = raw_rank_fields if isinstance(raw_rank_fields, list) else None
     document_texts = [
-        text
-        for document in documents
-        if (text := _extract_rerank_document_text(document, rank_fields).strip())
+        text for document in documents if (text := _extract_rerank_document_text(document, rank_fields).strip())
     ]
     combined_text = "\n\n".join([query_text, *document_texts]).strip()
     if not combined_text:
@@ -10998,9 +10422,8 @@ def _merge_estimated_rerank_tokens_into_usage(
     if _usage_has_positive_tokens(usage_dict):
         return usage_obj
 
-    search_units = (
-        _safe_int(usage_dict.get("search_units"))
-        or _safe_int(_maybe_get_path(result, "meta", "billed_units", "search_units"))
+    search_units = _safe_int(usage_dict.get("search_units")) or _safe_int(
+        _maybe_get_path(result, "meta", "billed_units", "search_units")
     )
     if not search_units:
         return usage_obj
@@ -11032,11 +10455,7 @@ def _load_bundled_model_cost_map() -> Dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def _bundled_model_cost_casefold_lookup() -> Dict[str, str]:
-    return {
-        key.lower(): key
-        for key in _load_bundled_model_cost_map()
-        if isinstance(key, str)
-    }
+    return {key.lower(): key for key in _load_bundled_model_cost_map() if isinstance(key, str)}
 
 
 def _lookup_bundled_model_cost_info(
@@ -11097,18 +10516,13 @@ def _calculate_response_cost_from_bundled_model_cost_map(
     if search_units and input_cost_per_query is not None and input_cost_per_query > 0:
         return search_units * input_cost_per_query
 
-    has_token_pricing = (
-        "input_cost_per_token" in model_info or "output_cost_per_token" in model_info
-    )
+    has_token_pricing = "input_cost_per_token" in model_info or "output_cost_per_token" in model_info
     if not has_token_pricing:
         return None
 
     input_cost_per_token = _safe_float(model_info.get("input_cost_per_token")) or 0.0
     output_cost_per_token = _safe_float(model_info.get("output_cost_per_token")) or 0.0
-    return (
-        (prompt_tokens * input_cost_per_token)
-        + (completion_tokens * output_cost_per_token)
-    )
+    return (prompt_tokens * input_cost_per_token) + (completion_tokens * output_cost_per_token)
 
 
 def _positive_int_or_none(value: Any) -> Optional[int]:
@@ -11122,9 +10536,7 @@ def _normalize_reasoning_state(record: Dict[str, Any]) -> None:
     reported = _positive_int_or_none(record.get("reasoning_tokens_reported"))
     estimated = _positive_int_or_none(record.get("reasoning_tokens_estimated"))
     source = record.get("reasoning_tokens_source")
-    reasoning_present = bool(
-        record.get("reasoning_present") or record.get("thinking_signature_present")
-    )
+    reasoning_present = bool(record.get("reasoning_present") or record.get("thinking_signature_present"))
 
     record["reasoning_tokens_reported"] = reported
     record["reasoning_tokens_estimated"] = estimated
@@ -11183,11 +10595,7 @@ def _normalize_provider_cache_state_on_record(record: Dict[str, Any]) -> None:
         return
 
     current_status = record.get("provider_cache_status")
-    if (
-        isinstance(current_status, str)
-        and current_status.strip()
-        and cache_state.get("status") == "not_attempted"
-    ):
+    if isinstance(current_status, str) and current_status.strip() and cache_state.get("status") == "not_attempted":
         return
     should_override = (
         not isinstance(current_status, str)
@@ -11268,10 +10676,7 @@ def _is_harness_tenant_identity(value: Any) -> bool:
     normalized = _normalize_identity_for_placeholder_check(value)
     if not normalized:
         return False
-    return any(
-        fragment in normalized
-        for fragment in _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS
-    )
+    return any(fragment in normalized for fragment in _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS)
 
 
 def _normalize_request_header_tenant_repository(value: Any) -> Optional[str]:
@@ -11279,10 +10684,7 @@ def _normalize_request_header_tenant_repository(value: Any) -> Optional[str]:
     if repository is None:
         return None
     normalized = repository.lower()
-    if any(
-        fragment in normalized
-        for fragment in _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS
-    ):
+    if any(fragment in normalized for fragment in _REQUEST_HEADER_TENANT_LITELLM_REPOSITORY_FRAGMENTS):
         return "litellm"
     if normalized.endswith("-dev") or "tenant" in normalized:
         return None
@@ -11343,15 +10745,9 @@ def _is_repository_source_trusted_common(
         marker in source for marker in _REPOSITORY_SOURCE_GENERAL_METADATA_MARKERS
     ):
         return True
-    if (
-        allow_route_rollup_label
-        and source.endswith(".aawm_route_rollup_context.group_header_label")
-    ):
+    if allow_route_rollup_label and source.endswith(".aawm_route_rollup_context.group_header_label"):
         return True
-    if (
-        "x-codex-turn-metadata" in source
-        and source.endswith(".text.project_path")
-    ):
+    if "x-codex-turn-metadata" in source and source.endswith(".text.project_path"):
         return True
     return any(source.endswith(marker) for marker in _REPOSITORY_SOURCE_TEXT_SUFFIXES)
 
@@ -11382,10 +10778,7 @@ def _is_codex_passthrough_tenant_extraction_context(
     if not isinstance(metadata, dict):
         metadata = {}
     headers = _extract_request_headers_from_kwargs(kwargs)
-    return bool(
-        _is_native_codex_passthrough_context(metadata, headers)
-        or _is_codex_client_identity(metadata, headers)
-    )
+    return bool(_is_native_codex_passthrough_context(metadata, headers) or _is_codex_client_identity(metadata, headers))
 
 
 def _is_repository_source_trusted_for_codex_tenant(value: Any) -> bool:
@@ -11410,9 +10803,7 @@ def _is_codex_session_history_record(record: Dict[str, Any]) -> bool:
     )
     if route_family and route_family.lower() == "codex_responses":
         return True
-    client_name = _clean_non_empty_string(
-        _first_non_none(record.get("client_name"), metadata.get("client_name"))
-    )
+    client_name = _clean_non_empty_string(_first_non_none(record.get("client_name"), metadata.get("client_name")))
     if client_name and "codex" in client_name.lower():
         return True
     trace_name = _clean_non_empty_string(metadata.get("trace_name"))
@@ -11423,12 +10814,7 @@ def _is_codex_session_history_record(record: Dict[str, Any]) -> bool:
             metadata.get("user_agent"),
         )
     )
-    return bool(
-        trace_name
-        and trace_name.lower() == "codex"
-        and user_agent
-        and "codex" in user_agent.lower()
-    )
+    return bool(trace_name and trace_name.lower() == "codex" and user_agent and "codex" in user_agent.lower())
 
 
 def _is_claude_session_history_record(record: Dict[str, Any]) -> bool:
@@ -11438,9 +10824,7 @@ def _is_claude_session_history_record(record: Dict[str, Any]) -> bool:
     provider = str(record.get("provider") or "").strip().lower()
     if provider == "anthropic":
         return True
-    client_name = _clean_non_empty_string(
-        _first_non_none(record.get("client_name"), metadata.get("client_name"))
-    )
+    client_name = _clean_non_empty_string(_first_non_none(record.get("client_name"), metadata.get("client_name")))
     if client_name and "claude" in client_name.lower():
         return True
     trace_name = _clean_non_empty_string(metadata.get("trace_name"))
@@ -11456,9 +10840,7 @@ def _is_claude_metadata_tenant_source(value: Any) -> bool:
     source = _clean_non_empty_string(value)
     if not source:
         return False
-    return source.endswith(".metadata.tenant_id") or source.endswith(
-        ".metadata.aawm_tenant_id"
-    )
+    return source.endswith(".metadata.tenant_id") or source.endswith(".metadata.aawm_tenant_id")
 
 
 def _claude_project_identity_is_trusted(
@@ -11466,11 +10848,7 @@ def _claude_project_identity_is_trusted(
     repository: Optional[str],
     source: Any,
 ) -> bool:
-    if not (
-        repository
-        and _is_claude_session_history_record(record)
-        and _is_claude_project_repository_source(source)
-    ):
+    if not (repository and _is_claude_session_history_record(record) and _is_claude_project_repository_source(source)):
         return True
     return _is_known_aawm_workspace_repository(repository)
 
@@ -11544,9 +10922,7 @@ def _codex_untrusted_repository_reason(metadata: Dict[str, Any]) -> str:
 def _mark_repository_unresolved_metadata(metadata: Dict[str, Any]) -> None:
     metadata["session_history_repository_status"] = "unresolved"
     metadata["session_history_repository_unresolved"] = True
-    metadata["session_history_repository_unresolved_reason"] = (
-        _codex_untrusted_repository_reason(metadata)
-    )
+    metadata["session_history_repository_unresolved_reason"] = _codex_untrusted_repository_reason(metadata)
 
 
 def _session_history_missing_repository_reason(record: Dict[str, Any]) -> str:
@@ -11578,9 +10954,7 @@ def _mark_missing_repository_unresolved(
         return
     metadata["session_history_repository_status"] = "unresolved"
     metadata["session_history_repository_unresolved"] = True
-    metadata["session_history_repository_unresolved_reason"] = (
-        _session_history_missing_repository_reason(record)
-    )
+    metadata["session_history_repository_unresolved_reason"] = _session_history_missing_repository_reason(record)
     record["metadata"] = metadata
 
 
@@ -11667,9 +11041,9 @@ def _clear_codex_trace_user_tenant_source_on_record(record: Dict[str, Any]) -> b
     ):
         return False
 
-    original_tenant_id = _clean_non_empty_string(
-        record.get("tenant_id")
-    ) or _clean_non_empty_string(metadata.get("tenant_id"))
+    original_tenant_id = _clean_non_empty_string(record.get("tenant_id")) or _clean_non_empty_string(
+        metadata.get("tenant_id")
+    )
     if original_tenant_id is None:
         original_tenant_id = _normalize_repository_identity(metadata.get("trace_user_id"))
     _mark_codex_trace_user_tenant_skipped(record, original_tenant_id)
@@ -11685,12 +11059,9 @@ def _clear_untrusted_codex_tenant_on_record(
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
-    if (
-        _is_codex_trace_user_tenant_source(metadata.get("tenant_id_source"))
-        or (
-            _normalize_repository_identity(metadata.get("trace_user_id")) == tenant_id
-            and not _codex_tenant_source_trusted_for_record(record)
-        )
+    if _is_codex_trace_user_tenant_source(metadata.get("tenant_id_source")) or (
+        _normalize_repository_identity(metadata.get("trace_user_id")) == tenant_id
+        and not _codex_tenant_source_trusted_for_record(record)
     ):
         _mark_codex_trace_user_tenant_skipped(record, tenant_id)
         return True
@@ -11776,10 +11147,9 @@ def _normalize_session_repository_on_record(record: Dict[str, Any]) -> None:
             metadata.setdefault("repository_source", repository_source)
             record["metadata"] = metadata
     if repository is None and metadata.get("tenant_id_source") == "request_headers":
-        repository = (
-            _normalize_request_header_tenant_repository(record.get("tenant_id"))
-            or _normalize_request_header_tenant_repository(metadata.get("tenant_id"))
-        )
+        repository = _normalize_request_header_tenant_repository(
+            record.get("tenant_id")
+        ) or _normalize_request_header_tenant_repository(metadata.get("tenant_id"))
         if repository is not None:
             metadata = dict(metadata)
             metadata.setdefault("repository_source", "tenant_id.request_headers")
@@ -11805,16 +11175,12 @@ def _can_promote_known_codex_repository_to_tenant(
     # other previously trusted sources remain trusted without the name check.
     repo_source = metadata.get("repository_source")
     return _is_known_aawm_workspace_repository(repository) and (
-        metadata.get("tenant_id_source")
-        in {"repository_untrusted", "trace_user_untrusted"}
+        metadata.get("tenant_id_source") in {"repository_untrusted", "trace_user_untrusted"}
         or metadata.get("trace_user_tenant_fallback_skipped") is True
         or metadata.get("repository_tenant_fallback_skipped") is True
         or (
             isinstance(repo_source, str)
-            and (
-                ".metadata.repository" in repo_source
-                or "litellm_metadata.repository" in repo_source
-            )
+            and (".metadata.repository" in repo_source or "litellm_metadata.repository" in repo_source)
         )
     )
 
@@ -11835,10 +11201,9 @@ def _normalize_session_tenant_on_record(record: Dict[str, Any]) -> None:
             metadata["aawm_original_tenant_id"] = original_tenant_id
         metadata["aawm_harness_tenant_alias"] = True
 
-        repository = (
-            _normalize_repository_identity(record.get("repository"))
-            or _normalize_request_header_tenant_repository(raw_tenant_id)
-        )
+        repository = _normalize_repository_identity(
+            record.get("repository")
+        ) or _normalize_request_header_tenant_repository(raw_tenant_id)
         record["tenant_id"] = repository
         if repository is not None:
             metadata["tenant_id"] = repository
@@ -11910,16 +11275,10 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:  # no
     for field in _PROMPT_OVERHEAD_TOKEN_FIELDS:
         metadata[f"usage_{field}"] = int(record.get(field) or 0)
 
-    metadata["usage_invalid_tool_call_count"] = int(
-        record.get("invalid_tool_call_count") or 0
-    )
+    metadata["usage_invalid_tool_call_count"] = int(record.get("invalid_tool_call_count") or 0)
 
-    metadata["usage_structured_output_attempted"] = bool(
-        record.get("structured_output_attempted")
-    )
-    metadata["usage_structured_output_failed"] = bool(
-        record.get("structured_output_failed")
-    )
+    metadata["usage_structured_output_attempted"] = bool(record.get("structured_output_attempted"))
+    metadata["usage_structured_output_failed"] = bool(record.get("structured_output_failed"))
     for field, metadata_key in (
         ("structured_output_mode", "usage_structured_output_mode"),
         ("structured_output_schema_hash", "usage_structured_output_schema_hash"),
@@ -12002,9 +11361,7 @@ def _sync_session_history_record_metadata(record: Dict[str, Any]) -> None:  # no
         else:
             metadata[metadata_key] = _json_safe_rate_limit_value(value)
 
-    agent_score_reasons = _normalize_agent_score_reasons(
-        record.get("agent_score_reasons")
-    )
+    agent_score_reasons = _normalize_agent_score_reasons(record.get("agent_score_reasons"))
     if agent_score_reasons:
         metadata["usage_agent_score_reasons"] = agent_score_reasons
     else:
@@ -12313,18 +11670,14 @@ def _collect_agent_quality_context_from_request_body(
                 tool_result_texts.append(_content_to_text(item.get("output")))
                 continue
             if item_type in {"function_call", "tool_use", "custom_tool_call"}:
-                command_text = _extract_command_text_from_tool_arguments(
-                    item.get("arguments") or item.get("input")
-                )
+                command_text = _extract_command_text_from_tool_arguments(item.get("arguments") or item.get("input"))
                 if command_text:
                     commands.append(
                         AgentQualityCommand(
                             name=str(item.get("name") or item_type),
                             command=command_text,
                             affected_paths=tuple(
-                                _extract_file_paths_from_tool_arguments(
-                                    item.get("arguments") or item.get("input")
-                                )
+                                _extract_file_paths_from_tool_arguments(item.get("arguments") or item.get("input"))
                             ),
                         )
                     )
@@ -12365,10 +11718,7 @@ def _agent_quality_commands_from_tool_activity(
             continue
         affected_paths = tuple(
             value
-            for value in (
-                list(item.get("file_paths_modified") or [])
-                + list(item.get("file_paths_read") or [])
-            )
+            for value in (list(item.get("file_paths_modified") or []) + list(item.get("file_paths_read") or []))
             if isinstance(value, str)
         )
         commands.append(
@@ -12388,8 +11738,8 @@ def _apply_runtime_agent_quality_scores(
     result: Any,
     tool_activity: List[Dict[str, Any]],
 ) -> None:
-    user_texts, assistant_texts, tool_result_texts, commands = (
-        _collect_agent_quality_context_from_request_body(request_body)
+    user_texts, assistant_texts, tool_result_texts, commands = _collect_agent_quality_context_from_request_body(
+        request_body
     )
     assistant_texts.extend(_collect_agent_quality_response_texts(result))
     commands.extend(_agent_quality_commands_from_tool_activity(tool_activity))
@@ -12504,9 +11854,7 @@ def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
     )
     for field in _SESSION_HISTORY_LATENCY_FIELDS:
         explicit_value = _nonnegative_float_or_none(record.get(field))
-        record[field] = (
-            explicit_value if explicit_value is not None else derived_latency.get(field)
-        )
+        record[field] = explicit_value if explicit_value is not None else derived_latency.get(field)
 
 
 _GEMINI_CONTROL_PLANE_METHOD_LABELS = {
@@ -12579,13 +11927,10 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
         metadata,
     )
     has_gemini_quota_payload = isinstance(metadata.get("google_retrieve_user_quota"), dict)
-    if (
-        provider in {"gemini", "google"}
-        and (
-            metadata.get("aawm_rate_limit_observation_only") is True
-            or has_gemini_quota_payload
-            or gemini_control_plane_method is not None
-        )
+    if provider in {"gemini", "google"} and (
+        metadata.get("aawm_rate_limit_observation_only") is True
+        or has_gemini_quota_payload
+        or gemini_control_plane_method is not None
     ):
         zero_token_class = "non_usage_rate_limit_observation"
         zero_token_reason = "gemini_control_plane_rate_limit_payload"
@@ -12597,9 +11942,7 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
             metadata["gemini_control_plane_excluded"] = True
             model = _clean_non_empty_string(record.get("model"))
             if model is None or model.lower() in {"unknown", "null", "none"}:
-                record["model"] = _GEMINI_CONTROL_PLANE_METHOD_LABELS[
-                    gemini_control_plane_method
-                ]
+                record["model"] = _GEMINI_CONTROL_PLANE_METHOD_LABELS[gemini_control_plane_method]
     elif (
         provider == "gemini"
         and metadata.get("codex_adapter_output_shape") == "openai_responses"
@@ -12613,8 +11956,7 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
     elif (
         provider in {"xai", "grok"}
         and str(record.get("model") or "").strip().lower() == "unknown"
-        and str(metadata.get("passthrough_route_family") or "").strip().lower()
-        == "grok_cli_chat_proxy"
+        and str(metadata.get("passthrough_route_family") or "").strip().lower() == "grok_cli_chat_proxy"
     ):
         inferred_model = _first_non_empty_string(
             metadata.get("grok_model_override"),
@@ -12756,9 +12098,7 @@ def _normalize_reporting_exclusion_state_on_record(record: Dict[str, Any]) -> No
     if call_type == "codex_transcript" or source == "codex_transcript":
         metadata["session_history_usage_record"] = False
         metadata["session_history_reporting_excluded"] = True
-        metadata["session_history_reporting_exclusion_reason"] = (
-            "synthetic_codex_transcript"
-        )
+        metadata["session_history_reporting_exclusion_reason"] = "synthetic_codex_transcript"
 
     if model == "unknown":
         metadata["session_history_model_unresolved"] = True
@@ -12968,11 +12308,7 @@ def _normalize_sensitive_config_change_state_on_record(record: Dict[str, Any]) -
         for item in tool_activity:
             if not isinstance(item, dict):
                 continue
-            modified_paths.extend(
-                value
-                for value in (item.get("file_paths_modified") or [])
-                if isinstance(value, str)
-            )
+            modified_paths.extend(value for value in (item.get("file_paths_modified") or []) if isinstance(value, str))
 
     flags = _sensitive_config_change_flags_from_paths(modified_paths)
     for field, derived_value in flags.items():
@@ -13128,8 +12464,7 @@ def _classify_tool_kind(tool_name: str) -> str:
     ):
         return "modify"
     if normalized_name in _TOOL_ACTIVITY_READ_NAMES or any(
-        token in normalized_name
-        for token in ("read", "view", "grep", "glob", "search", "fetch")
+        token in normalized_name for token in ("read", "view", "grep", "glob", "search", "fetch")
     ):
         return "read"
     return "other"
@@ -13157,9 +12492,7 @@ def _build_tool_activity_entry(
         if tool_name.strip().lower() in {"apply_patch", "applypatch"}:
             patch_text = _extract_command_text_from_tool_arguments(parsed_arguments)
             if patch_text:
-                file_paths_modified = _dedupe_strings(
-                    file_paths_modified + _extract_paths_from_patch_text(patch_text)
-                )
+                file_paths_modified = _dedupe_strings(file_paths_modified + _extract_paths_from_patch_text(patch_text))
     elif tool_kind == "command":
         command_text = _extract_command_text_from_tool_arguments(parsed_arguments)
 
@@ -13172,9 +12505,7 @@ def _build_tool_activity_entry(
         git_commit_count = _count_git_subcommand(command_text, "commit")
         git_push_count = _count_git_subcommand(command_text, "push")
 
-    sensitive_config_flags = _sensitive_config_change_flags_from_paths(
-        file_paths_modified
-    )
+    sensitive_config_flags = _sensitive_config_change_flags_from_paths(file_paths_modified)
     stored_arguments = _sanitize_tool_activity_arguments_for_sensitive_config(
         parsed_arguments,
         file_paths_modified=file_paths_modified,
@@ -13269,6 +12600,7 @@ def _extract_tool_activity_from_message(message: Any) -> List[Dict[str, Any]]:
 
     return activity
 
+
 _RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES: Dict[str, str] = {
     "apply_patch_call": "apply_patch",
     "custom_tool_call": "custom_tool_call",
@@ -13279,14 +12611,10 @@ _RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES: Dict[str, str] = {
     "file_search_call": "file_search_call",
     "image_generation_call": "image_generation_call",
 }
-_RESPONSE_OUTPUT_TOOL_ITEM_TYPES = set(_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES) | {
-    "function_call"
-}
+_RESPONSE_OUTPUT_TOOL_ITEM_TYPES = set(_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES) | {"function_call"}
 
 
-def _extract_response_output_items(
-    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
-) -> List[Any]:
+def _extract_response_output_items(result: Any, standard_logging_object: Optional[Dict[str, Any]] = None) -> List[Any]:
     candidate_sources: List[Any] = [result]
     if isinstance(standard_logging_object, dict):
         candidate_sources.append(standard_logging_object.get("response"))
@@ -13360,20 +12688,15 @@ def _extract_response_output_tool_activity(
 
     return activity
 
+
 def _summarize_tool_activity(tool_activity: List[Dict[str, Any]]) -> Dict[str, int]:
     read_paths: List[str] = []
     modified_paths: List[str] = []
     git_commit_count = 0
     git_push_count = 0
     for item in tool_activity:
-        read_paths.extend(
-            value for value in (item.get("file_paths_read") or []) if isinstance(value, str)
-        )
-        modified_paths.extend(
-            value
-            for value in (item.get("file_paths_modified") or [])
-            if isinstance(value, str)
-        )
+        read_paths.extend(value for value in (item.get("file_paths_read") or []) if isinstance(value, str))
+        modified_paths.extend(value for value in (item.get("file_paths_modified") or []) if isinstance(value, str))
         git_commit_count += _safe_int(item.get("git_commit_count")) or 0
         git_push_count += _safe_int(item.get("git_push_count")) or 0
     return {
@@ -13391,9 +12714,7 @@ def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
         tool_names: List[str] = []
         for tool_call in raw_tool_calls:
             function_obj = _maybe_get(tool_call, "function")
-            tool_name = _maybe_get(function_obj, "name") or _maybe_get(
-                tool_call, "name"
-            )
+            tool_name = _maybe_get(function_obj, "name") or _maybe_get(tool_call, "name")
             if isinstance(tool_name, str) and tool_name:
                 tool_names.append(tool_name)
         return len(raw_tool_calls), tool_names
@@ -13421,9 +12742,7 @@ def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
     if isinstance(provider_tool_calls, list):
         tool_names = []
         for tool_call in provider_tool_calls:
-            tool_name = _maybe_get(_maybe_get(tool_call, "function"), "name") or _maybe_get(
-                tool_call, "name"
-            )
+            tool_name = _maybe_get(_maybe_get(tool_call, "function"), "name") or _maybe_get(tool_call, "name")
             if isinstance(tool_name, str) and tool_name:
                 tool_names.append(tool_name)
         return len(provider_tool_calls), tool_names
@@ -13549,16 +12868,11 @@ def _extract_trace_id(kwargs: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _infer_usage_breakout_provider_prefix(
-    kwargs: Dict[str, Any], metadata: Dict[str, Any]
-) -> Optional[str]:
+def _infer_usage_breakout_provider_prefix(kwargs: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[str]:
     route_family = metadata.get("passthrough_route_family")
     if isinstance(route_family, str) and route_family.strip():
         route_family_lower = route_family.lower()
-        if (
-            route_family_lower == "codex_responses"
-            or route_family_lower.startswith("codex_")
-        ):
+        if route_family_lower == "codex_responses" or route_family_lower.startswith("codex_"):
             return "codex"
         if "gemini" in route_family_lower:
             return "gemini"
@@ -13618,30 +12932,20 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
     metadata["usage_tool_call_count"] = tool_call_count
     metadata["usage_tool_names"] = tool_names
     metadata[f"{provider_prefix}_cache_read_input_tokens"] = cache_read_input_tokens
-    metadata[f"{provider_prefix}_cache_creation_input_tokens"] = (
-        cache_creation_input_tokens
-    )
+    metadata[f"{provider_prefix}_cache_creation_input_tokens"] = cache_creation_input_tokens
     metadata[f"{provider_prefix}_tool_call_count"] = tool_call_count
     metadata[f"{provider_prefix}_tool_names"] = tool_names
 
     if reported_reasoning_tokens is not None:
         metadata["usage_reasoning_tokens_reported"] = reported_reasoning_tokens
-        metadata["usage_reasoning_tokens_source"] = (
-            reasoning_tokens_source or "provider_reported"
-        )
-        metadata[f"{provider_prefix}_reasoning_tokens_reported"] = (
-            reported_reasoning_tokens
-        )
+        metadata["usage_reasoning_tokens_source"] = reasoning_tokens_source or "provider_reported"
+        metadata[f"{provider_prefix}_reasoning_tokens_reported"] = reported_reasoning_tokens
 
     tags_to_add = [f"{provider_prefix}-usage-breakout"]
     if reported_reasoning_tokens is not None:
-        tags_to_add.extend(
-            ["reasoning-tokens-reported", f"{provider_prefix}-reasoning-tokens-reported"]
-        )
+        tags_to_add.extend(["reasoning-tokens-reported", f"{provider_prefix}-reasoning-tokens-reported"])
     if cache_read_input_tokens > 0:
-        tags_to_add.extend(
-            ["cache-read-input-tokens", f"{provider_prefix}-cache-read-input-tokens"]
-        )
+        tags_to_add.extend(["cache-read-input-tokens", f"{provider_prefix}-cache-read-input-tokens"])
     if cache_creation_input_tokens > 0:
         tags_to_add.extend(
             [
@@ -13732,21 +13036,13 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
     metadata[f"{provider_family}_provider_cache_status"] = cache_state["status"]
     metadata[f"{provider_family}_provider_cache_miss"] = cache_state["miss"]
     if cache_state.get("miss_reason"):
-        metadata[f"{provider_family}_provider_cache_miss_reason"] = cache_state[
-            "miss_reason"
-        ]
+        metadata[f"{provider_family}_provider_cache_miss_reason"] = cache_state["miss_reason"]
     if cache_state.get("miss_token_count") is not None:
-        metadata[f"{provider_family}_provider_cache_miss_token_count"] = cache_state[
-            "miss_token_count"
-        ]
+        metadata[f"{provider_family}_provider_cache_miss_token_count"] = cache_state["miss_token_count"]
     if cache_state.get("miss_cost_usd") is not None:
-        metadata[f"{provider_family}_provider_cache_miss_cost_usd"] = cache_state[
-            "miss_cost_usd"
-        ]
+        metadata[f"{provider_family}_provider_cache_miss_cost_usd"] = cache_state["miss_cost_usd"]
     if cache_state.get("miss_cost_basis"):
-        metadata[f"{provider_family}_provider_cache_miss_cost_basis"] = cache_state[
-            "miss_cost_basis"
-        ]
+        metadata[f"{provider_family}_provider_cache_miss_cost_basis"] = cache_state["miss_cost_basis"]
     if cache_state.get("source"):
         metadata[f"{provider_family}_provider_cache_source"] = cache_state["source"]
 
@@ -13769,17 +13065,11 @@ def _enrich_provider_cache_metadata(kwargs: Dict[str, Any], result: Any) -> None
     if status == "hit":
         tags_to_add.extend(["provider-cache-hit", f"{provider_family}-provider-cache-hit"])
     elif status == "write":
-        tags_to_add.extend(
-            ["provider-cache-write", f"{provider_family}-provider-cache-write"]
-        )
+        tags_to_add.extend(["provider-cache-write", f"{provider_family}-provider-cache-write"])
     elif status == "unsupported":
-        tags_to_add.extend(
-            ["provider-cache-unsupported", f"{provider_family}-provider-cache-unsupported"]
-        )
+        tags_to_add.extend(["provider-cache-unsupported", f"{provider_family}-provider-cache-unsupported"])
     if cache_state.get("miss_reason") == "partial_cache_hit":
-        tags_to_add.extend(
-            ["provider-cache-partial-hit", f"{provider_family}-provider-cache-partial-hit"]
-        )
+        tags_to_add.extend(["provider-cache-partial-hit", f"{provider_family}-provider-cache-partial-hit"])
     if tags_to_add:
         _merge_tags(metadata, tags_to_add)
         _append_langfuse_span(
@@ -13926,15 +13216,9 @@ def _synthesize_result_from_spend_log_row(
 
     if not isinstance(result.get("usage"), dict):
         reconstructed_usage = dict(usage_object)
-        reconstructed_usage.setdefault(
-            "prompt_tokens", _safe_int(spend_log_row.get("prompt_tokens")) or 0
-        )
-        reconstructed_usage.setdefault(
-            "completion_tokens", _safe_int(spend_log_row.get("completion_tokens")) or 0
-        )
-        reconstructed_usage.setdefault(
-            "total_tokens", _safe_int(spend_log_row.get("total_tokens")) or 0
-        )
+        reconstructed_usage.setdefault("prompt_tokens", _safe_int(spend_log_row.get("prompt_tokens")) or 0)
+        reconstructed_usage.setdefault("completion_tokens", _safe_int(spend_log_row.get("completion_tokens")) or 0)
+        reconstructed_usage.setdefault("total_tokens", _safe_int(spend_log_row.get("total_tokens")) or 0)
         result["usage"] = reconstructed_usage
 
     return result
@@ -14028,14 +13312,12 @@ def _build_backfill_kwargs_from_spend_log_row(
         "source_request_id": str(request_id),
         "source_spend_log_session_field": (
             str(spend_log_row.get("session_id")).strip()
-            if spend_log_row.get("session_id") is not None
-            and str(spend_log_row.get("session_id")).strip()
+            if spend_log_row.get("session_id") is not None and str(spend_log_row.get("session_id")).strip()
             else None
         ),
     }
 
     return kwargs, result, provenance
-
 
 
 # _derive_session_history_reasoning_fields moved to litellm.integrations.aawm_session_history.record
@@ -14088,9 +13370,7 @@ def _extract_agent_context_from_langfuse_trace_observation(
         observation.get("output"),
         trace.get("output"),
     ):
-        agent_name, tenant_id = _extract_agent_context_from_text(
-            _serialize_searchable_text(candidate)
-        )
+        agent_name, tenant_id = _extract_agent_context_from_text(_serialize_searchable_text(candidate))
         if agent_name:
             return agent_name, explicit_tenant_id or tenant_id
 
@@ -14164,9 +13444,7 @@ def _build_usage_object_from_langfuse_observation(observation: Dict[str, Any]) -
         metadata_usage_object = _build_usage_object_from_metadata(metadata)
         if isinstance(metadata_usage_object, dict):
             usage_object.update(metadata_usage_object)
-    output_usage_object = _build_usage_object_from_langfuse_output(
-        observation.get("output")
-    )
+    output_usage_object = _build_usage_object_from_langfuse_output(observation.get("output"))
     if isinstance(output_usage_object, dict):
         usage_object.update(output_usage_object)
     if isinstance(usage, dict):
@@ -14214,9 +13492,7 @@ def _build_usage_object_from_langfuse_observation(observation: Dict[str, Any]) -
 
     completion_tokens_details = _extract_completion_tokens_details(usage_object)
     if isinstance(completion_tokens_details, dict):
-        usage_object.setdefault(
-            "completion_tokens_details", completion_tokens_details
-        )
+        usage_object.setdefault("completion_tokens_details", completion_tokens_details)
 
     cache_read_tokens = _safe_int(usage_object.get("cache_read_input_tokens"))
     if cache_read_tokens is None:
@@ -14240,10 +13516,7 @@ def _extract_first_langfuse_response_message(output_payload: Any) -> Any:
             return _extract_first_response_message(output_payload)
         if isinstance(output_payload.get("message"), dict):
             return output_payload["message"]
-        if any(
-            key in output_payload
-            for key in ("content", "tool_calls", "reasoning_content", "thinking_blocks")
-        ):
+        if any(key in output_payload for key in ("content", "tool_calls", "reasoning_content", "thinking_blocks")):
             return output_payload
     return None
 
@@ -14260,16 +13533,12 @@ def _infer_provider_from_langfuse_observation(
     if auto_agent_provider is not None:
         return auto_agent_provider
 
-    route_provider = _session_history_provider_from_route_family(
-        metadata.get("passthrough_route_family")
-    )
+    route_provider = _session_history_provider_from_route_family(metadata.get("passthrough_route_family"))
     if route_provider is not None:
         return route_provider
 
     api_base = (
-        metadata.get("api_base")
-        or _maybe_get(metadata.get("hidden_params"), "api_base")
-        or observation.get("apiBase")
+        metadata.get("api_base") or _maybe_get(metadata.get("hidden_params"), "api_base") or observation.get("apiBase")
     )
     api_base_provider = _session_history_provider_from_api_base(
         api_base,
@@ -14306,9 +13575,11 @@ def _infer_provider_from_langfuse_observation(
 
 def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> List[str]:
     request_tags = metadata.get("tags")
-    normalized_tags = [
-        str(tag) for tag in request_tags if isinstance(tag, str) and tag.strip()
-    ] if isinstance(request_tags, list) else []
+    normalized_tags = (
+        [str(tag) for tag in request_tags if isinstance(tag, str) and tag.strip()]
+        if isinstance(request_tags, list)
+        else []
+    )
 
     route_family = metadata.get("passthrough_route_family")
     if isinstance(route_family, str) and route_family.strip():
@@ -14321,9 +13592,7 @@ def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> Lis
             if isinstance(key, str) and key.strip():
                 normalized_tags.append(f"anthropic-billing-header-key:{key}")
                 if value is not None and str(value).strip():
-                    normalized_tags.append(
-                        f"anthropic-billing-header:{key}={str(value).strip()}"
-                    )
+                    normalized_tags.append(f"anthropic-billing-header:{key}={str(value).strip()}")
 
     thinking_type = metadata.get("claude_thinking_type")
     if isinstance(thinking_type, str) and thinking_type.strip():
@@ -14362,16 +13631,12 @@ def _derive_langfuse_trace_tags_from_langfuse_trace(
     trace: Dict[str, Any],
 ) -> Tuple[Optional[str], List[str]]:
     trace_id = trace.get("id")
-    normalized_trace_id = (
-        str(trace_id).strip() if trace_id is not None and str(trace_id).strip() else None
-    )
+    normalized_trace_id = str(trace_id).strip() if trace_id is not None and str(trace_id).strip() else None
 
     derived_tags: List[str] = []
     existing_trace_tags = trace.get("tags")
     if isinstance(existing_trace_tags, list):
-        derived_tags.extend(
-            str(tag) for tag in existing_trace_tags if isinstance(tag, str) and tag.strip()
-        )
+        derived_tags.extend(str(tag) for tag in existing_trace_tags if isinstance(tag, str) and tag.strip())
 
     observations = trace.get("observations")
     if isinstance(observations, list):
@@ -14383,11 +13648,7 @@ def _derive_langfuse_trace_tags_from_langfuse_trace(
                 continue
             derived_tags.extend(_derive_request_tags_from_langfuse_metadata(metadata))
 
-    return normalized_trace_id, sorted(
-        {tag for tag in derived_tags if isinstance(tag, str) and tag.strip()}
-    )
-
-
+    return normalized_trace_id, sorted({tag for tag in derived_tags if isinstance(tag, str) and tag.strip()})
 
 
 def _iter_litellm_metadata_sources(
@@ -14487,8 +13748,6 @@ def _sanitize_worker_context_exhaustion_metadata(metadata: Dict[str, Any]) -> No
         metadata["worker_context_exhaustion_completed"] = False
 
 
-
-
 def _is_anthropic_session_history_context(
     *,
     provider: Optional[str],
@@ -14498,12 +13757,16 @@ def _is_anthropic_session_history_context(
     provider_lower = str(provider or "").strip().lower()
     if provider_lower in {"anthropic", "azure_ai", "bedrock"}:
         return True
-    route_family = str(
-        metadata.get("passthrough_route_family")
-        or metadata.get("route_family")
-        or metadata.get("openai_passthrough_route_family")
-        or ""
-    ).strip().lower()
+    route_family = (
+        str(
+            metadata.get("passthrough_route_family")
+            or metadata.get("route_family")
+            or metadata.get("openai_passthrough_route_family")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
     if "anthropic" in route_family:
         return True
     model_lower = str(resolved_model or "").strip().lower()
@@ -14574,11 +13837,7 @@ def _iter_anthropic_beta_header_candidates(
 
 
 def _split_anthropic_beta_values(raw_value: str) -> List[str]:
-    return [
-        token.strip()
-        for token in str(raw_value).replace(";", ",").split(",")
-        if token.strip()
-    ]
+    return [token.strip() for token in str(raw_value).replace(";", ",").split(",") if token.strip()]
 
 
 def _extract_context_1m_beta_values(
@@ -14590,9 +13849,8 @@ def _extract_context_1m_beta_values(
     for raw in _iter_anthropic_beta_header_candidates(headers, metadata):
         for beta_value in _split_anthropic_beta_values(raw):
             beta_lower = beta_value.lower()
-            if (
-                beta_lower == _ANTHROPIC_CONTEXT_1M_BETA_HEADER.lower()
-                or beta_lower.startswith(_ANTHROPIC_CONTEXT_1M_BETA_PREFIX)
+            if beta_lower == _ANTHROPIC_CONTEXT_1M_BETA_HEADER.lower() or beta_lower.startswith(
+                _ANTHROPIC_CONTEXT_1M_BETA_PREFIX
             ):
                 if beta_value not in seen:
                     seen.add(beta_value)
@@ -14713,11 +13971,7 @@ def _enrich_anthropic_context_window_metadata(
     provider: Optional[str] = None,
     allow_implicit_default: bool = True,
 ) -> None:
-    model_value = _clean_non_empty_string(
-        resolved_model
-        or metadata.get("model")
-        or kwargs.get("model")
-    ) or "unknown"
+    model_value = _clean_non_empty_string(resolved_model or metadata.get("model") or kwargs.get("model")) or "unknown"
     provider_value = _clean_non_empty_string(
         provider or kwargs.get("custom_llm_provider") or metadata.get("custom_llm_provider")
     )
@@ -14775,6 +14029,7 @@ def _enrich_backfill_anthropic_context_window_metadata(
     )
     record["metadata"] = metadata
 
+
 def _promote_worker_context_exhaustion_metadata(
     kwargs: Dict[str, Any],
     metadata: Dict[str, Any],
@@ -14815,10 +14070,7 @@ def _sanitize_session_history_api_base(value: Any) -> Optional[str]:
     if parsed.port is not None:
         netloc = f"{netloc}:{parsed.port}"
 
-    return (
-        urlunsplit((parsed.scheme, netloc, parsed.path.rstrip("/"), "", ""))
-        or None
-    )
+    return urlunsplit((parsed.scheme, netloc, parsed.path.rstrip("/"), "", "")) or None
 
 
 def _is_local_session_history_api_base(value: Any) -> bool:
@@ -14842,12 +14094,7 @@ def _is_local_session_history_api_base(value: Any) -> bool:
     except ValueError:
         return False
 
-    return (
-        parsed_ip.is_loopback
-        or parsed_ip.is_private
-        or parsed_ip.is_link_local
-        or parsed_ip.is_unspecified
-    )
+    return parsed_ip.is_loopback or parsed_ip.is_private or parsed_ip.is_link_local or parsed_ip.is_unspecified
 
 
 def _extract_session_history_api_base(
@@ -14891,29 +14138,32 @@ def _resolve_inbound_model_alias(
     metadata: Dict[str, Any],
     resolved_model: str,
 ) -> str:
-    return _first_non_empty_string(
-        metadata.get("model_alias_label"),
-        metadata.get("requested_model_alias"),
-        metadata.get("codex_auto_agent_alias"),
-        metadata.get("anthropic_auto_agent_alias"),
-        metadata.get("aawm_auto_agent_alias"),
-        _maybe_get_path(
-            kwargs.get("litellm_params"),
-            "proxy_server_request",
-            "body",
-            "model",
-        ),
-        _maybe_get_path(
-            kwargs.get("passthrough_logging_payload"),
-            "request_body",
-            "model",
-        ),
-        _maybe_get_path(standard_logging_object, "request_body", "model"),
-        kwargs.get("model"),
-        standard_logging_object.get("model"),
-        metadata.get("model"),
-        resolved_model,
-    ) or "unknown"
+    return (
+        _first_non_empty_string(
+            metadata.get("model_alias_label"),
+            metadata.get("requested_model_alias"),
+            metadata.get("codex_auto_agent_alias"),
+            metadata.get("anthropic_auto_agent_alias"),
+            metadata.get("aawm_auto_agent_alias"),
+            _maybe_get_path(
+                kwargs.get("litellm_params"),
+                "proxy_server_request",
+                "body",
+                "model",
+            ),
+            _maybe_get_path(
+                kwargs.get("passthrough_logging_payload"),
+                "request_body",
+                "model",
+            ),
+            _maybe_get_path(standard_logging_object, "request_body", "model"),
+            kwargs.get("model"),
+            standard_logging_object.get("model"),
+            metadata.get("model"),
+            resolved_model,
+        )
+        or "unknown"
+    )
 
 
 def _resolve_inbound_model_alias_from_langfuse(
@@ -14924,18 +14174,21 @@ def _resolve_inbound_model_alias_from_langfuse(
     output_model: Optional[str],
     resolved_model: str,
 ) -> str:
-    return _first_non_empty_string(
-        metadata.get("model_alias_label"),
-        metadata.get("requested_model_alias"),
-        metadata.get("codex_auto_agent_alias"),
-        metadata.get("anthropic_auto_agent_alias"),
-        metadata.get("aawm_auto_agent_alias"),
-        input_model,
-        metadata.get("model"),
-        observation.get("model"),
-        output_model,
-        resolved_model,
-    ) or "unknown"
+    return (
+        _first_non_empty_string(
+            metadata.get("model_alias_label"),
+            metadata.get("requested_model_alias"),
+            metadata.get("codex_auto_agent_alias"),
+            metadata.get("anthropic_auto_agent_alias"),
+            metadata.get("aawm_auto_agent_alias"),
+            input_model,
+            metadata.get("model"),
+            observation.get("model"),
+            output_model,
+            resolved_model,
+        )
+        or "unknown"
+    )
 
 
 def _normalize_session_history_model_group(
@@ -15070,9 +14323,7 @@ def _apply_local_embedding_route_metadata(
         return resolved_provider, resolved_model
 
     upstream_model = _strip_local_provider_model_prefix(resolved_model)
-    route_model = _clean_non_empty_string(upstream_model) or _clean_non_empty_string(
-        model_group
-    )
+    route_model = _clean_non_empty_string(upstream_model) or _clean_non_empty_string(model_group)
     if not route_model:
         return "local_embed", resolved_model
 
@@ -15107,10 +14358,7 @@ def _apply_local_llm_route_metadata(
     ):
         return resolved_provider, resolved_model
 
-    upstream_model = (
-        _clean_non_empty_string(_strip_local_provider_model_prefix(resolved_model))
-        or model_group
-    )
+    upstream_model = _clean_non_empty_string(_strip_local_provider_model_prefix(resolved_model)) or model_group
 
     metadata["aawm_local_route"] = True
     metadata["aawm_local_route_family"] = "local_llm_chat"
@@ -15150,9 +14398,7 @@ def _resolve_local_biomed_session_history_route(
     except ValueError:
         return None
 
-    route_info = _LOCAL_BIOMED_SESSION_HISTORY_ROUTES.get(
-        (parsed.port or 0, parsed.path.rstrip("/"))
-    )
+    route_info = _LOCAL_BIOMED_SESSION_HISTORY_ROUTES.get((parsed.port or 0, parsed.path.rstrip("/")))
     if route_info is None:
         return None
     return dict(route_info)
@@ -15301,7 +14547,6 @@ def _resolve_xai_grok_model_override(
     return None
 
 
-
 # _build_session_history_record moved to litellm.integrations.aawm_session_history.record
 # _build_session_history_db_payload moved to litellm.integrations.aawm_session_history.record
 def _strip_postgres_nul_bytes(value: Any) -> Any:
@@ -15345,8 +14590,7 @@ def _build_tool_definition_snapshot_db_payload(
 
     session_id = _clean_non_empty_string(record.get("session_id"))
     snapshot_hash = _clean_non_empty_string(
-        record.get("aawm_tool_definition_snapshot_hash")
-        or metadata.get("aawm_tool_definition_snapshot_hash")
+        record.get("aawm_tool_definition_snapshot_hash") or metadata.get("aawm_tool_definition_snapshot_hash")
     )
     if not session_id or not snapshot_hash:
         return None
@@ -15365,23 +14609,13 @@ def _build_tool_definition_snapshot_db_payload(
     return (
         session_id,
         snapshot_hash,
-        _clean_non_empty_string(
-            metadata.get("aawm_tool_definition_capture_version")
-        ),
+        _clean_non_empty_string(metadata.get("aawm_tool_definition_capture_version")),
         _clean_non_empty_string(metadata.get("aawm_tool_definition_capture_source")),
         _safe_int(metadata.get("aawm_tool_definition_count")),
         _safe_int(metadata.get("aawm_tool_definition_captured_count")),
-        json.dumps(
-            _json_safe_rate_limit_value(sources if isinstance(sources, list) else [])
-        ),
-        json.dumps(
-            _json_safe_rate_limit_value(names if isinstance(names, list) else [])
-        ),
-        json.dumps(
-            _json_safe_rate_limit_value(
-                tool_types if isinstance(tool_types, list) else []
-            )
-        ),
+        json.dumps(_json_safe_rate_limit_value(sources if isinstance(sources, list) else [])),
+        json.dumps(_json_safe_rate_limit_value(names if isinstance(names, list) else [])),
+        json.dumps(_json_safe_rate_limit_value(tool_types if isinstance(tool_types, list) else [])),
         bool(metadata.get("aawm_tool_definition_snapshot_truncated")),
         json.dumps(_json_safe_rate_limit_value(snapshot)),
         _clean_non_empty_string(record.get("litellm_call_id")),
@@ -15474,17 +14708,9 @@ def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
     provider = _clean_non_empty_string(record.get("provider")) or "unknown"
     source = str(record.get("source") or "").lower()
     client_family = str(record.get("client_family") or "").lower()
-    if (
-        provider == "antigravity"
-        or client_family == "antigravity_code_assist"
-        or source.startswith("antigravity_")
-    ):
+    if provider == "antigravity" or client_family == "antigravity_code_assist" or source.startswith("antigravity_"):
         return "antigravity"
-    if (
-        provider in {"opencode", "opencode_zen"}
-        or client_family == "opencode_zen"
-        or source.startswith("opencode_")
-    ):
+    if provider in {"opencode", "opencode_zen"} or client_family == "opencode_zen" or source.startswith("opencode_"):
         return "opencode_zen"
     if (
         provider in {"gemini", "google_code_assist"}
@@ -15532,9 +14758,7 @@ def _rate_limit_storage_quota_type(record: Dict[str, Any]) -> str:
     limit_scope = str(record.get("limit_scope") or "").lower()
     raw_provider_fields = record.get("raw_provider_fields")
     token_type = (
-        str(raw_provider_fields.get("tokenType") or "").lower()
-        if isinstance(raw_provider_fields, dict)
-        else ""
+        str(raw_provider_fields.get("tokenType") or "").lower() if isinstance(raw_provider_fields, dict) else ""
     )
     source = str(record.get("source") or "").lower()
     provider = _rate_limit_storage_provider(record)
@@ -15559,9 +14783,7 @@ def _rate_limit_storage_remaining_pct(record: Dict[str, Any]) -> Optional[float]
     if remaining_pct is not None:
         return max(0.0, min(100.0, remaining_pct))
 
-    remaining_fraction = _safe_float(
-        _maybe_get_path(record.get("raw_provider_fields"), "remainingFraction")
-    )
+    remaining_fraction = _safe_float(_maybe_get_path(record.get("raw_provider_fields"), "remainingFraction"))
     if remaining_fraction is not None:
         return max(0.0, min(100.0, remaining_fraction * 100.0))
 
@@ -15819,9 +15041,7 @@ def _alias_routing_audit_event_key(
     event: Dict[str, Any],
     event_index: int,
 ) -> Optional[str]:
-    litellm_call_id = _clean_non_empty_string(
-        event.get("litellm_call_id") or record.get("litellm_call_id")
-    )
+    litellm_call_id = _clean_non_empty_string(event.get("litellm_call_id") or record.get("litellm_call_id"))
     if litellm_call_id is None:
         return None
     key_material = [
@@ -15835,9 +15055,7 @@ def _alias_routing_audit_event_key(
         event.get("candidate_status"),
         event_index,
     ]
-    digest = hashlib.sha256(
-        json.dumps(key_material, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()[:24]
+    digest = hashlib.sha256(json.dumps(key_material, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
     return f"{litellm_call_id}:alias-routing:{digest}"
 
 
@@ -15847,16 +15065,8 @@ def _infer_alias_routing_family(
 ) -> str:
     return (
         _clean_non_empty_string(event.get("alias_family"))
-        or (
-            "codex_auto_agent"
-            if _clean_non_empty_string(metadata.get("codex_auto_agent_alias"))
-            else None
-        )
-        or (
-            "anthropic_auto_agent"
-            if _clean_non_empty_string(metadata.get("anthropic_auto_agent_alias"))
-            else None
-        )
+        or ("codex_auto_agent" if _clean_non_empty_string(metadata.get("codex_auto_agent_alias")) else None)
+        or ("anthropic_auto_agent" if _clean_non_empty_string(metadata.get("anthropic_auto_agent_alias")) else None)
         or "unknown"
     )
 
@@ -15882,13 +15092,10 @@ def _build_alias_routing_audit_db_payload(
             event_index=event_index,
         ),
         _alias_routing_audit_observed_at(record, event),
-        _clean_non_empty_string(event.get("session_id"))
-        or _clean_non_empty_string(record.get("session_id")),
+        _clean_non_empty_string(event.get("session_id")) or _clean_non_empty_string(record.get("session_id")),
         _clean_non_empty_string(event.get("session_key")),
-        _clean_non_empty_string(event.get("trace_id"))
-        or _clean_non_empty_string(record.get("trace_id")),
-        _clean_non_empty_string(event.get("litellm_call_id"))
-        or _clean_non_empty_string(record.get("litellm_call_id")),
+        _clean_non_empty_string(event.get("trace_id")) or _clean_non_empty_string(record.get("trace_id")),
+        _clean_non_empty_string(event.get("litellm_call_id")) or _clean_non_empty_string(record.get("litellm_call_id")),
         _clean_non_empty_string(event.get("alias_model"))
         or _clean_non_empty_string(metadata.get("requested_model_alias"))
         or "unknown",
@@ -15971,10 +15178,7 @@ def _rate_limit_previous_observation_row_to_dict(row: Any) -> Dict[str, Any]:
     try:
         row_dict = dict(row)
     except Exception:
-        return {
-            key: _maybe_get(row, key)
-            for key in _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS
-        }
+        return {key: _maybe_get(row, key) for key in _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS}
     row_dict.pop("input_limit_key", None)
     return row_dict
 
@@ -16033,9 +15237,7 @@ async def _fetch_previous_rate_limit_observations(
         sources.append(observation.get("source"))
         observed_ats.append(observation["observed_at"])
 
-    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {
-        limit_key: None for limit_key in limit_keys
-    }
+    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {limit_key: None for limit_key in limit_keys}
     rows = await conn.fetch(
         _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL,
         limit_keys,
@@ -16048,9 +15250,7 @@ async def _fetch_previous_rate_limit_observations(
     for row in rows:
         limit_key = _maybe_get(row, "input_limit_key")
         if isinstance(limit_key, str) and limit_key in previous_by_limit_key:
-            previous_by_limit_key[limit_key] = (
-                _rate_limit_previous_observation_row_to_dict(row)
-            )
+            previous_by_limit_key[limit_key] = _rate_limit_previous_observation_row_to_dict(row)
     return previous_by_limit_key
 
 
@@ -16060,9 +15260,7 @@ async def _derive_rate_limit_transitions(
     initial_previous_by_limit_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     transitions: List[Dict[str, Any]] = []
-    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = dict(
-        initial_previous_by_limit_key or {}
-    )
+    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = dict(initial_previous_by_limit_key or {})
     ordered_observations = sorted(
         observations,
         key=lambda item: (
@@ -16073,11 +15271,7 @@ async def _derive_rate_limit_transitions(
     missing_previous_observations: List[Dict[str, Any]] = []
     for observation in ordered_observations:
         limit_key = _rate_limit_storage_quota_key(observation)
-        if (
-            isinstance(limit_key, str)
-            and limit_key
-            and limit_key not in previous_by_limit_key
-        ):
+        if isinstance(limit_key, str) and limit_key and limit_key not in previous_by_limit_key:
             previous_by_limit_key[limit_key] = None
             missing_previous_observations.append(observation)
     if missing_previous_observations:
@@ -16086,7 +15280,7 @@ async def _derive_rate_limit_transitions(
                 conn,
                 missing_previous_observations,
             )
-    )
+        )
     for observation in ordered_observations:
         limit_key = _rate_limit_storage_quota_key(observation)
         if not isinstance(limit_key, str) or not limit_key:
@@ -16095,9 +15289,7 @@ async def _derive_rate_limit_transitions(
         if previous is not None:
             classification = _classify_rate_limit_transition(previous, observation)
             if classification is not None:
-                transitions.append(
-                    _build_rate_limit_transition(previous, observation, classification)
-                )
+                transitions.append(_build_rate_limit_transition(previous, observation, classification))
         previous_by_limit_key[limit_key] = observation
     return transitions
 
@@ -16112,8 +15304,7 @@ async def _filter_meaningful_rate_limit_observations(
     indexed_observations = [
         (index, observation)
         for index, observation in enumerate(observations)
-        if isinstance(observation.get("limit_key"), str)
-        and observation.get("limit_key")
+        if isinstance(observation.get("limit_key"), str) and observation.get("limit_key")
     ]
     indexed_observations.sort(
         key=lambda item: (
@@ -16249,9 +15440,7 @@ def _enrich_claude_thinking_metadata(metadata: Dict[str, Any], message: Any) -> 
     metadata["claude_thinking_signature_decoded"] = decoded_any
     metadata["claude_thinking_decode_version"] = "v1"
     metadata["claude_reasoning_content_present"] = bool(reasoning_content.strip())
-    metadata["claude_reasoning_content_empty_or_short"] = (
-        len(reasoning_content.strip()) < 16
-    )
+    metadata["claude_reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
     if experiment_ids:
         metadata["claude_thinking_experiment_ids"] = experiment_ids
         if len(experiment_ids) == 1:
@@ -16343,9 +15532,7 @@ def _extract_gemini_signature_summary(signature: str) -> Dict[str, Any]:
         indexed_fields[f"gemini_tsig_0_record_{record_index}_size"] = record_size
         indexed_fields[f"gemini_tsig_0_record_{record_index}_prefix"] = prefix_hex
         if absolute_marker_offset is not None:
-            indexed_fields[
-                f"gemini_tsig_0_record_{record_index}_marker_offset"
-            ] = absolute_marker_offset
+            indexed_fields[f"gemini_tsig_0_record_{record_index}_marker_offset"] = absolute_marker_offset
 
         record_index += 1
         offset = payload_end
@@ -16384,9 +15571,7 @@ def _enrich_gemini_thought_signature_metadata(  # noqa: PLR0915
     if not isinstance(thought_signatures, list):
         thought_signatures = []
     thought_signatures = [
-        signature
-        for signature in thought_signatures
-        if isinstance(signature, str) and signature.strip()
+        signature for signature in thought_signatures if isinstance(signature, str) and signature.strip()
     ]
 
     if not thought_signatures:
@@ -16423,9 +15608,7 @@ def _enrich_gemini_thought_signature_metadata(  # noqa: PLR0915
     metadata["gemini_tsig_signature_hashes"] = signature_hashes
     metadata["gemini_tsig_shape_hashes"] = sorted(set(shape_hashes))
     metadata["gemini_reasoning_content_present"] = bool(reasoning_content.strip())
-    metadata["gemini_reasoning_content_empty_or_short"] = (
-        len(reasoning_content.strip()) < 16
-    )
+    metadata["gemini_reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
     metadata["gemini_thinking_blocks_present"] = len(thinking_blocks) > 0
     if summaries:
         first_summary = summaries[0]
@@ -16447,9 +15630,7 @@ def _enrich_gemini_thought_signature_metadata(  # noqa: PLR0915
 
     tags_to_add = ["gemini-thought-signature", "thinking-signature-present"]
     if summaries:
-        tags_to_add.extend(
-            ["gemini-thought-signature-decoded", "thinking-signature-decoded"]
-        )
+        tags_to_add.extend(["gemini-thought-signature-decoded", "thinking-signature-decoded"])
         for shape_hash in sorted(set(shape_hashes)):
             tags_to_add.append(f"gemini-tsig-shape:{shape_hash}")
         for record_count in sorted({summary["record_count"] for summary in summaries}):
@@ -16470,9 +15651,7 @@ def _enrich_gemini_thought_signature_metadata(  # noqa: PLR0915
             "signature_count": len(thought_signatures),
             "decoded_signature_count": len(summaries),
             "shape_hashes": sorted(set(shape_hashes)),
-            "record_counts": sorted(
-                {summary["record_count"] for summary in summaries} if summaries else []
-            ),
+            "record_counts": sorted({summary["record_count"] for summary in summaries} if summaries else []),
             "reasoning_content_present": bool(reasoning_content.strip()),
         },
         start_time=span_started_at,
@@ -16514,9 +15693,7 @@ def _enrich_agent_identity_metadata(
         metadata.pop("agent_id_source", None)
 
 
-def _enrich_trace_name_and_provider_metadata(
-    kwargs: Dict[str, Any], result: Any
-) -> Tuple[dict, Any]:
+def _enrich_trace_name_and_provider_metadata(kwargs: Dict[str, Any], result: Any) -> Tuple[dict, Any]:
     agent_name = _extract_agent_name(kwargs)
     headers = _ensure_mutable_headers(kwargs)
     metadata = _ensure_mutable_metadata(kwargs)
@@ -16547,22 +15724,16 @@ def _enrich_trace_name_and_provider_metadata(
     current_trace_name = metadata.get("trace_name")
     if current_trace_name == "claude-code":
         metadata["trace_name"] = f"claude-code.{agent_name}"
-    elif is_grok_context and (
-        not current_trace_name or _is_generic_grok_trace_name(current_trace_name)
-    ):
+    elif is_grok_context and (not current_trace_name or _is_generic_grok_trace_name(current_trace_name)):
         metadata["trace_name"] = (
-            f"grok-build.{agent_name}"
-            if agent_name and agent_name != _DEFAULT_AGENT
-            else "grok-build"
+            f"grok-build.{agent_name}" if agent_name and agent_name != _DEFAULT_AGENT else "grok-build"
         )
     elif not current_trace_name:
         metadata["trace_name"] = agent_name
     child_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
     child_trace_name = _clean_non_empty_string(metadata.get("trace_name"))
     if headers and child_trace_name and child_trace_name.startswith("claude-code."):
-        current_trace_name_header = _clean_non_empty_string(
-            headers.get("langfuse_trace_name")
-        )
+        current_trace_name_header = _clean_non_empty_string(headers.get("langfuse_trace_name"))
         if (
             current_trace_name_header is None
             or current_trace_name_header == "claude-code"
@@ -16574,24 +15745,16 @@ def _enrich_trace_name_and_provider_metadata(
                 child_trace_name,
             )
     if headers and is_grok_context and child_trace_name:
-        current_trace_name_header = _clean_non_empty_string(
-            headers.get("langfuse_trace_name")
-        )
+        current_trace_name_header = _clean_non_empty_string(headers.get("langfuse_trace_name"))
         if (
-            current_trace_name_header is None
-            or _is_generic_grok_trace_name(current_trace_name_header)
+            current_trace_name_header is None or _is_generic_grok_trace_name(current_trace_name_header)
         ) and current_trace_name_header != child_trace_name:
             headers["langfuse_trace_name"] = child_trace_name
             verbose_logger.debug(
                 "AawmAgentIdentity: enriched Grok header trace_name to %s",
                 child_trace_name,
             )
-    if (
-        headers
-        and child_trace_user_id
-        and child_trace_name
-        and child_trace_name.startswith("claude-code.")
-    ):
+    if headers and child_trace_user_id and child_trace_name and child_trace_name.startswith("claude-code."):
         current_trace_user_id = headers.get("langfuse_trace_user_id")
         if current_trace_user_id != child_trace_user_id:
             headers["langfuse_trace_user_id"] = child_trace_user_id
@@ -16626,7 +15789,6 @@ def _enrich_trace_name_and_provider_metadata(
     return kwargs, result
 
 
-
 # _handle_session_history_success_event moved to litellm.integrations.aawm_session_history.record
 # _handle_session_history_failure_event moved to litellm.integrations.aawm_session_history.record
 
@@ -16652,9 +15814,7 @@ class AawmAgentIdentity(CustomLogger):
         super().__init__(*args, **kwargs)
         _bootstrap_session_history_spool_drainer_once()
 
-    def logging_hook(
-        self, kwargs: Dict[str, Any], result: Any, call_type: str
-    ) -> Tuple[dict, Any]:
+    def logging_hook(self, kwargs: Dict[str, Any], result: Any, call_type: str) -> Tuple[dict, Any]:
         """Sync hook - runs before Langfuse in sync success handler."""
         try:
             return _enrich_trace_name_and_provider_metadata(kwargs, result)
@@ -16662,16 +15822,12 @@ class AawmAgentIdentity(CustomLogger):
             verbose_logger.warning("AawmAgentIdentity.logging_hook failed: %s", exc)
             return kwargs, result
 
-    async def async_logging_hook(
-        self, kwargs: Dict[str, Any], result: Any, call_type: str
-    ) -> Tuple[dict, Any]:
+    async def async_logging_hook(self, kwargs: Dict[str, Any], result: Any, call_type: str) -> Tuple[dict, Any]:
         """Async hook - runs before Langfuse in async success handler."""
         try:
             return _enrich_trace_name_and_provider_metadata(kwargs, result)
         except Exception as exc:
-            verbose_logger.warning(
-                "AawmAgentIdentity.async_logging_hook failed: %s", exc
-            )
+            verbose_logger.warning("AawmAgentIdentity.async_logging_hook failed: %s", exc)
             return kwargs, result
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
@@ -16684,9 +15840,7 @@ class AawmAgentIdentity(CustomLogger):
             log_label="log_success_event",
         )
 
-    async def async_log_success_event(
-        self, kwargs, response_obj, start_time, end_time
-    ) -> None:
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
         _handle_session_history_success_event(
             kwargs,
             response_obj,
@@ -16705,9 +15859,7 @@ class AawmAgentIdentity(CustomLogger):
             log_label="log_failure_event",
         )
 
-    async def async_log_failure_event(
-        self, kwargs, response_obj, start_time, end_time
-    ) -> None:
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
         _handle_session_history_failure_event(
             kwargs,
             response_obj,

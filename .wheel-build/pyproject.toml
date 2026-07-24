@@ -13,17 +13,18 @@ dependencies = ["litellm"]
 dev = ["build"]
 
 # Single-source packaging (RR-003 + RR-006):
-# - force-include canonical agent_identity into the callback package
-# - force-include aawm_session_history package modules + sql shim under the
-#   litellm.integrations namespace so the wheel-installed agent_identity
-#   can import package-owned writer/sql/record without a dual-maintained copy
-# The thin checkout loader under aawm_litellm_callbacks/agent_identity.py is
-# overwritten at wheel build time by the agent_identity mapping.
+# - force-include the canonical aawm_agent_identity package + aawm_session_history
+#   package modules + sql shim under the litellm.integrations namespace so the
+#   wheel-installed callback can import package-owned writer/sql/record and the
+#   canonical agent_identity implementation without a dual-maintained copy
+# The thin checkout loader under aawm_litellm_callbacks/agent_identity.py ships
+# as-is and re-exports the canonical litellm.integrations.aawm_agent_identity
+# namespace (including private helpers) at wheel build time.
 [tool.hatch.build.targets.wheel]
 packages = ["aawm_litellm_callbacks"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"../litellm/integrations/aawm_agent_identity.py" = "aawm_litellm_callbacks/agent_identity.py"
+"../litellm/integrations/aawm_agent_identity/__init__.py" = "litellm/integrations/aawm_agent_identity/__init__.py"
 "../litellm/integrations/aawm_session_history/__init__.py" = "litellm/integrations/aawm_session_history/__init__.py"
 "../litellm/integrations/aawm_session_history/runtime.py" = "litellm/integrations/aawm_session_history/runtime.py"
 "../litellm/integrations/aawm_session_history/writer.py" = "litellm/integrations/aawm_session_history/writer.py"
@@ -35,7 +36,7 @@ packages = ["aawm_litellm_callbacks"]
 "../litellm/integrations/aawm_session_history_sql.py" = "litellm/integrations/aawm_session_history_sql.py"
 
 [tool.hatch.build.targets.sdist.force-include]
-"../litellm/integrations/aawm_agent_identity.py" = "aawm_litellm_callbacks/agent_identity.py"
+"../litellm/integrations/aawm_agent_identity/__init__.py" = "litellm/integrations/aawm_agent_identity/__init__.py"
 "../litellm/integrations/aawm_session_history/__init__.py" = "litellm/integrations/aawm_session_history/__init__.py"
 "../litellm/integrations/aawm_session_history/runtime.py" = "litellm/integrations/aawm_session_history/runtime.py"
 "../litellm/integrations/aawm_session_history/writer.py" = "litellm/integrations/aawm_session_history/writer.py"
