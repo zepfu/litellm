@@ -25,6 +25,13 @@ packages = ["aawm_litellm_callbacks"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "../litellm/integrations/aawm_agent_identity/__init__.py" = "litellm/integrations/aawm_agent_identity/__init__.py"
+"../litellm/integrations/aawm_agent_identity/constants.py" = "litellm/integrations/aawm_agent_identity/constants.py"
+"../litellm/integrations/aawm_agent_identity/coerce.py" = "litellm/integrations/aawm_agent_identity/coerce.py"
+"../litellm/integrations/aawm_agent_identity/cost_map.py" = "litellm/integrations/aawm_agent_identity/cost_map.py"
+"../litellm/integrations/aawm_agent_identity/identity_tenant_agent.py" = "litellm/integrations/aawm_agent_identity/identity_tenant_agent.py"
+"../litellm/integrations/aawm_agent_identity/identity_repository.py" = "litellm/integrations/aawm_agent_identity/identity_repository.py"
+"../litellm/integrations/aawm_agent_identity/identity_runtime.py" = "litellm/integrations/aawm_agent_identity/identity_runtime.py"
+"../litellm/integrations/aawm_agent_identity/agent_context.py" = "litellm/integrations/aawm_agent_identity/agent_context.py"
 "../litellm/integrations/aawm_session_history/__init__.py" = "litellm/integrations/aawm_session_history/__init__.py"
 "../litellm/integrations/aawm_session_history/runtime.py" = "litellm/integrations/aawm_session_history/runtime.py"
 "../litellm/integrations/aawm_session_history/writer.py" = "litellm/integrations/aawm_session_history/writer.py"
@@ -37,6 +44,13 @@ packages = ["aawm_litellm_callbacks"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "../litellm/integrations/aawm_agent_identity/__init__.py" = "litellm/integrations/aawm_agent_identity/__init__.py"
+"../litellm/integrations/aawm_agent_identity/constants.py" = "litellm/integrations/aawm_agent_identity/constants.py"
+"../litellm/integrations/aawm_agent_identity/coerce.py" = "litellm/integrations/aawm_agent_identity/coerce.py"
+"../litellm/integrations/aawm_agent_identity/cost_map.py" = "litellm/integrations/aawm_agent_identity/cost_map.py"
+"../litellm/integrations/aawm_agent_identity/identity_tenant_agent.py" = "litellm/integrations/aawm_agent_identity/identity_tenant_agent.py"
+"../litellm/integrations/aawm_agent_identity/identity_repository.py" = "litellm/integrations/aawm_agent_identity/identity_repository.py"
+"../litellm/integrations/aawm_agent_identity/identity_runtime.py" = "litellm/integrations/aawm_agent_identity/identity_runtime.py"
+"../litellm/integrations/aawm_agent_identity/agent_context.py" = "litellm/integrations/aawm_agent_identity/agent_context.py"
 "../litellm/integrations/aawm_session_history/__init__.py" = "litellm/integrations/aawm_session_history/__init__.py"
 "../litellm/integrations/aawm_session_history/runtime.py" = "litellm/integrations/aawm_session_history/runtime.py"
 "../litellm/integrations/aawm_session_history/writer.py" = "litellm/integrations/aawm_session_history/writer.py"
