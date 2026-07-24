@@ -36,16 +36,18 @@ def _session_history_insert_placeholder_count() -> int:
     values_clause = sql.split("VALUES", 1)[1].split("ON CONFLICT", 1)[0]
     return max(int(match) for match in re.findall(r"\$(\d+)", values_clause))
 
+
 def test_aawm_agent_identity_callback_overlay_is_thin_single_source_loader() -> None:
     """RR-003: checkout overlay is a thin loader; wheel force-includes canonical.
 
     The published callback wheel packages
-    ``litellm/integrations/aawm_agent_identity.py`` via hatch force-include.
+    ``litellm/integrations/aawm_agent_identity/__init__.py`` via hatch
+    force-include (Wave A1 converted the single-file module to a package).
     ``.wheel-build/aawm_litellm_callbacks/agent_identity.py`` must not be a
     second full source copy.
     """
     repo_root = Path(__file__).resolve().parents[3]
-    source = repo_root / "litellm/integrations/aawm_agent_identity.py"
+    source = repo_root / "litellm/integrations/aawm_agent_identity/__init__.py"
     overlay = repo_root / ".wheel-build/aawm_litellm_callbacks/agent_identity.py"
     pyproject = repo_root / ".wheel-build/pyproject.toml"
 
@@ -62,8 +64,8 @@ def test_aawm_agent_identity_callback_overlay_is_thin_single_source_loader() -> 
     packaging = pyproject.read_text(encoding="utf-8")
     assert 'build-backend = "hatchling.build"' in packaging
     assert (
-        '"../litellm/integrations/aawm_agent_identity.py" = '
-        '"aawm_litellm_callbacks/agent_identity.py"'
+        '"../litellm/integrations/aawm_agent_identity/__init__.py" = '
+        '"litellm/integrations/aawm_agent_identity/__init__.py"'
     ) in packaging
 
 
@@ -180,13 +182,8 @@ def test_aawm_agent_identity_enriches_trace_name() -> None:
     )
 
     assert result == {"choices": []}
-    assert (
-        updated_kwargs["litellm_params"]["metadata"]["trace_name"]
-        == "claude-code.engineer"
-    )
-    assert updated_kwargs["standard_logging_object"]["metadata"]["trace_name"] == (
-        "claude-code.engineer"
-    )
+    assert updated_kwargs["litellm_params"]["metadata"]["trace_name"] == "claude-code.engineer"
+    assert updated_kwargs["standard_logging_object"]["metadata"]["trace_name"] == ("claude-code.engineer")
 
 
 def test_aawm_agent_identity_syncs_metadata_request_tags() -> None:
@@ -241,9 +238,7 @@ def test_aawm_agent_identity_keeps_child_dispatch_trace_metadata() -> None:
 def test_aawm_agent_identity_rewrites_stale_orchestrator_langfuse_trace_header() -> None:
     logger = AawmAgentIdentity()
     kwargs = _child_dispatch_metadata_kwargs()
-    kwargs["litellm_params"]["proxy_server_request"]["headers"][
-        "langfuse_trace_name"
-    ] = "claude-code.orchestrator"
+    kwargs["litellm_params"]["proxy_server_request"]["headers"]["langfuse_trace_name"] = "claude-code.orchestrator"
 
     updated_kwargs, result = logger.logging_hook(
         kwargs=kwargs,
@@ -420,10 +415,7 @@ def test_build_session_history_record_extracts_agent_from_responses_instructions
     }
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.4-mini",
-        "instructions": (
-            "You are a 'worker' agent.\n"
-            "Always follow repository instructions."
-        ),
+        "instructions": ("You are a 'worker' agent.\n" "Always follow repository instructions."),
         "input": [
             {
                 "role": "user",
@@ -543,9 +535,7 @@ def test_aawm_agent_identity_preserves_explicit_codex_user_header() -> None:
 def test_aawm_agent_identity_propagates_session_id_into_metadata() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs()
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-claude-code-session-id": "session-abc-123"}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"x-claude-code-session-id": "session-abc-123"}}
 
     updated_kwargs, _ = logger.logging_hook(
         kwargs=kwargs,
@@ -554,10 +544,7 @@ def test_aawm_agent_identity_propagates_session_id_into_metadata() -> None:
     )
 
     assert updated_kwargs["litellm_params"]["metadata"]["session_id"] == "session-abc-123"
-    assert (
-        updated_kwargs["standard_logging_object"]["metadata"]["session_id"]
-        == "session-abc-123"
-    )
+    assert updated_kwargs["standard_logging_object"]["metadata"]["session_id"] == "session-abc-123"
 
 
 def test_aawm_agent_identity_adds_claude_thinking_tags() -> None:
@@ -603,10 +590,7 @@ def test_aawm_agent_identity_adds_claude_thinking_tags() -> None:
     assert metadata["claude_thinking_signature_present"] is True
     assert metadata["claude_thinking_signature_count"] == 1
     assert metadata["claude_thinking_signature_decoded"] is True
-    assert (
-        metadata["claude_thinking_experiment_id"]
-        == "numbat-v6-efforts-20-40-80-ab-prod"
-    )
+    assert metadata["claude_thinking_experiment_id"] == "numbat-v6-efforts-20-40-80-ab-prod"
     assert metadata["claude_reasoning_content_present"] is True
     assert metadata["thinking_signature_present"] is True
     assert metadata["thinking_signature_decoded"] is True
@@ -622,19 +606,13 @@ def test_aawm_agent_identity_adds_claude_thinking_tags() -> None:
     assert "claude-reasoning-present" in tags
     assert "claude-thinking-signature" in updated_kwargs["standard_logging_object"]["request_tags"]
     assert "thinking-signature-present" in updated_kwargs["standard_logging_object"]["request_tags"]
-    assert (
-        updated_kwargs["standard_logging_object"]["metadata"]["claude_thinking_signature_present"]
-        is True
-    )
-    span_names = [
-        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
-    ]
+    assert updated_kwargs["standard_logging_object"]["metadata"]["claude_thinking_signature_present"] is True
+    span_names = [span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)]
     assert "claude.thinking_signature_decode" in span_names
     claude_span = next(
         span
         for span in metadata["langfuse_spans"]
-        if isinstance(span, dict)
-        and span.get("name") == "claude.thinking_signature_decode"
+        if isinstance(span, dict) and span.get("name") == "claude.thinking_signature_decode"
     )
     assert claude_span["metadata"]["signature_count"] == 1
     assert claude_span["metadata"]["decoded_signature_count"] == 1
@@ -696,15 +674,8 @@ def test_aawm_agent_identity_adds_claude_permission_check_span() -> None:
     assert "claude-permission-check:no" in tags
     assert "claude-permission-check:allow" in tags
     assert "claude-agent:auto-reviewer" in tags
-    assert "claude-permission-check" in updated_kwargs["standard_logging_object"][
-        "request_tags"
-    ]
-    assert (
-        updated_kwargs["standard_logging_object"]["metadata"][
-            "claude_permission_check_decision"
-        ]
-        == "no"
-    )
+    assert "claude-permission-check" in updated_kwargs["standard_logging_object"]["request_tags"]
+    assert updated_kwargs["standard_logging_object"]["metadata"]["claude_permission_check_decision"] == "no"
 
     permission_span = next(
         span
@@ -724,9 +695,7 @@ def test_aawm_agent_identity_rewrites_permission_check_langfuse_headers() -> Non
     kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
     kwargs["model"] = "claude-opus-4-7[1m]"
     kwargs["custom_llm_provider"] = "anthropic"
-    kwargs["passthrough_logging_payload"]["request_body"]["model"] = (
-        "claude-opus-4-7[1m]"
-    )
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = "claude-opus-4-7[1m]"
     kwargs["litellm_params"]["metadata"].update(
         {
             "tenant_id": "dashboard-shell",
@@ -833,19 +802,13 @@ AY89a19r/hypDnlNZTmQhYj/vLtBERR2L8wa4yt0Y+GwcOOi3fr3hsG8ovj6G2rfZypo/OPdkDOgU3IR
     assert any(tag.startswith("gemini-tsig-shape:") for tag in tags)
     assert "gemini-thought-signature" in updated_kwargs["standard_logging_object"]["request_tags"]
     assert "thinking-signature-present" in updated_kwargs["standard_logging_object"]["request_tags"]
-    assert (
-        updated_kwargs["standard_logging_object"]["metadata"]["gemini_thought_signature_present"]
-        is True
-    )
-    span_names = [
-        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
-    ]
+    assert updated_kwargs["standard_logging_object"]["metadata"]["gemini_thought_signature_present"] is True
+    span_names = [span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)]
     assert "gemini.thought_signature_decode" in span_names
     gemini_span = next(
         span
         for span in metadata["langfuse_spans"]
-        if isinstance(span, dict)
-        and span.get("name") == "gemini.thought_signature_decode"
+        if isinstance(span, dict) and span.get("name") == "gemini.thought_signature_decode"
     )
     assert gemini_span["metadata"]["signature_count"] == 1
     assert gemini_span["metadata"]["decoded_signature_count"] == 1
@@ -861,9 +824,7 @@ def test_build_session_history_record_uses_passthrough_header_session_id() -> No
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-header-session"
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-claude-code-session-id": "session-from-header"}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"x-claude-code-session-id": "session-from-header"}}
 
     result = {
         "id": "resp-header-session",
@@ -888,9 +849,7 @@ def test_build_session_history_record_uses_synthetic_passthrough_session_id() ->
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-synthetic-session"
-    kwargs["litellm_params"]["metadata"].update(
-        {"passthrough_route_family": "codex_responses"}
-    )
+    kwargs["litellm_params"]["metadata"].update({"passthrough_route_family": "codex_responses"})
 
     result = {
         "id": "resp-synthetic-session",
@@ -909,10 +868,7 @@ def test_build_session_history_record_uses_synthetic_passthrough_session_id() ->
     assert record["session_id"] == "call-synthetic-session"
     assert record["metadata"]["session_id_source"] == "kwargs.litellm_call_id"
     assert record["metadata"]["synthetic_session_id"] is True
-    assert (
-        record["metadata"]["synthetic_session_id_basis"]
-        == "kwargs.litellm_call_id"
-    )
+    assert record["metadata"]["synthetic_session_id_basis"] == "kwargs.litellm_call_id"
 
 
 def test_build_session_history_record_aliases_permission_check_after_cost() -> None:
@@ -929,9 +885,7 @@ def test_build_session_history_record_aliases_permission_check_after_cost() -> N
             "tenant_id": "agent-a3ee0f55d7cda22ec",
         }
     )
-    kwargs["passthrough_logging_payload"]["request_body"]["model"] = (
-        "claude-opus-4-7[1m]"
-    )
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = "claude-opus-4-7[1m]"
     result = {
         "id": "resp-auto-review",
         "model": "claude-opus-4-7",
@@ -1125,10 +1079,7 @@ def test_build_session_history_record_defaults_grok_side_channel_model() -> None
     assert record["model_group"] == "grok-build"
     assert record["total_tokens"] == 0
     assert record["metadata"]["session_history_reporting_excluded"] is True
-    assert (
-        record["metadata"]["session_history_zero_token_class"]
-        == "grok_cli_side_channel_no_usage"
-    )
+    assert record["metadata"]["session_history_zero_token_class"] == "grok_cli_side_channel_no_usage"
     assert record["metadata"]["grok_side_channel_model_defaulted"] is True
 
 
@@ -1301,30 +1252,17 @@ def test_build_session_history_record_attributes_codex_oa_xai_passthrough_to_xai
         ("aegis-dashboard (memory)", "aegis-dashboard (memory)"),
     ],
 )
-def test_normalize_repository_identity_accepts_repo_shapes(
-    raw_repository: str, expected_repository: str
-) -> None:
-    assert (
-        aawm_agent_identity._normalize_repository_identity(raw_repository)
-        == expected_repository
-    )
+def test_normalize_repository_identity_accepts_repo_shapes(raw_repository: str, expected_repository: str) -> None:
+    assert aawm_agent_identity._normalize_repository_identity(raw_repository) == expected_repository
 
 
 def test_normalize_repository_identity_maps_instruction_file_paths_to_parent_repo() -> None:
-    assert (
-        aawm_agent_identity._normalize_repository_identity(
-            "/home/zepfu/projects/litellm/CLAUDE.md"
-        )
-        == "litellm"
-    )
+    assert aawm_agent_identity._normalize_repository_identity("/home/zepfu/projects/litellm/CLAUDE.md") == "litellm"
 
 
 def test_normalize_repository_identity_maps_codex_memories_memory_md_to_codex_memories() -> None:
     assert (
-        aawm_agent_identity._normalize_repository_identity(
-            "/home/zepfu/.codex/memories/MEMORY.md"
-        )
-        == "codex-memories"
+        aawm_agent_identity._normalize_repository_identity("/home/zepfu/.codex/memories/MEMORY.md") == "codex-memories"
     )
 
 
@@ -1337,31 +1275,11 @@ def test_normalize_repository_identity_rejects_bare_instruction_filenames() -> N
 
 def test_normalize_repository_identity_rejects_nested_project_file_paths_and_bare_filenames() -> None:
     """Reject referenced files while preserving trusted workspace roots."""
-    assert (
-        aawm_agent_identity._normalize_repository_identity(
-            "/home/zepfu/projects/litellm"
-        )
-        == "litellm"
-    )
-    assert (
-        aawm_agent_identity._normalize_repository_identity(
-            "/home/zepfu/projects/aawm-tap"
-        )
-        == "aawm-tap"
-    )
+    assert aawm_agent_identity._normalize_repository_identity("/home/zepfu/projects/litellm") == "litellm"
+    assert aawm_agent_identity._normalize_repository_identity("/home/zepfu/projects/aawm-tap") == "aawm-tap"
 
-    assert (
-        aawm_agent_identity._normalize_repository_identity(
-            "/home/zepfu/projects/litellm/AGENTS.md"
-        )
-        == "litellm"
-    )
-    assert (
-        aawm_agent_identity._normalize_repository_identity(
-            "/home/zepfu/projects/litellm/CLAUDE.md"
-        )
-        == "litellm"
-    )
+    assert aawm_agent_identity._normalize_repository_identity("/home/zepfu/projects/litellm/AGENTS.md") == "litellm"
+    assert aawm_agent_identity._normalize_repository_identity("/home/zepfu/projects/litellm/CLAUDE.md") == "litellm"
 
     rejected_values = [
         "/home/zepfu/projects/litellm/suggestion.md",
@@ -1385,10 +1303,7 @@ def test_normalize_repository_identity_rejects_nested_project_file_paths_and_bar
         assert aawm_agent_identity._normalize_repository_identity(value) is None
 
     assert aawm_agent_identity._normalize_repository_identity("litellm") == "litellm"
-    assert (
-        aawm_agent_identity._normalize_repository_identity("aegis-dashboard")
-        == "aegis-dashboard"
-    )
+    assert aawm_agent_identity._normalize_repository_identity("aegis-dashboard") == "aegis-dashboard"
     assert aawm_agent_identity._normalize_repository_identity("aawm-tap") == "aawm-tap"
 
 
@@ -1397,10 +1312,7 @@ def test_normalize_repository_identity_rejects_nested_project_file_paths_and_bar
     [
         {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
         "{'anyOf': [{'type': 'string'}, {'type': 'null'}], 'default': None}",
-        (
-            "rollout-2026-05-10T11-14-00-019e1273.jsonl, "
-            "updated_at=2026-05-10T15:30:57+00:00, thread_id=019e1273"
-        ),
+        ("rollout-2026-05-10T11-14-00-019e1273.jsonl, " "updated_at=2026-05-10T15:30:57+00:00, thread_id=019e1273"),
         "aegis commits=3a131aa skip_tests=true",
         "aawm-tap-dashboard all=true",
         "aawm-tap...pper",
@@ -1450,8 +1362,7 @@ def test_normalize_repository_identity_rejects_metadata_noise(
     ("text", "expected_repository"),
     [
         (
-            "<environment_context><cwd>/home/zepfu/projects/aegis</cwd>"
-            "</environment_context>",
+            "<environment_context><cwd>/home/zepfu/projects/aegis</cwd>" "</environment_context>",
             "aegis",
         ),
         ("<cwd>/home/zepfu/projects/aawm-tap</cwd>", "aawm-tap"),
@@ -1462,19 +1373,13 @@ def test_normalize_repository_identity_rejects_metadata_noise(
         ("Repository path: /home/zepfu/projects/litellm", "litellm"),
         ("cwd: /home/zepfu/projects/dashboard-shell", "dashboard-shell"),
         (
-            "- **workspace directories:**\n"
-            "  - /home/zepfu/projects/aawm-observe\n",
+            "- **workspace directories:**\n" "  - /home/zepfu/projects/aawm-observe\n",
             "aawm-observe",
         ),
     ],
 )
-def test_extract_repository_identity_from_text_preserves_supported_markers(
-    text: str, expected_repository: str
-) -> None:
-    assert (
-        aawm_agent_identity._extract_repository_identity_from_text(text)
-        == expected_repository
-    )
+def test_extract_repository_identity_from_text_preserves_supported_markers(text: str, expected_repository: str) -> None:
+    assert aawm_agent_identity._extract_repository_identity_from_text(text) == expected_repository
 
 
 def test_extract_repository_identity_from_text_skips_marker_free_large_text(
@@ -1491,10 +1396,7 @@ def test_extract_repository_identity_from_text_skips_marker_free_large_text(
         (ExplodingPattern(),),
     )
 
-    assert (
-        aawm_agent_identity._extract_repository_identity_from_text(marker_free_text)
-        is None
-    )
+    assert aawm_agent_identity._extract_repository_identity_from_text(marker_free_text) is None
 
 
 def test_build_session_history_record_preserves_worker_context_exhaustion_metadata() -> None:
@@ -1537,12 +1439,8 @@ def test_build_session_history_record_preserves_worker_context_exhaustion_metada
     assert record is not None
     meta = record["metadata"]
     assert meta["worker_context_exhaustion_failure_class"] == "context_window_exhaustion"
-    assert meta["worker_context_exhaustion_failure_reason"] == (
-        "output truncated before patch summary"
-    )
-    assert meta["worker_context_exhaustion_partial_output_summary"] == (
-        "Implemented partial fix in litellm/foo.py"
-    )
+    assert meta["worker_context_exhaustion_failure_reason"] == ("output truncated before patch summary")
+    assert meta["worker_context_exhaustion_partial_output_summary"] == ("Implemented partial fix in litellm/foo.py")
     assert meta["worker_context_exhaustion_changed_paths_hint"] == [
         "litellm/integrations/aawm_agent_identity.py",
     ]
@@ -1603,8 +1501,6 @@ def test_build_session_history_record_uses_repository_header_and_metadata() -> N
     assert payload[53] == "zepfu/litellm"
 
 
-
-
 def test_build_session_history_record_persists_client_ip_and_host_name() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"
@@ -1641,6 +1537,7 @@ def test_build_session_history_record_persists_client_ip_and_host_name() -> None
     assert payload[47] == "100.99.1.5"
     assert payload[48] == "thoth"
 
+
 def test_build_session_history_record_prefers_repository_header_over_request_context() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"
@@ -1657,8 +1554,7 @@ def test_build_session_history_record_prefers_repository_header_over_request_con
         {
             "role": "user",
             "content": (
-                "<environment_context><cwd>/home/zepfu/projects/"
-                "aegis-dashboard</cwd></environment_context>"
+                "<environment_context><cwd>/home/zepfu/projects/" "aegis-dashboard</cwd></environment_context>"
             ),
         }
     ]
@@ -1723,9 +1619,7 @@ def test_build_session_history_record_uses_request_header_tenant_as_repository_f
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-request-tenant-repository"
     kwargs["litellm_params"]["metadata"]["session_id"] = "session-request-tenant-repository"
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-aawm-tenant-id": "aawm-tap"}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"x-aawm-tenant-id": "aawm-tap"}}
     kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
 
     result = {
@@ -1761,9 +1655,7 @@ def test_build_session_history_record_maps_harness_tenant_to_litellm_repository(
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = f"call-request-{tenant_id}"
     kwargs["litellm_params"]["metadata"]["session_id"] = f"session-request-{tenant_id}"
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-aawm-tenant-id": tenant_id}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"x-aawm-tenant-id": tenant_id}}
     kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
 
     result = {
@@ -1805,10 +1697,7 @@ def test_normalize_session_history_record_excludes_codex_transcript_usage() -> N
 
     assert record["metadata"]["session_history_usage_record"] is False
     assert record["metadata"]["session_history_reporting_excluded"] is True
-    assert (
-        record["metadata"]["session_history_reporting_exclusion_reason"]
-        == "synthetic_codex_transcript"
-    )
+    assert record["metadata"]["session_history_reporting_exclusion_reason"] == "synthetic_codex_transcript"
 
 
 def test_normalize_session_history_record_marks_unknown_model_unresolved() -> None:
@@ -1824,10 +1713,7 @@ def test_normalize_session_history_record_marks_unknown_model_unresolved() -> No
 
     assert record["metadata"]["session_history_model_unresolved"] is True
     assert record["metadata"]["session_history_model_reporting_excluded"] is True
-    assert (
-        record["metadata"]["session_history_model_unresolved_reason"]
-        == "missing_source_model_evidence"
-    )
+    assert record["metadata"]["session_history_model_unresolved_reason"] == "missing_source_model_evidence"
 
 
 def test_normalize_session_history_record_excludes_grok_side_channel_usage() -> None:
@@ -1849,14 +1735,8 @@ def test_normalize_session_history_record_excludes_grok_side_channel_usage() -> 
     assert record["metadata"]["session_history_usage_record"] is False
     assert record["metadata"]["session_history_reporting_excluded"] is True
     assert record["metadata"]["session_history_model_reporting_excluded"] is True
-    assert (
-        record["metadata"]["session_history_zero_token_class"]
-        == "grok_cli_side_channel_no_usage"
-    )
-    assert (
-        record["metadata"]["session_history_reporting_exclusion_reason"]
-        == "grok_side_channel_without_model_usage"
-    )
+    assert record["metadata"]["session_history_zero_token_class"] == "grok_cli_side_channel_no_usage"
+    assert record["metadata"]["session_history_reporting_exclusion_reason"] == "grok_side_channel_without_model_usage"
 
 
 def test_build_session_history_record_uses_claude_project_over_agent_repository_noise() -> None:
@@ -1932,10 +1812,7 @@ def test_build_session_history_record_uses_claude_trace_user_identity_fallback()
     assert record["tenant_id"] == "dashboard-shell"
     assert record["repository"] == "dashboard-shell"
     assert record["metadata"]["repository"] == "dashboard-shell"
-    assert (
-        record["metadata"]["tenant_id_source"]
-        == "litellm_params.metadata.trace_user_id"
-    )
+    assert record["metadata"]["tenant_id_source"] == "litellm_params.metadata.trace_user_id"
 
 
 def test_build_session_history_record_rejects_agent_id_repository_without_tenant_fallback() -> None:
@@ -2062,12 +1939,8 @@ def test_build_session_history_record_rejects_numeric_header_tenant_fallback() -
     kwargs["custom_llm_provider"] = "openrouter"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-numeric-header-tenant"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-numeric-header-tenant"
-    )
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-aawm-tenant-id": "0"}
-    }
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-numeric-header-tenant"
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"x-aawm-tenant-id": "0"}}
     kwargs["passthrough_logging_payload"]["request_body"] = {"messages": []}
 
     result = {
@@ -2220,9 +2093,7 @@ def test_build_session_history_record_uses_prepared_body_litellm_metadata_reposi
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-prepared-body-repository"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-prepared-body-repository"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-prepared-body-repository"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.5",
         "input": "hello",
@@ -2255,9 +2126,7 @@ def test_build_session_history_record_uses_litellm_params_litellm_metadata_repos
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-litellm-params-repository"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-litellm-params-repository"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-litellm-params-repository"
     kwargs["litellm_params"]["litellm_metadata"] = {
         "repository": "git@github.com:zepfu/aawm.git",
     }
@@ -2286,9 +2155,7 @@ def test_build_session_history_record_infers_repository_from_codex_workspace_tex
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-codex-workspace-repository"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-codex-workspace-repository"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-codex-workspace-repository"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.5",
         "instructions": (
@@ -2318,9 +2185,7 @@ def test_build_session_history_record_infers_repository_from_codex_workspace_tex
     assert record["tenant_id"] == "aawm"
     assert record["metadata"]["repository"] == "aawm"
     assert record["metadata"]["tenant_id"] == "aawm"
-    assert record["metadata"]["repository_source"].endswith(
-        ".text.environment_context.cwd"
-    )
+    assert record["metadata"]["repository_source"].endswith(".text.environment_context.cwd")
 
 
 def test_build_session_history_record_stops_cwd_at_rollout_fragment() -> None:
@@ -2329,9 +2194,7 @@ def test_build_session_history_record_stops_cwd_at_rollout_fragment() -> None:
     kwargs["custom_llm_provider"] = "gemini"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-codex-rollout-fragment-repository"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-codex-rollout-fragment-repository"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-codex-rollout-fragment-repository"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gemini-3-flash-preview",
         "input": [
@@ -2389,9 +2252,7 @@ def test_build_session_history_record_ignores_codex_tool_output_worktree_reposit
             {
                 "type": "function_call_output",
                 "call_id": "call_1",
-                "output": (
-                    "created /home/user/projects/repo/.claude/worktrees/agent-ok"
-                ),
+                "output": ("created /home/user/projects/repo/.claude/worktrees/agent-ok"),
             },
             {"type": "message", "role": "user", "content": "continue"},
         ],
@@ -2435,9 +2296,7 @@ def test_build_session_history_record_ignores_assistant_compaction_repository_te
             {
                 "type": "message",
                 "role": "assistant",
-                "content": (
-                    "Earlier context claimed cwd=/home/zepfu/projects/wt-ops-xyz"
-                ),
+                "content": ("Earlier context claimed cwd=/home/zepfu/projects/wt-ops-xyz"),
             },
             {"type": "message", "role": "user", "content": "continue"},
         ],
@@ -2474,10 +2333,7 @@ def test_build_session_history_record_does_not_trust_inferred_metadata_repositor
             "client_name": "codex-tui",
             "client_user_agent": "codex-tui/0.142.4",
             "repository": "wt-ops-xyz",
-            "repository_source": (
-                "passthrough_logging_payload.request_body.input[0].content."
-                "text.cwd_assignment"
-            ),
+            "repository_source": ("passthrough_logging_payload.request_body.input[0].content." "text.cwd_assignment"),
         }
     )
     kwargs["passthrough_logging_payload"]["request_body"] = {
@@ -2586,10 +2442,7 @@ def test_build_session_history_record_does_not_promote_unknown_codex_metadata_re
     assert record["metadata"]["tenant_id_source"] == "repository_untrusted"
     assert record["metadata"]["session_history_repository_status"] == "unresolved"
     assert record["metadata"]["session_history_repository_unresolved"] is True
-    assert (
-        record["metadata"]["session_history_repository_unresolved_reason"]
-        == "untrusted_metadata_repository_label"
-    )
+    assert record["metadata"]["session_history_repository_unresolved_reason"] == "untrusted_metadata_repository_label"
     assert "tenant_id" not in record["metadata"]
 
 
@@ -2631,10 +2484,7 @@ def test_build_session_history_record_rejects_file_like_codex_metadata_repositor
     assert "tenant_id" not in record["metadata"]
     assert record["metadata"]["session_history_repository_status"] == "unresolved"
     assert record["metadata"]["session_history_repository_unresolved"] is True
-    assert (
-        record["metadata"]["session_history_repository_unresolved_reason"]
-        == "no_trusted_repository_signal"
-    )
+    assert record["metadata"]["session_history_repository_unresolved_reason"] == "no_trusted_repository_signal"
 
 
 def test_build_session_history_record_classifies_claude_cli_without_project() -> None:
@@ -2669,10 +2519,7 @@ def test_build_session_history_record_classifies_claude_cli_without_project() ->
     assert record["metadata"]["client_name"] == "claude-cli"
     assert record["metadata"]["session_history_repository_status"] == "unresolved"
     assert record["metadata"]["session_history_repository_unresolved"] is True
-    assert (
-        record["metadata"]["session_history_repository_unresolved_reason"]
-        == "no_trusted_claude_project_signal"
-    )
+    assert record["metadata"]["session_history_repository_unresolved_reason"] == "no_trusted_claude_project_signal"
     assert "tenant_id_source" not in record["metadata"]
 
 
@@ -2712,20 +2559,11 @@ def test_build_session_history_record_rejects_unknown_claude_project_owner() -> 
     assert "tenant_id" not in record["metadata"]
     assert record["metadata"]["aawm_original_repository"] == "zepfu"
     assert record["metadata"]["aawm_original_tenant_id"] == "zepfu"
-    assert (
-        record["metadata"]["repository_source_untrusted"]
-        == "litellm_params.metadata.aawm_claude_project"
-    )
-    assert (
-        record["metadata"]["tenant_id_source_untrusted"]
-        == "litellm_params.metadata.tenant_id"
-    )
+    assert record["metadata"]["repository_source_untrusted"] == "litellm_params.metadata.aawm_claude_project"
+    assert record["metadata"]["tenant_id_source_untrusted"] == "litellm_params.metadata.tenant_id"
     assert record["metadata"]["session_history_repository_status"] == "unresolved"
     assert record["metadata"]["session_history_repository_unresolved"] is True
-    assert (
-        record["metadata"]["session_history_repository_unresolved_reason"]
-        == "no_trusted_claude_project_signal"
-    )
+    assert record["metadata"]["session_history_repository_unresolved_reason"] == "no_trusted_claude_project_signal"
 
 
 def test_build_session_history_record_promotes_known_repo_after_stale_trace_user() -> None:
@@ -2832,9 +2670,7 @@ def test_build_session_history_record_prefers_codex_turn_metadata_over_stale_rep
     )
     kwargs["standard_logging_object"]["metadata"] = {
         "requester_custom_headers": {
-            "x-codex-turn-metadata": json.dumps(
-                {"project_path": "/home/zepfu/projects/aawm-hook"}
-            )
+            "x-codex-turn-metadata": json.dumps({"project_path": "/home/zepfu/projects/aawm-hook"})
         }
     }
     kwargs["passthrough_logging_payload"]["request_body"] = {
@@ -2867,17 +2703,14 @@ def test_build_session_history_record_prefers_current_codex_cwd_over_stale_conte
     kwargs["custom_llm_provider"] = "gemini"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-codex-current-workspace-repository"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-codex-current-workspace-repository"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-codex-current-workspace-repository"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gemini-3.1-flash-lite-preview",
         "input": [
             {
                 "role": "user",
                 "content": (
-                    "# AGENTS.md instructions for /home/zepfu/projects/aawm-tap\n\n"
-                    "Earlier session context."
+                    "# AGENTS.md instructions for /home/zepfu/projects/aawm-tap\n\n" "Earlier session context."
                 ),
             },
             {
@@ -2918,9 +2751,7 @@ def test_build_session_history_record_infers_repository_from_gemini_workspace_di
     kwargs["custom_llm_provider"] = "gemini"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-gemini-workspace-repository"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-gemini-workspace-repository"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-gemini-workspace-repository"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gemini-3-flash-preview",
         "request": {
@@ -2974,9 +2805,7 @@ def test_build_session_history_record_infers_repository_from_structured_workspac
     kwargs["custom_llm_provider"] = "gemini"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-structured-workspace-repository"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-structured-workspace-repository"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-structured-workspace-repository"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gemini-3-flash-preview",
         "request": {
@@ -3015,9 +2844,7 @@ def test_build_session_history_record_marks_claude_permission_check() -> None:
     kwargs["custom_llm_provider"] = "anthropic"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-claude-permission-check"
-    kwargs["passthrough_logging_payload"]["request_body"][
-        "model"
-    ] = "claude-opus-4-6"
+    kwargs["passthrough_logging_payload"]["request_body"]["model"] = "claude-opus-4-6"
     kwargs["litellm_params"]["metadata"].update(
         {
             "session_id": "session-claude-permission-check",
@@ -3086,12 +2913,7 @@ def test_build_session_history_record_tracks_runtime_and_client_identity() -> No
         }
     )
     kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {
-            "user-agent": (
-                "codex-tui/0.124.0 (Ubuntu 22.4.0; x86_64) "
-                "WindowsTerminal (codex-tui; 0.124.0)"
-            )
-        }
+        "headers": {"user-agent": ("codex-tui/0.124.0 (Ubuntu 22.4.0; x86_64) " "WindowsTerminal (codex-tui; 0.124.0)")}
     }
 
     result = {
@@ -3153,13 +2975,7 @@ def test_build_session_runtime_identity_uses_native_gemini_user_agent_header() -
             "litellm_wheel_versions": {"aawm-litellm-callbacks": "0.0.14"},
         },
         kwargs={
-            "litellm_params": {
-                "proxy_server_request": {
-                    "headers": {
-                        "user-agent": "GeminiCLI/0.9.1 (darwin; arm64)"
-                    }
-                }
-            }
+            "litellm_params": {"proxy_server_request": {"headers": {"user-agent": "GeminiCLI/0.9.1 (darwin; arm64)"}}}
         },
         allow_runtime=False,
     )
@@ -3265,9 +3081,7 @@ def test_build_session_history_record_handles_object_tool_use_blocks() -> None:
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-tool-object"
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-claude-code-session-id": "session-tool-object"}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"x-claude-code-session-id": "session-tool-object"}}
 
     class _ToolUseBlock:
         def __init__(self):
@@ -3474,9 +3288,7 @@ def test_build_session_history_record_tracks_structured_output_request() -> None
         0,
     )
     assert payload[119:122] == (None, None, None)
-    assert json.loads(payload[122]) == {
-        "agent_quality_rule_catalog_version": "2026-05-31.v1"
-    }
+    assert json.loads(payload[122]) == {"agent_quality_rule_catalog_version": "2026-05-31.v1"}
     assert payload[123:127] == (False, None, None, None)
 
 
@@ -3602,9 +3414,7 @@ def test_build_session_history_record_persists_output_contract_metadata() -> Non
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-output-contract-metadata"
-    kwargs["litellm_params"]["metadata"].update(
-        {"session_id": "session-output-contract-metadata"}
-    )
+    kwargs["litellm_params"]["metadata"].update({"session_id": "session-output-contract-metadata"})
     kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
         {
             "role": "user",
@@ -3636,35 +3446,20 @@ def test_build_session_history_record_persists_output_contract_metadata() -> Non
 
     assert record is not None
     assert record["output_contract_compliance_score"] == pytest.approx(0.0)
-    assert (
-        record["output_contract_required_final_phrase"]
-        == "No files were modified."
-    )
+    assert record["output_contract_required_final_phrase"] == "No files were modified."
     assert record["output_contract_required_final_phrase_present"] is False
     assert record["output_contract_failure_class"] == "missing_required_final_phrase"
     assert record["output_contract_failure_count"] == 1
-    assert record["agent_score_reasons"]["output_contract_compliance"] == [
-        "missing_required_final_phrase"
-    ]
+    assert record["agent_score_reasons"]["output_contract_compliance"] == ["missing_required_final_phrase"]
 
     payload_metadata = record["metadata"]
-    assert (
-        payload_metadata["usage_output_contract_required_final_phrase"]
-        == "No files were modified."
-    )
-    assert (
-        payload_metadata["usage_output_contract_required_final_phrase_present"]
-        is False
-    )
-    assert (
-        payload_metadata["usage_output_contract_failure_class"]
-        == "missing_required_final_phrase"
-    )
+    assert payload_metadata["usage_output_contract_required_final_phrase"] == "No files were modified."
+    assert payload_metadata["usage_output_contract_required_final_phrase_present"] is False
+    assert payload_metadata["usage_output_contract_failure_class"] == "missing_required_final_phrase"
     assert payload_metadata["usage_output_contract_failure_count"] == 1
-    assert (
-        payload_metadata["usage_agent_score_reasons"]["output_contract_compliance"]
-        == ["missing_required_final_phrase"]
-    )
+    assert payload_metadata["usage_agent_score_reasons"]["output_contract_compliance"] == [
+        "missing_required_final_phrase"
+    ]
 
 
 def test_build_session_history_record_flags_literal_claude_xml_output_contract() -> None:
@@ -3673,9 +3468,7 @@ def test_build_session_history_record_flags_literal_claude_xml_output_contract()
     kwargs["custom_llm_provider"] = "anthropic"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-output-contract-literal-xml"
-    kwargs["litellm_params"]["metadata"].update(
-        {"session_id": "session-output-contract-literal-xml"}
-    )
+    kwargs["litellm_params"]["metadata"].update({"session_id": "session-output-contract-literal-xml"})
     kwargs["passthrough_logging_payload"]["request_body"]["messages"] = [
         {"role": "user", "content": "Run the requested step."}
     ]
@@ -3686,11 +3479,7 @@ def test_build_session_history_record_flags_literal_claude_xml_output_contract()
             {
                 "message": {
                     "role": "assistant",
-                    "content": (
-                        '<invoke name="Bash">\n'
-                        '<parameter name="command">pwd</parameter>\n'
-                        "</invoke>"
-                    ),
+                    "content": ('<invoke name="Bash">\n' '<parameter name="command">pwd</parameter>\n' "</invoke>"),
                 }
             }
         ],
@@ -3707,17 +3496,12 @@ def test_build_session_history_record_flags_literal_claude_xml_output_contract()
     assert record["output_contract_compliance_score"] == pytest.approx(0.0)
     assert record["output_contract_failure_class"] == "literal_tool_call_text"
     assert record["output_contract_failure_count"] == 1
-    assert record["agent_score_reasons"]["output_contract_compliance"] == [
-        "literal_tool_call_text"
-    ]
+    assert record["agent_score_reasons"]["output_contract_compliance"] == ["literal_tool_call_text"]
 
     payload_metadata = record["metadata"]
     assert payload_metadata["usage_output_contract_failure_class"] == "literal_tool_call_text"
     assert payload_metadata["usage_output_contract_failure_count"] == 1
-    assert (
-        payload_metadata["usage_agent_score_reasons"]["output_contract_compliance"]
-        == ["literal_tool_call_text"]
-    )
+    assert payload_metadata["usage_agent_score_reasons"]["output_contract_compliance"] == ["literal_tool_call_text"]
     serialized = json.dumps(record)
     assert '<invoke name="Bash">' not in serialized
     assert "literal_tool_call_text" in serialized
@@ -3764,9 +3548,7 @@ def test_build_session_history_record_scores_runtime_ignored_path_tracking() -> 
     assert record["ignored_path_tracking_violation_count"] == 1
     reasons = record["agent_score_reasons"]
     assert reasons["ignored_path_tracking_policy"] == ["forced_tracking_ignored_path"]
-    assert reasons["ignored_path_tracking_evidence"][0]["evidence_mode"] == (
-        "inferred_common_ignored_path"
-    )
+    assert reasons["ignored_path_tracking_evidence"][0]["evidence_mode"] == ("inferred_common_ignored_path")
 
 
 def test_build_session_history_record_scores_runtime_baseline_deflection() -> None:
@@ -3775,9 +3557,7 @@ def test_build_session_history_record_scores_runtime_baseline_deflection() -> No
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-runtime-baseline-deflection"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-runtime-baseline-deflection"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-runtime-baseline-deflection"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.4-mini",
         "messages": [
@@ -3844,9 +3624,7 @@ def test_build_session_history_record_does_not_score_persona_guidance_as_baselin
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-runtime-baseline-guidance"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-runtime-baseline-guidance"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-runtime-baseline-guidance"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.4-mini",
         "messages": [
@@ -3923,9 +3701,7 @@ def test_build_session_history_record_scores_runtime_discovery_inventory_gap() -
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-runtime-discovery-inventory"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-runtime-discovery-inventory"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-runtime-discovery-inventory"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.4-mini",
         "messages": [
@@ -3945,9 +3721,7 @@ def test_build_session_history_record_scores_runtime_discovery_inventory_gap() -
                     {
                         "type": "tool_use",
                         "name": "Bash",
-                        "input": {
-                            "cmd": "find .analysis -maxdepth 1 -name '*handoff*.md' -print"
-                        },
+                        "input": {"cmd": "find .analysis -maxdepth 1 -name '*handoff*.md' -print"},
                     }
                 ],
             },
@@ -3956,10 +3730,7 @@ def test_build_session_history_record_scores_runtime_discovery_inventory_gap() -
                 "content": [
                     {
                         "type": "tool_result",
-                        "content": (
-                            ".analysis/seed-handoff.md\n"
-                            ".analysis/recent-handoff.md\n"
-                        ),
+                        "content": (".analysis/seed-handoff.md\n" ".analysis/recent-handoff.md\n"),
                     }
                 ],
             },
@@ -3993,9 +3764,7 @@ def test_build_session_history_record_scores_runtime_discovery_inventory_gap() -
     assert record is not None
     assert record["discovery_inventory_coverage_score"] == pytest.approx(0.0)
     assert record["discovery_inventory_missing_count"] == 1
-    assert record["metadata"]["usage_discovery_inventory_coverage_score"] == pytest.approx(
-        0.0
-    )
+    assert record["metadata"]["usage_discovery_inventory_coverage_score"] == pytest.approx(0.0)
     assert (
         "omitted_discovered_candidate:.analysis/recent-handoff.md"
         in record["agent_score_reasons"]["discovery_inventory_coverage"]
@@ -4020,10 +3789,7 @@ def test_build_session_history_record_scores_runtime_sleep_interruption() -> Non
             {
                 "message": {
                     "role": "assistant",
-                    "content": (
-                        "It's late. Go get some rest and we'll pick back up "
-                        "in the morning."
-                    ),
+                    "content": ("It's late. Go get some rest and we'll pick back up " "in the morning."),
                 }
             }
         ],
@@ -4040,9 +3806,7 @@ def test_build_session_history_record_scores_runtime_sleep_interruption() -> Non
     assert record["sleep_wellness_interruption_attempted_score"] == pytest.approx(1.0)
     assert record["sleep_wellness_interruption_incident_score"] == pytest.approx(1.0)
     assert record["sleep_wellness_interruption_count"] >= 1
-    assert record["metadata"][
-        "usage_sleep_wellness_interruption_incident_score"
-    ] == pytest.approx(1.0)
+    assert record["metadata"]["usage_sleep_wellness_interruption_incident_score"] == pytest.approx(1.0)
 
 
 def test_build_session_history_record_omits_empty_read_pages_from_tool_activity() -> None:
@@ -4051,9 +3815,7 @@ def test_build_session_history_record_omits_empty_read_pages_from_tool_activity(
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-read-output"
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-claude-code-session-id": "session-read-output"}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"x-claude-code-session-id": "session-read-output"}}
 
     class _Result:
         def __init__(self):
@@ -4126,10 +3888,7 @@ def test_build_session_history_record_keeps_google_prompt_policy_metadata() -> N
 
     assert record is not None
     assert record["metadata"]["google_adapter_system_prompt_policy"] == "replace_compact"
-    assert (
-        record["metadata"]["google_adapter_system_prompt_policy_version"]
-        == "2026-04-27.v2"
-    )
+    assert record["metadata"]["google_adapter_system_prompt_policy_version"] == "2026-04-27.v2"
     assert record["metadata"]["google_adapter_system_prompt_original_chars"] == 1234
     assert record["metadata"]["google_adapter_system_prompt_rewritten_chars"] == 456
 
@@ -4270,9 +4029,7 @@ def test_build_session_history_record_preserves_explicit_openrouter_model() -> N
     assert record is not None
     assert record["provider"] == "openrouter"
     assert record["model"] == "openrouter/owl-alpha"
-    assert record["metadata"]["anthropic_adapter_original_model"] == (
-        "openrouter/owl-alpha"
-    )
+    assert record["metadata"]["anthropic_adapter_original_model"] == ("openrouter/owl-alpha")
 
 
 def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None:
@@ -4310,13 +4067,16 @@ def test_build_session_history_record_tracks_usage_reasoning_and_tools() -> None
                         {
                             "id": "tool-2",
                             "type": "function",
-                            "function": {"name": "Write", "arguments": '{"file_path":"litellm/proxy/proxy_server.py","content":"updated"}'},
+                            "function": {
+                                "name": "Write",
+                                "arguments": '{"file_path":"litellm/proxy/proxy_server.py","content":"updated"}',
+                            },
                         },
                         {
                             "id": "tool-3",
                             "type": "function",
                             "function": {"name": "Bash", "arguments": '{"command":"git commit -m msg && git push"}'},
-                        }
+                        },
                     ],
                 }
             }
@@ -4417,9 +4177,7 @@ def test_build_session_history_record_flags_sensitive_config_file_changes() -> N
                             "type": "function",
                             "function": {
                                 "name": "Write",
-                                "arguments": json.dumps(
-                                    {"file_path": "pyproject.toml", "content": "x = 1"}
-                                ),
+                                "arguments": json.dumps({"file_path": "pyproject.toml", "content": "x = 1"}),
                             },
                         },
                         {
@@ -4427,9 +4185,7 @@ def test_build_session_history_record_flags_sensitive_config_file_changes() -> N
                             "type": "function",
                             "function": {
                                 "name": "Write",
-                                "arguments": json.dumps(
-                                    {"file_path": "./.gitignore", "content": ".env\n"}
-                                ),
+                                "arguments": json.dumps({"file_path": "./.gitignore", "content": ".env\n"}),
                             },
                         },
                     ],
@@ -4453,9 +4209,7 @@ def test_build_session_history_record_flags_sensitive_config_file_changes() -> N
     assert record["changed_gitignore"] is True
     env_activity = record["tool_activity"][1]
     assert env_activity["file_paths_modified"] == [".env.local"]
-    assert env_activity["arguments"]["content"] == (
-        aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION
-    )
+    assert env_activity["arguments"]["content"] == (aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION)
     assert "super-secret" not in json.dumps(env_activity)
 
 
@@ -4464,9 +4218,7 @@ def test_build_session_history_record_does_not_infer_config_changes_from_reads_o
     kwargs["litellm_call_id"] = "call-sensitive-config-negative"
     kwargs["model"] = "openai/gpt-5.4-mini"
     kwargs["custom_llm_provider"] = "openai"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-sensitive-config-negative"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-sensitive-config-negative"
     result = {
         "id": "response-sensitive-config-negative",
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
@@ -4519,12 +4271,8 @@ def test_build_session_history_record_does_not_infer_config_changes_from_reads_o
     assert record["changed_pyproject_toml"] is False
     assert record["changed_gitignore"] is False
     command_activity = record["tool_activity"][1]
-    assert command_activity["command_text"] == (
-        aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION
-    )
-    assert command_activity["arguments"]["command"] == (
-        aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION
-    )
+    assert command_activity["command_text"] == (aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION)
+    assert command_activity["arguments"]["command"] == (aawm_agent_identity._SENSITIVE_CONFIG_ENV_REDACTION)
     assert "super-secret" not in json.dumps(command_activity)
 
 
@@ -4621,9 +4369,7 @@ def test_build_session_history_record_flags_config_changes_across_agent_families
                             "type": "function",
                             "function": {
                                 "name": "Write",
-                                "arguments": json.dumps(
-                                    {"file_path": "config/.env.test", "content": "x=1"}
-                                ),
+                                "arguments": json.dumps({"file_path": "config/.env.test", "content": "x=1"}),
                             },
                         },
                         {
@@ -4644,11 +4390,9 @@ def test_build_session_history_record_flags_config_changes_across_agent_families
                             "type": "function",
                             "function": {
                                 "name": "Write",
-                                "arguments": json.dumps(
-                                    {"file_path": "repo/.gitignore", "content": ".env\n"}
-                                ),
+                                "arguments": json.dumps({"file_path": "repo/.gitignore", "content": ".env\n"}),
                             },
-                        }
+                        },
                     ],
                 }
             }
@@ -4853,10 +4597,7 @@ def test_build_session_history_record_estimates_codex_responses_prompt_overhead(
     )
     request_body = {
         "model": "gpt-5.3-codex",
-        "instructions": (
-            "Always use parallel work when it is safe.\n\n"
-            "Never expose secrets."
-        ),
+        "instructions": ("Always use parallel work when it is safe.\n\n" "Never expose secrets."),
         "tools": [{"type": "function", "name": "apply_patch"}],
         "input": [{"role": "user", "content": "Patch the tests."}],
     }
@@ -4971,9 +4712,7 @@ def test_build_session_history_record_excludes_openai_responses_opaque_state_fro
             {
                 "type": "message",
                 "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": "visible assistant reply"}
-                ],
+                "content": [{"type": "output_text", "text": "visible assistant reply"}],
             },
         ],
     }
@@ -5025,16 +4764,7 @@ def test_build_session_history_record_estimates_gemini_prompt_overhead(
     request_body = {
         "model": "gemini-3-flash-preview",
         "request": {
-            "systemInstruction": {
-                "parts": [
-                    {
-                        "text": (
-                            "You are Gemini CLI.\n\n"
-                            "Follow repository instructions."
-                        )
-                    }
-                ]
-            },
+            "systemInstruction": {"parts": [{"text": ("You are Gemini CLI.\n\n" "Follow repository instructions.")}]},
             "tools": [{"functionDeclarations": [{"name": "run_shell_command"}]}],
             "contents": [{"role": "user", "parts": [{"text": "Run date."}]}],
         },
@@ -5119,10 +4849,7 @@ def test_build_session_history_record_estimates_anthropic_google_adapter_prompt_
     )
     metadata = record["metadata"]
     assert metadata["google_adapter_system_prompt_policy"] == "replace_compact"
-    assert (
-        metadata["google_adapter_system_prompt_policy_version"]
-        == "2026-04-27.v2"
-    )
+    assert metadata["google_adapter_system_prompt_policy_version"] == "2026-04-27.v2"
     assert metadata["google_adapter_system_prompt_original_chars"] == 1234
     assert metadata["google_adapter_system_prompt_rewritten_chars"] == 456
     assert record["system_behavior_tokens_estimated"] > 0
@@ -5154,10 +4881,7 @@ def test_build_session_history_record_estimates_anthropic_chat_adapter_prompt_ov
     )
     request_body = {
         "model": model,
-        "system": (
-            "You are an adapter target.\n\n"
-            "Always preserve tool-use intent."
-        ),
+        "system": ("You are an adapter target.\n\n" "Always preserve tool-use intent."),
         "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
         "messages": [{"role": "user", "content": "Use Bash."}],
     }
@@ -5253,9 +4977,7 @@ def test_build_session_history_record_uses_request_header_tenant_without_prompt_
     kwargs["call_type"] = "responses"
     kwargs["litellm_call_id"] = "call-header-tenant"
     kwargs["litellm_params"]["metadata"]["session_id"] = "session-header-tenant"
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-aawm-tenant-id": "tenant-from-header"}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"x-aawm-tenant-id": "tenant-from-header"}}
 
     record = _build_session_history_record(
         kwargs=kwargs,
@@ -5293,10 +5015,7 @@ def test_build_session_history_record_calculates_gpt_5_5_cost_from_current_price
 
     assert record is not None
     model_prices = litellm.model_cost["gpt-5.5"]
-    expected_cost = (
-        (1000 * model_prices["input_cost_per_token"])
-        + (1000 * model_prices["output_cost_per_token"])
-    )
+    expected_cost = (1000 * model_prices["input_cost_per_token"]) + (1000 * model_prices["output_cost_per_token"])
     assert record["response_cost_usd"] == pytest.approx(expected_cost)
 
 
@@ -5307,14 +5026,16 @@ def test_build_session_history_record_estimates_openrouter_rerank_tokens_from_re
     kwargs["call_type"] = "rerank"
     kwargs["litellm_call_id"] = "call-openrouter-rerank-cost"
     kwargs["litellm_params"]["metadata"]["session_id"] = "session-openrouter-rerank-cost"
-    kwargs["litellm_params"]["proxy_server_request"] = {"body": {
-        "model": "openrouter/cohere/rerank-4-pro",
-        "query": "What is OpenRouter?",
-        "documents": [
-            "OpenRouter routes requests across model providers.",
-            "LiteLLM records provider usage in session history.",
-        ],
-    }}
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": {
+            "model": "openrouter/cohere/rerank-4-pro",
+            "query": "What is OpenRouter?",
+            "documents": [
+                "OpenRouter routes requests across model providers.",
+                "LiteLLM records provider usage in session history.",
+            ],
+        }
+    }
     kwargs["query"] = "What is OpenRouter?"
     kwargs["documents"] = [
         "OpenRouter routes requests across model providers.",
@@ -5360,9 +5081,7 @@ def test_build_session_history_record_uses_openrouter_hidden_response_cost() -> 
     kwargs["custom_llm_provider"] = "openrouter"
     kwargs["call_type"] = "rerank"
     kwargs["litellm_call_id"] = "call-openrouter-hidden-rerank-cost"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-openrouter-hidden-rerank-cost"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-openrouter-hidden-rerank-cost"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "query": "What is OpenRouter?",
         "documents": ["OpenRouter routes LLM calls.", "Unrelated text."],
@@ -5402,9 +5121,7 @@ def test_build_session_history_record_prefers_openrouter_reported_cost(
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-openrouter-qwen-reported-cost"
     kwargs["standard_logging_object"]["response_cost"] = generic_response_cost
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-openrouter-qwen-reported-cost"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-openrouter-qwen-reported-cost"
 
     result = SimpleNamespace(
         id="or-qwen-response-reported-cost",
@@ -5441,13 +5158,13 @@ def test_build_session_history_record_calculates_openrouter_embedding_cost() -> 
     kwargs["custom_llm_provider"] = "openrouter"
     kwargs["call_type"] = "embedding"
     kwargs["litellm_call_id"] = "call-openrouter-qwen-embedding-cost"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-openrouter-qwen-embedding-cost"
-    )
-    kwargs["litellm_params"]["proxy_server_request"] = {"body": {
-        "model": "openrouter/qwen/qwen3-embedding-8b",
-        "input": "Embed this text.",
-    }}
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-openrouter-qwen-embedding-cost"
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": {
+            "model": "openrouter/qwen/qwen3-embedding-8b",
+            "input": "Embed this text.",
+        }
+    }
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "qwen/qwen3-embedding-8b",
         "input": "Embed this text.",
@@ -5542,14 +5259,14 @@ def test_build_session_history_record_calculates_local_embedding_estimated_cost(
     kwargs["custom_llm_provider"] = "local_embed"
     kwargs["call_type"] = "embedding"
     kwargs["litellm_call_id"] = "call-local-medcpt-embedding-cost"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-local-medcpt-embedding-cost"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-local-medcpt-embedding-cost"
     kwargs["litellm_params"]["metadata"]["model_group"] = "tei-medcpt-article"
-    kwargs["litellm_params"]["proxy_server_request"] = {"body": {
-        "model": "tei-medcpt-article",
-        "input": "Embed this clinical text.",
-    }}
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": {
+            "model": "tei-medcpt-article",
+            "input": "Embed this clinical text.",
+        }
+    }
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "ncbi/MedCPT-Article-Encoder",
         "input": "Embed this clinical text.",
@@ -5680,9 +5397,7 @@ def test_build_session_history_record_sets_inbound_model_alias_for_direct_reques
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "acompletion"
     kwargs["litellm_call_id"] = "call-direct-model-inbound-alias"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-direct-model-inbound-alias"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-direct-model-inbound-alias"
 
     result = {
         "id": "direct-model-response-1",
@@ -5719,9 +5434,7 @@ def test_build_session_history_record_routes_openai_compatible_openrouter_model(
     kwargs["call_type"] = "acompletion"
     kwargs["litellm_call_id"] = "call-openrouter-openai-compatible"
     kwargs["litellm_params"]["api_base"] = "https://openrouter.ai/api/v1/chat/completions"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-openrouter-openai-compatible"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-openrouter-openai-compatible"
 
     result = {
         "id": "openrouter-openai-compatible-response-1",
@@ -5793,9 +5506,7 @@ def test_build_session_history_record_marks_local_openai_chat_route() -> None:
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "acompletion"
     kwargs["litellm_call_id"] = "call-local-qwen-chat"
-    kwargs["litellm_params"]["api_base"] = (
-        "http://user:secret@172.20.0.1:8093/v1?key=should-not-log"
-    )
+    kwargs["litellm_params"]["api_base"] = "http://user:secret@172.20.0.1:8093/v1?key=should-not-log"
     kwargs["litellm_params"]["metadata"]["session_id"] = "session-local-qwen-chat"
     kwargs["litellm_params"]["metadata"]["model_group"] = "qwen3-heretic-gguf"
     kwargs["litellm_params"]["proxy_server_request"] = {
@@ -5841,10 +5552,7 @@ def test_build_session_history_record_marks_local_openai_chat_route() -> None:
     assert record["metadata"]["aawm_local_model_group"] == "qwen3-heretic-gguf"
     assert record["metadata"]["aawm_local_upstream_provider"] == "openai"
     assert record["metadata"]["aawm_local_upstream_model"] == "qwen3-4b-heretic-q8"
-    assert (
-        record["metadata"]["aawm_local_upstream_api_base"]
-        == "http://172.20.0.1:8093/v1"
-    )
+    assert record["metadata"]["aawm_local_upstream_api_base"] == "http://172.20.0.1:8093/v1"
 
 
 @pytest.mark.parametrize(
@@ -5871,9 +5579,7 @@ def test_build_session_history_record_marks_local_biomed_passthrough_route(
     kwargs["model"] = "unknown"
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = f"call-local-biomed-{expected_model}"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        f"session-local-biomed-{expected_model}"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = f"session-local-biomed-{expected_model}"
     kwargs["passthrough_logging_payload"]["url"] = api_base
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "text": "BRCA1 is associated with breast cancer.",
@@ -5919,14 +5625,16 @@ def test_build_session_history_record_calculates_local_rerank_estimated_cost() -
     kwargs["litellm_call_id"] = "call-local-rerank-cost"
     kwargs["litellm_params"]["metadata"]["session_id"] = "session-local-rerank-cost"
     kwargs["litellm_params"]["metadata"]["model_group"] = "tei-reranker"
-    kwargs["litellm_params"]["proxy_server_request"] = {"body": {
-        "model": "tei-reranker",
-        "query": "What is LiteLLM?",
-        "documents": [
-            "LiteLLM records local rerank usage in session history.",
-            "A separate document about unrelated material.",
-        ],
-    }}
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "body": {
+            "model": "tei-reranker",
+            "query": "What is LiteLLM?",
+            "documents": [
+                "LiteLLM records local rerank usage in session history.",
+                "A separate document about unrelated material.",
+            ],
+        }
+    }
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "query": "What is LiteLLM?",
         "texts": [
@@ -6230,9 +5938,7 @@ def test_build_session_history_record_marks_xai_partial_cache_hit_miss_cost() ->
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "partial_cache_hit"
     assert record["provider_cache_miss_token_count"] == 300
-    assert record["provider_cache_miss_cost_usd"] == pytest.approx(
-        (0.00000125 - 0.0000002) * 300
-    )
+    assert record["provider_cache_miss_cost_usd"] == pytest.approx((0.00000125 - 0.0000002) * 300)
 
 
 def test_build_session_history_record_repairs_xai_metadata_partial_cache_hit() -> None:
@@ -6266,9 +5972,7 @@ def test_build_session_history_record_repairs_xai_metadata_partial_cache_hit() -
     assert record["provider_cache_miss"] is True
     assert record["provider_cache_miss_reason"] == "partial_cache_hit"
     assert record["provider_cache_miss_token_count"] == 300
-    assert record["provider_cache_miss_cost_usd"] == pytest.approx(
-        (0.00000125 - 0.0000002) * 300
-    )
+    assert record["provider_cache_miss_cost_usd"] == pytest.approx((0.00000125 - 0.0000002) * 300)
 
 
 def test_build_session_history_record_tracks_git_global_option_commit_and_push() -> None:
@@ -6446,9 +6150,7 @@ def test_d1_169_detects_claude_code_compact_summary_event() -> None:
             "total_tokens": 270,
             "cache_creation_input_tokens": 12,
         },
-        "choices": [
-            {"message": {"role": "assistant", "content": "summary created"}}
-        ],
+        "choices": [{"message": {"role": "assistant", "content": "summary created"}}],
     }
 
     record = _build_session_history_record(
@@ -6534,12 +6236,7 @@ def test_d1_169_recognizes_codex_resume_handoff_as_compact_context_not_counted()
     )
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.4",
-        "input": [
-            {
-                "role": "user",
-                "content": "Another language model started to solve this problem."
-            }
-        ],
+        "input": [{"role": "user", "content": "Another language model started to solve this problem."}],
     }
 
     result = {
@@ -6591,9 +6288,7 @@ def test_d1_169_detects_gemini_compact_output_state_snapshot() -> None:
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gemini-3-flash-preview",
         "user_prompt_id": "compress-1780246649610",
-        "contents": [
-            {"role": "user", "parts": [{"text": "checkpoint"}]}
-        ],
+        "contents": [{"role": "user", "parts": [{"text": "checkpoint"}]}],
     }
 
     result = {
@@ -6604,17 +6299,7 @@ def test_d1_169_detects_gemini_compact_output_state_snapshot() -> None:
             "totalTokenCount": 120,
         },
         "candidates": [
-            {
-                "content": {
-                    "parts": [
-                        {
-                            "text": (
-                                "<state_snapshot><summary>compact point</summary></state_snapshot>"
-                            )
-                        }
-                    ]
-                }
-            }
+            {"content": {"parts": [{"text": ("<state_snapshot><summary>compact point</summary></state_snapshot>")}]}}
         ],
     }
 
@@ -6651,9 +6336,7 @@ def test_d1_169_recognizes_gemini_compact_verify_not_counted_with_base_id() -> N
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gemini-3-flash-preview",
         "user_prompt_id": "compress-1780246649610-verify",
-        "contents": [
-            {"role": "user", "parts": [{"text": "checkpoint verification"}]}
-        ],
+        "contents": [{"role": "user", "parts": [{"text": "checkpoint verification"}]}],
     }
 
     result = {
@@ -6856,9 +6539,9 @@ def test_build_session_history_record_marks_gemini_provider_cache_miss_from_cach
     kwargs["call_type"] = "pass_through_endpoint"
     kwargs["litellm_call_id"] = "call-gemini-cache-miss"
     kwargs["litellm_params"]["metadata"]["session_id"] = "session-gemini-cache-miss"
-    kwargs["passthrough_logging_payload"]["request_body"]["cachedContent"] = (
-        "projects/demo/locations/us-central1/cachedContents/test-cache"
-    )
+    kwargs["passthrough_logging_payload"]["request_body"][
+        "cachedContent"
+    ] = "projects/demo/locations/us-central1/cachedContents/test-cache"
 
     result = {
         "id": "provider-response-gemini-cache-miss",
@@ -7350,9 +7033,7 @@ def test_build_session_history_record_keeps_unsupported_hosted_tool_metadata() -
     kwargs["litellm_params"]["metadata"].update(
         {
             "session_id": "session-nvidia-hosted-tool-policy",
-            "anthropic_adapter_unsupported_hosted_tools": [
-                {"type": "bash_20250124", "name": "bash"}
-            ],
+            "anthropic_adapter_unsupported_hosted_tools": [{"type": "bash_20250124", "name": "bash"}],
             "anthropic_adapter_unsupported_hosted_tool_choice": {
                 "type": "tool",
                 "name": "bash",
@@ -7381,9 +7062,7 @@ def test_build_session_history_record_keeps_unsupported_hosted_tool_metadata() -
     assert record["metadata"]["anthropic_adapter_unsupported_hosted_tools"] == [
         {"type": "bash_20250124", "name": "bash"}
     ]
-    assert record["metadata"][
-        "anthropic_adapter_unsupported_hosted_tool_choice"
-    ] == {"type": "tool", "name": "bash"}
+    assert record["metadata"]["anthropic_adapter_unsupported_hosted_tool_choice"] == {"type": "tool", "name": "bash"}
 
 
 def test_build_session_history_record_keeps_codex_unsupported_hosted_tool_metadata() -> None:
@@ -7514,9 +7193,7 @@ def test_build_session_history_record_uses_adapter_target_over_anthropic_ingress
     kwargs["model"] = model
     kwargs["custom_llm_provider"] = "anthropic"
     kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = (
-        f"call-adapter-target-{expected_provider}-{model.replace('/', '-')}"
-    )
+    kwargs["litellm_call_id"] = f"call-adapter-target-{expected_provider}-{model.replace('/', '-')}"
     kwargs["litellm_params"]["metadata"].update(
         {
             "session_id": f"session-adapter-target-{expected_provider}",
@@ -7539,9 +7216,7 @@ def test_build_session_history_record_uses_adapter_target_over_anthropic_ingress
                 "completion_tokens": 8,
                 "total_tokens": 50,
             },
-            "choices": [
-                {"message": {"role": "assistant", "content": "adapter output"}}
-            ],
+            "choices": [{"message": {"role": "assistant", "content": "adapter output"}}],
         },
         start_time=None,
         end_time=None,
@@ -7566,13 +7241,9 @@ def test_build_session_history_record_uses_codex_google_code_assist_metadata() -
             "codex_adapter_model": "gemini-3.1-pro-preview",
             "codex_adapter_input_shape": "openai_responses",
             "codex_adapter_output_shape": "openai_responses",
-            "codex_google_code_assist_tool_contract_policy_name": (
-                "codex_google_code_assist_tool_contract_policy"
-            ),
+            "codex_google_code_assist_tool_contract_policy_name": ("codex_google_code_assist_tool_contract_policy"),
             "codex_google_code_assist_tool_contract_policy": "append",
-            "codex_google_code_assist_tool_contract_policy_version": (
-                "2026-05-12.v1"
-            ),
+            "codex_google_code_assist_tool_contract_policy_version": ("2026-05-12.v1"),
             "codex_google_code_assist_tool_contract_policy_applied": True,
             "codex_google_code_assist_tool_contract_prompt_chars": 713,
             "google_retrieve_user_quota": {
@@ -7608,33 +7279,18 @@ def test_build_session_history_record_uses_codex_google_code_assist_metadata() -
     assert record is not None
     assert record["provider"] == "gemini"
     assert record["model"] == "gemini-3.1-pro-preview"
-    assert record["metadata"]["passthrough_route_family"] == (
-        "codex_google_code_assist_adapter"
-    )
+    assert record["metadata"]["passthrough_route_family"] == ("codex_google_code_assist_adapter")
     assert record["metadata"]["codex_adapter_model"] == "gemini-3.1-pro-preview"
     assert record["metadata"]["codex_adapter_input_shape"] == "openai_responses"
     assert record["metadata"]["codex_adapter_output_shape"] == "openai_responses"
-    assert record["metadata"][
-        "codex_google_code_assist_tool_contract_policy_name"
-    ] == "codex_google_code_assist_tool_contract_policy"
     assert (
-        record["metadata"]["codex_google_code_assist_tool_contract_policy"]
-        == "append"
+        record["metadata"]["codex_google_code_assist_tool_contract_policy_name"]
+        == "codex_google_code_assist_tool_contract_policy"
     )
-    assert (
-        record["metadata"]["codex_google_code_assist_tool_contract_policy_version"]
-        == "2026-05-12.v1"
-    )
-    assert (
-        record["metadata"][
-            "codex_google_code_assist_tool_contract_policy_applied"
-        ]
-        is True
-    )
-    assert (
-        record["metadata"]["codex_google_code_assist_tool_contract_prompt_chars"]
-        == 713
-    )
+    assert record["metadata"]["codex_google_code_assist_tool_contract_policy"] == "append"
+    assert record["metadata"]["codex_google_code_assist_tool_contract_policy_version"] == "2026-05-12.v1"
+    assert record["metadata"]["codex_google_code_assist_tool_contract_policy_applied"] is True
+    assert record["metadata"]["codex_google_code_assist_tool_contract_prompt_chars"] == 713
     assert record["metadata"]["google_retrieve_user_quota"] == {
         "source": "google_retrieve_user_quota",
         "buckets": {"items": []},
@@ -7646,9 +7302,7 @@ def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["model"] = "gpt-5.2-codex"
     kwargs["custom_llm_provider"] = "openai"
-    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
-        "codex_responses"
-    )
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = "codex_responses"
 
     result = {
         "id": "resp-codex-1",
@@ -7698,9 +7352,7 @@ def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
     assert "codex-tool-calls-present" in metadata["tags"]
     assert "reasoning-tokens-reported" in request_tags
     assert "cache-read-input-tokens" in request_tags
-    span_names = [
-        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
-    ]
+    span_names = [span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)]
     assert "codex.usage_breakout" in span_names
 
 
@@ -7709,9 +7361,7 @@ def test_aawm_agent_identity_adds_xai_partial_cache_hit_metadata() -> None:
     kwargs = _base_kwargs(trace_name="grok-build")
     kwargs["model"] = "grok-build"
     kwargs["custom_llm_provider"] = "xai"
-    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
-        "grok_cli_chat_proxy"
-    )
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = "grok_cli_chat_proxy"
 
     result = {
         "id": "resp-xai-partial-cache-hit",
@@ -7738,12 +7388,8 @@ def test_aawm_agent_identity_adds_xai_partial_cache_hit_metadata() -> None:
     assert metadata["usage_provider_cache_miss"] is True
     assert metadata["usage_provider_cache_miss_reason"] == "partial_cache_hit"
     assert metadata["usage_provider_cache_miss_token_count"] == 300
-    assert metadata["usage_provider_cache_miss_cost_usd"] == pytest.approx(
-        (0.00000125 - 0.0000002) * 300
-    )
-    assert metadata["usage_provider_cache_miss_cost_basis"] == (
-        "prompt_vs_cache_read_delta"
-    )
+    assert metadata["usage_provider_cache_miss_cost_usd"] == pytest.approx((0.00000125 - 0.0000002) * 300)
+    assert metadata["usage_provider_cache_miss_cost_basis"] == ("prompt_vs_cache_read_delta")
     assert metadata["xai_provider_cache_status"] == "hit"
     assert metadata["xai_provider_cache_miss"] is True
     assert "provider-cache-status:hit" in request_tags
@@ -7761,9 +7407,7 @@ def test_aawm_agent_identity_adds_codex_usage_breakout_tags_from_standard_loggin
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["model"] = "gpt-5.3-codex-spark"
     kwargs["custom_llm_provider"] = "openai"
-    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
-        "codex_responses"
-    )
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = "codex_responses"
     kwargs["standard_logging_object"]["response"] = {
         "output": [
             {
@@ -7814,9 +7458,9 @@ def test_aawm_agent_identity_treats_codex_adapter_route_as_codex_usage() -> None
     kwargs = _base_kwargs(trace_name="orchestrator")
     kwargs["model"] = "qwen3.8-max-preview"
     kwargs["custom_llm_provider"] = "alibaba_token_plan"
-    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
-        "codex_alibaba_token_plan_chat_completions_adapter"
-    )
+    kwargs["litellm_params"]["metadata"][
+        "passthrough_route_family"
+    ] = "codex_alibaba_token_plan_chat_completions_adapter"
 
     result = {
         "id": "chatcmpl-qwen-tool",
@@ -7836,9 +7480,7 @@ def test_aawm_agent_identity_treats_codex_adapter_route_as_codex_usage() -> None
                             "type": "function",
                             "function": {
                                 "name": "exec_command",
-                                "arguments": (
-                                    '{"cmd":"date --iso-8601=seconds"}'
-                                ),
+                                "arguments": ('{"cmd":"date --iso-8601=seconds"}'),
                             },
                         }
                     ],
@@ -7864,9 +7506,7 @@ def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout()
     kwargs = _base_kwargs(trace_name="gemini")
     kwargs["model"] = "google/gemini-3.1-flash"
     kwargs["custom_llm_provider"] = "gemini"
-    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = (
-        "gemini_generate_content"
-    )
+    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = "gemini_generate_content"
 
     result = {
         "id": "resp-gemini-usage-1",
@@ -7880,9 +7520,7 @@ def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout()
                 "message": {
                     "role": "assistant",
                     "content": "gemini routed",
-                    "provider_specific_fields": {
-                        "thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]
-                    },
+                    "provider_specific_fields": {"thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]},
                 }
             }
         ],
@@ -7908,9 +7546,7 @@ def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout()
     assert "gemini-usage-breakout" in metadata["tags"]
     assert "gemini-reasoning-tokens-reported" in metadata["tags"]
     assert "reasoning-tokens-reported" in request_tags
-    span_names = [
-        span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)
-    ]
+    span_names = [span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)]
     assert "gemini.usage_breakout" in span_names
     usage_span = next(
         span
@@ -7918,10 +7554,7 @@ def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout()
         if isinstance(span, dict) and span.get("name") == "gemini.usage_breakout"
     )
     assert usage_span["metadata"]["reported_reasoning_tokens"] == 1
-    assert (
-        usage_span["metadata"]["reported_reasoning_tokens_source"]
-        == "provider_signature_present"
-    )
+    assert usage_span["metadata"]["reported_reasoning_tokens_source"] == "provider_signature_present"
 
 
 def test_build_session_history_record_skips_without_session_id() -> None:
@@ -8138,27 +7771,20 @@ def test_build_rate_limit_observations_extracts_codex_response_headers() -> None
 
     assert len(observations) == 4
     by_limit_scope = {
-        (observation["limit_id"], observation["limit_scope"]): observation
-        for observation in observations
+        (observation["limit_id"], observation["limit_scope"]): observation for observation in observations
     }
     generic_primary = by_limit_scope[("codex", "primary")]
     assert generic_primary["source"] == "codex_response_headers"
     assert generic_primary["quota_period"] == "five_hour"
     assert generic_primary["reset_hint_seconds"] == 14375
     assert generic_primary["used_percentage"] == 18.25
-    assert aawm_agent_identity._build_rate_limit_observation_db_payload(generic_primary)[
-        10
-    ] == pytest.approx(81.75)
+    assert aawm_agent_identity._build_rate_limit_observation_db_payload(generic_primary)[10] == pytest.approx(81.75)
     spark_secondary = by_limit_scope[("codex_bengalfox", "secondary")]
     assert spark_secondary["limit_name"] == "GPT-5.3-Codex-Spark"
     assert spark_secondary["quota_period"] == "seven_day"
     assert spark_secondary["used_percentage"] == 87.25
-    assert aawm_agent_identity._build_rate_limit_observation_db_payload(
-        spark_secondary
-    )[10] == pytest.approx(12.75)
-    assert spark_secondary["provider_resets_at"].isoformat().startswith(
-        "2026-05-05T22:08:30"
-    )
+    assert aawm_agent_identity._build_rate_limit_observation_db_payload(spark_secondary)[10] == pytest.approx(12.75)
+    assert spark_secondary["provider_resets_at"].isoformat().startswith("2026-05-05T22:08:30")
 
 
 def test_build_rate_limit_observations_uses_codex_reset_after_when_reset_at_stale() -> None:
@@ -8197,9 +7823,7 @@ def test_build_rate_limit_observations_uses_codex_reset_after_when_reset_at_stal
         49,
         tzinfo=timezone.utc,
     )
-    assert aawm_agent_identity._build_rate_limit_observation_db_payload(
-        observations[0]
-    )[10] == pytest.approx(65.0)
+    assert aawm_agent_identity._build_rate_limit_observation_db_payload(observations[0])[10] == pytest.approx(65.0)
 
 
 def test_build_rate_limit_observations_skips_malformed_codex_placeholder_headers() -> None:
@@ -8245,16 +7869,12 @@ def test_build_rate_limit_observations_skips_malformed_codex_placeholder_headers
 
     assert len(observations) == 2
     by_limit_scope = {
-        (observation["limit_id"], observation["limit_scope"]): observation
-        for observation in observations
+        (observation["limit_id"], observation["limit_scope"]): observation for observation in observations
     }
     assert ("codex", "primary") not in by_limit_scope
     assert ("codex", "secondary") not in by_limit_scope
     assert by_limit_scope[("codex_bengalfox", "primary")]["quota_period"] == "five_hour"
-    assert (
-        by_limit_scope[("codex_bengalfox", "secondary")]["quota_period"]
-        == "seven_day"
-    )
+    assert by_limit_scope[("codex_bengalfox", "secondary")]["quota_period"] == "seven_day"
 
 
 def test_build_rate_limit_observations_drops_only_malformed_codex_headers() -> None:
@@ -8407,13 +8027,8 @@ def test_build_rate_limit_observations_extracts_anthropic_7d_oi_headers() -> Non
     assert oi["used_percentage"] == 67.0
     assert oi["quota_period"] == "seven_day"
     assert oi["window_minutes"] == 10080
-    assert oi["raw_provider_fields"][
-        "anthropic-ratelimit-unified-representative-claim"
-    ] == "seven_day_overage_included"
-    assert (
-        oi["raw_provider_fields"]["anthropic-ratelimit-unified-overage-status"]
-        == "within_included"
-    )
+    assert oi["raw_provider_fields"]["anthropic-ratelimit-unified-representative-claim"] == "seven_day_overage_included"
+    assert oi["raw_provider_fields"]["anthropic-ratelimit-unified-overage-status"] == "within_included"
     payload = aawm_agent_identity._build_rate_limit_observation_db_payload(oi)
     assert "anthropic_unified_7d_oi:7d_oi" in payload
     sonnet_rows = [o for o in observations if o.get("limit_scope") == "7d_sonnet"]
@@ -8437,9 +8052,7 @@ def test_build_rate_limit_observations_extracts_anthropic_7d_oi_hidden_headers()
                 "llm_provider-anthropic-ratelimit-unified-7d_oi-reset": "1783036800",
                 "llm_provider-anthropic-ratelimit-unified-7d_oi-status": "allowed",
                 "llm_provider-anthropic-ratelimit-unified-7d_oi-utilization": "0.12",
-                "llm_provider-anthropic-ratelimit-unified-representative-claim": (
-                    "seven_day_overage_included"
-                ),
+                "llm_provider-anthropic-ratelimit-unified-representative-claim": ("seven_day_overage_included"),
             }
         }
     )
@@ -8643,38 +8256,21 @@ def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> 
     assert request_observation["quota_remaining"] == pytest.approx(97.0)
     assert request_observation["used_percentage"] == pytest.approx(3.0)
     assert request_observation["quota_period"] == "monthly"
-    assert request_observation["provider_resets_at"] == datetime(
-        2026, 7, 1, tzinfo=timezone.utc
-    )
-    assert request_observation["billing_period_end_at"] == datetime(
-        2026, 7, 1, tzinfo=timezone.utc
-    )
+    assert request_observation["provider_resets_at"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert request_observation["billing_period_end_at"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
     assert request_observation["evidence"]["reset_absent"] is False
-    assert (
-        request_observation["evidence"]["reset_source"]
-        == "payload_config_billing_period_end"
-    )
-    assert request_observation["raw_provider_fields"]["billingPeriodEnd"] == (
-        "2026-07-01T00:00:00+00:00"
-    )
-    assert request_observation["account_hash"] == aawm_agent_identity._short_hash(
-        b"acct_xai_user_123"
-    )
+    assert request_observation["evidence"]["reset_source"] == "payload_config_billing_period_end"
+    assert request_observation["raw_provider_fields"]["billingPeriodEnd"] == ("2026-07-01T00:00:00+00:00")
+    assert request_observation["account_hash"] == aawm_agent_identity._short_hash(b"acct_xai_user_123")
     assert request_observation["metadata"]["xai_oauth_public_model"] == "oa_xai/grok-4.3"
     assert token_observation["quota_type"] == "tokens"
-    assert token_observation["provider_resets_at"] == datetime(
-        2026, 7, 1, tzinfo=timezone.utc
-    )
+    assert token_observation["provider_resets_at"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
     assert token_observation["remaining_pct"] == pytest.approx(99.5)
     assert token_observation["used_requests"] == 75000
     assert token_observation["raw_provider_fields"]["quota_unit_interpretation"] == "tokens"
 
-    request_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
-        request_observation
-    )
-    token_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
-        token_observation
-    )
+    request_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(request_observation)
+    token_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(token_observation)
     assert request_payload[1] == "xai_oauth"
     assert request_payload[4] == "xai"
     assert request_payload[5] == "oa_xai/grok-4.3"
@@ -8685,12 +8281,8 @@ def test_build_rate_limit_observations_extracts_xai_oauth_response_headers() -> 
     assert request_payload[12] == pytest.approx(3.0)
     assert request_payload[13] == pytest.approx(97.0)
     assert request_payload[15] == datetime(2026, 7, 1, tzinfo=timezone.utc)
-    assert json.loads(request_payload[16])["billingPeriodEnd"] == (
-        "2026-07-01T00:00:00+00:00"
-    )
-    assert json.loads(request_payload[17])["reset_source"] == (
-        "payload_config_billing_period_end"
-    )
+    assert json.loads(request_payload[16])["billingPeriodEnd"] == ("2026-07-01T00:00:00+00:00")
+    assert json.loads(request_payload[17])["reset_source"] == ("payload_config_billing_period_end")
     assert token_payload[6] == "xai_oauth_tokens:tokens"
     assert token_payload[8] == "tokens"
     assert token_payload[10] == pytest.approx(99.5)
@@ -8770,12 +8362,8 @@ def test_build_rate_limit_observations_extracts_xai_oauth_hidden_headers() -> No
     assert by_scope["requests"]["client_family"] == "xai_oauth"
     assert by_scope["requests"]["model"] == "oa_xai/grok-4.3"
     assert by_scope["requests"]["remaining_pct"] == pytest.approx(96.0)
-    assert by_scope["requests"]["provider_resets_at"] == datetime(
-        2026, 7, 1, tzinfo=timezone.utc
-    )
-    assert by_scope["requests"]["evidence"]["reset_source"] == (
-        "xai_grok_subscription_month_boundary"
-    )
+    assert by_scope["requests"]["provider_resets_at"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert by_scope["requests"]["evidence"]["reset_source"] == ("xai_grok_subscription_month_boundary")
     assert by_scope["tokens"]["remaining_pct"] == pytest.approx(99.0)
 
 
@@ -8908,9 +8496,7 @@ def test_build_rate_limit_observations_preserves_antigravity_quota_identity() ->
             "session_id": "session-antigravity-claude-quota",
             "passthrough_route_family": "anthropic_antigravity_completion_adapter",
             "aawm_stream_logging_custom_llm_provider": "antigravity",
-            "anthropic_adapter_original_model": (
-                "google-antigravity/claude-sonnet-4-6"
-            ),
+            "anthropic_adapter_original_model": ("google-antigravity/claude-sonnet-4-6"),
             "google_retrieve_user_quota": {
                 "source": "antigravity_retrieve_user_quota",
                 "buckets": {
@@ -8937,7 +8523,7 @@ def test_build_rate_limit_observations_preserves_antigravity_quota_identity() ->
                             "modelId": "tab_flash_lite_preview",
                             "tokenType": "WTUS",
                             "remainingFraction": 1,
-                        }
+                        },
                     ]
                 },
             },
@@ -8971,13 +8557,9 @@ def test_build_rate_limit_observations_preserves_antigravity_quota_identity() ->
     assert gemini_observation["limit_scope"] == "gemini_pool"
     assert gemini_observation["quota_period"] == "five_hour"
     assert gemini_observation["used_percentage"] == pytest.approx(25.0)
-    assert vertex_observation["limit_key"].startswith(
-        "antigravity:antigravity_code_assist:"
-    )
+    assert vertex_observation["limit_key"].startswith("antigravity:antigravity_code_assist:")
 
-    db_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
-        vertex_observation
-    )
+    db_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(vertex_observation)
     assert db_payload[1] == "antigravity_code_assist"
     assert db_payload[4] == "antigravity"
     assert db_payload[5] is None
@@ -9000,10 +8582,7 @@ def test_build_rate_limit_observations_pools_antigravity_quota_ids() -> None:
                 "buckets": {
                     "items": [
                         {
-                            "quotaId": (
-                                "antigravity_code_assist_requests_"
-                                "gpt-oss-120b-medium"
-                            ),
+                            "quotaId": ("antigravity_code_assist_requests_" "gpt-oss-120b-medium"),
                             "quotaName": "Antigravity GPT-OSS requests",
                             "modelId": "gpt-oss-120b-medium",
                             "tokenType": "REQUESTS",
@@ -9011,10 +8590,7 @@ def test_build_rate_limit_observations_pools_antigravity_quota_ids() -> None:
                             "resetTime": "2026-06-03T21:11:43Z",
                         },
                         {
-                            "quotaId": (
-                                "antigravity_code_assist_requests_"
-                                "gemini-3.5-flash-low"
-                            ),
+                            "quotaId": ("antigravity_code_assist_requests_" "gemini-3.5-flash-low"),
                             "quotaName": "Antigravity Gemini requests",
                             "modelId": "gemini-3.5-flash-low",
                             "tokenType": "REQUESTS",
@@ -9047,9 +8623,7 @@ def test_build_rate_limit_observations_pools_antigravity_quota_ids() -> None:
         assert observation["quota_period"] == "five_hour"
         assert observation["quota_type"] == "wtus"
 
-        db_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
-            observation
-        )
+        db_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(observation)
         assert db_payload[4] == "antigravity"
         assert db_payload[5] is None
         assert db_payload[6] in {
@@ -9177,11 +8751,7 @@ def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
 
     observations = _build_rate_limit_observations(
         kwargs=kwargs,
-        result={
-            "config": kwargs["standard_pass_through_logging_payload"]["response_body"][
-                "config"
-            ]
-        },
+        result={"config": kwargs["standard_pass_through_logging_payload"]["response_body"]["config"]},
         start_time=end_time,
         end_time=end_time,
     )
@@ -9221,9 +8791,7 @@ def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
         tzinfo=timezone.utc,
     )
 
-    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
-        observation
-    )
+    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(observation)
     assert payload[4] == "xai"
     assert payload[6] == "xai_grok_build_monthly_requests:requests"
     assert payload[8] == "requests"
@@ -9265,13 +8833,9 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> (  
                 "x-grok-model-override",
                 "x-xai-token-auth",
             ],
-            "grok_billing_passthrough_user_agent": (
-                "grok-pager/0.2.55 grok-shell/0.2.55 (linux; x86_64)"
-            ),
+            "grok_billing_passthrough_user_agent": ("grok-pager/0.2.55 grok-shell/0.2.55 (linux; x86_64)"),
             "grok_billing_passthrough_x_xai_token_auth_configured": True,
-            "grok_billing_passthrough_request_contract_fingerprint": (
-                "abcd" * 16
-            ),
+            "grok_billing_passthrough_request_contract_fingerprint": ("abcd" * 16),
         }
     )
     kwargs["standard_pass_through_logging_payload"] = {
@@ -9315,12 +8879,8 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> (  
     assert observation["quota_type"] == "credits"
     assert observation["quota_period"] == "weekly"
     assert observation["limit_scope"] == "credits"
-    assert observation["raw_provider_fields"]["quota_unit"] == (
-        "grok_billing_credit_usage_percent"
-    )
-    assert observation["raw_provider_fields"]["quota_unit_interpretation"] == (
-        "percent_of_credit_quota"
-    )
+    assert observation["raw_provider_fields"]["quota_unit"] == ("grok_billing_credit_usage_percent")
+    assert observation["raw_provider_fields"]["quota_unit_interpretation"] == ("percent_of_credit_quota")
     assert observation["remaining_pct"] == pytest.approx(85.460667)
     assert observation["used_percentage"] == pytest.approx(14.539333)
     assert observation["quota_limit"] is None
@@ -9364,15 +8924,11 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> (  
     assert observation["evidence"]["request_contract_fingerprint"] == "abcd" * 16
     assert observation["evidence"]["request_contract_http_client"] == "httpx"
     assert observation["evidence"]["request_contract_method"] == "GET"
-    assert observation["evidence"]["request_contract_target_host"] == (
-        "cli-chat-proxy.grok.com"
-    )
+    assert observation["evidence"]["request_contract_target_host"] == ("cli-chat-proxy.grok.com")
     assert observation["evidence"]["request_contract_target_path"] == "/v1/billing"
     assert observation["evidence"]["request_contract_query_keys"] == ["format"]
     assert "authorization" in observation["evidence"]["request_contract_header_names"]
-    assert (
-        observation["evidence"]["request_contract_x_xai_token_auth_configured"] is True
-    )
+    assert observation["evidence"]["request_contract_x_xai_token_auth_configured"] is True
 
     payload = aawm_agent_identity._build_rate_limit_observation_db_payload(observation)
     assert payload[4] == "xai"
@@ -9394,9 +8950,7 @@ def test_build_rate_limit_observations_extracts_grok_percentage_billing() -> (  
     ]
 
 
-def test_build_rate_limit_observations_extracts_grok_weekly_fresh_credit_billing() -> (
-    None
-):
+def test_build_rate_limit_observations_extracts_grok_weekly_fresh_credit_billing() -> None:
     kwargs = _base_kwargs(trace_name="grok-build")
     kwargs["model"] = "grok-build"
     kwargs["custom_llm_provider"] = "xai"
@@ -9441,9 +8995,7 @@ def test_build_rate_limit_observations_extracts_grok_weekly_fresh_credit_billing
     assert "grok_billing_weekly_fresh_period" in observation["evidence"]["signals"]
 
 
-def test_build_rate_limit_observations_keeps_legacy_grok_credit_payload_monthly() -> (
-    None
-):
+def test_build_rate_limit_observations_keeps_legacy_grok_credit_payload_monthly() -> None:
     kwargs = _base_kwargs(trace_name="grok-build")
     kwargs["model"] = "grok-build"
     kwargs["custom_llm_provider"] = "xai"
@@ -9533,9 +9085,7 @@ def test_build_rate_limit_observations_prefers_absolute_grok_billing_counts() ->
 def test_build_rate_limit_observations_skips_invalid_grok_billing_limit() -> None:
     kwargs = _base_kwargs(trace_name="grok-build")
     kwargs["custom_llm_provider"] = "xai"
-    kwargs["litellm_params"]["metadata"].update(
-        {"passthrough_route_family": "grok_cli_chat_proxy"}
-    )
+    kwargs["litellm_params"]["metadata"].update({"passthrough_route_family": "grok_cli_chat_proxy"})
     kwargs["standard_pass_through_logging_payload"] = {
         "url": "https://cli-chat-proxy.grok.com/v1/billing",
         "response_body": {
@@ -9581,11 +9131,7 @@ def test_build_rate_limit_observations_skips_grok_non_billing_side_channel() -> 
         end_time=end_time,
     )
 
-    assert [
-        observation
-        for observation in observations
-        if observation.get("source") == "grok_billing"
-    ] == []
+    assert [observation for observation in observations if observation.get("source") == "grok_billing"] == []
 
 
 def test_build_rate_limit_observations_extracts_openrouter_free_429() -> None:
@@ -9637,9 +9183,7 @@ def test_build_rate_limit_observations_extracts_openrouter_free_429() -> None:
     )
     assert observation["reset_hint_seconds"] == 120
 
-    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(
-        observation
-    )
+    payload = aawm_agent_identity._build_rate_limit_observation_db_payload(observation)
     assert payload[4] == "openrouter"
     assert payload[5] is None
     assert payload[6] == "openrouter_free_daily_requests:requests"
@@ -9706,18 +9250,13 @@ def test_tool_definition_snapshot_schema_is_migration_owned() -> None:
         "_AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOTS_INDEX_STATEMENTS",
     )
 
-    assert (
-        "CREATE TABLE IF NOT EXISTS "
-        "public.session_history_tool_definition_snapshots"
-    ) in table_sql
+    assert ("CREATE TABLE IF NOT EXISTS " "public.session_history_tool_definition_snapshots") in table_sql
     assert "session_id TEXT NOT NULL" in table_sql
     assert "snapshot_hash TEXT NOT NULL" in table_sql
     assert "sanitized_snapshot JSONB NOT NULL" in table_sql
     assert "UNIQUE (session_id, snapshot_hash)" in table_sql
     assert any(
-        "session_history_tool_definition_snapshots_session_created_idx"
-        in statement
-        for statement in index_statements
+        "session_history_tool_definition_snapshots_session_created_idx" in statement for statement in index_statements
     )
     assert "session_history_tool_definition_snapshots" not in source
 
@@ -9923,9 +9462,7 @@ def test_build_alias_routing_audit_only_record_skips_session_history_and_keeps_e
     assert record["_skip_session_history"] is True
     assert record["session_id"] == "session-audit-only"
     assert record["litellm_call_id"] == "call-audit-only"
-    assert record["aawm_alias_routing_audit_events"][0]["event_type"] == (
-        "no_candidate_available"
-    )
+    assert record["aawm_alias_routing_audit_events"][0]["event_type"] == ("no_candidate_available")
     assert record["metadata"]["aawm_alias_routing_audit_only"] is True
     assert record["metadata"]["agent_name"] == "worker"
     assert record["metadata"]["terminal_activity_status"] == "failed_no_activity"
@@ -9952,9 +9489,7 @@ def test_build_alias_routing_audit_only_record_promotes_terminal_event_metadata(
         ]
     )
 
-    assert record["metadata"]["terminal_activity_status"] == (
-        "failed_after_partial_activity"
-    )
+    assert record["metadata"]["terminal_activity_status"] == ("failed_after_partial_activity")
     assert record["metadata"]["cooldown_state_source"] == "durable_cache"
 
 
@@ -10006,9 +9541,7 @@ def test_extract_agent_context_role_profile_requires_exact_supported_sentence() 
     assert aawm_agent_identity._extract_agent_context_from_text(
         "You are a 'worker' agent.\nImplement the scoped change."
     ) == ("worker", None)
-    assert aawm_agent_identity._extract_agent_context_from_text(
-        "You are a 'orchestrator' agent."
-    ) == (None, None)
+    assert aawm_agent_identity._extract_agent_context_from_text("You are a 'orchestrator' agent.") == (None, None)
     assert aawm_agent_identity._extract_agent_context_from_text(
         "The phrase You are a 'worker' agent. is attribution metadata."
     ) == (None, None)
@@ -10104,9 +9637,7 @@ async def test_persist_tool_definition_snapshots_best_effort_uses_executemany() 
             "aawm_tool_definition_snapshot_hash": "hash-tool-snapshot",
             "aawm_tool_definition_snapshot_truncated": False,
         },
-        "aawm_tool_definition_snapshot": [
-            {"source": "tools", "index": 0, "name": "spawn_agent"}
-        ],
+        "aawm_tool_definition_snapshot": [{"source": "tools", "index": 0, "name": "spawn_agent"}],
     }
 
     await aawm_agent_identity._persist_tool_definition_snapshots_best_effort(
@@ -10116,16 +9647,11 @@ async def test_persist_tool_definition_snapshots_best_effort_uses_executemany() 
 
     conn.executemany.assert_awaited_once()
     sql, payloads = conn.executemany.await_args.args
-    assert (
-        sql
-        == aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL
-    )
+    assert sql == aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_DEFINITION_SNAPSHOT_INSERT_SQL
     assert len(payloads) == 1
     assert payloads[0][0] == "session-tool-snapshot"
     assert payloads[0][1] == "hash-tool-snapshot"
-    assert json.loads(payloads[0][10]) == [
-        {"source": "tools", "index": 0, "name": "spawn_agent"}
-    ]
+    assert json.loads(payloads[0][10]) == [{"source": "tools", "index": 0, "name": "spawn_agent"}]
 
 
 def test_provider_status_observations_schema_includes_icmp_fields() -> None:
@@ -10143,10 +9669,7 @@ def test_provider_status_observations_schema_includes_icmp_fields() -> None:
 
 
 def test_build_provider_error_observation_classifies_anthropic_upstream_reset_503() -> None:
-    reset_body = (
-        "upstream connect error or disconnect/reset before headers. "
-        "reset reason: connection termination"
-    )
+    reset_body = "upstream connect error or disconnect/reset before headers. " "reset reason: connection termination"
     kwargs = _base_kwargs(trace_name="claude-code.orchestrator")
     kwargs["model"] = "claude-opus-4-8"
     kwargs["custom_llm_provider"] = "anthropic"
@@ -10190,10 +9713,7 @@ def test_build_provider_error_observation_classifies_anthropic_upstream_reset_50
     assert failure_record is not None
     assert failure_record["_skip_session_history"] is True
     assert "rate_limit_observations" not in failure_record
-    assert (
-        failure_record["provider_error_observations"][0]["error_class"]
-        == "provider_5xx"
-    )
+    assert failure_record["provider_error_observations"][0]["error_class"] == "provider_5xx"
 
 
 def test_build_provider_error_observation_classifies_openrouter_5xx() -> None:
@@ -10248,11 +9768,9 @@ def test_build_provider_error_observation_preserves_openrouter_429_context() -> 
             "litellm_environment": "dev",
         }
     )
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "body": {"model": "openrouter/inclusionai/ling-2.6-flash"}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"body": {"model": "openrouter/inclusionai/ling-2.6-flash"}}
     error_message = (
-        'litellm.RateLimitError: RateLimitError: OpenrouterException - '
+        "litellm.RateLimitError: RateLimitError: OpenrouterException - "
         '{"error":{"message":"Provider returned error","code":429,'
         '"metadata":{"raw":"inclusionai/ling-2.6-flash is temporarily '
         'rate-limited upstream. Please retry shortly, or add your own key",'
@@ -10348,9 +9866,7 @@ def test_build_provider_error_observation_classifies_grok_auth_failure() -> None
             "grok_model_override": "grok-build",
             "grok_side_channel": True,
             "grok_side_channel_endpoint_type": "sessions_signals",
-            "grok_side_channel_endpoint_path_template": (
-                "/sessions/{session_id}/signals"
-            ),
+            "grok_side_channel_endpoint_path_template": ("/sessions/{session_id}/signals"),
             "grok_side_channel_request_content_type": "application/json",
             "grok_side_channel_request_body_byte_length": 64,
             "grok_side_channel_request_body_digest_source": "raw_body",
@@ -10371,10 +9887,7 @@ def test_build_provider_error_observation_classifies_grok_auth_failure() -> None
     }
     error = HTTPException(
         status_code=401,
-        detail=(
-            '{"error":"Invalid or expired credentials '
-            '(auth_kind=bearer, x_xai_token_auth=unknown)"}'
-        ),
+        detail=('{"error":"Invalid or expired credentials ' '(auth_kind=bearer, x_xai_token_auth=unknown)"}'),
     )
 
     observation = aawm_agent_identity._build_provider_error_observation(
@@ -10392,23 +9905,11 @@ def test_build_provider_error_observation_classifies_grok_auth_failure() -> None
     assert observation["error_class"] == "auth_failed"
     assert observation["metadata"]["grok_side_channel"] is True
     assert observation["metadata"]["grok_side_channel_endpoint_type"] == "sessions_signals"
-    assert (
-        observation["metadata"]["grok_side_channel_endpoint_path_template"]
-        == "/sessions/{session_id}/signals"
-    )
-    assert (
-        observation["metadata"]["grok_side_channel_request_content_type"]
-        == "application/json"
-    )
+    assert observation["metadata"]["grok_side_channel_endpoint_path_template"] == "/sessions/{session_id}/signals"
+    assert observation["metadata"]["grok_side_channel_request_content_type"] == "application/json"
     assert observation["metadata"]["grok_side_channel_request_body_byte_length"] == 64
-    assert (
-        observation["metadata"]["grok_side_channel_request_body_digest_source"]
-        == "raw_body"
-    )
-    assert (
-        observation["metadata"]["grok_side_channel_request_json_container_type"]
-        == "array"
-    )
+    assert observation["metadata"]["grok_side_channel_request_body_digest_source"] == "raw_body"
+    assert observation["metadata"]["grok_side_channel_request_json_container_type"] == "array"
     assert observation["metadata"]["grok_side_channel_request_array_length"] == 3
     serialized_observation = json.dumps(observation, default=str)
     assert "should-not-persist" not in serialized_observation
@@ -10508,9 +10009,7 @@ def test_failure_record_persists_structured_output_failure_in_session_history() 
     kwargs["model"] = "gpt-5.4-mini"
     kwargs["custom_llm_provider"] = "openai"
     kwargs["litellm_call_id"] = "call-structured-output-failure"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-structured-output-failure"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-structured-output-failure"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.4-mini",
         "messages": [{"role": "user", "content": "Return JSON."}],
@@ -10545,9 +10044,7 @@ def test_failure_record_persists_structured_output_failure_in_session_history() 
     assert record["structured_output_failed"] is True
     assert record["structured_output_failure_reason"] == "schema_validation_error"
     assert record["metadata"]["usage_structured_output_failed"] is True
-    assert record["provider_error_observations"][0]["metadata"][
-        "structured_output_failed"
-    ] is True
+    assert record["provider_error_observations"][0]["metadata"]["structured_output_failed"] is True
 
     payload = _build_session_history_db_payload(record)
     assert payload[73] is True
@@ -10560,9 +10057,7 @@ def test_failure_record_persists_structured_output_attempt_for_unrelated_error()
     kwargs["model"] = "gpt-5.4-mini"
     kwargs["custom_llm_provider"] = "openai"
     kwargs["litellm_call_id"] = "call-structured-output-rate-limit"
-    kwargs["litellm_params"]["metadata"]["session_id"] = (
-        "session-structured-output-rate-limit"
-    )
+    kwargs["litellm_params"]["metadata"]["session_id"] = "session-structured-output-rate-limit"
     kwargs["passthrough_logging_payload"]["request_body"] = {
         "model": "gpt-5.4-mini",
         "messages": [{"role": "user", "content": "Return JSON."}],
@@ -10583,13 +10078,8 @@ def test_failure_record_persists_structured_output_attempt_for_unrelated_error()
     assert record["structured_output_failure_reason"] is None
     assert record["metadata"]["source_status"] == "failure"
     assert record["metadata"]["session_history_usage_record"] is False
-    assert (
-        record["metadata"]["d1_140_zero_token_class"]
-        == "failed_observation_no_usage"
-    )
-    assert record["provider_error_observations"][0]["metadata"][
-        "structured_output_failed"
-    ] is False
+    assert record["metadata"]["d1_140_zero_token_class"] == "failed_observation_no_usage"
+    assert record["provider_error_observations"][0]["metadata"]["structured_output_failed"] is False
 
 
 def test_log_failure_event_enqueues_provider_error_without_quota(monkeypatch) -> None:
@@ -10702,7 +10192,14 @@ def test_classify_rate_limit_transition_uses_resets_percent_and_counters() -> No
     assert "usage_percent_drop" in classification["signals"]
     assert "success_after_exhaustion" in classification["signals"]
 
-    tiny_drop = dict(current, provider_resets_at=previous["provider_resets_at"], used_percentage=98.2, used_requests=1491, remaining_requests=9, exhausted=True)
+    tiny_drop = dict(
+        current,
+        provider_resets_at=previous["provider_resets_at"],
+        used_percentage=98.2,
+        used_requests=1491,
+        remaining_requests=9,
+        exhausted=True,
+    )
     assert _classify_rate_limit_transition(previous, tiny_drop) is None
 
     meaningful_drop = dict(tiny_drop, used_percentage=80.0)
@@ -10722,9 +10219,7 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
             return created_pool
 
     monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_pools", {})
-    monkeypatch.setattr(
-        aawm_agent_identity, "_build_aawm_dsn", lambda: "postgresql://aawm@test/db"
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_build_aawm_dsn", lambda: "postgresql://aawm@test/db")
     monkeypatch.setattr(aawm_agent_identity, "_get_session_history_pool_max_size", lambda: 3)
     monkeypatch.setattr(
         aawm_agent_identity,
@@ -10756,9 +10251,7 @@ async def test_session_history_pool_should_reuse_pool_for_event_loop(monkeypatch
     assert create_pool_calls[0]["max_size"] == 3
     assert create_pool_calls[0]["command_timeout"] == 42.0
     assert create_pool_calls[0]["statement_cache_size"] == 0
-    assert create_pool_calls[0]["server_settings"] == {
-        "application_name": "aawm-litellm-test"
-    }
+    assert create_pool_calls[0]["server_settings"] == {"application_name": "aawm-litellm-test"}
     # application_name is set via server_settings only; pool init= was removed.
     assert "init" not in create_pool_calls[0]
 
@@ -10801,11 +10294,7 @@ def test_session_history_command_timeout_should_default_and_parse_secret(monkeyp
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: (
-            "90.5"
-            if key == "AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS"
-            else None
-        ),
+        lambda key: ("90.5" if key == "AAWM_SESSION_HISTORY_COMMAND_TIMEOUT_SECONDS" else None),
     )
 
     assert aawm_agent_identity._get_session_history_command_timeout_seconds() == 90.5
@@ -10813,10 +10302,7 @@ def test_session_history_command_timeout_should_default_and_parse_secret(monkeyp
 
 def test_session_history_dsn_should_append_application_name(monkeypatch) -> None:
     values = {
-        "AAWM_DATABASE_URL": (
-            "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
-            "?sslmode=disable"
-        ),
+        "AAWM_DATABASE_URL": ("postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore" "?sslmode=disable"),
         "AAWM_SESSION_HISTORY_DB_APPLICATION_NAME": "aawm-litellm-test",
     }
     monkeypatch.setattr(
@@ -10826,17 +10312,13 @@ def test_session_history_dsn_should_append_application_name(monkeypatch) -> None
     )
 
     assert aawm_agent_identity._build_session_history_dsn() == (
-        "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
-        "?sslmode=disable&application_name=aawm-litellm-test"
+        "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore" "?sslmode=disable&application_name=aawm-litellm-test"
     )
 
 
 def test_session_history_dsn_should_preserve_existing_application_name(monkeypatch) -> None:
     values = {
-        "AAWM_DATABASE_URL": (
-            "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
-            "?application_name=custom-app"
-        ),
+        "AAWM_DATABASE_URL": ("postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore" "?application_name=custom-app"),
         "AAWM_SESSION_HISTORY_DB_APPLICATION_NAME": "ignored-app",
     }
     monkeypatch.setattr(
@@ -10846,8 +10328,7 @@ def test_session_history_dsn_should_preserve_existing_application_name(monkeypat
     )
 
     assert aawm_agent_identity._build_session_history_dsn() == (
-        "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore"
-        "?application_name=custom-app"
+        "postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore" "?application_name=custom-app"
     )
 
 
@@ -10885,12 +10366,8 @@ def test_enqueue_session_history_record_should_bound_overflow_flushers(monkeypat
         def start(self):
             started_threads.append(self)
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue())
     monkeypatch.setattr(
         aawm_agent_identity,
         "_aawm_session_history_overflow_flush_semaphore",
@@ -10924,12 +10401,8 @@ def test_enqueue_session_history_record_releases_overflow_semaphore_when_thread_
     def failing_thread(*args, **kwargs):
         raise RuntimeError("thread unavailable")
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue())
     monkeypatch.setattr(
         aawm_agent_identity,
         "_aawm_session_history_overflow_flush_semaphore",
@@ -10966,12 +10439,8 @@ def test_enqueue_session_history_record_logs_exception_type_when_thread_start_fa
     def failing_thread(*args, **kwargs):
         raise EmptyMessageError()
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue())
     monkeypatch.setattr(
         aawm_agent_identity,
         "_aawm_session_history_overflow_flush_semaphore",
@@ -10988,8 +10457,7 @@ def test_enqueue_session_history_record_logs_exception_type_when_thread_start_fa
     aawm_agent_identity._enqueue_session_history_record({"litellm_call_id": "call-1"})
 
     warning_mock.assert_any_call(
-        "AawmAgentIdentity: failed to start session_history overflow flusher; "
-        "flushing inline: %s",
+        "AawmAgentIdentity: failed to start session_history overflow flusher; " "flushing inline: %s",
         "EmptyMessageError: EmptyMessageError()",
     )
     assert semaphore.acquire(blocking=False) is True
@@ -11014,9 +10482,7 @@ def test_flush_session_history_batch_logs_exception_type_when_message_is_empty(
     )
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
 
-    flushed = aawm_agent_identity._flush_session_history_batch(
-        [{"litellm_call_id": "call-empty-message"}]
-    )
+    flushed = aawm_agent_identity._flush_session_history_batch([{"litellm_call_id": "call-empty-message"}])
 
     assert flushed is False
     exception_mock.assert_called_once()
@@ -11025,9 +10491,7 @@ def test_flush_session_history_batch_logs_exception_type_when_message_is_empty(
         "retrying within the configured retry budget: %s (%s)"
     )
     assert exception_mock.call_args.args[1] == 1
-    assert exception_mock.call_args.args[2] == (
-        "EmptyMessageError: EmptyMessageError()"
-    )
+    assert exception_mock.call_args.args[2] == ("EmptyMessageError: EmptyMessageError()")
     assert exception_mock.call_args.args[3].startswith("queue_depth=")
 
 
@@ -11046,9 +10510,7 @@ def test_retryable_session_history_failure_recovers_without_error_intake(
     async def flaky_persist(batch):
         attempts.append(batch)
         if len(attempts) == 1:
-            raise ConnectionDoesNotExistError(
-                "connection was closed in the middle of operation"
-            )
+            raise ConnectionDoesNotExistError("connection was closed in the middle of operation")
 
     def fake_secret(key: str):
         if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV:
@@ -11110,16 +10572,12 @@ def test_retryable_session_history_failure_keeps_write_ahead_spool_after_retry_b
     class ConnectionDoesNotExistError(Exception):
         pass
 
-    records = [
-        {"litellm_call_id": "call-retryable-spooled", "trace_id": "trace-db-spool"}
-    ]
+    records = [{"litellm_call_id": "call-retryable-spooled", "trace_id": "trace-db-spool"}]
     attempts = []
 
     async def failing_persist(batch):
         attempts.append(batch)
-        raise ConnectionDoesNotExistError(
-            "connection was closed in the middle of operation"
-        )
+        raise ConnectionDoesNotExistError("connection was closed in the middle of operation")
 
     def fake_secret(key: str):
         if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV:
@@ -11170,21 +10628,12 @@ def test_retryable_session_history_failure_keeps_write_ahead_spool_after_retry_b
     assert exception_mock.call_count == 0
     assert drainer_starts == ["start"]
 
-    raw_lines = [
-        json.loads(line)
-        for line in Path(paths[0]).read_text().splitlines()
-        if line.strip()
-    ]
+    raw_lines = [json.loads(line) for line in Path(paths[0]).read_text().splitlines() if line.strip()]
     assert raw_lines[0]["reason"] == "session_history batch flush retry write-ahead"
     assert raw_lines[0]["failure"] == {"type": "ConnectionDoesNotExistError"}
 
     warning_messages = [call.args[0] for call in warning_mock.call_args_list]
-    assert any(
-        "retry write-ahead spool remains protected for replay" in message
-        for message in warning_messages
-    )
-
-
+    assert any("retry write-ahead spool remains protected for replay" in message for message in warning_messages)
 
 
 def test_session_history_persistence_telemetry_suffix_includes_retry_budget() -> None:
@@ -11297,9 +10746,7 @@ def test_retryable_asyncpg_timeout_logs_warning_with_protection_telemetry(
 
     assert attempts == [records, records]
     assert exception_mock.call_count == 0
-    combined = " ".join(
-        " ".join(str(a) for a in (call.args or ())) for call in warning_mock.call_args_list
-    )
+    combined = " ".join(" ".join(str(a) for a in (call.args or ())) for call in warning_mock.call_args_list)
     assert "retryable session_history persistence degradation" in combined
     assert "at_risk_of_loss=false" in combined
     assert "degraded_telemetry=true" in combined
@@ -11320,9 +10767,7 @@ def test_retry_write_ahead_spool_failure_logs_at_risk_telemetry(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
     monkeypatch.setattr(
         aawm_agent_identity,
@@ -11361,9 +10806,7 @@ def test_handle_session_history_retry_exhaustion_spool_failure_logs_at_risk(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
     monkeypatch.setattr(
         aawm_agent_identity,
@@ -11401,9 +10844,7 @@ def test_enqueue_session_history_record_retries_queue_when_overflow_busy(monkeyp
     semaphore.acquire()
     started_threads = []
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
     monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", queue)
     monkeypatch.setattr(
         aawm_agent_identity,
@@ -11434,12 +10875,8 @@ def test_enqueue_session_history_record_spools_when_queue_and_overflow_are_busy(
     spooled_records = []
     warning_mock = MagicMock()
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue())
     monkeypatch.setattr(
         aawm_agent_identity,
         "_aawm_session_history_overflow_flush_semaphore",
@@ -11495,12 +10932,8 @@ def test_enqueue_session_history_record_spools_drained_queue_records_when_overfl
     spooled_batches = []
     warning_mock = MagicMock()
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_aawm_session_history_queue", FullQueueWithBacklog()
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", FullQueueWithBacklog())
     monkeypatch.setattr(
         aawm_agent_identity,
         "_aawm_session_history_overflow_flush_semaphore",
@@ -11567,9 +11000,7 @@ def test_enqueue_session_history_record_spools_directly_when_db_degraded(
     spooled_batches = []
     warning_mock = MagicMock()
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
     monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", queue_obj)
     monkeypatch.setattr(aawm_agent_identity, "_get_session_history_batch_size", lambda: 3)
     monkeypatch.setattr(
@@ -11593,9 +11024,7 @@ def test_enqueue_session_history_record_spools_directly_when_db_degraded(
         )
     ]
     degraded_warning = next(
-        call
-        for call in warning_mock.call_args_list
-        if "queue_disposition=db_degraded_spooling" in call.args[0]
+        call for call in warning_mock.call_args_list if "queue_disposition=db_degraded_spooling" in call.args[0]
     )
     assert degraded_warning.args[1] == 1
     assert degraded_warning.args[2] == 2
@@ -11628,16 +11057,10 @@ def test_enqueue_session_history_record_inline_protects_degraded_batch_when_spoo
     def failing_spool(records, **kwargs):
         raise OSError("spool unwritable")
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_aawm_session_history_queue", QueueWithBacklog()
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", QueueWithBacklog())
     monkeypatch.setattr(aawm_agent_identity, "_get_session_history_batch_size", lambda: 2)
-    monkeypatch.setattr(
-        aawm_agent_identity, "_spool_session_history_records", failing_spool
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_spool_session_history_records", failing_spool)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_flush_session_history_batch_with_retry",
@@ -11674,9 +11097,7 @@ def test_spool_session_history_records_logs_path_record_count_and_pending_summar
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
     monkeypatch.setattr(
         aawm_agent_identity,
@@ -11705,11 +11126,7 @@ def test_spool_session_history_records_logs_path_record_count_and_pending_summar
     assert Path(spool_path).exists()
     assert drainer_starts == ["start"]
 
-    spool_warning = next(
-        call
-        for call in warning_mock.call_args_list
-        if "spool_write_succeeded=true" in call.args[0]
-    )
+    spool_warning = next(call for call in warning_mock.call_args_list if "spool_write_succeeded=true" in call.args[0])
     assert spool_warning.args[1] == len(records)
     assert spool_warning.args[2] == spool_path
     assert spool_warning.args[3] == "overflow session_history flush"
@@ -11720,11 +11137,7 @@ def test_spool_session_history_records_logs_path_record_count_and_pending_summar
     assert spool_warning.args[7] == 1024
     assert spool_warning.args[8] == "spool_pending=2, oldest_pending_age_s=4.0"
 
-    raw_lines = [
-        json.loads(line)
-        for line in Path(spool_path).read_text().splitlines()
-        if line.strip()
-    ]
+    raw_lines = [json.loads(line) for line in Path(spool_path).read_text().splitlines() if line.strip()]
     assert raw_lines[0]["type"] == "metadata"
     assert raw_lines[0]["record_count"] == len(records)
     assert raw_lines[0]["reason"] == "overflow session_history flush"
@@ -11746,12 +11159,8 @@ def test_enqueue_session_history_record_spools_when_queue_and_overflow_are_busy_
     spooled_batches = []
     warning_mock = MagicMock()
 
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None
-    )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue()
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_worker_started", lambda: None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", AlwaysFullQueue())
     monkeypatch.setattr(
         aawm_agent_identity,
         "_aawm_session_history_overflow_flush_semaphore",
@@ -11774,9 +11183,7 @@ def test_enqueue_session_history_record_spools_when_queue_and_overflow_are_busy_
 
     assert spooled_batches == [([record], {"reason": "queue full overflow"})]
     overflow_warning = next(
-        call
-        for call in warning_mock.call_args_list
-        if "queue_disposition=spool_write_started" in call.args[0]
+        call for call in warning_mock.call_args_list if "queue_disposition=spool_write_started" in call.args[0]
     )
     assert overflow_warning.args[1] == 0
     assert overflow_warning.args[2] == 1
@@ -11806,13 +11213,9 @@ def test_session_history_spool_round_trips_event_timestamps_and_quota_only_recor
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     warning_mock = MagicMock()
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
 
@@ -11851,18 +11254,14 @@ def test_session_history_failed_flush_max_retries_defaults_and_parses(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: "7"
-        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
-        else None,
+        lambda key: "7" if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES" else None,
     )
     assert aawm_agent_identity._get_session_history_failed_flush_max_retries() == 7
 
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: "-2"
-        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
-        else None,
+        lambda key: "-2" if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES" else None,
     )
     assert aawm_agent_identity._get_session_history_failed_flush_max_retries() == 0
 
@@ -11883,9 +11282,7 @@ def test_spool_session_history_records_tolerates_file_exists_when_spool_dir_is_d
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: spool_dir
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: spool_dir if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
     monkeypatch.setattr(aawm_agent_identity.os, "makedirs", fake_makedirs)
     monkeypatch.setattr(
@@ -11934,9 +11331,7 @@ def test_spool_session_history_records_raises_when_spool_path_exists_but_not_dir
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: spool_dir
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: spool_dir if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
     monkeypatch.setattr(aawm_agent_identity.os, "makedirs", fake_makedirs)
     monkeypatch.setattr(
@@ -11955,10 +11350,7 @@ def test_spool_session_history_records_raises_when_spool_path_exists_but_not_dir
 def test_session_history_spool_dir_defaults_to_local_fallback(monkeypatch) -> None:
     monkeypatch.setattr(aawm_agent_identity, "get_secret_str", lambda key: None)
 
-    assert (
-        aawm_agent_identity._get_session_history_spool_dir()
-        == "/mnt/e/litellm/session_history"
-    )
+    assert aawm_agent_identity._get_session_history_spool_dir() == "/mnt/e/litellm/session_history"
 
 
 def test_session_history_spool_summary_reports_unavailable_listing(
@@ -12034,10 +11426,7 @@ def test_ensure_session_history_spool_drainer_started_retries_when_listing_unava
 
     assert len(started_threads) == 1
     warning_messages = [call.args[0] for call in warning_mock.call_args_list]
-    assert any(
-        "session_history spool replay status is unknown" in message
-        for message in warning_messages
-    )
+    assert any("session_history spool replay status is unknown" in message for message in warning_messages)
 
 
 def test_ensure_session_history_spool_drainer_started_skips_missing_directory(
@@ -12103,10 +11492,7 @@ def test_session_history_spool_drainer_skips_when_listing_unavailable(
 
     assert flush_attempts == []
     warning_messages = [call.args[0] for call in warning_mock.call_args_list]
-    assert any(
-        "session_history spool replay status is unknown" in message
-        for message in warning_messages
-    )
+    assert any("session_history spool replay status is unknown" in message for message in warning_messages)
 
 
 def test_failed_session_history_batch_spools_after_retry_budget(
@@ -12148,9 +11534,7 @@ def test_failed_session_history_batch_spools_after_retry_budget(
         "_persist_session_history_records",
         failing_persist,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
@@ -12169,11 +11553,7 @@ def test_failed_session_history_batch_spools_after_retry_budget(
     loaded_records = aawm_agent_identity._load_session_history_spool_records(paths[0])
     assert loaded_records == records
     assert loaded_records[0]["start_time"] == observed_at
-    raw_lines = [
-        json.loads(line)
-        for line in Path(paths[0]).read_text().splitlines()
-        if line.strip()
-    ]
+    raw_lines = [json.loads(line) for line in Path(paths[0]).read_text().splitlines() if line.strip()]
     assert raw_lines[0]["type"] == "metadata"
     assert raw_lines[0]["failure"] == {"type": "OSError"}
     assert all(line["type"] == "record" for line in raw_lines[1:])
@@ -12182,19 +11562,13 @@ def test_failed_session_history_batch_spools_after_retry_budget(
     retry_warning = next(
         message
         for message in warning_messages
-        if "session_history flush still failing within the configured retry budget"
-        in message
+        if "session_history flush still failing within the configured retry budget" in message
     )
     assert "%s, %s)" in retry_warning
-    warning_text = " ".join(
-        " ".join(str(arg) for arg in call.args) for call in warning_mock.call_args_list
-    )
+    warning_text = " ".join(" ".join(str(arg) for arg in call.args) for call in warning_mock.call_args_list)
     assert "retry_write_ahead_spooled=false" in warning_text
     assert "at_risk_of_loss=false" in warning_text
-    assert any(
-        "protected batch by spooling for replay" in message
-        for message in warning_messages
-    )
+    assert any("protected batch by spooling for replay" in message for message in warning_messages)
 
 
 def test_failed_session_history_traceback_is_suppressed_across_batches(
@@ -12229,9 +11603,7 @@ def test_failed_session_history_traceback_is_suppressed_across_batches(
         "_persist_session_history_records",
         maybe_failing_persist,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", warning_mock)
@@ -12276,14 +11648,10 @@ def test_failed_session_history_batch_stops_when_spool_fails_after_retry_budget(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: "0"
-        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
-        else None,
+        lambda key: "0" if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES" else None,
     )
     monkeypatch.setattr(aawm_agent_identity, "_flush_session_history_batch", fake_flush)
-    monkeypatch.setattr(
-        aawm_agent_identity, "_spool_session_history_records", failing_spool
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_spool_session_history_records", failing_spool)
     monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", MagicMock())
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", MagicMock())
@@ -12316,13 +11684,9 @@ def test_session_history_spool_drainer_flushes_and_removes_records(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_flush_session_history_batch",
@@ -12349,13 +11713,9 @@ def test_session_history_spool_drainer_skips_disappeared_records_without_quarant
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_flush_session_history_batch",
@@ -12436,13 +11796,9 @@ def test_session_history_spool_drainer_flushes_batch_spool_records(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_flush_session_history_batch",
@@ -12454,6 +11810,7 @@ def test_session_history_spool_drainer_flushes_batch_spool_records(
 
     assert flushed_batches == [records]
     assert aawm_agent_identity._session_history_spool_paths() == []
+
 
 def test_session_history_spool_loads_legacy_json_artifacts(
     monkeypatch,
@@ -12485,9 +11842,7 @@ def test_session_history_spool_loads_legacy_json_artifacts(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
 
     paths = aawm_agent_identity._session_history_spool_paths()
@@ -12518,14 +11873,10 @@ def test_failed_session_history_batch_logs_spool_failure_severity(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: "0"
-        if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES"
-        else None,
+        lambda key: "0" if key == "AAWM_SESSION_HISTORY_FAILED_FLUSH_MAX_RETRIES" else None,
     )
     monkeypatch.setattr(aawm_agent_identity, "_flush_session_history_batch", fake_flush)
-    monkeypatch.setattr(
-        aawm_agent_identity, "_spool_session_history_records", failing_spool
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_spool_session_history_records", failing_spool)
     monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", MagicMock())
     monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", exception_mock)
@@ -12535,10 +11886,7 @@ def test_failed_session_history_batch_logs_spool_failure_severity(
 
     assert len(attempts) == 1
     assert exception_mock.call_count == 1
-    assert (
-        "potential session_history data loss until inline retry succeeds"
-        in exception_mock.call_args.args[0]
-    )
+    assert "potential session_history data loss until inline retry succeeds" in exception_mock.call_args.args[0]
     assert error_mock.called
     assert "dropping" in error_mock.call_args.args[0]
 
@@ -12553,13 +11901,9 @@ def test_session_history_spool_drainer_logs_recovery_and_retention(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_get_session_history_spool_replay_backoff_seconds",
@@ -12578,14 +11922,8 @@ def test_session_history_spool_drainer_logs_recovery_and_retention(
     success_messages = [call.args[0] for call in warning_mock.call_args_list]
     assert any("recovered" in message for message in success_messages)
     assert any("spool_replay_started=true" in message for message in success_messages)
-    assert any(
-        "spool_replay_recovered=true" in message for message in success_messages
-    )
-    recovered_call = next(
-        call
-        for call in warning_mock.call_args_list
-        if "spool_replay_recovered=true" in call.args[0]
-    )
+    assert any("spool_replay_recovered=true" in message for message in success_messages)
+    recovered_call = next(call for call in warning_mock.call_args_list if "spool_replay_recovered=true" in call.args[0])
     assert recovered_call.args[2] == 1
     assert recovered_call.args[5] == 1
     assert recovered_call.args[6] == 1
@@ -12623,13 +11961,9 @@ def test_session_history_spool_drainer_logs_recovery_counts_and_remaining_pendin
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_get_session_history_spool_replay_backoff_seconds",
@@ -12650,11 +11984,7 @@ def test_session_history_spool_drainer_logs_recovery_counts_and_remaining_pendin
     aawm_agent_identity._spool_session_history_records(records, reason="test batch")
     aawm_agent_identity._session_history_spool_drainer_main()
 
-    recovery_call = next(
-        call
-        for call in warning_mock.call_args_list
-        if "spool_replay_recovered=true" in call.args[0]
-    )
+    recovery_call = next(call for call in warning_mock.call_args_list if "spool_replay_recovered=true" in call.args[0])
     assert recovery_call.args[1] == len(records)
     assert recovery_call.args[2] == 1
     assert recovery_call.args[3] == 1
@@ -12682,13 +12012,9 @@ def test_session_history_spool_drainer_retries_failed_replay_with_backoff(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_get_session_history_spool_replay_backoff_seconds",
@@ -12707,11 +12033,7 @@ def test_session_history_spool_drainer_retries_failed_replay_with_backoff(
 
     assert flush_attempts == [[record], [record]]
     assert sleep_calls == [0.5]
-    retry_call = next(
-        call
-        for call in warning_mock.call_args_list
-        if "spool_replay_retrying=true" in call.args[0]
-    )
+    retry_call = next(call for call in warning_mock.call_args_list if "spool_replay_retrying=true" in call.args[0])
     assert retry_call.args[1] == 1
     assert retry_call.args[2] == 0.5
     assert aawm_agent_identity._session_history_spool_paths() == []
@@ -12727,13 +12049,9 @@ def test_session_history_spool_drainer_logs_retry_exhaustion(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_get_session_history_spool_replay_backoff_seconds",
@@ -12749,16 +12067,14 @@ def test_session_history_spool_drainer_logs_retry_exhaustion(
     aawm_agent_identity._spool_session_history_record(record)
     aawm_agent_identity._session_history_spool_drainer_main()
 
-    exhausted_call = next(
-        call
-        for call in warning_mock.call_args_list
-        if "spool_replay_failed=true" in call.args[0]
-    )
+    exhausted_call = next(call for call in warning_mock.call_args_list if "spool_replay_failed=true" in call.args[0])
     assert exhausted_call.args[1] == 0
     assert exhausted_call.args[2] == 1
     assert exhausted_call.args[3] == 1
     assert exhausted_call.args[4] == 1
     assert len(aawm_agent_identity._session_history_spool_paths()) == 1
+
+
 def test_session_history_spool_drainer_keeps_records_when_flush_fails(
     monkeypatch,
     tmp_path,
@@ -12773,13 +12089,9 @@ def test_session_history_spool_drainer_keeps_records_when_flush_fails(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
-    monkeypatch.setattr(
-        aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None
-    )
+    monkeypatch.setattr(aawm_agent_identity, "_ensure_session_history_spool_drainer_started", lambda: None)
     monkeypatch.setattr(
         aawm_agent_identity,
         "_get_session_history_spool_replay_backoff_seconds",
@@ -12815,9 +12127,7 @@ async def test_flush_session_history_batch_spools_when_loop_is_running(
     monkeypatch.setattr(
         aawm_agent_identity,
         "get_secret_str",
-        lambda key: str(tmp_path)
-        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
-        else None,
+        lambda key: str(tmp_path) if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV else None,
     )
     monkeypatch.setattr(
         aawm_agent_identity,
@@ -12841,9 +12151,7 @@ async def test_flush_session_history_batch_spools_when_loop_is_running(
     drainer_mock.assert_called_once()
     paths = aawm_agent_identity._session_history_spool_paths()
     assert len(paths) == 1
-    assert aawm_agent_identity._load_session_history_spool_records(paths[0]) == [
-        record
-    ]
+    assert aawm_agent_identity._load_session_history_spool_records(paths[0]) == [record]
     assert any(
         "deferred session_history flush from a running event loop" in call.args[0]
         for call in warning_mock.call_args_list
@@ -12933,7 +12241,20 @@ async def test_persist_session_history_record_executes_insert(monkeypatch) -> No
         "file_modified_count": 1,
         "git_commit_count": 1,
         "git_push_count": 0,
-        "tool_activity": [{"tool_index": 0, "tool_name": "search", "tool_kind": "other", "file_paths_read": [], "file_paths_modified": ["foo.py"], "git_commit_count": 1, "git_push_count": 0, "command_text": "git commit -m test", "arguments": {"command": "git commit -m test"}, "metadata": {"source": "message.tool_calls"}}],
+        "tool_activity": [
+            {
+                "tool_index": 0,
+                "tool_name": "search",
+                "tool_kind": "other",
+                "file_paths_read": [],
+                "file_paths_modified": ["foo.py"],
+                "git_commit_count": 1,
+                "git_push_count": 0,
+                "command_text": "git commit -m test",
+                "arguments": {"command": "git commit -m test"},
+                "metadata": {"source": "message.tool_calls"},
+            }
+        ],
         "response_cost_usd": 0.12,
         "metadata": {"request_tags": ["reasoning-present"]},
     }
@@ -13200,9 +12521,7 @@ def test_build_session_history_record_from_spend_log_row_recovers_real_session_i
         },
     }
 
-    record = _build_session_history_record_from_spend_log_row(
-        spend_log_row, backfill_run_id="run-1"
-    )
+    record = _build_session_history_record_from_spend_log_row(spend_log_row, backfill_run_id="run-1")
 
     assert record is not None
     assert record["litellm_call_id"] == "req-123"
@@ -13218,10 +12537,7 @@ def test_build_session_history_record_from_spend_log_row_recovers_real_session_i
     assert record["metadata"]["backfilled"] is True
     assert record["metadata"]["backfill_source"] == "LiteLLM_SpendLogs"
     assert record["metadata"]["backfill_run_id"] == "run-1"
-    assert (
-        record["metadata"]["session_id_source"]
-        == "request_body.metadata.user_id.session_id"
-    )
+    assert record["metadata"]["session_id_source"] == "request_body.metadata.user_id.session_id"
     assert record["metadata"]["trace_id_source"] == "legacy_spend_log_session_field"
     assert "claude-thinking-signature" in record["metadata"]["request_tags"]
 
@@ -13803,10 +13119,7 @@ def test_build_session_history_record_from_langfuse_marks_gemini_quota_as_non_us
     assert record["input_tokens"] == 0
     assert record["output_tokens"] == 0
     assert record["metadata"]["session_history_usage_record"] is False
-    assert (
-        record["metadata"]["d1_140_zero_token_class"]
-        == "non_usage_rate_limit_observation"
-    )
+    assert record["metadata"]["d1_140_zero_token_class"] == "non_usage_rate_limit_observation"
     assert record["metadata"]["gemini_control_plane_excluded"] is True
     assert record["metadata"]["gemini_control_plane_method"] == "retrieveUserQuota"
 
@@ -13860,10 +13173,7 @@ def test_build_session_history_record_from_langfuse_marks_empty_gemini_adapter_r
     assert record["input_tokens"] == 0
     assert record["output_tokens"] == 0
     assert record["metadata"]["session_history_usage_record"] is False
-    assert (
-        record["metadata"]["d1_140_zero_token_class"]
-        == "empty_provider_response_no_usage"
-    )
+    assert record["metadata"]["d1_140_zero_token_class"] == "empty_provider_response_no_usage"
 
 
 def test_zero_token_classifier_ignores_estimated_reasoning_only() -> None:
@@ -13894,14 +13204,8 @@ def test_zero_token_classifier_ignores_estimated_reasoning_only() -> None:
 
     assert record["reasoning_tokens_estimated"] == 40
     assert record["metadata"]["session_history_usage_record"] is False
-    assert (
-        record["metadata"]["d1_140_zero_token_class"]
-        == "empty_provider_response_no_usage"
-    )
-    assert (
-        record["metadata"]["d1_140_zero_token_reason"]
-        == "gemini_code_assist_adapter_empty_response"
-    )
+    assert record["metadata"]["d1_140_zero_token_class"] == "empty_provider_response_no_usage"
+    assert record["metadata"]["d1_140_zero_token_reason"] == "gemini_code_assist_adapter_empty_response"
 
 
 def test_build_session_history_record_from_langfuse_recovers_anthropic_count_tokens_output() -> None:
@@ -13911,7 +13215,7 @@ def test_build_session_history_record_from_langfuse_recovers_anthropic_count_tok
         "sessionId": "claude-session-1",
         "userId": "aawm-tap",
         "environment": "prod",
-        "output": "{\"input_tokens\":28654}",
+        "output": '{"input_tokens":28654}',
     }
     observation = {
         "id": "call-count-tokens",
@@ -13921,7 +13225,7 @@ def test_build_session_history_record_from_langfuse_recovers_anthropic_count_tok
         "model": "",
         "startTime": "2026-05-22T02:04:19.555Z",
         "endTime": "2026-05-22T02:04:19.802Z",
-        "output": "{\"input_tokens\":28654}",
+        "output": '{"input_tokens":28654}',
         "metadata": {
             "passthrough_route_family": "anthropic_messages",
             "aawm_passthrough_endpoint_type": "anthropic",
@@ -14181,10 +13485,7 @@ def test_build_session_history_record_from_langfuse_recovers_raw_responses_outpu
         "model": "unknown",
         "startTime": "2026-05-23T02:22:54Z",
         "endTime": "2026-05-23T02:23:01Z",
-        "output": (
-            "cannot parse chunks to standard response object. Chunks="
-            f"{['data: ' + completed_event]!r}"
-        ),
+        "output": ("cannot parse chunks to standard response object. Chunks=" f"{['data: ' + completed_event]!r}"),
         "metadata": {
             "passthrough_route_family": "codex_responses",
             "client_name": "codex-tui",
@@ -14250,11 +13551,7 @@ def test_build_session_history_record_from_langfuse_observation_counts_invalid_t
         "promptTokens": 10,
         "completionTokens": 2,
         "totalTokens": 12,
-        "input": {
-            "messages": [
-                {"role": "user", "content": json.dumps(request_body)}
-            ]
-        },
+        "input": {"messages": [{"role": "user", "content": json.dumps(request_body)}]},
         "output": {"id": "provider-response-invalid-tool", "content": "Recovered."},
         "metadata": {"trace_name": "claude-code.engineer"},
     }
@@ -14324,10 +13621,7 @@ def test_build_session_history_record_from_langfuse_maps_harness_trace_user_and_
             "messages": [
                 {
                     "role": "user",
-                    "content": (
-                        "Contents of /home/zepfu/projects/litellm/CLAUDE.md\n"
-                        "# INSTRUCTIONS\n"
-                    ),
+                    "content": ("Contents of /home/zepfu/projects/litellm/CLAUDE.md\n" "# INSTRUCTIONS\n"),
                 }
             ]
         },
@@ -14576,14 +13870,9 @@ def test_build_session_history_record_from_langfuse_trace_observation_preserves_
     assert record["metadata"]["aawm_tool_definition_types"] == ["function"]
     assert "aawm_tool_definition_snapshot" not in record["metadata"]
     assert record["aawm_tool_definition_snapshot"] == tool_snapshot
-    assert (
-        record["metadata"]["aawm_tool_definition_snapshot_hash"]
-        == "hash-tool-definition"
-    )
+    assert record["metadata"]["aawm_tool_definition_snapshot_hash"] == "hash-tool-definition"
     assert record["metadata"]["aawm_tool_definition_snapshot_truncated"] is False
-    snapshot_payload = (
-        aawm_agent_identity._build_tool_definition_snapshot_db_payload(record)
-    )
+    snapshot_payload = aawm_agent_identity._build_tool_definition_snapshot_db_payload(record)
     assert snapshot_payload is not None
     assert snapshot_payload[0] == "session-tool-definition"
     assert snapshot_payload[1] == "hash-tool-definition"
@@ -14617,9 +13906,7 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_metad
                     "message": {
                         "role": "assistant",
                         "content": "gemini result",
-                        "provider_specific_fields": {
-                            "thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]
-                        },
+                        "provider_specific_fields": {"thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]},
                     }
                 }
             ]
@@ -14744,9 +14031,7 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_gemin
                     "message": {
                         "role": "assistant",
                         "content": "gemini flash result",
-                        "provider_specific_fields": {
-                            "thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]
-                        },
+                        "provider_specific_fields": {"thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]},
                     }
                 }
             ]
@@ -14862,10 +14147,7 @@ def test_build_session_history_record_from_langfuse_preserves_explicit_openroute
     assert record["provider"] == "openrouter"
     assert record["model"] == "openrouter/owl-alpha"
     assert record["call_type"] == "/anthropic/v1/messages"
-    assert (
-        record["metadata"]["passthrough_route_family"]
-        == "anthropic_openrouter_responses_adapter"
-    )
+    assert record["metadata"]["passthrough_route_family"] == "anthropic_openrouter_responses_adapter"
 
 
 def test_build_session_history_record_from_langfuse_preserves_inbound_model_alias() -> None:
@@ -14995,10 +14277,7 @@ def test_build_session_history_record_from_langfuse_marks_unresolved_anthropic_m
     assert record["provider"] == "anthropic"
     assert record["model"] == "unknown"
     assert record["metadata"]["session_history_model_unresolved"] is True
-    assert (
-        record["metadata"]["session_history_model_unresolved_reason"]
-        == "missing_source_model_evidence"
-    )
+    assert record["metadata"]["session_history_model_unresolved_reason"] == "missing_source_model_evidence"
     assert _build_session_history_db_payload(record)[5] == "unknown"
 
 
@@ -15022,11 +14301,7 @@ def test_build_session_history_record_from_langfuse_routes_openrouter_api_base()
             "output": 5,
             "total": 25,
         },
-        "output": {
-            "choices": [
-                {"message": {"role": "assistant", "content": "OK"}}
-            ]
-        },
+        "output": {"choices": [{"message": {"role": "assistant", "content": "OK"}}]},
         "metadata": {
             "custom_llm_provider": "openai",
             "api_base": "https://openrouter.ai/api/v1/chat/completions",
@@ -15064,9 +14339,7 @@ def test_build_session_history_record_from_langfuse_routes_local_embedding_api_b
             "output": 0,
             "total": 512,
         },
-        "output": {
-            "data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}]
-        },
+        "output": {"data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}]},
         "metadata": {
             "custom_llm_provider": "openai",
             "api_base": "http://172.20.0.1:8082/v1/embeddings",
@@ -15102,15 +14375,9 @@ def test_build_session_history_record_routes_local_llm_when_model_equals_group()
             },
         }
     )
-    kwargs["standard_logging_object"]["metadata"] = dict(
-        kwargs["litellm_params"]["metadata"]
-    )
-    kwargs["standard_logging_object"]["api_base"] = (
-        "http://172.20.0.1:8088/v1/chat/completions"
-    )
-    kwargs["standard_logging_object"]["model_group"] = (
-        "ministral3-3b-adjudicator-q4-k-m"
-    )
+    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
+    kwargs["standard_logging_object"]["api_base"] = "http://172.20.0.1:8088/v1/chat/completions"
+    kwargs["standard_logging_object"]["model_group"] = "ministral3-3b-adjudicator-q4-k-m"
     kwargs["custom_llm_provider"] = "openai"
     kwargs["call_type"] = "completion"
     kwargs["model"] = "ministral3-3b-adjudicator-q4-k-m"
@@ -15145,14 +14412,13 @@ def test_build_session_history_record_routes_local_llm_when_model_equals_group()
     assert record["model_group"] == "ministral3-3b-adjudicator-q4-k-m"
     assert record["metadata"]["aawm_local_route"] is True
     assert record["metadata"]["aawm_local_route_family"] == "local_llm_chat"
-    assert (
-        record["metadata"]["aawm_local_upstream_model"]
-        == "ministral3-3b-adjudicator-q4-k-m"
-    )
+    assert record["metadata"]["aawm_local_upstream_model"] == "ministral3-3b-adjudicator-q4-k-m"
     assert _build_session_history_db_payload(record)[4] == "local_llm"
 
 
-def test_build_session_history_record_from_langfuse_trace_observation_sets_not_applicable_reasoning_source_when_absent() -> None:
+def test_build_session_history_record_from_langfuse_trace_observation_sets_not_applicable_reasoning_source_when_absent() -> (
+    None
+):
     trace = {
         "id": "trace-no-reasoning",
         "name": "gpt",
@@ -15320,9 +14586,7 @@ def test_build_session_history_record_uses_gemini_signature_fallback_when_usage_
                 "message": {
                     "role": "assistant",
                     "content": "gemini result",
-                    "provider_specific_fields": {
-                        "thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]
-                    },
+                    "provider_specific_fields": {"thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]},
                 }
             }
         ],
@@ -15356,12 +14620,10 @@ def test_build_session_history_record_preserves_antigravity_provider_over_google
             },
         }
     )
-    kwargs["standard_logging_object"]["metadata"] = dict(
-        kwargs["litellm_params"]["metadata"]
-    )
-    kwargs["standard_logging_object"]["api_base"] = (
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-    )
+    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
+    kwargs["standard_logging_object"][
+        "api_base"
+    ] = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
     kwargs["custom_llm_provider"] = "antigravity"
     kwargs["model"] = "gemini-3.1-pro-low"
     result = {
@@ -15412,12 +14674,10 @@ def test_build_session_history_record_persists_antigravity_gemini_public_cost() 
             },
         }
     )
-    kwargs["standard_logging_object"]["metadata"] = dict(
-        kwargs["litellm_params"]["metadata"]
-    )
-    kwargs["standard_logging_object"]["api_base"] = (
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-    )
+    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
+    kwargs["standard_logging_object"][
+        "api_base"
+    ] = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
     kwargs["custom_llm_provider"] = "antigravity"
     kwargs["model"] = "gemini-3.5-flash-low"
     kwargs["response_cost"] = 0.000027
@@ -15469,12 +14729,10 @@ def test_build_session_history_record_recovers_codex_antigravity_over_openai_pro
             },
         }
     )
-    kwargs["standard_logging_object"]["metadata"] = dict(
-        kwargs["litellm_params"]["metadata"]
-    )
-    kwargs["standard_logging_object"]["api_base"] = (
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-    )
+    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
+    kwargs["standard_logging_object"][
+        "api_base"
+    ] = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
     kwargs["custom_llm_provider"] = "openai"
     kwargs["model"] = "gemini-3.1-pro-low"
     result = {
@@ -15505,9 +14763,7 @@ def test_build_session_history_record_recovers_codex_antigravity_over_openai_pro
     assert record is not None
     assert record["provider"] == "antigravity"
     assert record["model"] == "gemini-3.1-pro-low"
-    assert record["metadata"]["codex_adapter_original_model"] == (
-        "antigravity/gemini-3.1-pro-low"
-    )
+    assert record["metadata"]["codex_adapter_original_model"] == ("antigravity/gemini-3.1-pro-low")
     assert _build_session_history_db_payload(record)[4] == "antigravity"
 
 
@@ -15518,9 +14774,7 @@ def test_build_session_history_record_recovers_anthropic_antigravity_over_gemini
             "session_id": "session-antigravity-anthropic-gemini",
             "passthrough_route_family": "anthropic_antigravity_completion_adapter",
             "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            "anthropic_adapter_original_model": (
-                "google-antigravity/claude-sonnet-4-6"
-            ),
+            "anthropic_adapter_original_model": ("google-antigravity/claude-sonnet-4-6"),
             "anthropic_adapter_model": "claude-sonnet-4-6",
             "aawm_stream_logging_custom_llm_provider": "antigravity",
             "usage_object": {
@@ -15530,12 +14784,10 @@ def test_build_session_history_record_recovers_anthropic_antigravity_over_gemini
             },
         }
     )
-    kwargs["standard_logging_object"]["metadata"] = dict(
-        kwargs["litellm_params"]["metadata"]
-    )
-    kwargs["standard_logging_object"]["api_base"] = (
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-    )
+    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
+    kwargs["standard_logging_object"][
+        "api_base"
+    ] = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
     kwargs["custom_llm_provider"] = "gemini"
     kwargs["model"] = "claude-sonnet-4-6"
     result = {
@@ -15566,9 +14818,7 @@ def test_build_session_history_record_recovers_anthropic_antigravity_over_gemini
     assert record is not None
     assert record["provider"] == "antigravity"
     assert record["model"] == "claude-sonnet-4-6"
-    assert record["metadata"]["anthropic_adapter_original_model"] == (
-        "google-antigravity/claude-sonnet-4-6"
-    )
+    assert record["metadata"]["anthropic_adapter_original_model"] == ("google-antigravity/claude-sonnet-4-6")
     assert _build_session_history_db_payload(record)[4] == "antigravity"
 
 
@@ -15600,12 +14850,8 @@ def test_build_session_history_record_preserves_opencode_zen_provider_identity()
             },
         }
     )
-    kwargs["standard_logging_object"]["metadata"] = dict(
-        kwargs["litellm_params"]["metadata"]
-    )
-    kwargs["standard_logging_object"]["api_base"] = (
-        "https://opencode.ai/zen/v1/responses"
-    )
+    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
+    kwargs["standard_logging_object"]["api_base"] = "https://opencode.ai/zen/v1/responses"
     kwargs["custom_llm_provider"] = "opencode_zen"
     kwargs["model"] = "big-pickle"
     result = {
@@ -15747,7 +14993,20 @@ async def test_persist_session_history_records_executes_batch_insert(monkeypatch
             "file_modified_count": 0,
             "git_commit_count": 0,
             "git_push_count": 0,
-            "tool_activity": [{"tool_index": 0, "tool_name": "Read", "tool_kind": "read", "file_paths_read": ["README.md"], "file_paths_modified": [], "git_commit_count": 0, "git_push_count": 0, "command_text": None, "arguments": {"file_path": "README.md"}, "metadata": {"source": "message.tool_calls"}}],
+            "tool_activity": [
+                {
+                    "tool_index": 0,
+                    "tool_name": "Read",
+                    "tool_kind": "read",
+                    "file_paths_read": ["README.md"],
+                    "file_paths_modified": [],
+                    "git_commit_count": 0,
+                    "git_push_count": 0,
+                    "command_text": None,
+                    "arguments": {"file_path": "README.md"},
+                    "metadata": {"source": "message.tool_calls"},
+                }
+            ],
             "response_cost_usd": 0.01,
             "metadata": {"request_tags": ["reasoning-present"]},
         }
@@ -15872,8 +15131,7 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
     assert "INSERT INTO public.rate_limit_observations" in side_write_args[0]
     assert warning_mock.called
     assert any(
-        "best-effort rate limit observation persist failed" in str(call.args[0])
-        for call in warning_mock.call_args_list
+        "best-effort rate limit observation persist failed" in str(call.args[0]) for call in warning_mock.call_args_list
     )
 
 
@@ -15898,9 +15156,7 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
                     "aawm_tool_definition_types": ["function"],
                     "aawm_tool_definition_snapshot_hash": "hash-tool-snapshot-side-write-fails",
                     "aawm_tool_definition_snapshot_truncated": False,
-                    "aawm_tool_definition_snapshot": [
-                        {"source": "tools", "index": 0, "name": "spawn_agent"}
-                    ],
+                    "aawm_tool_definition_snapshot": [{"source": "tools", "index": 0, "name": "spawn_agent"}],
                 },
             },
             "best-effort tool definition snapshot persist failed",
@@ -16006,9 +15262,7 @@ async def test_persist_session_history_records_swallows_best_effort_side_write_f
     await _persist_session_history_records(records)
 
     assert mock_conn.executemany.await_count >= 1
-    assert any(
-        warning_fragment in str(call.args[0]) for call in warning_mock.call_args_list
-    )
+    assert any(warning_fragment in str(call.args[0]) for call in warning_mock.call_args_list)
 
 
 @pytest.mark.asyncio
@@ -16083,9 +15337,7 @@ async def test_persist_session_history_records_inherits_auto_review_parent_ident
 
     history_args = mock_conn.executemany.await_args_list[0].args
     payloads = history_args[1]
-    permission_payload = next(
-        payload for payload in payloads if payload[0] == "call-auto-review-child"
-    )
+    permission_payload = next(payload for payload in payloads if payload[0] == "call-auto-review-child")
     metadata = json.loads(permission_payload[52])
     assert permission_payload[5] == "claude-auto-review"
     assert permission_payload[7] == "auto-reviewer"
@@ -16095,10 +15347,7 @@ async def test_persist_session_history_records_inherits_auto_review_parent_ident
     assert metadata["tenant_id"] == "dashboard-shell"
     assert metadata["trace_user_id"] == "dashboard-shell"
     assert "claude-project:dashboard-shell" in metadata["request_tags"]
-    assert (
-        metadata["claude_auto_review_parent_identity_source"]
-        == "same_session.session_history"
-    )
+    assert metadata["claude_auto_review_parent_identity_source"] == "same_session.session_history"
     mock_conn.fetch.assert_not_awaited()
 
 
@@ -16162,9 +15411,7 @@ async def test_persist_session_history_records_writes_rate_limit_observation_and
         evidence={"signals": ["provider_rate_limits"]},
     )
     mock_conn = AsyncMock()
-    mock_conn.fetch.return_value = [
-        dict(previous, input_limit_key="codex_bengalfox:primary")
-    ]
+    mock_conn.fetch.return_value = [dict(previous, input_limit_key="codex_bengalfox:primary")]
     fake_pool = _FakePool(mock_conn)
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
@@ -16175,9 +15422,7 @@ async def test_persist_session_history_records_writes_rate_limit_observation_and
         AsyncMock(),
     )
 
-    await _persist_session_history_records(
-        [{"_skip_session_history": True, "rate_limit_observations": [current]}]
-    )
+    await _persist_session_history_records([{"_skip_session_history": True, "rate_limit_observations": [current]}])
 
     mock_conn.fetch.assert_awaited_once()
     fetch_args = mock_conn.fetch.await_args.args
@@ -16226,9 +15471,7 @@ async def test_persist_session_history_records_skips_repeated_rate_limit_snapsho
         litellm_call_id="call-rate-duplicate",
     )
     mock_conn = AsyncMock()
-    mock_conn.fetch.return_value = [
-        dict(previous, input_limit_key="anthropic:claude:acct:claude:seven_day:10080")
-    ]
+    mock_conn.fetch.return_value = [dict(previous, input_limit_key="anthropic:claude:acct:claude:seven_day:10080")]
     fake_pool = _FakePool(mock_conn)
     monkeypatch.setattr(
         "litellm.integrations.aawm_agent_identity._get_aawm_session_history_pool",
@@ -16239,9 +15482,7 @@ async def test_persist_session_history_records_skips_repeated_rate_limit_snapsho
         AsyncMock(),
     )
 
-    await _persist_session_history_records(
-        [{"_skip_session_history": True, "rate_limit_observations": [current]}]
-    )
+    await _persist_session_history_records([{"_skip_session_history": True, "rate_limit_observations": [current]}])
 
     mock_conn.fetch.assert_awaited_once()
     mock_conn.executemany.assert_not_awaited()
@@ -16300,11 +15541,9 @@ async def test_filter_meaningful_rate_limit_observations_batches_previous_lookup
     mock_conn = AsyncMock()
     mock_conn.fetch.return_value = [previous_first, previous_second]
 
-    kept, previous_by_limit_key = (
-        await aawm_agent_identity._filter_meaningful_rate_limit_observations(
-            mock_conn,
-            observations,
-        )
+    kept, previous_by_limit_key = await aawm_agent_identity._filter_meaningful_rate_limit_observations(
+        mock_conn,
+        observations,
     )
 
     mock_conn.fetch.assert_awaited_once()
@@ -16418,10 +15657,7 @@ def test_session_history_insert_sql_uses_start_time_as_created_at() -> None:
 
     assert "    start_time,\n    created_at,\n    end_time," in sql
     assert "$11, COALESCE($11, $12, NOW()), $12" in sql
-    assert (
-        "created_at = LEAST(session_history.created_at, EXCLUDED.created_at)"
-        in sql
-    )
+    assert "created_at = LEAST(session_history.created_at, EXCLUDED.created_at)" in sql
 
 
 def test_session_history_insert_sql_includes_client_ip_and_host_name_placeholders() -> None:
@@ -16524,9 +15760,7 @@ def test_extract_session_host_attribution_uses_localhost_display_for_loopback_ip
         lambda: "localhost",
     )
 
-    attribution = aawm_agent_identity._extract_session_host_attribution(
-        {"requester_ip_address": "127.0.0.1"}
-    )
+    attribution = aawm_agent_identity._extract_session_host_attribution({"requester_ip_address": "127.0.0.1"})
 
     assert attribution["client_ip"] == "127.0.0.1"
     assert attribution["host_name"] == "localhost"
@@ -16552,9 +15786,7 @@ def test_extract_session_host_attribution_resolves_local_magicdns_for_loopback_i
         Mock(return_value="seshat"),
     )
 
-    attribution = aawm_agent_identity._extract_session_host_attribution(
-        {"requester_ip_address": "127.0.0.1"}
-    )
+    attribution = aawm_agent_identity._extract_session_host_attribution({"requester_ip_address": "127.0.0.1"})
 
     assert attribution["client_ip"] == "127.0.0.1"
     assert attribution["host_name"] == "seshat"
@@ -16704,15 +15936,9 @@ def test_tool_activity_upsert_sql_guards_scalar_file_paths() -> None:
     sql = aawm_agent_identity._AAWM_SESSION_HISTORY_TOOL_ACTIVITY_INSERT_SQL
 
     assert "jsonb_typeof(EXCLUDED.file_paths_read) = 'array'" in sql
-    assert (
-        "jsonb_typeof(session_history_tool_activity.file_paths_read) = 'array'"
-        in sql
-    )
+    assert "jsonb_typeof(session_history_tool_activity.file_paths_read) = 'array'" in sql
     assert "jsonb_typeof(EXCLUDED.file_paths_modified) = 'array'" in sql
-    assert (
-        "jsonb_typeof(session_history_tool_activity.file_paths_modified) = 'array'"
-        in sql
-    )
+    assert "jsonb_typeof(session_history_tool_activity.file_paths_modified) = 'array'" in sql
 
 
 def test_rate_limit_observation_insert_sql_guards_unchanged_latest_snapshot() -> None:
@@ -16727,14 +15953,8 @@ def test_rate_limit_observation_insert_sql_guards_unchanged_latest_snapshot() ->
     assert "latest.quota_limit IS NOT DISTINCT FROM candidate.quota_limit" in sql
     assert "latest.quota_used IS NOT DISTINCT FROM candidate.quota_used" in sql
     assert "latest.quota_remaining IS NOT DISTINCT FROM candidate.quota_remaining" in sql
-    assert (
-        "latest.billing_period_start_at IS NOT DISTINCT FROM candidate.billing_period_start_at"
-        in sql
-    )
-    assert (
-        "latest.billing_period_end_at IS NOT DISTINCT FROM candidate.billing_period_end_at"
-        in sql
-    )
+    assert "latest.billing_period_start_at IS NOT DISTINCT FROM candidate.billing_period_start_at" in sql
+    assert "latest.billing_period_end_at IS NOT DISTINCT FROM candidate.billing_period_end_at" in sql
     assert "latest.raw_provider_fields IS NOT DISTINCT FROM" in sql
 
 
@@ -16806,9 +16026,7 @@ def test_build_session_history_record_persists_anthropic_context_window_metadata
             "passthrough_route_family": "anthropic_messages",
         }
     )
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"anthropic-beta": "context-1m-2025-08-07"}
-    }
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"anthropic-beta": "context-1m-2025-08-07"}}
     result = {
         "id": "msg-context-window",
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
