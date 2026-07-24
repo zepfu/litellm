@@ -142,6 +142,78 @@ def test_duration_signal_derived_then_backoff() -> None:
     assert decision_no_signal.duration_seconds != 42.0
 
 
+def test_structured_429_scope_is_model() -> None:
+    """Wave 2 (R3-3, DECIDED): structured 429/rate-limit is model-scoped.
+
+    Plain-429 and quota-text-429 both classify ``scope="model"`` (structured
+    confidence). Marker-only ``rate_limit`` also becomes model-scoped, but
+    ONLY after the confidence-tiered evidence gate has met its N-of-M
+    threshold -- the classifier's per-event ``scope`` field itself is what
+    this test pins (the gate's *decision* to cool is a separate concern
+    covered elsewhere). Marker-only ``capacity`` remains provider-scoped and
+    marker-only ``quota_exhausted`` remains account-scoped: these lower-
+    confidence signals are explicitly NOT widened by the OpenRouter
+    model-scope decision. Auth stays account, 404 stays model, 5xx stays
+    provider.
+
+    Pre-fix (develop before Wave 2): structured 429/quota classify
+    ``scope="provider"`` (classification.py:72/81) -- this assertion is the
+    named failing signal.
+    """
+    plain_429 = clsf.classify_failure(status_code=429, provider="openrouter", message="rate limited")
+    assert plain_429.scope == "model", f"expected model scope for plain 429, got {plain_429.scope!r}"
+
+    quota_429 = clsf.classify_failure(
+        status_code=429,
+        provider="openrouter",
+        message="You exceeded your current quota",
+    )
+    assert quota_429.scope == "model", f"expected model scope for quota-text 429, got {quota_429.scope!r}"
+
+    marker_rate_limit = clsf.classify_failure(
+        status_code=None,
+        provider="openrouter",
+        message="too many requests, please slow down",
+    )
+    assert marker_rate_limit.class_name == "rate_limit"
+    assert marker_rate_limit.confidence == "marker"
+    assert marker_rate_limit.scope == "model", (
+        "marker-only rate_limit must also report scope='model' on the event "
+        f"itself (post N-of-M gate applies separately); got {marker_rate_limit.scope!r}"
+    )
+
+    marker_capacity = clsf.classify_failure(
+        status_code=None,
+        provider="openrouter",
+        message="upstream capacity exceeded, please retry later",
+    )
+    assert marker_capacity.class_name == "capacity"
+    assert marker_capacity.scope == "provider", (
+        "marker-only capacity must remain provider-scoped -- not widened by "
+        f"the OpenRouter model-scope decision; got {marker_capacity.scope!r}"
+    )
+
+    marker_quota = clsf.classify_failure(
+        status_code=None,
+        provider="openrouter",
+        message="quota exhausted for this account",
+    )
+    assert marker_quota.class_name == "quota_exhausted"
+    assert marker_quota.scope == "account", (
+        "marker-only quota_exhausted must be account-scoped -- not widened "
+        f"by the OpenRouter model-scope decision; got {marker_quota.scope!r}"
+    )
+
+    auth_event = clsf.classify_failure(status_code=401, provider="anthropic", message="invalid api key")
+    assert auth_event.scope == "account"
+
+    not_found_event = clsf.classify_failure(status_code=404, provider="openai", message="model not found")
+    assert not_found_event.scope == "model"
+
+    five_xx_event = clsf.classify_failure(status_code=503, provider="openai", message="service unavailable")
+    assert five_xx_event.scope == "provider"
+
+
 def test_half_open_probe_recovery() -> None:
     """After expiry a single trial is allowed; success restores, failure re-cools with backoff."""
     gate = clsf.CooldownEvidenceGate()

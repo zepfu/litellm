@@ -812,3 +812,124 @@ async def test_rr054_31_codex_wrapper_wires_probe_lock_path_for_concurrent_cold_
     )
     successes = [r for r in results if isinstance(r, Response)]
     assert len(successes) >= 1, f"unexpected wrapper outcomes: {results!r}"
+
+
+# ---------------------------------------------------------------------------
+# Wave 2 (R3-1): the loop's cooldown-apply must move INSIDE the probe lock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rr054_31_contention_variant_waiter_sees_cooldown_before_lock_release() -> None:
+    """The Wave-0-repaired waiter test re-run with an injected suspension
+    point in the "durable half" of the apply -- ``apply_cooldown_fn`` awaits
+    ``asyncio.sleep(0)`` AFTER it has computed the failure but BEFORE it
+    publishes the cooldown into the shared ``cooldown_until`` map.
+
+    Pre-fix, ``_handle_auto_agent_alias_route`` releases ``probe_lock`` in its
+    inner ``finally`` clause immediately after the failed probe -- BEFORE
+    ``apply_cooldown_fn`` (and therefore this injected suspension) even
+    starts. The follower, queued on the SAME probe lock, acquires it as soon
+    as the leader's probe fails, reads a still-empty cooldown map, and
+    re-probes: ``probe.total == 2``.
+
+    Post-fix (R3-1: widen the locked region so cooldown publish happens
+    INSIDE the probe lock), the follower cannot acquire the probe lock until
+    the injected suspension has resolved and the cooldown is visible, so it
+    never re-probes: ``probe.total == 1``.
+    """
+    primary = _candidate()
+    cooldown_key = "openrouter:openrouter/cohere/north-mini-code:free:openrouter"
+    probe = _ProbeCounter()
+    probe.hold_seconds = 0.2
+    probe.release = asyncio.Event()
+    success = Response(content='{"ok":true}', media_type="application/json")
+    cooldown_until: dict[str, float] = {}
+    leader_started = asyncio.Event()
+
+    async def select_candidate_fn(
+        *,
+        request: Request,
+        request_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        if cooldown_until.get(cooldown_key, 0.0) > time.monotonic():
+            return _selection(
+                candidate=_candidate(model="openrouter/owl-alpha"),
+                lane_key="openrouter",
+                cooldown_key="openrouter:openrouter/owl-alpha:openrouter",
+                session_key=str(request_body["litellm_metadata"]["session_id"]),
+            )
+        return _selection(
+            candidate=primary,
+            lane_key="openrouter",
+            cooldown_key=cooldown_key,
+            session_key=str(request_body["litellm_metadata"]["session_id"]),
+        )
+
+    async def get_active_cooldown_state_fn(key: str) -> tuple[float, str]:
+        remaining = max(0.0, cooldown_until.get(key, 0.0) - time.monotonic())
+        return remaining, "local_fallback"
+
+    async def perform_candidate_request_fn(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        if candidate["model"] == primary["model"]:
+            leader_started.set()
+            return await probe.run(hold=True, outcome="fail")
+        return success
+
+    async def apply_cooldown_fn(**_kwargs: Any) -> str:
+        assert {"selected_cooldown_key", "cooldown_seconds", "error_class"} <= set(_kwargs.keys())
+        selected_cooldown_key = _kwargs["selected_cooldown_key"]
+        cooldown_seconds = _kwargs["cooldown_seconds"]
+        # Injected suspension: gives a follower that just acquired the probe
+        # lock a real scheduling opportunity to run BEFORE the cooldown
+        # becomes visible. Post-fix, the follower cannot even acquire the
+        # lock this early because the lock now covers this entire apply.
+        await asyncio.sleep(0)
+        cooldown_until[selected_cooldown_key] = time.monotonic() + max(1.0, float(cooldown_seconds or 30.0))
+        return "candidate"
+
+    leader_task = asyncio.create_task(
+        _run_route_once(
+            alias_family="codex_auto_agent",
+            alias_model="aawm-low",
+            session_id="contention-leader",
+            select_candidate_fn=select_candidate_fn,
+            perform_candidate_request_fn=perform_candidate_request_fn,
+            get_active_cooldown_state_fn=get_active_cooldown_state_fn,
+            apply_cooldown_fn=apply_cooldown_fn,
+            max_candidate_attempts=3,
+        )
+    )
+    await asyncio.wait_for(leader_started.wait(), timeout=1.0)
+
+    follower_task = asyncio.create_task(
+        _run_route_once(
+            alias_family="codex_auto_agent",
+            alias_model="aawm-low",
+            session_id="contention-follower",
+            select_candidate_fn=select_candidate_fn,
+            perform_candidate_request_fn=perform_candidate_request_fn,
+            get_active_cooldown_state_fn=get_active_cooldown_state_fn,
+            apply_cooldown_fn=apply_cooldown_fn,
+            max_candidate_attempts=3,
+        )
+    )
+    # Give the follower time to queue on the same lane lock.
+    await asyncio.sleep(0.05)
+    assert probe.total == 1
+    assert probe.current == 1
+
+    probe.release.set()
+    results = await asyncio.gather(leader_task, follower_task, return_exceptions=True)
+
+    assert probe.total == 1, (
+        "R3-1 gap: the follower re-probed the same candidate/lane after the "
+        f"leader's probe failed but before the cooldown was published "
+        f"(total={probe.total})."
+    )
+    assert probe.max_current == 1
+    assert any(isinstance(r, Response) for r in results)
