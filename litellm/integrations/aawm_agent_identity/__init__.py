@@ -58,7 +58,13 @@ from typing import (
     Tuple,
     cast,
 )
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import (  # noqa: F401 - parse_qsl/quote/urlencode consumed by moved coerce helpers via host globals
+    parse_qsl,
+    quote,
+    urlencode,
+    urlsplit,
+    urlunsplit,
+)
 
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
@@ -181,19 +187,6 @@ _AAWM_DB_APPLICATION_NAME_ENV_VARS = (
     "AAWM_POSTGRES_APPLICATION_NAME",
     "PGAPPNAME",
 )
-_AAWM_LITELLM_ENVIRONMENT_ENV_VARS = (
-    "AAWM_LITELLM_ENVIRONMENT",
-    "LITELLM_INSTANCE_ENVIRONMENT",
-    "LITELLM_ENVIRONMENT",
-    "LITELLM_ENV",
-    "LITELLM_LANGFUSE_TRACE_ENVIRONMENT",
-    "LANGFUSE_TRACING_ENVIRONMENT",
-    "AAWM_ENVIRONMENT",
-)
-_AAWM_LITELLM_VERSION_ENV_VARS = (
-    "AAWM_LITELLM_VERSION",
-    "LITELLM_VERSION",
-)
 _AAWM_LITELLM_FORK_VERSION_ENV_VARS = (
     "AAWM_LITELLM_FORK_VERSION",
     "LITELLM_FORK_VERSION",
@@ -203,24 +196,6 @@ _AAWM_ASSOCIATED_WHEEL_PACKAGES = (
     "aawm-litellm-callbacks",
     "aawm-litellm-control-plane",
 )
-_AAWM_ASSOCIATED_VERSION_ENV_VARS = {
-    "aawm-litellm-callbacks": (
-        "AAWM_CALLBACK_WHEEL_VERSION",
-        "AAWM_LITELLM_CALLBACKS_VERSION",
-    ),
-    "aawm-litellm-control-plane": (
-        "AAWM_CONTROL_PLANE_WHEEL_VERSION",
-        "AAWM_LITELLM_CONTROL_PLANE_VERSION",
-    ),
-    "litellm-model-config": (
-        "AAWM_MODEL_CONFIG_VERSION",
-        "LITELLM_MODEL_CONFIG_VERSION",
-    ),
-    "litellm-local-ci-harness": (
-        "AAWM_HARNESS_VERSION",
-        "LITELLM_LOCAL_CI_HARNESS_VERSION",
-    ),
-}
 _USER_AGENT_PRODUCT_RE = re.compile(
     r"(?P<name>[A-Za-z][A-Za-z0-9._-]{1,63})/" r"(?P<version>[A-Za-z0-9][A-Za-z0-9.+_-]{0,127})"
 )
@@ -229,15 +204,6 @@ _USER_AGENT_PAREN_PRODUCT_RE = re.compile(
 )
 _RESET_AFTER_SECONDS_RE = re.compile(
     r"\breset(?:s|ting)?\s+after\s+(?P<seconds>\d+)s\b",
-    re.IGNORECASE,
-)
-_AAWM_AGENT_ID_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-_AAWM_AGENT_ID_HEX_RE = re.compile(r"^(?=.*[a-f])[a-f0-9]{12,64}$", re.IGNORECASE)
-_AAWM_AGENT_ID_PREFIXED_RE = re.compile(
-    r"^(?:agent|subagent|task)[-_][A-Za-z0-9][A-Za-z0-9._:-]{5,127}$",
     re.IGNORECASE,
 )
 from litellm.integrations.aawm_session_history.sql import (  # noqa: F401
@@ -422,315 +388,6 @@ _ANTHROPIC_CONTEXT_WINDOW_METADATA_KEYS = (
     "anthropic_context_window_classification",
 )
 
-_AAWM_SESSION_HISTORY_METADATA_KEYS = (
-    "agent_id",
-    "agent_id_source",
-    "tenant_id_source",
-    "repository_source",
-    "workload_type",
-    "workload_subtype",
-    "source_repository",
-    "memory_workload_label",
-    "trace_name",
-    "trace_user_id",
-    "trace_environment",
-    "session_id_source",
-    "synthetic_session_id",
-    "synthetic_session_id_basis",
-    "source_status",
-    "source_model",
-    "logical_model",
-    "aawm_claude_agent_name",
-    "aawm_claude_project",
-    "aawm_tenant_id",
-    "cc_version",
-    "cc_entrypoint",
-    "litellm_environment",
-    "litellm_version",
-    "litellm_fork_version",
-    "litellm_wheel_versions",
-    "client_name",
-    "client_version",
-    "client_user_agent",
-    "client_ip",
-    "client_ip_source",
-    "host_name",
-    "host_name_source",
-    "repository",
-    "route_tag",
-    "openai_passthrough_route_family",
-    "passthrough_route_family",
-    "route_family",
-    "auth_mode",
-    "credential_family",
-    "xai_oauth_managed",
-    "xai_oauth_public_model",
-    "xai_oauth_upstream_model",
-    "billing_mode",
-    "actual_invoice_cost_known",
-    "reference_cost_kind",
-    "reference_cost_currency",
-    "reference_cost_model",
-    "reference_cost_source",
-    "reference_cost_cached_input_usd",
-    "reference_cost_uncached_input_usd",
-    "reference_cost_output_usd",
-    "reference_cost_total_usd",
-    "xai_quota_family",
-    "shared_quota_family",
-    "grok_subscription_quota_shared",
-    "xai_responses_request_sanitized",
-    "xai_responses_sanitized_removed_params",
-    "xai_responses_sanitized_tool_count",
-    "xai_responses_sanitized_tool_types",
-    "xai_tool_choice_without_tools_removed",
-    "xai_tool_choice_without_tools_removed_reason",
-    "claude_internal_check",
-    "claude_internal_check_type",
-    "claude_permission_check",
-    "claude_permission_check_decision",
-    "claude_permission_check_blocked",
-    "claude_permission_check_request_model",
-    "claude_permission_check_response_model",
-    "reasoning_content_present",
-    "thinking_signature_present",
-    "usage_reasoning_tokens_reported",
-    "usage_reasoning_tokens_source",
-    "usage_token_count_response",
-    "aawm_rate_limit_observation_only",
-    "session_history_usage_record",
-    "session_history_zero_token_class",
-    "d1_140_zero_token_class",
-    "d1_140_zero_token_reason",
-    "gemini_control_plane_excluded",
-    "gemini_control_plane_method",
-    "reasoning_effort_requested",
-    "reasoning_effort_source",
-    "reasoning_effort_native_provider",
-    "reasoning_effort_native_value",
-    "reasoning_effort_native_field",
-    "reasoning_effort_supported_ceiling",
-    "reasoning_effort_resolved_model",
-    "reasoning_effort_resolved_provider",
-    "reasoning_effort_candidate_attempt",
-    "reasoning_effort_mapping_reason",
-    "reasoning_effort_clamped_from",
-    "reasoning_effort_clamp_reason",
-    "codex_reasoning_effort",
-    "openai_reasoning_effort",
-    "gemini_reasoning_effort",
-    "openrouter_reasoning_effort",
-    "nvidia_reasoning_effort",
-    "usage_cache_read_input_tokens",
-    "usage_cache_creation_input_tokens",
-    "usage_provider_cache_attempted",
-    "usage_provider_cache_status",
-    "usage_provider_cache_miss",
-    "usage_provider_cache_miss_reason",
-    "usage_provider_cache_miss_token_count",
-    "usage_provider_cache_miss_cost_usd",
-    "usage_provider_cache_miss_cost_basis",
-    "usage_provider_cache_source",
-    "openai_prompt_cache_key_present",
-    "anthropic_adapter_cache_control_present",
-    "anthropic_adapter_unsupported_hosted_tools",
-    "anthropic_adapter_unsupported_hosted_tool_choice",
-    "anthropic_adapter_model",
-    "anthropic_adapter_original_model",
-    "anthropic_adapter_target_endpoint",
-    "codex_unsupported_hosted_tool_removed_count",
-    "codex_unsupported_hosted_tool_types_removed",
-    "codex_unsupported_hosted_tools_removed",
-    "codex_unsupported_hosted_tool_choice_removed",
-    "aawm_tool_definition_capture_version",
-    "aawm_tool_definition_capture_source",
-    "aawm_tool_definition_count",
-    "aawm_tool_definition_captured_count",
-    "aawm_tool_definition_sources",
-    "aawm_tool_definition_names",
-    "aawm_tool_definition_types",
-    "aawm_tool_definition_snapshot_hash",
-    "aawm_tool_definition_snapshot_truncated",
-    "aawm_tool_definition_snapshot_storage",
-    "aawm_tool_definition_snapshot_storage_key",
-    "opencode_zen_removed_unsupported_tool_count",
-    "opencode_zen_removed_unsupported_tool_types",
-    "opencode_zen_removed_unsupported_tool_names",
-    "codex_adapter_model",
-    "codex_adapter_original_model",
-    "codex_adapter_target_endpoint",
-    "codex_adapter_input_shape",
-    "codex_adapter_output_shape",
-    "model_alias_label",
-    "requested_model_alias",
-    "codex_auto_agent_alias",
-    "codex_auto_agent_selected_provider",
-    "codex_auto_agent_selected_model",
-    "codex_auto_agent_selected_route_family",
-    "codex_auto_agent_selected_last_resort",
-    "codex_auto_agent_selection_reason",
-    "codex_auto_agent_lane_key",
-    "codex_auto_agent_attempts",
-    "codex_auto_agent_skipped_candidates",
-    "codex_auto_agent_audit_events",
-    "anthropic_auto_agent_alias",
-    "anthropic_auto_agent_selected_provider",
-    "anthropic_auto_agent_selected_model",
-    "anthropic_auto_agent_selected_route_family",
-    "anthropic_auto_agent_selected_last_resort",
-    "anthropic_auto_agent_selection_reason",
-    "anthropic_auto_agent_lane_key",
-    "anthropic_auto_agent_attempts",
-    "anthropic_auto_agent_skipped_candidates",
-    "anthropic_auto_agent_audit_events",
-    "aawm_alias_routing_audit_events",
-    "codex_google_code_assist_dropped_response_tool_types",
-    "google_retrieve_user_quota",
-    "usage_tool_call_count",
-    "usage_invalid_tool_call_count",
-    "usage_structured_output_attempted",
-    "usage_structured_output_failed",
-    "usage_structured_output_mode",
-    "usage_structured_output_schema_hash",
-    "usage_structured_output_failure_reason",
-    "usage_trace_quality_score",
-    "usage_empty_completion_failure",
-    "usage_large_tool_result_payload_risk",
-    "usage_destructive_checkout_after_work",
-    "usage_invalid_tool_call_error",
-    "usage_read_only_policy_compliance_score",
-    "usage_read_only_policy_violation_count",
-    "usage_response_meaningfulness_score",
-    "usage_instruction_adherence_score",
-    "usage_answer_completeness_score",
-    "usage_evidence_fidelity_score",
-    "usage_tool_result_fidelity_score",
-    "usage_error_attribution_quality_score",
-    "usage_repetition_loop_risk_score",
-    "usage_context_retention_score",
-    "usage_tool_use_validity_score",
-    "usage_tool_error_recovery_score",
-    "usage_stall_risk_score",
-    "usage_output_contract_compliance_score",
-    "usage_task_progress_score",
-    "usage_scope_control_score",
-    "usage_destructive_action_policy_score",
-    "usage_ignored_path_tracking_policy_score",
-    "usage_ignored_path_tracking_violation_count",
-    "usage_baseline_deflection_attempted_score",
-    "usage_baseline_deflection_incident_score",
-    "usage_baseline_deflection_attempt_count",
-    "usage_baseline_deflection_tool_call_count",
-    "usage_baseline_deflection_input_tokens",
-    "usage_baseline_deflection_elapsed_ms",
-    "usage_quality_gate_trigger_count",
-    "usage_quality_gate_fix_attempt_count",
-    "usage_quality_gate_rerun_count",
-    "usage_sleep_wellness_interruption_attempted_score",
-    "usage_sleep_wellness_interruption_incident_score",
-    "usage_sleep_wellness_interruption_count",
-    "usage_sleep_wellness_interruption_output_tokens",
-    "usage_sleep_wellness_interruption_input_tokens",
-    "usage_sleep_wellness_interruption_elapsed_ms",
-    "usage_sleep_wellness_interruption_after_user_pushback_count",
-    "usage_sleep_wellness_interruption_repeated_count",
-    "usage_terminal_completion_score",
-    "usage_discovery_inventory_coverage_score",
-    "usage_discovery_inventory_missing_count",
-    "usage_output_contract_required_final_phrase",
-    "usage_output_contract_required_final_phrase_present",
-    "usage_output_contract_required_final_phrase_source",
-    "usage_output_contract_failure_class",
-    "usage_output_contract_failure_count",
-    "usage_output_contract_setup_only_detected",
-    "usage_output_contract_setup_only_markers",
-    "usage_output_contract_final_text_chars",
-    "usage_agent_score_reasons",
-    "usage_agent_score_source",
-    "gemini_user_prompt_id",
-    "is_compact_summary",
-    "compact_summary_source",
-    "compact_summary_role",
-    "compact_summary_id",
-    "usage_tool_names",
-    "google_adapter_system_prompt_policy_name",
-    "google_adapter_system_prompt_policy",
-    "google_adapter_system_prompt_policy_version",
-    "google_adapter_system_prompt_original_chars",
-    "google_adapter_system_prompt_rewritten_chars",
-    "google_adapter_system_prompt_removed_claude_overhead_chars",
-    "google_adapter_system_prompt_preserved_instruction_chars",
-    "google_adapter_system_prompt_policy_applied",
-    "codex_google_code_assist_tool_contract_policy_name",
-    "codex_google_code_assist_tool_contract_policy",
-    "codex_google_code_assist_tool_contract_policy_version",
-    "codex_google_code_assist_tool_contract_policy_applied",
-    "anthropic_context_window_mode",
-    "anthropic_context_window_requested_tokens",
-    "anthropic_context_window_source",
-    "anthropic_context_window_beta",
-    "anthropic_context_window_classification",
-    "codex_google_code_assist_tool_contract_prompt_chars",
-    "usage_search_units",
-    "usage_openrouter_cost",
-    "openrouter_provider",
-    "openrouter_response_model",
-    "aawm_local_prepare_ms",
-    "aawm_upstream_wait_ms",
-    "aawm_time_to_first_token_ms",
-    "aawm_upstream_first_chunk_ms",
-    "aawm_first_emitted_chunk_ms",
-    "aawm_stream_emit_gap_ms",
-    "aawm_upstream_stream_complete_ms",
-    "aawm_local_stream_finalize_ms",
-    "aawm_local_finalize_ms",
-    "aawm_total_proxy_overhead_ms",
-    "aawm_total_proxy_duration_ms",
-    "aawm_stream_chunk_count",
-    "aawm_stream_total_bytes",
-    "aawm_passthrough_endpoint_type",
-    "responses_stream_event_types",
-    "responses_stream_event_counts",
-    "responses_stream_tool_call_count",
-    "responses_stream_tool_names",
-    "aawm_stream_logging_endpoint_type",
-    "aawm_stream_logging_custom_llm_provider",
-    "aawm_stream_logging_is_openai_responses",
-    "aawm_local_route",
-    "aawm_local_route_family",
-    "aawm_local_model_group",
-    "aawm_local_service",
-    "aawm_local_endpoint",
-    "aawm_local_upstream_provider",
-    "aawm_local_upstream_model",
-    "aawm_local_upstream_api_base",
-    "aawm_local_upstream_url",
-    "usage_input_system_tokens_estimated",
-    "usage_input_tool_advertisement_tokens_estimated",
-    "usage_input_conversation_tokens_estimated",
-    "usage_input_other_tokens_estimated",
-    "usage_input_breakdown_residual_tokens",
-    "usage_input_opaque_state_tokens_estimated",
-    "usage_system_behavior_tokens_estimated",
-    "usage_system_safety_tokens_estimated",
-    "usage_system_instructional_tokens_estimated",
-    "usage_system_unclassified_tokens_estimated",
-    "prompt_overhead_breakdown_source",
-    "prompt_overhead_counted_shape",
-    "prompt_overhead_route_family",
-    "prompt_overhead_tokenizer",
-    "prompt_overhead_classifier_version",
-    "prompt_overhead_component_paths",
-    "prompt_overhead_excluded_component_paths",
-    "worker_context_exhaustion_failure_class",
-    "worker_context_exhaustion_failure_reason",
-    "worker_context_exhaustion_partial_output_summary",
-    "worker_context_exhaustion_changed_paths_hint",
-    "worker_context_exhaustion_attempted_patch_scope",
-    "worker_context_exhaustion_last_visible_message",
-    "worker_context_exhaustion_success",
-    "worker_context_exhaustion_completed",
-)
 _WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS = (
     "worker_context_exhaustion_failure_class",
     "worker_context_exhaustion_failure_reason",
@@ -845,18 +502,6 @@ _PROMPT_OVERHEAD_CLASSIFIER_VERSION = "deterministic-v2"
 _AAWM_REQUEST_PAYLOAD_SCAN_MAX_DEPTH = 16
 _AAWM_REQUEST_PAYLOAD_SCAN_MAX_ITEMS = 5000
 _AAWM_JSON_SAFE_MAX_DEPTH = 12
-_AAWM_TENANT_ID_METADATA_KEYS = (
-    "tenant_id",
-    "aawm_tenant_id",
-    "user_api_key_org_id",
-    "organization_id",
-    "org_id",
-    "litellm_organization_id",
-    "litellm_org_id",
-    "user_api_key_team_id",
-    "team_id",
-    "litellm_team_id",
-)
 _AAWM_TENANT_ID_HEADER_NAMES = (
     "x-aawm-tenant-id",
     "x-litellm-tenant-id",
@@ -879,28 +524,6 @@ _AAWM_AGENT_ID_HEADER_NAMES = (
     "x-grok-agent-id",
     "x-litellm-agent-id",
     "x-agent-id",
-)
-_AAWM_REPOSITORY_METADATA_KEYS = (
-    "repository",
-    "aawm_repository",
-    "repo",
-    "repo_name",
-    "repository_name",
-    "git_repository",
-    "vcs_repository",
-    "workspace_root",
-    "workspaceRoot",
-    "project_root",
-    "projectRoot",
-    "root_path",
-    "rootPath",
-    "working_directory",
-    "workingDirectory",
-    "cwd_path",
-    "cwdPath",
-    "cwd_uri",
-    "cwdUri",
-    "aawm_claude_project",
 )
 _AAWM_REPOSITORY_HEADER_NAMES = (
     "x-aawm-repository",
@@ -1181,118 +804,6 @@ def _content_to_text(content: Any) -> str:
     return str(content) if content else ""
 
 
-def _clean_secret_string(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-
-    cleaned = value.strip()
-    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
-        cleaned = cleaned[1:-1].strip()
-    return cleaned or None
-
-
-def _get_first_secret_value(secret_names: tuple[str, ...]) -> Optional[str]:
-    for secret_name in secret_names:
-        value = _clean_secret_string(get_secret_str(secret_name))
-        if value:
-            return value
-    return None
-
-
-def _normalize_aawm_sslmode(value: Optional[str]) -> Optional[str]:
-    cleaned = _clean_secret_string(value)
-    if not cleaned:
-        return None
-
-    lowered = cleaned.lower()
-    if lowered in {"1", "true", "yes", "on"}:
-        return "require"
-    if lowered in {"0", "false", "no", "off"}:
-        return "disable"
-    return cleaned
-
-
-def _build_aawm_dsn() -> Optional[str]:
-    host = _get_first_secret_value(_AAWM_DB_HOST_ENV_VARS)
-    port = _get_first_secret_value(_AAWM_DB_PORT_ENV_VARS)
-    user = _get_first_secret_value(_AAWM_DB_USER_ENV_VARS)
-    password = _get_first_secret_value(_AAWM_DB_PASSWORD_ENV_VARS)
-    database = _get_first_secret_value(_AAWM_DB_NAME_ENV_VARS)
-    sslmode = _normalize_aawm_sslmode(
-        _get_first_secret_value(_AAWM_DB_SSLMODE_ENV_VARS) or _get_first_secret_value(_AAWM_DB_SSL_BOOL_ENV_VARS)
-    )
-
-    has_component_config = any((host, port, user, password, database, sslmode))
-    if has_component_config:
-        if not host or not user or not database:
-            return None
-
-        credentials = quote(user, safe="")
-        if password:
-            credentials += f":{quote(password, safe='')}"
-        dsn = f"postgresql://{credentials}@{host}:{port or '5432'}/" f"{quote(database, safe='')}"
-        if sslmode:
-            dsn += f"?{urlencode({'sslmode': sslmode})}"
-        return dsn
-
-    return _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
-
-
-def _append_aawm_dsn_query_params(
-    dsn: str,
-    params: Dict[str, Optional[str]],
-) -> str:
-    parsed = urlsplit(dsn)
-    if not parsed.scheme:
-        return dsn
-
-    query_items = parse_qsl(parsed.query, keep_blank_values=True)
-    existing_keys = {key for key, _value in query_items}
-    for key, value in params.items():
-        cleaned_value = _clean_secret_string(value)
-        if cleaned_value and key not in existing_keys:
-            query_items.append((key, cleaned_value))
-            existing_keys.add(key)
-    return urlunsplit(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            urlencode(query_items),
-            parsed.fragment,
-        )
-    )
-
-
-def _clean_non_empty_string(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    cleaned = str(value).strip()
-    return cleaned or None
-
-
-def _first_non_empty_string(*values: Any) -> Optional[str]:
-    for value in values:
-        cleaned = _clean_non_empty_string(value)
-        if cleaned:
-            return cleaned
-    return None
-
-
-def _coerce_string_dict(value: Any) -> Dict[str, str]:
-    parsed_value = _safe_json_load(value, value)
-    if not isinstance(parsed_value, dict):
-        return {}
-
-    result: Dict[str, str] = {}
-    for key, nested_value in list(parsed_value.items()):
-        key_text = _clean_non_empty_string(key)
-        value_text = _clean_non_empty_string(nested_value)
-        if key_text and value_text:
-            result[key_text] = value_text
-    return result
-
-
 def _get_header_value(headers: Any, *names: str) -> Optional[str]:
     if not headers:
         return None
@@ -1376,169 +887,6 @@ def _extract_tenant_identity_from_metadata_sources(
     return None, None
 
 
-def _extract_claude_trace_agent_name(value: Any) -> Optional[str]:
-    trace_name = _clean_non_empty_string(value)
-    if not trace_name or not trace_name.startswith("claude-code."):
-        return None
-    agent_name = _clean_non_empty_string(trace_name.split(".", 1)[1])
-    return agent_name
-
-
-def _extract_claude_trace_user_identity_from_metadata_sources(
-    *sources: Tuple[str, Any],
-) -> Tuple[Optional[str], Optional[str]]:
-    for source_name, raw_source in sources:
-        source = _coerce_mapping(raw_source)
-        if not source:
-            continue
-
-        trace_user_id = _normalize_repository_identity(source.get("trace_user_id"))
-        if (
-            trace_user_id
-            and _clean_non_empty_string(source.get("trace_name"))
-            and str(source.get("trace_name")).startswith("claude-code")
-        ):
-            return trace_user_id, f"{source_name}.trace_user_id"
-
-        nested_source = _coerce_mapping(source.get("metadata"))
-        if not nested_source:
-            continue
-        trace_user_id = _normalize_repository_identity(nested_source.get("trace_user_id"))
-        if (
-            trace_user_id
-            and _clean_non_empty_string(nested_source.get("trace_name"))
-            and str(nested_source.get("trace_name")).startswith("claude-code")
-        ):
-            return trace_user_id, f"{source_name}.metadata.trace_user_id"
-
-    return None, None
-
-
-def _extract_tenant_identity_from_kwargs(
-    kwargs: Dict[str, Any],
-    *,
-    metadata: Optional[Dict[str, Any]] = None,
-    standard_logging_object: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[str], Optional[str]]:
-    litellm_params = kwargs.get("litellm_params") or {}
-    standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
-    passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
-    proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
-    proxy_body = _coerce_mapping(proxy_request.get("body"))
-    passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
-
-    tenant_id, source = _extract_tenant_identity_from_metadata_sources(
-        ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
-        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
-        ("kwargs.metadata", kwargs.get("metadata")),
-        ("litellm_params.proxy_server_request.body", proxy_body),
-        ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
-        ("passthrough_logging_payload", passthrough_payload),
-        ("passthrough_logging_payload.request_body", passthrough_body),
-        ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
-        ("standard_logging_object", standard_logging_object),
-        ("kwargs", kwargs),
-    )
-    metadata_mapping = _coerce_mapping(metadata or litellm_params.get("metadata"))
-    if tenant_id and _is_codex_passthrough_tenant_extraction_context(
-        kwargs,
-        metadata=metadata_mapping,
-    ):
-        trace_user_id = _normalize_repository_identity(metadata_mapping.get("trace_user_id"))
-        tenant_source = _clean_non_empty_string(metadata_mapping.get("tenant_id_source"))
-        if _is_codex_trace_user_tenant_source(source) or _is_codex_trace_user_tenant_source(tenant_source):
-            tenant_id, source = None, None
-        elif isinstance(source, str) and source.endswith(".trace_user_id"):
-            tenant_id, source = None, None
-        elif (
-            trace_user_id
-            and tenant_id == trace_user_id
-            and not _is_repository_source_trusted_for_codex_tenant(metadata_mapping.get("repository_source"))
-        ):
-            tenant_id, source = None, None
-        elif (
-            isinstance(source, str)
-            and any(source.endswith(marker) for marker in (".tenant_id", ".aawm_tenant_id"))
-            and trace_user_id
-            and tenant_id == trace_user_id
-        ):
-            tenant_id, source = None, None
-    if tenant_id:
-        return tenant_id, source
-
-    headers = _extract_request_headers_from_kwargs(kwargs)
-    tenant_id = _normalize_tenant_identity(_get_header_value(headers, *_AAWM_TENANT_ID_HEADER_NAMES))
-    if tenant_id:
-        return tenant_id, "request_headers"
-
-    tenant_id, source = _extract_claude_trace_user_identity_from_metadata_sources(
-        ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
-        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
-        ("kwargs.metadata", kwargs.get("metadata")),
-        ("litellm_params.proxy_server_request.body", proxy_body),
-        ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
-        ("passthrough_logging_payload", passthrough_payload),
-        ("passthrough_logging_payload.request_body", passthrough_body),
-        ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
-        ("standard_logging_object", standard_logging_object),
-        ("kwargs", kwargs),
-    )
-    if tenant_id:
-        return tenant_id, source
-
-    return None, None
-
-
-def _extract_tenant_identity_from_langfuse_trace_observation(
-    trace: Dict[str, Any],
-    observation: Dict[str, Any],
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[str], Optional[str]]:
-    trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
-    tenant_id, source = _extract_tenant_identity_from_metadata_sources(
-        ("observation.metadata", metadata or observation.get("metadata")),
-        ("trace.metadata", trace_metadata),
-        ("observation", observation),
-        ("trace", trace),
-    )
-    if tenant_id:
-        return tenant_id, source
-    trace_user_id = _normalize_tenant_identity(trace.get("userId") if isinstance(trace, dict) else None)
-    if trace_user_id:
-        return trace_user_id, "trace.userId"
-    return None, None
-
-
-def _is_agent_id_like(value: str) -> bool:
-    normalized = value.strip()
-    if not normalized:
-        return False
-    return bool(
-        _AAWM_AGENT_ID_UUID_RE.fullmatch(normalized)
-        or _AAWM_AGENT_ID_HEX_RE.fullmatch(normalized)
-        or _AAWM_AGENT_ID_PREFIXED_RE.fullmatch(normalized)
-    )
-
-
-def _normalize_agent_id_identity(
-    value: Any,
-    *,
-    disallowed_values: Optional[Set[str]] = None,
-) -> Optional[str]:
-    cleaned = _clean_non_empty_string(value)
-    if not cleaned:
-        return None
-    cleaned = cleaned.strip("`'\"")
-    normalized = cleaned.lower()
-    if normalized in {"none", "null", "unknown", "orchestrator"}:
-        return None
-    if disallowed_values and normalized in disallowed_values:
-        return None
-    if not _is_agent_id_like(cleaned):
-        return None
-    return cleaned
-
-
 def _agent_id_disallowed_values(
     *values: Any,
 ) -> Set[str]:
@@ -1585,127 +933,6 @@ def _agent_id_disallowed_values_from_kwargs(
         standard_metadata.get("repository") if isinstance(standard_metadata, dict) else None,
         standard_metadata.get("tenant_id") if isinstance(standard_metadata, dict) else None,
         standard_metadata.get("agent_name") if isinstance(standard_metadata, dict) else None,
-    )
-
-
-def _extract_agent_id_from_metadata_sources(
-    *sources: Tuple[str, Any],
-    disallowed_values: Optional[Set[str]] = None,
-) -> Tuple[Optional[str], Optional[str]]:
-    for source_name, raw_source in sources:
-        source = _coerce_mapping(raw_source)
-        if not source:
-            continue
-        for key in _AAWM_AGENT_ID_METADATA_KEYS:
-            agent_id = _normalize_agent_id_identity(
-                source.get(key),
-                disallowed_values=disallowed_values,
-            )
-            if agent_id:
-                return agent_id, f"{source_name}.{key}"
-
-        for nested_key in (
-            "metadata",
-            "litellm_metadata",
-            "request_metadata",
-            "user_api_key_metadata",
-        ):
-            nested_source = _coerce_mapping(source.get(nested_key))
-            if not nested_source:
-                continue
-            for key in _AAWM_AGENT_ID_METADATA_KEYS:
-                agent_id = _normalize_agent_id_identity(
-                    nested_source.get(key),
-                    disallowed_values=disallowed_values,
-                )
-                if agent_id:
-                    return agent_id, f"{source_name}.{nested_key}.{key}"
-
-    return None, None
-
-
-def _extract_agent_id_from_kwargs(
-    kwargs: Dict[str, Any],
-    *,
-    metadata: Optional[Dict[str, Any]] = None,
-    standard_logging_object: Optional[Dict[str, Any]] = None,
-    agent_name: Optional[str] = None,
-    tenant_id: Optional[str] = None,
-    repository: Optional[str] = None,
-) -> Tuple[Optional[str], Optional[str]]:
-    litellm_params = kwargs.get("litellm_params") or {}
-    standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
-    passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
-    proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
-    proxy_body = _coerce_mapping(proxy_request.get("body"))
-    passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
-    disallowed_values = _agent_id_disallowed_values_from_kwargs(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=standard_logging_object,
-        agent_name=agent_name,
-        tenant_id=tenant_id,
-        repository=repository,
-    )
-
-    agent_id, source = _extract_agent_id_from_metadata_sources(
-        ("litellm_params.metadata", metadata or litellm_params.get("metadata")),
-        ("standard_logging_object.metadata", standard_logging_object.get("metadata")),
-        ("kwargs.metadata", kwargs.get("metadata")),
-        ("litellm_params.proxy_server_request.body", proxy_body),
-        ("litellm_params.proxy_server_request.body.metadata", proxy_body.get("metadata")),
-        ("litellm_params.proxy_server_request.body.litellm_metadata", proxy_body.get("litellm_metadata")),
-        ("passthrough_logging_payload", passthrough_payload),
-        ("passthrough_logging_payload.request_body", passthrough_body),
-        ("passthrough_logging_payload.request_body.metadata", passthrough_body.get("metadata")),
-        ("passthrough_logging_payload.request_body.litellm_metadata", passthrough_body.get("litellm_metadata")),
-        disallowed_values=disallowed_values,
-    )
-    if agent_id:
-        return agent_id, source
-
-    headers = _extract_request_headers_from_kwargs(kwargs)
-    for header_name in _AAWM_AGENT_ID_HEADER_NAMES:
-        agent_id = _normalize_agent_id_identity(
-            _get_header_value(headers, header_name),
-            disallowed_values=disallowed_values,
-        )
-        if agent_id:
-            return agent_id, f"request_headers.{header_name}"
-
-    return None, None
-
-
-def _extract_agent_id_from_langfuse_trace_observation(
-    trace: Dict[str, Any],
-    observation: Dict[str, Any],
-    metadata: Optional[Dict[str, Any]] = None,
-    *,
-    agent_name: Optional[str] = None,
-    tenant_id: Optional[str] = None,
-    repository: Optional[str] = None,
-) -> Tuple[Optional[str], Optional[str]]:
-    trace_metadata = trace.get("metadata") if isinstance(trace, dict) else None
-    disallowed_values = _agent_id_disallowed_values(
-        agent_name,
-        tenant_id,
-        repository,
-        trace.get("sessionId") if isinstance(trace, dict) else None,
-        trace.get("session_id") if isinstance(trace, dict) else None,
-        trace.get("id") if isinstance(trace, dict) else None,
-        observation.get("traceId") if isinstance(observation, dict) else None,
-        observation.get("id") if isinstance(observation, dict) else None,
-        metadata.get("session_id") if isinstance(metadata, dict) else None,
-        metadata.get("trace_id") if isinstance(metadata, dict) else None,
-        metadata.get("trace_user_id") if isinstance(metadata, dict) else None,
-        metadata.get("repository") if isinstance(metadata, dict) else None,
-        metadata.get("tenant_id") if isinstance(metadata, dict) else None,
-        metadata.get("agent_name") if isinstance(metadata, dict) else None,
-    )
-    return _extract_agent_id_from_metadata_sources(
-        ("observation.metadata", metadata or observation.get("metadata")),
-        ("trace.metadata", trace_metadata),
-        disallowed_values=disallowed_values,
     )
 
 
@@ -1808,87 +1035,6 @@ def _is_bare_dot_directory(value: str) -> bool:
     return True
 
 
-def _normalize_repository_identity_from_absolute_path(
-    normalized_path: str,
-) -> Optional[str]:
-    codex_memory_root = _get_codex_memory_root_path()
-    workspace_prefix = _aawm_workspace_root_prefix()
-    if normalized_path == codex_memory_root:
-        return _CODEX_MEMORY_ROOT_REPOSITORY
-
-    path_parts = normalized_path.rsplit("/", 1)
-    basename = path_parts[-1]
-    if basename.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES and len(path_parts) > 1:
-        parent_path = path_parts[0].rstrip("/")
-        if parent_path == codex_memory_root:
-            return _CODEX_MEMORY_ROOT_REPOSITORY
-        if parent_path.startswith(workspace_prefix):
-            return parent_path.rsplit("/", 1)[-1]
-        return None
-
-    # Trusted workspace roots map to repos; nested prompt-text file paths under
-    # a project are references, not session ownership.
-    if normalized_path.startswith(workspace_prefix):
-        sub = normalized_path[len(workspace_prefix) :].strip("/")
-        if not sub:
-            return None
-        if "/" not in sub:
-            return sub
-        first, sep, rest = sub.partition("/")
-        if sep and rest and rest.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES:
-            return first
-        return None
-
-    return basename
-
-
-def _normalize_repository_identity(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-
-    cleaned = _clean_non_empty_string(value)
-    if not cleaned:
-        return None
-    cleaned = cleaned.strip("`'\"")
-
-    if "..." in cleaned:
-        return None
-
-    if cleaned.startswith("git@") and ":" in cleaned:
-        cleaned = cleaned.split(":", 1)[1]
-    elif "://" in cleaned:
-        try:
-            parsed = urlsplit(cleaned)
-            netloc = parsed.netloc.split("@", 1)[-1]
-            path = parsed.path.strip("/")
-            if parsed.scheme == "file" and path:
-                cleaned = path.rstrip("/").rsplit("/", 1)[-1]
-            elif netloc.lower().endswith("github.com") and path:
-                cleaned = path
-            else:
-                cleaned = urlunsplit(("", netloc, path, "", "")).strip("/")
-        except Exception:
-            pass
-    elif cleaned.startswith("/"):
-        cleaned = _normalize_repository_identity_from_absolute_path(cleaned.rstrip("/"))
-        if cleaned is None:
-            return None
-
-    if cleaned.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES:
-        return None
-
-    if cleaned.endswith(".git"):
-        cleaned = cleaned[:-4]
-    cleaned = cleaned.strip().strip("/")
-    if _is_bare_file_basename_with_reject_extension(cleaned):
-        return None
-    if _is_bare_dot_directory(cleaned):
-        return None
-    if not cleaned or not _is_valid_repository_identity(cleaned) or _is_disallowed_repository_identity(cleaned):
-        return None
-    return cleaned
-
-
 def _extract_repository_identity_from_text_with_source(
     value: str,
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -1911,11 +1057,6 @@ def _extract_repository_identity_from_text_with_source(
                 )
                 return repository, source
     return None, None
-
-
-def _extract_repository_identity_from_text(value: str) -> Optional[str]:
-    repository, _source = _extract_repository_identity_from_text_with_source(value)
-    return repository
 
 
 _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
@@ -2022,21 +1163,6 @@ def _extract_repository_identity_from_value_with_source(
     return None, None
 
 
-def _extract_repository_identity_from_value(
-    value: Any,
-    *,
-    _seen: Optional[set[int]] = None,
-    _depth: int = 0,
-) -> Optional[str]:
-    repository, _source = _extract_repository_identity_from_value_with_source(
-        value,
-        source_prefix="value",
-        _seen=_seen,
-        _depth=_depth,
-    )
-    return repository
-
-
 def _extract_repository_identity_from_metadata_sources_with_source(
     *sources: Tuple[str, Any],
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -2105,13 +1231,6 @@ def _extract_repository_identity_from_metadata_sources_with_source(
     return None, None
 
 
-def _extract_repository_identity_from_metadata_sources(
-    *sources: Tuple[str, Any],
-) -> Optional[str]:
-    repository, _source = _extract_repository_identity_from_metadata_sources_with_source(*sources)
-    return repository
-
-
 def _extract_repository_identity_from_kwargs_with_source(
     kwargs: Dict[str, Any],
     *,
@@ -2174,20 +1293,6 @@ def _extract_repository_identity_from_kwargs_with_source(
     return None, None
 
 
-def _extract_repository_identity_from_kwargs(
-    kwargs: Dict[str, Any],
-    *,
-    metadata: Optional[Dict[str, Any]] = None,
-    standard_logging_object: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    repository, _source = _extract_repository_identity_from_kwargs_with_source(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=standard_logging_object,
-    )
-    return repository
-
-
 def _extract_repository_identity_from_langfuse_trace_observation_with_source(
     trace: Dict[str, Any],
     observation: Dict[str, Any],
@@ -2200,19 +1305,6 @@ def _extract_repository_identity_from_langfuse_trace_observation_with_source(
         ("observation", observation),
         ("trace", trace),
     )
-
-
-def _extract_repository_identity_from_langfuse_trace_observation(
-    trace: Dict[str, Any],
-    observation: Dict[str, Any],
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    repository, _source = _extract_repository_identity_from_langfuse_trace_observation_with_source(
-        trace,
-        observation,
-        metadata,
-    )
-    return repository
 
 
 def _payload_contains_codex_memory_workflow_markers(value: Any) -> bool:
@@ -2254,55 +1346,10 @@ def _payload_contains_codex_memory_workflow_markers(value: Any) -> bool:
     return found_required_marker and found_context_marker
 
 
-def _is_codex_memory_workflow_request(
-    kwargs: Dict[str, Any],
-    metadata: Dict[str, Any],
-    *,
-    request_body: Optional[Dict[str, Any]] = None,
-) -> bool:
-    headers = _extract_request_headers_from_kwargs(kwargs)
-    if not _is_native_codex_passthrough_context(metadata, headers):
-        return False
-
-    payload = request_body
-    if payload is None:
-        payload = _extract_provider_cache_request_body(kwargs)
-    return _payload_contains_codex_memory_workflow_markers(payload)
-
-
 def _format_memory_repository_identity(repository: str) -> str:
     if repository.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
         return repository
     return f"{repository}{_CODEX_MEMORY_REPOSITORY_SUFFIX}"
-
-
-def _apply_codex_memory_workflow_repository(
-    kwargs: Dict[str, Any],
-    metadata: Dict[str, Any],
-    repository: Optional[str],
-    *,
-    request_body: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    if not repository:
-        return repository
-    if not _is_codex_memory_workflow_request(
-        kwargs,
-        metadata,
-        request_body=request_body,
-    ):
-        return repository
-
-    source_repository = repository
-    if source_repository.endswith(_CODEX_MEMORY_REPOSITORY_SUFFIX):
-        source_repository = source_repository[: -len(_CODEX_MEMORY_REPOSITORY_SUFFIX)]
-
-    metadata["workload_type"] = "agent_memory"
-    metadata["workload_subtype"] = "codex_memory_writer"
-    metadata["source_repository"] = source_repository
-    metadata["repository"] = source_repository
-    metadata["memory_workload_label"] = _format_memory_repository_identity(source_repository)
-    _merge_tags(metadata, ["codex-memory-workflow", "agent-memory-workload"])
-    return source_repository
 
 
 @lru_cache(maxsize=1)
@@ -2356,69 +1403,7 @@ def _resolve_runtime_wheel_versions() -> Dict[str, str]:
     return versions
 
 
-def _parse_client_identity_from_user_agent(
-    user_agent: Optional[str],
-) -> Tuple[Optional[str], Optional[str]]:
-    if not user_agent:
-        return None, None
-
-    known_patterns = (
-        (re.compile(r"\bclaude-code/(?P<version>[A-Za-z0-9.+_-]+)"), "claude-code"),
-        (re.compile(r"\bcodex-tui/(?P<version>[A-Za-z0-9.+_-]+)"), "codex-tui"),
-        (
-            re.compile(r"\bGeminiCLI(?:-tui)?/(?P<version>[A-Za-z0-9.+_-]+)"),
-            "gemini-cli",
-        ),
-        (re.compile(r"\bOpenAI/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "openai-python"),
-        (re.compile(r"\bAnthropic/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "anthropic-python"),
-    )
-    for pattern, client_name in known_patterns:
-        match = pattern.search(user_agent)
-        if match:
-            return client_name, match.group("version")
-
-    for pattern in (_USER_AGENT_PRODUCT_RE, _USER_AGENT_PAREN_PRODUCT_RE):
-        match = pattern.search(user_agent)
-        if match:
-            return match.group("name"), match.group("version")
-
-    return None, None
-
-
-def _extract_claude_code_version_from_metadata(
-    metadata: Dict[str, Any],
-) -> Tuple[Optional[str], Optional[str]]:
-    billing_header_fields = metadata.get("anthropic_billing_header_fields")
-    if not isinstance(billing_header_fields, dict):
-        billing_header_fields = {}
-    return (
-        _first_non_empty_string(metadata.get("cc_version"), billing_header_fields.get("cc_version")),
-        _first_non_empty_string(metadata.get("cc_entrypoint"), billing_header_fields.get("cc_entrypoint")),
-    )
-
-
 _SESSION_HISTORY_LOOPBACK_HOST_LABEL = "localhost"
-
-
-def _clean_session_history_client_ip_candidate(value: Any) -> Optional[str]:
-    cleaned = _clean_non_empty_string(value)
-    if not cleaned:
-        return None
-    if "," in cleaned:
-        cleaned = cleaned.split(",", 1)[0].strip()
-    return cleaned or None
-
-
-def _canonical_session_history_client_ip(value: Any) -> Optional[str]:
-    cleaned = _clean_session_history_client_ip_candidate(value)
-    if not cleaned:
-        return None
-    try:
-        return str(ipaddress.ip_address(cleaned))
-    except ValueError:
-        if cleaned.lower() == _SESSION_HISTORY_LOOPBACK_HOST_LABEL:
-            return _SESSION_HISTORY_LOOPBACK_HOST_LABEL
-        return None
 
 
 def _resolve_session_history_host_name_from_ip(
@@ -2674,11 +1659,6 @@ def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optio
     return None, explicit_tenant_id
 
 
-def _extract_agent_name(kwargs: Dict[str, Any]) -> str:
-    agent_name, _tenant_id = _extract_agent_context(kwargs)
-    return agent_name or _DEFAULT_AGENT
-
-
 def _ensure_mutable_headers(kwargs: Dict[str, Any]) -> dict:
     """Ensure proxy_server_request.headers is a mutable dict.
 
@@ -2726,82 +1706,6 @@ def _is_generic_codex_trace_user_id(value: Any) -> bool:
     )
 
 
-def _is_native_codex_passthrough_context(metadata: Dict[str, Any], headers: Dict[str, Any]) -> bool:
-    route_family = _clean_non_empty_string(metadata.get("passthrough_route_family"))
-    if route_family and route_family.lower() == "codex_responses":
-        return True
-
-    trace_name = _first_non_empty_string(
-        metadata.get("trace_name"),
-        _get_header_value(headers, "langfuse_trace_name"),
-    )
-    user_agent = _get_header_value(headers, "user-agent")
-    return bool(trace_name and trace_name.lower() == "codex" and user_agent and "codex" in user_agent.lower())
-
-
-def _is_codex_client_identity(metadata: Dict[str, Any], headers: Dict[str, Any]) -> bool:
-    user_agent = _first_non_empty_string(
-        metadata.get("client_user_agent"),
-        metadata.get("user_agent"),
-        metadata.get("http_user_agent"),
-        _get_header_value(headers, "user-agent", "User-Agent"),
-    )
-    parsed_client_name, _parsed_client_version = _parse_client_identity_from_user_agent(user_agent)
-    client_name = _first_non_empty_string(metadata.get("client_name"), parsed_client_name)
-    return bool((client_name and "codex" in client_name.lower()) or (user_agent and "codex" in user_agent.lower()))
-
-
-def _is_codex_default_agent_context(
-    kwargs: Dict[str, Any],
-    metadata: Optional[Dict[str, Any]] = None,
-) -> bool:
-    metadata = metadata or _ensure_mutable_metadata(kwargs)
-    headers = _extract_request_headers_from_kwargs(kwargs)
-    return bool(
-        _is_native_codex_passthrough_context(metadata, headers)
-        and _is_codex_client_identity(metadata, headers)
-        and not _is_codex_subagent_context(kwargs, metadata)
-    )
-
-
-def _is_codex_subagent_context(
-    kwargs: Dict[str, Any],
-    metadata: Optional[Dict[str, Any]] = None,
-) -> bool:
-    litellm_params = kwargs.get("litellm_params") or {}
-    metadata = metadata or litellm_params.get("metadata") or {}
-    standard_logging_object = kwargs.get("standard_logging_object") or {}
-    passthrough_payload = kwargs.get("passthrough_logging_payload") or {}
-    proxy_request = _coerce_mapping(litellm_params.get("proxy_server_request"))
-    proxy_body = _coerce_mapping(proxy_request.get("body"))
-    passthrough_body = _coerce_mapping(passthrough_payload.get("request_body"))
-    sources = (
-        metadata,
-        standard_logging_object.get("metadata"),
-        proxy_body,
-        proxy_body.get("metadata"),
-        proxy_body.get("litellm_metadata"),
-        passthrough_payload,
-        passthrough_body,
-        passthrough_body.get("metadata"),
-        passthrough_body.get("litellm_metadata"),
-    )
-    for raw_source in sources:
-        source = _coerce_mapping(raw_source)
-        if not source:
-            continue
-        thread_source = _clean_non_empty_string(source.get("thread_source"))
-        if thread_source and thread_source.lower() == "subagent":
-            return True
-        nested_source = _coerce_mapping(source.get("source"))
-        nested_thread_source = _clean_non_empty_string(nested_source.get("thread_source"))
-        if nested_thread_source and nested_thread_source.lower() == "subagent":
-            return True
-        if nested_source.get("subagent"):
-            return True
-    return False
-
-
 def _is_generic_grok_trace_user_id(value: Any) -> bool:
     normalized = _clean_non_empty_string(value)
     return normalized is not None and normalized.lower() in {
@@ -2819,123 +1723,6 @@ def _is_generic_grok_trace_name(value: Any) -> bool:
         return True
     normalized_lower = normalized.lower()
     return normalized_lower in {"grok", "grok-build", "xai"} or normalized_lower.startswith("grok-build.")
-
-
-def _is_native_grok_passthrough_context(metadata: Dict[str, Any], headers: Dict[str, Any]) -> bool:
-    route_family = str(metadata.get("passthrough_route_family") or "").lower()
-    if "grok" in route_family or "xai" in route_family:
-        return True
-
-    client_name = str(metadata.get("client_name") or "").lower()
-    if client_name == "grok-build":
-        return True
-
-    trace_name = _first_non_empty_string(
-        metadata.get("trace_name"),
-        _get_header_value(headers, "langfuse_trace_name"),
-    )
-    if trace_name and str(trace_name).lower().startswith("grok-build"):
-        return True
-
-    return any(
-        str(header_name).lower().startswith("x-grok-") or str(header_name).lower() == "x-xai-token-auth"
-        for header_name in headers
-    )
-
-
-def _promote_grok_repository_trace_identity(
-    kwargs: Dict[str, Any],
-    metadata: Dict[str, Any],
-    headers: Dict[str, Any],
-) -> None:
-    if not _is_native_grok_passthrough_context(metadata, headers):
-        return
-
-    repository = _extract_repository_identity_from_kwargs(
-        kwargs,
-        metadata=metadata,
-    )
-    if repository:
-        metadata["repository"] = repository
-
-    tenant_id, tenant_source = _extract_tenant_identity_from_kwargs(
-        kwargs,
-        metadata=metadata,
-    )
-    if not tenant_id:
-        _agent_name, agent_context_tenant_id = _extract_agent_context(kwargs)
-        if agent_context_tenant_id:
-            tenant_id = agent_context_tenant_id
-            tenant_source = "agent_context_text"
-    if tenant_id and not metadata.get("tenant_id"):
-        metadata["tenant_id"] = tenant_id
-    if tenant_id and tenant_source and not metadata.get("tenant_id_source"):
-        metadata["tenant_id_source"] = tenant_source
-
-    metadata_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
-    header_trace_user_id = _get_header_value(headers, "langfuse_trace_user_id")
-    desired_trace_user_id = repository or tenant_id
-    if not desired_trace_user_id:
-        return
-
-    if metadata_trace_user_id is None or _is_generic_grok_trace_user_id(metadata_trace_user_id):
-        metadata["trace_user_id"] = desired_trace_user_id
-    if header_trace_user_id is None or _is_generic_grok_trace_user_id(header_trace_user_id):
-        headers["langfuse_trace_user_id"] = desired_trace_user_id
-
-
-def _promote_codex_repository_trace_user_id(
-    kwargs: Dict[str, Any],
-    metadata: Dict[str, Any],
-    headers: Dict[str, Any],
-) -> None:
-    if not _is_native_codex_passthrough_context(metadata, headers):
-        return
-
-    if _is_numeric_identity_placeholder(metadata.get("repository")):
-        metadata.pop("repository", None)
-    if _is_numeric_identity_placeholder(metadata.get("tenant_id")):
-        metadata.pop("tenant_id", None)
-        metadata.pop("tenant_id_source", None)
-    if _is_numeric_identity_placeholder(metadata.get("trace_user_id")):
-        metadata.pop("trace_user_id", None)
-    if _is_numeric_identity_placeholder(_get_header_value(headers, "langfuse_trace_user_id")):
-        headers.pop("langfuse_trace_user_id", None)
-
-    metadata_trace_user_id = _normalize_repository_identity(metadata.get("trace_user_id"))
-    header_trace_user_id = _get_header_value(headers, "langfuse_trace_user_id")
-    repository, repository_source = _extract_repository_identity_from_kwargs_with_source(
-        kwargs,
-        metadata=metadata,
-    )
-    repository_before_memory_workflow = repository
-    repository = _apply_codex_memory_workflow_repository(
-        kwargs,
-        metadata,
-        repository,
-    )
-    if repository and repository_source:
-        if repository != repository_before_memory_workflow:
-            repository_source = f"{repository_source}.codex_memory_workflow"
-        metadata["repository_source"] = repository_source
-
-    desired_trace_user_id: Optional[str] = None
-    if metadata_trace_user_id and not _is_generic_codex_trace_user_id(metadata_trace_user_id):
-        desired_trace_user_id = metadata_trace_user_id
-    elif (
-        repository
-        and _is_repository_source_trusted_for_tenant(repository_source)
-        and (metadata_trace_user_id is None or _is_generic_codex_trace_user_id(metadata_trace_user_id))
-        and (header_trace_user_id is None or _is_generic_codex_trace_user_id(header_trace_user_id))
-    ):
-        desired_trace_user_id = repository
-
-    if not desired_trace_user_id:
-        return
-
-    metadata["trace_user_id"] = desired_trace_user_id
-    if header_trace_user_id is None or _is_generic_codex_trace_user_id(header_trace_user_id):
-        headers["langfuse_trace_user_id"] = desired_trace_user_id
 
 
 def _merge_tags(metadata: Dict[str, Any], tags_to_add: List[str]) -> None:
@@ -10439,92 +9226,6 @@ def _merge_estimated_rerank_tokens_into_usage(
     return merged_usage
 
 
-@lru_cache(maxsize=1)
-def _load_bundled_model_cost_map() -> Dict[str, Any]:
-    try:
-        from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
-
-        return GetModelCostMap.load_local_model_cost_map()
-    except Exception as exc:
-        verbose_logger.debug(
-            "AawmAgentIdentity: failed to load bundled model cost map: %s",
-            exc,
-        )
-        return {}
-
-
-@lru_cache(maxsize=1)
-def _bundled_model_cost_casefold_lookup() -> Dict[str, str]:
-    return {key.lower(): key for key in _load_bundled_model_cost_map() if isinstance(key, str)}
-
-
-def _lookup_bundled_model_cost_info(
-    *,
-    model: str,
-    custom_llm_provider: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    model_cost = _load_bundled_model_cost_map()
-    if not model_cost:
-        return None
-
-    # Prefer provider-qualified keys when an explicit provider is supplied so
-    # ambiguous bare model names cannot win over the intended provider entry.
-    candidates: List[str] = []
-    if custom_llm_provider:
-        provider_prefix = f"{custom_llm_provider}/"
-        if model.startswith(provider_prefix):
-            candidates.append(model)
-            stripped_model = model[len(provider_prefix) :]
-            if stripped_model:
-                candidates.append(stripped_model)
-        else:
-            candidates.append(f"{provider_prefix}{model}")
-            candidates.append(model)
-    else:
-        candidates.append(model)
-
-    lookup = _bundled_model_cost_casefold_lookup()
-    for candidate in candidates:
-        if not isinstance(candidate, str) or not candidate.strip():
-            continue
-        if candidate in model_cost and isinstance(model_cost[candidate], dict):
-            return model_cost[candidate]
-        matched_key = lookup.get(candidate.lower())
-        if matched_key is not None and isinstance(model_cost.get(matched_key), dict):
-            return model_cost[matched_key]
-
-    return None
-
-
-def _calculate_response_cost_from_bundled_model_cost_map(
-    *,
-    model: str,
-    custom_llm_provider: Optional[str],
-    prompt_tokens: int,
-    completion_tokens: int,
-    usage_obj: Any,
-) -> Optional[float]:
-    model_info = _lookup_bundled_model_cost_info(
-        model=model,
-        custom_llm_provider=custom_llm_provider,
-    )
-    if not model_info:
-        return None
-
-    search_units = _safe_int(_maybe_get(usage_obj, "search_units"))
-    input_cost_per_query = _safe_float(model_info.get("input_cost_per_query"))
-    if search_units and input_cost_per_query is not None and input_cost_per_query > 0:
-        return search_units * input_cost_per_query
-
-    has_token_pricing = "input_cost_per_token" in model_info or "output_cost_per_token" in model_info
-    if not has_token_pricing:
-        return None
-
-    input_cost_per_token = _safe_float(model_info.get("input_cost_per_token")) or 0.0
-    output_cost_per_token = _safe_float(model_info.get("output_cost_per_token")) or 0.0
-    return (prompt_tokens * input_cost_per_token) + (completion_tokens * output_cost_per_token)
-
-
 def _positive_int_or_none(value: Any) -> Optional[int]:
     normalized = _safe_int(value)
     if normalized is not None and normalized > 0:
@@ -15792,6 +14493,93 @@ def _enrich_trace_name_and_provider_metadata(kwargs: Dict[str, Any], result: Any
 # _handle_session_history_success_event moved to litellm.integrations.aawm_session_history.record
 # _handle_session_history_failure_event moved to litellm.integrations.aawm_session_history.record
 
+
+# --- Wave A2 identity leaf extractions: facade rebinds. These MUST precede
+# _bind_session_history_record_apis() so record-API free names and
+# monkeypatch targets keep resolving through this namespace. ---
+from . import agent_context as _aawm_agent_context
+from . import coerce as _aawm_coerce
+from . import cost_map as _aawm_cost_map
+from . import identity_repository as _aawm_identity_repository
+from . import identity_runtime as _aawm_identity_runtime
+from . import identity_tenant_agent as _aawm_identity_tenant_agent
+from .constants import (  # noqa: F401 - re-exported into host globals for moved helpers
+    _AAWM_AGENT_ID_HEX_RE,
+    _AAWM_AGENT_ID_PREFIXED_RE,
+    _AAWM_AGENT_ID_UUID_RE,
+    _AAWM_ASSOCIATED_VERSION_ENV_VARS,
+    _AAWM_LITELLM_ENVIRONMENT_ENV_VARS,
+    _AAWM_LITELLM_VERSION_ENV_VARS,
+    _AAWM_REPOSITORY_METADATA_KEYS,
+    _AAWM_SESSION_HISTORY_METADATA_KEYS,
+    _AAWM_TENANT_ID_METADATA_KEYS,
+)
+
+# literal facade assignments (AST-visible; installers finalize identity)
+_clean_secret_string = _aawm_coerce._clean_secret_string
+_get_first_secret_value = _aawm_coerce._get_first_secret_value
+_normalize_aawm_sslmode = _aawm_coerce._normalize_aawm_sslmode
+_build_aawm_dsn = _aawm_coerce._build_aawm_dsn
+_append_aawm_dsn_query_params = _aawm_coerce._append_aawm_dsn_query_params
+_clean_non_empty_string = _aawm_coerce._clean_non_empty_string
+_first_non_empty_string = _aawm_coerce._first_non_empty_string
+_coerce_string_dict = _aawm_coerce._coerce_string_dict
+_load_bundled_model_cost_map = _aawm_cost_map._load_bundled_model_cost_map
+_bundled_model_cost_casefold_lookup = _aawm_cost_map._bundled_model_cost_casefold_lookup
+_lookup_bundled_model_cost_info = _aawm_cost_map._lookup_bundled_model_cost_info
+_calculate_response_cost_from_bundled_model_cost_map = (
+    _aawm_cost_map._calculate_response_cost_from_bundled_model_cost_map
+)
+_extract_claude_trace_agent_name = _aawm_identity_tenant_agent._extract_claude_trace_agent_name
+_extract_claude_trace_user_identity_from_metadata_sources = (
+    _aawm_identity_tenant_agent._extract_claude_trace_user_identity_from_metadata_sources
+)
+_extract_tenant_identity_from_kwargs = _aawm_identity_tenant_agent._extract_tenant_identity_from_kwargs
+_extract_tenant_identity_from_langfuse_trace_observation = (
+    _aawm_identity_tenant_agent._extract_tenant_identity_from_langfuse_trace_observation
+)
+_is_agent_id_like = _aawm_identity_tenant_agent._is_agent_id_like
+_normalize_agent_id_identity = _aawm_identity_tenant_agent._normalize_agent_id_identity
+_extract_agent_id_from_metadata_sources = _aawm_identity_tenant_agent._extract_agent_id_from_metadata_sources
+_extract_agent_id_from_kwargs = _aawm_identity_tenant_agent._extract_agent_id_from_kwargs
+_extract_agent_id_from_langfuse_trace_observation = (
+    _aawm_identity_tenant_agent._extract_agent_id_from_langfuse_trace_observation
+)
+_normalize_repository_identity = _aawm_identity_repository._normalize_repository_identity
+_normalize_repository_identity_from_absolute_path = (
+    _aawm_identity_repository._normalize_repository_identity_from_absolute_path
+)
+_extract_repository_identity_from_text = _aawm_identity_repository._extract_repository_identity_from_text
+_extract_repository_identity_from_value = _aawm_identity_repository._extract_repository_identity_from_value
+_extract_repository_identity_from_metadata_sources = (
+    _aawm_identity_repository._extract_repository_identity_from_metadata_sources
+)
+_extract_repository_identity_from_kwargs = _aawm_identity_repository._extract_repository_identity_from_kwargs
+_extract_repository_identity_from_langfuse_trace_observation = (
+    _aawm_identity_repository._extract_repository_identity_from_langfuse_trace_observation
+)
+_is_codex_memory_workflow_request = _aawm_identity_repository._is_codex_memory_workflow_request
+_apply_codex_memory_workflow_repository = _aawm_identity_repository._apply_codex_memory_workflow_repository
+_parse_client_identity_from_user_agent = _aawm_identity_runtime._parse_client_identity_from_user_agent
+_extract_claude_code_version_from_metadata = _aawm_identity_runtime._extract_claude_code_version_from_metadata
+_clean_session_history_client_ip_candidate = _aawm_identity_runtime._clean_session_history_client_ip_candidate
+_canonical_session_history_client_ip = _aawm_identity_runtime._canonical_session_history_client_ip
+_extract_agent_name = _aawm_agent_context._extract_agent_name
+_is_native_codex_passthrough_context = _aawm_agent_context._is_native_codex_passthrough_context
+_is_codex_client_identity = _aawm_agent_context._is_codex_client_identity
+_is_codex_default_agent_context = _aawm_agent_context._is_codex_default_agent_context
+_is_codex_subagent_context = _aawm_agent_context._is_codex_subagent_context
+_is_native_grok_passthrough_context = _aawm_agent_context._is_native_grok_passthrough_context
+_promote_grok_repository_trace_identity = _aawm_agent_context._promote_grok_repository_trace_identity
+_promote_codex_repository_trace_user_id = _aawm_agent_context._promote_codex_repository_trace_user_id
+
+# rebind installers: helper __globals__ -> this namespace
+_aawm_coerce.install(globals())
+_aawm_cost_map.install(globals())
+_aawm_identity_tenant_agent.install(globals())
+_aawm_identity_repository.install(globals())
+_aawm_identity_runtime.install(globals())
+_aawm_agent_context.install(globals())
 
 _bind_session_history_record_apis()
 
