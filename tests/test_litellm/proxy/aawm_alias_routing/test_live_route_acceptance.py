@@ -1,9 +1,15 @@
-"""Live-route acceptance harness (Wave 1 of the god-module decomposition +
+"""Live-route acceptance harness (Waves 1-2 of the god-module decomposition +
 R3 remediation plan, ``.analysis/plan-godmodule-decomposition-r3-remediation-2026-07-23.md``).
 
 This file grows across Waves 1-3 into the full 5-scenario harness. Wave 1
 covers scenario (e) -- round-robin rotation semantics -- plus the supporting
-per-request selection-context / commit-tracking behaviors.
+per-request selection-context / commit-tracking behaviors. Wave 2 adds
+scenarios (b) and (c) plus the (e-scope) R3-3 model-scope test: the R3-1
+exact-key in-lock cooldown publish (single-flight under contention, Kimi
+managed-account / no-cooldown scope targets, Grok account-quota lane
+publish), the R3-3 bounded model-scope classification, and regression pins
+for the round-2 evidence-gate live-path behaviors re-driven through the
+WRAPPER.
 
 Every scenario drives the REAL wrapper ``_handle_codex_auto_agent_alias_route``
 (the wrapper at ``llm_passthrough_endpoints.py:25381``, so the counting call
@@ -22,11 +28,20 @@ cursor multiple times. With two tied candidates this means the cursor advances
 an even number of times per request and rotation never reaches live traffic
 (one candidate is selected on every request). These tests pin the correct
 per-request-single-commit behavior and MUST fail against pre-fix develop.
+
+Pre-fix (before the Wave-2 R3-1/R3-3 changes land), the candidate-loop's
+cooldown apply happens OUTSIDE the probe lock -- a suspension point between
+the failed probe and the applied cooldown lets a concurrent sibling also
+enter upstream before the cooldown/evidence becomes visible -- and structured
+429/rate-limit classifies ``scope="provider"`` instead of the DECIDED
+``scope="model"``. See individual test docstrings for the concrete pre-fix
+values.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import asyncio
+from typing import Any, Callable, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -35,6 +50,9 @@ from fastapi import Request, Response
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    policy,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -488,3 +506,646 @@ async def test_retry_failover_commits_each_actual_rotated_selection() -> None:
         )
     finally:
         restore()
+
+
+# ---------------------------------------------------------------------------
+# Wave 2 helpers: structured-failure exceptions + a local probe counter
+# ---------------------------------------------------------------------------
+
+
+class _StructuredUpstream429(Exception):
+    """Upstream failure that surfaces a structured HTTP 429 + Retry-After."""
+
+    def __init__(self, retry_after_seconds: int = 12) -> None:
+        super().__init__("rate limited by upstream")
+        self.status_code = 429
+        self.upstream_headers = {"Retry-After": str(retry_after_seconds)}
+
+
+def _marker_only_capacity_error() -> RuntimeError:
+    """A retryable capacity failure with NO structured status code (marker tier)."""
+    return RuntimeError("Selected model is at capacity. Please try a different model.")
+
+
+class _ProbeCounter:
+    """Tracks total and peak concurrent probe entries for one upstream candidate.
+
+    Local copy of the pattern in
+    ``test_rr054_candidate_singleflight.py:_ProbeCounter`` -- kept file-local
+    so this harness has no cross-test-module coupling.
+    """
+
+    def __init__(self, *, hold_seconds: float = 0.15) -> None:
+        self.total = 0
+        self.current = 0
+        self.max_current = 0
+        self._guard = asyncio.Lock()
+        self.hold_seconds = hold_seconds
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def run(self, *, outcome: str = "fail", success_response: Optional[Response] = None) -> Response:
+        async with self._guard:
+            self.total += 1
+            self.current += 1
+            self.max_current = max(self.max_current, self.current)
+            self.entered.set()
+        try:
+            if not self.release.is_set():
+                try:
+                    await asyncio.wait_for(self.release.wait(), timeout=self.hold_seconds)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(0)
+            if outcome == "success":
+                assert success_response is not None
+                return success_response
+            raise _StructuredCapacityError()
+        finally:
+            async with self._guard:
+                self.current -= 1
+
+
+def _install_openrouter_and_opencode_performers(
+    *,
+    openrouter_handler: Callable[..., Any],
+) -> Callable[[], None]:
+    """Patch the OpenRouter performer + durable writer; return a restorer."""
+    original_perform = lpe._perform_codex_auto_agent_openrouter_completion_request
+    original_write = lpe._write_aawm_alias_routing_durable_payload
+    lpe._perform_codex_auto_agent_openrouter_completion_request = openrouter_handler  # type: ignore[assignment]
+    lpe._write_aawm_alias_routing_durable_payload = AsyncMock(return_value=True)  # type: ignore[assignment]
+
+    def _restore() -> None:
+        lpe._perform_codex_auto_agent_openrouter_completion_request = original_perform  # type: ignore[assignment]
+        lpe._write_aawm_alias_routing_durable_payload = original_write  # type: ignore[assignment]
+
+    return _restore
+
+
+async def _drive_low_alias_wrapper(*, session_id: str) -> Any:
+    """Drive the real Codex wrapper for the ``aawm-low`` alias (2 OpenRouter candidates)."""
+    request = _minimal_request(session_id)
+    body: dict[str, Any] = {
+        "model": policy.CODEX_AAWM_LOW_ALIAS,
+        "input": [{"role": "user", "content": "hello"}],
+        "stream": False,
+        "litellm_metadata": {"session_id": session_id},
+    }
+    return await lpe._handle_codex_auto_agent_alias_route(
+        endpoint="/v1/responses",
+        request=request,
+        fastapi_response=MagicMock(spec=Response),
+        user_api_key_dict=MagicMock(),
+        prepared_request_body=body,
+        target_url="https://chatgpt.com/backend-api/codex/responses",
+        api_key=None,
+        forward_headers=True,
+    )
+
+
+def _low_alias_openrouter_lane_key_for_model(model: str) -> str:
+    candidate = {
+        "provider": policy.CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        "model": model,
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    return lpe._codex_auto_agent_candidate_key(candidate, lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY)
+
+
+# ---------------------------------------------------------------------------
+# (R3-1, scenario c1) concurrent cold probes single-flight under contention
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_c1_concurrent_cold_probes_single_flight_under_contention() -> None:
+    """Four concurrent wrapper requests for one cold candidate must single-flight.
+
+    The memory cooldown WRITE (``_set_codex_auto_agent_cooldown``, which
+    acquires ``_codex_auto_agent_lock``) is monkeypatched to inject a real
+    ``await`` suspension AFTER the underlying probe fails but BEFORE the
+    cooldown becomes visible in ``_codex_auto_agent_cooldown_until_monotonic_by_key``.
+    Pre-fix, the loop releases ``probe_lock`` in its inner ``finally`` clause
+    -- BEFORE ``apply_cooldown_fn`` (and therefore this delayed write) even
+    runs -- so a follower queued on the SAME probe lock acquires it, reads
+    the still-zero cooldown state, and re-probes: ``probe_total == 2``.
+    Post-fix (R3-1: widen the locked region so the cooldown publish happens
+    INSIDE the probe lock), a follower cannot acquire the probe lock until
+    the cooldown write has completed, so it never re-probes:
+    ``probe_total == 1``.
+    """
+    primary_model = "openrouter/cohere/north-mini-code:free"
+    secondary_model = "openrouter/owl-alpha"
+    probe = _ProbeCounter(hold_seconds=0.05)
+
+    original_set_cooldown = lpe._set_codex_auto_agent_cooldown
+
+    async def _delayed_set_cooldown(cooldown_key: str, cooldown_seconds: float) -> None:
+        # Suspend AFTER the probe has already failed (and, pre-fix, after the
+        # probe lock has already been released) but BEFORE the cooldown
+        # becomes visible -- the exact window a follower can race into.
+        await asyncio.sleep(0.1)
+        await original_set_cooldown(cooldown_key, cooldown_seconds)
+
+    async def _openrouter_performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        if adapter_model == primary_model:
+            return await probe.run(outcome="fail")
+        return _SUCCESS_RESPONSE
+
+    restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
+    lpe._set_codex_auto_agent_cooldown = _delayed_set_cooldown  # type: ignore[assignment]
+    try:
+        results = await asyncio.gather(
+            _drive_low_alias_wrapper(session_id="c1-session-1"),
+            _drive_low_alias_wrapper(session_id="c1-session-2"),
+            _drive_low_alias_wrapper(session_id="c1-session-3"),
+            _drive_low_alias_wrapper(session_id="c1-session-4"),
+            return_exceptions=True,
+        )
+    finally:
+        lpe._set_codex_auto_agent_cooldown = original_set_cooldown  # type: ignore[assignment]
+        restore()
+
+    assert probe.max_current == 1, (
+        "concurrent cold probes for the same candidate entered upstream "
+        f"together (max_current={probe.max_current}, total={probe.total})"
+    )
+    assert probe.total == 1, (
+        "R3-1 gap: more than one upstream probe ran for the same cold "
+        f"candidate before the failure/cooldown became visible "
+        f"(total={probe.total}, max_current={probe.max_current}). Expected "
+        "the cooldown publish to happen inside the probe lock so followers "
+        "never re-probe."
+    )
+
+    successes = [r for r in results if isinstance(r, Response)]
+    assert len(successes) >= 1, (
+        "expected at least one request to recover onto the alternate "
+        f"candidate ({secondary_model!r}) once the cold probe's failure was "
+        f"visible; results={results!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (R3-1 negative control, scenario c2) non-cooling failure does not false-singleflight
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_c2_non_cooling_failure_does_not_false_singleflight() -> None:
+    """A read-lane single marker-only failure (gate says don't cool yet) must
+    NOT trigger single-flight suppression for concurrent waiters -- each
+    waiter's own attempt is independently serialized through the probe lock
+    (total == N, max_concurrent == 1), and the legacy (non-read) success path
+    is unaffected by the R3-1 restructure."""
+    raw_yaml = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: openrouter/c2-marker-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 900
+"""
+    snapshot = compiler.compile_yaml(raw_yaml)
+    lpe.set_active_routing_snapshot(snapshot)
+
+    probe = _ProbeCounter(hold_seconds=0.05)
+
+    async def _openrouter_performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        return await probe.run(outcome="fail")
+
+    async def _drive_read_once(session_id: str) -> Any:
+        request = _minimal_request(session_id)
+        body: dict[str, Any] = {
+            "model": "read",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": False,
+            "litellm_metadata": {"session_id": session_id},
+        }
+        return await lpe._handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
+    try:
+        results = await asyncio.gather(
+            _drive_read_once("c2-session-1"),
+            _drive_read_once("c2-session-2"),
+            _drive_read_once("c2-session-3"),
+            return_exceptions=True,
+        )
+    finally:
+        restore()
+
+    # A single-candidate lane with only one marker-tier failure per request
+    # never meets the N-of-M evidence threshold, so the gate does not cool --
+    # every waiter must independently probe (no false single-flight
+    # suppression across unrelated, non-cooling failures).
+    assert probe.total == 3, f"expected every waiter to probe independently: total={probe.total}"
+    assert probe.max_current == 1, (
+        "waiters must still be serialized through the per-candidate probe "
+        f"lock even though no cooldown is published: max_current={probe.max_current}"
+    )
+    for result in results:
+        assert isinstance(result, Exception) or hasattr(result, "status_code")
+
+
+# ---------------------------------------------------------------------------
+# (R3-1 scope targets) Kimi managed-account / no-cooldown publish
+# ---------------------------------------------------------------------------
+
+
+async def test_kimi_managed_account_publishes_only_managed_account_key() -> None:
+    """A Kimi managed-account failure publishes ONLY the managed-account
+    sentinel key under the probe lock -- not the selected candidate's own
+    cooldown key."""
+    candidate = {
+        "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+        "model": "kimi_code/k3-high",
+        "route_family": "codex_kimi_chat_completions_adapter",
+        "last_resort": False,
+    }
+    candidate_key = "kimi_code:kimi_code/k3-high:kimi_code_managed_account"
+    metadata = {
+        "kind": "quota",
+        "scope": "managed_account",
+        "upstream_id": "k3",
+        "metadata_gate": "none",
+        "status_code": 429,
+        "trace_id": "wave2-c1-managed",
+        "reset_reason": "quota_exhausted",
+    }
+
+    scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
+        request=_minimal_request("kimi-managed-session"),
+        candidate=candidate,
+        lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
+        selected_cooldown_key=candidate_key,
+        cooldown_seconds=30.0,
+        error_class="kimi_code_managed_account",
+        kimi_failure_metadata=metadata,
+    )
+
+    assert scope == "managed_account"
+    managed_key = lpe._get_kimi_code_managed_account_cooldown_key()
+    assert (
+        await lpe._get_codex_auto_agent_active_cooldown_seconds(managed_key) > 0
+    ), "managed-account sentinel key must be cooled"
+    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(candidate_key) == 0, (
+        "the selected candidate's own key must NOT be cooled by a " "managed-account-scoped Kimi failure"
+    )
+
+
+async def test_kimi_no_cooldown_publishes_no_shared_key() -> None:
+    """A Kimi no-cooldown / request-local failure must publish an EMPTY
+    shared-memory key set -- neither the candidate key nor the managed-account
+    sentinel is cooled."""
+    candidate = {
+        "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+        "model": "kimi_code/kimi-for-coding",
+        "route_family": "codex_kimi_chat_completions_adapter",
+        "last_resort": False,
+    }
+    candidate_key = "kimi_code:kimi_code/kimi-for-coding:kimi_code_managed_account"
+    metadata = {
+        "kind": "malformed",
+        "scope": "telemetry",
+        "upstream_id": "kimi-for-coding",
+        "metadata_gate": "none",
+        "status_code": 422,
+        "trace_id": "wave2-c1-no-cooldown",
+        "reset_reason": "malformed_provider_response",
+    }
+
+    scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
+        request=_minimal_request("kimi-no-cooldown-session"),
+        candidate=candidate,
+        lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
+        selected_cooldown_key=candidate_key,
+        cooldown_seconds=3 * 60 * 60.0,
+        error_class="kimi_code_no_cooldown",
+        kimi_failure_metadata=metadata,
+    )
+
+    assert scope == "none"
+    managed_key = lpe._get_kimi_code_managed_account_cooldown_key()
+    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(candidate_key) == 0
+    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(managed_key) == 0
+
+
+# ---------------------------------------------------------------------------
+# (R3-1 scope targets) Grok account-quota candidate + lane publish
+# ---------------------------------------------------------------------------
+
+
+async def test_grok_account_quota_publishes_candidate_and_lane_keys_before_release() -> None:
+    """A Grok account-quota exhaustion failure publishes BOTH the selected
+    candidate key and the ``provider:__account_quota__:lane`` key -- a
+    concurrent sibling candidate on the same lane must observe the lane key
+    and skip probing the exhausted account."""
+    grok_candidate = {
+        "provider": policy.CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "grok-composer-2.5-fast",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+    }
+    lane_key = lpe._CODEX_AUTO_AGENT_XAI_LANE_KEY
+    selected_key = lpe._codex_auto_agent_candidate_key(grok_candidate, lane_key)
+    lane_cooldown_key = f"{grok_candidate['provider']}:__account_quota__:{lane_key}"
+
+    scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
+        request=_minimal_request("grok-quota-session"),
+        candidate=grok_candidate,
+        lane_key=lane_key,
+        selected_cooldown_key=selected_key,
+        cooldown_seconds=3 * 60 * 60.0,
+        error_class="capacity_exhausted",
+        grok_account_quota_exhausted=True,
+    )
+
+    assert scope == "candidate"
+    assert (
+        await lpe._get_codex_auto_agent_active_cooldown_seconds(selected_key) > 0
+    ), "selected candidate key must be cooled"
+    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(lane_cooldown_key) > 0, (
+        "account-quota lane key must ALSO be cooled so a sibling candidate "
+        "on the same lane observes the account-level exhaustion"
+    )
+
+    # A concurrent sibling xAI candidate on the SAME lane (native Grok) must
+    # see the lane key's cooldown when it builds its own candidate state.
+    sibling_candidate_template = {
+        "provider": policy.CODEX_AUTO_AGENT_XAI_PROVIDER,
+        "model": "xai/grok-4.5",
+        "route_family": "codex_grok_native_responses_adapter",
+        "last_resort": False,
+    }
+    sibling_state = await lpe._build_codex_auto_agent_candidate_state(
+        _minimal_request("grok-quota-sibling-session"),
+        candidate_template=sibling_candidate_template,
+    )
+    assert sibling_state["cooldown_seconds"] > 0, (
+        "a sibling candidate resolving on the exhausted account's lane must "
+        "observe the account-quota lane cooldown, not probe the exhausted "
+        f"account again: sibling_state={sibling_state!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (R3-3, scenario e3) structured 429 cools only the failing model
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_e3_structured_429_cools_only_the_failing_model() -> None:
+    """Two same-provider OpenRouter candidates + one opencode_zen candidate.
+
+    A structured 429 (Retry-After: 12) on the leader must cool ONLY the
+    failing candidate's ``provider:model:lane`` key -- the sibling OpenRouter
+    candidate's key stays uncooled, the next attempt selects the sibling, and
+    the applied attempt record reports ``cooldown_scope == "model"``.
+
+    Pre-fix: ``cooldown_scope == "provider"`` in telemetry (the classifier
+    still emits ``scope="provider"`` for structured 429) while only one key
+    is actually cooled -- assertion (4) below is the named pre-fix failure.
+    """
+    raw_yaml = """
+defaults: {}
+aliases:
+  - name: read
+    distribution_strategy: round_robin
+    candidates:
+      - provider: openrouter
+        model: e3-leader
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: e3-sibling
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: opencode_zen
+        model: e3-opencode
+        route_family: codex_opencode_zen_adapter
+        priority: 10
+"""
+    snapshot = compiler.compile_yaml(raw_yaml)
+    lpe.set_active_routing_snapshot(snapshot)
+
+    leaders: list[str] = []
+    request_bodies: list[dict[str, Any]] = []
+
+    async def _openrouter_performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        leaders.append(adapter_model)
+        request_bodies.append(request_body)
+        if adapter_model == "e3-leader":
+            raise _StructuredUpstream429(retry_after_seconds=12)
+        return _SUCCESS_RESPONSE
+
+    async def _drive_read_once(session_id: str) -> Any:
+        request = _minimal_request(session_id)
+        body: dict[str, Any] = {
+            "model": "read",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": False,
+            "litellm_metadata": {"session_id": session_id},
+        }
+        return await lpe._handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
+    try:
+        result = await _drive_read_once("e3-session-1")
+    finally:
+        restore()
+
+    assert isinstance(result, Response)
+    assert leaders[0] == "e3-leader"
+    assert "e3-sibling" in leaders, f"expected the sibling candidate to be attempted: leaders={leaders!r}"
+
+    leader_key = _low_alias_openrouter_lane_key_for_model("e3-leader")
+    sibling_key = _low_alias_openrouter_lane_key_for_model("e3-sibling")
+
+    leader_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
+    sibling_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(sibling_key)
+
+    assert leader_remaining == pytest.approx(
+        12.0, abs=2.0
+    ), f"expected the failing candidate's key to cool ~12s, got {leader_remaining!r}"
+    assert sibling_remaining == 0.0, (
+        "the sibling OpenRouter candidate's key must NOT be cooled by the "
+        f"leader's structured 429: sibling_remaining={sibling_remaining!r}"
+    )
+
+    leader_request_body = next(
+        (body for model, body in zip(leaders, request_bodies) if model == "e3-sibling"),
+        None,
+    )
+    assert leader_request_body is not None, f"expected a request body for the retried e3-sibling attempt: {leaders!r}"
+    litellm_metadata = leader_request_body.get("litellm_metadata", {})
+    attempts = litellm_metadata.get("codex_auto_agent_attempts", [])
+    leader_attempt = next((a for a in attempts if a.get("model") == "e3-leader"), None)
+    assert leader_attempt is not None, f"expected an attempt record for e3-leader: attempts={attempts!r}"
+    assert leader_attempt.get("cooldown_scope") == "model", (
+        "R3-3 (DECIDED): a structured 429 must apply/report model scope, not "
+        f"provider scope; got {leader_attempt.get('cooldown_scope')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (scenario b, port of round-2 live-path tests through the WRAPPER)
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_b1_structured_429_cools_with_gate_duration() -> None:
+    """A structured 429 on the LIVE read-lane path (through the WRAPPER) must
+    cool the live cooldown key with the gate's retry-after-derived duration.
+
+    Regression pin: passes both pre-fix AND post-fix.
+    """
+    raw_yaml = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: openrouter/b1-live-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 500
+"""
+    snapshot = compiler.compile_yaml(raw_yaml)
+    lpe.set_active_routing_snapshot(snapshot)
+
+    async def _openrouter_performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        raise _StructuredUpstream429(retry_after_seconds=12)
+
+    async def _drive_read_once(session_id: str) -> Any:
+        request = _minimal_request(session_id)
+        body: dict[str, Any] = {
+            "model": "read",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": False,
+            "litellm_metadata": {"session_id": session_id},
+        }
+        return await lpe._handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
+    try:
+        with pytest.raises(Exception):
+            await _drive_read_once("b1-live-session")
+    finally:
+        restore()
+
+    live_key = _low_alias_openrouter_lane_key_for_model("openrouter/b1-live-model")
+    applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
+    assert applied_remaining == pytest.approx(12.0, abs=1.5)
+
+
+async def test_scenario_b2_single_marker_failure_does_not_cool() -> None:
+    """A single marker-only (non-structured) failure on the LIVE read-lane
+    path must NOT cool the candidate -- the N-of-M gate needs multiple marker
+    events within its window before a key advances toward cooling.
+
+    Regression pin: passes both pre-fix AND post-fix.
+    """
+    raw_yaml = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: openrouter/b2-live-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 500
+"""
+    snapshot = compiler.compile_yaml(raw_yaml)
+    lpe.set_active_routing_snapshot(snapshot)
+
+    async def _openrouter_performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        raise _marker_only_capacity_error()
+
+    async def _drive_read_once(session_id: str) -> Any:
+        request = _minimal_request(session_id)
+        body: dict[str, Any] = {
+            "model": "read",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": False,
+            "litellm_metadata": {"session_id": session_id},
+        }
+        return await lpe._handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
+    try:
+        with pytest.raises(Exception):
+            await _drive_read_once("b2-live-session")
+    finally:
+        restore()
+
+    live_key = _low_alias_openrouter_lane_key_for_model("openrouter/b2-live-model")
+    applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
+    assert applied_remaining == 0.0
+    assert lpe._read_pilot_cooldown_gate.is_cooled(cooldown_key=live_key) is False

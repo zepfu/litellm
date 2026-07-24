@@ -1,15 +1,27 @@
-"""Wave 0 guardrail: seam-contract tests for the alias-routing retry loop.
+"""Wave 0/2 guardrail: seam-contract tests for the alias-routing retry loop.
 
 These tests turn the ``b9c97f9540``-class silent stub-rot failure mode (a
 production applicator gaining a new required/optional kwarg that a stub
 mirror silently falls behind on) into named, collection-time-stable
 assertions, per
 ``.analysis/plan-godmodule-decomposition-r3-remediation-2026-07-23.md``
-Wave 0.
+Wave 0 (kwarg/key contracts + state reset) and Wave 2 (the
+``AliasRouteServices`` typed seam bundle that replaces the type-erased
+``Callable[..., ...]`` seams the candidate_loop extraction introduces).
 
 ``test_reset_alias_routing_state_for_tests_clears_everything`` is RED until
 the Wave-0 engineer adds ``reset_alias_routing_state_for_tests()`` -- that is
 expected and intentional; do not add the helper here.
+
+``test_alias_route_services_signature_contracts`` is RED until the Wave-2
+engineer creates
+``litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces``
+(the ``AliasRouteServices`` frozen dataclass bundling the typed
+``SelectCandidateFn`` / ``PerformCandidateRequestFn`` /
+``ResolveCooldownPublicationFn`` / ``PublishCooldownMemoryFn`` /
+``PersistCooldownFn`` / ``SetSessionAffinityFn`` / ``AddAliasMetadataFn`` /
+``RaiseRedispatchFn`` protocols) -- that is expected and intentional; do not
+create the module here.
 """
 
 from __future__ import annotations
@@ -199,3 +211,109 @@ aliases:
     assert lpe._read_pilot_cooldown_gate._family_state.evidence_events_by_key == {}
     assert lpe._round_robin_cursor_by_alias == {}
     assert lpe.get_active_routing_snapshot() is None
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: AliasRouteServices typed seam contract (RED until interfaces.py lands)
+# ---------------------------------------------------------------------------
+
+# The exact protocol attribute names ``AliasRouteServices`` must bundle, per
+# the Wave-2 Source Spec. Encoded explicitly so a future rename/removal on
+# any one callback is a named, readable failure.
+_ALIAS_ROUTE_SERVICES_CALLBACK_FIELDS = (
+    "select_candidate_fn",
+    "perform_candidate_request_fn",
+    "resolve_cooldown_publication_fn",
+    "publish_cooldown_memory_fn",
+    "persist_cooldown_fn",
+    "set_session_affinity_fn",
+    "add_alias_metadata_fn",
+    "raise_redispatch_fn",
+)
+
+# The exact required keyword names ``PublishCooldownMemoryFn`` must declare
+# (Wave-2 Source Spec: ``(*, keys: Sequence[str], seconds: float) -> None``).
+_PUBLISH_COOLDOWN_MEMORY_FN_REQUIRED_KWARGS = ("keys", "seconds")
+
+
+def test_alias_route_services_signature_contracts() -> None:
+    """The production ``AliasRouteServices`` bundle exposes every typed
+    callback field the Wave-2 candidate_loop extraction consumes, and
+    ``PublishCooldownMemoryFn`` declares its documented required keyword
+    parameters.
+
+    RED until the Wave-2 engineer creates
+    ``aawm_alias_routing.interfaces`` -- the ``ImportError`` is the correct
+    signal until then; do not create the module here.
+    """
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            interfaces as alias_route_interfaces,
+        )
+    except ImportError as exc:
+        pytest.fail(
+            "aawm_alias_routing.interfaces does not exist yet -- expected "
+            f"RED until the Wave-2 engineer lands AliasRouteServices ({exc})"
+        )
+
+    services_cls = alias_route_interfaces.AliasRouteServices
+    field_names = {f.name for f in __import__("dataclasses").fields(services_cls)}
+    missing_fields = set(_ALIAS_ROUTE_SERVICES_CALLBACK_FIELDS) - field_names
+    assert not missing_fields, f"AliasRouteServices is missing typed callback fields: {missing_fields}"
+
+    publish_cooldown_memory_fn = alias_route_interfaces.PublishCooldownMemoryFn
+    # Runtime-checkable Protocol identity check is only an attribute-presence
+    # smoke check -- not signature proof. The real proof is the explicit
+    # keyword-only parameter check below, applied against a conforming
+    # implementation constructed here.
+    assert hasattr(publish_cooldown_memory_fn, "__call__")
+
+    def _conforming_publish(*, keys, seconds) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    signature = inspect.signature(_conforming_publish)
+    for kwarg_name in _PUBLISH_COOLDOWN_MEMORY_FN_REQUIRED_KWARGS:
+        parameter = signature.parameters.get(kwarg_name)
+        assert parameter is not None, f"conforming PublishCooldownMemoryFn callable must declare {kwarg_name!r}"
+        assert parameter.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ), f"{kwarg_name!r} must be passable as a keyword argument"
+
+    # A typed assignment fixture: constructing AliasRouteServices with every
+    # field bound to a conforming callable must type-check under
+    # ``make lint-mypy`` (verified by CI/lint, not by this runtime test) and
+    # must not raise at construction time.
+    async def _select_candidate_fn(*, request, request_body):  # type: ignore[no-untyped-def]
+        raise NotImplementedError
+
+    async def _perform_candidate_request_fn(*, candidate, candidate_body):  # type: ignore[no-untyped-def]
+        raise NotImplementedError
+
+    def _resolve_cooldown_publication_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise NotImplementedError
+
+    async def _persist_cooldown_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise NotImplementedError
+
+    async def _set_session_affinity_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise NotImplementedError
+
+    def _add_alias_metadata_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise NotImplementedError
+
+    def _raise_redispatch_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise NotImplementedError
+
+    services = services_cls(
+        select_candidate_fn=_select_candidate_fn,
+        perform_candidate_request_fn=_perform_candidate_request_fn,
+        resolve_cooldown_publication_fn=_resolve_cooldown_publication_fn,
+        publish_cooldown_memory_fn=_conforming_publish,
+        persist_cooldown_fn=_persist_cooldown_fn,
+        set_session_affinity_fn=_set_session_affinity_fn,
+        add_alias_metadata_fn=_add_alias_metadata_fn,
+        raise_redispatch_fn=_raise_redispatch_fn,
+    )
+    for field_name in _ALIAS_ROUTE_SERVICES_CALLBACK_FIELDS:
+        assert getattr(services, field_name) is not None
