@@ -42,15 +42,11 @@ async def test_rr054_issue2_durable_write_keeps_longer_existing_expiry() -> None
     dual.redis_cache = MagicMock()
     dual.redis_cache.async_set_cache = AsyncMock(return_value=None)
     existing_expires = time.time() + 3600.0
-    dual.async_get_cache = AsyncMock(
-        return_value={"cooldown_key": "k", "expires_at_epoch": existing_expires}
-    )
+    dual.async_get_cache = AsyncMock(return_value={"cooldown_key": "k", "expires_at_epoch": existing_expires})
 
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable as d
 
-    with patch.object(
-        d, "get_aawm_alias_routing_dual_cache", return_value=dual
-    ), patch.object(
+    with patch.object(d, "get_aawm_alias_routing_dual_cache", return_value=dual), patch.object(
         d, "build_aawm_alias_routing_durable_cache_key", return_value="cache-key"
     ):
         ok = await lpe._write_aawm_alias_routing_durable_payload(
@@ -74,15 +70,11 @@ async def test_rr054_issue2_durable_write_extends_when_new_expiry_later() -> Non
     dual.redis_cache = MagicMock()
     dual.redis_cache.async_set_cache = AsyncMock(return_value=None)
     existing_expires = time.time() + 10.0
-    dual.async_get_cache = AsyncMock(
-        return_value={"cooldown_key": "k", "expires_at_epoch": existing_expires}
-    )
+    dual.async_get_cache = AsyncMock(return_value={"cooldown_key": "k", "expires_at_epoch": existing_expires})
 
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable as d
 
-    with patch.object(
-        d, "get_aawm_alias_routing_dual_cache", return_value=dual
-    ), patch.object(
+    with patch.object(d, "get_aawm_alias_routing_dual_cache", return_value=dual), patch.object(
         d, "build_aawm_alias_routing_durable_cache_key", return_value="cache-key"
     ):
         before = time.time()
@@ -147,32 +139,16 @@ def test_rr054_issue5_schema_sanitize_cycle_guard() -> None:
 def test_rr054_issue6_tool_call_cache_is_scope_isolated() -> None:
     lpe._codex_google_code_assist_tool_call_name_cache.clear()
     lpe._codex_google_code_assist_tool_call_arguments_cache.clear()
-    lpe._remember_codex_google_code_assist_tool_call_name(
-        "call_1", "Read", '{"path":"a"}', scope_key="tenant-a"
-    )
-    lpe._remember_codex_google_code_assist_tool_call_name(
-        "call_1", "Write", '{"path":"b"}', scope_key="tenant-b"
-    )
-    assert (
-        lpe._lookup_codex_google_code_assist_tool_call_name(
-            "call_1", scope_key="tenant-a"
-        )
-        == "Read"
-    )
-    assert (
-        lpe._lookup_codex_google_code_assist_tool_call_name(
-            "call_1", scope_key="tenant-b"
-        )
-        == "Write"
-    )
+    lpe._remember_codex_google_code_assist_tool_call_name("call_1", "Read", '{"path":"a"}', scope_key="tenant-a")
+    lpe._remember_codex_google_code_assist_tool_call_name("call_1", "Write", '{"path":"b"}', scope_key="tenant-b")
+    assert lpe._lookup_codex_google_code_assist_tool_call_name("call_1", scope_key="tenant-a") == "Read"
+    assert lpe._lookup_codex_google_code_assist_tool_call_name("call_1", scope_key="tenant-b") == "Write"
 
 
 def test_rr054_issue13_tool_call_cache_fifo_and_ttl() -> None:
     lpe._codex_google_code_assist_tool_call_name_cache.clear()
     lpe._codex_google_code_assist_tool_call_arguments_cache.clear()
-    with patch.object(
-        lpe, "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE", 2
-    ):
+    with patch.object(lpe, "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE", 2):
         lpe._remember_codex_google_code_assist_tool_call_name("a", "A")
         lpe._remember_codex_google_code_assist_tool_call_name("b", "B")
         lpe._remember_codex_google_code_assist_tool_call_name("c", "C")
@@ -210,14 +186,10 @@ def test_rr054_issue20_parallel_instruction_prepends_not_replaces() -> None:
     updated, changes = lpe._apply_openai_adapter_parallel_instruction_policy(body)
     assert changes["openai_adapter_parallel_instruction_policy_applied"] is True
     assert changes["openai_adapter_parallel_instruction_mode"] == "prepend"
-    assert updated["instructions"].startswith(
-        "You are an OpenAI Responses function-calling agent for Claude Code."
-    )
+    assert updated["instructions"].startswith("You are an OpenAI Responses function-calling agent for Claude Code.")
     assert original in updated["instructions"]
     # Second application is a no-op once policy text is present.
-    second, second_changes = lpe._apply_openai_adapter_parallel_instruction_policy(
-        updated
-    )
+    second, second_changes = lpe._apply_openai_adapter_parallel_instruction_policy(updated)
     assert second is updated
     assert second_changes == {}
 
@@ -329,9 +301,7 @@ def test_rr054_issue43_decode_http_response_body_replaces_invalid_utf8() -> None
 # ---------------------------------------------------------------------------
 
 
-def test_rr054_issue47_claude_persisted_output_root_uses_home(
-    monkeypatch, tmp_path
-) -> None:
+def test_rr054_issue47_claude_persisted_output_root_uses_home(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT", raising=False)
     monkeypatch.setattr(lpe.Path, "home", staticmethod(lambda: tmp_path))
     root = lpe._get_claude_persisted_output_root()
@@ -363,12 +333,8 @@ def test_rr054_issue50_no_candidate_selection_resolves_lane_scoped_session_key()
 def test_rr054_issue57_empty_success_helper_single_tail() -> None:
     import inspect
 
-    source = inspect.getsource(
-        lpe._anthropic_google_shaping._is_codex_google_code_assist_empty_success_model_response
-    )
-    assert (
-        source.count("_usage_has_no_more_than_one_output_token") == 2
-    )  # empty choices + final
+    source = inspect.getsource(lpe._anthropic_google_shaping._is_codex_google_code_assist_empty_success_model_response)
+    assert source.count("_usage_has_no_more_than_one_output_token") == 2  # empty choices + final
 
 
 def test_rr054_issue32_alias_routing_memory_maps_are_bounded() -> None:
@@ -430,9 +396,7 @@ def test_rr054_issue25_drop_unsupported_params_depth_bound() -> None:
         nxt = {"child": {}}
         cur["nested"] = nxt
         cur = nxt["child"]
-    updated, removed = lpe._drop_unsupported_codex_request_params_from_request_body(
-        node
-    )
+    updated, removed = lpe._drop_unsupported_codex_request_params_from_request_body(node)
     assert isinstance(updated, dict)
 
 
@@ -463,9 +427,7 @@ def test_rr054_issue48_grok_auth_formats_authorization() -> None:
     request.headers = {"Authorization": "sk-test-key"}
     request.query_params = {}
     # _format may prefix Bearer
-    with patch.object(
-        lpe, "_format_litellm_passthrough_api_key", side_effect=lambda v: f"Bearer {v}"
-    ):
+    with patch.object(lpe, "_format_litellm_passthrough_api_key", side_effect=lambda v: f"Bearer {v}"):
         assert lpe._get_grok_litellm_auth_header(request) == "Bearer sk-test-key"
 
 
@@ -529,19 +491,14 @@ def test_rr054_issue56_headers_filtered_for_metadata() -> None:
 
 
 def test_rr054_issue59_shared_error_payload_extract() -> None:
-    payloads = lpe._extract_google_adapter_error_payloads(
-        Exception('upstream error: {"error":{"message":"boom"}}')
-    )
+    payloads = lpe._extract_google_adapter_error_payloads(Exception('upstream error: {"error":{"message":"boom"}}'))
     assert any(isinstance(p, dict) and p.get("error") for p in payloads)
 
 
 @pytest.mark.asyncio
 async def test_rr054_issue15_google_lane_negative_cache() -> None:
     lpe._codex_auto_agent_google_lane_negative_until_monotonic = time.monotonic() + 30
-    assert (
-        await lpe._resolve_codex_auto_agent_google_lane_key()
-        == lpe._CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY
-    )
+    assert await lpe._resolve_codex_auto_agent_google_lane_key() == lpe._CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY
     lpe._codex_auto_agent_google_lane_negative_until_monotonic = 0.0
 
 
@@ -591,15 +548,11 @@ def test_rr054_issue16_vertex_live_docstring_requires_auth_wrapper() -> None:
 
 def test_rr054_issue34_code_assist_endpoint_accepts_action_shape() -> None:
     assert (
-        lpe._normalize_gemini_code_assist_endpoint_path(
-            "v1internal:streamGenerateContent"
-        )
+        lpe._normalize_gemini_code_assist_endpoint_path("v1internal:streamGenerateContent")
         == "/v1internal:streamGenerateContent"
     )
     assert (
-        lpe._normalize_gemini_code_assist_endpoint_path(
-            "/v1internal:loadCodeAssist?alt=sse"
-        )
+        lpe._normalize_gemini_code_assist_endpoint_path("/v1internal:loadCodeAssist?alt=sse")
         == "/v1internal:loadCodeAssist"
     )
 
@@ -608,9 +561,7 @@ def test_rr054_issue34_code_assist_endpoint_rejects_smuggling() -> None:
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as exc:
-        lpe._normalize_gemini_code_assist_endpoint_path(
-            "v1internal:streamGenerateContent/http://evil.example/bar"
-        )
+        lpe._normalize_gemini_code_assist_endpoint_path("v1internal:streamGenerateContent/http://evil.example/bar")
     assert exc.value.status_code == 400
 
     with pytest.raises(HTTPException):
@@ -687,22 +638,13 @@ def test_rr054_issue11_policy_module_owns_candidate_tables_and_allowlists() -> N
     assert "aawm-codex-agent-auto" in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
     assert "aawm-code-anthropic" in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
     assert lpe._CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS is policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert (
-        policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-        is package_policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    )
-    assert (
-        lpe._ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-        is policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    )
+    assert policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS is package_policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
+    assert lpe._ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS is policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
     assert (
         lpe._ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
         is policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
     )
-    assert (
-        "gpt-5.3-codex-spark"
-        in policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
-    )
+    assert "gpt-5.3-codex-spark" in policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
     # God-file re-exports policy-owned tables rather than defining row literals.
     god_source = Path(lpe.__file__).read_text()
     assert "_POLICY_CODEX_AUTO_AGENT_CANDIDATES" in god_source
@@ -819,12 +761,8 @@ def test_rr054_issue12_shared_openrouter_retry_and_auto_agent_cooldown() -> None
     passthrough = inspect.getsource(lpe._perform_openrouter_adapter_pass_through_request)
     assert "perform_completion_operation" in completion
     assert "perform_pass_through_request" in passthrough
-    assert "run_retry_loop" in inspect.getsource(
-        retry_transport.perform_completion_operation
-    )
-    assert "run_retry_loop" in inspect.getsource(
-        retry_transport.perform_pass_through_request
-    )
+    assert "run_retry_loop" in inspect.getsource(retry_transport.perform_completion_operation)
+    assert "run_retry_loop" in inspect.getsource(retry_transport.perform_pass_through_request)
     codex = inspect.getsource(lpe._apply_codex_auto_agent_alias_cooldown)
     anth = inspect.getsource(lpe._apply_anthropic_auto_agent_alias_cooldown)
     assert "_apply_auto_agent_alias_cooldown" in codex
@@ -834,18 +772,14 @@ def test_rr054_issue12_shared_openrouter_retry_and_auto_agent_cooldown() -> None
     openrouter_wait = inspect.getsource(lpe._wait_for_openrouter_adapter_cooldown_if_needed)
     google_wait = inspect.getsource(lpe._wait_for_google_adapter_cooldown_if_needed)
     assert "wait_for_cooldown_if_needed" in openrouter_wait
-    assert "wait_for_monotonic_cooldown_map" in inspect.getsource(
-        retry_transport.wait_for_cooldown_if_needed
-    )
+    assert "wait_for_monotonic_cooldown_map" in inspect.getsource(retry_transport.wait_for_cooldown_if_needed)
     assert "wait_for_monotonic_cooldown_map" in google_wait
     # Google multi-budget loop remains distinct (not collapsed into OpenRouter).
     google_loop = inspect.getsource(lpe._perform_google_adapter_pass_through_request)
     openrouter_loop = inspect.getsource(lpe._run_openrouter_adapter_retry_loop)
     assert "run_adapter_retry_policy" in google_loop
     assert "retry_transport.run_retry_loop" in openrouter_loop
-    assert "run_adapter_retry_policy" in inspect.getsource(
-        retry_transport.run_retry_loop
-    )
+    assert "run_adapter_retry_policy" in inspect.getsource(retry_transport.run_retry_loop)
     assert "capacity_total_attempts" in google_loop
     assert "is_capacity_retry" in google_loop
 
@@ -867,13 +801,20 @@ def test_rr054_issue36_alias_state_uses_asyncio_locks() -> None:
 def test_rr054_issue10_shared_auto_agent_handler_is_wired() -> None:
     import inspect
 
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
+
     assert hasattr(lpe, "_handle_auto_agent_alias_route")
     assert hasattr(lpe, "_dispatch_auto_agent_alias_candidate_request")
     anth = inspect.getsource(lpe._handle_anthropic_auto_agent_alias_route)
     codex = inspect.getsource(lpe._handle_codex_auto_agent_alias_route)
-    assert "_handle_auto_agent_alias_route" in anth
-    assert "_handle_auto_agent_alias_route" in codex
-    shared = inspect.getsource(lpe._handle_auto_agent_alias_route)
+    # Wave 2: both wrappers build the typed ``AliasRouteServices`` bundle and
+    # delegate to the shared ``candidate_loop.handle_alias_route`` (the loop
+    # body moved out of the god-module into the package).
+    assert "AliasRouteServices" in anth
+    assert "handle_alias_route" in anth
+    assert "AliasRouteServices" in codex
+    assert "handle_alias_route" in codex
+    shared = inspect.getsource(candidate_loop.handle_alias_route)
     assert "signaling redispatch" in shared
     assert "native_grok_continuation_same_candidate_retry" in shared
     anth_perform = inspect.getsource(lpe._perform_anthropic_auto_agent_alias_candidate_request)
@@ -928,9 +869,7 @@ def test_rr054_issue35_task_state_prefers_structured_flag_and_env_markers() -> N
     assert selected[2] == "structured"
 
     # Compatibility wrapper delegates to the provider-owned package contract.
-    wrapper_src = __import__("inspect").getsource(
-        lpe._build_google_adapter_preserved_task_state_message
-    )
+    wrapper_src = __import__("inspect").getsource(lpe._build_google_adapter_preserved_task_state_message)
     provider_src = __import__("inspect").getsource(
         lpe._anthropic_google_shaping._build_google_adapter_preserved_task_state_message
     )
@@ -963,17 +902,16 @@ def test_rr054_issue39_annotate_does_not_mutate_query_string() -> None:
     request = Request(scope)
     original_qs = scope["query_string"]
     original_path = scope["path"]
-    lpe._annotate_request_scope_for_adapted_access_log(
-        request, "https://api.openai.com/v1/responses"
-    )
+    lpe._annotate_request_scope_for_adapted_access_log(request, "https://api.openai.com/v1/responses")
     assert scope["query_string"] == original_qs
     assert scope["path"] == original_path
     assert isinstance(scope.get("_aawm_adapted_access_log_target"), str)
     assert isinstance(scope.get("_aawm_adapted_access_log_display_path"), str)
     assert "foo=1" in scope["_aawm_adapted_access_log_display_path"]
-    assert "->" in scope["_aawm_adapted_access_log_display_path"] or "adapted_to=" in scope[
-        "_aawm_adapted_access_log_display_path"
-    ]
+    assert (
+        "->" in scope["_aawm_adapted_access_log_display_path"]
+        or "adapted_to=" in scope["_aawm_adapted_access_log_display_path"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1059,9 +997,7 @@ async def test_rr054_issue27_collect_responses_from_dict_sse_stream() -> None:
 
     response = StreamingResponse(_gen(), media_type="text/event-stream")
     summaries: list[dict] = []
-    collected = await lpe._collect_responses_response_from_stream(
-        response, event_summaries=summaries
-    )
+    collected = await lpe._collect_responses_response_from_stream(response, event_summaries=summaries)
     assert collected["id"] == "resp_1"
     assert collected["status"] == "completed"
     assert isinstance(collected.get("output"), list)
@@ -1137,26 +1073,17 @@ async def test_rr054_issue27_collect_function_call_args_from_dict_sse() -> None:
     collected = await lpe._collect_responses_response_from_stream(response)
     assert collected["id"] == "resp_fc"
     output = collected.get("output") or []
-    assert any(
-        isinstance(item, dict) and item.get("type") == "function_call" for item in output
-    )
+    assert any(isinstance(item, dict) and item.get("type") == "function_call" for item in output)
 
 
 def test_rr054_issue1_google_oauth_owned_by_package() -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import google_oauth
 
-    assert lpe._load_valid_local_google_oauth_access_token is (
-        google_oauth._load_valid_local_google_oauth_access_token
-    )
-    assert lpe._refresh_local_google_oauth_credentials is (
-        google_oauth._refresh_local_google_oauth_credentials
-    )
+    assert lpe._load_valid_local_google_oauth_access_token is (google_oauth._load_valid_local_google_oauth_access_token)
+    assert lpe._refresh_local_google_oauth_credentials is (google_oauth._refresh_local_google_oauth_credentials)
     assert lpe._google_oauth_access_token_cache is google_oauth._google_oauth_access_token_cache
     # Constants re-exported from package owner.
-    assert (
-        lpe._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL
-        == google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL
-    )
+    assert lpe._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL == google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL
 
 
 def test_rr054_issue12_retry_env_parsers_are_shared() -> None:
@@ -1166,11 +1093,7 @@ def test_rr054_issue12_retry_env_parsers_are_shared() -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import retry as ar_retry
     import inspect
 
-    assert "parse_non_negative_int_env" in inspect.getsource(
-        retry_transport.get_max_retries
-    )
-    assert "parse_non_negative_float_env" in inspect.getsource(
-        lpe._get_google_adapter_hidden_retry_budget_seconds
-    )
+    assert "parse_non_negative_int_env" in inspect.getsource(retry_transport.get_max_retries)
+    assert "parse_non_negative_float_env" in inspect.getsource(lpe._get_google_adapter_hidden_retry_budget_seconds)
     assert ar_retry.parse_non_negative_int_env("NOPE", default=2) == 2
     assert ar_retry.parse_non_negative_float_env("NOPE", default=1.5) == 1.5

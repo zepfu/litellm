@@ -14,6 +14,24 @@ confidence-tiered N-of-M cooldown-evidence policy:
   present, else falls back to a capped exponential backoff.
 - After a cooldown expires, a single half-open probe is allowed; success
   restores the candidate, failure re-cools with continued backoff.
+
+Scope policy (R3-3, operator-DECIDED, bounded):
+- Structured 429 (plain rate-limit AND quota-text) and marker-only
+  ``rate_limit`` classify ``scope="model"`` so a throttled model cools only its
+  own ``provider:model:lane`` key, not the whole provider. Marker-only
+  ``rate_limit`` still only cools AFTER its existing N-of-M evidence threshold
+  is met (the per-event ``scope`` is model; the gate's decision to cool is a
+  separate concern).
+- Marker-only ``capacity`` stays ``scope="provider"`` and marker-only
+  ``quota_exhausted`` is ``scope="account"``: these lower-confidence signals are
+  deliberately NOT widened by the OpenRouter model-scope decision.
+- Unchanged: auth ``"account"``, 404 ``"model"``, 5xx ``"provider"``,
+  client_cancelled ``"lane"``, unknown ``"lane"``.
+
+Non-goal: this wave makes a bounded operator scope decision only. NO global
+provider/account fan-out framework is built here -- the capacity/quota scopes
+above are preserved precisely so the model-scope decision does not become a
+framework-wide under-cooling policy.
 """
 
 from __future__ import annotations
@@ -69,7 +87,7 @@ def classify_failure(
                 origin="upstream",
                 confidence="structured",
                 provider=provider,
-                scope="provider",
+                scope="model",
                 retryable=True,
                 evidence=evidence,
             )
@@ -78,7 +96,7 @@ def classify_failure(
             origin="upstream",
             confidence="structured",
             provider=provider,
-            scope="provider",
+            scope="model",
             retryable=True,
             evidence=evidence,
         )
@@ -140,7 +158,7 @@ def classify_failure(
             origin="upstream",
             confidence="marker",
             provider=provider,
-            scope="provider",
+            scope="account",
             retryable=True,
             evidence=evidence,
         )
@@ -150,7 +168,7 @@ def classify_failure(
             origin="upstream",
             confidence="marker",
             provider=provider,
-            scope="provider",
+            scope="model",
             retryable=True,
             evidence=evidence,
         )
