@@ -1,0 +1,96 @@
+{
+  "commit": "e3dc89f634a61e89aeaab98c7fbf91b7bdae896c",
+  "path": "litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py",
+  "entries": [
+    {
+      "address": "decorated_function:anthropic_base_probe",
+      "qualified_name": "anthropic_base_probe",
+      "source_kind": "decorated_function",
+      "sha256": "e1e6446584b945d5e54ceb1724d56f209a80b1026396d0070088ec66ee00fb2d"
+    },
+    {
+      "address": "decorated_function:anthropic_proxy_route",
+      "qualified_name": "anthropic_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "eff26b6046637af91efd7ecd37a14e31da305e60a366aa86a76760e57c2f99ba"
+    },
+    {
+      "address": "decorated_function:assemblyai_proxy_route",
+      "qualified_name": "assemblyai_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "fb638dbc12edf5e823ce0e6c126fccdb8eee40e40b49adc9113a63e249d946f0"
+    },
+    {
+      "address": "decorated_function:azure_proxy_route",
+      "qualified_name": "azure_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "1314c5af1770149623e7668e9d24eb94d045917688ff0ac318e1cf4258fdaf0c"
+    },
+    {
+      "address": "decorated_function:bedrock_proxy_route",
+      "qualified_name": "bedrock_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "6f71a591d108db1382def391e94f6185a04fb9bb6c9a1f6f6934c57c06520b1e"
+    },
+    {
+      "address": "decorated_function:cohere_proxy_route",
+      "qualified_name": "cohere_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "66cdd62d8e6ca3694b11402b1e4a49c93811c5fe20a5dd6604c0e6d6e4a6aee8"
+    },
+    {
+      "address": "decorated_function:gemini_proxy_route",
+      "qualified_name": "gemini_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "fdb0af562be92f256591bedbb45961a1f47c0257b7192465a5731f75f69bc605"
+    },
+    {
+      "address": "decorated_function:mistral_proxy_route",
+      "qualified_name": "mistral_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "50fce8d968b5918c9ee4d22ec66efd5dd665328d9bd41b8386c2f2f18ba4f862"
+    },
+    {
+      "address": "decorated_function:openai_proxy_route",
+      "qualified_name": "openai_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "34e3534318b8f83e694f90c0eca72b721ae136de34b4db5d8b014259cb1391e3"
+    },
+    {
+      "address": "decorated_function:vertex_discovery_proxy_route",
+      "qualified_name": "vertex_discovery_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "0c561e2bd5883ab9791b77a7724ff269f04195783d2664f9055dd9c4a90122bd"
+    },
+    {
+      "address": "decorated_function:vertex_proxy_route",
+      "qualified_name": "vertex_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "defdf2459218cc99fc677c1c62b0ff6e630af13bda43462ce615bdee888f390a"
+    },
+    {
+      "address": "decorated_function:vllm_proxy_route",
+      "qualified_name": "vllm_proxy_route",
+      "source_kind": "decorated_function",
+      "sha256": "cf880a74129cf4b5b106f48f420abf252ae2ce1c5f2aef0aada2d95cb45169d2"
+    },
+    {
+      "address": "function:_base_vertex_proxy_route",
+      "qualified_name": "_base_vertex_proxy_route",
+      "source_kind": "function",
+      "sha256": "0095a1247957ac4cf2ced5391944d6d2f07f3a135f102c73bb1664026ec4ab7d"
+    },
+    {
+      "address": "function:_is_bedrock_agent_runtime_route",
+      "qualified_name": "_is_bedrock_agent_runtime_route",
+      "source_kind": "function",
+      "sha256": "61c8201ed0ba5e2e7370f7a862c7713499e2b775a3ddf0a1c798cde5b866212e"
+    },
+    {
+      "address": "function:_prepare_anthropic_context_1m_native_passthrough",
+      "qualified_name": "_prepare_anthropic_context_1m_native_passthrough",
+      "source_kind": "function",
+      "sha256": "484137be03255500b11e6c92a906b2647877f3c9a8555e687fc72c7377d43ed3"
+    }
+  ]
+}
