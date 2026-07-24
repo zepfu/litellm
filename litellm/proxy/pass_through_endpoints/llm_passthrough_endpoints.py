@@ -638,6 +638,37 @@ def _select_round_robin_snapshot_candidate(
     return winner
 
 
+def reset_module_singletons() -> None:
+    """Clear the god-module-owned alias-routing singletons IN PLACE (test-support).
+
+    These singletons are NOT yet owned by ``AliasRoutingStateManager`` (they move
+    onto the manager in Wave 5B). Until then this helper resets them directly:
+
+    * the read-pilot cooldown gate's per-key state and its family evidence map,
+    * the per-alias round-robin rotation cursor,
+    * the active config-driven routing snapshot (cleared to ``None``).
+
+    Every dict is cleared with ``.clear()`` -- never reassigned -- so any module
+    alias bound to the same object stays valid.
+    """
+    _read_pilot_cooldown_gate._key_state.clear()
+    _read_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
+    _round_robin_cursor_by_alias.clear()
+    set_active_routing_snapshot(None)
+
+
+def reset_alias_routing_state_for_tests() -> None:
+    """Reset ALL process-local alias-routing state (test-support only).
+
+    Clears manager-owned state via ``alias_routing_state.reset_for_tests()`` and
+    the god-module-owned singletons via ``reset_module_singletons()``. Fixtures
+    fetch this by name (``getattr(lpe, "reset_alias_routing_state_for_tests")``)
+    to isolate process-local routing state between tests.
+    """
+    _alias_routing_state.reset_for_tests()
+    reset_module_singletons()
+
+
 def _apply_snapshot_alias_distribution_strategy(
     ordered: Sequence[_RoutingSnapshotCandidate],
     *,

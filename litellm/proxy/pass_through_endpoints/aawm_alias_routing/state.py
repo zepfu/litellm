@@ -180,6 +180,18 @@ class AliasFamilyState:
             max_size=max_size,
         )
 
+    def clear_for_tests(self) -> None:
+        """Clear every process-local map IN PLACE (test-support only).
+
+        Uses ``.clear()`` so any module-global alias bound to these same dict
+        objects (see ``llm_passthrough_endpoints``) observes the reset without
+        needing to be rebound.
+        """
+        self.cooldown_until_monotonic_by_key.clear()
+        self.cooldown_negative_until_monotonic_by_key.clear()
+        self.session_affinity_by_key.clear()
+        self.evidence_events_by_key.clear()
+
 
 @dataclass
 class MonotonicCooldownMap:
@@ -214,6 +226,10 @@ class MonotonicCooldownMap:
             default=0.0,
         )
 
+    def clear_for_tests(self) -> None:
+        """Clear the cooldown map IN PLACE (test-support only)."""
+        self.until_monotonic_by_key.clear()
+
 
 class AliasRoutingStateManager:
     """Single owner of alias-routing process-local maps + locks (RR-054 #1)."""
@@ -242,6 +258,28 @@ class AliasRoutingStateManager:
         if alias_family == "anthropic":
             return self.anthropic
         return self.codex
+
+    def reset_for_tests(self) -> None:
+        """Clear all manager-owned process-local state IN PLACE (test-support only).
+
+        Every map is cleared with ``.clear()`` -- never reassigned -- so the
+        module-global aliases in ``llm_passthrough_endpoints`` (which are bound
+        to these exact dict objects) stay valid and observe the reset. Scalar
+        cooldown/log timestamps are reset to ``0.0``.
+        """
+        self.codex.clear_for_tests()
+        self.anthropic.clear_for_tests()
+        self.google_lane_key_until_monotonic_by_key.clear()
+        self.google_lane_key_by_key.clear()
+        self.google_lane_negative_until_monotonic = 0.0
+        self.antigravity_lane_key_until_monotonic_by_key.clear()
+        self.antigravity_lane_key_by_key.clear()
+        self.antigravity_auth_degraded_log_until_monotonic = 0.0
+        self.log_until_monotonic_by_key.clear()
+        self.candidate_probe_locks.clear()
+        self.openrouter_rate_limit.clear_for_tests()
+        self.openrouter_failure_circuit.clear_for_tests()
+        self.google_rate_limit.clear_for_tests()
 
     async def candidate_probe_lock(
         self,
