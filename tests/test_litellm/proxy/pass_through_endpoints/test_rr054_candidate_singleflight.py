@@ -89,28 +89,37 @@ def _selection(
 
 
 def _capacity_error() -> RuntimeError:
-    return RuntimeError(
-        "Selected model is at capacity. Please try a different model."
-    )
+    return RuntimeError("Selected model is at capacity. Please try a different model.")
 
 
 def _clear_probe_locks() -> None:
     alias_routing_state.candidate_probe_locks.clear()
 
 
-@pytest.fixture(autouse=True)
-def _clear_singleflight_state() -> Any:
+def _reset_alias_routing_state() -> None:
+    """Migrated to the Wave-0 reset helper (RED-guarded until it lands).
+
+    ``getattr`` guard so this fixture also runs against pre-helper develop
+    (falling back to the previous per-map clearing), letting each test fail
+    on its own behavioral assertion rather than an AttributeError here.
+    """
+    reset_fn = getattr(lpe, "reset_alias_routing_state_for_tests", None)
+    if reset_fn is not None:
+        reset_fn()
+        return
     _clear_probe_locks()
     lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
     lpe._codex_auto_agent_session_affinity_by_key.clear()
     lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_singleflight_state() -> Any:
+    _reset_alias_routing_state()
     yield
-    _clear_probe_locks()
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
+    _reset_alias_routing_state()
     lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     lpe._anthropic_auto_agent_session_affinity_by_key.clear()
 
@@ -144,9 +153,7 @@ class _ProbeCounter:
                 # Keep the probe "in flight" long enough for siblings to contend.
                 if not self.release.is_set():
                     try:
-                        await asyncio.wait_for(
-                            self.release.wait(), timeout=self.hold_seconds
-                        )
+                        await asyncio.wait_for(self.release.wait(), timeout=self.hold_seconds)
                     except asyncio.TimeoutError:
                         pass
                 else:
@@ -219,9 +226,7 @@ async def _run_route_once(
 
 
 @pytest.mark.asyncio
-async def test_rr054_31_candidate_probe_lock_is_shared_per_family_and_cooldown_key() -> (
-    None
-):
+async def test_rr054_31_candidate_probe_lock_is_shared_per_family_and_cooldown_key() -> None:
     manager = AliasRoutingStateManager(max_size=16)
     lock_a1 = await manager.candidate_probe_lock(
         alias_family="codex_auto_agent",
@@ -244,16 +249,11 @@ async def test_rr054_31_candidate_probe_lock_is_shared_per_family_and_cooldown_k
     assert lock_a1 is not lock_b
     assert lock_a1 is not lock_other_family
     assert "codex_auto_agent:openrouter:model-a:openrouter" in manager.candidate_probe_locks
-    assert (
-        "anthropic_auto_agent:openrouter:model-a:openrouter"
-        in manager.candidate_probe_locks
-    )
+    assert "anthropic_auto_agent:openrouter:model-a:openrouter" in manager.candidate_probe_locks
 
 
 @pytest.mark.asyncio
-async def test_rr054_31_process_singleton_probe_lock_matches_alias_routing_state() -> (
-    None
-):
+async def test_rr054_31_process_singleton_probe_lock_matches_alias_routing_state() -> None:
     lock = await alias_routing_state.candidate_probe_lock(
         alias_family="codex_auto_agent",
         cooldown_key="rr054-31:singleton",
@@ -322,19 +322,17 @@ async def test_rr054_31_same_candidate_lane_serializes_concurrent_cold_probes() 
             return await probe.run(hold=True, outcome="fail")
         return success
 
-    async def apply_cooldown_fn(
-        *,
-        request: Request,
-        candidate: dict[str, Any],
-        lane_key: Optional[str],
-        selected_cooldown_key: str,
-        cooldown_seconds: float,
-        error_class: Optional[str],
-    ) -> str:
+    async def apply_cooldown_fn(**_kwargs: Any) -> str:
+        # Widened to **_kwargs so this stub does not silently drift out of
+        # sync with the production applicator's kwarg set (Wave 0 guardrail
+        # repair -- see test_seam_contracts.py). The observed-keys assertion
+        # turns a future required-kwarg addition into a named failure here
+        # instead of a masked TypeError.
+        assert {"selected_cooldown_key", "cooldown_seconds", "error_class"} <= set(_kwargs.keys())
+        selected_cooldown_key = _kwargs["selected_cooldown_key"]
+        cooldown_seconds = _kwargs["cooldown_seconds"]
         # Publish durable/local failure state so waiters can observe it.
-        cooldown_until[selected_cooldown_key] = time.monotonic() + max(
-            1.0, float(cooldown_seconds or 30.0)
-        )
+        cooldown_until[selected_cooldown_key] = time.monotonic() + max(1.0, float(cooldown_seconds or 30.0))
         return "candidate"
 
     async def one(session_id: str) -> Any:
@@ -378,8 +376,7 @@ async def test_rr054_31_same_candidate_lane_serializes_concurrent_cold_probes() 
     # the primary cold-probe outcome is published.
     successes = [r for r in results if isinstance(r, Response)]
     assert len(successes) >= 1, (
-        "expected at least one request to recover after single-flight cooldown; "
-        f"results={results!r}"
+        "expected at least one request to recover after single-flight cooldown; " f"results={results!r}"
     )
 
 
@@ -495,15 +492,12 @@ async def test_rr054_31_waiter_skips_probe_after_leader_publishes_cooldown() -> 
             return await probe.run(hold=True, outcome="fail")
         return success
 
-    async def apply_cooldown_fn(
-        *,
-        request: Request,
-        candidate: dict[str, Any],
-        lane_key: Optional[str],
-        selected_cooldown_key: str,
-        cooldown_seconds: float,
-        error_class: Optional[str],
-    ) -> str:
+    async def apply_cooldown_fn(**_kwargs: Any) -> str:
+        # Widened to **_kwargs so this stub does not silently drift out of
+        # sync with the production applicator's kwarg set (Wave 0 guardrail
+        # repair -- see test_seam_contracts.py).
+        assert {"selected_cooldown_key", "cooldown_seconds", "error_class"} <= set(_kwargs.keys())
+        selected_cooldown_key = _kwargs["selected_cooldown_key"]
         cooldown_until[selected_cooldown_key] = time.monotonic() + 60.0
         return "candidate"
 
@@ -661,9 +655,7 @@ async def test_rr054_31_distinct_candidates_or_lanes_probe_independently() -> No
 
 
 @pytest.mark.asyncio
-async def test_rr054_31_family_isolation_allows_parallel_probes_for_same_cooldown_key() -> (
-    None
-):
+async def test_rr054_31_family_isolation_allows_parallel_probes_for_same_cooldown_key() -> None:
     """Codex and Anthropic families use independent probe locks for the same key."""
     cand = _candidate()
     shared_key = "openrouter:openrouter/cohere/north-mini-code:free:openrouter"
@@ -694,18 +686,14 @@ async def test_rr054_31_family_isolation_allows_parallel_probes_for_same_cooldow
         candidate: dict[str, Any],
         candidate_body: dict[str, Any],
     ) -> Response:
-        return await probe_codex.run(
-            hold=True, outcome="success", success_response=success
-        )
+        return await probe_codex.run(hold=True, outcome="success", success_response=success)
 
     async def perform_anth(
         *,
         candidate: dict[str, Any],
         candidate_body: dict[str, Any],
     ) -> Response:
-        return await probe_anth.run(
-            hold=True, outcome="success", success_response=success
-        )
+        return await probe_anth.run(hold=True, outcome="success", success_response=success)
 
     async def apply_cooldown(**_k: Any) -> str:
         return "none"
@@ -752,9 +740,7 @@ async def test_rr054_31_family_isolation_allows_parallel_probes_for_same_cooldow
 
 
 @pytest.mark.asyncio
-async def test_rr054_31_codex_wrapper_wires_probe_lock_path_for_concurrent_cold_failure() -> (
-    None
-):
+async def test_rr054_31_codex_wrapper_wires_probe_lock_path_for_concurrent_cold_failure() -> None:
     """Exercise the production Codex wrapper entry with concurrent cold failures.
 
     Uses real select + cooldown maps; only the upstream perform path is mocked.

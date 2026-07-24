@@ -44,29 +44,35 @@ def _minimal_request(session_id: str = "round2-live-session") -> MagicMock:
     return request
 
 
+def _reset_alias_routing_ambient_state_now() -> None:
+    """Migrated to the Wave-0 reset helper (RED-guarded until it lands).
+
+    ``getattr`` guard so this fixture also runs against pre-helper develop
+    (falling back to the previous per-map clearing), letting each test fail
+    on its own behavioral assertion rather than an AttributeError here.
+    """
+    reset_fn = getattr(lpe, "reset_alias_routing_state_for_tests", None)
+    if reset_fn is not None:
+        reset_fn()
+        return
+    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
+    lpe._codex_auto_agent_session_affinity_by_key.clear()
+    lpe._read_pilot_cooldown_gate._key_state.clear()
+    lpe._read_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
+    # ``getattr`` guard so the fixture also runs against pre-fix develop (where
+    # ``_round_robin_cursor_by_alias`` does not exist), letting each test fail
+    # on its behavioral assertion rather than a fixture AttributeError.
+    getattr(lpe, "_round_robin_cursor_by_alias", {}).clear()
+
+
 @pytest.fixture(autouse=True)
 def _reset_alias_routing_ambient_state() -> Any:
     """Neutralize shared cooldown / affinity / snapshot / gate / round-robin state."""
     previous_snapshot = lpe.get_active_routing_snapshot()
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe._read_pilot_cooldown_gate._key_state.clear()
-    lpe._read_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
-    # ``getattr`` guard so the fixture also runs against pre-fix develop (where
-    # ``_round_robin_cursor_by_alias`` does not exist), letting each test fail
-    # on its behavioral assertion rather than a fixture AttributeError.
-    getattr(lpe, "_round_robin_cursor_by_alias", {}).clear()
+    _reset_alias_routing_ambient_state_now()
     yield
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe._read_pilot_cooldown_gate._key_state.clear()
-    lpe._read_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
-    # ``getattr`` guard so the fixture also runs against pre-fix develop (where
-    # ``_round_robin_cursor_by_alias`` does not exist), letting each test fail
-    # on its behavioral assertion rather than a fixture AttributeError.
-    getattr(lpe, "_round_robin_cursor_by_alias", {}).clear()
+    _reset_alias_routing_ambient_state_now()
     lpe.set_active_routing_snapshot(previous_snapshot)
 
 
