@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -144,6 +145,7 @@ class GrokBuildPassthroughHarness:
         content_type: str = "application/json",
         query_params: dict[str, str] | None = None,
         include_session_id: bool = True,
+        raw_body: bytes | None = None,
     ) -> tuple[dict[str, Any], AsyncMock, AsyncMock, AsyncMock]:
         request = self.request(
             endpoint=endpoint,
@@ -151,6 +153,8 @@ class GrokBuildPassthroughHarness:
             query_params=query_params,
             include_session_id=include_session_id,
         )
+        if raw_body is not None:
+            request.body = AsyncMock(return_value=raw_body)
         auth_mock = AsyncMock(return_value=MagicMock())
         get_body_mock = AsyncMock(return_value=request_body or self.request_body())
         pass_through_mock = AsyncMock(return_value={"ok": True})
@@ -171,8 +175,7 @@ class GrokBuildPassthroughHarness:
                 fastapi_response=MagicMock(spec=Response),
             )
 
-        assert result == {"ok": True}
-        return pass_through_mock.await_args.kwargs, auth_mock, get_body_mock, pass_through_mock
+        return result, pass_through_mock, auth_mock, get_body_mock
 
     def forwarded_headers(self, call_kwargs: dict[str, Any]) -> dict[str, Any]:
         return HttpPassThroughEndpointHelpers.forward_headers_from_request(
@@ -185,7 +188,9 @@ class GrokBuildPassthroughHarness:
     def final_response_body(self) -> dict[str, Any]:
         return {
             "id": "resp_grok_harness",
+            "created_at": 1748807400,
             "object": "response",
+            "status": "completed",
             "model": self.model,
             "output": [
                 {
@@ -210,12 +215,14 @@ class GrokBuildPassthroughHarness:
 async def test_grok_build_harness_routes_json_headers_and_filters_litellm_auth(model):
     harness = GrokBuildPassthroughHarness(model=model)
 
-    call_kwargs, auth_mock, _, _ = await harness.invoke_route(
+    result, pass_through_mock, auth_mock, _ = await harness.invoke_route(
         endpoint="v1/responses",
         request_body=harness.request_body(),
         query_params={"key": "query-litellm-key", "debug": "1"},
     )
 
+    assert result == {"ok": True}
+    call_kwargs = pass_through_mock.await_args.kwargs
     assert auth_mock.await_args.kwargs["api_key"] == f"Bearer {harness.litellm_api_key}"
     assert call_kwargs["target"] == f"{harness.upstream_base}/v1/responses"
     assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
@@ -244,57 +251,51 @@ async def test_grok_build_harness_routes_json_headers_and_filters_litellm_auth(m
 
 
 @pytest.mark.asyncio
-async def test_grok_build_harness_defaults_privacy_retention_opt_out():
+async def test_grok_build_harness_suppresses_privacy_retention_endpoint():
+    """Privacy retention endpoint is intentionally suppressed (f2ceaacb56)."""
     harness = GrokBuildPassthroughHarness()
 
-    call_kwargs, _, _, _ = await harness.invoke_route(
+    result, pass_through_mock, _, _ = await harness.invoke_route(
         endpoint="v1/privacy/coding-data-retention",
         request_body={},
     )
 
-    assert call_kwargs["target"] == (
-        f"{harness.upstream_base}/v1/privacy/coding-data-retention"
-    )
-    assert call_kwargs["custom_body"]["codingDataRetentionOptOut"] is True
-
-
-@pytest.mark.parametrize("explicit_value", [True, False])
-@pytest.mark.asyncio
-async def test_grok_build_harness_preserves_privacy_retention_opt_out(
-    explicit_value,
-):
-    harness = GrokBuildPassthroughHarness()
-
-    call_kwargs, _, _, _ = await harness.invoke_route(
-        endpoint="v1/privacy/coding-data-retention",
-        request_body={"codingDataRetentionOptOut": explicit_value},
-    )
-
-    assert call_kwargs["custom_body"]["codingDataRetentionOptOut"] is explicit_value
+    assert result == {
+        "ok": True,
+        "suppressed": True,
+        "endpoint": "grok_coding_data_retention",
+    }
+    pass_through_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_grok_build_harness_does_not_default_privacy_flag_elsewhere():
     harness = GrokBuildPassthroughHarness()
 
-    call_kwargs, _, _, _ = await harness.invoke_route(
+    result, pass_through_mock, _, _ = await harness.invoke_route(
         endpoint="v1/responses",
         request_body={},
     )
 
+    assert result == {"ok": True}
+    call_kwargs = pass_through_mock.await_args.kwargs
     assert "codingDataRetentionOptOut" not in call_kwargs["custom_body"]
 
 
 @pytest.mark.asyncio
 async def test_grok_build_harness_routes_protobuf_raw_body_without_json_parse():
     harness = GrokBuildPassthroughHarness()
+    protobuf_body = b"\x0a\x05hello\x12\x05world"
 
-    call_kwargs, _, get_body_mock, _ = await harness.invoke_route(
+    result, pass_through_mock, _, get_body_mock = await harness.invoke_route(
         endpoint="v1/traces",
         content_type="application/x-protobuf",
         query_params={},
+        raw_body=protobuf_body,
     )
 
+    assert result == {"ok": True}
+    call_kwargs = pass_through_mock.await_args.kwargs
     get_body_mock.assert_not_awaited()
     assert call_kwargs["target"] == f"{harness.upstream_base}/v1/traces"
     assert call_kwargs["custom_body"] is None
@@ -303,6 +304,12 @@ async def test_grok_build_harness_routes_protobuf_raw_body_without_json_parse():
     assert metadata["client_name"] == "grok-build"
     assert metadata["passthrough_route_family"] == "grok_cli_chat_proxy"
     assert metadata["grok_cli_chat_proxy"] is True
+    assert metadata["grok_side_channel_request_body_byte_length"] == 14
+    assert metadata["grok_side_channel_request_body_digest_source"] == "raw_body"
+    assert (
+        metadata["grok_side_channel_request_body_sha256"]
+        == "9e202500d1f5ecd7fab7ff7e57ca04dc9c22aac7a45921099b3945d4c5f3ccfb"
+    )
     assert "route:grok_cli_chat_proxy" in metadata["tags"]
 
 
@@ -377,12 +384,14 @@ def test_grok_build_harness_normalizes_final_response_and_session_history_identi
 async def test_grok_build_harness_uses_conv_id_when_session_header_missing():
     harness = GrokBuildPassthroughHarness(model="grok-composer-2.5-fast")
 
-    call_kwargs, _, _, _ = await harness.invoke_route(
+    result, pass_through_mock, _, _ = await harness.invoke_route(
         endpoint="v1/responses",
         request_body=harness.request_body(),
         include_session_id=False,
     )
 
+    assert result == {"ok": True}
+    call_kwargs = pass_through_mock.await_args.kwargs
     metadata = call_kwargs["custom_body"]["litellm_metadata"]
     assert metadata["session_id"] == "conv_harness"
     assert call_kwargs["passthrough_logging_metadata"] == metadata
@@ -446,6 +455,7 @@ async def test_grok_build_harness_uses_conv_id_when_session_header_missing():
 @pytest.mark.asyncio
 async def test_grok_build_harness_routes_streaming_final_response_to_logging():
     harness = GrokBuildPassthroughHarness()
+    response_body = harness.final_response_body()
     logging_obj = MagicMock()
     logging_obj.model_call_details = {
         "custom_llm_provider": "xai",
@@ -474,6 +484,11 @@ async def test_grok_build_harness_routes_streaming_final_response_to_logging():
         start_time=datetime.now() - timedelta(milliseconds=20),
         raw_bytes=[
             b'data: {"type":"response.output_text.delta","delta":"pong","output_index":0}\n\n',
+            (
+                b'data: {"type":"response.completed","response":'
+                + json.dumps(response_body).encode()
+                + b"}\n\n"
+            ),
             b"data: [DONE]\n\n",
         ],
         end_time=datetime.now(),
