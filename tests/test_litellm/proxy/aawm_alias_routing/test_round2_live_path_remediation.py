@@ -220,11 +220,23 @@ aliases:
 def test_live_round_robin_rotates_across_equal_priority_candidates() -> None:
     """``distribution_strategy: round_robin`` must rotate the leading candidate
     across the equal-top-priority pair on successive LIVE selections, rather than
-    always returning declaration order (the pre-fix behavior) or a random pick."""
+    always returning declaration order (the pre-fix behavior) or a random pick.
+
+    Wave-1 R3-2 purified the enumeration: ``_select_read_pilot_snapshot_candidates``
+    now READS the rotation cursor (it no longer self-advances), so the getter
+    cannot double-count within a single request. The cursor advances exactly once
+    per ACTUAL selection via ``_commit_round_robin_selection`` -- the same commit
+    the live selector performs on its ``first_available`` return. This test drives
+    that read+commit pair per selection to prove deterministic rotation."""
     snapshot = compiler.compile_yaml(_ROUND_ROBIN_YAML)
     lpe.set_active_routing_snapshot(snapshot)
 
-    leaders = [lpe._select_read_pilot_snapshot_candidates()[0]["model"] for _ in range(4)]
+    leaders: list[str] = []
+    for _ in range(4):
+        token = lpe._derive_round_robin_commit_token("read", client_product_label=None)
+        leader = lpe._select_read_pilot_snapshot_candidates()[0]
+        leaders.append(leader["model"])
+        lpe._commit_round_robin_selection(token, selected_candidate=leader)
     # Deterministic rotation: consecutive leaders must alternate and both
     # candidates must lead within any two consecutive selections.
     assert leaders[0] != leaders[1]
