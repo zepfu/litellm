@@ -226,6 +226,8 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Bounded, lossless stream peeking | `aawm_alias_routing/streaming.py` |
 | Responses-to-Anthropic finalization | `aawm_alias_routing/responses_finalize.py` |
 | Shared retry attempt sequencing and cooldown waits | `aawm_alias_routing/retry.py` |
+| Shared alias candidate retry loop and R3-1 single-flight cooldown publication | `aawm_alias_routing/candidate_loop.py` |
+| Typed alias-route seam contracts (`AliasRouteServices`, cooldown publication plan) | `aawm_alias_routing/interfaces.py` |
 | Structured task-state source selection | `aawm_alias_routing/task_state.py` |
 | Route registration, process-local routing call sites, compatibility re-exports, and residual provider orchestration | `llm_passthrough_endpoints.py` |
 

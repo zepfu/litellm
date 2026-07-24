@@ -173,7 +173,6 @@ from litellm.proxy.aawm_route_logging import (
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
     record_aawm_route_rollup_turn,
-    register_aawm_route_rollup_access_log_replacement,
     resolve_aawm_route_host_attribution,
 )
 
@@ -321,7 +320,9 @@ from .aawm_alias_routing import retry as _aawm_alias_retry
 from .aawm_alias_routing import streaming as _aawm_alias_streaming
 from .aawm_alias_routing import google_oauth as _aawm_google_oauth
 from .aawm_alias_routing import antigravity_oauth as _aawm_antigravity_oauth
+from .aawm_alias_routing import candidate_loop as _aawm_alias_candidate_loop
 from .aawm_alias_routing import durable as _aawm_alias_durable
+from .aawm_alias_routing import interfaces as _aawm_alias_interfaces
 from .aawm_alias_routing.config_compiler import (
     ConfigCompileError as _AawmAliasConfigCompileError,
     compile_yaml as _compile_aawm_alias_routing_yaml,
@@ -6293,6 +6294,177 @@ def _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
     )
 
 
+def _resolve_auto_agent_cooldown_publication_plan(
+    *,
+    request: Optional[Request],
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
+) -> _aawm_alias_interfaces.CooldownPublicationPlan:
+    """Pure resolver: classify one failure into an immutable publication plan (R3-1).
+
+    Resolves the cooldown scope and derives the exact memory/durable target
+    keys WITHOUT performing any I/O, so the retry loop can publish the memory
+    keys synchronously inside the probe lock and persist the durable keys after
+    release -- both derived from this single plan so telemetry, waiter
+    visibility, and Redis state cannot disagree.
+
+    Scope targets (preserved exactly from the legacy apply chain):
+      - ``none`` / request-local -> no shared keys (request-local action only)
+      - ``candidate`` / ``model`` -> the selected candidate key
+      - Kimi ``managed_account`` -> the managed-account sentinel ONLY
+      - Grok account-quota -> the selected key PLUS the account-lane key
+
+    The read-pilot lane resolves its scope/duration from the N-of-M evidence
+    gate's current decision (fed earlier by the loop via
+    ``_record_read_pilot_cooldown_evidence``); when the gate says do-not-cool,
+    the plan carries ``applied_scope="none"`` and empty key sets.
+    """
+    if is_read_pilot_lane:
+        decision = _read_pilot_cooldown_gate.current_decision(cooldown_key=selected_cooldown_key)
+        if not decision.should_cool:
+            return _aawm_alias_interfaces.CooldownPublicationPlan(
+                applied_scope="none",
+                duration_seconds=0.0,
+                grok_account_quota_exhausted=grok_account_quota_exhausted,
+                kimi_failure_metadata=kimi_failure_metadata,
+            )
+        return _aawm_alias_interfaces.CooldownPublicationPlan(
+            memory_keys=(selected_cooldown_key,),
+            durable_keys=(selected_cooldown_key,),
+            duration_seconds=float(decision.duration_seconds),
+            applied_scope=decision.scope or "candidate",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+
+    cooldown_scope = _get_codex_auto_agent_candidate_cooldown_scope(
+        error_class,
+        candidate=candidate,
+        kimi_failure_metadata=kimi_failure_metadata,
+    )
+    duration = max(0.0, float(cooldown_seconds))
+    if cooldown_scope == "none":
+        return _aawm_alias_interfaces.CooldownPublicationPlan(
+            applied_scope="none",
+            duration_seconds=duration,
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+    if cooldown_scope == "managed_account":
+        managed_key = _get_kimi_code_managed_account_cooldown_key()
+        return _aawm_alias_interfaces.CooldownPublicationPlan(
+            memory_keys=(managed_key,),
+            durable_keys=(managed_key,),
+            duration_seconds=duration,
+            applied_scope="managed_account",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+    if cooldown_scope == "candidate":
+        memory_keys = [selected_cooldown_key]
+        if grok_account_quota_exhausted:
+            lane_cooldown_key = _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
+                candidate,
+                lane_key,
+            )
+            if lane_cooldown_key is not None and lane_cooldown_key != selected_cooldown_key:
+                memory_keys.append(lane_cooldown_key)
+        keys = tuple(memory_keys)
+        return _aawm_alias_interfaces.CooldownPublicationPlan(
+            memory_keys=keys,
+            durable_keys=keys,
+            duration_seconds=duration,
+            applied_scope="candidate",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+    # request_local: no shared keys; the loop applies the request-local
+    # cooldown + exclusion post-release.
+    return _aawm_alias_interfaces.CooldownPublicationPlan(
+        applied_scope=cooldown_scope,
+        duration_seconds=duration,
+        request_local_action="request_local_cooldown",
+        grok_account_quota_exhausted=grok_account_quota_exhausted,
+        kimi_failure_metadata=kimi_failure_metadata,
+    )
+
+
+def _apply_request_local_cooldown_from_plan(
+    request: Request,
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+) -> None:
+    """Apply a request-local cooldown + exclusion for a request-local plan (R3-1)."""
+    request_local_key = _get_codex_auto_agent_request_local_cooldown_key(
+        candidate=candidate,
+        lane_key=lane_key,
+    )
+    _set_codex_auto_agent_request_local_cooldown(
+        request,
+        cooldown_key=request_local_key,
+        cooldown_seconds=cooldown_seconds,
+    )
+    _exclude_codex_auto_agent_request_local_candidate(
+        request,
+        cooldown_key=request_local_key,
+    )
+
+
+def _publish_codex_cooldown_memory(*, keys: Sequence[str], seconds: float) -> None:
+    """Synchronously publish cooldowns into codex family memory (R3-1).
+
+    Direct ``state.py`` writes -- no awaitable lock -- so the retry loop can
+    call this inside the probe lock without violating the
+    ``probe_lock -> (nothing awaitable)`` ordering.
+    """
+    for key in keys:
+        _alias_routing_state.codex.set_cooldown_memory(key, seconds)
+
+
+def _publish_anthropic_cooldown_memory(*, keys: Sequence[str], seconds: float) -> None:
+    """Synchronously publish cooldowns into anthropic family memory (R3-1)."""
+    for key in keys:
+        _alias_routing_state.anthropic.set_cooldown_memory(key, seconds)
+
+
+async def _persist_codex_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
+    """Persist codex cooldown keys to durable Redis (post-release, R3-1)."""
+    ttl_seconds = max(0.0, float(seconds))
+    if ttl_seconds <= 0:
+        return
+    for key in keys:
+        await _write_aawm_alias_routing_durable_payload(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=key,
+            payload={"cooldown_key": key},
+            ttl_seconds=ttl_seconds,
+        )
+
+
+async def _persist_anthropic_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
+    """Persist anthropic cooldown keys to durable Redis (post-release, R3-1)."""
+    ttl_seconds = max(0.0, float(seconds))
+    if ttl_seconds <= 0:
+        return
+    for key in keys:
+        await _write_aawm_alias_routing_durable_payload(
+            alias_family="anthropic",
+            state_kind="cooldown",
+            state_key=key,
+            payload={"cooldown_key": key},
+            ttl_seconds=ttl_seconds,
+        )
+
+
 async def _apply_auto_agent_alias_cooldown(
     *,
     request: Request,
@@ -6356,9 +6528,6 @@ async def _apply_auto_agent_alias_cooldown(
     return cooldown_scope
 
 
-_READ_PILOT_COOLDOWN_KEY_PREFIX = "read_pilot:"
-
-
 async def _apply_codex_auto_agent_alias_cooldown(
     *,
     request: Request,
@@ -6401,24 +6570,35 @@ async def _apply_read_pilot_gated_cooldown(
 ) -> str:
     """Apply the ``CooldownEvidenceGate``'s decision for the read-pilot lane.
 
-    The read-pilot lane's cooldown-worthiness is decided by
+    Delegates to the pure publication-plan resolver
+    (:func:`_resolve_auto_agent_cooldown_publication_plan`) so this applicator
+    no longer owns a separate memory target or a fire-and-forget durable
+    target: the resolver derives the gate-driven scope/duration and the single
+    candidate key, this function publishes the memory key synchronously, and
+    the durable write is best-effort (must not block the selector-observed
+    value). The read-pilot lane's cooldown-worthiness is decided by
     ``_read_pilot_cooldown_gate`` (fed via ``_record_read_pilot_cooldown_evidence``
-    on failure). This makes that decision authoritative for what cooldown is
-    actually applied -- when the gate says "do not cool yet" (marker-only
-    evidence below the N-of-M threshold, or a non-coolable origin), no
-    cooldown is applied at all; when it says cool, the gate's own
-    duration/scope drives the applied candidate cooldown instead of the
-    legacy flat ``cooldown_seconds`` value.
+    on failure); when the gate says "do not cool yet", no cooldown is applied.
     """
-    decision = _read_pilot_cooldown_gate.current_decision(cooldown_key=selected_cooldown_key)
-    if not decision.should_cool:
+    plan = _resolve_auto_agent_cooldown_publication_plan(
+        request=None,
+        candidate={},
+        lane_key=None,
+        selected_cooldown_key=selected_cooldown_key,
+        cooldown_seconds=0.0,
+        error_class=None,
+        is_read_pilot_lane=True,
+    )
+    if plan.applied_scope == "none" or not plan.memory_keys:
         return "none"
     # Apply to the authoritative in-memory cooldown state synchronously so the
     # selector observes the full gate-resolved duration; the durable write is
     # best-effort and must not block that value.
-    _alias_routing_state.codex.set_cooldown_memory(selected_cooldown_key, decision.duration_seconds)
-    asyncio.ensure_future(set_candidate_cooldown(selected_cooldown_key, decision.duration_seconds))
-    return decision.scope or "candidate"
+    for key in plan.memory_keys:
+        _alias_routing_state.codex.set_cooldown_memory(key, plan.duration_seconds)
+    for key in plan.durable_keys:
+        asyncio.ensure_future(set_candidate_cooldown(key, plan.duration_seconds))
+    return plan.applied_scope
 
 
 async def _apply_anthropic_auto_agent_alias_cooldown(
@@ -6860,7 +7040,7 @@ def _record_read_pilot_cooldown_evidence(
     )
     attempt_record["origin"] = event.origin
     _read_pilot_cooldown_gate.record(
-        cooldown_key=cooldown_key or f"{_READ_PILOT_COOLDOWN_KEY_PREFIX}unknown",
+        cooldown_key=cooldown_key or "read_pilot:unknown",
         event=event,
     )
 
@@ -22280,311 +22460,103 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
     no_candidate_detail: str,
     log_label: str,
 ) -> Response:
-    """Shared Anthropic/Codex auto-agent alias candidate loop (RR-054 #10)."""
-    register_aawm_route_rollup_access_log_replacement(request)
-    attempts: list[dict[str, Any]] = []
-    last_retryable_exc: Optional[Exception] = None
-    has_continuation_state = _codex_auto_agent_request_has_continuation_state(prepared_request_body)
-    native_grok_continuation_transient_max_attempts = (
-        _get_codex_auto_agent_native_grok_continuation_transient_max_attempts()
+    """Shared Anthropic/Codex auto-agent alias candidate loop (RR-054 #10).
+
+    Thin façade that adapts the legacy per-call seam callables into the typed
+    :class:`AliasRouteServices` bundle and delegates to
+    :func:`aawm_alias_routing.candidate_loop.handle_alias_route`, which owns the
+    R3-1 widened-lock single-flight publication. The production wrappers
+    (``_handle_codex_auto_agent_alias_route`` /
+    ``_handle_anthropic_auto_agent_alias_route``) build the services directly;
+    this façade keeps the legacy seam contract for the RR-054 single-flight
+    tests, bridging the per-call ``apply_cooldown_fn`` into the resolver +
+    in-lock publisher via a per-call closure holder (concurrency-safe: each
+    invocation has its own holder).
+    """
+    # Per-call holder so the resolver can flow the exact apply kwargs to the
+    # in-lock publisher without a global (concurrent requests must not share).
+    apply_holder: dict[str, Any] = {}
+
+    def _legacy_resolve_publication(
+        *,
+        request: Optional[Request],
+        candidate: dict[str, Any],
+        lane_key: Optional[str],
+        selected_cooldown_key: str,
+        cooldown_seconds: float,
+        error_class: Optional[str],
+        grok_account_quota_exhausted: bool = False,
+        kimi_failure_metadata: Optional[dict[str, Any]] = None,
+        is_read_pilot_lane: bool = False,
+    ) -> _aawm_alias_interfaces.CooldownPublicationPlan:
+        apply_holder["kwargs"] = {
+            "request": request,
+            "candidate": candidate,
+            "lane_key": lane_key,
+            "selected_cooldown_key": selected_cooldown_key,
+            "cooldown_seconds": cooldown_seconds,
+            "error_class": error_class,
+            "grok_account_quota_exhausted": grok_account_quota_exhausted,
+            "kimi_failure_metadata": kimi_failure_metadata,
+            "is_read_pilot_lane": is_read_pilot_lane,
+        }
+        return _resolve_auto_agent_cooldown_publication_plan(
+            request=request,
+            candidate=candidate,
+            lane_key=lane_key,
+            selected_cooldown_key=selected_cooldown_key,
+            cooldown_seconds=cooldown_seconds,
+            error_class=error_class,
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+            is_read_pilot_lane=is_read_pilot_lane,
+        )
+
+    async def _legacy_publish_memory(*, keys: Sequence[str], seconds: float) -> str:
+        # Drive the legacy per-call applicator INSIDE the probe lock (R3-1) so
+        # its injected suspension / cooldown write completes before a queued
+        # follower can acquire the lock and re-probe. The applicator returns the
+        # authoritative applied scope.
+        kwargs = dict(apply_holder.get("kwargs") or {})
+        kwargs.pop("is_read_pilot_lane", None)
+        if apply_holder.get("kwargs", {}).get("is_read_pilot_lane"):
+            kwargs["is_read_pilot_lane"] = True
+        return await apply_cooldown_fn(**kwargs)
+
+    async def _legacy_persist(*, keys: Sequence[str], seconds: float) -> None:
+        # The legacy applicator already performed the durable write inside the
+        # lock; nothing to persist post-release on the legacy path.
+        return None
+
+    # The legacy seam callables are type-erased (``Callable[..., ...]``); cast
+    # them to the typed protocols at this bridge boundary. The production
+    # wrappers pass conforming functions directly and need no cast.
+    services = _aawm_alias_interfaces.AliasRouteServices(
+        select_candidate_fn=cast(_aawm_alias_interfaces.SelectCandidateFn, select_candidate_fn),
+        perform_candidate_request_fn=cast(
+            _aawm_alias_interfaces.PerformCandidateRequestFn, perform_candidate_request_fn
+        ),
+        resolve_cooldown_publication_fn=_legacy_resolve_publication,
+        # The legacy publisher returns the applied scope (awaited by the loop);
+        # bridge it to the sync ``PublishCooldownMemoryFn`` contract via Any.
+        publish_cooldown_memory_fn=cast(Any, _legacy_publish_memory),
+        persist_cooldown_fn=_legacy_persist,
+        set_session_affinity_fn=cast(_aawm_alias_interfaces.SetSessionAffinityFn, set_session_affinity_fn),
+        add_alias_metadata_fn=add_alias_metadata_fn,
+        raise_redispatch_fn=raise_redispatch_required_fn,
     )
-    # Request-scoped total for eligible native Grok continuation transient
-    # attempts. Must not reset when the outer candidate-selection loop re-enters.
-    native_grok_continuation_transient_provider_attempts = 0
-
-    def _raise_terminal_alias_failure(exc: Exception) -> Never:
-        last_attempt = attempts[-1] if attempts else {}
-        error_class = str(
-            last_attempt.get("error_class")
-            or _classify_codex_auto_agent_retryable_exhaustion(exc)
-            or "provider_terminal_error"
-        )
-        if error_class in {
-            "capacity_exhausted",
-            "rate_limited",
-            "usage_limit_reached",
-        }:
-            terminal_status_code = status.HTTP_429_TOO_MANY_REQUESTS
-        elif error_class == "safety_policy_denied":
-            terminal_status_code = status.HTTP_403_FORBIDDEN
-        elif error_class == "upstream_timeout":
-            terminal_status_code = status.HTTP_504_GATEWAY_TIMEOUT
-        elif error_class == "candidate_unavailable":
-            terminal_status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        else:
-            terminal_status_code = status.HTTP_502_BAD_GATEWAY
-        source_error = _get_codex_auto_agent_source_error_summary(
-            exc,
-            status_code=_extract_google_adapter_exception_status_code(exc),
-        )
-        terminal_exc = HTTPException(
-            status_code=terminal_status_code,
-            detail={
-                "error": {
-                    "message": source_error,
-                    "type": error_class,
-                    "code": "all_candidates_unavailable",
-                }
-            },
-        )
-        _emit_auto_agent_alias_no_candidate_event(
-            alias_family=alias_family,
-            alias_model=alias_model,
-            request=request,
-            request_body=prepared_request_body,
-            exc=terminal_exc,
-            attempts=attempts,
-        )
-        raise terminal_exc from None
-
-    for _attempt_number in range(max_candidate_attempts):
-        try:
-            selection = await select_candidate_fn(
-                request=request,
-                request_body=prepared_request_body,
-            )
-        except HTTPException as exc:
-            if exc.status_code == 429 and not _is_auto_agent_alias_in_flight_cooldown_http_exception(exc):
-                _emit_auto_agent_alias_no_candidate_event(
-                    alias_family=alias_family,
-                    alias_model=alias_model,
-                    request=request,
-                    request_body=prepared_request_body,
-                    exc=exc,
-                    attempts=attempts,
-                )
-            raise
-        candidate = selection["candidate"]
-        attempt_record = _codex_auto_agent_candidate_public_shape(
-            candidate,
-            lane_key=selection.get("lane_key"),
-            reason=selection.get("selection_reason"),
-        )
-        attempts.append(attempt_record)
-        candidate_body = _record_auto_agent_alias_attempt_started(
-            alias_family=alias_family,
-            alias_model=alias_model,
-            request=request,
-            prepared_request_body=prepared_request_body,
-            selection=selection,
-            attempts=attempts,
-            attempt_record=attempt_record,
-            add_alias_metadata_fn=add_alias_metadata_fn,
-        )
-        while True:
-            try:
-                probe_lock = await _alias_routing_state.candidate_probe_lock(
-                    alias_family=alias_family,
-                    cooldown_key=selection["cooldown_key"],
-                )
-                skip_after_probe_wait = False
-                await probe_lock.acquire()
-                try:
-                    active_seconds, _active_source = await get_active_cooldown_state_fn(selection["cooldown_key"])
-                    if active_seconds > 0:
-                        skip_after_probe_wait = True
-                        attempt_record["status"] = "skipped_single_flight_cooldown"
-                        attempt_record["cooldown_seconds"] = active_seconds
-                    else:
-                        response = await perform_candidate_request_fn(
-                            candidate=candidate,
-                            candidate_body=candidate_body,
-                        )
-                finally:
-                    probe_lock.release()
-                if skip_after_probe_wait:
-                    break
-                await set_session_affinity_fn(
-                    selection.get("session_key"),
-                    candidate,
-                )
-                return response
-            except Exception as exc:
-                kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
-                    exc,
-                    candidate=candidate,
-                )
-                error_class = _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
-                if error_class is None:
-                    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
-                if error_class is None:
-                    raise
-                last_retryable_exc = exc
-                grok_account_quota_exhausted = _is_codex_auto_agent_grok_account_quota_exhaustion(
-                    exc,
-                    candidate=candidate,
-                )
-                cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
-                    exc,
-                    candidate=candidate,
-                )
-                # For the read lane only, classify + record this attempt's
-                # failure evidence into the N-of-M gate BEFORE applying the
-                # cooldown, keyed on the live ``provider:model:lane`` key, so
-                # the gate's decision drives the applied cooldown for the same
-                # attempt. Every other lane keeps its existing ordering. The
-                # ``is_read_pilot_lane`` signal is only threaded to the apply
-                # site on the read lane (always the real Codex applicator),
-                # leaving the generic ``apply_cooldown_fn`` contract untouched
-                # for every other lane and every test-provided stub.
-                is_read_pilot_lane = alias_model == _READ_PILOT_ALIAS_NAME
-                if is_read_pilot_lane:
-                    _record_read_pilot_cooldown_evidence(
-                        cooldown_key=selection["cooldown_key"],
-                        exc=exc,
-                        attempt_record=attempt_record,
-                    )
-                cooldown_scope = await apply_cooldown_fn(
-                    request=request,
-                    candidate=candidate,
-                    lane_key=selection.get("lane_key"),
-                    selected_cooldown_key=selection["cooldown_key"],
-                    cooldown_seconds=cooldown_seconds,
-                    error_class=error_class,
-                    grok_account_quota_exhausted=grok_account_quota_exhausted,
-                    kimi_failure_metadata=kimi_failure_metadata,
-                    **({"is_read_pilot_lane": True} if is_read_pilot_lane else {}),
-                )
-                error_tokens = _update_codex_auto_agent_retryable_attempt_record(
-                    attempt_record=attempt_record,
-                    exc=exc,
-                    error_class=error_class,
-                    cooldown_seconds=cooldown_seconds,
-                    cooldown_scope=cooldown_scope,
-                    alias_model=alias_model,
-                    candidate=candidate,
-                    kimi_failure_metadata=kimi_failure_metadata,
-                )
-                if cooldown_scope == "none" and not has_continuation_state:
-                    _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
-                        request,
-                        candidate=candidate,
-                        lane_key=selection.get("lane_key"),
-                    )
-                if has_continuation_state and cooldown_scope != "none":
-                    attempt_record["status"] = "terminal_in_flight_cooldown_set"
-                    failure_body = _record_auto_agent_alias_attempt_failure(
-                        alias_family=alias_family,
-                        alias_model=alias_model,
-                        request=request,
-                        prepared_request_body=prepared_request_body,
-                        selection=selection,
-                        attempts=attempts,
-                        attempt_record=attempt_record,
-                        error_class=error_class,
-                        add_alias_metadata_fn=add_alias_metadata_fn,
-                        redispatch_required=True,
-                    )
-                    failure_metadata = failure_body.get("litellm_metadata") or {}
-                    verbose_proxy_logger.debug(
-                        "%s auto-agent alias %s target %s/%s hit %s "
-                        "for an in-flight session on attempt %s; signaling redispatch",
-                        log_label,
-                        alias_model,
-                        candidate["provider"],
-                        candidate["model"],
-                        error_class,
-                        len(attempts),
-                    )
-                    raise_redispatch_required_fn(
-                        candidate=candidate,
-                        lane_key=selection.get("lane_key"),
-                        cooldown_seconds=cooldown_seconds,
-                        error_tokens=error_tokens,
-                        alias_model=alias_model,
-                        error_class=error_class,
-                        cooldown_scope=cooldown_scope,
-                        error_status_code=attempt_record.get("error_status_code"),
-                        error_type=attempt_record.get("error_type"),
-                        error_code=attempt_record.get("error_code"),
-                        retry_after_seconds=attempt_record.get("retry_after_seconds"),
-                        failure_phase=attempt_record.get("failure_phase"),
-                        attempted_provider_call=attempt_record.get("attempted_provider_call"),
-                        audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
-                        attempts=failure_metadata.get(attempts_metadata_key),
-                        skipped_candidates=failure_metadata.get(skipped_candidates_metadata_key),
-                    )
-                native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
-                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=has_continuation_state,
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                )
-                if native_grok_retry_eligible:
-                    native_grok_continuation_transient_provider_attempts += 1
-                    native_grok_provider_attempt = native_grok_continuation_transient_provider_attempts
-                else:
-                    native_grok_provider_attempt = 0
-                (
-                    should_retry_same_candidate,
-                    same_candidate_backoff_seconds,
-                    native_grok_retry_metadata,
-                ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
-                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                    has_continuation_state=has_continuation_state,
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                    provider_attempt=native_grok_provider_attempt,
-                    provider=str(candidate.get("provider") or "") or None,
-                    model=str(candidate.get("model") or "") or None,
-                    route_family=str(candidate.get("route_family") or "") or None,
-                    max_attempts=native_grok_continuation_transient_max_attempts,
-                )
-                if native_grok_retry_metadata is not None:
-                    attempt_record["native_grok_continuation_retry"] = native_grok_retry_metadata
-                _record_auto_agent_alias_attempt_failure(
-                    alias_family=alias_family,
-                    alias_model=alias_model,
-                    request=request,
-                    prepared_request_body=prepared_request_body,
-                    selection=selection,
-                    attempts=attempts,
-                    attempt_record=attempt_record,
-                    error_class=error_class,
-                    add_alias_metadata_fn=add_alias_metadata_fn,
-                )
-                verbose_proxy_logger.debug(
-                    "%s auto-agent alias %s target %s/%s hit %s on attempt %s; " "cooldown %.1fs scope=%s tokens=%s",
-                    log_label,
-                    alias_model,
-                    candidate["provider"],
-                    candidate["model"],
-                    error_class,
-                    len(attempts),
-                    cooldown_seconds,
-                    cooldown_scope,
-                    sorted(error_tokens),
-                )
-                if should_retry_same_candidate:
-                    if same_candidate_backoff_seconds and same_candidate_backoff_seconds > 0:
-                        await asyncio.sleep(same_candidate_backoff_seconds)
-                    attempt_record = _codex_auto_agent_candidate_public_shape(
-                        candidate,
-                        lane_key=selection.get("lane_key"),
-                        reason="native_grok_continuation_same_candidate_retry",
-                    )
-                    attempts.append(attempt_record)
-                    candidate_body = _record_auto_agent_alias_attempt_started(
-                        alias_family=alias_family,
-                        alias_model=alias_model,
-                        request=request,
-                        prepared_request_body=prepared_request_body,
-                        selection=selection,
-                        attempts=attempts,
-                        attempt_record=attempt_record,
-                        add_alias_metadata_fn=add_alias_metadata_fn,
-                    )
-                    continue
-                if native_grok_retry_eligible:
-                    # Same-candidate budget exhausted; do not switch providers.
-                    _raise_terminal_alias_failure(last_retryable_exc)
-                break
-
-    if last_retryable_exc is not None:
-        _raise_terminal_alias_failure(last_retryable_exc)
-    raise HTTPException(
-        status_code=429,
-        detail=no_candidate_detail,
+    return await _aawm_alias_candidate_loop.handle_alias_route(
+        services,
+        alias_family=alias_family,
+        alias_model=alias_model,
+        request=request,
+        prepared_request_body=prepared_request_body,
+        max_candidate_attempts=max_candidate_attempts,
+        get_active_cooldown_state_fn=get_active_cooldown_state_fn,
+        attempts_metadata_key=attempts_metadata_key,
+        skipped_candidates_metadata_key=skipped_candidates_metadata_key,
+        no_candidate_detail=no_candidate_detail,
+        log_label=log_label,
     )
 
 
@@ -22619,19 +22591,24 @@ async def _handle_anthropic_auto_agent_alias_route(
             custom_headers=custom_headers,
         )
 
-    return await _handle_auto_agent_alias_route(
+    services = _aawm_alias_interfaces.AliasRouteServices(
+        select_candidate_fn=_select_anthropic_auto_agent_candidate,
+        perform_candidate_request_fn=_perform_candidate_request,
+        resolve_cooldown_publication_fn=_resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=_publish_anthropic_cooldown_memory,
+        persist_cooldown_fn=_persist_anthropic_cooldown_durable,
+        set_session_affinity_fn=_set_anthropic_auto_agent_session_affinity,
+        add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
+        raise_redispatch_fn=_raise_anthropic_auto_agent_redispatch_required,
+    )
+    return await _aawm_alias_candidate_loop.handle_alias_route(
+        services,
         alias_family="anthropic_auto_agent",
         alias_model=alias_model,
         request=request,
         prepared_request_body=prepared_request_body,
         max_candidate_attempts=len(_get_anthropic_auto_agent_candidates_for_alias(alias_model)),
-        select_candidate_fn=_select_anthropic_auto_agent_candidate,
-        add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
-        perform_candidate_request_fn=_perform_candidate_request,
-        get_active_cooldown_state_fn=(_get_anthropic_auto_agent_active_cooldown_state),
-        set_session_affinity_fn=_set_anthropic_auto_agent_session_affinity,
-        apply_cooldown_fn=_apply_anthropic_auto_agent_alias_cooldown,
-        raise_redispatch_required_fn=_raise_anthropic_auto_agent_redispatch_required,
+        get_active_cooldown_state_fn=_get_anthropic_auto_agent_active_cooldown_state,
         attempts_metadata_key="anthropic_auto_agent_attempts",
         skipped_candidates_metadata_key="anthropic_auto_agent_skipped_candidates",
         no_candidate_detail="No Anthropic auto-agent alias candidates were available.",
@@ -25594,7 +25571,18 @@ async def _handle_codex_auto_agent_alias_route(
             forward_headers=forward_headers,
         )
 
-    return await _handle_auto_agent_alias_route(
+    services = _aawm_alias_interfaces.AliasRouteServices(
+        select_candidate_fn=_select_codex_auto_agent_candidate,
+        perform_candidate_request_fn=_perform_candidate_request,
+        resolve_cooldown_publication_fn=_resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=_publish_codex_cooldown_memory,
+        persist_cooldown_fn=_persist_codex_cooldown_durable,
+        set_session_affinity_fn=_set_codex_auto_agent_session_affinity,
+        add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
+        raise_redispatch_fn=_raise_codex_auto_agent_redispatch_required,
+    )
+    return await _aawm_alias_candidate_loop.handle_alias_route(
+        services,
         alias_family="codex_auto_agent",
         alias_model=alias_model,
         request=request,
@@ -25606,13 +25594,7 @@ async def _handle_codex_auto_agent_alias_route(
                 client_product_label=client_product_label,
             ).candidates
         ),
-        select_candidate_fn=_select_codex_auto_agent_candidate,
-        add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
-        perform_candidate_request_fn=_perform_candidate_request,
         get_active_cooldown_state_fn=_get_codex_auto_agent_active_cooldown_state,
-        set_session_affinity_fn=_set_codex_auto_agent_session_affinity,
-        apply_cooldown_fn=_set_codex_auto_agent_candidate_cooldowns,
-        raise_redispatch_required_fn=_raise_codex_auto_agent_redispatch_required,
         attempts_metadata_key="codex_auto_agent_attempts",
         skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
         no_candidate_detail="No Codex auto-agent alias candidates were available.",
