@@ -35,17 +35,18 @@ Published source / packaging:
 - `.wheel-build/aawm_litellm_callbacks/__init__.py`
 - `.wheel-build/aawm_litellm_callbacks/agent_identity.py` (thin checkout re-export
   loader only; **not** a second maintained implementation)
-- `litellm/integrations/aawm_agent_identity.py` (canonical agent-identity host;
+- `litellm/integrations/aawm_agent_identity/` (canonical agent-identity package;
   re-exports package-owned session_history surfaces)
 - `litellm/integrations/aawm_session_history/` (package-owned durable writer,
   spool, retry, record builders, SQL constants)
 - `litellm/integrations/aawm_session_history_sql.py` (compat re-export of SQL)
 
-Build packaging (RR-003 + RR-006): hatch `force-include` maps the canonical
-agent-identity file into `aawm_litellm_callbacks/agent_identity.py` and maps
-`aawm_session_history` (+ sql shim) under `litellm/integrations/` inside the
-published wheel/sdist so production installs resolve package imports without
-dual-maintaining full copies under `.wheel-build/`. Guard with
+Build packaging (RR-003 + RR-006): hatch `force-include` maps every canonical
+agent-identity package module and `aawm_session_history` (+ sql shim) under
+`litellm/integrations/` inside the published wheel/sdist. The
+`aawm_litellm_callbacks.agent_identity` module remains a thin re-export loader,
+so production installs resolve the canonical package without dual-maintaining
+full copies under `.wheel-build/`. Guard with
 `python scripts/sync_aawm_agent_identity_to_wheel.py --check` (read-only;
 does not copy sources).
 
@@ -461,7 +462,7 @@ When rebasing this fork:
   byte-synced full tree under `.wheel-build/`; session_history package modules
   are also force-included so wheel agent_identity imports resolve)
 - bump the relevant wheel version whenever wheel-visible behavior changes
-- after editing the canonical agent-identity module or `aawm_session_history`,
+- after editing the canonical agent-identity package or `aawm_session_history`,
   run `python scripts/sync_aawm_agent_identity_to_wheel.py --check` (loader +
   packaging guard only) and rebuild the callback wheel; do not reintroduce a
   full source copy under `.wheel-build/`

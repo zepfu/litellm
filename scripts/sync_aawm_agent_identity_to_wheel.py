@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Guard single-source packaging for callback-wheel agent_identity (RR-003).
 
-Canonical implementation lives only at::
+Canonical implementation lives only in::
 
-    litellm/integrations/aawm_agent_identity.py
+    litellm/integrations/aawm_agent_identity/
 
 ``.wheel-build/aawm_litellm_callbacks/agent_identity.py`` must remain a thin
-checkout loader that re-exports that module. The published
-``aawm-litellm-callbacks`` wheel force-includes the canonical file via hatch
-(see ``.wheel-build/pyproject.toml``); do **not** reintroduce a full maintained
-source copy under ``.wheel-build/``.
+checkout loader that re-exports that package. The published
+``aawm-litellm-callbacks`` wheel force-includes every canonical package module
+via hatch (see ``.wheel-build/pyproject.toml``); do **not** reintroduce a full
+maintained source copy under ``.wheel-build/``.
 
 Usage::
 
@@ -17,7 +17,7 @@ Usage::
     python scripts/sync_aawm_agent_identity_to_wheel.py --check
 
 Both modes are read-only checks. There is nothing to copy: packaging pulls the
-canonical module at wheel build time.
+canonical package modules at wheel build time.
 """
 
 from __future__ import annotations
@@ -28,17 +28,22 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CANONICAL = REPO_ROOT / "litellm" / "integrations" / "aawm_agent_identity.py"
+CANONICAL_PACKAGE = REPO_ROOT / "litellm" / "integrations" / "aawm_agent_identity"
+CANONICAL_INIT = CANONICAL_PACKAGE / "__init__.py"
 LOADER = REPO_ROOT / ".wheel-build" / "aawm_litellm_callbacks" / "agent_identity.py"
 PYPROJECT = REPO_ROOT / ".wheel-build" / "pyproject.toml"
 
 _MAX_LOADER_LINES = 80
-_FORCE_INCLUDE_SNIPPET = (
+_FORCE_INCLUDE_SECTIONS = (
+    "tool.hatch.build.targets.wheel.force-include",
+    "tool.hatch.build.targets.sdist.force-include",
+)
+_LEGACY_FORCE_INCLUDE_SNIPPET = (
     '"../litellm/integrations/aawm_agent_identity.py" = '
     '"aawm_litellm_callbacks/agent_identity.py"'
 )
 # RR-006: wheel must also ship package-owned session_history modules so the
-# force-included agent_identity import path resolves inside the wheel.
+# force-included agent_identity package imports resolve inside the wheel.
 _SESSION_HISTORY_FORCE_INCLUDE_SNIPPETS = (
     '"../litellm/integrations/aawm_session_history/__init__.py" = '
     '"litellm/integrations/aawm_session_history/__init__.py"',
@@ -62,7 +67,7 @@ _SESSION_HISTORY_FORCE_INCLUDE_SNIPPETS = (
 _REQUIRED_LOADER_MARKERS = (
     "Checkout loader for aawm_litellm_callbacks",
     "litellm.integrations.aawm_agent_identity",
-    "force-includes the canonical file",
+    "force-includes the canonical package",
 )
 _FORBIDDEN_LOADER_MARKERS = (
     "class AawmAgentIdentity",
@@ -75,10 +80,35 @@ def _line_count(path: Path) -> int:
     return path.read_text(encoding="utf-8").count("\n") + 1
 
 
+def _canonical_package_force_include_snippets() -> tuple[str, ...]:
+    snippets = []
+    for source_path in sorted(CANONICAL_PACKAGE.rglob("*.py")):
+        repo_relative = source_path.relative_to(REPO_ROOT).as_posix()
+        snippets.append(f'"../{repo_relative}" = "{repo_relative}"')
+    return tuple(snippets)
+
+
+def _section_body(text: str, section_name: str) -> str | None:
+    header_match = re.search(
+        rf"(?m)^\[{re.escape(section_name)}\]\s*$",
+        text,
+    )
+    if header_match is None:
+        return None
+    body_start = header_match.end()
+    next_section = re.search(r"(?m)^\[", text[body_start:])
+    if next_section is None:
+        return text[body_start:]
+    return text[body_start : body_start + next_section.start()]
+
+
 def _validate() -> list[str]:
     errors: list[str] = []
-    if not CANONICAL.is_file():
-        errors.append(f"missing canonical {CANONICAL}")
+    if not CANONICAL_PACKAGE.is_dir():
+        errors.append(f"missing canonical package {CANONICAL_PACKAGE}")
+        return errors
+    if not CANONICAL_INIT.is_file():
+        errors.append(f"missing canonical package initializer {CANONICAL_INIT}")
         return errors
     if not LOADER.is_file():
         errors.append(f"missing checkout loader {LOADER}")
@@ -103,9 +133,9 @@ def _validate() -> list[str]:
                 f"checkout loader looks like a full implementation "
                 f"(found {marker!r}); use thin re-export only"
             )
-    if loader_text == CANONICAL.read_text(encoding="utf-8"):
+    if loader_text == CANONICAL_INIT.read_text(encoding="utf-8"):
         errors.append(
-            "checkout loader is byte-identical to canonical; dual-maintained "
+            "checkout loader is byte-identical to canonical __init__; dual-maintained "
             "full source copy is forbidden"
         )
 
@@ -115,22 +145,28 @@ def _validate() -> list[str]:
             ".wheel-build/pyproject.toml must use hatchling.build for "
             "force-include packaging"
         )
-    if "[tool.hatch.build.targets.wheel.force-include]" not in pyproject_text:
-        errors.append(
-            ".wheel-build/pyproject.toml missing "
-            "[tool.hatch.build.targets.wheel.force-include]"
-        )
-    if _FORCE_INCLUDE_SNIPPET not in pyproject_text:
-        errors.append(
-            ".wheel-build/pyproject.toml missing force-include mapping of "
-            "canonical agent_identity into the callback package"
-        )
-    for snippet in _SESSION_HISTORY_FORCE_INCLUDE_SNIPPETS:
-        if snippet not in pyproject_text:
+    required_snippets = (
+        *_canonical_package_force_include_snippets(),
+        *_SESSION_HISTORY_FORCE_INCLUDE_SNIPPETS,
+    )
+    for section_name in _FORCE_INCLUDE_SECTIONS:
+        section_body = _section_body(pyproject_text, section_name)
+        if section_body is None:
             errors.append(
-                ".wheel-build/pyproject.toml missing session_history "
-                f"force-include mapping: {snippet}"
+                f".wheel-build/pyproject.toml missing [{section_name}]"
             )
+            continue
+        for snippet in required_snippets:
+            if snippet not in section_body:
+                errors.append(
+                    f".wheel-build/pyproject.toml [{section_name}] missing "
+                    f"force-include mapping: {snippet}"
+                )
+    if _LEGACY_FORCE_INCLUDE_SNIPPET in pyproject_text:
+        errors.append(
+            ".wheel-build/pyproject.toml still contains the obsolete "
+            "single-file agent_identity force-include mapping"
+        )
     # Reject accidental setuptools dual-copy package layouts that drop force-include.
     if (
         re.search(
@@ -162,17 +198,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {error}", file=sys.stderr)  # noqa: T201
         print(  # noqa: T201
             "RR-003 single-source packaging check failed.\n"
-            "Canonical source: litellm/integrations/aawm_agent_identity.py\n"
-            "Checkout path must stay a thin loader; hatch force-includes "
-            "the canonical module into the published wheel.",
+            "Canonical source: litellm/integrations/aawm_agent_identity/\n"
+            "Checkout path must stay a thin loader; hatch must force-include "
+            "every canonical package module into the published wheel and sdist.",
             file=sys.stderr,
         )
         return 1
 
     print(  # noqa: T201
-        "ok: thin checkout loader + hatch force-include single-source packaging (agent_identity + aawm_session_history)"
+        "ok: thin checkout loader + hatch force-include single-source packaging "
+        "(aawm_agent_identity package + aawm_session_history)"
     )
-    print(f"  canonical: {CANONICAL}")  # noqa: T201
+    print(f"  canonical: {CANONICAL_PACKAGE}")  # noqa: T201
     print(f"  loader:    {LOADER} ({_line_count(LOADER)} lines)")  # noqa: T201
     print(f"  packaging: {PYPROJECT}")  # noqa: T201
     return 0

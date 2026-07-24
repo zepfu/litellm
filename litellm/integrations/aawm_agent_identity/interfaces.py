@@ -1,4 +1,4 @@
-"""Typed seams for the AAWM identity observation pipeline (Wave A3A).
+"""Typed seams for the AAWM identity observation pipeline (Waves A3A/A3B).
 
 This module introduces the *typed specification* of the rate-limit /
 provider-error observation contract that the extracted bands
@@ -21,9 +21,20 @@ build it directly once the record boundary moves.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Tuple,
+    runtime_checkable,
+)
 
 
 class CallbackEnvelope(Dict[str, Any]):
@@ -151,3 +162,104 @@ class ObservationExtractor(Protocol):
         observed_at: Any,
     ) -> List[Dict[str, Any]]:
         ...
+
+
+@dataclass(frozen=True)
+class ProviderCacheState:
+    """Typed provider-cache state used by the production cache pipeline.
+
+    Fields mirror the CLAUDE.md-documented stable session_history columns
+    (``provider_cache_status``, ``provider_cache_miss_reason``,
+    ``provider_cache_miss_token_count``, ``provider_cache_miss_cost_usd``)
+    plus the internal bookkeeping fields the state machine produces.
+
+    ``record_fields`` preserves the exact legacy mapping shape when the typed
+    state crosses the session-history or metadata boundary.
+    """
+
+    RECORD_FIELD_ORDER: ClassVar[Tuple[str, ...]] = (
+        "attempted",
+        "status",
+        "miss",
+        "miss_reason",
+        "miss_token_count",
+        "miss_cost_usd",
+        "miss_cost_basis",
+        "source",
+        "supports_prompt_caching",
+    )
+
+    # --- stable record columns ---
+    status: Optional[str] = None
+    miss_reason: Optional[str] = None
+    miss_token_count: Optional[int] = None
+    miss_cost_usd: Optional[float] = None
+
+    # --- internal bookkeeping ---
+    attempted: bool = False
+    miss: bool = False
+    source: Optional[str] = None
+    miss_cost_basis: Optional[str] = None
+
+    # --- extended metadata (not mapped to stable columns) ---
+    supports_prompt_caching: Optional[bool] = None
+
+    record_fields: FrozenSet[str] = field(
+        default_factory=lambda: frozenset(ProviderCacheState.RECORD_FIELD_ORDER),
+        repr=False,
+        compare=False,
+    )
+
+    @classmethod
+    def from_record_dict(cls, state: Mapping[str, Any]) -> "ProviderCacheState":
+        """Create typed state from the existing resolver mapping contract."""
+        return cls(
+            attempted=bool(state.get("attempted")),
+            status=state.get("status"),
+            miss=bool(state.get("miss")),
+            miss_reason=state.get("miss_reason"),
+            miss_token_count=state.get("miss_token_count"),
+            miss_cost_usd=state.get("miss_cost_usd"),
+            miss_cost_basis=state.get("miss_cost_basis"),
+            source=state.get("source"),
+            supports_prompt_caching=state.get("supports_prompt_caching"),
+            record_fields=frozenset(
+                key for key in cls.RECORD_FIELD_ORDER if key in state
+            ),
+        )
+
+    def with_cost_state(
+        self,
+        cost_state: Mapping[str, Any],
+    ) -> "ProviderCacheState":
+        """Return a new state with cache-miss cost fields applied."""
+        return replace(
+            self,
+            miss_token_count=cost_state.get(
+                "miss_token_count", self.miss_token_count
+            ),
+            miss_cost_usd=cost_state.get("miss_cost_usd", self.miss_cost_usd),
+            miss_cost_basis=cost_state.get(
+                "miss_cost_basis", self.miss_cost_basis
+            ),
+            record_fields=self.record_fields.union(cost_state.keys()),
+        )
+
+    def to_record_dict(self) -> Dict[str, Any]:
+        """Return the exact backward-compatible mapping shape."""
+        values = {
+            "attempted": self.attempted,
+            "status": self.status,
+            "miss": self.miss,
+            "miss_reason": self.miss_reason,
+            "miss_token_count": self.miss_token_count,
+            "miss_cost_usd": self.miss_cost_usd,
+            "miss_cost_basis": self.miss_cost_basis,
+            "source": self.source,
+            "supports_prompt_caching": self.supports_prompt_caching,
+        }
+        return {
+            key: values[key]
+            for key in self.RECORD_FIELD_ORDER
+            if key in self.record_fields
+        }

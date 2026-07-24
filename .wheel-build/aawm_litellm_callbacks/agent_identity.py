@@ -8,9 +8,10 @@ This file is intentionally *not* a maintained full source copy of
   aligned without dual maintenance (including underscore helpers that
   ``import *`` would omit).
 - When this package is built into the ``aawm-litellm-callbacks`` wheel, hatch
-  force-includes the canonical file as ``aawm_litellm_callbacks/agent_identity.py``
-  (see ``.wheel-build/pyproject.toml``), so the installed wheel module is the
-  full implementation and does not depend on this loader.
+  force-includes the canonical package under
+  ``litellm/integrations/aawm_agent_identity/`` (see
+  ``.wheel-build/pyproject.toml``), so this loader resolves the packaged
+  implementation without a second maintained source tree.
 
 Do not paste the full integration body back into this path.
 """

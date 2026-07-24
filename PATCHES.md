@@ -9,10 +9,10 @@ upstream releases with AAWM-specific patches applied on top.
 
 **Callback wheel:** production callback changes are published separately from
 `.wheel-build/` and consumed as a GitHub release wheel by the production image.
-Canonical agent-identity implementation is only
-`litellm/integrations/aawm_agent_identity.py`. The checkout path
+Canonical agent-identity implementation exists only under
+`litellm/integrations/aawm_agent_identity/`. The checkout path
 `.wheel-build/aawm_litellm_callbacks/agent_identity.py` is a thin re-export
-loader; hatch force-includes the canonical module into the published
+loader; hatch force-includes the canonical package into the published
 `aawm-litellm-callbacks` wheel so production does not dual-maintain a full
 source copy (RR-003). Guard with
 `python scripts/sync_aawm_agent_identity_to_wheel.py --check`. See
@@ -3978,10 +3978,11 @@ published fork image tag `v1.82.3-aawm.72` from current `main`.
 
 As of RR-003, the checkout path `.wheel-build/aawm_litellm_callbacks/agent_identity.py`
 is a thin re-export loader only. Canonical source is solely
-`litellm/integrations/aawm_agent_identity.py`, and hatch force-includes that file into
-the published `aawm-litellm-callbacks` wheel. Historical `cb-v*` entries below that
-describe byte-syncing a full source copy under `.wheel-build/` refer to the older dual-copy
-workflow and are not the current packaging model. Guard with
+`litellm/integrations/aawm_agent_identity/`, and hatch force-includes that
+package into the published `aawm-litellm-callbacks` wheel. Historical `cb-v*`
+entries below that describe byte-syncing a full source copy under `.wheel-build/`
+refer to the older dual-copy workflow and are not the current packaging model.
+Guard with
 `python scripts/sync_aawm_agent_identity_to_wheel.py --check`.
 
 ---

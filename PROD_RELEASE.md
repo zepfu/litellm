@@ -169,8 +169,9 @@ because GitHub suppresses recursive workflow triggers from the workflow token.
 If the autobump job creates `cb-v*`, `cp-v*`, `cfg-v*`, or `h-v*` tags but the
 matching GitHub Releases are missing, build and upload the missing assets before
 the infrastructure rebuild. Callback agent identity is single-source: edit only
-`litellm/integrations/aawm_agent_identity.py`; hatch force-includes it into the
-wheel built from `.wheel-build/` (checkout `agent_identity.py` is a thin loader).
+modules under `litellm/integrations/aawm_agent_identity/`; hatch force-includes
+that package into the wheel built from `.wheel-build/` (checkout
+`agent_identity.py` is a thin loader).
 Guard with
 `./.venv/bin/python scripts/sync_aawm_agent_identity_to_wheel.py --check`
 before publishing. Example recovery flow:
@@ -616,9 +617,10 @@ gaps, and session-history gaps remain hard failures.
 
 - Callback behavior in prod comes from the overlay wheel, not only the in-repo
   `litellm/integrations` import path. When fixing callback behavior, edit the
-  canonical `litellm/integrations/aawm_agent_identity.py` (hatch force-includes
-  it into the published callback wheel; do not maintain a full second copy under
-  `.wheel-build/`), publish the callback wheel, rebuild the infrastructure
+  canonical modules under `litellm/integrations/aawm_agent_identity/` (hatch
+  force-includes the package into the published callback wheel; do not maintain
+  a full second copy under `.wheel-build/`), publish the callback wheel, rebuild
+  the infrastructure
   image, and verify installed package versions inside the built/running
   container before relying on prod harness evidence.
 - GitHub release workflows require the tagged commit to be reachable from

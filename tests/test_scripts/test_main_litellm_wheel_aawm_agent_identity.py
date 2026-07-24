@@ -12,7 +12,12 @@ from poetry.core.factory import Factory
 from poetry.core.masonry.builders.wheel import WheelBuilder
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-AGENT_IDENTITY_MEMBER = "litellm/integrations/aawm_agent_identity.py"
+AGENT_IDENTITY_PACKAGE = "litellm/integrations/aawm_agent_identity"
+REQUIRED_AGENT_IDENTITY_MEMBERS = (
+    f"{AGENT_IDENTITY_PACKAGE}/__init__.py",
+    f"{AGENT_IDENTITY_PACKAGE}/interfaces.py",
+    f"{AGENT_IDENTITY_PACKAGE}/provider_cache.py",
+)
 EXCLUDED_MEMBERS = (
     "litellm/integrations/aawm_payload_capture.py",
     "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py",
@@ -75,7 +80,8 @@ def test_main_litellm_wheel_includes_aawm_agent_identity_helpers(tmp_path: Path)
     with zipfile.ZipFile(wheel_path) as archive:
         member_names = set(archive.namelist())
 
-    assert AGENT_IDENTITY_MEMBER in member_names
+    for required_member in REQUIRED_AGENT_IDENTITY_MEMBERS:
+        assert required_member in member_names
     for excluded_member in EXCLUDED_MEMBERS:
         assert excluded_member not in member_names
 
@@ -84,7 +90,11 @@ def test_main_litellm_wheel_includes_aawm_agent_identity_helpers(tmp_path: Path)
     _install_wheel_to_target(wheel_path=wheel_path, install_dir=install_dir)
 
     installed_module = (
-        install_dir / "litellm" / "integrations" / "aawm_agent_identity.py"
+        install_dir
+        / "litellm"
+        / "integrations"
+        / "aawm_agent_identity"
+        / "__init__.py"
     )
     assert installed_module.is_file()
 
