@@ -38609,11 +38609,15 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
     fallback_success = Response(content='{"ok": true}', media_type="application/json")
     spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
     grok45_cooldown_key = "xai:xai/grok-4.5:xai_grok_native"
+    dual_cache = _FakeAawmAliasRoutingDualCache()
     await _set_anthropic_auto_agent_cooldown(spark_cooldown_key, 120.0)
     await _set_codex_auto_agent_cooldown(spark_cooldown_key, 120.0)
     await _set_anthropic_auto_agent_cooldown(grok45_cooldown_key, 120.0)
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
         new=AsyncMock(side_effect=AssertionError("Spark must be skipped")),
     ) as mock_spark, patch(

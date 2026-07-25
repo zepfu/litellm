@@ -136,6 +136,7 @@ def test_rr054_package_public_surface_matches_init() -> None:
         "adapter_driver",
         "alias_routing_state",
         "AliasRoutingStateManager",
+        "cooldown_state",
         "google_oauth",
         "memory",
         "oauth_token_cache",
@@ -143,6 +144,7 @@ def test_rr054_package_public_surface_matches_init() -> None:
         "provider_shaping",
         "responses_finalize",
         "retry",
+        "selection",
         "state",
         "streaming",
         "task_state",
@@ -154,10 +156,12 @@ def test_rr054_package_public_surface_matches_init() -> None:
     assert package.retry is retry
     assert package.adapter_config is adapter_config
     assert package.adapter_driver is adapter_driver
+    assert package.cooldown_state.__name__.endswith(".cooldown_state")
     assert package.google_oauth is google_oauth
     assert package.oauth_token_cache is oauth_token_cache
     assert package.provider_shaping is provider_shaping
     assert package.responses_finalize is responses_finalize
+    assert package.selection.__name__.endswith(".selection")
     assert package.state is state
     assert package.streaming is streaming
     assert package.task_state is task_state

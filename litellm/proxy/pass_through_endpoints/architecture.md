@@ -268,19 +268,27 @@ provider algorithms back into the route module. Responses finalization is
 configured with explicit runtime callbacks so that control flow is
 package-owned without importing the FastAPI route module.
 
-#### Wave 5A deferred state (until Wave 5B)
+#### Wave 5A deferred state (resolved in Wave 5B)
 
-The following process-local state remains god-module-owned in
-`llm_passthrough_endpoints.py`. Wave 5A modules access them only through
-injected callbacks or shared object references:
+The following process-local state moved onto `AliasRoutingStateManager` in
+Wave 5B. God-module facades and Wave 5A modules access them through manager
+methods or injected callbacks:
 
 | State | Owner | Access seam |
 |-------|-------|-------------|
-| `_openrouter_free_daily_quota_cache` (tuple) | `llm_passthrough_endpoints.py` | getter/setter callbacks injected via `configure_openrouter_quota_runtime` |
-| `_openrouter_free_daily_quota_lock` (asyncio.Lock) | `llm_passthrough_endpoints.py` | shared lock object injected via `configure_openrouter_quota_runtime` |
-| `_round_robin_cursor_by_alias` (dict) | `llm_passthrough_endpoints.py` | accessed directly by snapshot_select via god-module import at call site |
+| `_openrouter_free_daily_quota_cache` (tuple) | `AliasRoutingStateManager` | `get/set_openrouter_free_quota_cache()` methods; god-module `__getattr__` compat |
+| `_openrouter_free_daily_quota_lock` (asyncio.Lock) | `AliasRoutingStateManager` | shared lock object via `openrouter_free_quota_lock` |
+| `_round_robin_cursor_by_alias` (dict) | `AliasRoutingStateManager` | `round_robin_cursor` attribute; snapshot_select via injected reference |
+| `_read_pilot_cooldown_gate` (CooldownEvidenceGate) | `AliasRoutingStateManager` | `read_pilot_gate` attribute with separate `AliasFamilyState` |
 | FastAPI route registration (`@router.post`, etc.) | `llm_passthrough_endpoints.py` | decorators stay in god module; handler bodies in Wave 5A modules |
 
+#### Wave 5B ownership
+
+| Concern | Module |
+|---------|--------|
+| Codex/Anthropic active cooldown reads/writes, session affinity, merged-family state, R3-1 memory publication, state-source attachment | `aawm_alias_routing/cooldown_state.py` |
+| Candidate lookup, state construction, availability shaping, request-local cooldown/exclusion, forced/adapter/Kimi/Grok lane application, Codex/Anthropic selectors, in-flight/redispatch errors | `aawm_alias_routing/selection.py` |
+| Read-pilot evidence gate, round-robin cursor, OpenRouter quota cache/lock | `aawm_alias_routing/state.py` (`AliasRoutingStateManager`) |
 Google retry classification retains separate capacity, rate-limit, transient,
 and request budgets through strategy callbacks. The shared retry driver owns
 only identical attempt sequencing; it does not collapse Google's multi-budget

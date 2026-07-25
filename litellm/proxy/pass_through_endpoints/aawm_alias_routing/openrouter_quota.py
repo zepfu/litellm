@@ -42,6 +42,9 @@ _get_dynamic_injection_pool: Optional[Callable[[], Awaitable[Any]]] = None
 _get_adapter_active_cooldown_seconds: Optional[Callable[[Optional[str]], Awaitable[float]]] = None
 _get_adapter_rate_limit_key: Optional[Callable[[Optional[str]], str]] = None
 _fetch_quota_row: Optional[Callable[[], Awaitable[Optional[Any]]]] = None
+_get_free_daily_quota_exhausted_cooldown_seconds: Optional[
+    Callable[[], Awaitable[float]]
+] = None
 
 
 def configure_openrouter_quota_runtime(
@@ -53,12 +56,16 @@ def configure_openrouter_quota_runtime(
     get_adapter_active_cooldown_seconds: Callable[[Optional[str]], Awaitable[float]],
     get_adapter_rate_limit_key: Callable[[Optional[str]], str],
     fetch_quota_row: Callable[[], Awaitable[Optional[Any]]],
+    get_free_daily_quota_exhausted_cooldown_seconds: Callable[
+        [], Awaitable[float]
+    ],
 ) -> None:
     """Bind god-module-owned quota cache accessors and adapter helpers."""
     global _get_quota_cache, _set_quota_cache, _quota_lock
     global _get_dynamic_injection_pool
     global _get_adapter_active_cooldown_seconds, _get_adapter_rate_limit_key
     global _fetch_quota_row
+    global _get_free_daily_quota_exhausted_cooldown_seconds
     _get_quota_cache = get_quota_cache
     _set_quota_cache = set_quota_cache
     _quota_lock = quota_lock
@@ -66,6 +73,9 @@ def configure_openrouter_quota_runtime(
     _get_adapter_active_cooldown_seconds = get_adapter_active_cooldown_seconds
     _get_adapter_rate_limit_key = get_adapter_rate_limit_key
     _fetch_quota_row = fetch_quota_row
+    _get_free_daily_quota_exhausted_cooldown_seconds = (
+        get_free_daily_quota_exhausted_cooldown_seconds
+    )
 
 
 def _reset_openrouter_free_daily_quota_cache() -> None:
@@ -201,7 +211,10 @@ async def _apply_openrouter_durable_quota_candidate_cooldown(
     if not _is_openrouter_free_quota_candidate(candidate):
         return cooldown_seconds, cooldown_state_source, skip_reason
 
-    durable_cooldown = await _get_openrouter_free_daily_quota_exhausted_cooldown_seconds()
+    assert _get_free_daily_quota_exhausted_cooldown_seconds is not None
+    durable_cooldown = (
+        await _get_free_daily_quota_exhausted_cooldown_seconds()
+    )
     if durable_cooldown <= 0:
         return cooldown_seconds, cooldown_state_source, skip_reason
 

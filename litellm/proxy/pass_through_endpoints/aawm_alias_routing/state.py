@@ -1,7 +1,8 @@
 """Process-local alias-routing state manager (RR-054 #1).
 
-Owns cooldown / affinity / lane-cache dicts and their asyncio.Locks so the
-pass-through god-module does not declare the state maps itself.
+Owns cooldown / affinity / lane-cache dicts, their asyncio.Locks, the
+read-pilot evidence gate, round-robin cursor, and OpenRouter quota cache
+so the pass-through god-module does not declare the state maps itself.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 from .oauth_token_cache import (
     antigravity_oauth_access_token_cache,
@@ -235,6 +236,7 @@ class AliasRoutingStateManager:
     """Single owner of alias-routing process-local maps + locks (RR-054 #1)."""
 
     def __init__(self, *, max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE) -> None:
+        from .classification import CooldownEvidenceGate  # lazy: avoid state->classification->state cycle
         self.max_size = max_size
         self.codex = AliasFamilyState()
         self.anthropic = AliasFamilyState()
@@ -253,11 +255,26 @@ class AliasRoutingStateManager:
         self.google_rate_limit = MonotonicCooldownMap()
         self.google_oauth = google_oauth_access_token_cache
         self.antigravity_oauth = antigravity_oauth_access_token_cache
+        # Wave 5B: read-pilot evidence gate with its own separate AliasFamilyState
+        self.read_pilot_gate = CooldownEvidenceGate(family_state=AliasFamilyState())
+        # Wave 5B: per-alias round-robin rotation cursor
+        self.round_robin_cursor: dict[tuple[str, str], int] = {}
+        # Wave 5B: OpenRouter free-daily-quota cache (immutable tuple) + lock
+        self._openrouter_free_quota_cache: Tuple[Optional[float], float] = (None, 0.0)
+        self.openrouter_free_quota_lock = asyncio.Lock()
 
     def family(self, alias_family: str) -> AliasFamilyState:
         if alias_family == "anthropic":
             return self.anthropic
         return self.codex
+
+    def get_openrouter_free_quota_cache(self) -> Tuple[Optional[float], float]:
+        """Return the current OpenRouter free-daily-quota cache tuple."""
+        return self._openrouter_free_quota_cache
+
+    def set_openrouter_free_quota_cache(self, value: Tuple[Optional[float], float]) -> None:
+        """Replace the OpenRouter free-daily-quota cache tuple (immutable update)."""
+        self._openrouter_free_quota_cache = value
 
     def reset_for_tests(self) -> None:
         """Clear all manager-owned process-local state IN PLACE (test-support only).
@@ -280,6 +297,11 @@ class AliasRoutingStateManager:
         self.openrouter_rate_limit.clear_for_tests()
         self.openrouter_failure_circuit.clear_for_tests()
         self.google_rate_limit.clear_for_tests()
+        # Wave 5B: gate, cursor, quota
+        self.read_pilot_gate._key_state.clear()
+        self.read_pilot_gate._family_state.evidence_events_by_key.clear()
+        self.round_robin_cursor.clear()
+        self._openrouter_free_quota_cache = (None, 0.0)
 
     async def candidate_probe_lock(
         self,

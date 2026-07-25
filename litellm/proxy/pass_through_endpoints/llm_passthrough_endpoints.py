@@ -331,7 +331,6 @@ from litellm.llms.anthropic.experimental_pass_through.providers.google import co
 from litellm.llms.anthropic.experimental_pass_through.providers.google import error_signals as _google_error_signals
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import side_channel as _grok_side_channel
 from .aawm_alias_routing import interfaces as _aawm_alias_interfaces
-from .aawm_alias_routing.state import AliasFamilyState as _AliasFamilyState
 from .aawm_alias_routing.state import alias_routing_state as _alias_routing_state
 
 
@@ -569,6 +568,10 @@ from .aawm_alias_routing import config_refresh as _aawm_config_refresh
 from .aawm_alias_routing import codex_oauth as _aawm_codex_oauth
 from .aawm_alias_routing import openrouter_quota as _aawm_openrouter_quota
 
+# Wave 5B: cooldown_state + selection extraction modules
+from .aawm_alias_routing import cooldown_state as _aawm_cooldown_state
+from .aawm_alias_routing import selection as _aawm_selection
+
 # -- snapshot_select facades --
 _READ_PILOT_ALIAS_NAME = _aawm_snapshot_select._READ_PILOT_ALIAS_NAME
 get_active_routing_snapshot = _aawm_snapshot_select.get_active_routing_snapshot
@@ -632,16 +635,11 @@ _get_openrouter_free_daily_quota_exhausted_cooldown_seconds = _aawm_openrouter_q
 _is_openrouter_free_quota_candidate = _aawm_openrouter_quota._is_openrouter_free_quota_candidate
 _apply_openrouter_durable_quota_candidate_cooldown = _aawm_openrouter_quota._apply_openrouter_durable_quota_candidate_cooldown
 
-_read_pilot_cooldown_gate = _aawm_alias_classification.CooldownEvidenceGate(family_state=_AliasFamilyState())
+# Wave 5B: gate, cursor, and quota cache are now manager-owned.
+_read_pilot_cooldown_gate = _alias_routing_state.read_pilot_gate
+_round_robin_cursor_by_alias = _alias_routing_state.round_robin_cursor
 
-
-# Process-local rotation cursor for ``distribution_strategy: round_robin``,
-# keyed per ``(epoch_tag, alias_name)`` so each alias rotates independently
-# across proxy calls AND a semantic config change (new epoch_tag) starts a
-# fresh rotation cycle.  Static/legacy aliases use ``("", alias_name)``.
-_round_robin_cursor_by_alias: dict[tuple[str, str], int] = {}
-
-# Wave 5A: bind the round-robin cursor into snapshot_select.
+# Wave 5A/5B: bind the round-robin cursor into snapshot_select.
 _aawm_snapshot_select.configure_snapshot_runtime(
     round_robin_cursor=_round_robin_cursor_by_alias,
     get_candidates_for_alias=lambda *a, **kw: globals()["_get_codex_auto_agent_candidates_for_alias"](*a, **kw),
@@ -649,17 +647,12 @@ _aawm_snapshot_select.configure_snapshot_runtime(
 
 
 def reset_module_singletons() -> None:
-    """Clear the god-module-owned alias-routing singletons IN PLACE (test-support).
+    """Clear legacy god-module singleton state (test-support).
 
-    These singletons are NOT yet owned by ``AliasRoutingStateManager`` (they move
-    onto the manager in Wave 5B). Until then this helper resets them directly:
-
-    * the read-pilot cooldown gate's per-key state and its family evidence map,
-    * the per-alias round-robin rotation cursor,
-    * the active config-driven routing snapshot (cleared to ``None``).
-
-    Every dict is cleared with ``.clear()`` -- never reassigned -- so any module
-    alias bound to the same object stays valid.
+    Wave 5B moved the read-pilot gate and round-robin cursor onto
+    ``AliasRoutingStateManager``. Preserve this helper's historical narrow
+    behavior by clearing only those manager-owned surfaces plus the active
+    routing snapshot.
     """
     _read_pilot_cooldown_gate._key_state.clear()
     _read_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
@@ -670,13 +663,12 @@ def reset_module_singletons() -> None:
 def reset_alias_routing_state_for_tests() -> None:
     """Reset ALL process-local alias-routing state (test-support only).
 
-    Clears manager-owned state via ``alias_routing_state.reset_for_tests()`` and
-    the god-module-owned singletons via ``reset_module_singletons()``. Fixtures
-    fetch this by name (``getattr(lpe, "reset_alias_routing_state_for_tests")``)
-    to isolate process-local routing state between tests.
+    Clears manager-owned state (including gate/cursor/quota since Wave 5B)
+    via ``alias_routing_state.reset_for_tests()`` and the snapshot via
+    ``reset_module_singletons()``.
     """
     _alias_routing_state.reset_for_tests()
-    reset_module_singletons()
+    set_active_routing_snapshot(None)
 
 
 def _get_anthropic_auto_agent_candidates_for_alias(
@@ -1074,8 +1066,8 @@ _CLAUDE_POST_REWRITE_CONTEXT_FILE_MARKERS: tuple[tuple[str, str], ...] = (
     ("MEMORY.md", "memory-md"),
     ("CLAUDE.md", "claude-md"),
 )
-_openrouter_free_daily_quota_cache: tuple[Optional[float], float] = (None, 0.0)
-_openrouter_free_daily_quota_lock = asyncio.Lock()
+# Wave 5B: OpenRouter quota cache/lock are now manager-owned.
+_openrouter_free_daily_quota_lock = _alias_routing_state.openrouter_free_quota_lock
 _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
 _claude_agent_model_cache: dict[Path, tuple[Optional[int], Optional[str]]] = {}
@@ -2038,35 +2030,10 @@ def _resolve_codex_auto_agent_session_key(
 _codex_auto_agent_candidate_key = _aawm_lane_keys._codex_auto_agent_candidate_key
 
 
-def _codex_auto_agent_candidate_public_shape(
-    candidate: dict[str, Any],
-    *,
-    lane_key: Optional[str] = None,
-    cooldown_seconds: Optional[float] = None,
-    reason: Optional[str] = None,
-) -> dict[str, Any]:
-    shaped = {
-        "provider": candidate["provider"],
-        "model": candidate["model"],
-        "route_family": candidate["route_family"],
-        "last_resort": bool(candidate.get("last_resort")),
-    }
-    if lane_key is not None:
-        shaped["lane_key"] = lane_key
-    if cooldown_seconds is not None:
-        shaped["cooldown_seconds"] = round(float(cooldown_seconds), 3)
-    if reason is not None:
-        shaped["reason"] = reason
-    return shaped
+_codex_auto_agent_candidate_public_shape = _aawm_selection._codex_auto_agent_candidate_public_shape
 
 
-def _auto_agent_alias_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+_auto_agent_alias_float = _aawm_selection._auto_agent_alias_float
 
 
 def _auto_agent_alias_int(value: Any) -> Optional[int]:
@@ -3772,1065 +3739,73 @@ def _codex_auto_agent_request_has_continuation_state(
     return False
 
 
-def _raise_codex_auto_agent_in_flight_cooldown(
-    *,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    cooldown_seconds: float,
-) -> None:
-    shaped_candidate = _codex_auto_agent_candidate_public_shape(
-        candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        reason="in_flight_session_affinity_cooldown",
-    )
-    raise HTTPException(
-        status_code=429,
-        detail={
-            "error": {
-                "message": (
-                    "Codex auto-agent alias target is cooling down for an in-flight "
-                    "session; provider switching is disabled for stateful agent "
-                    "continuations. Redispatch a fresh agent attempt to re-run the "
-                    "auto selector."
-                ),
-                "type": "invalid_request_error",
-                "code": "aawm_codex_auto_agent_in_flight_provider_cooling_down",
-            },
-            "candidate": shaped_candidate,
-        },
-        headers={"Retry-After": str(int(max(1.0, cooldown_seconds)))},
-    )
+_raise_codex_auto_agent_in_flight_cooldown = _aawm_selection._raise_codex_auto_agent_in_flight_cooldown
 
 
-def _build_auto_agent_redispatch_http_exception_detail(
-    *,
-    alias_family: str,
-    alias_model: str,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    cooldown_seconds: float,
-    error_tokens: set[str],
-    error_class: Optional[str] = None,
-    cooldown_scope: Optional[str] = None,
-    error_status_code: Optional[Any] = None,
-    error_type: Optional[str] = None,
-    error_code: Optional[Any] = None,
-    retry_after_seconds: Optional[Any] = None,
-    failure_phase: Optional[str] = None,
-    attempted_provider_call: Optional[bool] = None,
-    audit_events: Optional[list[dict[str, Any]]] = None,
-    attempts: Optional[list[dict[str, Any]]] = None,
-    skipped_candidates: Optional[list[dict[str, Any]]] = None,
-    code: str,
-    message: str,
-) -> dict[str, Any]:
-    retry_after = int(
-        max(
-            1.0,
-            float(retry_after_seconds) if retry_after_seconds is not None else cooldown_seconds,
-        )
-    )
-    shaped_candidate = _codex_auto_agent_candidate_public_shape(
-        candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        reason="in_flight_retryable_provider_exhaustion",
-    )
-    detail: dict[str, Any] = {
-        "error": {
-            "message": message,
-            "type": "rate_limit_error",
-            "code": code,
-        },
-        "alias_family": alias_family,
-        "alias_model": alias_model,
-        "redispatch_model": alias_model,
-        "redispatch_reason": "in_flight_retryable_provider_exhaustion",
-        "redispatch_required": True,
-        "selected_provider": candidate.get("provider"),
-        "selected_model": candidate.get("model"),
-        "selected_route_family": candidate.get("route_family"),
-        "cooldown_seconds": round(float(cooldown_seconds), 3),
-        "cooldown_scope": cooldown_scope,
-        "retry_after_seconds": retry_after,
-        "error_tokens": sorted(error_tokens),
-        "candidate": shaped_candidate,
-    }
-    if error_class is not None:
-        detail["failure_class"] = error_class
-    if error_status_code is not None:
-        detail["error_status_code"] = error_status_code
-    if error_type is not None:
-        detail["error_type"] = error_type
-    if error_code is not None:
-        detail["error_code"] = str(error_code)
-    if failure_phase is not None:
-        detail["failure_phase"] = failure_phase
-    if attempted_provider_call is not None:
-        detail["attempted_provider_call"] = attempted_provider_call
-    if isinstance(audit_events, list):
-        detail["aawm_alias_routing_audit_events"] = audit_events
-    if isinstance(attempts, list):
-        detail["attempts"] = attempts
-    if isinstance(skipped_candidates, list):
-        detail["skipped_candidates"] = skipped_candidates
-    return detail
+_build_auto_agent_redispatch_http_exception_detail = _aawm_selection._build_auto_agent_redispatch_http_exception_detail
 
 
-def _raise_codex_auto_agent_redispatch_required(
-    *,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    cooldown_seconds: float,
-    error_tokens: set[str],
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
-    error_class: Optional[str] = None,
-    cooldown_scope: Optional[str] = None,
-    error_status_code: Optional[Any] = None,
-    error_type: Optional[str] = None,
-    error_code: Optional[Any] = None,
-    retry_after_seconds: Optional[Any] = None,
-    failure_phase: Optional[str] = None,
-    attempted_provider_call: Optional[bool] = None,
-    audit_events: Optional[list[dict[str, Any]]] = None,
-    attempts: Optional[list[dict[str, Any]]] = None,
-    skipped_candidates: Optional[list[dict[str, Any]]] = None,
-) -> None:
-    detail = _build_auto_agent_redispatch_http_exception_detail(
-        alias_family="codex_auto_agent",
-        alias_model=alias_model,
-        candidate=candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        error_tokens=error_tokens,
-        error_class=error_class,
-        cooldown_scope=cooldown_scope,
-        error_status_code=error_status_code,
-        error_type=error_type,
-        error_code=error_code,
-        retry_after_seconds=retry_after_seconds,
-        failure_phase=failure_phase,
-        attempted_provider_call=attempted_provider_call,
-        audit_events=audit_events,
-        attempts=attempts,
-        skipped_candidates=skipped_candidates,
-        code="aawm_codex_auto_agent_redispatch_required",
-        message=(
-            "Codex auto-agent alias target hit retryable provider exhaustion "
-            "for an in-flight session. Do not continue this child agent. "
-            f"Redispatch a fresh subagent using model {alias_model} "
-            "so the auto selector can choose the next available candidate."
-        ),
-    )
-    raise HTTPException(
-        status_code=429,
-        detail=detail,
-        headers={"Retry-After": str(detail["retry_after_seconds"])},
-    )
+_raise_codex_auto_agent_redispatch_required = _aawm_selection._raise_codex_auto_agent_redispatch_required
 
 
-async def _get_codex_auto_agent_active_cooldown_state(
-    cooldown_key: str,
-) -> tuple[float, str]:
-    async with _codex_auto_agent_lock:
-        now = time.monotonic()
-        until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if until > now:
-            return max(0.0, until - now), "memory"
-        _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
-    # RR-054 #30: negative-cache durable misses so healthy keys do not Redis-hit every call.
-    async with _codex_auto_agent_lock:
-        neg_until = _codex_auto_agent_cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if neg_until > time.monotonic():
-            return 0.0, "negative_cache"
-    dual_cache = _get_aawm_alias_routing_dual_cache()
-    if dual_cache is None:
-        return 0.0, "local_fallback"
-    durable_payload = await _read_aawm_alias_routing_durable_payload(
-        alias_family="codex",
-        state_kind="cooldown",
-        state_key=cooldown_key,
-    )
-    if durable_payload is None:
-        async with _codex_auto_agent_lock:
-            _codex_auto_agent_cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
-            )
-            _bound_aawm_alias_routing_memory_map(_codex_auto_agent_cooldown_negative_until_monotonic_by_key)
-        return 0.0, "local_fallback"
-    expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
-    if expires_at_epoch is None:
-        async with _codex_auto_agent_lock:
-            _codex_auto_agent_cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
-            )
-            _bound_aawm_alias_routing_memory_map(_codex_auto_agent_cooldown_negative_until_monotonic_by_key)
-        return 0.0, "local_fallback"
-    async with _codex_auto_agent_lock:
-        _codex_auto_agent_cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
-        _hydrate_aawm_alias_routing_cooldown_memory(
-            memory_map=_codex_auto_agent_cooldown_until_monotonic_by_key,
-            cooldown_key=cooldown_key,
-            expires_at_epoch=expires_at_epoch,
-        )
-        until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        return max(0.0, until - time.monotonic()), "durable_cache"
+_get_codex_auto_agent_active_cooldown_state = _aawm_cooldown_state._get_codex_auto_agent_active_cooldown_state
 
 
-async def _get_codex_auto_agent_active_cooldown_seconds(
-    cooldown_key: str,
-) -> float:
-    seconds, _ = await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
-    return seconds
+_get_codex_auto_agent_active_cooldown_seconds = _aawm_cooldown_state._get_codex_auto_agent_active_cooldown_seconds
 
 
-async def _set_codex_auto_agent_cooldown(
-    cooldown_key: str,
-    cooldown_seconds: float,
-) -> None:
-    ttl_seconds = max(0.0, float(cooldown_seconds))
-    async with _codex_auto_agent_lock:
-        until = time.monotonic() + ttl_seconds
-        current_until = _codex_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if until > current_until:
-            _codex_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = until
-            _codex_auto_agent_cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
-            _bound_aawm_alias_routing_memory_map(_codex_auto_agent_cooldown_until_monotonic_by_key)
-    if ttl_seconds <= 0:
-        return
-    await _write_aawm_alias_routing_durable_payload(
-        alias_family="codex",
-        state_kind="cooldown",
-        state_key=cooldown_key,
-        payload={"cooldown_key": cooldown_key},
-        ttl_seconds=ttl_seconds,
-    )
+_set_codex_auto_agent_cooldown = _aawm_cooldown_state._set_codex_auto_agent_cooldown
 
 
-async def _get_codex_auto_agent_session_affinity(
-    session_key: Optional[str],
-) -> Optional[dict[str, Any]]:
-    if session_key is None:
-        return None
-    async with _codex_auto_agent_lock:
-        affinity = _codex_auto_agent_session_affinity_by_key.get(session_key)
-        if isinstance(affinity, dict):
-            expires_at = affinity.get("expires_at_monotonic", 0.0)
-            if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
-                hydrated = dict(affinity)
-                hydrated["affinity_state_source"] = affinity.get("affinity_state_source", "memory")
-                return hydrated
-            _codex_auto_agent_session_affinity_by_key.pop(session_key, None)
-    dual_cache = _get_aawm_alias_routing_dual_cache()
-    if dual_cache is None:
-        return None
-    durable_payload = await _read_aawm_alias_routing_durable_payload(
-        alias_family="codex",
-        state_kind="affinity",
-        state_key=session_key,
-    )
-    if durable_payload is None:
-        return None
-    expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
-    if expires_at_epoch is None:
-        return None
-    async with _codex_auto_agent_lock:
-        affinity = _hydrate_aawm_alias_routing_affinity_memory(
-            memory_map=_codex_auto_agent_session_affinity_by_key,
-            session_key=session_key,
-            payload=durable_payload,
-            expires_at_epoch=expires_at_epoch,
-        )
-        if not affinity:
-            return None
-        affinity["affinity_state_source"] = "durable_cache"
-        return dict(affinity)
+_get_codex_auto_agent_session_affinity = _aawm_cooldown_state._get_codex_auto_agent_session_affinity
 
 
-async def _set_codex_auto_agent_session_affinity(
-    session_key: Optional[str],
-    candidate: dict[str, Any],
-) -> None:
-    if session_key is None:
-        return
-    # Wave 3 R3-4: carry the semantic config digest observed when affinity
-    # was established.  Continuations validate provider/model/route_family
-    # compatibility against the active enumeration -- NOT the config hash --
-    # so a priority/weight/schedule change does not break a valid pin.
-    config_hash = candidate.get("config_epoch_tag")
-    async with _codex_auto_agent_lock:
-        _codex_auto_agent_session_affinity_by_key[session_key] = {
-            "provider": candidate["provider"],
-            "model": candidate["model"],
-            "route_family": candidate["route_family"],
-            "last_resort": bool(candidate.get("last_resort")),
-            "config_hash": config_hash,
-            "expires_at_monotonic": (time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS),
-            "affinity_state_source": "memory",
-        }
-        _bound_aawm_alias_routing_memory_map(_codex_auto_agent_session_affinity_by_key)
-    durable_payload: dict[str, Any] = {
-        "provider": candidate["provider"],
-        "model": candidate["model"],
-        "route_family": candidate["route_family"],
-        "last_resort": bool(candidate.get("last_resort")),
-    }
-    if config_hash is not None:
-        durable_payload["config_hash"] = config_hash
-    await _write_aawm_alias_routing_durable_payload(
-        alias_family="codex",
-        state_kind="affinity",
-        state_key=session_key,
-        payload=durable_payload,
-        ttl_seconds=_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS,
-    )
+_set_codex_auto_agent_session_affinity = _aawm_cooldown_state._set_codex_auto_agent_session_affinity
 
 
-def _find_codex_auto_agent_candidate(
-    provider: Any,
-    model: Any,
-    *,
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
-    client_product_label: Optional[str] = None,
-    request: Optional[Request] = None,
-) -> Optional[dict[str, Any]]:
-    if request is not None:
-        candidates: Sequence[dict[str, Any]] = _resolve_aawm_alias_selection_enumeration(
-            request,
-            alias_model,
-            client_product_label=client_product_label,
-        ).candidates
-    else:
-        candidates = _get_codex_auto_agent_candidates_for_alias(
-            alias_model,
-            client_product_label=client_product_label,
-        )
-    for candidate in candidates:
-        if candidate["provider"] == provider and candidate["model"] == model:
-            return dict(candidate)
-    return None
+_find_codex_auto_agent_candidate = _aawm_selection._find_codex_auto_agent_candidate
 
 
-def _find_codex_auto_agent_affinity_candidate(
-    affinity: dict[str, Any],
-    *,
-    alias_model: str,
-    client_product_label: Optional[str],
-    request: Request,
-) -> Optional[dict[str, Any]]:
-    """Resolve a pinned candidate without applying new-request eligibility gates.
-
-    Snapshot-established affinity is checked against the active snapshot's full
-    alias membership so schedule-only changes do not evict an in-flight
-    continuation. Static/legacy affinity keeps the existing lookup path.
-    """
-    if (
-        alias_model == _READ_PILOT_ALIAS_NAME
-        and affinity.get("config_hash") is not None
-    ):
-        snapshot = get_active_routing_snapshot()
-        if snapshot is None:
-            return None
-        alias = snapshot.aliases.get(alias_model)
-        if alias is None:
-            return None
-        for candidate in alias.candidates:
-            if (
-                candidate.provider == affinity.get("provider")
-                and candidate.model == affinity.get("model")
-            ):
-                return _routing_candidate_to_public_dict(
-                    candidate,
-                    epoch_tag=snapshot.config_hash,
-                )
-        return None
-    return _find_codex_auto_agent_candidate(
-        affinity.get("provider"),
-        affinity.get("model"),
-        alias_model=alias_model,
-        client_product_label=client_product_label,
-        request=request,
-    )
+_find_codex_auto_agent_affinity_candidate = _aawm_selection._find_codex_auto_agent_affinity_candidate
 
 
-def _is_auto_agent_candidate_state_available(state: dict[str, Any]) -> bool:
-    return state["cooldown_seconds"] <= 0 and state.get("skip_reason") is None
+_is_auto_agent_candidate_state_available = _aawm_selection._is_auto_agent_candidate_state_available
 
 
-def _build_auto_agent_skipped_candidates_from_states(
-    states: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    skipped: list[dict[str, Any]] = []
-    for state in states:
-        if _is_auto_agent_candidate_state_available(state):
-            continue
-        shaped = _codex_auto_agent_candidate_public_shape(
-            state["candidate"],
-            lane_key=state["lane_key"],
-            cooldown_seconds=(state["cooldown_seconds"] if state["cooldown_seconds"] > 0 else None),
-            reason=state.get("skip_reason") or "cooldown",
-        )
-        for field in (
-            "cooldown_state_source",
-            "cooldown_scope",
-            "failure_phase",
-            "attempted_provider_call",
-        ):
-            if field in state:
-                shaped[field] = state[field]
-        skipped.append(shaped)
-    return skipped
+_build_auto_agent_skipped_candidates_from_states = _aawm_selection._build_auto_agent_skipped_candidates_from_states
 
 
-async def _apply_codex_auto_agent_forced_candidate_cooldown(
-    *,
-    cooldown_key: str,
-    cooldown_seconds: float,
-) -> None:
-    await _set_codex_auto_agent_cooldown(cooldown_key, cooldown_seconds)
+_apply_codex_auto_agent_forced_candidate_cooldown = _aawm_selection._apply_codex_auto_agent_forced_candidate_cooldown
 
 
-async def _apply_anthropic_auto_agent_forced_candidate_cooldown(
-    *,
-    cooldown_key: str,
-    cooldown_seconds: float,
-) -> None:
-    await _set_anthropic_auto_agent_cooldown(cooldown_key, cooldown_seconds)
+_apply_anthropic_auto_agent_forced_candidate_cooldown = _aawm_selection._apply_anthropic_auto_agent_forced_candidate_cooldown
 
 
-def _apply_codex_auto_agent_request_local_candidate_state(
-    request: Request,
-    *,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    cooldown_seconds: float,
-    cooldown_state_source: Optional[str],
-    skip_reason: Optional[str],
-) -> tuple[float, Optional[str], Optional[str]]:
-    request_local_cooldown_key = _get_codex_auto_agent_request_local_cooldown_key(
-        candidate=candidate,
-        lane_key=lane_key,
-    )
-    request_local_cooldown_seconds = _get_codex_auto_agent_request_local_cooldown_seconds(
-        request,
-        cooldown_key=request_local_cooldown_key,
-    )
-    if request_local_cooldown_seconds > cooldown_seconds:
-        cooldown_seconds = request_local_cooldown_seconds
-        cooldown_state_source = "request_local"
-    if request_local_cooldown_key in _get_codex_auto_agent_request_local_excluded_keys(request):
-        if request_local_cooldown_seconds <= 0:
-            cooldown_seconds = max(cooldown_seconds, 0.001)
-        cooldown_state_source = "request_local"
-        skip_reason = "request_local_transient_failure"
-    return cooldown_seconds, cooldown_state_source, skip_reason
+_apply_codex_auto_agent_request_local_candidate_state = _aawm_selection._apply_codex_auto_agent_request_local_candidate_state
 
 
-async def _apply_codex_auto_agent_adapter_local_candidate_cooldown(
-    *,
-    candidate: dict[str, Any],
-    cooldown_seconds: float,
-    cooldown_state_source: Optional[str],
-    skip_reason: Optional[str],
-) -> tuple[float, Optional[str], Optional[str]]:
-    """Merge process-local adapter cooldown evidence into alias selection state."""
-    provider = candidate.get("provider")
-    model = candidate.get("model")
-    adapter_seconds = 0.0
-    if provider == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-        adapter_seconds = await _get_openrouter_adapter_active_cooldown_seconds(model)
-    elif provider == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-        lane_key = await _resolve_codex_auto_agent_google_lane_key()
-        async with _google_adapter_rate_limit_lock:
-            now = time.monotonic()
-            adapter_seconds = max(
-                0.0,
-                _google_adapter_rate_limit_until_monotonic_by_key.get(lane_key, 0.0) - now,
-            )
-    if adapter_seconds <= 0:
-        return cooldown_seconds, cooldown_state_source, skip_reason
-    if adapter_seconds > cooldown_seconds:
-        cooldown_seconds = adapter_seconds
-        cooldown_state_source = "adapter_local"
-    if cooldown_seconds > 0 and skip_reason is None:
-        skip_reason = "adapter_cooldown"
-    return cooldown_seconds, cooldown_state_source, skip_reason
+_apply_codex_auto_agent_adapter_local_candidate_cooldown = _aawm_selection._apply_codex_auto_agent_adapter_local_candidate_cooldown
 
 
-async def _apply_kimi_code_managed_account_lane_cooldown(
-    *,
-    candidate: dict[str, Any],
-    cooldown_seconds: float,
-    cooldown_state_source: Optional[str],
-    skip_reason: Optional[str],
-    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
-) -> tuple[float, Optional[str], Optional[str], Optional[str]]:
-    """Apply one Kimi managed-account lane without conflating candidate gates."""
-
-    if not _is_kimi_code_auto_agent_candidate(candidate):
-        return cooldown_seconds, cooldown_state_source, skip_reason, None
-    managed_seconds, managed_source = await get_active_cooldown_state(_get_kimi_code_managed_account_cooldown_key())
-    if managed_seconds <= 0:
-        return cooldown_seconds, cooldown_state_source, skip_reason, None
-    if managed_seconds >= cooldown_seconds:
-        cooldown_seconds = managed_seconds
-        cooldown_state_source = f"kimi_managed_account:{managed_source}"
-    return cooldown_seconds, cooldown_state_source, skip_reason, "managed_account"
+_apply_kimi_code_managed_account_lane_cooldown = _aawm_selection._apply_kimi_code_managed_account_lane_cooldown
 
 
-async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
-    request: Request,
-    *,
-    candidate_template: dict[str, Any],
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
-    openai_lane_key: Optional[str] = None,
-    google_lane_key: Optional[str] = None,
-    antigravity_lane_state: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    candidate = dict(candidate_template)
-    if openai_lane_key is None:
-        openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
-    forced_cooldown_seconds: Optional[float] = None
-    skip_reason: Optional[str] = None
-    cooldown_state_source_override: Optional[str] = None
-    failure_phase: Optional[str] = None
-    attempted_provider_call: Optional[bool] = None
-    if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-        if google_lane_key is None:
-            google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
-        lane_key = google_lane_key
-        if lane_key == _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY:
-            forced_cooldown_seconds = _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
-            skip_reason = "auth_degraded"
-            cooldown_state_source_override = "auth_degraded"
-            failure_phase = "auth"
-            attempted_provider_call = False
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
-        if antigravity_lane_state is None:
-            antigravity_lane_state = await _resolve_codex_auto_agent_antigravity_lane_state()
-        lane_key = str(antigravity_lane_state["lane_key"])
-        forced_cooldown_seconds = _auto_agent_alias_float(antigravity_lane_state.get("forced_cooldown_seconds"))
-        skip_reason = cast(Optional[str], antigravity_lane_state.get("skip_reason"))
-        cooldown_state_source_override = cast(Optional[str], antigravity_lane_state.get("cooldown_state_source"))
-        failure_phase = cast(Optional[str], antigravity_lane_state.get("failure_phase"))
-        attempted_provider_call = cast(Optional[bool], antigravity_lane_state.get("attempted_provider_call"))
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-        lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
-    else:
-        lane_key = openai_lane_key
-    # Wave 3 R3-4: snapshot-resolved candidates carry config_epoch_tag;
-    # static/legacy candidates do not, keeping bare keys.
-    _epoch_tag = candidate.get("config_epoch_tag")
-    cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=_epoch_tag)
-    (
-        cooldown_seconds,
-        initial_cooldown_state_source,
-    ) = await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
-    cooldown_state_source: Optional[str] = initial_cooldown_state_source
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-    ) = await _apply_codex_auto_agent_grok_account_lane_cooldown(
-        candidate=candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-        get_active_cooldown_state=_get_codex_auto_agent_active_cooldown_state,
-    )
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-        managed_account_cooldown_scope,
-    ) = await _apply_kimi_code_managed_account_lane_cooldown(
-        candidate=candidate,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-        get_active_cooldown_state=_get_codex_auto_agent_active_cooldown_state,
-    )
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-    ) = _apply_codex_auto_agent_request_local_candidate_state(
-        request,
-        candidate=candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-    )
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-    ) = await _apply_codex_auto_agent_adapter_local_candidate_cooldown(
-        candidate=candidate,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-    )
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-    ) = await _apply_openrouter_durable_quota_candidate_cooldown(
-        candidate=candidate,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-    )
-    if forced_cooldown_seconds is not None and forced_cooldown_seconds > cooldown_seconds:
-        await _apply_codex_auto_agent_forced_candidate_cooldown(
-            cooldown_key=cooldown_key,
-            cooldown_seconds=forced_cooldown_seconds,
-        )
-        cooldown_seconds = forced_cooldown_seconds
-        cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
-    state = {
-        "candidate": candidate,
-        "lane_key": lane_key,
-        "cooldown_key": cooldown_key,
-        "cooldown_seconds": cooldown_seconds,
-        "cooldown_state_source": cooldown_state_source,
-    }
-    if _epoch_tag is not None:
-        state["config_epoch_tag"] = _epoch_tag
-    if skip_reason is not None:
-        state["skip_reason"] = skip_reason
-    if failure_phase is not None:
-        state["failure_phase"] = failure_phase
-    if attempted_provider_call is not None:
-        state["attempted_provider_call"] = attempted_provider_call
-    if managed_account_cooldown_scope is not None:
-        state["cooldown_scope"] = managed_account_cooldown_scope
-    return state
+_build_codex_auto_agent_candidate_state = _aawm_selection._build_codex_auto_agent_candidate_state
 
 
-async def _get_anthropic_auto_agent_candidate_cooldown_state(
-    *,
-    provider: str,
-    cooldown_key: str,
-) -> tuple[float, str]:
-    """OpenAI/Codex candidates merge Anthropic + Codex cooldown; others use Anthropic-only."""
-    if provider in {
-        _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-        _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
-        _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-    }:
-        return await _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(cooldown_key)
-    return await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
+_get_anthropic_auto_agent_candidate_cooldown_state = _aawm_selection._get_anthropic_auto_agent_candidate_cooldown_state
 
 
-async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
-    request: Request,
-    *,
-    candidate_template: dict[str, Any],
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-    openai_lane_key: Optional[str] = None,
-    anthropic_lane_key: Optional[str] = None,
-    google_lane_key: Optional[str] = None,
-    antigravity_lane_state: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    candidate = dict(candidate_template)
-    if openai_lane_key is None:
-        openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
-    if anthropic_lane_key is None:
-        anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
-    forced_cooldown_seconds: Optional[float] = None
-    skip_reason: Optional[str] = None
-    cooldown_state_source_override: Optional[str] = None
-    failure_phase: Optional[str] = None
-    attempted_provider_call: Optional[bool] = None
-    if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-        if google_lane_key is None:
-            google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
-        lane_key = google_lane_key
-        if lane_key == _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY:
-            forced_cooldown_seconds = _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
-            skip_reason = "auth_degraded"
-            cooldown_state_source_override = "auth_degraded"
-            failure_phase = "auth"
-            attempted_provider_call = False
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
-        if antigravity_lane_state is None:
-            antigravity_lane_state = await _resolve_codex_auto_agent_antigravity_lane_state()
-        lane_key = str(antigravity_lane_state["lane_key"])
-        forced_cooldown_seconds = _auto_agent_alias_float(antigravity_lane_state.get("forced_cooldown_seconds"))
-        skip_reason = cast(Optional[str], antigravity_lane_state.get("skip_reason"))
-        cooldown_state_source_override = cast(Optional[str], antigravity_lane_state.get("cooldown_state_source"))
-        failure_phase = cast(Optional[str], antigravity_lane_state.get("failure_phase"))
-        attempted_provider_call = cast(Optional[bool], antigravity_lane_state.get("attempted_provider_call"))
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
-        lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
-        lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
-    elif candidate["provider"] == _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER:
-        lane_key = anthropic_lane_key
-    else:
-        lane_key = openai_lane_key
-    _epoch_tag = candidate.get("config_epoch_tag")
-    cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=_epoch_tag)
-    (
-        cooldown_seconds,
-        initial_cooldown_state_source,
-    ) = await _get_anthropic_auto_agent_candidate_cooldown_state(
-        provider=candidate["provider"],
-        cooldown_key=cooldown_key,
-    )
-    cooldown_state_source: Optional[str] = initial_cooldown_state_source
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-    ) = await _apply_codex_auto_agent_grok_account_lane_cooldown(
-        candidate=candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-        get_active_cooldown_state=_get_anthropic_auto_agent_active_cooldown_state,
-    )
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-        managed_account_cooldown_scope,
-    ) = await _apply_kimi_code_managed_account_lane_cooldown(
-        candidate=candidate,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-        get_active_cooldown_state=lambda cooldown_key: (
-            _get_anthropic_auto_agent_candidate_cooldown_state(
-                provider=_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
-                cooldown_key=cooldown_key,
-            )
-        ),
-    )
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-    ) = _apply_codex_auto_agent_request_local_candidate_state(
-        request,
-        candidate=candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-    )
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-    ) = await _apply_codex_auto_agent_adapter_local_candidate_cooldown(
-        candidate=candidate,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-    )
-    (
-        cooldown_seconds,
-        cooldown_state_source,
-        skip_reason,
-    ) = await _apply_openrouter_durable_quota_candidate_cooldown(
-        candidate=candidate,
-        cooldown_seconds=cooldown_seconds,
-        cooldown_state_source=cooldown_state_source,
-        skip_reason=skip_reason,
-    )
-    if forced_cooldown_seconds is not None and forced_cooldown_seconds > cooldown_seconds:
-        await _apply_anthropic_auto_agent_forced_candidate_cooldown(
-            cooldown_key=cooldown_key,
-            cooldown_seconds=forced_cooldown_seconds,
-        )
-        cooldown_seconds = forced_cooldown_seconds
-        cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
-    state = {
-        "candidate": candidate,
-        "lane_key": lane_key,
-        "cooldown_key": cooldown_key,
-        "cooldown_seconds": cooldown_seconds,
-        "cooldown_state_source": cooldown_state_source,
-    }
-    if _epoch_tag is not None:
-        state["config_epoch_tag"] = _epoch_tag
-    if skip_reason is not None:
-        state["skip_reason"] = skip_reason
-    if failure_phase is not None:
-        state["failure_phase"] = failure_phase
-    if attempted_provider_call is not None:
-        state["attempted_provider_call"] = attempted_provider_call
-    if managed_account_cooldown_scope is not None:
-        state["cooldown_scope"] = managed_account_cooldown_scope
-    return state
+_build_anthropic_auto_agent_candidate_state = _aawm_selection._build_anthropic_auto_agent_candidate_state
 
 
-async def _build_codex_auto_agent_candidate_states(
-    request: Request,
-    *,
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
-    client_product_label: Optional[str] = None,
-) -> list[dict[str, Any]]:
-    openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
-    google_lane_key: Optional[str] = None
-    antigravity_lane_state: Optional[dict[str, Any]] = None
-    states: list[dict[str, Any]] = []
-    for candidate_template in _resolve_aawm_alias_selection_enumeration(
-        request,
-        alias_model,
-        client_product_label=client_product_label,
-    ).candidates:
-        if candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER and google_lane_key is None:
-            google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
-        if candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER and antigravity_lane_state is None:
-            antigravity_lane_state = await _resolve_codex_auto_agent_antigravity_lane_state()
-        states.append(
-            await _build_codex_auto_agent_candidate_state(
-                request,
-                candidate_template=candidate_template,
-                alias_model=alias_model,
-                openai_lane_key=openai_lane_key,
-                google_lane_key=google_lane_key,
-                antigravity_lane_state=antigravity_lane_state,
-            )
-        )
-    return states
+_build_codex_auto_agent_candidate_states = _aawm_selection._build_codex_auto_agent_candidate_states
 
 
-def _attach_aawm_alias_routing_state_sources(
-    selection: dict[str, Any],
-    *,
-    affinity: Optional[dict[str, Any]] = None,
-    selected_state: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    enriched = dict(selection)
-    if affinity is not None:
-        enriched["affinity_state_source"] = affinity.get("affinity_state_source", "local_fallback")
-    if selected_state is not None:
-        enriched["cooldown_state_source"] = selected_state.get("cooldown_state_source", "local_fallback")
-    return enriched
+_attach_aawm_alias_routing_state_sources = _aawm_cooldown_state._attach_aawm_alias_routing_state_sources
 
 
-async def _select_codex_auto_agent_candidate(
-    *,
-    request: Request,
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    alias_model = _normalize_codex_auto_agent_alias_model(request_body.get("model")) or _CODEX_AUTO_AGENT_MODEL_ALIAS
-    client_product_label = _extract_auto_agent_alias_client_product_label(request, request_body)
-    session_key = _resolve_codex_auto_agent_session_key(
-        request,
-        request_body,
-        alias_model=alias_model,
-    )
-    has_continuation_state = _codex_auto_agent_request_has_continuation_state(request_body)
-
-    enumeration = _resolve_aawm_alias_selection_enumeration(
-        request,
-        alias_model,
-        client_product_label=client_product_label,
-    )
-    commit_token = enumeration.commit_token
-
-    affinity = await _get_codex_auto_agent_session_affinity(session_key)
-    if affinity is not None and not has_continuation_state:
-        affinity = None
-    if affinity is not None and has_continuation_state:
-        affinity_candidate = _find_codex_auto_agent_affinity_candidate(
-            affinity,
-            alias_model=alias_model,
-            client_product_label=client_product_label,
-            request=request,
-        )
-        # Wave 3 R3-4: continuation-safe affinity.  If the pinned candidate
-        # was removed from the active enumeration or its route_family changed
-        # (route-incompatible), fail closed with redispatch-required BEFORE
-        # any alternate upstream call.  Compatible candidates (same
-        # provider/model/route_family) remain pinned regardless of
-        # priority/weight/schedule changes.
-        if affinity_candidate is None or (
-            affinity_candidate.get("route_family") != affinity.get("route_family")
-        ):
-            _pinned_candidate_shape = {
-                "provider": affinity.get("provider"),
-                "model": affinity.get("model"),
-                "route_family": affinity.get("route_family"),
-                "last_resort": bool(affinity.get("last_resort")),
-            }
-            _raise_codex_auto_agent_redispatch_required(
-                candidate=_pinned_candidate_shape,
-                lane_key=None,
-                cooldown_seconds=0.0,
-                error_tokens=set(),
-                alias_model=alias_model,
-                failure_phase="affinity_continuation_removed",
-                attempted_provider_call=False,
-            )
-        if affinity_candidate is not None:
-            affinity_state = await _build_codex_auto_agent_candidate_state(
-                request,
-                candidate_template=affinity_candidate,
-                alias_model=alias_model,
-            )
-            if _is_auto_agent_candidate_state_available(affinity_state):
-                return _attach_aawm_alias_routing_state_sources(
-                    {
-                        **affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": [],
-                        "in_flight_session": has_continuation_state,
-                    },
-                    affinity=affinity,
-                    selected_state=affinity_state,
-                )
-            if affinity_state["cooldown_seconds"] > 0:
-                _raise_codex_auto_agent_in_flight_cooldown(
-                    candidate=affinity_candidate,
-                    lane_key=affinity_state.get("lane_key"),
-                    cooldown_seconds=affinity_state["cooldown_seconds"],
-                )
-
-    states = await _build_codex_auto_agent_candidate_states(
-        request,
-        alias_model=alias_model,
-        client_product_label=client_product_label,
-    )
-    skipped = _build_auto_agent_skipped_candidates_from_states(states)
-
-    if affinity is not None:
-        affinity_candidate = _find_codex_auto_agent_candidate(
-            affinity.get("provider"),
-            affinity.get("model"),
-            alias_model=alias_model,
-            client_product_label=client_product_label,
-            request=request,
-        )
-        if affinity_candidate is not None:
-            matched_affinity_state: Optional[dict[str, Any]] = None
-            for state in states:
-                if (
-                    state["candidate"]["provider"] == affinity_candidate["provider"]
-                    and state["candidate"]["model"] == affinity_candidate["model"]
-                ):
-                    matched_affinity_state = state
-                    break
-            if matched_affinity_state is not None:
-                if not _is_auto_agent_candidate_state_available(matched_affinity_state):
-                    if has_continuation_state:
-                        if matched_affinity_state["cooldown_seconds"] > 0:
-                            _raise_codex_auto_agent_in_flight_cooldown(
-                                candidate=affinity_candidate,
-                                lane_key=matched_affinity_state.get("lane_key"),
-                                cooldown_seconds=matched_affinity_state["cooldown_seconds"],
-                            )
-                    skipped.append(
-                        _codex_auto_agent_candidate_public_shape(
-                            affinity_candidate,
-                            lane_key=matched_affinity_state.get("lane_key"),
-                            cooldown_seconds=(
-                                matched_affinity_state["cooldown_seconds"]
-                                if matched_affinity_state["cooldown_seconds"] > 0
-                                else None
-                            ),
-                            reason=matched_affinity_state.get("skip_reason") or "session_affinity_cooldown",
-                        )
-                    )
-                else:
-                    return _attach_aawm_alias_routing_state_sources(
-                        {
-                            **matched_affinity_state,
-                            "alias_model": alias_model,
-                            "session_key": session_key,
-                            "selection_reason": "session_affinity",
-                            "skipped": skipped,
-                            "in_flight_session": has_continuation_state,
-                        },
-                        affinity=affinity,
-                        selected_state=matched_affinity_state,
-                    )
-            preferred_available = any(
-                not state["candidate"].get("last_resort") and _is_auto_agent_candidate_state_available(state)
-                for state in states
-            )
-            if (
-                matched_affinity_state is not None
-                and _is_auto_agent_candidate_state_available(matched_affinity_state)
-                and (not affinity_candidate.get("last_resort") or not preferred_available)
-            ):
-                return _attach_aawm_alias_routing_state_sources(
-                    {
-                        **matched_affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": skipped,
-                    },
-                    affinity=affinity,
-                    selected_state=matched_affinity_state,
-                )
-
-    for state in states:
-        if state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
-            continue
-        _commit_round_robin_selection(commit_token, selected_candidate=state["candidate"])
-        return _attach_aawm_alias_routing_state_sources(
-            {
-                **state,
-                "alias_model": alias_model,
-                "session_key": session_key,
-                "selection_reason": "first_available",
-                "skipped": skipped,
-            },
-            selected_state=state,
-        )
-
-    for state in states:
-        if not state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
-            continue
-        return _attach_aawm_alias_routing_state_sources(
-            {
-                **state,
-                "alias_model": alias_model,
-                "session_key": session_key,
-                "selection_reason": "last_resort",
-                "skipped": skipped,
-            },
-            selected_state=state,
-        )
-
-    raise HTTPException(
-        status_code=429,
-        detail={
-            "error": {
-                "message": ("All Codex auto-agent alias candidates are currently cooled down."),
-                "type": "rate_limit_error",
-                "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
-            },
-            "candidates": skipped,
-        },
-    )
+_select_codex_auto_agent_candidate = _aawm_selection._select_codex_auto_agent_candidate
 
 
 def _codex_auto_agent_error_text(exc: Any) -> str:
@@ -5379,96 +4354,25 @@ def _aawm_alias_route_healthy_json_enabled() -> bool:
     }
 
 
-def _get_codex_auto_agent_request_local_cooldown_key(
-    *,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-) -> str:
-    return _codex_auto_agent_candidate_key(
-        candidate,
-        lane_key or "__default__",
-        epoch_tag=candidate.get("config_epoch_tag"),
-    )
+_get_codex_auto_agent_request_local_cooldown_key = _aawm_selection._get_codex_auto_agent_request_local_cooldown_key
 
 
-def _get_codex_auto_agent_request_local_cooldown_state(
-    request: Request,
-) -> dict[str, float]:
-    state = getattr(request.state, "aawm_alias_request_local_cooldown_until", None)
-    if isinstance(state, dict):
-        return state
-    state = {}
-    setattr(request.state, "aawm_alias_request_local_cooldown_until", state)
-    return state
+_get_codex_auto_agent_request_local_cooldown_state = _aawm_selection._get_codex_auto_agent_request_local_cooldown_state
 
 
-def _get_codex_auto_agent_request_local_cooldown_seconds(
-    request: Request,
-    *,
-    cooldown_key: str,
-) -> float:
-    until = _get_codex_auto_agent_request_local_cooldown_state(request).get(
-        cooldown_key,
-        0.0,
-    )
-    remaining = max(0.0, until - time.monotonic())
-    if remaining <= 0:
-        _get_codex_auto_agent_request_local_cooldown_state(request).pop(
-            cooldown_key,
-            None,
-        )
-        return 0.0
-    return remaining
+_get_codex_auto_agent_request_local_cooldown_seconds = _aawm_selection._get_codex_auto_agent_request_local_cooldown_seconds
 
 
-def _set_codex_auto_agent_request_local_cooldown(
-    request: Request,
-    *,
-    cooldown_key: str,
-    cooldown_seconds: float,
-) -> None:
-    ttl_seconds = max(0.0, float(cooldown_seconds))
-    if ttl_seconds <= 0:
-        return
-    until = time.monotonic() + ttl_seconds
-    state = _get_codex_auto_agent_request_local_cooldown_state(request)
-    current_until = state.get(cooldown_key, 0.0)
-    if until > current_until:
-        state[cooldown_key] = until
+_set_codex_auto_agent_request_local_cooldown = _aawm_selection._set_codex_auto_agent_request_local_cooldown
 
 
-def _get_codex_auto_agent_request_local_excluded_keys(
-    request: Request,
-) -> set[str]:
-    excluded = getattr(request.state, "aawm_alias_request_local_excluded_keys", None)
-    if isinstance(excluded, set):
-        return excluded
-    excluded = set()
-    setattr(request.state, "aawm_alias_request_local_excluded_keys", excluded)
-    return excluded
+_get_codex_auto_agent_request_local_excluded_keys = _aawm_selection._get_codex_auto_agent_request_local_excluded_keys
 
 
-def _exclude_codex_auto_agent_request_local_candidate(
-    request: Request,
-    *,
-    cooldown_key: str,
-) -> None:
-    _get_codex_auto_agent_request_local_excluded_keys(request).add(cooldown_key)
+_exclude_codex_auto_agent_request_local_candidate = _aawm_selection._exclude_codex_auto_agent_request_local_candidate
 
 
-def _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
-    request: Request,
-    *,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-) -> None:
-    _exclude_codex_auto_agent_request_local_candidate(
-        request,
-        cooldown_key=_get_codex_auto_agent_request_local_cooldown_key(
-            candidate=candidate,
-            lane_key=lane_key,
-        ),
-    )
+_exclude_codex_auto_agent_request_local_candidate_without_cooldown = _aawm_selection._exclude_codex_auto_agent_request_local_candidate_without_cooldown
 
 
 def _resolve_auto_agent_cooldown_publication_plan(
@@ -5572,44 +4476,13 @@ def _resolve_auto_agent_cooldown_publication_plan(
     )
 
 
-def _apply_request_local_cooldown_from_plan(
-    request: Request,
-    *,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    cooldown_seconds: float,
-) -> None:
-    """Apply a request-local cooldown + exclusion for a request-local plan (R3-1)."""
-    request_local_key = _get_codex_auto_agent_request_local_cooldown_key(
-        candidate=candidate,
-        lane_key=lane_key,
-    )
-    _set_codex_auto_agent_request_local_cooldown(
-        request,
-        cooldown_key=request_local_key,
-        cooldown_seconds=cooldown_seconds,
-    )
-    _exclude_codex_auto_agent_request_local_candidate(
-        request,
-        cooldown_key=request_local_key,
-    )
+_apply_request_local_cooldown_from_plan = _aawm_selection._apply_request_local_cooldown_from_plan
 
 
-def _publish_codex_cooldown_memory(*, keys: Sequence[str], seconds: float) -> None:
-    """Synchronously publish cooldowns into codex family memory (R3-1).
-
-    Direct ``state.py`` writes -- no awaitable lock -- so the retry loop can
-    call this inside the probe lock without violating the
-    ``probe_lock -> (nothing awaitable)`` ordering.
-    """
-    for key in keys:
-        _alias_routing_state.codex.set_cooldown_memory(key, seconds)
+_publish_codex_cooldown_memory = _aawm_cooldown_state._publish_codex_cooldown_memory
 
 
-def _publish_anthropic_cooldown_memory(*, keys: Sequence[str], seconds: float) -> None:
-    """Synchronously publish cooldowns into anthropic family memory (R3-1)."""
-    for key in keys:
-        _alias_routing_state.anthropic.set_cooldown_memory(key, seconds)
+_publish_anthropic_cooldown_memory = _aawm_cooldown_state._publish_anthropic_cooldown_memory
 
 
 async def _persist_codex_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
@@ -5854,28 +4727,7 @@ def _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
     return f"{candidate.get('provider')}:__account_quota__:{lane_key}"
 
 
-async def _apply_codex_auto_agent_grok_account_lane_cooldown(
-    *,
-    candidate: Payload,
-    lane_key: Optional[str],
-    cooldown_seconds: float,
-    cooldown_state_source: Optional[str],
-    skip_reason: Optional[str],
-    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
-) -> tuple[float, Optional[str], Optional[str]]:
-    lane_cooldown_key = _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
-        candidate,
-        lane_key,
-    )
-    if lane_cooldown_key is None:
-        return cooldown_seconds, cooldown_state_source, skip_reason
-    lane_seconds, lane_source = await get_active_cooldown_state(lane_cooldown_key)
-    if lane_seconds > cooldown_seconds:
-        cooldown_seconds = lane_seconds
-        cooldown_state_source = lane_source
-    if lane_seconds > 0 and skip_reason is None:
-        skip_reason = "account_quota_cooldown"
-    return cooldown_seconds, cooldown_state_source, skip_reason
+_apply_codex_auto_agent_grok_account_lane_cooldown = _aawm_selection._apply_codex_auto_agent_grok_account_lane_cooldown
 
 
 def _is_codex_auto_agent_grok_account_quota_exhaustion(
@@ -6539,14 +5391,7 @@ def _add_codex_auto_agent_alias_metadata(
     )
 
 
-def _normalize_anthropic_auto_agent_alias_model(model: Any) -> Optional[str]:
-    if not isinstance(model, str):
-        return None
-    normalized = model.strip().lower()
-    for alias in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS:
-        if normalized == alias.lower():
-            return alias
-    return None
+_normalize_anthropic_auto_agent_alias_model = _aawm_selection._normalize_anthropic_auto_agent_alias_model
 
 
 def _is_anthropic_auto_agent_alias_model(model: Any) -> bool:
@@ -6591,464 +5436,40 @@ def _resolve_anthropic_auto_agent_session_key(
     return f"{alias_model}:{session_id}:" f"{_resolve_anthropic_auto_agent_native_lane_key(request)}"
 
 
-def _format_merged_alias_family_cooldown_state_source(
-    *,
-    anthropic_seconds: float,
-    anthropic_source: str,
-    codex_seconds: float,
-    codex_source: str,
-) -> tuple[float, str]:
-    family_states: list[tuple[float, str]] = []
-    if anthropic_seconds > 0:
-        family_states.append(
-            (
-                anthropic_seconds,
-                f"anthropic_family:{anthropic_source}",
-            )
-        )
-    if codex_seconds > 0:
-        family_states.append((codex_seconds, f"codex_family:{codex_source}"))
-    if not family_states:
-        return 0.0, "local_fallback"
-    family_states.sort(key=lambda item: item[0], reverse=True)
-    merged_seconds = family_states[0][0]
-    merged_source = "+".join(source for _, source in family_states)
-    return merged_seconds, merged_source
+_format_merged_alias_family_cooldown_state_source = _aawm_cooldown_state._format_merged_alias_family_cooldown_state_source
 
 
-async def _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
-    cooldown_key: str,
-) -> tuple[float, str]:
-    (
-        anthropic_seconds,
-        anthropic_source,
-    ) = await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
-    codex_seconds, codex_source = await _get_codex_auto_agent_active_cooldown_state(cooldown_key)
-    return _format_merged_alias_family_cooldown_state_source(
-        anthropic_seconds=anthropic_seconds,
-        anthropic_source=anthropic_source,
-        codex_seconds=codex_seconds,
-        codex_source=codex_source,
-    )
+_get_anthropic_auto_agent_merged_codex_openai_cooldown_state = _aawm_cooldown_state._get_anthropic_auto_agent_merged_codex_openai_cooldown_state
 
 
-async def _get_anthropic_auto_agent_active_cooldown_state(
-    cooldown_key: str,
-) -> tuple[float, str]:
-    async with _anthropic_auto_agent_lock:
-        now = time.monotonic()
-        until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if until > now:
-            return max(0.0, until - now), "memory"
-        _anthropic_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
-        neg_until = _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if neg_until > now:
-            return 0.0, "negative_cache"
-    dual_cache = _get_aawm_alias_routing_dual_cache()
-    if dual_cache is None:
-        return 0.0, "local_fallback"
-    durable_payload = await _read_aawm_alias_routing_durable_payload(
-        alias_family="anthropic",
-        state_kind="cooldown",
-        state_key=cooldown_key,
-    )
-    if durable_payload is None:
-        async with _anthropic_auto_agent_lock:
-            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
-            )
-            _bound_aawm_alias_routing_memory_map(_anthropic_auto_agent_cooldown_negative_until_monotonic_by_key)
-        return 0.0, "local_fallback"
-    expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
-    if expires_at_epoch is None:
-        async with _anthropic_auto_agent_lock:
-            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
-            )
-            _bound_aawm_alias_routing_memory_map(_anthropic_auto_agent_cooldown_negative_until_monotonic_by_key)
-        return 0.0, "local_fallback"
-    async with _anthropic_auto_agent_lock:
-        _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
-        _hydrate_aawm_alias_routing_cooldown_memory(
-            memory_map=_anthropic_auto_agent_cooldown_until_monotonic_by_key,
-            cooldown_key=cooldown_key,
-            expires_at_epoch=expires_at_epoch,
-        )
-        until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        return max(0.0, until - time.monotonic()), "durable_cache"
+_get_anthropic_auto_agent_active_cooldown_state = _aawm_cooldown_state._get_anthropic_auto_agent_active_cooldown_state
 
 
-async def _get_anthropic_auto_agent_active_cooldown_seconds(
-    cooldown_key: str,
-) -> float:
-    seconds, _ = await _get_anthropic_auto_agent_active_cooldown_state(cooldown_key)
-    return seconds
+_get_anthropic_auto_agent_active_cooldown_seconds = _aawm_cooldown_state._get_anthropic_auto_agent_active_cooldown_seconds
 
 
-async def _set_anthropic_auto_agent_cooldown(
-    cooldown_key: str,
-    cooldown_seconds: float,
-) -> None:
-    ttl_seconds = max(0.0, float(cooldown_seconds))
-    async with _anthropic_auto_agent_lock:
-        until = time.monotonic() + ttl_seconds
-        current_until = _anthropic_auto_agent_cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if until > current_until:
-            _anthropic_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = until
-            _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
-            _bound_aawm_alias_routing_memory_map(_anthropic_auto_agent_cooldown_until_monotonic_by_key)
-    if ttl_seconds <= 0:
-        return
-    await _write_aawm_alias_routing_durable_payload(
-        alias_family="anthropic",
-        state_kind="cooldown",
-        state_key=cooldown_key,
-        payload={"cooldown_key": cooldown_key},
-        ttl_seconds=ttl_seconds,
-    )
+_set_anthropic_auto_agent_cooldown = _aawm_cooldown_state._set_anthropic_auto_agent_cooldown
 
 
-async def _get_anthropic_auto_agent_session_affinity(
-    session_key: Optional[str],
-) -> Optional[dict[str, Any]]:
-    if session_key is None:
-        return None
-    async with _anthropic_auto_agent_lock:
-        affinity = _anthropic_auto_agent_session_affinity_by_key.get(session_key)
-        if isinstance(affinity, dict):
-            expires_at = affinity.get("expires_at_monotonic", 0.0)
-            if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
-                hydrated = dict(affinity)
-                hydrated["affinity_state_source"] = affinity.get("affinity_state_source", "memory")
-                return hydrated
-            _anthropic_auto_agent_session_affinity_by_key.pop(session_key, None)
-    dual_cache = _get_aawm_alias_routing_dual_cache()
-    if dual_cache is None:
-        return None
-    durable_payload = await _read_aawm_alias_routing_durable_payload(
-        alias_family="anthropic",
-        state_kind="affinity",
-        state_key=session_key,
-    )
-    if durable_payload is None:
-        return None
-    expires_at_epoch = _parse_aawm_alias_routing_durable_expiry(durable_payload)
-    if expires_at_epoch is None:
-        return None
-    async with _anthropic_auto_agent_lock:
-        affinity = _hydrate_aawm_alias_routing_affinity_memory(
-            memory_map=_anthropic_auto_agent_session_affinity_by_key,
-            session_key=session_key,
-            payload=durable_payload,
-            expires_at_epoch=expires_at_epoch,
-        )
-        if not affinity:
-            return None
-        affinity["affinity_state_source"] = "durable_cache"
-        return dict(affinity)
+_get_anthropic_auto_agent_session_affinity = _aawm_cooldown_state._get_anthropic_auto_agent_session_affinity
 
 
-async def _set_anthropic_auto_agent_session_affinity(
-    session_key: Optional[str],
-    candidate: dict[str, Any],
-) -> None:
-    if session_key is None:
-        return
-    async with _anthropic_auto_agent_lock:
-        _anthropic_auto_agent_session_affinity_by_key[session_key] = {
-            "provider": candidate["provider"],
-            "model": candidate["model"],
-            "route_family": candidate["route_family"],
-            "last_resort": bool(candidate.get("last_resort")),
-            "expires_at_monotonic": (time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS),
-            "affinity_state_source": "memory",
-        }
-        _bound_aawm_alias_routing_memory_map(_anthropic_auto_agent_session_affinity_by_key)
-    await _write_aawm_alias_routing_durable_payload(
-        alias_family="anthropic",
-        state_kind="affinity",
-        state_key=session_key,
-        payload={
-            "provider": candidate["provider"],
-            "model": candidate["model"],
-            "route_family": candidate["route_family"],
-            "last_resort": bool(candidate.get("last_resort")),
-        },
-        ttl_seconds=_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS,
-    )
+_set_anthropic_auto_agent_session_affinity = _aawm_cooldown_state._set_anthropic_auto_agent_session_affinity
 
 
-def _find_anthropic_auto_agent_candidate(
-    provider: Any,
-    model: Any,
-    *,
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-) -> Optional[dict[str, Any]]:
-    for candidate in _get_anthropic_auto_agent_candidates_for_alias(alias_model):
-        if candidate["provider"] == provider and candidate["model"] == model:
-            return dict(candidate)
-    return None
+_find_anthropic_auto_agent_candidate = _aawm_selection._find_anthropic_auto_agent_candidate
 
 
-async def _build_anthropic_auto_agent_candidate_states(
-    request: Request,
-    *,
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-) -> list[dict[str, Any]]:
-    openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
-    anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
-    google_lane_key: Optional[str] = None
-    antigravity_lane_state: Optional[dict[str, Any]] = None
-    states: list[dict[str, Any]] = []
-    for candidate_template in _get_anthropic_auto_agent_candidates_for_alias(alias_model):
-        if candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER and google_lane_key is None:
-            google_lane_key = await _resolve_codex_auto_agent_google_lane_key()
-        if candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER and antigravity_lane_state is None:
-            antigravity_lane_state = await _resolve_codex_auto_agent_antigravity_lane_state()
-        states.append(
-            await _build_anthropic_auto_agent_candidate_state(
-                request,
-                candidate_template=candidate_template,
-                alias_model=alias_model,
-                openai_lane_key=openai_lane_key,
-                anthropic_lane_key=anthropic_lane_key,
-                google_lane_key=google_lane_key,
-                antigravity_lane_state=antigravity_lane_state,
-            )
-        )
-    return states
+_build_anthropic_auto_agent_candidate_states = _aawm_selection._build_anthropic_auto_agent_candidate_states
 
 
-def _raise_anthropic_auto_agent_in_flight_cooldown(
-    *,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    cooldown_seconds: float,
-) -> None:
-    shaped_candidate = _codex_auto_agent_candidate_public_shape(
-        candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        reason="in_flight_session_affinity_cooldown",
-    )
-    raise HTTPException(
-        status_code=429,
-        detail={
-            "error": {
-                "message": (
-                    "Anthropic auto-agent alias target is cooling down for an "
-                    "in-flight session; provider switching is disabled for "
-                    "stateful Claude continuations. Redispatch a fresh agent "
-                    "attempt to re-run the auto selector."
-                ),
-                "type": "rate_limit_error",
-                "code": "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
-            },
-            "candidate": shaped_candidate,
-        },
-        headers={"Retry-After": str(int(max(1.0, cooldown_seconds)))},
-    )
+_raise_anthropic_auto_agent_in_flight_cooldown = _aawm_selection._raise_anthropic_auto_agent_in_flight_cooldown
 
 
-def _raise_anthropic_auto_agent_redispatch_required(
-    *,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    cooldown_seconds: float,
-    error_tokens: set[str],
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-    error_class: Optional[str] = None,
-    cooldown_scope: Optional[str] = None,
-    error_status_code: Optional[Any] = None,
-    error_type: Optional[str] = None,
-    error_code: Optional[Any] = None,
-    retry_after_seconds: Optional[Any] = None,
-    failure_phase: Optional[str] = None,
-    attempted_provider_call: Optional[bool] = None,
-    audit_events: Optional[list[dict[str, Any]]] = None,
-    attempts: Optional[list[dict[str, Any]]] = None,
-    skipped_candidates: Optional[list[dict[str, Any]]] = None,
-) -> None:
-    detail = _build_auto_agent_redispatch_http_exception_detail(
-        alias_family="anthropic_auto_agent",
-        alias_model=alias_model,
-        candidate=candidate,
-        lane_key=lane_key,
-        cooldown_seconds=cooldown_seconds,
-        error_tokens=error_tokens,
-        error_class=error_class,
-        cooldown_scope=cooldown_scope,
-        error_status_code=error_status_code,
-        error_type=error_type,
-        error_code=error_code,
-        retry_after_seconds=retry_after_seconds,
-        failure_phase=failure_phase,
-        attempted_provider_call=attempted_provider_call,
-        audit_events=audit_events,
-        attempts=attempts,
-        skipped_candidates=skipped_candidates,
-        code="aawm_anthropic_auto_agent_redispatch_required",
-        message=(
-            "Anthropic auto-agent alias target hit retryable provider "
-            "exhaustion for an in-flight session. Do not continue this "
-            f"child agent. Redispatch a fresh subagent using model {alias_model} "
-            "so the auto selector can choose the next available candidate."
-        ),
-    )
-    raise HTTPException(
-        status_code=429,
-        detail=detail,
-        headers={"Retry-After": str(detail["retry_after_seconds"])},
-    )
+_raise_anthropic_auto_agent_redispatch_required = _aawm_selection._raise_anthropic_auto_agent_redispatch_required
 
 
-async def _select_anthropic_auto_agent_candidate(
-    *,
-    request: Request,
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    alias_model = (
-        _normalize_anthropic_auto_agent_alias_model(request_body.get("model")) or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-    )
-    session_key = _resolve_anthropic_auto_agent_session_key(
-        request,
-        request_body,
-        alias_model=alias_model,
-    )
-    has_continuation_state = _codex_auto_agent_request_has_continuation_state(request_body)
-
-    affinity = await _get_anthropic_auto_agent_session_affinity(session_key)
-    if affinity is not None and not has_continuation_state:
-        affinity = None
-    if affinity is not None and has_continuation_state:
-        affinity_candidate = _find_anthropic_auto_agent_candidate(
-            affinity.get("provider"),
-            affinity.get("model"),
-            alias_model=alias_model,
-        )
-        if affinity_candidate is not None:
-            affinity_state = await _build_anthropic_auto_agent_candidate_state(
-                request,
-                candidate_template=affinity_candidate,
-                alias_model=alias_model,
-            )
-            if _is_auto_agent_candidate_state_available(affinity_state):
-                return _attach_aawm_alias_routing_state_sources(
-                    {
-                        **affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": [],
-                        "in_flight_session": has_continuation_state,
-                    },
-                    affinity=affinity,
-                    selected_state=affinity_state,
-                )
-            if affinity_state["cooldown_seconds"] > 0:
-                _raise_anthropic_auto_agent_in_flight_cooldown(
-                    candidate=affinity_candidate,
-                    lane_key=affinity_state.get("lane_key"),
-                    cooldown_seconds=affinity_state["cooldown_seconds"],
-                )
-
-    states = await _build_anthropic_auto_agent_candidate_states(
-        request,
-        alias_model=alias_model,
-    )
-    skipped = _build_auto_agent_skipped_candidates_from_states(states)
-
-    if affinity is not None:
-        affinity_candidate = _find_anthropic_auto_agent_candidate(
-            affinity.get("provider"),
-            affinity.get("model"),
-            alias_model=alias_model,
-        )
-        if affinity_candidate is not None:
-            matched_affinity_state: Optional[dict[str, Any]] = None
-            for state in states:
-                if (
-                    state["candidate"]["provider"] == affinity_candidate["provider"]
-                    and state["candidate"]["model"] == affinity_candidate["model"]
-                ):
-                    matched_affinity_state = state
-                    break
-            if matched_affinity_state is not None:
-                if not _is_auto_agent_candidate_state_available(matched_affinity_state):
-                    if has_continuation_state:
-                        if matched_affinity_state["cooldown_seconds"] > 0:
-                            _raise_anthropic_auto_agent_in_flight_cooldown(
-                                candidate=affinity_candidate,
-                                lane_key=matched_affinity_state.get("lane_key"),
-                                cooldown_seconds=matched_affinity_state["cooldown_seconds"],
-                            )
-                    skipped.append(
-                        _codex_auto_agent_candidate_public_shape(
-                            affinity_candidate,
-                            lane_key=matched_affinity_state.get("lane_key"),
-                            cooldown_seconds=(
-                                matched_affinity_state["cooldown_seconds"]
-                                if matched_affinity_state["cooldown_seconds"] > 0
-                                else None
-                            ),
-                            reason=matched_affinity_state.get("skip_reason") or "session_affinity_cooldown",
-                        )
-                    )
-                else:
-                    return _attach_aawm_alias_routing_state_sources(
-                        {
-                            **matched_affinity_state,
-                            "alias_model": alias_model,
-                            "session_key": session_key,
-                            "selection_reason": "session_affinity",
-                            "skipped": skipped,
-                            "in_flight_session": has_continuation_state,
-                        },
-                        affinity=affinity,
-                        selected_state=matched_affinity_state,
-                    )
-
-    for state in states:
-        if state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
-            continue
-        return _attach_aawm_alias_routing_state_sources(
-            {
-                **state,
-                "alias_model": alias_model,
-                "session_key": session_key,
-                "selection_reason": "first_available",
-                "skipped": skipped,
-                "in_flight_session": has_continuation_state,
-            },
-            selected_state=state,
-        )
-
-    for state in states:
-        if not state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
-            continue
-        return _attach_aawm_alias_routing_state_sources(
-            {
-                **state,
-                "alias_model": alias_model,
-                "session_key": session_key,
-                "selection_reason": "last_resort",
-                "skipped": skipped,
-                "in_flight_session": has_continuation_state,
-            },
-            selected_state=state,
-        )
-
-    raise HTTPException(
-        status_code=429,
-        detail={
-            "error": {
-                "message": ("All Anthropic auto-agent alias candidates are currently cooled down."),
-                "type": "rate_limit_error",
-                "code": "aawm_anthropic_auto_agent_all_candidates_cooling_down",
-            },
-            "candidates": skipped,
-        },
-    )
+_select_anthropic_auto_agent_candidate = _aawm_selection._select_anthropic_auto_agent_candidate
 
 
 def _add_anthropic_auto_agent_alias_metadata(
@@ -8373,12 +6794,11 @@ async def _get_openrouter_adapter_active_cooldown_seconds(
 
 # Wave 5A: bind quota state and adapter helpers into openrouter_quota.
 def _get_openrouter_free_daily_quota_cache() -> tuple[Optional[float], float]:
-    return _openrouter_free_daily_quota_cache
+    return _alias_routing_state.get_openrouter_free_quota_cache()
 
 
 def _set_openrouter_free_daily_quota_cache(value: tuple[Optional[float], float]) -> None:
-    global _openrouter_free_daily_quota_cache
-    _openrouter_free_daily_quota_cache = value
+    _alias_routing_state.set_openrouter_free_quota_cache(value)
 
 
 async def _fetch_openrouter_quota_row_via_facade():
@@ -8395,8 +6815,44 @@ _aawm_openrouter_quota.configure_openrouter_quota_runtime(
     get_adapter_active_cooldown_seconds=_get_openrouter_adapter_active_cooldown_seconds,
     get_adapter_rate_limit_key=_get_openrouter_adapter_rate_limit_key,
     fetch_quota_row=_fetch_openrouter_quota_row_via_facade,
+    get_free_daily_quota_exhausted_cooldown_seconds=(
+        lambda: globals()[
+            "_get_openrouter_free_daily_quota_exhausted_cooldown_seconds"
+        ]()
+    ),
 )
 
+# Wave 5B: bind the state manager into cooldown_state.
+_aawm_cooldown_state.configure_cooldown_state_runtime(
+    manager=_alias_routing_state,
+)
+
+# Wave 5B: bind god-module / cooldown_state dependencies into selection.
+# Late-binding lambdas ensure the god-module names are resolved at call time.
+_aawm_selection.configure_selection_runtime(
+    get_codex_active_cooldown_state=lambda *a, **kw: _get_codex_auto_agent_active_cooldown_state(*a, **kw),
+    get_anthropic_active_cooldown_state=lambda *a, **kw: _get_anthropic_auto_agent_active_cooldown_state(*a, **kw),
+    get_anthropic_merged_codex_openai_cooldown_state=lambda *a, **kw: _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(*a, **kw),
+    set_codex_cooldown=lambda *a, **kw: _set_codex_auto_agent_cooldown(*a, **kw),
+    set_anthropic_cooldown=lambda *a, **kw: _set_anthropic_auto_agent_cooldown(*a, **kw),
+    get_codex_session_affinity=lambda *a, **kw: _get_codex_auto_agent_session_affinity(*a, **kw),
+    get_anthropic_session_affinity=lambda *a, **kw: _get_anthropic_auto_agent_session_affinity(*a, **kw),
+    resolve_google_lane_key=lambda *a, **kw: _resolve_codex_auto_agent_google_lane_key(*a, **kw),
+    resolve_antigravity_lane_state=lambda *a, **kw: _resolve_codex_auto_agent_antigravity_lane_state(*a, **kw),
+    get_openrouter_adapter_active_cooldown_seconds=lambda *a, **kw: _get_openrouter_adapter_active_cooldown_seconds(*a, **kw),
+    google_adapter_rate_limit_lock=_google_adapter_rate_limit_lock,
+    google_adapter_rate_limit_until_monotonic_by_key=_google_adapter_rate_limit_until_monotonic_by_key,
+    normalize_codex_alias_model=lambda *a, **kw: _normalize_codex_auto_agent_alias_model(*a, **kw),
+    extract_client_product_label=lambda *a, **kw: _extract_auto_agent_alias_client_product_label(*a, **kw),
+    resolve_codex_session_key=lambda *a, **kw: _resolve_codex_auto_agent_session_key(*a, **kw),
+    resolve_anthropic_session_key=lambda *a, **kw: _resolve_anthropic_auto_agent_session_key(*a, **kw),
+    has_continuation_state=lambda *a, **kw: _codex_auto_agent_request_has_continuation_state(*a, **kw),
+    get_anthropic_candidates_for_alias=lambda *a, **kw: _get_anthropic_auto_agent_candidates_for_alias(*a, **kw),
+    is_grok_account_quota_candidate=lambda *a, **kw: _is_codex_auto_agent_grok_account_quota_candidate(*a, **kw),
+    get_grok_account_quota_lane_cooldown_key=lambda *a, **kw: _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(*a, **kw),
+    is_kimi_code_candidate=lambda *a, **kw: _is_kimi_code_auto_agent_candidate(*a, **kw),
+    get_kimi_managed_account_cooldown_key=lambda *a, **kw: _get_kimi_code_managed_account_cooldown_key(*a, **kw),
+)
 
 async def _wait_for_openrouter_adapter_cooldown_if_needed(
     rate_limit_keys: Union[str, list[str], tuple[str, ...]],
@@ -24433,8 +22889,27 @@ def create_generic_websocket_passthrough_endpoint(
 
 # Wave 4 runtime injection -- FunctionType rebind for live host-global lookup
 _aawm_lane_keys.install(globals())
+_aawm_selection.install(globals())
+_aawm_cooldown_state.install(globals())
+_aawm_selection._attach_aawm_alias_routing_state_sources = (
+    _aawm_cooldown_state._attach_aawm_alias_routing_state_sources
+)
 _aawm_adapter_model_resolution.install(globals())
 _google_env_policy.install(globals())
 _google_context_window.install(globals())
 _google_error_signals.install(globals())
 _grok_side_channel.install(globals())
+
+
+# Wave 5B: backward-compat module __getattr__ for manager-owned quota cache.
+# Tests and external code may still reference the old module-level name.
+_W5B_MANAGER_OWNED_ATTRS = {
+    "_openrouter_free_daily_quota_cache": lambda: _alias_routing_state.get_openrouter_free_quota_cache(),
+}
+
+
+def __getattr__(name: str):
+    factory = _W5B_MANAGER_OWNED_ATTRS.get(name)
+    if factory is not None:
+        return factory()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
