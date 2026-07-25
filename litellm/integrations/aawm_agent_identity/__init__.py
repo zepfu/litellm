@@ -29,9 +29,9 @@ re-exported here for compatibility with repair/backfill scripts and tests.
 """
 
 import ast
+import base64  # noqa: F401 - consumed by moved enrich helpers via host globals
 import asyncio  # noqa: F401 - monkeypatch surface for session_history writer tests
 import atexit  # noqa: F401 - monkeypatch surface for session_history writer tests
-import base64
 import hashlib
 import importlib  # noqa: F401 - monkeypatch surface for session_history writer tests
 import inspect  # noqa: F401 - freevar seed for record APIs
@@ -41,7 +41,7 @@ import math
 import os
 import queue  # noqa: F401 - monkeypatch surface for session_history writer tests
 import re
-import shlex
+import shlex  # noqa: F401 - consumed by moved tool_activity helpers via host globals
 import threading  # noqa: F401 - monkeypatch surface for session_history writer tests
 import time  # noqa: F401 - monkeypatch surface for session_history writer tests
 import warnings  # noqa: F401 - consumed by moved rate_limit_base._coerce_rate_limit_payload via host globals
@@ -119,10 +119,6 @@ def _get_response_api_logging_utils() -> Any:
     return _response_api_logging_utils
 
 
-_CLAUDE_PERMISSION_CHECK_OUTPUT_RE = re.compile(
-    r"^<block>\s*(?P<decision>yes|no)\s*$",
-    re.IGNORECASE,
-)
 _AGENT_RE = re.compile(r"You are '([^']+)' and you are working")
 _AGENT_TENANT_RE = re.compile(r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project")
 _AGENT_ROLE_RE = re.compile(
@@ -131,7 +127,6 @@ _AGENT_ROLE_RE = re.compile(
 )
 _DEFAULT_AGENT = "orchestrator"
 _CLAUDE_EXPERIMENT_ID_RE = re.compile(rb"(?<![A-Za-z0-9._-])([A-Za-z][A-Za-z0-9._-]{11,})(?![A-Za-z0-9._-])")
-_GEMINI_MARKER = bytes.fromhex("8f3d6b5f")
 _AAWM_DB_HOST_ENV_VARS = (
     "AAWM_DB_HOST",
     "AAWM_POSTGRES_SERVER",
@@ -388,30 +383,6 @@ _ANTHROPIC_CONTEXT_WINDOW_METADATA_KEYS = (
     "anthropic_context_window_classification",
 )
 
-_WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS = (
-    "worker_context_exhaustion_failure_class",
-    "worker_context_exhaustion_failure_reason",
-    "worker_context_exhaustion_partial_output_summary",
-    "worker_context_exhaustion_changed_paths_hint",
-    "worker_context_exhaustion_attempted_patch_scope",
-    "worker_context_exhaustion_last_visible_message",
-    "worker_context_exhaustion_success",
-    "worker_context_exhaustion_completed",
-)
-_WORKER_CONTEXT_EXHAUSTION_STRING_MAX_LEN = {
-    "worker_context_exhaustion_failure_class": 128,
-    "worker_context_exhaustion_failure_reason": 512,
-    "worker_context_exhaustion_partial_output_summary": 2000,
-    "worker_context_exhaustion_changed_paths_hint": 2000,
-    "worker_context_exhaustion_attempted_patch_scope": 2000,
-    "worker_context_exhaustion_last_visible_message": 2000,
-}
-_WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS = frozenset(
-    {
-        "worker_context_exhaustion_success",
-        "worker_context_exhaustion_completed",
-    }
-)
 _PROMPT_OVERHEAD_TOKEN_FIELDS = (
     "input_system_tokens_estimated",
     "input_tool_advertisement_tokens_estimated",
@@ -755,9 +726,6 @@ _AAWM_REPOSITORY_WAVE_AGENT_RE = re.compile(
 )
 _AAWM_NUMERIC_IDENTITY_ALLOWLIST: frozenset[str] = frozenset()
 _AAWM_SCALAR_NUMERIC_IDENTITY_RE = re.compile(r"^[+-]?\d+$")
-_CLAUDE_AUTO_REVIEW_LOGICAL_MODEL = "claude-auto-review"
-_CLAUDE_AUTO_REVIEW_TRACE_NAME = "claude-code.auto-reviewer"
-_CLAUDE_AUTO_REVIEW_AGENT_NAME = "auto-reviewer"
 _CODEX_MEMORY_REPOSITORY_SUFFIX = " (memory)"
 _CODEX_MEMORY_ROOT_REPOSITORY = "codex-memories"
 _AAWM_REPOSITORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?$")
@@ -1802,43 +1770,14 @@ def _extract_provider_specific_fields(message: Any) -> Dict[str, Any]:
     return {}
 
 
-def _extract_reasoning_content(message: Any, thinking_blocks: List[dict]) -> str:
-    reasoning_content = _maybe_get(message, "reasoning_content")
-    if isinstance(reasoning_content, str):
-        return reasoning_content
-
-    thinking_parts: List[str] = []
-    for block in thinking_blocks:
-        thinking_text = _maybe_get(block, "thinking")
-        if isinstance(thinking_text, str) and thinking_text:
-            thinking_parts.append(thinking_text)
-    return "\n".join(thinking_parts)
 
 
-def _extract_thinking_blocks(message: Any) -> List[dict]:
-    thinking_blocks = _maybe_get(message, "thinking_blocks")
-    if not isinstance(thinking_blocks, list):
-        provider_specific_fields = _extract_provider_specific_fields(message)
-        thinking_blocks = provider_specific_fields.get("thinking_blocks")
-    if not isinstance(thinking_blocks, list):
-        return []
-    return [block for block in thinking_blocks if isinstance(block, dict)]
 
 
-def _normalize_base64_text(value: str) -> str:
-    return "".join(value.split())
 
 
-def _decode_base64_bytes(value: str) -> bytes:
-    normalized_value = _normalize_base64_text(value)
-    padding = (-len(normalized_value)) % 4
-    if padding:
-        normalized_value += "=" * padding
-    return base64.b64decode(normalized_value)
 
 
-def _short_hash(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()[:12]
 
 
 def _format_langfuse_span_timestamp(value: datetime) -> str:
@@ -1885,443 +1824,36 @@ def _maybe_parse_json_text(value: str) -> Any:
         return None
 
 
-def _permission_check_probeable_value(value: Any) -> bool:
-    """True when *value* is a concrete response-shaped container we should walk.
-
-    Restricts attribute probing to dicts and objects that already expose the
-    known fields, so free-form getattr on test doubles / arbitrary objects is
-    not required in production code.
-    """
-    if isinstance(value, (str, list, dict)):
-        return True
-    if value is None or isinstance(value, (bool, int, float, bytes)):
-        return False
-    for key in ("content", "choices", "response", "message"):
-        try:
-            if isinstance(value, dict) and key in value:
-                return True
-            obj_dict = getattr(value, "__dict__", None)
-            if isinstance(obj_dict, dict) and key in obj_dict:
-                return True
-        except Exception:
-            continue
-    return False
 
 
-def _extract_claude_permission_check_decision_from_value(
-    value: Any,
-    *,
-    _depth: int = 0,
-) -> Optional[str]:
-    if value is None or _depth > 8:
-        return None
-
-    if isinstance(value, str):
-        stripped_value = value.strip()
-        match = _CLAUDE_PERMISSION_CHECK_OUTPUT_RE.match(stripped_value)
-        if match is not None:
-            return match.group("decision").lower()
-        parsed_value = _maybe_parse_json_text(stripped_value)
-        if parsed_value is not None:
-            return _extract_claude_permission_check_decision_from_value(parsed_value, _depth=_depth + 1)
-        return None
-
-    if isinstance(value, list):
-        text_value = _content_to_text(value).strip()
-        match = _CLAUDE_PERMISSION_CHECK_OUTPUT_RE.match(text_value)
-        if match is not None:
-            return match.group("decision").lower()
-        for item in value:
-            decision = _extract_claude_permission_check_decision_from_value(item, _depth=_depth + 1)
-            if decision is not None:
-                return decision
-        return None
-
-    if not _permission_check_probeable_value(value):
-        return None
-
-    content = _maybe_get(value, "content")
-    if content is not None and content is not value:
-        decision = _extract_claude_permission_check_decision_from_value(content, _depth=_depth + 1)
-        if decision is not None:
-            return decision
-
-    message = _extract_first_response_message(value)
-    if message is not None and message is not value:
-        decision = _extract_claude_permission_check_decision_from_value(message, _depth=_depth + 1)
-        if decision is not None:
-            return decision
-
-    response = _maybe_get(value, "response")
-    if response is not None and response is not value:
-        decision = _extract_claude_permission_check_decision_from_value(response, _depth=_depth + 1)
-        if decision is not None:
-            return decision
-
-    return None
 
 
-def _extract_claude_permission_check_decision(
-    result: Any,
-    standard_logging_object: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    decision = _extract_claude_permission_check_decision_from_value(result)
-    if decision is not None:
-        return decision
-
-    if isinstance(standard_logging_object, dict):
-        for candidate in (
-            standard_logging_object.get("response"),
-            standard_logging_object.get("output"),
-        ):
-            decision = _extract_claude_permission_check_decision_from_value(candidate)
-            if decision is not None:
-                return decision
-
-    return None
 
 
-def _extract_claude_permission_check_models(
-    kwargs: Dict[str, Any],
-    standard_logging_object: Dict[str, Any],
-    metadata: Dict[str, Any],
-    result: Any,
-) -> Tuple[Optional[str], Optional[str]]:
-    request_model = _first_non_empty_string(
-        _maybe_get_path(kwargs.get("passthrough_logging_payload"), "request_body", "model"),
-        _maybe_get_path(
-            kwargs.get("litellm_params"),
-            "proxy_server_request",
-            "body",
-            "model",
-        ),
-        _maybe_get_path(standard_logging_object, "request_body", "model"),
-    )
-    response_model = _first_non_empty_string(
-        _maybe_get(result, "model"),
-        _maybe_get_path(standard_logging_object, "response", "model"),
-        standard_logging_object.get("model"),
-        kwargs.get("model"),
-        metadata.get("model"),
-    )
-    return request_model, response_model
 
 
-def _enrich_claude_permission_check_metadata(
-    kwargs: Dict[str, Any],
-    metadata: Dict[str, Any],
-    result: Any,
-    *,
-    standard_logging_object: Optional[Dict[str, Any]] = None,
-) -> None:
-    standard_logging_object = standard_logging_object or kwargs.get("standard_logging_object") or {}
-    decision = _extract_claude_permission_check_decision(
-        result,
-        standard_logging_object=standard_logging_object,
-    )
-    if decision is None:
-        return
-
-    blocked = decision == "yes"
-    request_model, response_model = _extract_claude_permission_check_models(
-        kwargs,
-        standard_logging_object,
-        metadata,
-        result,
-    )
-
-    metadata["claude_internal_check"] = True
-    metadata["claude_internal_check_type"] = "permission_check"
-    metadata["claude_permission_check"] = True
-    metadata["claude_permission_check_decision"] = decision
-    metadata["claude_permission_check_blocked"] = blocked
-    if request_model:
-        metadata["claude_permission_check_request_model"] = request_model
-    if response_model:
-        metadata["claude_permission_check_response_model"] = response_model
-
-    _merge_tags(
-        metadata,
-        [
-            "claude-internal-check",
-            "claude-permission-check",
-            f"claude-permission-check:{decision}",
-            "claude-permission-check:block" if blocked else "claude-permission-check:allow",
-        ],
-    )
-
-    existing_spans = metadata.get("langfuse_spans") or []
-    if not isinstance(existing_spans, list):
-        existing_spans = []
-    if any(isinstance(span, dict) and span.get("name") == "claude.permission_check" for span in existing_spans):
-        return
-
-    span_metadata: Dict[str, Any] = {
-        "decision": decision,
-        "blocked": blocked,
-        "source": "claude_code_block_output",
-    }
-    for key in (
-        "cc_version",
-        "cc_entrypoint",
-        "client_name",
-        "client_version",
-        "litellm_environment",
-    ):
-        value = metadata.get(key)
-        if value is not None:
-            span_metadata[key] = value
-    if request_model:
-        span_metadata["request_model"] = request_model
-    if response_model:
-        span_metadata["response_model"] = response_model
-
-    now = datetime.now(timezone.utc)
-    _append_langfuse_span(
-        metadata,
-        name="claude.permission_check",
-        span_metadata=span_metadata,
-        input_data={"check_type": "permission_check"},
-        output_data={"decision": decision, "blocked": blocked},
-        start_time=now,
-        end_time=now,
-    )
 
 
-def _metadata_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y"}
-    return bool(value)
 
 
-def _metadata_request_tags(metadata: Dict[str, Any]) -> List[str]:
-    request_tags = metadata.get("request_tags")
-    tags = metadata.get("tags")
-    merged: List[str] = []
-    for source in (request_tags, tags):
-        if not isinstance(source, list):
-            continue
-        for tag in source:
-            if isinstance(tag, str) and tag.strip() and tag not in merged:
-                merged.append(tag)
-    return merged
 
 
-def _is_claude_permission_check_metadata(metadata: Any) -> bool:
-    if not isinstance(metadata, dict):
-        return False
-    if _metadata_bool(metadata.get("claude_permission_check")):
-        return True
-    for tag in _metadata_request_tags(metadata):
-        if tag == "claude-permission-check" or tag.startswith("claude-permission-check:"):
-            return True
-    return False
 
 
-def _extract_claude_project_from_metadata_tags(
-    metadata: Dict[str, Any],
-) -> Optional[str]:
-    for tag in _metadata_request_tags(metadata):
-        if not tag.startswith("claude-project:"):
-            continue
-        repository = _normalize_repository_identity(tag.split(":", 1)[1])
-        if repository:
-            return repository
-    return None
 
 
-def _extract_claude_auto_review_source_model(
-    metadata: Dict[str, Any],
-    fallback_model: Optional[str] = None,
-) -> Optional[str]:
-    return _first_non_empty_string(
-        metadata.get("source_model"),
-        metadata.get("claude_permission_check_response_model"),
-        metadata.get("claude_permission_check_request_model"),
-        fallback_model,
-    )
 
 
-def _apply_claude_auto_review_metadata(
-    metadata: Dict[str, Any],
-    *,
-    repository: Optional[str] = None,
-    tenant_id: Optional[str] = None,
-    source_model: Optional[str] = None,
-) -> None:
-    metadata["trace_name"] = _CLAUDE_AUTO_REVIEW_TRACE_NAME
-    metadata["agent_name"] = _CLAUDE_AUTO_REVIEW_AGENT_NAME
-    metadata["aawm_claude_agent_name"] = _CLAUDE_AUTO_REVIEW_AGENT_NAME
-    metadata["logical_model"] = _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
-
-    resolved_source_model = _extract_claude_auto_review_source_model(
-        metadata,
-        source_model,
-    )
-    if resolved_source_model and resolved_source_model != _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL:
-        metadata["source_model"] = resolved_source_model
-
-    normalized_repository = _normalize_repository_identity(repository)
-    normalized_tenant = _normalize_repository_identity(tenant_id)
-    inherited_identity = normalized_repository or normalized_tenant
-    if inherited_identity:
-        metadata["repository"] = inherited_identity
-        metadata["tenant_id"] = inherited_identity
-        metadata["aawm_tenant_id"] = inherited_identity
-        metadata["aawm_claude_project"] = inherited_identity
-        metadata["trace_user_id"] = inherited_identity
-
-    tags_to_add = [
-        "claude-internal-check",
-        "claude-permission-check",
-        f"claude-agent:{_CLAUDE_AUTO_REVIEW_AGENT_NAME}",
-    ]
-    if inherited_identity:
-        tags_to_add.append(f"claude-project:{inherited_identity}")
-    _merge_tags(metadata, tags_to_add)
-    existing_request_tags = metadata.get("request_tags") or []
-    if not isinstance(existing_request_tags, list):
-        existing_request_tags = []
-    merged_request_tags = list(existing_request_tags)
-    for tag in tags_to_add:
-        if tag and tag not in merged_request_tags:
-            merged_request_tags.append(tag)
-    metadata["request_tags"] = merged_request_tags
 
 
-def _apply_claude_auto_review_identity_to_record(record: Dict[str, Any]) -> None:
-    metadata = record.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-    else:
-        metadata = dict(metadata)
-    if not _is_claude_permission_check_metadata(metadata):
-        return
-
-    source_model = _extract_claude_auto_review_source_model(
-        metadata,
-        _clean_non_empty_string(record.get("model")),
-    )
-    repository = _normalize_repository_identity(record.get("repository"))
-    tenant_id = _normalize_repository_identity(record.get("tenant_id"))
-    if repository is None:
-        repository = _extract_claude_project_from_metadata_tags(metadata)
-    if tenant_id is None:
-        tenant_id = repository
-
-    _apply_claude_auto_review_metadata(
-        metadata,
-        repository=repository,
-        tenant_id=tenant_id,
-        source_model=source_model,
-    )
-    record["metadata"] = metadata
-    record["model"] = _CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
-    record["agent_name"] = _CLAUDE_AUTO_REVIEW_AGENT_NAME
-    if repository is not None:
-        record["repository"] = repository
-    resolved_tenant = tenant_id or repository
-    if resolved_tenant is not None:
-        record["tenant_id"] = resolved_tenant
 
 
-def _extract_claude_auto_review_identity_from_row(
-    row: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    metadata = row.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-
-    repository = (
-        _normalize_repository_identity(row.get("repository"))
-        or _extract_claude_project_from_metadata_tags(metadata)
-        or _normalize_repository_identity(metadata.get("aawm_claude_project"))
-        or _normalize_repository_identity(metadata.get("repository"))
-        or _normalize_repository_identity(row.get("tenant_id"))
-        or _normalize_repository_identity(metadata.get("tenant_id"))
-    )
-    if not repository:
-        return None
-
-    return {
-        "repository": repository,
-        "tenant_id": repository,
-        "source_row_id": row.get("id"),
-        "source": "same_session.session_history",
-    }
 
 
-def _apply_claude_auto_review_parent_identity(
-    payload: Dict[str, Any],
-    identity: Dict[str, Any],
-) -> None:
-    repository = _normalize_repository_identity(identity.get("repository"))
-    if not repository:
-        return
-
-    metadata = payload.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-    else:
-        metadata = dict(metadata)
-
-    payload["repository"] = repository
-    payload["tenant_id"] = repository
-    _apply_claude_auto_review_metadata(
-        metadata,
-        repository=repository,
-        tenant_id=repository,
-        source_model=_extract_claude_auto_review_source_model(
-            metadata,
-            _clean_non_empty_string(payload.get("model")),
-        ),
-    )
-    metadata["claude_auto_review_parent_identity_source"] = identity.get("source")
-    if identity.get("source_row_id") is not None:
-        metadata["claude_auto_review_parent_identity_source_row_id"] = identity["source_row_id"]
-    payload["metadata"] = metadata
 
 
-def _build_session_identity_cache(
-    records: List[Dict[str, Any]],
-) -> Dict[str, Dict[str, Any]]:
-    identity_by_session: Dict[str, Dict[str, Any]] = {}
-    for record in records:
-        if record.get("_skip_session_history"):
-            continue
-        session_id = _clean_non_empty_string(record.get("session_id"))
-        if not session_id:
-            continue
-        metadata = record.get("metadata")
-        if _is_claude_permission_check_metadata(metadata):
-            continue
-        identity = _extract_claude_auto_review_identity_from_row(record)
-        if identity:
-            identity_by_session[session_id] = identity
-    return identity_by_session
 
 
-def _build_permission_usage_fields(
-    *,
-    metadata: Dict[str, Any],
-    prompt_tokens: Optional[int],
-    completion_tokens: Optional[int],
-    response_cost_usd: Optional[float],
-) -> Dict[str, Any]:
-    if not _metadata_bool(metadata.get("claude_permission_check")):
-        return {
-            "token_permission_input": 0,
-            "token_permission_output": 0,
-            "permission_usd_cost": 0.0,
-        }
-
-    return {
-        "token_permission_input": _safe_int(prompt_tokens) or 0,
-        "token_permission_output": _safe_int(completion_tokens) or 0,
-        "permission_usd_cost": _safe_float(response_cost_usd) or 0.0,
-    }
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -4479,664 +4011,60 @@ def _normalize_reporting_exclusion_state_on_record(record: Dict[str, Any]) -> No
     record["metadata"] = metadata
 
 
-_TOOL_ACTIVITY_READ_NAMES = {
-    "read",
-    "view",
-    "cat",
-    "grep",
-    "glob",
-    "ls",
-    "listdir",
-    "list_files",
-    "search",
-    "fetch",
-    "webfetch",
-    "web_fetch",
-    "notebookread",
-}
-_TOOL_ACTIVITY_MODIFY_NAMES = {
-    "write",
-    "edit",
-    "replace",
-    "replacement",
-    "multiedit",
-    "apply_patch",
-    "applypatch",
-    "notebookedit",
-    "notebookwrite",
-}
-_TOOL_ACTIVITY_COMMAND_NAMES = {
-    "bash",
-    "shell",
-    "terminal",
-    "run",
-    "exec",
-    "exec_command",
-    "browser_run_code",
-}
-_TOOL_ACTIVITY_SKIP_PATH_KEYS = {
-    "content",
-    "old_str",
-    "new_str",
-    "replacement",
-    "patch",
-    "command",
-    "cmd",
-    "description",
-    "thinking",
-    "reason",
-}
-_APPLY_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", re.MULTILINE)
-_APPLY_PATCH_MOVE_TO_RE = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
-_GIT_COMMAND_RE = re.compile(r"(?<!\S)git\b(?P<args>[^;&|]*)")
-_GIT_GLOBAL_OPTIONS_WITH_VALUES = {
-    "-C",
-    "-c",
-    "--git-dir",
-    "--work-tree",
-    "--namespace",
-    "--exec-path",
-    "--config-env",
-}
-_TOOL_ACTIVITY_COMMAND_TEXT_KEYS = (
-    "command",
-    "cmd",
-    "raw_text",
-    "input",
-    "script",
-    "shell",
-    "bash",
-    "code",
-    "text",
-)
-_TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS = {
-    "description",
-    "reason",
-    "thinking",
-    "title",
-    "summary",
-}
-_SENSITIVE_CONFIG_CHANGE_FIELDS = (
-    "changed_pre_commit_config",
-    "changed_env_file",
-    "changed_pyproject_toml",
-    "changed_gitignore",
-)
-_SENSITIVE_CONFIG_ENV_REDACTION = "[redacted_sensitive_config_file_content]"
-_SENSITIVE_CONFIG_ENV_REDACT_ARGUMENT_KEYS = {
-    "bash",
-    "cmd",
-    "code",
-    "command",
-    "content",
-    "input",
-    "new_str",
-    "old_str",
-    "patch",
-    "raw_text",
-    "replacement",
-    "script",
-    "shell",
-    "text",
-    "value",
-}
-_SENSITIVE_CONFIG_ENV_COMMAND_RE = re.compile(
-    r"(?<![A-Za-z0-9_./-])\.env[A-Za-z0-9._-]*(?![A-Za-z0-9_/-])",
-    re.IGNORECASE,
-)
-
-
-def _dedupe_strings(values: List[str]) -> List[str]:
-    seen: set[str] = set()
-    result: List[str] = []
-    for value in values:
-        stripped = str(value).strip()
-        if not stripped or stripped in seen:
-            continue
-        seen.add(stripped)
-        result.append(stripped)
-    return result
-
-
-def _normalize_changed_file_path(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    normalized = str(value).strip().strip("'\"").replace("\\", "/")
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    if not normalized:
-        return None
-    return normalized
-
-
-def _changed_file_basename(value: Any) -> Optional[str]:
-    normalized = _normalize_changed_file_path(value)
-    if normalized is None:
-        return None
-    return normalized.rstrip("/").rsplit("/", 1)[-1]
-
-
-def _sensitive_config_change_flags_from_paths(paths: List[str]) -> Dict[str, bool]:
-    flags = {field: False for field in _SENSITIVE_CONFIG_CHANGE_FIELDS}
-    for path in _dedupe_strings(paths):
-        basename = _changed_file_basename(path)
-        if not basename:
-            continue
-        basename_lower = basename.lower()
-        if basename_lower in {".pre-commit-config.yaml", ".pre-commit-config.yml"}:
-            flags["changed_pre_commit_config"] = True
-        if basename_lower.startswith(".env"):
-            flags["changed_env_file"] = True
-        if basename_lower == "pyproject.toml":
-            flags["changed_pyproject_toml"] = True
-        if basename_lower == ".gitignore":
-            flags["changed_gitignore"] = True
-    return flags
-
-
-def _text_mentions_env_file(value: Any) -> bool:
-    return isinstance(value, str) and bool(_SENSITIVE_CONFIG_ENV_COMMAND_RE.search(value))
-
-
-def _redact_sensitive_config_argument_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: Dict[str, Any] = {}
-        for key, nested_value in value.items():
-            key_lower = str(key).lower()
-            if key_lower in _SENSITIVE_CONFIG_ENV_REDACT_ARGUMENT_KEYS:
-                redacted[key] = _SENSITIVE_CONFIG_ENV_REDACTION
-            else:
-                redacted[key] = _redact_sensitive_config_argument_value(nested_value)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_sensitive_config_argument_value(item) for item in value]
-    return value
-
-
-def _sanitize_tool_activity_arguments_for_sensitive_config(
-    arguments: Any,
-    *,
-    file_paths_modified: List[str],
-    command_text: Optional[str] = None,
-) -> Any:
-    flags = _sensitive_config_change_flags_from_paths(file_paths_modified)
-    if not flags["changed_env_file"] and not _text_mentions_env_file(command_text):
-        return arguments
-    if isinstance(arguments, str):
-        return _SENSITIVE_CONFIG_ENV_REDACTION
-    return _redact_sensitive_config_argument_value(arguments)
-
-
-def _normalize_sensitive_config_change_state_on_record(record: Dict[str, Any]) -> None:
-    modified_paths: List[str] = []
-    tool_activity = record.get("tool_activity")
-    if not isinstance(tool_activity, list):
-        return
-    if isinstance(tool_activity, list):
-        for item in tool_activity:
-            if not isinstance(item, dict):
-                continue
-            modified_paths.extend(value for value in (item.get("file_paths_modified") or []) if isinstance(value, str))
-
-    flags = _sensitive_config_change_flags_from_paths(modified_paths)
-    for field, derived_value in flags.items():
-        record[field] = bool(record.get(field)) or derived_value
-
-
-def _parse_tool_arguments(arguments: Any) -> Any:
-    if arguments is None or arguments == "":
-        return {}
-    if isinstance(arguments, (dict, list)):
-        return arguments
-    if isinstance(arguments, str):
-        stripped = arguments.strip()
-        if not stripped:
-            return {}
-        try:
-            return json.loads(stripped)
-        except json.JSONDecodeError:
-            return {"raw_text": stripped}
-    return {"value": arguments}
-
-
-def _is_empty_claude_read_pages_value(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return not value.strip()
-    if isinstance(value, list):
-        return len(value) == 0
-    return False
-
-
-def _sanitize_tool_activity_arguments(tool_name: str, arguments: Any) -> Any:
-    if tool_name != "Read" or not isinstance(arguments, dict):
-        return arguments
-    if "pages" not in arguments:
-        return arguments
-    if not _is_empty_claude_read_pages_value(arguments.get("pages")):
-        return arguments
-
-    sanitized_arguments = dict(arguments)
-    sanitized_arguments.pop("pages", None)
-    return sanitized_arguments
-
-
-def _extract_paths_from_patch_text(text: str) -> List[str]:
-    if not isinstance(text, str) or not text.strip():
-        return []
-    paths = _APPLY_PATCH_FILE_RE.findall(text) + _APPLY_PATCH_MOVE_TO_RE.findall(text)
-    return _dedupe_strings(paths)
-
-
-def _collect_file_paths_from_value(value: Any) -> List[str]:
-    collected: List[str] = []
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped:
-            collected.append(stripped)
-    elif isinstance(value, list):
-        for item in value:
-            collected.extend(_collect_file_paths_from_value(item))
-    elif isinstance(value, dict):
-        for nested_key, nested_value in list(value.items()):
-            nested_key_lower = str(nested_key).lower()
-            if nested_key_lower in _TOOL_ACTIVITY_SKIP_PATH_KEYS:
-                continue
-            if any(token in nested_key_lower for token in ("path", "file")):
-                collected.extend(_collect_file_paths_from_value(nested_value))
-    return collected
-
-
-def _extract_file_paths_from_tool_arguments(arguments: Any) -> List[str]:
-    parsed_arguments = _parse_tool_arguments(arguments)
-    if isinstance(parsed_arguments, str):
-        return []
-    return _dedupe_strings(_collect_file_paths_from_value(parsed_arguments))
-
-
-def _extract_command_text_from_tool_arguments(arguments: Any) -> Optional[str]:
-    parsed_arguments = _parse_tool_arguments(arguments)
-    command_text = _find_command_text_in_value(parsed_arguments)
-    if command_text is not None:
-        return command_text
-    if isinstance(parsed_arguments, str) and parsed_arguments.strip():
-        return parsed_arguments.strip()
-    return None
-
-
-def _find_command_text_in_value(value: Any, *, depth: int = 0) -> Optional[str]:
-    if depth > 4:
-        return None
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, list):
-        for item in value:
-            command_text = _find_command_text_in_value(item, depth=depth + 1)
-            if command_text is not None:
-                return command_text
-        return None
-    if not isinstance(value, dict):
-        return None
-
-    for key in _TOOL_ACTIVITY_COMMAND_TEXT_KEYS:
-        candidate = value.get(key)
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-
-    for key, nested_value in list(value.items()):
-        if str(key).lower() in _TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS:
-            continue
-        command_text = _find_command_text_in_value(nested_value, depth=depth + 1)
-        if command_text is not None:
-            return command_text
-    return None
-
-
-def _count_git_subcommand(command_text: str, subcommand: str) -> int:
-    count = 0
-    for match in _GIT_COMMAND_RE.finditer(command_text):
-        command = f"git{match.group('args') or ''}"
-        try:
-            tokens = shlex.split(command)
-        except ValueError:
-            tokens = command.split()
-        index = 1
-        while index < len(tokens):
-            token = tokens[index]
-            if token in _GIT_GLOBAL_OPTIONS_WITH_VALUES:
-                index += 2
-                continue
-            if any(token.startswith(f"{option}=") for option in _GIT_GLOBAL_OPTIONS_WITH_VALUES):
-                index += 1
-                continue
-            if token.startswith("-"):
-                index += 1
-                continue
-            if token == subcommand:
-                count += 1
-            break
-    return count
-
-
-def _classify_tool_kind(tool_name: str) -> str:
-    normalized_name = (tool_name or "").strip().lower()
-    if normalized_name.startswith("mcp__"):
-        return "mcp"
-    if normalized_name in _TOOL_ACTIVITY_COMMAND_NAMES or any(
-        token in normalized_name for token in ("bash", "shell", "terminal")
-    ):
-        return "command"
-    if normalized_name in _TOOL_ACTIVITY_MODIFY_NAMES or any(
-        token in normalized_name for token in ("write", "edit", "patch")
-    ):
-        return "modify"
-    if normalized_name in _TOOL_ACTIVITY_READ_NAMES or any(
-        token in normalized_name for token in ("read", "view", "grep", "glob", "search", "fetch")
-    ):
-        return "read"
-    return "other"
-
-
-def _build_tool_activity_entry(
-    *,
-    tool_index: int,
-    tool_name: str,
-    arguments: Any,
-    tool_call_id: Optional[str] = None,
-    source: Optional[str] = None,
-) -> Dict[str, Any]:
-    parsed_arguments = _parse_tool_arguments(arguments)
-    parsed_arguments = _sanitize_tool_activity_arguments(tool_name, parsed_arguments)
-    tool_kind = _classify_tool_kind(tool_name)
-    file_paths_read: List[str] = []
-    file_paths_modified: List[str] = []
-    command_text: Optional[str] = None
-
-    if tool_kind == "read":
-        file_paths_read = _extract_file_paths_from_tool_arguments(parsed_arguments)
-    elif tool_kind == "modify":
-        file_paths_modified = _extract_file_paths_from_tool_arguments(parsed_arguments)
-        if tool_name.strip().lower() in {"apply_patch", "applypatch"}:
-            patch_text = _extract_command_text_from_tool_arguments(parsed_arguments)
-            if patch_text:
-                file_paths_modified = _dedupe_strings(file_paths_modified + _extract_paths_from_patch_text(patch_text))
-    elif tool_kind == "command":
-        command_text = _extract_command_text_from_tool_arguments(parsed_arguments)
-
-    if command_text is None and tool_name.strip().lower() in {"apply_patch", "applypatch"}:
-        command_text = _extract_command_text_from_tool_arguments(parsed_arguments)
-
-    git_commit_count = 0
-    git_push_count = 0
-    if isinstance(command_text, str) and command_text:
-        git_commit_count = _count_git_subcommand(command_text, "commit")
-        git_push_count = _count_git_subcommand(command_text, "push")
-
-    sensitive_config_flags = _sensitive_config_change_flags_from_paths(file_paths_modified)
-    stored_arguments = _sanitize_tool_activity_arguments_for_sensitive_config(
-        parsed_arguments,
-        file_paths_modified=file_paths_modified,
-        command_text=command_text,
-    )
-    if (
-        sensitive_config_flags["changed_env_file"] or _text_mentions_env_file(command_text)
-    ) and command_text is not None:
-        command_text = _SENSITIVE_CONFIG_ENV_REDACTION
-
-    return {
-        "tool_index": tool_index,
-        "tool_call_id": tool_call_id,
-        "tool_name": tool_name,
-        "tool_kind": tool_kind,
-        "file_paths_read": _dedupe_strings(file_paths_read),
-        "file_paths_modified": _dedupe_strings(file_paths_modified),
-        "git_commit_count": git_commit_count,
-        "git_push_count": git_push_count,
-        "command_text": command_text,
-        "arguments": stored_arguments,
-        "metadata": {"source": source} if source else {},
-    }
-
-
-def _extract_tool_activity_from_message(message: Any) -> List[Dict[str, Any]]:
-    activity: List[Dict[str, Any]] = []
-    raw_tool_calls = _maybe_get(message, "tool_calls")
-    if isinstance(raw_tool_calls, list):
-        for index, tool_call in enumerate(raw_tool_calls):
-            function_obj = _maybe_get(tool_call, "function")
-            tool_name = _maybe_get(function_obj, "name") or _maybe_get(tool_call, "name")
-            if not isinstance(tool_name, str) or not tool_name.strip():
-                continue
-            activity.append(
-                _build_tool_activity_entry(
-                    tool_index=index,
-                    tool_name=tool_name.strip(),
-                    arguments=_maybe_get(function_obj, "arguments"),
-                    tool_call_id=_maybe_get(tool_call, "id"),
-                    source="message.tool_calls",
-                )
-            )
-        return activity
-
-    content = _maybe_get(message, "content")
-    if isinstance(content, list):
-        for index, block in enumerate(content):
-            if isinstance(block, dict):
-                block_type = block.get("type")
-                tool_name = block.get("name")
-                arguments = block.get("input") or block.get("arguments")
-                tool_call_id = block.get("id")
-            else:
-                block_type = getattr(block, "type", None)
-                tool_name = getattr(block, "name", None)
-                arguments = getattr(block, "input", None) or getattr(block, "arguments", None)
-                tool_call_id = getattr(block, "id", None)
-            if block_type not in {"tool_use", "function_call"}:
-                continue
-            if not isinstance(tool_name, str) or not tool_name.strip():
-                continue
-            activity.append(
-                _build_tool_activity_entry(
-                    tool_index=index,
-                    tool_name=tool_name.strip(),
-                    arguments=arguments,
-                    tool_call_id=tool_call_id,
-                    source="message.content",
-                )
-            )
-        if activity:
-            return activity
-
-    provider_specific_fields = _extract_provider_specific_fields(message)
-    provider_tool_calls = provider_specific_fields.get("tool_calls")
-    if isinstance(provider_tool_calls, list):
-        for index, tool_call in enumerate(provider_tool_calls):
-            function_obj = _maybe_get(tool_call, "function")
-            tool_name = _maybe_get(function_obj, "name") or _maybe_get(tool_call, "name")
-            if not isinstance(tool_name, str) or not tool_name.strip():
-                continue
-            activity.append(
-                _build_tool_activity_entry(
-                    tool_index=index,
-                    tool_name=tool_name.strip(),
-                    arguments=_maybe_get(function_obj, "arguments"),
-                    tool_call_id=_maybe_get(tool_call, "id"),
-                    source="provider_specific_fields.tool_calls",
-                )
-            )
-
-    return activity
-
-
-_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES: Dict[str, str] = {
-    "apply_patch_call": "apply_patch",
-    "custom_tool_call": "custom_tool_call",
-    "computer_call": "computer_call",
-    "local_shell_call": "local_shell_call",
-    "mcp_call": "mcp_call",
-    "web_search_call": "web_search_call",
-    "file_search_call": "file_search_call",
-    "image_generation_call": "image_generation_call",
-}
-_RESPONSE_OUTPUT_TOOL_ITEM_TYPES = set(_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES) | {"function_call"}
-
-
-def _extract_response_output_items(result: Any, standard_logging_object: Optional[Dict[str, Any]] = None) -> List[Any]:
-    candidate_sources: List[Any] = [result]
-    if isinstance(standard_logging_object, dict):
-        candidate_sources.append(standard_logging_object.get("response"))
-
-    for source in candidate_sources:
-        if isinstance(source, list):
-            return source
-
-        output_items = _maybe_get(source, "output")
-        if isinstance(output_items, list):
-            return output_items
-
-        output_items = _maybe_get_path(source, "_hidden_params", "responses_output")
-        if isinstance(output_items, list):
-            return output_items
-
-        completed_payload = _extract_responses_completed_payload_from_passthrough_fallback_text(
-            _maybe_get(source, "response")
-        )
-        if isinstance(completed_payload, dict):
-            output_items = _maybe_get(_maybe_get(completed_payload, "response"), "output")
-            if isinstance(output_items, list):
-                return output_items
-
-    return []
-
-
-def _resolve_response_output_tool_name(item: Any) -> Optional[str]:
-    tool_name = _maybe_get(item, "name")
-    if isinstance(tool_name, str) and tool_name.strip():
-        return tool_name.strip()
-
-    item_type = _maybe_get(item, "type")
-    if not isinstance(item_type, str) or not item_type.strip():
-        return None
-
-    fallback_name = _RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES.get(item_type)
-    if isinstance(fallback_name, str) and fallback_name.strip():
-        return fallback_name.strip()
-
-    return None
-
-
-def _extract_response_output_tool_activity(
-    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
-    output_items = _extract_response_output_items(result, standard_logging_object)
-    if not output_items:
-        return []
-
-    activity: List[Dict[str, Any]] = []
-    for index, item in enumerate(output_items):
-        item_type = _maybe_get(item, "type")
-        if item_type not in _RESPONSE_OUTPUT_TOOL_ITEM_TYPES:
-            continue
-        tool_name = _resolve_response_output_tool_name(item)
-        if not isinstance(tool_name, str) or not tool_name.strip():
-            continue
-        arguments = _maybe_get(item, "arguments")
-        if arguments is None and item_type in {"apply_patch_call", "custom_tool_call"}:
-            arguments = _maybe_get(item, "patch") or _maybe_get(item, "input")
-        activity.append(
-            _build_tool_activity_entry(
-                tool_index=index,
-                tool_name=tool_name,
-                arguments=arguments,
-                tool_call_id=_maybe_get(item, "call_id") or _maybe_get(item, "id"),
-                source="responses.output",
-            )
-        )
-
-    return activity
-
-
-def _summarize_tool_activity(tool_activity: List[Dict[str, Any]]) -> Dict[str, int]:
-    read_paths: List[str] = []
-    modified_paths: List[str] = []
-    git_commit_count = 0
-    git_push_count = 0
-    for item in tool_activity:
-        read_paths.extend(value for value in (item.get("file_paths_read") or []) if isinstance(value, str))
-        modified_paths.extend(value for value in (item.get("file_paths_modified") or []) if isinstance(value, str))
-        git_commit_count += _safe_int(item.get("git_commit_count")) or 0
-        git_push_count += _safe_int(item.get("git_push_count")) or 0
-    return {
-        "file_read_count": len(_dedupe_strings(read_paths)),
-        "file_modified_count": len(_dedupe_strings(modified_paths)),
-        **_sensitive_config_change_flags_from_paths(modified_paths),
-        "git_commit_count": git_commit_count,
-        "git_push_count": git_push_count,
-    }
-
-
-def _extract_tool_call_info(message: Any) -> Tuple[int, List[str]]:
-    raw_tool_calls = _maybe_get(message, "tool_calls")
-    if isinstance(raw_tool_calls, list):
-        tool_names: List[str] = []
-        for tool_call in raw_tool_calls:
-            function_obj = _maybe_get(tool_call, "function")
-            tool_name = _maybe_get(function_obj, "name") or _maybe_get(tool_call, "name")
-            if isinstance(tool_name, str) and tool_name:
-                tool_names.append(tool_name)
-        return len(raw_tool_calls), tool_names
-
-    content = _maybe_get(message, "content")
-    if isinstance(content, list):
-        tool_names = []
-        tool_call_count = 0
-        for block in content:
-            if isinstance(block, dict):
-                block_type = block.get("type")
-            else:
-                block_type = getattr(block, "type", None)
-            if block_type not in {"tool_use", "function_call"}:
-                continue
-            tool_call_count += 1
-            tool_name = block.get("name") if isinstance(block, dict) else getattr(block, "name", None)
-            if isinstance(tool_name, str) and tool_name:
-                tool_names.append(tool_name)
-        if tool_call_count:
-            return tool_call_count, tool_names
-
-    provider_specific_fields = _extract_provider_specific_fields(message)
-    provider_tool_calls = provider_specific_fields.get("tool_calls")
-    if isinstance(provider_tool_calls, list):
-        tool_names = []
-        for tool_call in provider_tool_calls:
-            tool_name = _maybe_get(_maybe_get(tool_call, "function"), "name") or _maybe_get(tool_call, "name")
-            if isinstance(tool_name, str) and tool_name:
-                tool_names.append(tool_name)
-        return len(provider_tool_calls), tool_names
-
-    return 0, []
-
-
-def _extract_response_output_tool_call_info(
-    result: Any, standard_logging_object: Optional[Dict[str, Any]] = None
-) -> Tuple[int, List[str]]:
-    output_items = _extract_response_output_items(result, standard_logging_object)
-    if not output_items:
-        return 0, []
-
-    tool_call_count = 0
-    tool_names: List[str] = []
-    for item in output_items:
-        item_type = _maybe_get(item, "type")
-        if item_type not in _RESPONSE_OUTPUT_TOOL_ITEM_TYPES:
-            continue
-        tool_call_count += 1
-        tool_name = _resolve_response_output_tool_name(item)
-        if isinstance(tool_name, str) and tool_name.strip():
-            tool_names.append(tool_name)
-
-    return tool_call_count, tool_names
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
@@ -5236,109 +4164,8 @@ def _extract_trace_id(kwargs: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _infer_usage_breakout_provider_prefix(kwargs: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[str]:
-    route_family = metadata.get("passthrough_route_family")
-    if isinstance(route_family, str) and route_family.strip():
-        route_family_lower = route_family.lower()
-        if route_family_lower == "codex_responses" or route_family_lower.startswith("codex_"):
-            return "codex"
-        if "gemini" in route_family_lower:
-            return "gemini"
-
-    provider = kwargs.get("custom_llm_provider")
-    if isinstance(provider, str) and provider.strip():
-        provider_lower = provider.lower()
-        if provider_lower == "gemini":
-            return "gemini"
-
-    model = kwargs.get("model")
-    if isinstance(model, str) and model.strip():
-        model_lower = model.lower()
-        if "gemini" in model_lower:
-            return "gemini"
-        if "codex" in model_lower:
-            return "codex"
-
-    return None
 
 
-def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None:
-    metadata = _ensure_mutable_metadata(kwargs)
-    provider_prefix = _infer_usage_breakout_provider_prefix(kwargs, metadata)
-    if provider_prefix is None:
-        return
-
-    usage_obj = _extract_usage_object(kwargs, result)
-    if usage_obj is None:
-        return
-
-    reported_reasoning_tokens = _extract_reported_reasoning_tokens(usage_obj)
-    reasoning_tokens_source: Optional[str] = None
-    cache_read_input_tokens = _extract_cache_read_input_tokens(usage_obj)
-    cache_creation_input_tokens = _extract_cache_creation_input_tokens(usage_obj)
-
-    message = _extract_first_response_message(result)
-    if reported_reasoning_tokens is not None:
-        reasoning_tokens_source = "provider_reported"
-    elif provider_prefix == "gemini":
-        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
-            metadata,
-            message,
-        )
-        if reported_reasoning_tokens is not None:
-            reasoning_tokens_source = "provider_signature_present"
-
-    tool_call_count, tool_names = _extract_tool_call_info(message)
-    if tool_call_count == 0:
-        tool_call_count, tool_names = _extract_response_output_tool_call_info(
-            result,
-            kwargs.get("standard_logging_object"),
-        )
-
-    metadata["usage_cache_read_input_tokens"] = cache_read_input_tokens
-    metadata["usage_cache_creation_input_tokens"] = cache_creation_input_tokens
-    metadata["usage_tool_call_count"] = tool_call_count
-    metadata["usage_tool_names"] = tool_names
-    metadata[f"{provider_prefix}_cache_read_input_tokens"] = cache_read_input_tokens
-    metadata[f"{provider_prefix}_cache_creation_input_tokens"] = cache_creation_input_tokens
-    metadata[f"{provider_prefix}_tool_call_count"] = tool_call_count
-    metadata[f"{provider_prefix}_tool_names"] = tool_names
-
-    if reported_reasoning_tokens is not None:
-        metadata["usage_reasoning_tokens_reported"] = reported_reasoning_tokens
-        metadata["usage_reasoning_tokens_source"] = reasoning_tokens_source or "provider_reported"
-        metadata[f"{provider_prefix}_reasoning_tokens_reported"] = reported_reasoning_tokens
-
-    tags_to_add = [f"{provider_prefix}-usage-breakout"]
-    if reported_reasoning_tokens is not None:
-        tags_to_add.extend(["reasoning-tokens-reported", f"{provider_prefix}-reasoning-tokens-reported"])
-    if cache_read_input_tokens > 0:
-        tags_to_add.extend(["cache-read-input-tokens", f"{provider_prefix}-cache-read-input-tokens"])
-    if cache_creation_input_tokens > 0:
-        tags_to_add.extend(
-            [
-                "cache-creation-input-tokens",
-                f"{provider_prefix}-cache-creation-input-tokens",
-            ]
-        )
-    if tool_call_count > 0:
-        tags_to_add.extend(["tool-calls-present", f"{provider_prefix}-tool-calls-present"])
-    _merge_tags(metadata, tags_to_add)
-
-    _append_langfuse_span(
-        metadata,
-        name=f"{provider_prefix}.usage_breakout",
-        span_metadata={
-            "reported_reasoning_tokens": reported_reasoning_tokens,
-            "reported_reasoning_tokens_source": reasoning_tokens_source,
-            "cache_read_input_tokens": cache_read_input_tokens,
-            "cache_creation_input_tokens": cache_creation_input_tokens,
-            "tool_call_count": tool_call_count,
-            "tool_names": tool_names,
-        },
-        start_time=datetime.now(timezone.utc),
-        end_time=datetime.now(timezone.utc),
-    )
 def _split_spend_log_proxy_server_request(
     spend_log_row: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -5933,68 +4760,10 @@ def _iter_litellm_metadata_sources(
             yield source
 
 
-def _bound_worker_context_exhaustion_string(
-    key: str,
-    value: Any,
-) -> Optional[str]:
-    cleaned = _clean_non_empty_string(value)
-    if cleaned is None:
-        return None
-    max_len = _WORKER_CONTEXT_EXHAUSTION_STRING_MAX_LEN.get(key, 512)
-    if len(cleaned) > max_len:
-        cleaned = cleaned[:max_len]
-    return cleaned
 
 
-def _normalize_worker_context_exhaustion_bool(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "1", "yes"}:
-            return True
-        if normalized in {"false", "0", "no"}:
-            return False
-    if isinstance(value, (int, float)) and value in (0, 1):
-        return bool(value)
-    return None
 
 
-def _sanitize_worker_context_exhaustion_metadata(metadata: Dict[str, Any]) -> None:
-    """Bound orchestrator worker exhaustion fields; never infer success from LLM output."""
-    for key in _WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS:
-        if key not in metadata:
-            continue
-        raw_value = metadata.get(key)
-        if key in _WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS:
-            normalized_bool = _normalize_worker_context_exhaustion_bool(raw_value)
-            if normalized_bool is None:
-                metadata.pop(key, None)
-            else:
-                metadata[key] = normalized_bool
-            continue
-
-        if isinstance(raw_value, list):
-            bounded_items = []
-            for item in raw_value[:50]:
-                item_text = _bound_worker_context_exhaustion_string(key, item)
-                if item_text is not None:
-                    bounded_items.append(item_text)
-            if bounded_items:
-                metadata[key] = bounded_items
-            else:
-                metadata.pop(key, None)
-            continue
-
-        bounded = _bound_worker_context_exhaustion_string(key, raw_value)
-        if bounded is None:
-            metadata.pop(key, None)
-        else:
-            metadata[key] = bounded
-
-    if metadata.get("worker_context_exhaustion_failure_class"):
-        metadata["worker_context_exhaustion_success"] = False
-        metadata["worker_context_exhaustion_completed"] = False
 
 
 def _is_anthropic_session_history_context(
@@ -6279,22 +5048,6 @@ def _enrich_backfill_anthropic_context_window_metadata(
     record["metadata"] = metadata
 
 
-def _promote_worker_context_exhaustion_metadata(
-    kwargs: Dict[str, Any],
-    metadata: Dict[str, Any],
-) -> None:
-    """Copy allowlisted worker exhaustion keys from upstream litellm_metadata without overwriting."""
-    for source in _iter_litellm_metadata_sources(kwargs, metadata):
-        for key in _WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS:
-            if key in metadata:
-                continue
-            if key not in source:
-                continue
-            value = source.get(key)
-            if value is None:
-                continue
-            metadata[key] = value
-    _sanitize_worker_context_exhaustion_metadata(metadata)
 
 
 # _build_session_history_metadata moved to litellm.integrations.aawm_session_history.record
@@ -6377,58 +5130,8 @@ def _build_tool_definition_snapshot_db_payload(
 
 # _build_tool_definition_snapshot_db_payloads moved to litellm.integrations.aawm_session_history.record
 # _persist_tool_definition_snapshots_best_effort moved to litellm.integrations.aawm_session_history.record
-async def _lookup_claude_auto_review_parent_identity(
-    conn: Any,
-    payload: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    session_id = _clean_non_empty_string(payload.get("session_id"))
-    if not session_id:
-        return None
-    reference_time = (
-        _parse_datetime_value(payload.get("start_time"))
-        or _parse_datetime_value(payload.get("observed_at"))
-        or _parse_datetime_value(payload.get("end_time"))
-    )
-    rows = await conn.fetch(
-        _AAWM_CLAUDE_AUTO_REVIEW_PARENT_IDENTITY_SQL,
-        session_id,
-        reference_time,
-    )
-    for row in rows:
-        try:
-            candidate = dict(row)
-        except Exception:
-            candidate = {
-                "id": _maybe_get(row, "id"),
-                "repository": _maybe_get(row, "repository"),
-                "tenant_id": _maybe_get(row, "tenant_id"),
-                "agent_name": _maybe_get(row, "agent_name"),
-                "metadata": _maybe_get(row, "metadata"),
-            }
-        identity = _extract_claude_auto_review_identity_from_row(candidate)
-        if identity:
-            return identity
-    return None
 
 
-async def _apply_claude_auto_review_parent_identity_from_store(
-    conn: Any,
-    payload: Dict[str, Any],
-    identity_by_session: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> None:
-    metadata = payload.get("metadata")
-    if not _is_claude_permission_check_metadata(metadata):
-        return
-
-    session_id = _clean_non_empty_string(payload.get("session_id"))
-    identity = (identity_by_session or {}).get(session_id or "")
-    if identity is None:
-        identity = await _lookup_claude_auto_review_parent_identity(conn, payload)
-    if identity is not None:
-        _apply_claude_auto_review_parent_identity(payload, identity)
-        return
-
-    _apply_claude_auto_review_identity_to_record(payload)
 
 
 def _extract_session_history_call_ids_from_payloads(
@@ -7097,452 +5800,139 @@ def _rate_limit_observation_only_requested(kwargs: Dict[str, Any]) -> bool:
 # _session_history_transaction moved to litellm.integrations.aawm_session_history.record
 # _persist_session_history_record moved to litellm.integrations.aawm_session_history.record
 # _persist_session_history_records moved to litellm.integrations.aawm_session_history.record
-def _get_reasoning_state_tags(
-    provider_prefix: str,
-    reasoning_content: str,
-    thinking_blocks: List[dict],
-) -> List[str]:
-    stripped_reasoning = reasoning_content.strip()
-    tags: List[str] = []
-    if stripped_reasoning:
-        tags.append("reasoning-present")
-        tags.append(f"{provider_prefix}-reasoning-present")
-    else:
-        tags.append("reasoning-empty")
-        tags.append(f"{provider_prefix}-reasoning-empty")
-
-    if thinking_blocks:
-        tags.append("thinking-blocks-present")
-        tags.append(f"{provider_prefix}-thinking-blocks-present")
-    else:
-        tags.append("thinking-blocks-empty")
-        tags.append(f"{provider_prefix}-thinking-blocks-empty")
-    return tags
 
 
-def _extract_claude_experiment_ids(decoded_bytes: bytes) -> List[str]:
-    experiment_ids: List[str] = []
-    for offset, current_byte in enumerate(decoded_bytes[:-2]):
-        if current_byte != 0x32:
-            continue
-        candidate_length = decoded_bytes[offset + 1]
-        candidate_start = offset + 2
-        candidate_end = candidate_start + candidate_length
-        if candidate_end > len(decoded_bytes):
-            continue
-        candidate_bytes = decoded_bytes[candidate_start:candidate_end]
-        if not all(32 <= byte <= 126 for byte in candidate_bytes):
-            continue
-        decoded_match = candidate_bytes.decode("ascii", errors="ignore")
-        if decoded_match.count("-") < 2:
-            continue
-        if decoded_match not in experiment_ids:
-            experiment_ids.append(decoded_match)
-
-    if experiment_ids:
-        return experiment_ids
-
-    for match in _CLAUDE_EXPERIMENT_ID_RE.findall(decoded_bytes):
-        decoded_match = match.decode("ascii", errors="ignore")
-        if decoded_match.count("-") < 2:
-            continue
-        if decoded_match not in experiment_ids:
-            experiment_ids.append(decoded_match)
-    return experiment_ids
 
 
-def _enrich_claude_thinking_metadata(metadata: Dict[str, Any], message: Any) -> None:
-    span_started_at = datetime.now(timezone.utc)
-    thinking_blocks = _extract_thinking_blocks(message)
-    if not thinking_blocks:
-        return
-    reasoning_content = _extract_reasoning_content(message, thinking_blocks)
-
-    signatures: List[str] = []
-    for block in thinking_blocks:
-        if _maybe_get(block, "type") != "thinking":
-            continue
-        signature = _maybe_get(block, "signature")
-        if isinstance(signature, str) and signature.strip():
-            signatures.append(signature)
-
-    if not signatures:
-        return
-
-    decoded_hashes: List[str] = []
-    experiment_ids: List[str] = []
-    decode_errors: List[str] = []
-    decoded_any = False
-
-    for signature in signatures:
-        try:
-            decoded_bytes = _decode_base64_bytes(signature)
-            decoded_hashes.append(_short_hash(decoded_bytes))
-            decoded_any = True
-            for experiment_id in _extract_claude_experiment_ids(decoded_bytes):
-                if experiment_id not in experiment_ids:
-                    experiment_ids.append(experiment_id)
-        except Exception as exc:
-            decode_errors.append(str(exc))
-
-    metadata["claude_thinking_signature_present"] = len(signatures) > 0
-    metadata["claude_thinking_signature_count"] = len(signatures)
-    metadata["claude_thinking_signature_hashes"] = decoded_hashes
-    metadata["claude_thinking_signature_decoded"] = decoded_any
-    metadata["claude_thinking_decode_version"] = "v1"
-    metadata["claude_reasoning_content_present"] = bool(reasoning_content.strip())
-    metadata["claude_reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
-    if experiment_ids:
-        metadata["claude_thinking_experiment_ids"] = experiment_ids
-        if len(experiment_ids) == 1:
-            metadata["claude_thinking_experiment_id"] = experiment_ids[0]
-    if decode_errors:
-        metadata["claude_thinking_decode_errors"] = decode_errors
-
-    metadata["thinking_signature_present"] = True
-    metadata["thinking_signature_decoded"] = decoded_any
-    metadata["reasoning_content_present"] = bool(reasoning_content.strip())
-    metadata["reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
-    metadata["thinking_blocks_present"] = len(thinking_blocks) > 0
-
-    tags_to_add = ["claude-thinking-signature", "thinking-signature-present"]
-    if decoded_any:
-        tags_to_add.extend(["claude-thinking-decoded", "thinking-signature-decoded"])
-    tags_to_add.extend(
-        _get_reasoning_state_tags(
-            provider_prefix="claude",
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        )
-    )
-    tags_to_add.extend(f"claude-exp:{experiment_id}" for experiment_id in experiment_ids)
-    _merge_tags(metadata, tags_to_add)
-    _append_langfuse_span(
-        metadata,
-        name="claude.thinking_signature_decode",
-        span_metadata={
-            "signature_count": len(signatures),
-            "decoded_signature_count": len(decoded_hashes),
-            "thinking_block_count": len(thinking_blocks),
-            "reasoning_content_present": bool(reasoning_content.strip()),
-            "experiment_ids": experiment_ids,
-        },
-        start_time=span_started_at,
-        end_time=datetime.now(timezone.utc),
-    )
 
 
-def _read_varint(data: bytes, offset: int) -> Tuple[Optional[int], int]:
-    value = 0
-    shift = 0
-    current_offset = offset
-    while current_offset < len(data):
-        current_byte = data[current_offset]
-        value |= (current_byte & 0x7F) << shift
-        current_offset += 1
-        if current_byte < 0x80:
-            return value, current_offset
-        shift += 7
-        if shift > 63:
-            break
-    return None, offset
 
 
-def _extract_gemini_signature_summary(signature: str) -> Dict[str, Any]:
-    decoded_bytes = _decode_base64_bytes(signature)
-    signature_hash = _short_hash(decoded_bytes)
-
-    record_sizes: List[int] = []
-    prefixes: List[str] = []
-    marker_offsets: List[int] = []
-    indexed_fields: Dict[str, Any] = {}
-
-    offset = 0
-    record_index = 0
-    while offset < len(decoded_bytes):
-        if decoded_bytes[offset] != 0x0A:
-            break
-        record_size, payload_offset = _read_varint(decoded_bytes, offset + 1)
-        if record_size is None:
-            break
-        payload_end = payload_offset + record_size
-        if payload_end > len(decoded_bytes):
-            break
-
-        payload = decoded_bytes[payload_offset:payload_end]
-        marker_index = payload.find(_GEMINI_MARKER)
-        prefix_hex = ""
-        absolute_marker_offset = None
-        if marker_index >= 0:
-            prefix_hex = payload[:marker_index].hex()
-            absolute_marker_offset = payload_offset + marker_index
-            marker_offsets.append(absolute_marker_offset)
-
-        record_sizes.append(record_size)
-        prefixes.append(prefix_hex)
-        indexed_fields[f"gemini_tsig_0_record_{record_index}_size"] = record_size
-        indexed_fields[f"gemini_tsig_0_record_{record_index}_prefix"] = prefix_hex
-        if absolute_marker_offset is not None:
-            indexed_fields[f"gemini_tsig_0_record_{record_index}_marker_offset"] = absolute_marker_offset
-
-        record_index += 1
-        offset = payload_end
-
-    shape_components = {
-        "decoded_bytes": len(decoded_bytes),
-        "record_sizes": record_sizes,
-        "prefixes": prefixes,
-        "marker_offsets": marker_offsets,
-    }
-    shape_hash = _short_hash(str(shape_components).encode("utf-8"))
-
-    summary: Dict[str, Any] = {
-        "decoded_bytes": len(decoded_bytes),
-        "record_count": len(record_sizes),
-        "record_sizes": record_sizes,
-        "prefixes": prefixes,
-        "marker_offsets": marker_offsets,
-        "marker_hex": _GEMINI_MARKER.hex(),
-        "shape_hash": shape_hash,
-        "signature_hash": signature_hash,
-        "indexed_fields": indexed_fields,
-    }
-    return summary
 
 
-def _enrich_gemini_thought_signature_metadata(  # noqa: PLR0915
-    metadata: Dict[str, Any], message: Any
-) -> None:
-    span_started_at = datetime.now(timezone.utc)
-    provider_specific_fields = _extract_provider_specific_fields(message)
-    thought_signatures = provider_specific_fields.get("thought_signatures")
-    thinking_blocks = _extract_thinking_blocks(message)
-    reasoning_content = _extract_reasoning_content(message, thinking_blocks)
-
-    if not isinstance(thought_signatures, list):
-        thought_signatures = []
-    thought_signatures = [
-        signature for signature in thought_signatures if isinstance(signature, str) and signature.strip()
-    ]
-
-    if not thought_signatures:
-        return
-
-    summaries: List[Dict[str, Any]] = []
-    decode_errors: List[str] = []
-    signature_hashes: List[str] = []
-    shape_hashes: List[str] = []
-
-    for index, signature in enumerate(thought_signatures):
-        try:
-            summary = _extract_gemini_signature_summary(signature)
-            summaries.append(summary)
-            signature_hashes.append(summary["signature_hash"])
-            shape_hashes.append(summary["shape_hash"])
-            metadata[f"gemini_tsig_{index}_decoded_bytes"] = summary["decoded_bytes"]
-            metadata[f"gemini_tsig_{index}_record_count"] = summary["record_count"]
-            metadata[f"gemini_tsig_{index}_record_sizes"] = summary["record_sizes"]
-            metadata[f"gemini_tsig_{index}_prefixes"] = summary["prefixes"]
-            metadata[f"gemini_tsig_{index}_marker_offsets"] = summary["marker_offsets"]
-            metadata[f"gemini_tsig_{index}_marker_hex"] = summary["marker_hex"]
-            metadata[f"gemini_tsig_{index}_shape_hash"] = summary["shape_hash"]
-
-            indexed_fields = summary["indexed_fields"]
-            for key, value in list(indexed_fields.items()):
-                if key.startswith("gemini_tsig_0_"):
-                    metadata[key.replace("gemini_tsig_0_", f"gemini_tsig_{index}_")] = value
-        except Exception as exc:
-            decode_errors.append(str(exc))
-
-    metadata["gemini_thought_signature_present"] = len(thought_signatures) > 0
-    metadata["gemini_thought_signature_count"] = len(thought_signatures)
-    metadata["gemini_tsig_signature_hashes"] = signature_hashes
-    metadata["gemini_tsig_shape_hashes"] = sorted(set(shape_hashes))
-    metadata["gemini_reasoning_content_present"] = bool(reasoning_content.strip())
-    metadata["gemini_reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
-    metadata["gemini_thinking_blocks_present"] = len(thinking_blocks) > 0
-    if summaries:
-        first_summary = summaries[0]
-        metadata["gemini_tsig_decoded_bytes"] = first_summary["decoded_bytes"]
-        metadata["gemini_tsig_record_count"] = first_summary["record_count"]
-        metadata["gemini_tsig_record_sizes"] = first_summary["record_sizes"]
-        metadata["gemini_tsig_prefixes"] = first_summary["prefixes"]
-        metadata["gemini_tsig_marker_offsets"] = first_summary["marker_offsets"]
-        metadata["gemini_tsig_marker_hex"] = first_summary["marker_hex"]
-        metadata["gemini_tsig_shape_hash"] = first_summary["shape_hash"]
-    if decode_errors:
-        metadata["gemini_tsig_decode_errors"] = decode_errors
-
-    metadata["thinking_signature_present"] = True
-    metadata["thinking_signature_decoded"] = len(summaries) > 0
-    metadata["reasoning_content_present"] = bool(reasoning_content.strip())
-    metadata["reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
-    metadata["thinking_blocks_present"] = len(thinking_blocks) > 0
-
-    tags_to_add = ["gemini-thought-signature", "thinking-signature-present"]
-    if summaries:
-        tags_to_add.extend(["gemini-thought-signature-decoded", "thinking-signature-decoded"])
-        for shape_hash in sorted(set(shape_hashes)):
-            tags_to_add.append(f"gemini-tsig-shape:{shape_hash}")
-        for record_count in sorted({summary["record_count"] for summary in summaries}):
-            tags_to_add.append(f"gemini-tsig-records:{record_count}")
-
-    tags_to_add.extend(
-        _get_reasoning_state_tags(
-            provider_prefix="gemini",
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        )
-    )
-    _merge_tags(metadata, tags_to_add)
-    _append_langfuse_span(
-        metadata,
-        name="gemini.thought_signature_decode",
-        span_metadata={
-            "signature_count": len(thought_signatures),
-            "decoded_signature_count": len(summaries),
-            "shape_hashes": sorted(set(shape_hashes)),
-            "record_counts": sorted({summary["record_count"] for summary in summaries} if summaries else []),
-            "reasoning_content_present": bool(reasoning_content.strip()),
-        },
-        start_time=span_started_at,
-        end_time=datetime.now(timezone.utc),
-    )
 
 
-def _enrich_agent_identity_metadata(
-    kwargs: Dict[str, Any],
-    metadata: Dict[str, Any],
-) -> None:
-    if (
-        _is_codex_default_agent_context(kwargs, metadata)
-        and not _clean_non_empty_string(metadata.get("agent_name"))
-        and not _clean_non_empty_string(metadata.get("aawm_claude_agent_name"))
-    ):
-        metadata["agent_name"] = _DEFAULT_AGENT
-
-    agent_context_name, agent_context_tenant_id = _extract_agent_context(kwargs)
-    agent_id_repository = _extract_repository_identity_from_kwargs(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=kwargs.get("standard_logging_object") or {},
-    )
-    agent_id, agent_id_source = _extract_agent_id_from_kwargs(
-        kwargs,
-        metadata=metadata,
-        standard_logging_object=kwargs.get("standard_logging_object") or {},
-        agent_name=agent_context_name,
-        tenant_id=agent_context_tenant_id,
-        repository=agent_id_repository,
-    )
-    if agent_id:
-        metadata["agent_id"] = agent_id
-        if agent_id_source:
-            metadata["agent_id_source"] = agent_id_source
-    else:
-        metadata.pop("agent_id", None)
-        metadata.pop("agent_id_source", None)
 
 
-def _enrich_trace_name_and_provider_metadata(kwargs: Dict[str, Any], result: Any) -> Tuple[dict, Any]:
-    agent_name = _extract_agent_name(kwargs)
-    headers = _ensure_mutable_headers(kwargs)
-    metadata = _ensure_mutable_metadata(kwargs)
-    session_id = _extract_session_id(kwargs)
-    is_grok_context = _is_native_grok_passthrough_context(metadata, headers)
-    _enrich_claude_permission_check_metadata(kwargs, metadata, result)
-    if _is_claude_permission_check_metadata(metadata):
-        direct_repository = _extract_repository_identity_from_kwargs(
-            kwargs,
-            metadata=metadata,
-            standard_logging_object=kwargs.get("standard_logging_object") or {},
-        )
-        direct_tenant_id, _tenant_source = _extract_tenant_identity_from_kwargs(
-            kwargs,
-            metadata=metadata,
-            standard_logging_object=kwargs.get("standard_logging_object") or {},
-        )
-        _apply_claude_auto_review_metadata(
-            metadata,
-            repository=direct_repository,
-            tenant_id=direct_tenant_id,
-            source_model=_extract_claude_auto_review_source_model(
-                metadata,
-                _clean_non_empty_string(kwargs.get("model")),
-            ),
-        )
-
-    current_trace_name = metadata.get("trace_name")
-    if current_trace_name == "claude-code":
-        metadata["trace_name"] = f"claude-code.{agent_name}"
-    elif is_grok_context and (not current_trace_name or _is_generic_grok_trace_name(current_trace_name)):
-        metadata["trace_name"] = (
-            f"grok-build.{agent_name}" if agent_name and agent_name != _DEFAULT_AGENT else "grok-build"
-        )
-    elif not current_trace_name:
-        metadata["trace_name"] = agent_name
-    child_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
-    child_trace_name = _clean_non_empty_string(metadata.get("trace_name"))
-    if headers and child_trace_name and child_trace_name.startswith("claude-code."):
-        current_trace_name_header = _clean_non_empty_string(headers.get("langfuse_trace_name"))
-        if (
-            current_trace_name_header is None
-            or current_trace_name_header == "claude-code"
-            or current_trace_name_header.startswith("claude-code.")
-        ) and current_trace_name_header != child_trace_name:
-            headers["langfuse_trace_name"] = child_trace_name
-            verbose_logger.debug(
-                "AawmAgentIdentity: enriched header trace_name to %s",
-                child_trace_name,
-            )
-    if headers and is_grok_context and child_trace_name:
-        current_trace_name_header = _clean_non_empty_string(headers.get("langfuse_trace_name"))
-        if (
-            current_trace_name_header is None or _is_generic_grok_trace_name(current_trace_name_header)
-        ) and current_trace_name_header != child_trace_name:
-            headers["langfuse_trace_name"] = child_trace_name
-            verbose_logger.debug(
-                "AawmAgentIdentity: enriched Grok header trace_name to %s",
-                child_trace_name,
-            )
-    if headers and child_trace_user_id and child_trace_name and child_trace_name.startswith("claude-code."):
-        current_trace_user_id = headers.get("langfuse_trace_user_id")
-        if current_trace_user_id != child_trace_user_id:
-            headers["langfuse_trace_user_id"] = child_trace_user_id
-            verbose_logger.debug(
-                "AawmAgentIdentity: enriched header trace_user_id to %s",
-                child_trace_user_id,
-            )
-    if session_id and not metadata.get("session_id"):
-        metadata["session_id"] = session_id
-
-    _promote_codex_repository_trace_user_id(kwargs, metadata, headers)
-    _promote_grok_repository_trace_identity(kwargs, metadata, headers)
-    _enrich_agent_identity_metadata(kwargs, metadata)
-    _enrich_session_runtime_identity_metadata(kwargs)
-
-    message = _extract_first_response_message(result)
-    if message is not None:
-        _enrich_claude_thinking_metadata(metadata, message)
-        _enrich_gemini_thought_signature_metadata(metadata, message)
-    _enrich_token_count_usage_metadata(kwargs, result)
-    _enrich_usage_breakout_metadata(kwargs, result)
-    _enrich_provider_cache_metadata(kwargs, result)
-
-    _sync_standard_logging_object(kwargs, metadata)
-
-    verbose_logger.debug(
-        "AawmAgentIdentity: agent=%s, trace_name=%s, tags=%s",
-        agent_name,
-        metadata.get("trace_name"),
-        metadata.get("tags"),
-    )
-    return kwargs, result
 
 
 # _handle_session_history_success_event moved to litellm.integrations.aawm_session_history.record
 # _handle_session_history_failure_event moved to litellm.integrations.aawm_session_history.record
 
+
+# --- Wave A4B tool-activity/claude-review/enrichment extraction.
+# These MUST precede _bind_session_history_record_apis() so record-API free
+# names and monkeypatch targets keep resolving through this namespace. ---
+from . import tool_activity as _aawm_tool_activity
+from . import claude_review as _aawm_claude_review
+from . import enrich as _aawm_enrich
+
+# rebind installers: helper __globals__ -> this namespace
+_aawm_tool_activity.install(globals())
+_aawm_claude_review.install(globals())
+_aawm_enrich.install(globals())
+
+# literal facade assignments (AST-visible; installers above already published
+# the rebound function objects into this namespace, these re-affirm identity).
+# --- Wave A4B tool_activity facades ---
+_dedupe_strings = _aawm_tool_activity._dedupe_strings
+_normalize_changed_file_path = _aawm_tool_activity._normalize_changed_file_path
+_changed_file_basename = _aawm_tool_activity._changed_file_basename
+_sensitive_config_change_flags_from_paths = _aawm_tool_activity._sensitive_config_change_flags_from_paths
+_text_mentions_env_file = _aawm_tool_activity._text_mentions_env_file
+_redact_sensitive_config_argument_value = _aawm_tool_activity._redact_sensitive_config_argument_value
+_sanitize_tool_activity_arguments_for_sensitive_config = (
+    _aawm_tool_activity._sanitize_tool_activity_arguments_for_sensitive_config
+)
+_normalize_sensitive_config_change_state_on_record = (
+    _aawm_tool_activity._normalize_sensitive_config_change_state_on_record
+)
+_parse_tool_arguments = _aawm_tool_activity._parse_tool_arguments
+_is_empty_claude_read_pages_value = _aawm_tool_activity._is_empty_claude_read_pages_value
+_sanitize_tool_activity_arguments = _aawm_tool_activity._sanitize_tool_activity_arguments
+_extract_paths_from_patch_text = _aawm_tool_activity._extract_paths_from_patch_text
+_extract_file_paths_from_tool_arguments = _aawm_tool_activity._extract_file_paths_from_tool_arguments
+_extract_command_text_from_tool_arguments = _aawm_tool_activity._extract_command_text_from_tool_arguments
+_count_git_subcommand = _aawm_tool_activity._count_git_subcommand
+_collect_file_paths_from_value = _aawm_tool_activity._collect_file_paths_from_value
+_find_command_text_in_value = _aawm_tool_activity._find_command_text_in_value
+_classify_tool_kind = _aawm_tool_activity._classify_tool_kind
+_build_tool_activity_entry = _aawm_tool_activity._build_tool_activity_entry
+_extract_tool_activity_from_message = _aawm_tool_activity._extract_tool_activity_from_message
+_extract_response_output_items = _aawm_tool_activity._extract_response_output_items
+_resolve_response_output_tool_name = _aawm_tool_activity._resolve_response_output_tool_name
+_extract_response_output_tool_activity = _aawm_tool_activity._extract_response_output_tool_activity
+_summarize_tool_activity = _aawm_tool_activity._summarize_tool_activity
+_extract_tool_call_info = _aawm_tool_activity._extract_tool_call_info
+_extract_response_output_tool_call_info = _aawm_tool_activity._extract_response_output_tool_call_info
+_TOOL_ACTIVITY_READ_NAMES = _aawm_tool_activity._TOOL_ACTIVITY_READ_NAMES
+_TOOL_ACTIVITY_MODIFY_NAMES = _aawm_tool_activity._TOOL_ACTIVITY_MODIFY_NAMES
+_TOOL_ACTIVITY_COMMAND_NAMES = _aawm_tool_activity._TOOL_ACTIVITY_COMMAND_NAMES
+_TOOL_ACTIVITY_SKIP_PATH_KEYS = _aawm_tool_activity._TOOL_ACTIVITY_SKIP_PATH_KEYS
+_APPLY_PATCH_FILE_RE = _aawm_tool_activity._APPLY_PATCH_FILE_RE
+_APPLY_PATCH_MOVE_TO_RE = _aawm_tool_activity._APPLY_PATCH_MOVE_TO_RE
+_GIT_COMMAND_RE = _aawm_tool_activity._GIT_COMMAND_RE
+_GIT_GLOBAL_OPTIONS_WITH_VALUES = _aawm_tool_activity._GIT_GLOBAL_OPTIONS_WITH_VALUES
+_TOOL_ACTIVITY_COMMAND_TEXT_KEYS = _aawm_tool_activity._TOOL_ACTIVITY_COMMAND_TEXT_KEYS
+_TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS = _aawm_tool_activity._TOOL_ACTIVITY_COMMAND_TEXT_SKIP_KEYS
+_SENSITIVE_CONFIG_CHANGE_FIELDS = _aawm_tool_activity._SENSITIVE_CONFIG_CHANGE_FIELDS
+_SENSITIVE_CONFIG_ENV_REDACTION = _aawm_tool_activity._SENSITIVE_CONFIG_ENV_REDACTION
+_SENSITIVE_CONFIG_ENV_REDACT_ARGUMENT_KEYS = _aawm_tool_activity._SENSITIVE_CONFIG_ENV_REDACT_ARGUMENT_KEYS
+_SENSITIVE_CONFIG_ENV_COMMAND_RE = _aawm_tool_activity._SENSITIVE_CONFIG_ENV_COMMAND_RE
+_RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES = _aawm_tool_activity._RESPONSE_OUTPUT_TOOL_ITEM_FALLBACK_NAMES
+_RESPONSE_OUTPUT_TOOL_ITEM_TYPES = _aawm_tool_activity._RESPONSE_OUTPUT_TOOL_ITEM_TYPES
+# --- Wave A4B claude_review facades ---
+_permission_check_probeable_value = _aawm_claude_review._permission_check_probeable_value
+_extract_claude_permission_check_decision_from_value = (
+    _aawm_claude_review._extract_claude_permission_check_decision_from_value
+)
+_extract_claude_permission_check_decision = _aawm_claude_review._extract_claude_permission_check_decision
+_extract_claude_permission_check_models = _aawm_claude_review._extract_claude_permission_check_models
+_enrich_claude_permission_check_metadata = _aawm_claude_review._enrich_claude_permission_check_metadata
+_metadata_bool = _aawm_claude_review._metadata_bool
+_metadata_request_tags = _aawm_claude_review._metadata_request_tags
+_is_claude_permission_check_metadata = _aawm_claude_review._is_claude_permission_check_metadata
+_extract_claude_project_from_metadata_tags = _aawm_claude_review._extract_claude_project_from_metadata_tags
+_extract_claude_auto_review_source_model = _aawm_claude_review._extract_claude_auto_review_source_model
+_apply_claude_auto_review_metadata = _aawm_claude_review._apply_claude_auto_review_metadata
+_apply_claude_auto_review_identity_to_record = _aawm_claude_review._apply_claude_auto_review_identity_to_record
+_extract_claude_auto_review_identity_from_row = _aawm_claude_review._extract_claude_auto_review_identity_from_row
+_apply_claude_auto_review_parent_identity = _aawm_claude_review._apply_claude_auto_review_parent_identity
+_build_session_identity_cache = _aawm_claude_review._build_session_identity_cache
+_build_permission_usage_fields = _aawm_claude_review._build_permission_usage_fields
+_lookup_claude_auto_review_parent_identity = _aawm_claude_review._lookup_claude_auto_review_parent_identity
+_apply_claude_auto_review_parent_identity_from_store = (
+    _aawm_claude_review._apply_claude_auto_review_parent_identity_from_store
+)
+_CLAUDE_PERMISSION_CHECK_OUTPUT_RE = _aawm_claude_review._CLAUDE_PERMISSION_CHECK_OUTPUT_RE
+_CLAUDE_AUTO_REVIEW_LOGICAL_MODEL = _aawm_claude_review._CLAUDE_AUTO_REVIEW_LOGICAL_MODEL
+_CLAUDE_AUTO_REVIEW_TRACE_NAME = _aawm_claude_review._CLAUDE_AUTO_REVIEW_TRACE_NAME
+_CLAUDE_AUTO_REVIEW_AGENT_NAME = _aawm_claude_review._CLAUDE_AUTO_REVIEW_AGENT_NAME
+# --- Wave A4B enrich facades ---
+_bound_worker_context_exhaustion_string = _aawm_enrich._bound_worker_context_exhaustion_string
+_normalize_worker_context_exhaustion_bool = _aawm_enrich._normalize_worker_context_exhaustion_bool
+_sanitize_worker_context_exhaustion_metadata = _aawm_enrich._sanitize_worker_context_exhaustion_metadata
+_promote_worker_context_exhaustion_metadata = _aawm_enrich._promote_worker_context_exhaustion_metadata
+_infer_usage_breakout_provider_prefix = _aawm_enrich._infer_usage_breakout_provider_prefix
+_enrich_usage_breakout_metadata = _aawm_enrich._enrich_usage_breakout_metadata
+_enrich_claude_thinking_metadata = _aawm_enrich._enrich_claude_thinking_metadata
+_read_varint = _aawm_enrich._read_varint
+_extract_gemini_signature_summary = _aawm_enrich._extract_gemini_signature_summary
+_enrich_gemini_thought_signature_metadata = _aawm_enrich._enrich_gemini_thought_signature_metadata
+_enrich_agent_identity_metadata = _aawm_enrich._enrich_agent_identity_metadata
+_enrich_trace_name_and_provider_metadata = _aawm_enrich._enrich_trace_name_and_provider_metadata
+_get_reasoning_state_tags = _aawm_enrich._get_reasoning_state_tags
+_extract_claude_experiment_ids = _aawm_enrich._extract_claude_experiment_ids
+_extract_reasoning_content = _aawm_enrich._extract_reasoning_content
+_extract_thinking_blocks = _aawm_enrich._extract_thinking_blocks
+_normalize_base64_text = _aawm_enrich._normalize_base64_text
+_decode_base64_bytes = _aawm_enrich._decode_base64_bytes
+_short_hash = _aawm_enrich._short_hash
+_WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS = _aawm_enrich._WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS
+_WORKER_CONTEXT_EXHAUSTION_STRING_MAX_LEN = _aawm_enrich._WORKER_CONTEXT_EXHAUSTION_STRING_MAX_LEN
+_WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS = _aawm_enrich._WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS
+_GEMINI_MARKER = _aawm_enrich._GEMINI_MARKER
+# --- end Wave A4B facades ---
 
 # --- Wave A3A rate-limit / provider-error typed extraction: facade rebinds.
 # These MUST precede _bind_session_history_record_apis() so record-API free

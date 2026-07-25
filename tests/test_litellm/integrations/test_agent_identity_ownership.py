@@ -37,6 +37,7 @@ import json
 import inspect
 import sys
 import typing
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -741,6 +742,7 @@ def test_a4a_type_checking_host_callable_signatures_match_runtime() -> None:
 
     annotation_namespace = dict(vars(typing))
     annotation_namespace.update(vars(builtins))
+    annotation_namespace["datetime"] = datetime
     mismatches = []
 
     def evaluate_annotation(annotation: ast.expr | None):
@@ -2117,6 +2119,7 @@ def test_a4b_type_checking_host_callable_signatures_match_runtime() -> None:  # 
 
     annotation_namespace = dict(vars(typing))
     annotation_namespace.update(vars(builtins))
+    annotation_namespace["datetime"] = datetime
     missing_modules: List[str] = []
     missing_type_checking_blocks: List[str] = []
     missing_declarations: List[tuple] = []
