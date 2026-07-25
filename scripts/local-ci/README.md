@@ -402,3 +402,39 @@ Important notes:
 - `openrouter/free` is a legacy manual-only diagnostic, not a default-suite canary or hard gate; upstream routing, rate limits, or model availability can make it noisy even when the local adapter path is correct.
 - `warning_only` canaries stay non-gating even when the subprocess itself times out; those conditions should surface as `soft_failures` / warnings in the artifact, not as suite-stopping failures.
 - Do not re-add `ling-2-6-flash` as a harness target unless the model is intentionally moved to a currently available paid target and the agent file is restored. Use a replacement OpenRouter model for future release-gating parallel proofs.
+
+# AAWM Moonshot and maintenance release gates
+
+The local checks for MS-030 through MS-032 are dev-first documentation and
+release gates, not production authorization.
+
+For AAWM Moonshot, test only OAuth-backed `kimi_code/*` routes. The generic
+LiteLLM `moonshot/*` API-key integration remains separate, unchanged library
+functionality and must not be used as an AAWM fallback. Contract checks must
+cover the single sanitized descriptor consumed by managed chat, the Codex and
+Claude adapters, the raw gateway, and usage polling:
+
+- exact endpoint `https://api.kimi.com/coding/v1`
+- native client name/version and `User-Agent`
+- issued/expiry freshness and integrity digest
+- caller-spoof rejection, no personal workstation/device/account/session
+  identity, and descriptor-owned service identity values
+- atomic replacement without restart
+- fail-closed missing, stale, malformed, or hostile descriptor behavior
+
+Managed model allowlisting remains in existing `kimi_code` provider
+metadata/config and needs its own focused coverage; it is not asserted from the
+descriptor. Native usage/chat request-correlation behavior is likewise tested
+as polling/persistence behavior outside the descriptor schema.
+
+Run focused checks against `litellm-dev` on `:4001` before any production
+action. A passing dev run does not authorize production mutation; use
+`PROD_RELEASE.md` and explicit operator approval before validating or changing
+`:4000`.
+
+MS-032 is an `aawm-infrastructure` Thoth-host responsibility, not a LiteLLM
+request or OAuth-refresh task. Its acceptance evidence must come from the
+infrastructure owner and cover a non-root daily timer, locking, bounded
+timeout, explicit outcome classes, rollback, atomic publication, no credential
+mutation, and no implicit LiteLLM restart. It is paused and is not a
+prerequisite for MS-030/MS-031.

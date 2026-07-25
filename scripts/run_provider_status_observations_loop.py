@@ -57,6 +57,15 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     kimi_oauth_refresh = importlib.import_module("kimi_oauth_refresh")
 
+# The canonical module is a required image dependency. Missing it must fail at
+# import time instead of silently creating a divergent local contract.
+from litellm.secret_managers.kimi_native_contract import (
+    KimiNativeContractError as _KimiNativeContractError,
+    build_outbound_headers as _kimi_build_outbound_headers,
+    resolve_contract as _kimi_resolve_contract,
+    resolve_endpoint_url as _kimi_resolve_endpoint_url,
+)
+
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
@@ -109,11 +118,27 @@ DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_USAGE_POLL_ENABLED = False
 DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
-DEFAULT_KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+DEFAULT_KIMI_USAGE_URL = _kimi_resolve_endpoint_url(None, "usages")
 KIMI_CODE_USAGE_SOURCE = "kimi_code_usage"
 KIMI_CODE_USAGE_PARSER_VERSION = "kimi_code_usage_v2"
-KIMI_CODE_USAGE_SOURCE_VERSION = "kimi_code_0.27.0_managed_usage_v1"
+KIMI_CODE_USAGE_SOURCE_VERSION_FALLBACK = "kimi_code_0.29.1_managed_usage_v1"
+
+
+def _resolve_kimi_usage_source_version() -> str:
+    """Derive source-version metadata from the descriptor when present.
+
+    Falls back to the current native client version (0.29.1) when no
+    descriptor is mounted.  Never restarts containers or contacts providers.
+    """
+    try:
+        contract = _kimi_resolve_contract()
+    except _KimiNativeContractError:
+        return KIMI_CODE_USAGE_SOURCE_VERSION_FALLBACK
+    if contract is not None:
+        return f"kimi_code_{contract.client_version}_managed_usage_v1"
+    return KIMI_CODE_USAGE_SOURCE_VERSION_FALLBACK
 KIMI_CODE_USAGE_CLIENT = "kimi-code"
+KIMI_CODE_NATIVE_FALLBACK_USER_AGENT = "kimi-code-cli/0.29.1"
 KIMI_CODE_USAGE_MODEL = "kimi-code"
 KIMI_CODE_USAGE_QUOTA_TYPE = "quota_units"
 KIMI_CODE_5H_QUOTA_KEY = "kimi_code_5h:quota_units"
@@ -4232,15 +4257,6 @@ def _load_kimi_usage_access_token(auth_file: str) -> str:
     raise ValueError("Kimi Code credential does not contain a usable access token.")
 
 
-def _build_kimi_usage_request_headers(*, access_token: str) -> Dict[str, str]:
-    """Build the smallest native request contract; never add Kimi device headers."""
-    return {
-        "accept": "application/json",
-        "authorization": f"Bearer {access_token}",
-        "user-agent": KIMI_CODE_USAGE_CLIENT,
-    }
-
-
 def _kimi_usage_http_telemetry_class(status_code: int) -> str:
     if status_code in {401, 403}:
         return "auth"
@@ -4290,9 +4306,32 @@ def _fetch_kimi_usage_payload(
     while attempt_count < 2:
         attempt_count += 1
         access_token = _load_kimi_usage_access_token(config.kimi_oauth_auth_file)
+        try:
+            usage_contract = _kimi_resolve_contract()
+        except _KimiNativeContractError as exc:
+            raise _kimi_usage_poll_error(
+                status_code=None,
+                telemetry_class="contract_unavailable",
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+                refresh_attempted=refresh_attempted,
+                refresh_succeeded=refresh_succeeded,
+                message=(
+                    "Kimi Code native contract descriptor is unavailable or "
+                    "invalid; no upstream call was made."
+                ),
+            ) from exc
+        usage_url = _kimi_resolve_endpoint_url(usage_contract, "usages")
+        usage_headers = _kimi_build_outbound_headers(
+            usage_contract,
+            access_token,
+            json_body=False,
+            accept_json=True,
+            fallback_user_agent=KIMI_CODE_NATIVE_FALLBACK_USER_AGENT,
+        )
         request = urllib_request.Request(
-            DEFAULT_KIMI_USAGE_URL,
-            headers=_build_kimi_usage_request_headers(access_token=access_token),
+            usage_url,
+            headers=usage_headers,
             method="GET",
         )
         response_body: Optional[str] = None
@@ -4782,7 +4821,7 @@ def _build_kimi_usage_rate_limit_payloads(
     valid_snapshots = [snapshot for snapshot in snapshots if snapshot["state"] in {"valid_zero", "valid_nonzero"}]
     parser_summary: Dict[str, Any] = {
         "source_version": KIMI_CODE_USAGE_PARSER_VERSION,
-        "native_contract_version": KIMI_CODE_USAGE_SOURCE_VERSION,
+        "native_contract_version": _resolve_kimi_usage_source_version(),
         "window_states": window_states,
         "window_sources": window_sources,
         "malformed_windows": malformed_windows,
@@ -4813,7 +4852,7 @@ def _build_kimi_usage_rate_limit_payloads(
         definition = KIMI_USAGE_WINDOW_DEFINITIONS[snapshot["window"]]
         raw_provider_fields = {
             "parser_version": KIMI_CODE_USAGE_PARSER_VERSION,
-            "source_version": KIMI_CODE_USAGE_SOURCE_VERSION,
+            "source_version": _resolve_kimi_usage_source_version(),
             "window": snapshot["window"],
             "parser_path": snapshot["parser_path"],
             "window_state": snapshot["state"],
@@ -4833,7 +4872,7 @@ def _build_kimi_usage_rate_limit_payloads(
                 "kimi_code_native_quota_window",
             ],
             "parser_version": KIMI_CODE_USAGE_PARSER_VERSION,
-            "source_version": KIMI_CODE_USAGE_SOURCE_VERSION,
+            "source_version": _resolve_kimi_usage_source_version(),
             "telemetry_status": parser_summary["telemetry_status"],
             "window_state": snapshot["state"],
             "window_parser_path": snapshot["parser_path"],
@@ -7446,13 +7485,21 @@ def _run_kimi_usage_poll_task(
     state.kimi_usage_last_attempt_monotonic = now_monotonic
     state.kimi_usage_refresh_pending = False
     observed_at = datetime.now(timezone.utc)
+    try:
+        _summary_contract = _kimi_resolve_contract()
+    except _KimiNativeContractError:
+        _summary_contract = None
+    _summary_usage_url = _kimi_resolve_endpoint_url(
+        _summary_contract,
+        "usages",
+    )
     summary: Dict[str, Any] = {
         "attempted": True,
         "persisted": False,
         "skipped": False,
         "trigger": "oauth_refresh" if refresh_triggered else "interval",
         "credential_source": config.kimi_oauth_auth_file_source,
-        "usage_url": DEFAULT_KIMI_USAGE_URL,
+        "usage_url": _summary_usage_url,
         "observation_count": 0,
         "inserted_count": 0,
         "status_code": None,

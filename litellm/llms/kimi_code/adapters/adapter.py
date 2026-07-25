@@ -21,9 +21,11 @@ from litellm.llms.kimi_code import (
     classify_kimi_code_failure,
     is_k3_model_id,
 )
-from litellm.llms.kimi_code.chat.transformation import (
-    KIMI_CODE_API_BASE,
-    KIMI_CODE_CHAT_COMPLETIONS_URL,
+from litellm.secret_managers.kimi_native_contract import (
+    KimiNativeContractError,
+    resolve_contract,
+    resolve_endpoint_url,
+    KIMI_NATIVE_BASE_URL,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
@@ -55,6 +57,26 @@ _CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN = re.compile(
     r"Sender: [^\n]+\n"
     r"Payload:\n?\Z"
 )
+
+
+def _resolve_kimi_contract_or_fail():
+    """Resolve the native contract, raising HTTPException when required but absent."""
+    try:
+        return resolve_contract()
+    except KimiNativeContractError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": (
+                        "Managed Kimi Code native contract descriptor is "
+                        "unavailable or invalid."
+                    ),
+                    "type": "service_unavailable",
+                    "code": "kimi_code_contract_unavailable",
+                }
+            },
+        ) from exc
 
 
 def normalize_kimi_code_chat_completions_adapter_model_name(
@@ -714,12 +736,13 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
             use_alias_candidate_probe=use_alias_candidate_probe,
         )
 
+    contract = _resolve_kimi_contract_or_fail()
     return adapter_driver.CompletionAdapterRoutePlan(
         config=config,
         prepared_request_body=request_body,
-        target_url=KIMI_CODE_CHAT_COMPLETIONS_URL,
+        target_url=resolve_endpoint_url(contract, "chat_completions"),
         api_key=KIMI_CODE_MANAGED_CREDENTIAL_SENTINEL,
-        api_base=KIMI_CODE_API_BASE,
+        api_base=contract.base_url if contract is not None else KIMI_NATIVE_BASE_URL,
         client_requested_stream=bool(request_body.get("stream")),
         perform_kwargs={
             "completion_kwargs": completion_kwargs,
@@ -772,12 +795,13 @@ async def prepare_anthropic_kimi_chat_completions_adapter_route(
     if isinstance(parallel_tool_calls, bool):
         extra_handler_kwargs["parallel_tool_calls"] = parallel_tool_calls
 
+    contract = _resolve_kimi_contract_or_fail()
     return adapter_driver.CompletionAdapterRoutePlan(
         config=config,
         prepared_request_body=request_body,
-        target_url=KIMI_CODE_CHAT_COMPLETIONS_URL,
+        target_url=resolve_endpoint_url(contract, "chat_completions"),
         api_key=KIMI_CODE_MANAGED_CREDENTIAL_SENTINEL,
-        api_base=KIMI_CODE_API_BASE,
+        api_base=contract.base_url if contract is not None else KIMI_NATIVE_BASE_URL,
         client_requested_stream=bool(request_body.get("stream")),
         perform_kwargs={
             "custom_llm_provider": "kimi_code",

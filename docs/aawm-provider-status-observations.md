@@ -1,5 +1,39 @@
 # AAWM Provider Status Observations
 
+## MS-031: shared Kimi native contract
+
+The authoritative capture source is the WSL
+`/home/zepfu/.kimi-code/bin/kimi` installation at version `0.29.1`. The paused
+Thoth updater in `MS-032` is not a prerequisite and must not be resumed or used
+to publish a descriptor without separate operator authorization.
+
+The Kimi usage poller is one consumer of the same sanitized native contract
+descriptor used by managed chat, the Codex adapter, the Claude adapter, and
+the raw gateway. The descriptor contains the exact endpoint
+`https://api.kimi.com/coding/v1`, native client name/version, the native
+`User-Agent` and header names, service-owned non-personal identity values,
+issued/expiry timestamps, and an integrity digest. Managed model allowlisting
+remains in existing `kimi_code` provider metadata/config and is not part of the
+descriptor.
+
+The descriptor contains no token, personal device, account, session, or caller
+identity. Reject caller attempts to spoof its endpoint, native header/version,
+freshness, digest, or identity fields. Replacement is validated and atomically
+published without a LiteLLM restart. The configured host directory is mounted
+read-only at `/app/kimi-descriptor`, and the consumer path is
+`/app/kimi-descriptor/kimi-native-contract.json`.
+
+The standalone image default
+`LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode. Managed
+dev Compose defaults the gate to `true`. In required mode, a missing, stale,
+malformed, digest-invalid, endpoint-mismatched, version-incoherent, or hostile
+descriptor fails closed and records a sanitized failure. It must not fall back
+to generic `moonshot/*`, API-key authentication, or another endpoint.
+
+The descriptor does not define usage-to-chat correlation. Any such join must
+be proved by the polling and persistence runtime evidence; prompt text,
+caller-supplied identity, and model-name guesses are not descriptor join keys.
+
 The provider-status sidecar records non-inference front-door health signals for
 configured providers. It probes DNS, TCP/TLS, and optional ICMP paths, then
 writes rows to `public.provider_status_observations`.

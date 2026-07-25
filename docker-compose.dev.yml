@@ -111,6 +111,9 @@ services:
       # Kimi Code CLI credential directory. LiteLLM only reads the host CLI's
       # existing grant; the directory mount preserves atomic credential replacement.
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
+      # Sanitized Kimi native descriptor for canonical endpoint resolution (MS-030/MS-031).
+      # Read-only; does not contain OAuth credentials or the full Kimi home.
+      - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:/app/kimi-descriptor:ro
       # Qwen CLI settings are the canonical Token Plan credential owner.
       # LiteLLM reads the existing file in place and never copies the key.
       - /home/zepfu/.qwen/settings.json:/home/zepfu/.qwen/settings.json:ro
@@ -197,6 +200,8 @@ services:
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
       - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
       - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
+      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/kimi-native-contract.json}
+      - LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}
       - LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE=${LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE:-/home/zepfu/.qwen/settings.json}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
@@ -262,6 +267,8 @@ services:
       # native proper-lockfile parent for the oauth/kimi-code sentinel.
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials
       - /home/zepfu/.kimi-code/oauth:/home/zepfu/.kimi-code/oauth
+      # Sanitized Kimi native descriptor for canonical endpoint resolution (MS-030/MS-031).
+      - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:/app/kimi-descriptor:ro
       # Alibaba Token Plan sidecar session file source for quota polling.
       - /home/zepfu/.alibaba:/home/zepfu/.alibaba:ro
     environment:
@@ -329,6 +336,8 @@ services:
       - AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
       - AAWM_KIMI_OAUTH_REFRESH_ENABLED=${AAWM_KIMI_OAUTH_REFRESH_ENABLED:-1}
       - AAWM_KIMI_OAUTH_AUTH_FILE=${AAWM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
+      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/kimi-native-contract.json}
+      - LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}
       - AAWM_KIMI_OAUTH_LOCK_FILE=${AAWM_KIMI_OAUTH_LOCK_FILE:-/home/zepfu/.kimi-code/oauth/kimi-code}
       - AAWM_KIMI_OAUTH_AUTH_FILE_UID=${AAWM_KIMI_OAUTH_AUTH_FILE_UID:-1000}
       - AAWM_KIMI_OAUTH_AUTH_FILE_GID=${AAWM_KIMI_OAUTH_AUTH_FILE_GID:-1000}

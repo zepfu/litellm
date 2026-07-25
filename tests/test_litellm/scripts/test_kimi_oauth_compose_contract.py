@@ -107,3 +107,63 @@ def test_kimi_credential_docs_use_only_the_existing_cli_grant() -> None:
     assert "~/.litellm/kimi/kimi-code.json" not in docs
     assert "scripts/kimi_oauth_refresh.py --login" not in docs
     assert "device enrollment" not in docs
+
+
+def test_litellm_dev_mounts_sanitized_descriptor_directory_read_only() -> None:
+    """MS-030/MS-031: litellm-dev mounts a dedicated sanitized descriptor
+    directory read-only, not the full Kimi home or OAuth credentials."""
+    compose = _COMPOSE_PATH.read_text(encoding="utf-8")
+    litellm_dev = _service_block(compose, "litellm-dev")
+
+    assert (
+        "- ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:"
+        "/app/kimi-descriptor:ro"
+    ) in litellm_dev
+    assert "/home/zepfu/.kimi-code:/home/zepfu/.kimi-code" not in litellm_dev
+    assert (
+        "- LITELLM_KIMI_NATIVE_CONTRACT_PATH="
+        "${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-"
+        "/app/kimi-descriptor/kimi-native-contract.json}"
+    ) in litellm_dev
+    assert (
+        "- LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED="
+        "${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}"
+    ) in litellm_dev
+
+
+def test_provider_status_mounts_sanitized_descriptor_directory_read_only() -> None:
+    """MS-030/MS-031: provider-status-observations mounts the same sanitized
+    descriptor directory read-only for canonical endpoint resolution."""
+    compose = _COMPOSE_PATH.read_text(encoding="utf-8")
+    sidecar = _service_block(compose, "provider-status-observations")
+
+    assert (
+        "- ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:"
+        "/app/kimi-descriptor:ro"
+    ) in sidecar
+    assert (
+        "- LITELLM_KIMI_NATIVE_CONTRACT_PATH="
+        "${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-"
+        "/app/kimi-descriptor/kimi-native-contract.json}"
+    ) in sidecar
+    assert (
+        "- LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED="
+        "${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}"
+    ) in sidecar
+
+
+def test_provider_status_image_packages_kimi_native_contract_module() -> None:
+    """MS-030/MS-031: the provider-status image packages the pure-stdlib
+    kimi_native_contract module and exposes the descriptor path gate."""
+    dockerfile = _PROVIDER_STATUS_DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+    assert (
+        "COPY litellm/secret_managers/kimi_native_contract.py "
+        "/app/litellm/secret_managers/kimi_native_contract.py"
+    ) in dockerfile
+    assert (
+        "LITELLM_KIMI_NATIVE_CONTRACT_PATH="
+        "/app/kimi-descriptor/kimi-native-contract.json"
+    ) in dockerfile
+    assert "LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false" in dockerfile
+    assert "RUN mkdir -p /app/kimi-descriptor" in dockerfile

@@ -12,7 +12,9 @@ ENV PYTHONUNBUFFERED=1 \
     AAWM_PROVIDER_STATUS_SKIP_ICMP=0 \
     AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START=1 \
     AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS=1000 \
-    AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS=5000
+    AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS=5000 \
+    LITELLM_KIMI_NATIVE_CONTRACT_PATH=/app/kimi-descriptor/kimi-native-contract.json \
+    LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -34,9 +36,16 @@ COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_m
 COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py
 COPY litellm/secret_managers/credential_file_metadata.py /app/litellm/secret_managers/credential_file_metadata.py
 COPY litellm/secret_managers/credential_file_write.py /app/litellm/secret_managers/credential_file_write.py
+# Canonical Kimi endpoint/contract resolver (pure-stdlib, MS-030/MS-031).
+COPY litellm/secret_managers/kimi_native_contract.py /app/litellm/secret_managers/kimi_native_contract.py
 RUN touch \
     /app/scripts/__init__.py \
     /app/litellm/__init__.py \
     /app/litellm/secret_managers/__init__.py
+
+# The sanitized Kimi native descriptor is mounted read-only by compose at
+# /app/kimi-descriptor.  The image itself ships only the contract module and
+# the descriptor path gate; it never bundles OAuth credentials or the Kimi home.
+RUN mkdir -p /app/kimi-descriptor
 
 ENTRYPOINT ["python", "/app/scripts/run_provider_status_observations_loop.py"]

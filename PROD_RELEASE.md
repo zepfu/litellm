@@ -1,5 +1,40 @@
 # Production Release Runbook
 
+## MS-030/MS-031 release gates
+
+For AAWM Moonshot changes, all managed traffic is OAuth-only through
+`kimi_code/*`. Generic upstream `moonshot/*` API-key support is separate,
+unchanged LiteLLM library functionality; it is not an AAWM route or fallback.
+Release evidence must prove the single sanitized native contract descriptor is
+consumed consistently by managed chat, both adapters, the raw gateway, and
+usage polling. The descriptor governs the exact endpoint
+`https://api.kimi.com/coding/v1`, native client name/version and `User-Agent`
+header values, issued/expiry freshness, and its integrity digest.
+
+Managed model allowlisting remains in existing `kimi_code` provider
+metadata/config, outside the descriptor. Native request/correlation joins for
+usage and chat are also runtime persistence behavior, not descriptor fields.
+Caller-spoof rejection, no personal workstation/device/account/session
+identity, service-owned `X-Msh-Device-*` values, atomic restart-free
+replacement, and fail-closed missing/stale/hostile behavior remain release
+requirements.
+
+Run the complete gate on `litellm-dev` (`:4001`) first, including focused
+contract, adapter, gateway, usage, log, and persistence checks. Dev evidence
+authorizes consideration of promotion only; it does not authorize production
+mutation. Production remains untouched until the operator separately approves
+promotion, after which the exact proven build is validated again on `:4000`.
+
+## MS-032 ownership boundary
+
+MS-032 is owned by `aawm-infrastructure` as Thoth host maintenance. It is
+separate from OAuth refresh and from LiteLLM request serving. Its Thoth
+maintenance design must provide a non-root daily timer, an exclusive lock, a
+bounded timeout, explicit success/degraded/failed outcomes, rollback, and
+atomic publication. It must not mutate credentials and must not imply or
+perform a LiteLLM restart. The item is paused and is not a prerequisite for
+MS-030/MS-031; LiteLLM must not reimplement or resume it in this repository.
+
 This runbook is the durable release process for moving the AAWM LiteLLM fork,
 overlay wheels, model config, and acceptance harness into the production-style
 container on `:4000`.

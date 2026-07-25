@@ -1732,3 +1732,281 @@ async def test_should_leave_unrelated_direct_failure_unchanged():
 
     assert caught.value is upstream_failure
     assert not hasattr(upstream_failure, "kimi_code_probe_failure_metadata")
+
+
+# ---------------------------------------------------------------------------
+# Adapter parity: both adapters use the shared contract resolver
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_should_use_shared_contract_resolver_for_endpoint_parity(
+    monkeypatch,
+    tmp_path,
+):
+    """Both Codex and Anthropic adapters resolve the same endpoint via the
+    shared contract module, never hardcoding a generic Moonshot base."""
+    credentials_path = tmp_path / "kimi-code.json"
+    _write_credentials(credentials_path)
+    monkeypatch.setenv(KIMI_CODE_CREDENTIAL_PATH_ENV, str(credentials_path))
+
+    codex_plan = await prepare_codex_kimi_chat_completions_adapter_route(
+        request=_request(),
+        prepared_request_body={
+            "model": "kimi_code/k3",
+            "input": "hello",
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3",
+    )
+    anthropic_plan = await prepare_anthropic_kimi_chat_completions_adapter_route(
+        request=_request(),
+        prepared_request_body={
+            "model": "kimi_code/k3",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3",
+    )
+
+    # Both must resolve to the same Kimi-native endpoint
+    assert codex_plan.target_url == anthropic_plan.target_url
+    assert codex_plan.target_url == "https://api.kimi.com/coding/v1/chat/completions"
+    assert codex_plan.api_base == anthropic_plan.api_base
+    assert codex_plan.api_base == "https://api.kimi.com/coding/v1"
+
+    # Neither may reference the generic Moonshot API
+    assert "moonshot" not in codex_plan.target_url
+    assert "moonshot" not in anthropic_plan.target_url
+    assert "moonshot" not in codex_plan.api_base
+    assert "moonshot" not in anthropic_plan.api_base
+
+
+@pytest.mark.asyncio
+async def test_should_use_contract_descriptor_when_available(
+    monkeypatch,
+    tmp_path,
+):
+    """When a valid contract descriptor is mounted, both adapters use its
+    base_url and the shared resolver."""
+    import json as _json
+    import time as _time
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_BASE_URL,
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+        KIMI_NATIVE_SCHEMA_VERSION,
+        compute_canonical_digest,
+    )
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _write_credentials(credentials_path)
+    monkeypatch.setenv(KIMI_CODE_CREDENTIAL_PATH_ENV, str(credentials_path))
+
+    now = _time.time()
+    contract_payload = {
+        "schema_version": KIMI_NATIVE_SCHEMA_VERSION,
+        "client_name": "kimi-code",
+        "client_version": "2.0.0",
+        "base_url": KIMI_NATIVE_BASE_URL,
+        "user_agent": "kimi-code-cli/2.0.0",
+        "issued_at": now - 60,
+        "expires_at": now + 3600,
+        "x_msh_platform": "kimi_code_cli",
+        "x_msh_version": "2.0.0",
+        "x_msh_device_name": "aawm-service-node",
+        "x_msh_device_model": "aawm-managed",
+        "x_msh_os_version": "linux-6.x",
+        "x_msh_device_id": "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6",
+    }
+    contract_payload["digest"] = compute_canonical_digest(contract_payload)
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(_json.dumps(contract_payload), encoding="utf-8")
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_PATH_ENV, str(contract_path))
+
+    codex_plan = await prepare_codex_kimi_chat_completions_adapter_route(
+        request=_request(),
+        prepared_request_body={
+            "model": "kimi_code/k3",
+            "input": "hello",
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3",
+    )
+
+    assert codex_plan.target_url == "https://api.kimi.com/coding/v1/chat/completions"
+    assert codex_plan.api_base == KIMI_NATIVE_BASE_URL
+
+
+# ---------------------------------------------------------------------------
+# MS-030/MS-031: descriptor-present adapter consumer tests
+# ---------------------------------------------------------------------------
+
+
+def _write_contract_descriptor(
+    tmp_path,
+    monkeypatch,
+    *,
+    client_version: str = "0.29.1",
+):
+    """Write a valid contract descriptor and set the env path."""
+    import time as _time
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_BASE_URL,
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+        KIMI_NATIVE_SCHEMA_VERSION,
+        compute_canonical_digest,
+    )
+
+    now = _time.time()
+    payload = {
+        "schema_version": KIMI_NATIVE_SCHEMA_VERSION,
+        "client_name": "kimi-code",
+        "client_version": client_version,
+        "base_url": KIMI_NATIVE_BASE_URL,
+        "user_agent": f"kimi-code-cli/{client_version}",
+        "issued_at": now - 60,
+        "expires_at": now + 3600,
+        "x_msh_platform": "kimi_code_cli",
+        "x_msh_version": client_version,
+        "x_msh_device_name": "aawm-service-node",
+        "x_msh_device_model": "aawm-managed",
+        "x_msh_os_version": "linux-6.x",
+        "x_msh_device_id": "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6",
+    }
+    payload["digest"] = compute_canonical_digest(payload)
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_PATH_ENV, str(contract_path))
+    return contract_path
+
+
+@pytest.mark.asyncio
+async def test_should_fail_closed_when_contract_required_but_missing_codex(
+    monkeypatch,
+    tmp_path,
+):
+    """Codex adapter raises 503 HTTPException when the contract is required
+    but the descriptor is absent; no upstream call is made."""
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+        KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
+    )
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _write_credentials(credentials_path)
+    monkeypatch.setenv(KIMI_CODE_CREDENTIAL_PATH_ENV, str(credentials_path))
+    monkeypatch.delenv(KIMI_NATIVE_CONTRACT_PATH_ENV, raising=False)
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await prepare_codex_kimi_chat_completions_adapter_route(
+            request=_request(),
+            prepared_request_body={
+                "model": "kimi_code/k3",
+                "input": "hello",
+                "stream": False,
+            },
+            adapter_model="kimi_code/k3",
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["error"]["code"] == "kimi_code_contract_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_should_fail_closed_when_contract_required_but_missing_anthropic(
+    monkeypatch,
+    tmp_path,
+):
+    """Anthropic adapter raises 503 HTTPException when the contract is required
+    but the descriptor is absent; no upstream call is made."""
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+        KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
+    )
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _write_credentials(credentials_path)
+    monkeypatch.setenv(KIMI_CODE_CREDENTIAL_PATH_ENV, str(credentials_path))
+    monkeypatch.delenv(KIMI_NATIVE_CONTRACT_PATH_ENV, raising=False)
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await prepare_anthropic_kimi_chat_completions_adapter_route(
+            request=_request(),
+            prepared_request_body={
+                "model": "kimi_code/k3",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+            adapter_model="kimi_code/k3",
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["error"]["code"] == "kimi_code_contract_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_should_emit_descriptor_headers_through_codex_adapter_e2e(
+    monkeypatch,
+    tmp_path,
+    respx_mock,
+):
+    """End-to-end: descriptor-present Codex adapter request carries descriptor
+    UA, all six X-Msh headers, Content-Type, and omits caller spoof headers."""
+    credentials_path = tmp_path / "kimi-code.json"
+    _write_credentials(credentials_path)
+    monkeypatch.setenv(KIMI_CODE_CREDENTIAL_PATH_ENV, str(credentials_path))
+    _write_contract_descriptor(tmp_path, monkeypatch, client_version="0.29.1")
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+
+    respx_mock.post(KIMI_CODE_CHAT_COMPLETIONS_URL).respond(
+        json={
+            "id": "chatcmpl-kimi",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "k3",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    )
+
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_adapted_route_access_log",
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._record_adapted_completed_route_rollup_turn",
+        ),
+    ):
+        await _handle_codex_kimi_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": "kimi_code/k3",
+                "input": "hello",
+                "stream": False,
+            },
+            adapter_model="kimi_code/k3",
+        )
+
+    assert len(respx_mock.calls) == 1
+    request = respx_mock.calls[0].request
+    assert request.headers["User-Agent"] == "kimi-code-cli/0.29.1"
+    assert request.headers["X-Msh-Platform"] == "kimi_code_cli"
+    assert request.headers["X-Msh-Version"] == "0.29.1"
+    assert request.headers["X-Msh-Device-Name"] == "aawm-service-node"
+    assert request.headers["X-Msh-Device-Model"] == "aawm-managed"
+    assert request.headers["X-Msh-Os-Version"] == "linux-6.x"
+    assert request.headers["X-Msh-Device-Id"] == "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6"
+    assert request.headers["Content-Type"] == "application/json"
