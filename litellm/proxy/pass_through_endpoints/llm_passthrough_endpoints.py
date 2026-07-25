@@ -107,7 +107,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (
 from litellm.proxy.pass_through_endpoints.common_utils import get_litellm_virtual_key
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
-    PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS,
+    PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS,  # noqa: F401  # consumed by rebound env_policy functions
     PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES,
     create_pass_through_route,
     create_websocket_passthrough_route,
@@ -115,7 +115,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     websocket_passthrough_request,
     _classify_passthrough_hidden_retry_failure,
     _get_passthrough_handled_http_error_summary,
-    _get_passthrough_hidden_retry_wait_seconds,
+    _get_passthrough_hidden_retry_wait_seconds,  # noqa: F401  # consumed by rebound env_policy functions
     _is_known_grok_build_usage_balance_exhausted_response,
     _is_known_grok_personal_team_spending_limit_response,
     _record_passthrough_hidden_retry_metadata,
@@ -153,6 +153,9 @@ from litellm.llms.anthropic.experimental_pass_through.providers.openai import (
 )
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen import (
     adapter as _anthropic_opencode_zen_provider,
+)
+from litellm.llms.anthropic.experimental_pass_through.providers import (
+    common as _anthropic_providers_common,
 )
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen import (
     normalization as _anthropic_opencode_zen_normalization,
@@ -322,6 +325,16 @@ from .aawm_alias_routing import google_oauth as _aawm_google_oauth
 from .aawm_alias_routing import antigravity_oauth as _aawm_antigravity_oauth
 from .aawm_alias_routing import candidate_loop as _aawm_alias_candidate_loop
 from .aawm_alias_routing import durable as _aawm_alias_durable
+
+# Wave 4 pure-leaf extraction imports
+from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen import constants as _opencode_zen_constants
+from litellm.llms.anthropic.experimental_pass_through.providers.antigravity import constants as _antigravity_constants
+from .aawm_alias_routing import lane_keys as _aawm_lane_keys
+from .aawm_adapter_runtime import model_resolution as _aawm_adapter_model_resolution
+from litellm.llms.anthropic.experimental_pass_through.providers.google import env_policy as _google_env_policy
+from litellm.llms.anthropic.experimental_pass_through.providers.google import context_window as _google_context_window
+from litellm.llms.anthropic.experimental_pass_through.providers.google import error_signals as _google_error_signals
+from litellm.llms.anthropic.experimental_pass_through.providers.grok import side_channel as _grok_side_channel
 from .aawm_alias_routing import interfaces as _aawm_alias_interfaces
 from .aawm_alias_routing.config_compiler import (
     ConfigCompileError as _AawmAliasConfigCompileError,
@@ -1014,208 +1027,62 @@ _ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN = (
 
 # --- restored missing constants from HEAD (ordered) ---
 
-_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST = frozenset(
-    {
-        "accept",
-        "authorization",
-        "content-type",
-        "user-agent",
-        "x-goog-api-client",
-        "x-goog-fieldmask",
-        "x-goog-request-params",
-        "x-goog-request-reason",
-    }
-)
+_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST = _antigravity_constants._ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST
 
-_OPENCODE_ZEN_DEFAULT_BASE_URL = "https://opencode.ai/zen/v1"
-_OPENCODE_ZEN_PROVIDER = "opencode_zen"
-_OPENCODE_ZEN_AUTH_FILE_ENV_VARS = (
-    "LITELLM_OPENCODE_AUTH_FILE",
-    "OPENCODE_AUTH_FILE",
-)
-_OPENCODE_ZEN_API_KEY_ENV_VARS = (
-    "LITELLM_OPENCODE_API_KEY",
-    "OPENCODE_API_KEY",
-)
-_OPENCODE_ZEN_DEFAULT_AUTH_PATHS = (
-    "~/.local/share/opencode/auth.json",
-    "~/.local/share/opencode/auth.json",
-)
-_OPENCODE_ZEN_FREE_MODELS = frozenset(
-    {
-        "big-pickle",
-        "mini-v2.5",
-        "north-mini-code",
-        "nemotron-3-ultra",
-        "deepseek-v4-flash",
-    }
-)
-_OPENCODE_ZEN_ANTHROPIC_COMPLETION_MODELS = frozenset({"big-pickle"})
+_OPENCODE_ZEN_DEFAULT_BASE_URL = _opencode_zen_constants._OPENCODE_ZEN_DEFAULT_BASE_URL
+_OPENCODE_ZEN_PROVIDER = _opencode_zen_constants._OPENCODE_ZEN_PROVIDER
+_OPENCODE_ZEN_AUTH_FILE_ENV_VARS = _opencode_zen_constants._OPENCODE_ZEN_AUTH_FILE_ENV_VARS
+_OPENCODE_ZEN_API_KEY_ENV_VARS = _opencode_zen_constants._OPENCODE_ZEN_API_KEY_ENV_VARS
+_OPENCODE_ZEN_DEFAULT_AUTH_PATHS = _opencode_zen_constants._OPENCODE_ZEN_DEFAULT_AUTH_PATHS
+_OPENCODE_ZEN_FREE_MODELS = _opencode_zen_constants._OPENCODE_ZEN_FREE_MODELS
+_OPENCODE_ZEN_ANTHROPIC_COMPLETION_MODELS = _opencode_zen_constants._OPENCODE_ZEN_ANTHROPIC_COMPLETION_MODELS
 
-_GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com"
+_GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL = _grok_side_channel._GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL
 
-_GROK_CLI_FORWARD_HEADER_ALLOWLIST = frozenset(
-    {
-        "accept",
-        "accept-encoding",
-        "authorization",
-        "content-type",
-        "grok-shell-timestamp",
-        "user-agent",
-        "x-email",
-        "x-grok-agent-id",
-        "x-grok-client-identifier",
-        "x-grok-client-version",
-        "x-grok-conv-id",
-        "x-grok-model-override",
-        "x-grok-req-id",
-        "x-grok-session-id",
-        "x-grok-turn-idx",
-        "x-grok-user-id",
-        "x-request-id",
-        "x-teamid",
-        "x-userid",
-        "x-xai-token-auth",
-    }
-)
+_GROK_CLI_FORWARD_HEADER_ALLOWLIST = _grok_side_channel._GROK_CLI_FORWARD_HEADER_ALLOWLIST
 
-_GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE = frozenset(
-    {
-        "content-length",
-        "host",
-        "traceparent",
-        "tracestate",
-        "x-litellm-api-key",
-    }
-)
+_GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE = _grok_side_channel._GROK_CLI_FORWARD_HEADER_COMPARE_IGNORE
 
-_CLAUDE_PERSISTED_OUTPUT_PATTERN = re.compile(
-    r"\A<system-reminder>\n"
-    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
-    r"Output too large \([^)]+\)\. Full output saved to: (?P<path>/[^\n]+)\n\n"
-    r"Preview \(first 2KB\):\n"
-    r"(?P<preview>.*)"
-    r"\n</persisted-output>\n</system-reminder>\n?\Z",
-    re.DOTALL,
-)
+_CLAUDE_PERSISTED_OUTPUT_PATTERN = _aawm_lane_keys._CLAUDE_PERSISTED_OUTPUT_PATTERN
 
-_CLAUDE_PERSISTED_OUTPUT_INLINE_PATTERN = re.compile(
-    r"<system-reminder>\n"
-    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
-    r"Output too large \([^)]+\)\. Full output saved to: (?P<path>/[^\n]+)\n\n"
-    r"Preview \(first 2KB\):\n"
-    r"(?P<preview>.*?)"
-    r"\n</persisted-output>\n</system-reminder>\n?",
-    re.DOTALL,
-)
-_CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN = re.compile(
-    r"<system-reminder>\n"
-    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context: <persisted-output>\n"
-    r"(?P<content>.*?)"
-    r"\n</persisted-output>\n</system-reminder>\n?",
-    re.DOTALL,
-)
-_CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN = re.compile(
-    r"<system-reminder>\n"
-    r"(?P<hook>SubagentStart|SubAgentStart|SessionStart) hook additional context:(?P<body>.*?)"
-    r"</system-reminder>\n?",
-    re.DOTALL,
-)
-_ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME = "google_anthropic_system_prompt_policy"
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION = "2026-04-27.v2"
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV = "AAWM_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY"
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT = "replace_compact"
-_GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT = """You are a non-interactive CLI software engineering agent.
+_CLAUDE_PERSISTED_OUTPUT_INLINE_PATTERN = _aawm_lane_keys._CLAUDE_PERSISTED_OUTPUT_INLINE_PATTERN
+_CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN = _aawm_lane_keys._CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN
+_CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN = _aawm_lane_keys._CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN
+_ANTHROPIC_BILLING_HEADER_PREFIX = _anthropic_providers_common._ANTHROPIC_BILLING_HEADER_PREFIX
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME = _google_env_policy._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION = _google_env_policy._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV = _google_env_policy._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV
+_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT = _google_env_policy._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT
+_GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT = _google_env_policy._GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT
 
-Work in this cycle: understand, plan briefly, implement, verify, finalize.
-Use the provided tools to inspect and modify the workspace when the task
-requires it.
+_CODEX_REASONING_EFFORT_TIERS = _aawm_lane_keys._CODEX_REASONING_EFFORT_TIERS
+_CODEX_REASONING_EFFORT_TIER_INDEX = _aawm_lane_keys._CODEX_REASONING_EFFORT_TIER_INDEX
+_CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS = _aawm_lane_keys._CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS
+_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME = _aawm_lane_keys._CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME
+_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION = _aawm_lane_keys._CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION
+_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT = _aawm_lane_keys._CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT
+_AAWM_READ_AGENT_GUIDANCE_POLICY_NAME = _aawm_lane_keys._AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
+_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION = _aawm_lane_keys._AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
+_AAWM_READ_AGENT_GUIDANCE_PROMPT = _aawm_lane_keys._AAWM_READ_AGENT_GUIDANCE_PROMPT
+_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS = _aawm_lane_keys._CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
+_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS = _aawm_lane_keys._CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS
 
-Tool usage:
-- Prefer search tools before broad file reads.
-- Batch independent search/read calls in parallel when possible.
-- Use write/edit tools to complete requested artifacts or code changes.
-- If a tool is unavailable or blocked, recover with another available tool.
-- Do not remain in read-only exploration when the user requested an
-  implementation or artifact.
-- Final responses must include visible assistant text. Never end a completed
-  task with only thoughts or reasoning. After tool results, write the requested
-  final answer in normal text.
+_CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS = _aawm_lane_keys._CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS
+_CODEX_AUTO_AGENT_SPARK_MODEL = _aawm_lane_keys._CODEX_AUTO_AGENT_SPARK_MODEL
+_CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = _aawm_lane_keys._CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS
+_CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = _grok_side_channel._CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS
+_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = _grok_side_channel._CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN
+_CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN = _grok_side_channel._CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN
+_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL = _grok_side_channel._CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL
 
-Follow the preserved project, workspace, safety, and operator instructions
-below."""
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME = "codex_google_code_assist_tool_contract_policy"
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION = "2026-05-12.v1"
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV = "AAWM_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY"
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT = "append"
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = """Codex tool contract:
-- Tool results are observations only. Never copy a previous tool result, terminal transcript, "Chunk ID", "Wall time", "Process exited", or "Output:" text into the arguments for a later tool call.
-- For every function call, construct arguments from the declared tool schema. If the tool requires `cmd`, the arguments must contain a non-empty `cmd` string. Do not use `output`, `content`, or raw terminal transcript text as a substitute.
-- After a tool result, continue the assigned task. Use the latest user task and requested output shape as authoritative.
-- If a previous tool call failed because required arguments were missing, either retry once with schema-valid arguments or stop and explain the blocker in the final answer.
-- Final answers must address the assigned task directly. Do not return generic descriptions of files unless the user asked for a file overview."""
-
-_CODEX_REASONING_EFFORT_TIERS = (
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-)
-_CODEX_REASONING_EFFORT_TIER_INDEX = {effort: index for index, effort in enumerate(_CODEX_REASONING_EFFORT_TIERS)}
-_CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS = (
-    "reasoning_effort_requested",
-    "reasoning_effort_source",
-    "reasoning_effort_native_provider",
-    "reasoning_effort_native_value",
-    "reasoning_effort_native_field",
-    "reasoning_effort_supported_ceiling",
-    "reasoning_effort_resolved_model",
-    "reasoning_effort_resolved_provider",
-    "reasoning_effort_candidate_attempt",
-    "reasoning_effort_mapping_reason",
-    "reasoning_effort_clamped_from",
-    "reasoning_effort_clamp_reason",
-)
-_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME = "codex_auto_agent_prevention_guidance"
-_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION = "2026-07-21.v2"
-_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT = """Codex auto-agent completion contract:
-- Always produce a non-empty final answer after completing or stopping the task; do not end a successful request with only reasoning, tool calls, or no visible assistant text.
-- Do not return internal planning text as the final answer. Complete the requested work, or state the exact blocker and the next concrete step.
-- If a required tool is unavailable or blocked, state the exact observed tool/platform error and continue with bounded evidence from available context; do not claim tools or filesystem are unavailable unless a tool/platform error proves it.
-- If the user requested code or artifact changes, either make the scoped change or explicitly say no files were modified and why. Do not answer with a generic explanation of the function or file when implementation or verification was requested.
-- If verification could not be run, name the command or check that was not run and why.
-- For a coding or file-edit task, a design summary, plan, or statement that edits are about to begin is not a valid final answer. Do not stop until the edit tool has returned and the requested checks have run, or an explicit blocker has been proven.
-- Never claim `apply_patch` failed, aborted, or cannot edit a linked `/tmp` worktree unless the client returned an explicit tool error. Absolute paths to writable linked worktrees are supported. If no tool result is visible, retry the tool call instead of switching editing methods or finalizing.
-- Preserve the caller's editing contract. Do not replace `apply_patch` with Python, `sed`, or another file-mutation mechanism when the task or repository requires `apply_patch`.
-- A successful coding-task final answer must name the changed paths and requested verification results."""
-_AAWM_READ_AGENT_GUIDANCE_POLICY_NAME = "aawm_read_agent_guidance"
-_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION = "2026-06-06.v1"
-_AAWM_READ_AGENT_GUIDANCE_PROMPT = """AAWM read-only agent contract:
-- Treat the delegated task as exploration, audit, review, or investigation unless the prompt explicitly authorizes file edits for this worker.
-- Do not edit files, create files, apply patches, or run commands that modify the worktree.
-- If a fix is needed, describe the patch only. Do not claim the patch was implemented unless the prompt explicitly authorized edits and the files were actually changed.
-- If the delegated prompt requires the exact final phrase `No files were modified.`, include that phrase truthfully in the final answer.
-- Return findings, evidence, coverage gaps, and recommended next steps. Do not return implementation summaries for read-only work."""
-_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS = 6 * 60 * 60
-_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS = 30.0
-
-_CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS = 30.0 * 60.0
-_CODEX_AUTO_AGENT_SPARK_MODEL = "gpt-5.3-codex-spark"
-_CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS = 300.0
-_CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS = 3 * 60 * 60.0
-_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN = "GROK_BUILD_USAGE_BALANCE_EXHAUSTED"
-_CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN = "GROK_PERSONAL_TEAM_SPENDING_LIMIT"
-_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL = "https://cli-chat-proxy.grok.com/v1/responses"
-
-_CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset({500, 502, 503, 529})
-_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS = 8
-_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS_ENV = (
-    "AAWM_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS"
-)
+_CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES = _aawm_lane_keys._CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES
+_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS = _aawm_lane_keys._CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS
+_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS_ENV = _aawm_lane_keys._CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS_ENV
 _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS = 0.05
 _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS = 1.0
 _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS = 0.05
@@ -1426,6 +1293,7 @@ _ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS = (
 
 
 vertex_llm_base = VertexBase()
+
 router = APIRouter()
 default_vertex_config = None
 
@@ -2253,134 +2121,28 @@ def _has_direct_request_header(request: Request, header_name: str) -> bool:
     return isinstance(value, str) and len(value.strip()) > 0
 
 
-def _normalize_anthropic_adapter_model_name(model: Any) -> Optional[str]:
-    if not isinstance(model, str):
-        return None
-    normalized_model = model.strip()
-    return normalized_model or None
+_normalize_anthropic_adapter_model_name = _aawm_adapter_model_resolution._normalize_anthropic_adapter_model_name
 
 
-def _split_anthropic_adapter_provider_prefix(
-    model: Any,
-) -> tuple[Optional[str], Optional[str]]:
-    normalized_model = _normalize_anthropic_adapter_model_name(model)
-    if normalized_model is None:
-        return None, None
-    if "/" not in normalized_model:
-        return None, normalized_model
-
-    prefix, remainder = normalized_model.split("/", 1)
-    provider = {
-        "agy": "antigravity",
-        "chatgpt": "openai",
-        "gemini": "google",
-        "google-antigravity": "antigravity",
-        "nvidia_nim": "nvidia",
-        "opencode": _OPENCODE_ZEN_PROVIDER,
-        "opencode-zen": _OPENCODE_ZEN_PROVIDER,
-        "zen": _OPENCODE_ZEN_PROVIDER,
-    }.get(
-        prefix,
-        prefix
-        if prefix
-        in (
-            "openai",
-            "google",
-            "openrouter",
-            "nvidia",
-            "antigravity",
-            _OPENCODE_ZEN_PROVIDER,
-        )
-        else None,
-    )
-    if provider is None:
-        return None, normalized_model
-    return provider, remainder.strip()
+_split_anthropic_adapter_provider_prefix = _aawm_adapter_model_resolution._split_anthropic_adapter_provider_prefix
 
 
-def _get_anthropic_adapter_model_candidates(request_body: dict[str, Any]) -> list[str]:
-    candidates: list[str] = []
-    requested_model = _normalize_anthropic_adapter_model_name(request_body.get("model"))
-    if requested_model is not None:
-        candidates.append(requested_model)
-
-    agent_name, _tenant = _extract_claude_agent_and_tenant_from_request_body(request_body)
-    if not agent_name:
-        return candidates
-
-    agent_model = _normalize_anthropic_adapter_model_name(_load_claude_agent_declared_model(agent_name))
-    if agent_model is not None:
-        candidates.append(agent_model)
-    return candidates
+_get_anthropic_adapter_model_candidates = _aawm_adapter_model_resolution._get_anthropic_adapter_model_candidates
 
 
-def _has_anthropic_responses_adapter_endpoint(endpoint: str) -> bool:
-    normalized_endpoint = endpoint.strip()
-    if not normalized_endpoint.startswith("/"):
-        normalized_endpoint = f"/{normalized_endpoint}"
-    return normalized_endpoint in _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS
+_has_anthropic_responses_adapter_endpoint = _aawm_adapter_model_resolution._has_anthropic_responses_adapter_endpoint
 
 
-def _normalize_anthropic_openai_responses_adapter_model_name(
-    model: Any,
-) -> Optional[str]:
-    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
-    if explicit_provider not in (None, "openai") or candidate is None:
-        return None
-    if candidate in _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS:
-        return candidate
-    return None
+_normalize_anthropic_openai_responses_adapter_model_name = _aawm_adapter_model_resolution._normalize_anthropic_openai_responses_adapter_model_name
 
 
-def _normalize_anthropic_nvidia_responses_adapter_model_name(
-    model: Any,
-) -> Optional[str]:
-    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
-    if explicit_provider not in (None, "nvidia") or candidate is None:
-        return None
-
-    requested_model = model.strip() if isinstance(model, str) else ""
-    has_explicit_nvidia_prefix = requested_model.startswith("nvidia/")
-    normalized_candidate = candidate.strip()
-    nvidia_model_aliases = {
-        "minimax/minimax-m2.7": "minimaxai/minimax-m2.7",
-    }
-    normalized_candidate = nvidia_model_aliases.get(normalized_candidate, normalized_candidate)
-    is_openrouter_namespace_model = requested_model in _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS
-    if has_explicit_nvidia_prefix and not is_openrouter_namespace_model:
-        return normalized_candidate or None
-    if normalized_candidate in _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS:
-        return normalized_candidate
-    return None
+_normalize_anthropic_nvidia_responses_adapter_model_name = _aawm_adapter_model_resolution._normalize_anthropic_nvidia_responses_adapter_model_name
 
 
-def _normalize_anthropic_openrouter_adapter_model_name(
-    model: Any,
-) -> Optional[str]:
-    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
-    normalized_candidate = (
-        candidate if explicit_provider == "openrouter" else _normalize_anthropic_adapter_model_name(model)
-    )
-    if normalized_candidate is None:
-        return None
-
-    openrouter_model_aliases = {
-        "free": "openrouter/free",
-        "elephant-alpha": "openrouter/elephant-alpha",
-        "meta-llama/llama-3.3-70b-instructfree": ("meta-llama/llama-3.3-70b-instruct:free"),
-    }
-    normalized_candidate = openrouter_model_aliases.get(normalized_candidate, normalized_candidate)
-    return normalized_candidate or None
+_normalize_anthropic_openrouter_adapter_model_name = _aawm_adapter_model_resolution._normalize_anthropic_openrouter_adapter_model_name
 
 
-def _get_openrouter_completion_adapter_upstream_model(
-    model: Any,
-) -> Optional[str]:
-    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
-    if explicit_provider == "openrouter" and candidate is not None:
-        candidate = candidate.strip()
-        return candidate or None
-    return _normalize_anthropic_adapter_model_name(model)
+_get_openrouter_completion_adapter_upstream_model = _aawm_adapter_model_resolution._get_openrouter_completion_adapter_upstream_model
 
 
 def _raise_openrouter_auto_agent_candidate_unavailable(message: str) -> Never:
@@ -2423,233 +2185,79 @@ async def _maybe_raise_openrouter_adapter_alias_probe_cooldown(
     )
 
 
-def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
-    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
-    if explicit_provider != _OPENCODE_ZEN_PROVIDER or candidate is None:
-        return None
-    normalized_candidate = candidate.strip()
-    if normalized_candidate in _OPENCODE_ZEN_FREE_MODELS:
-        return normalized_candidate
-    return None
+_normalize_opencode_zen_adapter_model_name = _aawm_adapter_model_resolution._normalize_opencode_zen_adapter_model_name
 
 
-def _normalize_kimi_code_chat_completions_adapter_model_name(
-    model: Any,
-) -> Optional[str]:
-    return _kimi_code_adapters.normalize_kimi_code_chat_completions_adapter_model_name(
-        model,
-        allowed_models=_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,
-    )
+_normalize_kimi_code_chat_completions_adapter_model_name = _aawm_adapter_model_resolution._normalize_kimi_code_chat_completions_adapter_model_name
 
 
-def _normalize_alibaba_token_plan_adapter_model_name(
-    model: Any,
-) -> Optional[str]:
-    return _alibaba_token_plan_adapters.normalize_alibaba_token_plan_adapter_model_name(
-        model,
-        allowed_models=_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS,
-    )
+_normalize_alibaba_token_plan_adapter_model_name = _aawm_adapter_model_resolution._normalize_alibaba_token_plan_adapter_model_name
 
 
-def _normalize_anthropic_google_completion_adapter_model_name(model: Any) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_anthropic_google_completion_adapter_model_name(model)
+_normalize_anthropic_google_completion_adapter_model_name = _aawm_adapter_model_resolution._normalize_anthropic_google_completion_adapter_model_name
 
 
-def _normalize_antigravity_code_assist_adapter_model_name(
-    model: Any,
-) -> Optional[str]:
-    return _anthropic_antigravity_provider._normalize_antigravity_code_assist_adapter_model_name(
-        model,
-        runtime=_get_anthropic_antigravity_runtime(),
-    )
+_normalize_antigravity_code_assist_adapter_model_name = _aawm_adapter_model_resolution._normalize_antigravity_code_assist_adapter_model_name
 
 
-def _normalize_codex_google_code_assist_adapter_model_name(model: Any) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_adapter_model_name(model)
+_normalize_codex_google_code_assist_adapter_model_name = _aawm_adapter_model_resolution._normalize_codex_google_code_assist_adapter_model_name
 
 
-def _resolve_codex_opencode_zen_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _is_openai_responses_endpoint(endpoint):
-        return None
-    return _normalize_opencode_zen_adapter_model_name(request_body.get("model"))
+_resolve_codex_opencode_zen_adapter_model = _aawm_adapter_model_resolution._resolve_codex_opencode_zen_adapter_model
 
 
-def _resolve_codex_kimi_chat_completions_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _is_openai_responses_endpoint(endpoint):
-        return None
-    return _normalize_kimi_code_chat_completions_adapter_model_name(request_body.get("model"))
+_resolve_codex_kimi_chat_completions_adapter_model = _aawm_adapter_model_resolution._resolve_codex_kimi_chat_completions_adapter_model
 
 
-def _resolve_codex_alibaba_token_plan_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _is_openai_responses_endpoint(endpoint):
-        return None
-    return _normalize_alibaba_token_plan_adapter_model_name(request_body.get("model"))
+_resolve_codex_alibaba_token_plan_adapter_model = _aawm_adapter_model_resolution._resolve_codex_alibaba_token_plan_adapter_model
 
 
-def _resolve_anthropic_opencode_zen_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_opencode_zen_adapter_model_name(candidate)
-        if normalized_model is not None:
-            return normalized_model
-    return None
+_resolve_anthropic_opencode_zen_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_opencode_zen_adapter_model
 
 
-def _resolve_anthropic_kimi_chat_completions_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_kimi_code_chat_completions_adapter_model_name(candidate)
-        if normalized_model is not None:
-            return normalized_model
-    return None
+_resolve_anthropic_kimi_chat_completions_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_kimi_chat_completions_adapter_model
 
 
-def _resolve_anthropic_alibaba_token_plan_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_alibaba_token_plan_adapter_model_name(candidate)
-        if normalized_model is not None:
-            return normalized_model
-    return None
+_resolve_anthropic_alibaba_token_plan_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_alibaba_token_plan_adapter_model
 
 
-def _resolve_anthropic_antigravity_code_assist_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    _ = endpoint
-    return _normalize_antigravity_code_assist_adapter_model_name(request_body.get("model"))
+_resolve_anthropic_antigravity_code_assist_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_antigravity_code_assist_adapter_model
 
 
-def _resolve_codex_google_code_assist_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _is_openai_responses_endpoint(endpoint):
-        return None
-    return _normalize_codex_google_code_assist_adapter_model_name(request_body.get("model"))
+_resolve_codex_google_code_assist_adapter_model = _aawm_adapter_model_resolution._resolve_codex_google_code_assist_adapter_model
 
 
-def _resolve_codex_antigravity_code_assist_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _is_openai_responses_endpoint(endpoint):
-        return None
-    return _normalize_antigravity_code_assist_adapter_model_name(request_body.get("model"))
+_resolve_codex_antigravity_code_assist_adapter_model = _aawm_adapter_model_resolution._resolve_codex_antigravity_code_assist_adapter_model
 
 
-def _normalize_codex_auto_agent_alias_model(model: Any) -> Optional[str]:
-    if not isinstance(model, str):
-        return None
-    normalized = model.strip().lower()
-    for alias in _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS:
-        if normalized == alias.lower():
-            return alias
-    return None
+_normalize_codex_auto_agent_alias_model = _aawm_adapter_model_resolution._normalize_codex_auto_agent_alias_model
 
 
-def _is_codex_auto_agent_alias_model(model: Any) -> bool:
-    return _normalize_codex_auto_agent_alias_model(model) is not None
+_is_codex_auto_agent_alias_model = _aawm_adapter_model_resolution._is_codex_auto_agent_alias_model
 
 
-def _resolve_codex_auto_agent_alias_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _is_openai_responses_endpoint(endpoint):
-        return None
-    return _normalize_codex_auto_agent_alias_model(request_body.get("model"))
+_resolve_codex_auto_agent_alias_model = _aawm_adapter_model_resolution._resolve_codex_auto_agent_alias_model
 
 
-def _get_codex_auto_agent_header(headers: dict[str, Any], header_name: str) -> Optional[str]:
-    for key, value in headers.items():
-        if not isinstance(key, str) or key.lower() != header_name.lower():
-            continue
-        cleaned = _clean_codex_auth_value(value)
-        if cleaned is not None:
-            return cleaned
-    return None
+_get_codex_auto_agent_header = _aawm_lane_keys._get_codex_auto_agent_header
 
 
-def _hash_codex_auto_agent_lane_value(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+_hash_codex_auto_agent_lane_value = _aawm_lane_keys._hash_codex_auto_agent_lane_value
 
 
-def _resolve_codex_auto_agent_openai_lane_key(
-    request: Request,
-    *,
-    include_session_fallback: bool = True,
-) -> str:
-    headers = _safe_get_request_headers(request)
-    account_id = _get_codex_auto_agent_header(headers, "chatgpt-account-id")
-    if account_id is not None:
-        return f"chatgpt-account:{account_id}"
-    authorization = _get_codex_auto_agent_header(headers, "authorization")
-    if authorization is not None:
-        return f"auth:{_hash_codex_auto_agent_lane_value(authorization)}"
-    if include_session_fallback:
-        session_header = _get_codex_auto_agent_header(headers, "session_id") or _get_codex_auto_agent_header(
-            headers, "session-id"
-        )
-        if session_header is not None:
-            return f"session:{session_header}"
-    return "__default__"
+_resolve_codex_auto_agent_openai_lane_key = _aawm_lane_keys._resolve_codex_auto_agent_openai_lane_key
 
 
-def _resolve_codex_auto_agent_openai_cooldown_lane_key(request: Request) -> str:
-    return _resolve_codex_auto_agent_openai_lane_key(
-        request,
-        include_session_fallback=False,
-    )
+_resolve_codex_auto_agent_openai_cooldown_lane_key = _aawm_lane_keys._resolve_codex_auto_agent_openai_cooldown_lane_key
 
 
-def _get_codex_auto_agent_lane_state_cache_ttl_seconds() -> float:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS"))
-    if raw_value is None:
-        return _CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS
-    try:
-        parsed = float(raw_value)
-    except Exception:
-        return _CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS
-    return max(0.0, parsed)
+_get_codex_auto_agent_lane_state_cache_ttl_seconds = _aawm_lane_keys._get_codex_auto_agent_lane_state_cache_ttl_seconds
 
 
-def _get_codex_auto_agent_google_lane_cache_key() -> str:
-    auth_path = _get_anthropic_adapter_google_auth_file_path()
-    if auth_path is not None:
-        return f"google-auth:{auth_path.expanduser()}"
-    return "google-auth:__default__"
+_get_codex_auto_agent_google_lane_cache_key = _aawm_lane_keys._get_codex_auto_agent_google_lane_cache_key
 
 
-def _get_codex_auto_agent_antigravity_lane_cache_key() -> str:
-    auth_path = _get_antigravity_auth_file_path()
-    if auth_path is not None:
-        return f"antigravity-auth:{auth_path.expanduser()}"
-    return "antigravity-auth:__default__"
+_get_codex_auto_agent_antigravity_lane_cache_key = _aawm_lane_keys._get_codex_auto_agent_antigravity_lane_cache_key
 
 
 def _invalidate_codex_auto_agent_google_lane_cache() -> None:
@@ -2831,34 +2439,7 @@ def _resolve_codex_auto_agent_session_key(
     return f"{alias_model}:{session_id}:" f"{_resolve_codex_auto_agent_openai_lane_key(request)}"
 
 
-def _codex_auto_agent_candidate_key(
-    candidate: dict[str, Any],
-    lane_key: str,
-    *,
-    epoch_tag: Optional[str] = None,
-) -> str:
-    """Build the canonical cooldown/evidence/probe state key for a candidate.
-
-    When ``epoch_tag`` is set (snapshot-resolved aliases only), the key is
-    prefixed with ``h{epoch_tag}:`` so that a semantic config change
-    invalidates cooldowns earned under the previous config generation.
-    Static/legacy routes and Kimi managed-account keys pass no epoch_tag
-    and keep bare keys.
-
-    Deliberate cooldown semantics: a cooldown earned under semantic config N
-    vanishes for semantic config N+1 requests (operator-intended re-probe).
-    Wave-2 exact-key single-flight limits the resulting probe storm.
-    Affinity is explicitly excluded from this invalidation rule -- session
-    pins survive config changes as long as the candidate remains compatible.
-    """
-    base = "{}:{}:{}".format(
-        candidate["provider"],
-        candidate["model"],
-        lane_key or "__default__",
-    )
-    if epoch_tag:
-        return "h{}:{}".format(epoch_tag, base)
-    return base
+_codex_auto_agent_candidate_key = _aawm_lane_keys._codex_auto_agent_candidate_key
 
 
 def _codex_auto_agent_candidate_public_shape(
@@ -6789,14 +6370,7 @@ def _is_codex_auto_agent_grok_account_quota_candidate(
     }
 
 
-def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:
-    route_family = str(candidate.get("route_family") or "")
-    if route_family in {
-        "codex_xai_oauth_responses_adapter",
-        "anthropic_xai_oauth_responses_adapter",
-    }:
-        return _CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
-    return _CODEX_AUTO_AGENT_XAI_LANE_KEY
+_resolve_codex_auto_agent_xai_lane_key = _aawm_lane_keys._resolve_codex_auto_agent_xai_lane_key
 
 
 def _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
@@ -7516,32 +7090,10 @@ def _resolve_anthropic_auto_agent_alias_model(
     return _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
 
 
-def _resolve_anthropic_auto_agent_native_lane_key(
-    request: Request,
-    *,
-    include_session_fallback: bool = True,
-) -> str:
-    headers = _safe_get_request_headers(request)
-    for header_name in ("x-api-key", "authorization"):
-        header_value = _get_codex_auto_agent_header(headers, header_name)
-        if header_value is not None:
-            return f"{header_name}:{_hash_codex_auto_agent_lane_value(header_value)}"
-    if include_session_fallback:
-        session_header = (
-            _get_codex_auto_agent_header(headers, "session_id")
-            or _get_codex_auto_agent_header(headers, "session-id")
-            or _get_codex_auto_agent_header(headers, "x-session-id")
-        )
-        if session_header is not None:
-            return f"session:{session_header}"
-    return "__default__"
+_resolve_anthropic_auto_agent_native_lane_key = _aawm_lane_keys._resolve_anthropic_auto_agent_native_lane_key
 
 
-def _resolve_anthropic_auto_agent_native_cooldown_lane_key(request: Request) -> str:
-    return _resolve_anthropic_auto_agent_native_lane_key(
-        request,
-        include_session_fallback=False,
-    )
+_resolve_anthropic_auto_agent_native_cooldown_lane_key = _aawm_lane_keys._resolve_anthropic_auto_agent_native_cooldown_lane_key
 
 
 def _resolve_anthropic_auto_agent_session_key(
@@ -8082,97 +7634,25 @@ def _add_anthropic_auto_agent_alias_metadata(
     )
 
 
-def _resolve_anthropic_openai_responses_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_openai_responses_adapter_model_name(candidate)
-        if normalized_model is not None:
-            return normalized_model
-    return None
+_resolve_anthropic_openai_responses_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_openai_responses_adapter_model
 
 
-def _resolve_anthropic_xai_oauth_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        if is_oa_xai_model(candidate):
-            return candidate
-    return None
+_resolve_anthropic_xai_oauth_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_xai_oauth_adapter_model
 
 
-def _resolve_anthropic_grok_native_oauth_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = normalize_grok_native_oauth_model(candidate)
-        if normalized_model is not None:
-            return normalized_model
-    return None
+_resolve_anthropic_grok_native_oauth_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_grok_native_oauth_adapter_model
 
 
-def _resolve_anthropic_openrouter_completion_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_openrouter_adapter_model_name(candidate)
-        if normalized_model in _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS:
-            return normalized_model
-    return None
+_resolve_anthropic_openrouter_completion_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_openrouter_completion_adapter_model
 
 
-def _resolve_anthropic_nvidia_responses_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_nvidia_responses_adapter_model_name(candidate)
-        if normalized_model is not None:
-            return normalized_model
-    return None
+_resolve_anthropic_nvidia_responses_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_nvidia_responses_adapter_model
 
 
-def _resolve_anthropic_openrouter_responses_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_openrouter_adapter_model_name(candidate)
-        if normalized_model in _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS:
-            return normalized_model
-        explicit_provider, _ = _split_anthropic_adapter_provider_prefix(candidate)
-        if explicit_provider == "openrouter" and normalized_model is not None:
-            return normalized_model
-    return None
+_resolve_anthropic_openrouter_responses_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_openrouter_responses_adapter_model
 
 
-def _resolve_anthropic_google_completion_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_google_completion_adapter_model_name(candidate)
-        if normalized_model is not None:
-            return normalized_model
-    return None
+_resolve_anthropic_google_completion_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_google_completion_adapter_model
 
 
 _get_anthropic_adapter_google_auth_file_path = _aawm_google_oauth._get_anthropic_adapter_google_auth_file_path
@@ -8342,253 +7822,64 @@ async def _get_or_load_google_code_assist_project(
     )
 
 
-def _get_google_code_assist_prime_ttl_seconds() -> float:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS"))
-    if raw_value is None:
-        # Current Gemini CLI caches Code Assist user/project setup for 30s.
-        # Match that default instead of re-priming on every adapted request.
-        return 30.0
-    try:
-        parsed = float(raw_value)
-    except Exception:
-        return 30.0
-    return max(0.0, parsed)
+_get_google_code_assist_prime_ttl_seconds = _google_env_policy._get_google_code_assist_prime_ttl_seconds
 
 
-def _get_google_code_assist_prime_cache_key(
-    access_token: str,
-    companion_project: str,
-) -> str:
-    token_hash = hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:12]
-    return f"{token_hash}:{companion_project}"
+_get_google_code_assist_prime_cache_key = _google_env_policy._get_google_code_assist_prime_cache_key
 
 
-def _get_google_adapter_max_concurrent() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONCURRENT"))
-    if raw_value is None:
-        return 1
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 1
-    return max(1, parsed)
+_get_google_adapter_max_concurrent = _google_env_policy._get_google_adapter_max_concurrent
 
 
-def _get_google_adapter_shared_lane_key(
-    *,
-    access_token: Optional[str],
-    companion_project: Optional[str],
-) -> Optional[str]:
-    # Gemini CLI's Code Assist envelope matches our request shape, but its
-    # actual traffic is serialized on the shared account/project lane instead of
-    # being split by model id. Mirror that here to avoid fanout-only 429s.
-    cleaned_access_token = _clean_codex_auth_value(access_token)
-    cleaned_companion_project = _clean_codex_auth_value(companion_project)
-    if cleaned_access_token is None or cleaned_companion_project is None:
-        return None
-    return _get_google_code_assist_prime_cache_key(
-        cleaned_access_token,
-        cleaned_companion_project,
-    )
+_get_google_adapter_shared_lane_key = _google_env_policy._get_google_adapter_shared_lane_key
 
 
-def _get_google_adapter_rate_limit_key(
-    model: Optional[str],
-    *,
-    access_token: Optional[str] = None,
-    companion_project: Optional[str] = None,
-) -> str:
-    shared_lane_key = _get_google_adapter_shared_lane_key(
-        access_token=access_token,
-        companion_project=companion_project,
-    )
-    if shared_lane_key is not None:
-        return shared_lane_key
-    normalized = _clean_codex_auth_value(model)
-    if normalized is None:
-        return "__default__"
-    return normalized
+_get_google_adapter_rate_limit_key = _google_env_policy._get_google_adapter_rate_limit_key
 
 
-def _get_google_adapter_rate_limit_key_from_kwargs(kwargs: dict[str, Any]) -> str:
-    explicit_rate_limit_key = _clean_codex_auth_value(cast(Optional[str], kwargs.get("google_adapter_rate_limit_key")))
-    if explicit_rate_limit_key is not None:
-        return explicit_rate_limit_key
-    custom_body = kwargs.get("custom_body")
-    model = custom_body.get("model") if isinstance(custom_body, dict) else None
-    project = custom_body.get("project") if isinstance(custom_body, dict) else None
-    access_token = cast(Optional[str], kwargs.get("google_access_token"))
-    return _get_google_adapter_rate_limit_key(
-        cast(Optional[str], model),
-        access_token=access_token,
-        companion_project=cast(Optional[str], project),
-    )
+_get_google_adapter_rate_limit_key_from_kwargs = _google_env_policy._get_google_adapter_rate_limit_key_from_kwargs
 
 
-def _get_google_adapter_semaphore(
-    model: Optional[str] = None,
-    *,
-    access_token: Optional[str] = None,
-    companion_project: Optional[str] = None,
-    rate_limit_key: Optional[str] = None,
-) -> asyncio.Semaphore:
-    return _anthropic_google_process_cache._get_google_adapter_semaphore(
-        model,
-        runtime=_get_anthropic_google_process_cache_runtime(),
-        access_token=access_token,
-        companion_project=companion_project,
-        rate_limit_key=rate_limit_key,
-    )
+_get_google_adapter_semaphore = _google_env_policy._get_google_adapter_semaphore
 
 
-def _get_google_adapter_max_retries() -> int:
-    return _aawm_alias_retry.parse_non_negative_int_env(
-        "AAWM_GOOGLE_ADAPTER_MAX_RETRIES",
-        default=1,
-    )
+_get_google_adapter_max_retries = _google_env_policy._get_google_adapter_max_retries
 
 
-def _coerce_non_negative_int(value: Any, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except Exception:
-        return default
-    return max(0, parsed)
+_coerce_non_negative_int = _google_env_policy._coerce_non_negative_int
 
 
-def _coerce_non_negative_float(value: Any, default: float) -> float:
-    if value is None:
-        return default
-    try:
-        parsed = float(value)
-    except Exception:
-        return default
-    return max(0.0, parsed)
+_coerce_non_negative_float = _google_env_policy._coerce_non_negative_float
 
 
-def _get_google_adapter_post_tool_cooldown_seconds() -> float:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_POST_TOOL_COOLDOWN_SECONDS"))
-    if raw_value is None:
-        return 0.0
-    try:
-        parsed = float(raw_value)
-    except Exception:
-        return 0.0
-    return max(0.0, parsed)
+_get_google_adapter_post_tool_cooldown_seconds = _google_env_policy._get_google_adapter_post_tool_cooldown_seconds
 
 
-def _google_code_assist_unwrapped_chunk_contains_tool_call(
-    unwrapped: dict[str, Any],
-) -> bool:
-    candidates = unwrapped.get("candidates")
-    if not isinstance(candidates, list):
-        return False
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        content = candidate.get("content")
-        if not isinstance(content, dict):
-            continue
-        parts = content.get("parts")
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            if isinstance(part.get("functionCall"), dict):
-                return True
-    return False
+_google_code_assist_unwrapped_chunk_contains_tool_call = _google_env_policy._google_code_assist_unwrapped_chunk_contains_tool_call
 
 
-def _get_google_adapter_max_output_tokens_cap() -> Optional[int]:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP"))
-    if raw_value is None:
-        return 8192
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 8192
-    if parsed <= 0:
-        return None
-    return parsed
+_get_google_adapter_max_output_tokens_cap = _google_env_policy._get_google_adapter_max_output_tokens_cap
 
 
-def _get_google_adapter_default_thinking_level(model: Optional[str]) -> Optional[str]:
-    disabled = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG"))
-    if isinstance(disabled, str) and disabled.lower() in {"1", "true", "yes", "on"}:
-        return None
-
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL"))
-    if raw_value:
-        return raw_value
-
-    normalized_model = (model or "").lower()
-    if "flash-lite" in normalized_model:
-        return "minimal"
-    return "low"
+_get_google_adapter_default_thinking_level = _google_env_policy._get_google_adapter_default_thinking_level
 
 
-def _get_google_adapter_max_contents_window() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_WINDOW"))
-    if raw_value is None:
-        return 24
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 24
-    return max(2, parsed)
+_get_google_adapter_max_contents_window = _google_env_policy._get_google_adapter_max_contents_window
 
 
-def _get_google_adapter_max_contents_text_chars() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_TEXT_CHARS"))
-    if raw_value is None:
-        return 12000
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 12000
-    return max(1000, parsed)
+_get_google_adapter_max_contents_text_chars = _google_env_policy._get_google_adapter_max_contents_text_chars
 
 
-def _estimate_google_content_text_chars(content_block: Any) -> int:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._estimate_google_content_text_chars(content_block)
+_estimate_google_content_text_chars = _google_env_policy._estimate_google_content_text_chars
 
 
-def _google_content_has_text(content_block: Any) -> bool:
-    return _estimate_google_content_text_chars(content_block) > 0
+_google_content_has_text = _google_env_policy._google_content_has_text
 
 
-def _google_content_has_function_exchange(content_block: Any) -> bool:
-    if not isinstance(content_block, dict):
-        return False
-    parts = content_block.get("parts")
-    if not isinstance(parts, list):
-        return False
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        if isinstance(part.get("functionCall"), dict) or isinstance(part.get("function_call"), dict):
-            return True
-        if isinstance(part.get("functionResponse"), dict) or isinstance(part.get("function_response"), dict):
-            return True
-    return False
+_google_content_has_function_exchange = _google_context_window._google_content_has_function_exchange
 
 
-def _google_content_has_function_call(content_block: Any) -> bool:
-    if not isinstance(content_block, dict):
-        return False
-    parts = content_block.get("parts")
-    if not isinstance(parts, list):
-        return False
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        if isinstance(part.get("functionCall"), dict) or isinstance(part.get("function_call"), dict):
-            return True
-    return False
+_google_content_has_function_call = _google_context_window._google_content_has_function_call
 
 
 def _google_content_function_call_ids(content_block: Any) -> set[str]:
@@ -8677,74 +7968,19 @@ def _trim_google_content_indices_to_window(
     )
 
 
-def _get_google_adapter_oversized_text_part_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_OVERSIZED_TEXT_PART_CHAR_CAP"))
-    if raw_value is None:
-        return 6000
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 6000
-    return max(1500, parsed)
+_get_google_adapter_oversized_text_part_char_cap = _google_env_policy._get_google_adapter_oversized_text_part_char_cap
 
 
-def _get_google_adapter_pure_context_text_part_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_PURE_CONTEXT_TEXT_PART_CHAR_CAP"))
-    if raw_value is None:
-        return 6000
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 6000
-    return max(512, parsed)
+_get_google_adapter_pure_context_text_part_char_cap = _google_env_policy._get_google_adapter_pure_context_text_part_char_cap
 
 
-def _get_google_adapter_subagent_context_text_part_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP"))
-    if raw_value is None:
-        return 2000
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 2000
-    return max(512, parsed)
+_get_google_adapter_subagent_context_text_part_char_cap = _google_env_policy._get_google_adapter_subagent_context_text_part_char_cap
 
 
-def _get_google_adapter_followup_subagent_context_text_part_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP"))
-    if raw_value is None:
-        return 1200
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 1200
-    return max(256, parsed)
+_get_google_adapter_followup_subagent_context_text_part_char_cap = _google_env_policy._get_google_adapter_followup_subagent_context_text_part_char_cap
 
 
-def _get_google_adapter_followup_allowed_tool_names() -> set[str]:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_ALLOWED_TOOL_NAMES"))
-    if raw_value:
-        allowed_tool_names = {item.strip() for item in raw_value.split(",") if isinstance(item, str) and item.strip()}
-    else:
-        allowed_tool_names = {
-            "Read",
-            "Write",
-            "Edit",
-            "Glob",
-            "Grep",
-            "Bash",
-            "WebSearch",
-            "WebFetch",
-        }
-
-    aliases = _get_google_code_assist_native_tool_aliases()
-    expanded_tool_names = set(allowed_tool_names)
-    for tool_name in list(allowed_tool_names):
-        alias_name = aliases.get(tool_name)
-        if isinstance(alias_name, str) and alias_name:
-            expanded_tool_names.add(alias_name)
-
-    return expanded_tool_names
+_get_google_adapter_followup_allowed_tool_names = _google_env_policy._get_google_adapter_followup_allowed_tool_names
 
 
 def _get_openai_adapter_claude_context_char_cap() -> int:
@@ -8829,9 +8065,7 @@ def _compact_google_adapter_oversized_text_parts(request_block: dict[str, Any]) 
     return _anthropic_google_shaping._compact_google_adapter_oversized_text_parts(request_block)
 
 
-def _apply_google_adapter_contents_window_policy(request_block: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_adapter_contents_window_policy(request_block)
+_apply_google_adapter_contents_window_policy = _google_context_window._apply_google_adapter_contents_window_policy
 
 
 def _apply_google_adapter_generation_config_policy(
@@ -8846,14 +8080,10 @@ def _apply_google_adapter_request_shape_policy(payload: dict[str, Any]) -> dict[
     return _anthropic_google_shaping._apply_google_adapter_request_shape_policy(payload)
 
 
-def _extract_google_adapter_exception_status_code(exc: Any) -> Optional[int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_exception_status_code(exc)
+_extract_google_adapter_exception_status_code = _google_error_signals._extract_google_adapter_exception_status_code
 
 
-def _extract_google_adapter_exception_detail(exc: Any) -> Any:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_exception_detail(exc)
+_extract_google_adapter_exception_detail = _google_error_signals._extract_google_adapter_exception_detail
 
 
 def _extract_adapter_upstream_headers(exc: Any) -> dict[str, Any]:
@@ -8913,26 +8143,7 @@ def _parse_rate_limit_reset_wait_seconds_from_headers(headers: dict[str, Any]) -
     return max(0.0, reset_epoch_seconds - time.time())
 
 
-def _parse_google_rate_limit_reset_seconds(exc: Any) -> float:
-    upstream_headers = _extract_adapter_upstream_headers(exc)
-    retry_after_seconds = _parse_retry_after_seconds_from_headers(upstream_headers)
-    if retry_after_seconds is not None:
-        return max(1.0, retry_after_seconds)
-    reset_wait_seconds = _parse_rate_limit_reset_wait_seconds_from_headers(upstream_headers)
-    if reset_wait_seconds is not None:
-        return max(1.0, reset_wait_seconds)
-    detail = _extract_google_adapter_exception_detail(exc)
-    if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="ignore")
-    else:
-        detail_text = str(detail)
-    match = re.search(r"reset after\s+(\d+)s", detail_text)
-    if match is None:
-        return 5.0
-    try:
-        return max(1.0, float(match.group(1)))
-    except Exception:
-        return 5.0
+_parse_google_rate_limit_reset_seconds = _google_error_signals._parse_google_rate_limit_reset_seconds
 
 
 def _extract_embedded_json_payload_candidates(detail: object) -> list[str]:
@@ -8993,105 +8204,34 @@ def _parse_json_payloads_from_text_candidates(
     return parsed_payloads
 
 
-def _extract_google_adapter_error_payloads(exc: Any) -> list[Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_error_payloads(exc)
+_extract_google_adapter_error_payloads = _google_error_signals._extract_google_adapter_error_payloads
 
 
-def _extract_google_adapter_error_reason(exc: Any) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_error_reason(exc)
+_extract_google_adapter_error_reason = _google_error_signals._extract_google_adapter_error_reason
 
 
-def _extract_google_adapter_error_payload_for_logging(exc: Any) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_error_payload_for_logging(exc)
+_extract_google_adapter_error_payload_for_logging = _google_error_signals._extract_google_adapter_error_payload_for_logging
 
 
-def _record_google_adapter_error_for_logging(
-    passthrough_kwargs: dict[str, Any],
-    *,
-    exc: Any,
-    status_code: Optional[int],
-    error_reason: Optional[str],
-    attempt: int,
-    wait_seconds: float,
-) -> None:
-    custom_body = passthrough_kwargs.get("custom_body")
-    if not isinstance(custom_body, dict):
-        return
-    metadata = custom_body.get("litellm_metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-        custom_body["litellm_metadata"] = metadata
-
-    payload = _extract_google_adapter_error_payload_for_logging(exc)
-    if not isinstance(payload.get("error"), dict):
-        detail = _extract_google_adapter_exception_detail(exc)
-        if isinstance(detail, bytes):
-            detail_text = detail.decode("utf-8", errors="ignore")
-        else:
-            detail_text = str(detail)
-        synthesized_error: dict[str, Any] = {
-            "code": status_code,
-            "message": detail_text[:1000],
-        }
-        if status_code == 429:
-            synthesized_error["status"] = "RESOURCE_EXHAUSTED"
-        if error_reason:
-            synthesized_error["details"] = [{"reason": error_reason}]
-        payload["error"] = synthesized_error
-
-    payload["source"] = "google_generate_content_error"
-    payload["adapter_attempt"] = attempt
-    payload["adapter_wait_seconds"] = wait_seconds
-    payload["adapter_error_reason"] = error_reason
-    metadata["google_generate_content_error"] = payload
-    metadata["google_generate_content_error_count"] = int(metadata.get("google_generate_content_error_count") or 0) + 1
+_record_google_adapter_error_for_logging = _google_error_signals._record_google_adapter_error_for_logging
 
 
-def _get_google_adapter_model_capacity_max_retries() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES"))
-    if raw_value is None:
-        return 3
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 3
-    return max(0, parsed)
+_get_google_adapter_model_capacity_max_retries = _google_env_policy._get_google_adapter_model_capacity_max_retries
 
 
-def _get_google_adapter_capacity_backoff_seconds(attempt: int) -> float:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS"))
-    if raw_value:
-        try:
-            values = [max(1.0, float(item.strip())) for item in raw_value.split(",") if item.strip()]
-        except Exception:
-            values = []
-        if values:
-            index = min(max(1, attempt) - 1, len(values) - 1)
-            return values[index]
-    schedule = (5.0, 15.0, 30.0, 60.0)
-    index = min(max(1, attempt) - 1, len(schedule) - 1)
-    return schedule[index]
+_get_google_adapter_capacity_backoff_seconds = _google_env_policy._get_google_adapter_capacity_backoff_seconds
 
 
-def _get_google_adapter_hidden_retry_budget_seconds() -> float:
-    return _aawm_alias_retry.parse_non_negative_float_env(
-        "AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS",
-        default=0.0,
-    )
+_get_google_adapter_hidden_retry_budget_seconds = _google_env_policy._get_google_adapter_hidden_retry_budget_seconds
 
 
 _GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset(PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES)
 
 
-def _get_google_adapter_transient_retry_max_attempts() -> int:
-    return len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS) + 1
+_get_google_adapter_transient_retry_max_attempts = _google_env_policy._get_google_adapter_transient_retry_max_attempts
 
 
-def _get_google_adapter_transient_backoff_seconds(attempt: int) -> float:
-    return _get_passthrough_hidden_retry_wait_seconds(max(0, attempt - 1))
+_get_google_adapter_transient_backoff_seconds = _google_env_policy._get_google_adapter_transient_backoff_seconds
 
 
 def _is_google_adapter_transient_retryable_failure(
@@ -9205,13 +8345,7 @@ def _record_google_adapter_success_after_transient_retry(
     )
 
 
-def _build_google_adapter_terminal_error_log_context(
-    passthrough_kwargs: dict[str, Any], *, status_code: Optional[int], failure_classification: Optional[str]
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_google_adapter_terminal_error_log_context(
-        passthrough_kwargs, status_code=status_code, failure_classification=failure_classification
-    )
+_build_google_adapter_terminal_error_log_context = _google_error_signals._build_google_adapter_terminal_error_log_context
 
 
 def _log_google_adapter_terminal_transient_failure(
@@ -9968,22 +9102,7 @@ def _sanitize_google_code_assist_tool_schema(schema_node: Any) -> int:
     return _anthropic_google_shaping._sanitize_google_code_assist_tool_schema(schema_node)
 
 
-def _extract_completion_message_text(message: Any) -> str:
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        text = part.get("text")
-        if isinstance(text, str) and text.strip():
-            parts.append(text)
-    return "\n".join(parts)
+_extract_completion_message_text = _google_context_window._extract_completion_message_text
 
 
 def _is_google_adapter_synthetic_tool_context_text(text: Any) -> bool:
@@ -9996,15 +9115,7 @@ def _is_google_adapter_synthetic_tool_context_message(message: Any) -> bool:
     return _anthropic_google_shaping._is_google_adapter_synthetic_tool_context_message(message)
 
 
-def _get_google_adapter_fallback_context_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FALLBACK_CONTEXT_CHAR_CAP"))
-    if raw_value is None:
-        return 2000
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 2000
-    return max(256, parsed)
+_get_google_adapter_fallback_context_char_cap = _google_env_policy._get_google_adapter_fallback_context_char_cap
 
 
 def _inject_google_adapter_fallback_text_context(
@@ -10016,16 +9127,7 @@ def _inject_google_adapter_fallback_text_context(
     )
 
 
-def _get_google_adapter_system_prompt_policy() -> str:
-    raw_value = _clean_codex_auth_value(os.getenv(_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV))
-    if raw_value is None:
-        return _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT
-    normalized_value = raw_value.strip().lower()
-    if normalized_value in {"0", "false", "disabled", "none", "off"}:
-        return "off"
-    if normalized_value in {"append", "replace_compact"}:
-        return normalized_value
-    return _GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT
+_get_google_adapter_system_prompt_policy = _google_env_policy._get_google_adapter_system_prompt_policy
 
 
 def _get_codex_google_code_assist_tool_contract_policy() -> str:
@@ -10656,17 +9758,7 @@ async def _prepare_codex_google_code_assist_adapter_request(
     )
 
 
-def _get_google_code_assist_native_tool_aliases() -> dict[str, str]:
-    return {
-        "Bash": "run_shell_command",
-        "Read": "read_file",
-        "Write": "write_file",
-        "Edit": "replace",
-        "Glob": "glob",
-        "Grep": "grep_search",
-        "WebFetch": "web_fetch",
-        "WebSearch": "google_web_search",
-    }
+_get_google_code_assist_native_tool_aliases = _google_env_policy._get_google_code_assist_native_tool_aliases
 
 
 def _apply_google_code_assist_alias_to_function_block(
@@ -10712,31 +9804,10 @@ def _apply_google_code_assist_native_tool_aliases(
     return _anthropic_google_shaping._apply_google_code_assist_native_tool_aliases(completion_kwargs, tool_name_mapping)
 
 
-def _get_google_adapter_max_completion_messages_window() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW"))
-    if raw_value is None:
-        return 12
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 12
-    return max(2, parsed)
+_get_google_adapter_max_completion_messages_window = _google_env_policy._get_google_adapter_max_completion_messages_window
 
 
-def _completion_message_has_visible_text(message: Any) -> bool:
-    if not isinstance(message, dict):
-        return False
-    content = message.get("content")
-    if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            text = part.get("text")
-            if isinstance(text, str) and text.strip():
-                return True
-    return False
+_completion_message_has_visible_text = _google_context_window._completion_message_has_visible_text
 
 
 def _inject_google_adapter_tool_call_context_text(
@@ -10746,135 +9817,22 @@ def _inject_google_adapter_tool_call_context_text(
     return _anthropic_google_shaping._inject_google_adapter_tool_call_context_text(messages)
 
 
-def _estimate_completion_message_text_chars(message: Any) -> int:
-    if not isinstance(message, dict):
-        return 0
-    content = message.get("content")
-    if isinstance(content, str):
-        return len(content)
-    if isinstance(content, list):
-        total = 0
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            text = part.get("text")
-            if isinstance(text, str):
-                total += len(text)
-        return total
-    return 0
+_estimate_completion_message_text_chars = _google_context_window._estimate_completion_message_text_chars
 
 
-def _completion_message_has_tool_result(message: Any) -> bool:
-    if not isinstance(message, dict):
-        return False
-    if message.get("role") == "tool":
-        return True
-    if isinstance(message.get("tool_call_id"), str):
-        return True
-    content = message.get("content")
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "tool_result":
-                return True
-            if isinstance(part.get("tool_result"), dict):
-                return True
-    return False
+_completion_message_has_tool_result = _google_context_window._completion_message_has_tool_result
 
 
-def _completion_message_tool_call_ids(message: Any) -> set[str]:
-    if not isinstance(message, dict):
-        return set()
-    tool_call_ids: set[str] = set()
-    tool_calls = message.get("tool_calls")
-    if isinstance(tool_calls, list):
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            tool_call_id = tool_call.get("id")
-            if isinstance(tool_call_id, str) and tool_call_id:
-                tool_call_ids.add(tool_call_id)
-    content = message.get("content")
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "tool_use":
-                tool_call_id = part.get("id")
-                if isinstance(tool_call_id, str) and tool_call_id:
-                    tool_call_ids.add(tool_call_id)
-    return tool_call_ids
+_completion_message_tool_call_ids = _google_context_window._completion_message_tool_call_ids
 
 
-def _completion_message_tool_result_ids(message: Any) -> set[str]:
-    if not isinstance(message, dict):
-        return set()
-    tool_result_ids: set[str] = set()
-    tool_call_id = message.get("tool_call_id")
-    if isinstance(tool_call_id, str) and tool_call_id:
-        tool_result_ids.add(tool_call_id)
-    content = message.get("content")
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_tool_use_id = part.get("tool_use_id")
-            if isinstance(part_tool_use_id, str) and part_tool_use_id:
-                tool_result_ids.add(part_tool_use_id)
-            tool_result = part.get("tool_result")
-            if isinstance(tool_result, dict):
-                nested_tool_use_id = tool_result.get("tool_use_id")
-                if isinstance(nested_tool_use_id, str) and nested_tool_use_id:
-                    tool_result_ids.add(nested_tool_use_id)
-    return tool_result_ids
+_completion_message_tool_result_ids = _google_context_window._completion_message_tool_result_ids
 
 
-def _trim_completion_message_tail_preserving_tool_pairs(
-    messages: list[dict[str, Any]],
-    tail_budget: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    if tail_budget <= 0:
-        return [], {}
-
-    tail_start = max(0, len(messages) - tail_budget)
-    boundary_adjustments = 0
-    while tail_start < len(messages) and _completion_message_has_tool_result(messages[tail_start]):
-        tail_start += 1
-        boundary_adjustments += 1
-
-    while tail_start < len(messages):
-        seen_tool_call_ids: set[str] = set()
-        orphan_index: Optional[int] = None
-        for index, message in enumerate(messages[tail_start:]):
-            seen_tool_call_ids.update(_completion_message_tool_call_ids(message))
-            tool_result_ids = _completion_message_tool_result_ids(message)
-            if tool_result_ids and not tool_result_ids.issubset(seen_tool_call_ids):
-                orphan_index = tail_start + index
-                break
-        if orphan_index is None:
-            break
-        tail_start = orphan_index + 1
-        boundary_adjustments += 1
-        while tail_start < len(messages) and _completion_message_has_tool_result(messages[tail_start]):
-            tail_start += 1
-            boundary_adjustments += 1
-
-    changes: dict[str, Any] = {}
-    if boundary_adjustments:
-        changes["trimmed_completion_messages_tool_pair_boundary_adjustments"] = boundary_adjustments
-    return messages[tail_start:], changes
+_trim_completion_message_tail_preserving_tool_pairs = _google_context_window._trim_completion_message_tail_preserving_tool_pairs
 
 
-def _get_google_adapter_preserved_task_state_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_PRESERVED_TASK_STATE_CHAR_CAP"))
-    if raw_value is None:
-        return 6000
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 6000
-    return max(512, parsed)
+_get_google_adapter_preserved_task_state_char_cap = _google_env_policy._get_google_adapter_preserved_task_state_char_cap
 
 
 def _extract_google_adapter_preserved_task_excerpt(text: str) -> str:
@@ -10889,11 +9847,7 @@ def _build_google_adapter_preserved_task_state_message(
     return _anthropic_google_shaping._build_google_adapter_preserved_task_state_message(messages)
 
 
-def _apply_google_adapter_completion_message_window(
-    messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_adapter_completion_message_window(messages)
+_apply_google_adapter_completion_message_window = _google_context_window._apply_google_adapter_completion_message_window
 
 
 def _normalize_google_code_assist_httpx_payload(value: Any) -> Any:
@@ -10901,50 +9855,7 @@ def _normalize_google_code_assist_httpx_payload(value: Any) -> Any:
     return _anthropic_google_shaping._normalize_google_code_assist_httpx_payload(value)
 
 
-def _google_code_assist_duplicate_tool_results_from_completion_messages(
-    completion_messages: list[dict[str, Any]],
-) -> list[tuple[str, str]]:
-    duplicate_tool_results: list[tuple[str, str]] = []
-    pending_tool_calls_by_id: dict[str, str] = {}
-    duplicate_tool_call_names: set[str] = set()
-
-    for message in completion_messages:
-        role = message.get("role")
-        if role == "assistant":
-            pending_tool_calls_by_id.clear()
-            duplicate_tool_call_names.clear()
-            tool_calls = message.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                continue
-            tool_call_name_counts: dict[str, int] = {}
-            for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                tool_call_id = tool_call.get("id")
-                function = tool_call.get("function")
-                if not isinstance(tool_call_id, str) or not isinstance(function, dict):
-                    continue
-                function_name = function.get("name")
-                if not isinstance(function_name, str) or not function_name:
-                    continue
-                pending_tool_calls_by_id[tool_call_id] = function_name
-                tool_call_name_counts[function_name] = tool_call_name_counts.get(function_name, 0) + 1
-            duplicate_tool_call_names = {name for name, count in tool_call_name_counts.items() if count > 1}
-            continue
-
-        if role != "tool":
-            pending_tool_calls_by_id.clear()
-            duplicate_tool_call_names.clear()
-            continue
-
-        tool_call_id = message.get("tool_call_id")
-        if not isinstance(tool_call_id, str):
-            continue
-        function_name = pending_tool_calls_by_id.get(tool_call_id)
-        if function_name in duplicate_tool_call_names:
-            duplicate_tool_results.append((function_name, tool_call_id))
-
-    return duplicate_tool_results
+_google_code_assist_duplicate_tool_results_from_completion_messages = _google_context_window._google_code_assist_duplicate_tool_results_from_completion_messages
 
 
 def _annotate_google_code_assist_duplicate_tool_response_parts(
@@ -10965,43 +9876,7 @@ def _annotate_google_code_assist_duplicate_tool_responses(
     )
 
 
-def _google_code_assist_tool_results_from_completion_messages(
-    completion_messages: list[dict[str, Any]],
-) -> list[tuple[str, str]]:
-    tool_results: list[tuple[str, str]] = []
-    pending_tool_calls_by_id: dict[str, str] = {}
-
-    for message in completion_messages:
-        role = message.get("role")
-        if role == "assistant":
-            pending_tool_calls_by_id.clear()
-            tool_calls = message.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                continue
-            for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                tool_call_id = tool_call.get("id")
-                function = tool_call.get("function")
-                if not isinstance(tool_call_id, str) or not isinstance(function, dict):
-                    continue
-                function_name = function.get("name")
-                if isinstance(function_name, str) and function_name:
-                    pending_tool_calls_by_id[tool_call_id] = function_name
-            continue
-
-        if role != "tool":
-            pending_tool_calls_by_id.clear()
-            continue
-
-        tool_call_id = message.get("tool_call_id")
-        if not isinstance(tool_call_id, str):
-            continue
-        function_name = pending_tool_calls_by_id.get(tool_call_id)
-        if isinstance(function_name, str) and function_name:
-            tool_results.append((function_name, tool_call_id))
-
-    return tool_results
+_google_code_assist_tool_results_from_completion_messages = _google_context_window._google_code_assist_tool_results_from_completion_messages
 
 
 def _annotate_google_code_assist_claude_tool_response_ids(
@@ -12403,19 +11278,10 @@ def _build_google_debug_header_summary(headers: dict[str, Any]) -> dict[str, Any
     return _anthropic_google_shaping._build_google_debug_header_summary(headers)
 
 
-def _get_google_adapter_native_user_agent(model: Optional[str]) -> str:
-    configured = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_NATIVE_USER_AGENT"))
-    if configured:
-        return configured
-    model_name = model or "gemini-3-flash-preview"
-    return f"GeminiCLI/0.38.2/{model_name} (linux; x64; terminal) google-api-nodejs-client/9.15.1"
+_get_google_adapter_native_user_agent = _google_env_policy._get_google_adapter_native_user_agent
 
 
-def _get_google_adapter_native_api_client_header() -> str:
-    configured = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_NATIVE_X_GOOG_API_CLIENT"))
-    if configured:
-        return configured
-    return "gl-node/24.13.1"
+_get_google_adapter_native_api_client_header = _google_env_policy._get_google_adapter_native_api_client_header
 
 
 def _build_google_adapter_native_headers(*, access_token: str, model: Optional[str], accept: str) -> dict[str, str]:
@@ -16856,48 +15722,16 @@ def _build_claude_persisted_output_source_metadata(*, resolved_path: Path, file_
     }
 
 
-def _get_google_adapter_persisted_output_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_PERSISTED_OUTPUT_CHAR_CAP"))
-    if raw_value is None:
-        return 2000
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 2000
-    return max(256, parsed)
+_get_google_adapter_persisted_output_char_cap = _google_env_policy._get_google_adapter_persisted_output_char_cap
 
 
-def _get_google_adapter_auxiliary_context_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_AUXILIARY_CONTEXT_CHAR_CAP"))
-    if raw_value is None:
-        return 4000
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 4000
-    return max(512, parsed)
+_get_google_adapter_auxiliary_context_char_cap = _google_env_policy._get_google_adapter_auxiliary_context_char_cap
 
 
-def _get_google_adapter_followup_persisted_output_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_PERSISTED_OUTPUT_CHAR_CAP"))
-    if raw_value is None:
-        return 512
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 512
-    return max(128, parsed)
+_get_google_adapter_followup_persisted_output_char_cap = _google_env_policy._get_google_adapter_followup_persisted_output_char_cap
 
 
-def _get_google_adapter_followup_auxiliary_context_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_GOOGLE_ADAPTER_FOLLOWUP_AUXILIARY_CONTEXT_CHAR_CAP"))
-    if raw_value is None:
-        return 1024
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 1024
-    return max(256, parsed)
+_get_google_adapter_followup_auxiliary_context_char_cap = _google_env_policy._get_google_adapter_followup_auxiliary_context_char_cap
 
 
 def _compact_google_adapter_persisted_output_preview_and_expanded_text(
@@ -21155,16 +19989,7 @@ def _get_grok_passthrough_target_base() -> str:
     )
 
 
-def _normalize_grok_endpoint_for_target(endpoint: str, base_target_url: str) -> str:
-    normalized_endpoint = httpx.URL(endpoint).path
-    if not normalized_endpoint.startswith("/"):
-        normalized_endpoint = "/" + normalized_endpoint
-
-    base_url = httpx.URL(base_target_url)
-    base_path = base_url.path.rstrip("/")
-    if base_path.endswith("/v1") and normalized_endpoint.startswith("/v1/"):
-        normalized_endpoint = normalized_endpoint[len("/v1") :]
-    return normalized_endpoint
+_normalize_grok_endpoint_for_target = _grok_side_channel._normalize_grok_endpoint_for_target
 
 
 def _join_grok_passthrough_url(base_target_url: str, endpoint: str) -> str:
@@ -21313,189 +20138,37 @@ def _is_grok_coding_data_retention_endpoint(endpoint: str) -> bool:
     return endpoint_path == "/privacy/coding-data-retention"
 
 
-def _normalize_grok_endpoint_path(endpoint: str) -> str:
-    endpoint_path = httpx.URL(endpoint).path
-    if not endpoint_path.startswith("/"):
-        endpoint_path = "/" + endpoint_path
-    if endpoint_path.startswith("/v1/"):
-        endpoint_path = endpoint_path[len("/v1") :]
-    return endpoint_path
+_normalize_grok_endpoint_path = _grok_side_channel._normalize_grok_endpoint_path
 
 
-def _get_grok_side_channel_endpoint_type(endpoint: str) -> Optional[str]:
-    endpoint_path = _normalize_grok_endpoint_path(endpoint)
-    if endpoint_path == "/sessions/register":
-        return "sessions_register"
-    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith("/replicas/update"):
-        return "sessions_replicas_update"
-    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith("/signals"):
-        return "sessions_signals"
-    if endpoint_path.startswith("/sessions/") and endpoint_path.endswith("/turn-deltas"):
-        return "sessions_turn_deltas"
-    if endpoint_path == "/traces":
-        return "traces"
-    return None
+_get_grok_side_channel_endpoint_type = _grok_side_channel._get_grok_side_channel_endpoint_type
 
 
-def _get_grok_session_side_channel_endpoint_type(endpoint: str) -> Optional[str]:
-    return _get_grok_side_channel_endpoint_type(endpoint)
+_get_grok_session_side_channel_endpoint_type = _grok_side_channel._get_grok_session_side_channel_endpoint_type
 
 
-def _get_grok_side_channel_endpoint_path_template(
-    endpoint_type: str,
-) -> Optional[str]:
-    if endpoint_type == "sessions_register":
-        return "/sessions/register"
-    if endpoint_type == "sessions_replicas_update":
-        return "/sessions/{session_id}/replicas/update"
-    if endpoint_type == "sessions_signals":
-        return "/sessions/{session_id}/signals"
-    if endpoint_type == "sessions_turn_deltas":
-        return "/sessions/{session_id}/turn-deltas"
-    if endpoint_type == "traces":
-        return "/traces"
-    return None
+_get_grok_side_channel_endpoint_path_template = _grok_side_channel._get_grok_side_channel_endpoint_path_template
 
 
-def _get_grok_session_side_channel_endpoint_path_template(
-    endpoint_type: str,
-) -> Optional[str]:
-    return _get_grok_side_channel_endpoint_path_template(endpoint_type)
+_get_grok_session_side_channel_endpoint_path_template = _grok_side_channel._get_grok_session_side_channel_endpoint_path_template
 
 
-def _json_shape_type_name(value: Any) -> str:
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "bool"
-    if isinstance(value, int) and not isinstance(value, bool):
-        return "int"
-    if isinstance(value, float):
-        return "float"
-    if isinstance(value, str):
-        return "str"
-    if isinstance(value, list):
-        return "array"
-    if isinstance(value, dict):
-        return "object"
-    return type(value).__name__
+_json_shape_type_name = _grok_side_channel._json_shape_type_name
 
 
-def _extract_redacted_grok_json_request_shape(parsed_body: Any) -> dict[str, Any]:
-    if isinstance(parsed_body, dict):
-        top_level_key_types = {
-            str(key): _json_shape_type_name(parsed_body.get(key))
-            for key in sorted(parsed_body.keys(), key=str)
-            if str(key) != "litellm_metadata"
-        }
-        return {
-            "json_container_type": "object",
-            "top_level_key_types": top_level_key_types,
-        }
-    if isinstance(parsed_body, list):
-        return {
-            "json_container_type": "array",
-            "array_length": len(parsed_body),
-        }
-    if parsed_body is None:
-        return {"json_container_type": "null"}
-    return {"json_container_type": _json_shape_type_name(parsed_body)}
+_extract_redacted_grok_json_request_shape = _grok_side_channel._extract_redacted_grok_json_request_shape
 
 
-def _stable_grok_side_channel_body_digest(
-    *,
-    parsed_body: Any = None,
-    raw_body: Optional[bytes] = None,
-) -> tuple[int, str, str]:
-    if raw_body is not None:
-        body_bytes = raw_body
-        digest_source = "raw_body"
-    elif isinstance(parsed_body, dict):
-        upstream_body = {key: value for key, value in parsed_body.items() if str(key) != "litellm_metadata"}
-        body_bytes = json.dumps(
-            upstream_body,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-        digest_source = "canonical_json_without_litellm_metadata"
-    elif isinstance(parsed_body, list):
-        body_bytes = json.dumps(
-            parsed_body,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-        digest_source = "canonical_json"
-    else:
-        body_bytes = b""
-        digest_source = "empty_body"
-
-    return len(body_bytes), hashlib.sha256(body_bytes).hexdigest(), digest_source
+_stable_grok_side_channel_body_digest = _grok_side_channel._stable_grok_side_channel_body_digest
 
 
-def _build_grok_side_channel_request_shape_metadata(
-    *,
-    endpoint: str,
-    request: Request,
-    parsed_body: Any = None,
-    raw_body: Optional[bytes] = None,
-) -> Optional[dict[str, Any]]:
-    endpoint_type = _get_grok_side_channel_endpoint_type(endpoint)
-    if endpoint_type is None:
-        return None
-
-    content_type = request.headers.get("content-type")
-    (
-        body_byte_length,
-        body_sha256,
-        digest_source,
-    ) = _stable_grok_side_channel_body_digest(
-        parsed_body=parsed_body,
-        raw_body=raw_body,
-    )
-    json_shape = _extract_redacted_grok_json_request_shape(parsed_body)
-
-    metadata: dict[str, Any] = {
-        "grok_side_channel": True,
-        "grok_side_channel_endpoint_type": endpoint_type,
-        "grok_side_channel_endpoint_path_template": (_get_grok_side_channel_endpoint_path_template(endpoint_type)),
-        "grok_side_channel_request_content_type": content_type,
-        "grok_side_channel_request_body_byte_length": body_byte_length,
-        "grok_side_channel_request_body_sha256": body_sha256,
-        "grok_side_channel_request_body_digest_source": digest_source,
-        "grok_side_channel_request_json_container_type": json_shape.get("json_container_type"),
-    }
-    if "top_level_key_types" in json_shape:
-        metadata["grok_side_channel_request_top_level_key_types"] = json_shape["top_level_key_types"]
-    if "array_length" in json_shape:
-        metadata["grok_side_channel_request_array_length"] = json_shape["array_length"]
-
-    return metadata
+_build_grok_side_channel_request_shape_metadata = _grok_side_channel._build_grok_side_channel_request_shape_metadata
 
 
-def _merge_grok_side_channel_shape_into_passthrough_logging_metadata(
-    passthrough_logging_metadata: dict[str, Any],
-    *,
-    shape_metadata: Optional[dict[str, Any]],
-) -> dict[str, Any]:
-    if not shape_metadata:
-        return passthrough_logging_metadata
-    merged = dict(passthrough_logging_metadata)
-    merged.update(shape_metadata)
-    tags = list(merged.get("tags") or [])
-    if "grok-side-channel" not in tags:
-        tags.append("grok-side-channel")
-    merged["tags"] = tags
-    return merged
+_merge_grok_side_channel_shape_into_passthrough_logging_metadata = _grok_side_channel._merge_grok_side_channel_shape_into_passthrough_logging_metadata
 
 
-def _get_grok_side_channel_retryable_status_codes(endpoint: str) -> list[int]:
-    is_session_side_channel = _get_grok_side_channel_endpoint_type(endpoint) is not None
-    if not is_session_side_channel:
-        return []
-
-    return [500, 502, 503, 504]
+_get_grok_side_channel_retryable_status_codes = _grok_side_channel._get_grok_side_channel_retryable_status_codes
 
 
 def _log_grok_forward_header_compare(
@@ -26473,3 +25146,11 @@ def create_generic_websocket_passthrough_endpoint(
         _forward_headers=forward_headers,
         cost_per_request=cost_per_request,
     )
+
+# Wave 4 runtime injection -- FunctionType rebind for live host-global lookup
+_aawm_lane_keys.install(globals())
+_aawm_adapter_model_resolution.install(globals())
+_google_env_policy.install(globals())
+_google_context_window.install(globals())
+_google_error_signals.install(globals())
+_grok_side_channel.install(globals())

@@ -221,6 +221,14 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Google/Antigravity provider preparation and Google process-local project/prime cache algorithms | `providers/google/adapter.py`, `providers/google/process_cache.py`, `providers/antigravity/adapter.py` |
 | Grok argument/input normalization and composer response repair | `providers/grok/normalization.py`, `providers/grok/composer_repair.py` |
 | OpenCode Zen request and stream normalization | `providers/opencode_zen/normalization.py` |
+| OpenCode Zen constants (base URL, provider ID, auth paths, free models) | `providers/opencode_zen/constants.py` |
+| Antigravity constants (forward header allowlist) | `providers/antigravity/constants.py` |
+| Model resolution and adapter model normalization | `aawm_adapter_runtime/model_resolution.py` |
+| Lane key generation and session affinity | `aawm_alias_routing/lane_keys.py` |
+| Google environment policy and configuration | `providers/google/env_policy.py` |
+| Google context window management | `providers/google/context_window.py` |
+| Google error signal extraction | `providers/google/error_signals.py` |
+| Grok side channel endpoint classification | `providers/grok/side_channel.py` |
 | OpenRouter retry and transport algorithms | `providers/openrouter/retry_transport.py` |
 | Cross-provider text/JSON shaping primitives | `aawm_alias_routing/provider_shaping.py` |
 | Bounded, lossless stream peeking | `aawm_alias_routing/streaming.py` |

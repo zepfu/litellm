@@ -19,6 +19,10 @@ from litellm.types.llms.anthropic import (
 )
 
 
+# ── Shared Anthropic adapter constants (Wave 4) ────────────────────────
+
+_ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+
 @dataclass(frozen=True)
 class ShapingRuntime:
     """Injected low-level transforms used by shared provider shaping."""
