@@ -58,6 +58,31 @@ passed the local acceptance suite with artifact
 
 ## Applied Patches
 
+
+### D1-491 - rate_limit_intervals concurrent-refresh eligible unique index
+
+**What changed:** Both materialized-view rebuild scripts
+(`scripts/apply_rate_limit_intervals_mview_2026_05_23.sql` and
+`scripts/apply_rate_limit_intervals_mview_2026_06_03_antigravity.sql`) now
+create a plain seven-column `UNIQUE INDEX ... NULLS NOT DISTINCT` over
+`(provider, model, quota_key, quota_type, fromdate, expected_reset_at,
+remaining_pct)` with no expression wrappers. The window partition logic
+retains `COALESCE(model, ''::text)` for correct grouping semantics. A new
+one-time repair script
+(`scripts/apply_rate_limit_intervals_concurrent_index_2026_07_25.sql`)
+migrates a live database from the old expression-based unique index to the
+column-only index without dropping/recreating the materialized view, using
+advisory-lock serialization, fail-closed duplicate and null-vs-empty collision
+preflight guards, a safe `REFRESH MATERIALIZED VIEW CONCURRENTLY` while both
+indexes coexist, and an atomic rename.
+
+**Why:** PostgreSQL requires a plain (non-expression) unique index for
+`REFRESH MATERIALIZED VIEW CONCURRENTLY` eligibility. The prior expression
+index using `COALESCE(model, '')` blocked concurrent refresh, forcing
+exclusive-lock refreshes that stall dashboard readers.
+
+**Why not upstream:** Fork-local AAWM observability schema and maintenance.
+
 ### aawm.139 - Read-only provider health parity for remote collectors
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.139`. The

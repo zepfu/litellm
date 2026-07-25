@@ -397,6 +397,30 @@ old 0% row open past reset. Monthly Grok request
 rows (`xai_grok_build_monthly_requests:requests`) continue to enter via
 `quota_type = 'requests'` when `remaining_pct < 100`.
 
+
+### Concurrent Refresh and Unique Index Contract (D1-491)
+
+Both rebuild scripts create a plain seven-column unique index
+`rate_limit_intervals_unique_idx` over `(provider, model, quota_key,
+quota_type, fromdate, expected_reset_at, remaining_pct)` with
+`NULLS NOT DISTINCT`. No expression wrappers (such as `COALESCE(model, '')`)
+appear in the index definition; the `COALESCE` is retained only inside the
+window `PARTITION BY` clauses for correct interval-grouping semantics.
+This column-only shape satisfies the PostgreSQL requirement for
+`REFRESH MATERIALIZED VIEW CONCURRENTLY` eligibility.
+
+For databases still carrying the older expression-based unique index, a
+one-time repair script is provided:
+`scripts/apply_rate_limit_intervals_concurrent_index_2026_07_25.sql`.
+It acquires the same advisory lock used by dashboard-shell maintenance
+(`hashtext('dashboard-shell'), hashtext('materialized-view-maintenance')`),
+runs fail-closed preflight guards for raw column-key duplicates and
+null-vs-empty model collisions, creates a temporary eligible unique index,
+performs `REFRESH MATERIALIZED VIEW CONCURRENTLY` while both indexes coexist,
+then atomically drops the old index and renames the new one to the canonical
+name. The script does not drop or recreate the materialized view and does not
+mutate pg_cron schedules.
+
 When a non-weekly credit payload includes only billing-period boundaries with
 no usage fields, the sidecar may still persist a period-only monthly credits
 snapshot with null `remaining_pct`.

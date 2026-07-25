@@ -126,13 +126,13 @@ CREATE INDEX rate_limit_intervals_type_provider_from_idx
 CREATE UNIQUE INDEX rate_limit_intervals_unique_idx
     ON public.rate_limit_intervals (
         provider,
-        COALESCE(model, ''::text),
+        model,
         quota_key,
         quota_type,
         fromdate,
         expected_reset_at,
         remaining_pct
-    );
+    ) NULLS NOT DISTINCT;
 
 ANALYZE public.rate_limit_intervals;
 

@@ -58,7 +58,7 @@ rate_limit_changes AS (
         lag(remaining_pct) OVER rate_limit_window AS previous_remaining_pct
     FROM rate_limit_points
     WINDOW rate_limit_window AS (
-        PARTITION BY provider, model, quota_key, quota_type
+        PARTITION BY provider, COALESCE(model, ''::text), quota_key, quota_type
         ORDER BY observed_at, id
     )
 ),
@@ -72,7 +72,7 @@ rate_limit_intervals AS (
         remaining_pct,
         observed_at AS fromdate,
         lead(observed_at) OVER (
-            PARTITION BY provider, model, quota_key, quota_type
+            PARTITION BY provider, COALESCE(model, ''::text), quota_key, quota_type
             ORDER BY observed_at, id
         ) AS next_fromdate
     FROM rate_limit_changes
@@ -118,7 +118,7 @@ CREATE UNIQUE INDEX rate_limit_intervals_unique_idx
         fromdate,
         expected_reset_at,
         remaining_pct
-    );
+    ) NULLS NOT DISTINCT;
 
 ANALYZE public.rate_limit_intervals;
 
