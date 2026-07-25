@@ -32,7 +32,7 @@ import ast
 import base64  # noqa: F401 - consumed by moved enrich helpers via host globals
 import asyncio  # noqa: F401 - monkeypatch surface for session_history writer tests
 import atexit  # noqa: F401 - monkeypatch surface for session_history writer tests
-import hashlib
+import hashlib  # noqa: F401 - consumed by moved storage_fields helpers via host globals
 import importlib  # noqa: F401 - monkeypatch surface for session_history writer tests
 import inspect  # noqa: F401 - freevar seed for record APIs
 import ipaddress  # noqa: F401 - consumed by moved provider_normalize helpers via host globals
@@ -2581,565 +2581,41 @@ def _extract_trace_id(kwargs: Dict[str, Any]) -> Optional[str]:
 
 
 
-def _split_spend_log_proxy_server_request(
-    spend_log_row: Dict[str, Any],
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    proxy_server_request = _safe_json_load(spend_log_row.get("proxy_server_request"), {})
-    if not isinstance(proxy_server_request, dict):
-        return {}, {}
-
-    request_headers = proxy_server_request.get("headers")
-    if not isinstance(request_headers, dict):
-        request_headers = {}
-
-    for body_key in ("body", "request"):
-        request_body = proxy_server_request.get(body_key)
-        if isinstance(request_body, dict):
-            return request_body, request_headers
-
-    return proxy_server_request, request_headers
 
 
-def _extract_trace_id_from_spend_log_row(spend_log_row: Dict[str, Any]) -> Tuple[Optional[str], str]:
-    metadata = _safe_json_load(spend_log_row.get("metadata"), {})
-    request_body, _request_headers = _split_spend_log_proxy_server_request(spend_log_row)
-
-    for candidate in (
-        metadata.get("trace_id") if isinstance(metadata, dict) else None,
-        request_body.get("trace_id") if isinstance(request_body, dict) else None,
-        spend_log_row.get("session_id"),
-        spend_log_row.get("request_id"),
-    ):
-        if candidate is not None and str(candidate).strip():
-            candidate_str = str(candidate).strip()
-            if candidate is spend_log_row.get("session_id"):
-                return candidate_str, "legacy_spend_log_session_field"
-            if candidate is spend_log_row.get("request_id"):
-                return candidate_str, "request_id_fallback"
-            return candidate_str, "metadata_or_request_body"
-
-    return None, "missing"
 
 
-def _coerce_nested_session_id(value: Any) -> Optional[str]:
-    if isinstance(value, dict):
-        session_candidate = value.get("session_id") or value.get("sessionId")
-        if session_candidate is not None and str(session_candidate).strip():
-            return str(session_candidate).strip()
-        return None
-
-    if isinstance(value, str):
-        parsed = _safe_json_load(value, None)
-        if parsed is not None:
-            return _coerce_nested_session_id(parsed)
-        if value.strip():
-            return value.strip()
-
-    return None
 
 
-def _extract_session_id_from_spend_log_row(
-    spend_log_row: Dict[str, Any],
-) -> Tuple[Optional[str], str]:
-    metadata = _safe_json_load(spend_log_row.get("metadata"), {})
-    request_body, _request_headers = _split_spend_log_proxy_server_request(spend_log_row)
-    response_body = _safe_json_load(spend_log_row.get("response"), {})
-
-    if isinstance(request_body, dict):
-        metadata_payload = request_body.get("metadata")
-        if isinstance(metadata_payload, dict):
-            session_candidate = metadata_payload.get("session_id")
-            if session_candidate is not None and str(session_candidate).strip():
-                return str(session_candidate).strip(), "request_body.metadata.session_id"
-
-            user_id_payload = metadata_payload.get("user_id")
-            nested_session_id = _coerce_nested_session_id(user_id_payload)
-            if nested_session_id:
-                return nested_session_id, "request_body.metadata.user_id.session_id"
-
-        top_level_session_id = request_body.get("session_id")
-        if top_level_session_id is not None and str(top_level_session_id).strip():
-            return str(top_level_session_id).strip(), "request_body.session_id"
-
-        request_payload = request_body.get("request")
-        if isinstance(request_payload, dict):
-            request_session_id = request_payload.get("session_id")
-            if request_session_id is not None and str(request_session_id).strip():
-                return str(request_session_id).strip(), "request_body.request.session_id"
-
-    if isinstance(metadata, dict):
-        for key in ("session_id", "sessionId"):
-            session_candidate = metadata.get(key)
-            if session_candidate is not None and str(session_candidate).strip():
-                return str(session_candidate).strip(), f"metadata.{key}"
-
-    if isinstance(response_body, dict):
-        for key in ("session_id", "sessionId"):
-            session_candidate = response_body.get(key)
-            if session_candidate is not None and str(session_candidate).strip():
-                return str(session_candidate).strip(), f"response.{key}"
-
-    legacy_session_field = spend_log_row.get("session_id")
-    if legacy_session_field is not None and str(legacy_session_field).strip():
-        return str(legacy_session_field).strip(), "legacy_spend_log_session_field"
-
-    return None, "missing"
 
 
-def _coerce_spend_log_request_tags(value: Any) -> List[str]:
-    parsed = _safe_json_load(value, value)
-    if not isinstance(parsed, list):
-        return []
-    return [str(tag) for tag in parsed if isinstance(tag, str) and tag.strip()]
 
 
-def _synthesize_result_from_spend_log_row(
-    spend_log_row: Dict[str, Any],
-    metadata: Dict[str, Any],
-) -> Dict[str, Any]:
-    result = _safe_json_load(spend_log_row.get("response"), {})
-    if not isinstance(result, dict):
-        result = {"response": result}
-
-    usage_object = metadata.get("usage_object")
-    if not isinstance(usage_object, dict):
-        usage_object = {}
-
-    if not isinstance(result.get("usage"), dict):
-        reconstructed_usage = dict(usage_object)
-        reconstructed_usage.setdefault("prompt_tokens", _safe_int(spend_log_row.get("prompt_tokens")) or 0)
-        reconstructed_usage.setdefault("completion_tokens", _safe_int(spend_log_row.get("completion_tokens")) or 0)
-        reconstructed_usage.setdefault("total_tokens", _safe_int(spend_log_row.get("total_tokens")) or 0)
-        result["usage"] = reconstructed_usage
-
-    return result
 
 
-def _build_backfill_kwargs_from_spend_log_row(
-    spend_log_row: Dict[str, Any],
-) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]]:
-    request_id = spend_log_row.get("request_id")
-    model = spend_log_row.get("model")
-    if request_id is None or not str(request_id).strip():
-        return None
-    if model is None or not str(model).strip():
-        return None
-
-    metadata = _safe_json_load(spend_log_row.get("metadata"), {})
-    if not isinstance(metadata, dict):
-        metadata = {}
-    request_body, request_headers = _split_spend_log_proxy_server_request(spend_log_row)
-    request_tags = _coerce_spend_log_request_tags(spend_log_row.get("request_tags"))
-
-    session_id, session_id_source = _extract_session_id_from_spend_log_row(spend_log_row)
-    trace_id, trace_id_source = _extract_trace_id_from_spend_log_row(spend_log_row)
-
-    litellm_metadata: Dict[str, Any] = dict(metadata)
-    if session_id:
-        litellm_metadata["session_id"] = session_id
-    if trace_id:
-        litellm_metadata["trace_id"] = trace_id
-    if spend_log_row.get("model_group"):
-        litellm_metadata["model_group"] = spend_log_row.get("model_group")
-
-    standard_logging_metadata = dict(litellm_metadata)
-    if isinstance(metadata.get("usage_object"), dict):
-        standard_logging_metadata["usage_object"] = metadata.get("usage_object")
-
-    standard_logging_object: Dict[str, Any] = {
-        "metadata": standard_logging_metadata,
-        "request_headers": request_headers,
-        "request_tags": list(request_tags),
-        "trace_id": trace_id,
-        "model": str(model),
-        "model_group": spend_log_row.get("model_group"),
-        "response_cost": _safe_float(spend_log_row.get("spend")),
-        "prompt_tokens": _safe_int(spend_log_row.get("prompt_tokens")) or 0,
-        "completion_tokens": _safe_int(spend_log_row.get("completion_tokens")) or 0,
-        "total_tokens": _safe_int(spend_log_row.get("total_tokens")) or 0,
-    }
-
-    kwargs: Dict[str, Any] = {
-        "model": str(model),
-        "custom_llm_provider": _normalize_session_history_provider(
-            spend_log_row.get("custom_llm_provider"),
-            str(model),
-            metadata,
-        ),
-        "call_type": spend_log_row.get("call_type"),
-        "litellm_call_id": str(request_id),
-        "litellm_trace_id": trace_id,
-        "litellm_session_id": session_id,
-        "litellm_params": {
-            "metadata": litellm_metadata,
-            "litellm_trace_id": trace_id,
-            "litellm_session_id": session_id,
-            "proxy_server_request": {
-                "body": request_body,
-                "headers": request_headers,
-            },
-        },
-        "standard_logging_object": standard_logging_object,
-        "passthrough_logging_payload": {
-            "request_body": request_body,
-            "request_headers": request_headers,
-        },
-        "response_cost": _safe_float(spend_log_row.get("spend")),
-    }
-
-    messages = _safe_json_load(spend_log_row.get("messages"), None)
-    if isinstance(messages, list):
-        kwargs["messages"] = messages
-
-    system = request_body.get("system")
-    if system is not None:
-        kwargs["system"] = system
-
-    result = _synthesize_result_from_spend_log_row(spend_log_row, metadata)
-
-    provenance = {
-        "session_id_source": session_id_source,
-        "trace_id_source": trace_id_source,
-        "source_request_id": str(request_id),
-        "source_spend_log_session_field": (
-            str(spend_log_row.get("session_id")).strip()
-            if spend_log_row.get("session_id") is not None and str(spend_log_row.get("session_id")).strip()
-            else None
-        ),
-    }
-
-    return kwargs, result, provenance
 
 
 # _derive_session_history_reasoning_fields moved to litellm.integrations.aawm_session_history.record
 # _derive_session_history_tool_fields moved to litellm.integrations.aawm_session_history.record
 # _derive_session_history_provider_cache_fields moved to litellm.integrations.aawm_session_history.record
 # _build_session_history_record_from_spend_log_row moved to litellm.integrations.aawm_session_history.record
-def _derive_langfuse_trace_tags_from_spend_log_row(
-    spend_log_row: Dict[str, Any],
-) -> Tuple[Optional[str], List[str]]:
-    prepared = _build_backfill_kwargs_from_spend_log_row(spend_log_row)
-    if prepared is None:
-        return None, []
-
-    kwargs, result, _provenance = prepared
-    kwargs, result = _enrich_trace_name_and_provider_metadata(kwargs, result)
-    standard_logging_object = kwargs.get("standard_logging_object") or {}
-    request_tags = standard_logging_object.get("request_tags") or []
-    if not isinstance(request_tags, list):
-        request_tags = []
-    trace_id = kwargs.get("litellm_trace_id")
-    if trace_id is not None and str(trace_id).strip():
-        trace_id = str(trace_id).strip()
-    else:
-        trace_id = None
-    return trace_id, [tag for tag in request_tags if isinstance(tag, str) and tag.strip()]
 
 
-def _serialize_searchable_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, sort_keys=True)
-    except (TypeError, ValueError):
-        return str(value)
 
 
-def _extract_agent_context_from_langfuse_trace_observation(
-    trace: Dict[str, Any],
-    observation: Dict[str, Any],
-) -> Tuple[Optional[str], Optional[str]]:
-    explicit_tenant_id, _tenant_source = _extract_tenant_identity_from_langfuse_trace_observation(
-        trace,
-        observation,
-    )
-    for candidate in (
-        observation.get("input"),
-        trace.get("input"),
-        observation.get("output"),
-        trace.get("output"),
-    ):
-        agent_name, tenant_id = _extract_agent_context_from_text(_serialize_searchable_text(candidate))
-        if agent_name:
-            return agent_name, explicit_tenant_id or tenant_id
-
-    trace_name = trace.get("name")
-    if isinstance(trace_name, str) and trace_name.startswith("claude-code."):
-        return trace_name.split(".", 1)[1], explicit_tenant_id
-
-    return None, explicit_tenant_id
 
 
-def _extract_langfuse_session_id(
-    trace: Dict[str, Any],
-    observation_metadata: Dict[str, Any],
-) -> Tuple[Optional[str], str]:
-    for candidate in (
-        trace.get("sessionId"),
-        trace.get("session_id"),
-        observation_metadata.get("session_id"),
-        observation_metadata.get("google_adapter_session_id"),
-        _coerce_nested_session_id(observation_metadata.get("user_id")),
-        _coerce_nested_session_id(observation_metadata.get("user_api_key_end_user_id")),
-    ):
-        if candidate is not None and str(candidate).strip():
-            if candidate == trace.get("sessionId"):
-                return str(candidate).strip(), "trace.sessionId"
-            if candidate == trace.get("session_id"):
-                return str(candidate).strip(), "trace.session_id"
-            if candidate == observation_metadata.get("session_id"):
-                return str(candidate).strip(), "observation.metadata.session_id"
-            if candidate == observation_metadata.get("google_adapter_session_id"):
-                return (
-                    str(candidate).strip(),
-                    "observation.metadata.google_adapter_session_id",
-                )
-            if candidate == _coerce_nested_session_id(observation_metadata.get("user_id")):
-                return str(candidate).strip(), "observation.metadata.user_id.session_id"
-            return (
-                str(candidate).strip(),
-                "observation.metadata.user_api_key_end_user_id.session_id",
-            )
-
-    route_family = observation_metadata.get("passthrough_route_family")
-    is_passthrough_trace = (
-        isinstance(route_family, str)
-        and bool(route_family.strip())
-        or observation_metadata.get("aawm_passthrough_endpoint_type") is not None
-        or observation_metadata.get("aawm_stream_logging_endpoint_type") is not None
-    )
-    if is_passthrough_trace:
-        for source, candidate in (
-            ("trace.id", trace.get("id")),
-            ("observation.traceId", observation_metadata.get("traceId")),
-        ):
-            if candidate is None or not str(candidate).strip():
-                continue
-            observation_metadata.setdefault("session_id_source", f"{source}.synthetic")
-            observation_metadata.setdefault("synthetic_session_id", True)
-            observation_metadata.setdefault("synthetic_session_id_basis", source)
-            return str(candidate).strip(), f"{source}.synthetic"
-
-    return None, "missing"
 
 
-def _build_usage_object_from_langfuse_observation(observation: Dict[str, Any]) -> Dict[str, Any]:
-    metadata = observation.get("metadata")
-    usage = observation.get("usage")
-    usage_details = observation.get("usageDetails")
-
-    usage_object: Dict[str, Any] = {}
-    if isinstance(metadata, dict):
-        metadata_usage_object = _build_usage_object_from_metadata(metadata)
-        if isinstance(metadata_usage_object, dict):
-            usage_object.update(metadata_usage_object)
-    output_usage_object = _build_usage_object_from_langfuse_output(observation.get("output"))
-    if isinstance(output_usage_object, dict):
-        usage_object.update(output_usage_object)
-    if isinstance(usage, dict):
-        usage_object.update(usage)
-    if isinstance(usage_details, dict):
-        usage_object.update(usage_details)
-
-    prompt_tokens = _safe_int(
-        _first_non_none(
-            observation.get("promptTokens"),
-            observation.get("inputTokens"),
-            usage_object.get("prompt_tokens"),
-            usage_object.get("input_tokens"),
-            usage_object.get("input"),
-        )
-    )
-    completion_tokens = _safe_int(
-        _first_non_none(
-            observation.get("completionTokens"),
-            observation.get("outputTokens"),
-            usage_object.get("completion_tokens"),
-            usage_object.get("output_tokens"),
-            usage_object.get("output"),
-        )
-    )
-    total_tokens = _safe_int(
-        _first_non_none(
-            observation.get("totalTokens"),
-            usage_object.get("total_tokens"),
-            usage_object.get("total"),
-        )
-    )
-
-    if prompt_tokens is not None:
-        usage_object["prompt_tokens"] = prompt_tokens
-    if completion_tokens is not None:
-        usage_object["completion_tokens"] = completion_tokens
-        usage_object.setdefault("output_tokens", completion_tokens)
-    if total_tokens is not None:
-        usage_object["total_tokens"] = total_tokens
-
-    prompt_tokens_details = _extract_prompt_tokens_details(usage_object)
-    if isinstance(prompt_tokens_details, dict):
-        usage_object.setdefault("prompt_tokens_details", prompt_tokens_details)
-
-    completion_tokens_details = _extract_completion_tokens_details(usage_object)
-    if isinstance(completion_tokens_details, dict):
-        usage_object.setdefault("completion_tokens_details", completion_tokens_details)
-
-    cache_read_tokens = _safe_int(usage_object.get("cache_read_input_tokens"))
-    if cache_read_tokens is None:
-        cache_read_tokens = _safe_int(usage_object.get("cachedContentTokenCount"))
-    cache_creation_tokens = _safe_int(usage_object.get("cache_creation_input_tokens"))
-    if cache_read_tokens is not None:
-        usage_object["cache_read_input_tokens"] = cache_read_tokens
-    if cache_creation_tokens is not None:
-        usage_object["cache_creation_input_tokens"] = cache_creation_tokens
-    if usage_object.get("reasoning_tokens") is None:
-        thoughts_token_count = _safe_int(usage_object.get("thoughtsTokenCount"))
-        if thoughts_token_count is not None:
-            usage_object["reasoning_tokens"] = thoughts_token_count
-
-    return usage_object
 
 
-def _extract_first_langfuse_response_message(output_payload: Any) -> Any:
-    if isinstance(output_payload, dict):
-        if isinstance(output_payload.get("choices"), list):
-            return _extract_first_response_message(output_payload)
-        if isinstance(output_payload.get("message"), dict):
-            return output_payload["message"]
-        if any(key in output_payload for key in ("content", "tool_calls", "reasoning_content", "thinking_blocks")):
-            return output_payload
-    return None
 
 
-def _infer_provider_from_langfuse_observation(
-    observation: Dict[str, Any],
-    metadata: Dict[str, Any],
-) -> Optional[str]:
-    adapter_target_provider = _session_history_adapter_target_provider(metadata)
-    if adapter_target_provider is not None:
-        return adapter_target_provider
-
-    auto_agent_provider = _session_history_auto_agent_selected_provider(metadata)
-    if auto_agent_provider is not None:
-        return auto_agent_provider
-
-    route_provider = _session_history_provider_from_route_family(metadata.get("passthrough_route_family"))
-    if route_provider is not None:
-        return route_provider
-
-    api_base = (
-        metadata.get("api_base") or _maybe_get(metadata.get("hidden_params"), "api_base") or observation.get("apiBase")
-    )
-    api_base_provider = _session_history_provider_from_api_base(
-        api_base,
-        call_type=metadata.get("user_api_key_request_route") or observation.get("name"),
-    )
-    if api_base_provider is not None:
-        return api_base_provider
-
-    model = (
-        _session_history_adapter_model(metadata)
-        or _session_history_metadata_model(metadata)
-        or observation.get("model")
-    )
-    model_provider = _session_history_provider_from_model(model)
-    if model_provider is not None:
-        return model_provider
-
-    request_route = metadata.get("user_api_key_request_route")
-    if isinstance(request_route, str) and request_route.strip():
-        route_lower = request_route.lower()
-        if "gemini" in route_lower or "google" in route_lower:
-            return "gemini"
-        if route_lower.startswith("/v1/"):
-            return "openai"
-        if route_lower.startswith("/anthropic/"):
-            return "anthropic"
-
-    return _normalize_session_history_provider(
-        metadata.get("custom_llm_provider"),
-        str(observation.get("model") or ""),
-        metadata,
-    )
 
 
-def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> List[str]:
-    request_tags = metadata.get("tags")
-    normalized_tags = (
-        [str(tag) for tag in request_tags if isinstance(tag, str) and tag.strip()]
-        if isinstance(request_tags, list)
-        else []
-    )
-
-    route_family = metadata.get("passthrough_route_family")
-    if isinstance(route_family, str) and route_family.strip():
-        normalized_tags.append(f"route:{route_family.strip()}")
-
-    billing_header_fields = metadata.get("anthropic_billing_header_fields")
-    if isinstance(billing_header_fields, dict) and billing_header_fields:
-        normalized_tags.append("anthropic-billing-header")
-        for key, value in list(billing_header_fields.items()):
-            if isinstance(key, str) and key.strip():
-                normalized_tags.append(f"anthropic-billing-header-key:{key}")
-                if value is not None and str(value).strip():
-                    normalized_tags.append(f"anthropic-billing-header:{key}={str(value).strip()}")
-
-    thinking_type = metadata.get("claude_thinking_type")
-    if isinstance(thinking_type, str) and thinking_type.strip():
-        normalized_tags.append(f"claude-thinking-type:{thinking_type}")
-        normalized_tags.append(f"thinking-type:{thinking_type}")
-
-    effort = metadata.get("claude_effort")
-    if isinstance(effort, str) and effort.strip():
-        normalized_tags.append(f"claude-effort:{effort}")
-        normalized_tags.append(f"effort:{effort}")
-
-    if metadata.get("thinking_signature_present") is True:
-        normalized_tags.append("thinking-signature-present")
-    if metadata.get("claude_thinking_signature_present") is True:
-        normalized_tags.append("claude-thinking-signature")
-    if metadata.get("gemini_thought_signature_present") is True:
-        normalized_tags.append("gemini-thought-signature")
-    if metadata.get("thinking_signature_decoded") is True:
-        normalized_tags.append("thinking-signature-decoded")
-    if metadata.get("claude_thinking_signature_decoded") is True:
-        normalized_tags.append("claude-thinking-decoded")
-    if metadata.get("reasoning_content_present") is True:
-        normalized_tags.append("reasoning-present")
-    elif metadata.get("reasoning_content_present") is False:
-        normalized_tags.append("reasoning-empty")
-    if metadata.get("thinking_blocks_present") is True:
-        normalized_tags.append("thinking-blocks-present")
-    elif metadata.get("thinking_blocks_present") is False:
-        normalized_tags.append("thinking-blocks-empty")
-
-    return sorted({tag for tag in normalized_tags if isinstance(tag, str) and tag.strip()})
 
 
 # _build_session_history_record_from_langfuse_trace_observation moved to litellm.integrations.aawm_session_history.record
-def _derive_langfuse_trace_tags_from_langfuse_trace(
-    trace: Dict[str, Any],
-) -> Tuple[Optional[str], List[str]]:
-    trace_id = trace.get("id")
-    normalized_trace_id = str(trace_id).strip() if trace_id is not None and str(trace_id).strip() else None
-
-    derived_tags: List[str] = []
-    existing_trace_tags = trace.get("tags")
-    if isinstance(existing_trace_tags, list):
-        derived_tags.extend(str(tag) for tag in existing_trace_tags if isinstance(tag, str) and tag.strip())
-
-    observations = trace.get("observations")
-    if isinstance(observations, list):
-        for observation in observations:
-            if not isinstance(observation, dict) or observation.get("type") != "GENERATION":
-                continue
-            metadata = observation.get("metadata")
-            if not isinstance(metadata, dict):
-                continue
-            derived_tags.extend(_derive_request_tags_from_langfuse_metadata(metadata))
-
-    return normalized_trace_id, sorted({tag for tag in derived_tags if isinstance(tag, str) and tag.strip()})
 
 
 def _iter_litellm_metadata_sources(
@@ -3285,641 +2761,60 @@ async def _update_session_history_previous_gap_ms(
     await conn.execute(_AAWM_SESSION_HISTORY_PREVIOUS_GAP_UPDATE_SQL, call_ids)
 
 
-def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
-    provider = _clean_non_empty_string(record.get("provider")) or "unknown"
-    source = str(record.get("source") or "").lower()
-    client_family = str(record.get("client_family") or "").lower()
-    if provider == "antigravity" or client_family == "antigravity_code_assist" or source.startswith("antigravity_"):
-        return "antigravity"
-    if provider in {"opencode", "opencode_zen"} or client_family == "opencode_zen" or source.startswith("opencode_"):
-        return "opencode_zen"
-    if (
-        provider in {"gemini", "google_code_assist"}
-        or client_family in {"gemini", "google_code_assist"}
-        or source.startswith("google_")
-        or source.startswith("gemini_")
-    ):
-        return "google"
-    return provider
 
 
-def _rate_limit_storage_client(record: Dict[str, Any]) -> Optional[str]:
-    return _first_non_empty_string(
-        record.get("client_family"),
-        record.get("client_name"),
-        _maybe_get_path(record.get("metadata"), "client_name"),
-    )
 
 
-def _rate_limit_storage_quota_key(record: Dict[str, Any]) -> str:
-    limit_id = _clean_non_empty_string(record.get("limit_id"))
-    limit_scope = _clean_non_empty_string(record.get("limit_scope"))
-    if limit_id and limit_scope:
-        return f"{limit_id}:{limit_scope}"
-    return (
-        _clean_non_empty_string(record.get("limit_key"))
-        or _clean_non_empty_string(record.get("limit_name"))
-        or ":".join(
-            part
-            for part in (
-                _clean_non_empty_string(record.get("source")),
-                _clean_non_empty_string(record.get("model")),
-            )
-            if part
-        )
-        or "unknown_quota"
-    )
 
 
-def _rate_limit_storage_quota_type(record: Dict[str, Any]) -> str:
-    explicit_quota_type = _clean_non_empty_string(record.get("quota_type"))
-    if explicit_quota_type:
-        return explicit_quota_type
-
-    limit_scope = str(record.get("limit_scope") or "").lower()
-    raw_provider_fields = record.get("raw_provider_fields")
-    token_type = (
-        str(raw_provider_fields.get("tokenType") or "").lower() if isinstance(raw_provider_fields, dict) else ""
-    )
-    source = str(record.get("source") or "").lower()
-    provider = _rate_limit_storage_provider(record)
-
-    if "request" in limit_scope or limit_scope == "requests" or token_type == "requests":
-        return "requests"
-    if "message" in limit_scope or token_type == "messages":
-        return "messages"
-    if "token" in limit_scope or limit_scope == "tokens" or token_type == "tokens":
-        return "tokens"
-    if limit_scope == "model_capacity" or "capacity" in source:
-        return "capacity"
-    if provider == "google":
-        return "requests"
-    if provider in {"openai", "anthropic"}:
-        return "tokens"
-    return "unknown"
 
 
-def _rate_limit_storage_remaining_pct(record: Dict[str, Any]) -> Optional[float]:
-    remaining_pct = _safe_float(record.get("remaining_pct"))
-    if remaining_pct is not None:
-        return max(0.0, min(100.0, remaining_pct))
-
-    remaining_fraction = _safe_float(_maybe_get_path(record.get("raw_provider_fields"), "remainingFraction"))
-    if remaining_fraction is not None:
-        return max(0.0, min(100.0, remaining_fraction * 100.0))
-
-    used_percentage = _safe_float(record.get("used_percentage"))
-    if used_percentage is not None:
-        return max(0.0, min(100.0, 100.0 - used_percentage))
-
-    if bool(record.get("exhausted")):
-        return 0.0
-    return None
 
 
-def _rate_limit_storage_numeric_detail(
-    record: Dict[str, Any],
-    key: str,
-    *raw_paths: str,
-) -> Optional[float]:
-    direct_value = _nonnegative_float_or_none(record.get(key))
-    if direct_value is not None:
-        return direct_value
-    raw_provider_fields = record.get("raw_provider_fields")
-    if not isinstance(raw_provider_fields, dict):
-        return None
-    for raw_path in raw_paths:
-        value: Any = raw_provider_fields
-        for part in raw_path.split("."):
-            if isinstance(value, dict):
-                value = value.get(part)
-            else:
-                value = None
-                break
-        normalized = _nonnegative_float_or_none(value.get("val") if isinstance(value, dict) else value)
-        if normalized is not None:
-            return normalized
-    return None
 
 
-def _rate_limit_storage_quota_limit(record: Dict[str, Any]) -> Optional[float]:
-    return _first_non_none(
-        _rate_limit_storage_numeric_detail(
-            record,
-            "quota_limit",
-            "monthlyLimit",
-            "total",
-            "limit",
-            "x-ratelimit-limit-requests",
-            "x-ratelimit-limit-tokens",
-        ),
-        _nonnegative_float_or_none(record.get("total_requests")),
-    )
 
 
-def _rate_limit_storage_quota_used(record: Dict[str, Any]) -> Optional[float]:
-    return _first_non_none(
-        _rate_limit_storage_numeric_detail(record, "quota_used", "used"),
-        _nonnegative_float_or_none(record.get("used_requests")),
-    )
 
 
-def _rate_limit_storage_quota_remaining(record: Dict[str, Any]) -> Optional[float]:
-    return _first_non_none(
-        _rate_limit_storage_numeric_detail(
-            record,
-            "quota_remaining",
-            "remaining",
-            "x-ratelimit-remaining-requests",
-            "x-ratelimit-remaining-tokens",
-        ),
-        _nonnegative_float_or_none(record.get("remaining_requests")),
-    )
 
 
-def _rate_limit_storage_timestamp_detail(
-    record: Dict[str, Any],
-    key: str,
-    *raw_paths: str,
-) -> Optional[datetime]:
-    direct_value = _parse_provider_timestamp(record.get(key))
-    if direct_value is not None:
-        return direct_value
-    raw_provider_fields = record.get("raw_provider_fields")
-    if not isinstance(raw_provider_fields, dict):
-        return None
-    for raw_path in raw_paths:
-        value: Any = raw_provider_fields
-        for part in raw_path.split("."):
-            if isinstance(value, dict):
-                value = value.get(part)
-            else:
-                value = None
-                break
-        parsed = _parse_provider_timestamp(value)
-        if parsed is not None:
-            return parsed
-    return None
 
 
-def _rate_limit_storage_billing_period_start_at(
-    record: Dict[str, Any],
-) -> Optional[datetime]:
-    return _rate_limit_storage_timestamp_detail(
-        record,
-        "billing_period_start_at",
-        "billingPeriodStart",
-    )
 
 
-def _rate_limit_storage_billing_period_end_at(
-    record: Dict[str, Any],
-) -> Optional[datetime]:
-    return _first_non_none(
-        _rate_limit_storage_timestamp_detail(
-            record,
-            "billing_period_end_at",
-            "billingPeriodEnd",
-        ),
-        _parse_provider_timestamp(record.get("provider_resets_at"))
-        if record.get("quota_period") == "monthly"
-        else None,
-    )
 
 
-def _build_rate_limit_observation_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
-    return (
-        record["observed_at"],
-        _rate_limit_storage_client(record),
-        record.get("client_version"),
-        record.get("account_hash"),
-        _rate_limit_storage_provider(record),
-        record.get("model"),
-        _rate_limit_storage_quota_key(record),
-        record.get("quota_period"),
-        _rate_limit_storage_quota_type(record),
-        record.get("provider_resets_at"),
-        _rate_limit_storage_remaining_pct(record),
-        _rate_limit_storage_quota_limit(record),
-        _rate_limit_storage_quota_used(record),
-        _rate_limit_storage_quota_remaining(record),
-        _rate_limit_storage_billing_period_start_at(record),
-        _rate_limit_storage_billing_period_end_at(record),
-        json.dumps(_json_safe_rate_limit_value(record.get("raw_provider_fields") or {})),
-        json.dumps(_json_safe_rate_limit_value(record.get("evidence") or {})),
-        record.get("source"),
-        record.get("session_id"),
-        record.get("trace_id"),
-        record.get("litellm_call_id"),
-    )
 
 
-def _build_rate_limit_transition_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
-    return (
-        record["transition_key"],
-        record["limit_key"],
-        record.get("provider"),
-        record.get("client_family"),
-        record.get("account_hash"),
-        record["transition_type"],
-        record.get("confidence") or 0.0,
-        json.dumps(_json_safe_rate_limit_value(record.get("signals") or [])),
-        record.get("source"),
-        record.get("old_observed_at"),
-        record["new_observed_at"],
-        record.get("old_provider_resets_at"),
-        record.get("new_provider_resets_at"),
-        record.get("old_used_percentage"),
-        record.get("new_used_percentage"),
-        record.get("old_remaining_requests"),
-        record.get("new_remaining_requests"),
-        record.get("old_used_requests"),
-        record.get("new_used_requests"),
-        record.get("old_total_requests"),
-        record.get("new_total_requests"),
-        record.get("inferred_window_start_at"),
-        record.get("detection_window_start_at"),
-        record.get("detection_window_end_at"),
-        json.dumps(_json_safe_rate_limit_value(record.get("session_usage_summary") or {})),
-        json.dumps(_json_safe_rate_limit_value(record.get("old_observation") or {})),
-        json.dumps(_json_safe_rate_limit_value(record.get("new_observation") or {})),
-        json.dumps(_json_safe_rate_limit_value(record.get("metadata") or {})),
-    )
 
 
-def _build_provider_error_observation_db_payload(record: Dict[str, Any]) -> Tuple[Any, ...]:
-    return (
-        record["observed_at"],
-        record.get("environment"),
-        record["provider"],
-        record.get("model"),
-        record.get("model_group"),
-        record.get("route_family"),
-        record.get("status_code"),
-        record.get("error_type"),
-        record.get("error_code"),
-        record["error_class"],
-        record.get("retry_after_seconds"),
-        record.get("expected_reset_at"),
-        record.get("session_id"),
-        record.get("trace_id"),
-        record.get("litellm_call_id"),
-        json.dumps(_json_safe_rate_limit_value(record.get("metadata") or {})),
-    )
 
 
-def _extract_alias_routing_audit_events(
-    record: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    metadata = record.get("metadata")
-    event_sources: List[Any] = [record.get("aawm_alias_routing_audit_events")]
-    if isinstance(metadata, dict):
-        event_sources.extend(
-            [
-                metadata.get("aawm_alias_routing_audit_events"),
-                metadata.get("codex_auto_agent_audit_events"),
-                metadata.get("anthropic_auto_agent_audit_events"),
-            ]
-        )
-    events: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
-    for source in event_sources:
-        if not isinstance(source, list):
-            continue
-        for event in source:
-            if not isinstance(event, dict):
-                continue
-            try:
-                fingerprint = json.dumps(
-                    _json_safe_rate_limit_value(event),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            except Exception:
-                fingerprint = str(id(event))
-            if fingerprint in seen:
-                continue
-            seen.add(fingerprint)
-            events.append(event)
-    return events
 
 
-def _alias_routing_audit_observed_at(
-    record: Dict[str, Any],
-    event: Dict[str, Any],
-) -> datetime:
-    return (
-        _parse_datetime_value(event.get("observed_at"))
-        or _parse_datetime_value(record.get("start_time"))
-        or _parse_datetime_value(record.get("end_time"))
-        or datetime.now(timezone.utc)
-    )
 
 
-def _alias_routing_audit_event_key(
-    *,
-    record: Dict[str, Any],
-    event: Dict[str, Any],
-    event_index: int,
-) -> Optional[str]:
-    litellm_call_id = _clean_non_empty_string(event.get("litellm_call_id") or record.get("litellm_call_id"))
-    if litellm_call_id is None:
-        return None
-    key_material = [
-        litellm_call_id,
-        event.get("alias_family"),
-        event.get("alias_model"),
-        event.get("event_type"),
-        event.get("provider"),
-        event.get("model"),
-        event.get("attempt_number"),
-        event.get("candidate_status"),
-        event_index,
-    ]
-    digest = hashlib.sha256(json.dumps(key_material, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
-    return f"{litellm_call_id}:alias-routing:{digest}"
 
 
-def _infer_alias_routing_family(
-    event: Dict[str, Any],
-    metadata: Dict[str, Any],
-) -> str:
-    return (
-        _clean_non_empty_string(event.get("alias_family"))
-        or ("codex_auto_agent" if _clean_non_empty_string(metadata.get("codex_auto_agent_alias")) else None)
-        or ("anthropic_auto_agent" if _clean_non_empty_string(metadata.get("anthropic_auto_agent_alias")) else None)
-        or "unknown"
-    )
 
 
-def _build_alias_routing_audit_db_payload(
-    record: Dict[str, Any],
-    event: Dict[str, Any],
-    event_index: int,
-) -> Tuple[Any, ...]:
-    metadata = record.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-    event_metadata = dict(event)
-    event_metadata["event_index"] = event_index
-    event_metadata.setdefault("session_history_provider", record.get("provider"))
-    event_metadata.setdefault("session_history_model", record.get("model"))
-    event_metadata.setdefault("session_history_model_group", record.get("model_group"))
-    event_metadata.setdefault("session_history_repository", record.get("repository"))
-    return (
-        _alias_routing_audit_event_key(
-            record=record,
-            event=event,
-            event_index=event_index,
-        ),
-        _alias_routing_audit_observed_at(record, event),
-        _clean_non_empty_string(event.get("session_id")) or _clean_non_empty_string(record.get("session_id")),
-        _clean_non_empty_string(event.get("session_key")),
-        _clean_non_empty_string(event.get("trace_id")) or _clean_non_empty_string(record.get("trace_id")),
-        _clean_non_empty_string(event.get("litellm_call_id")) or _clean_non_empty_string(record.get("litellm_call_id")),
-        _clean_non_empty_string(event.get("alias_model"))
-        or _clean_non_empty_string(metadata.get("requested_model_alias"))
-        or "unknown",
-        _infer_alias_routing_family(event, metadata),
-        _clean_non_empty_string(event.get("route_family")),
-        _clean_non_empty_string(event.get("provider")),
-        _clean_non_empty_string(event.get("model")),
-        _clean_non_empty_string(event.get("lane_key")),
-        _clean_non_empty_string(event.get("cooldown_key")),
-        _safe_int(event.get("attempt_number")),
-        _clean_non_empty_string(event.get("event_type")) or "unknown",
-        _clean_non_empty_string(event.get("selection_reason")),
-        _clean_non_empty_string(event.get("candidate_status")),
-        _clean_non_empty_string(event.get("failure_class")),
-        _safe_int(event.get("error_status_code")),
-        _clean_non_empty_string(event.get("cooldown_scope")),
-        _safe_float(event.get("cooldown_seconds")),
-        _parse_datetime_value(event.get("cooldown_until")),
-        _metadata_bool(event.get("selected")),
-        _metadata_bool(event.get("skipped")),
-        _metadata_bool(event.get("last_resort")),
-        _metadata_bool(event.get("in_flight_session")),
-        _metadata_bool(event.get("redispatch_required")),
-        _metadata_bool(event.get("redispatch_threshold_crossed")),
-        json.dumps(_json_safe_rate_limit_value(event_metadata)),
-    )
 
 
 # _persist_alias_routing_audit_best_effort moved to litellm.integrations.aawm_session_history.record
-_AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS: Tuple[str, ...] = (
-    "observed_at",
-    "source",
-    "provider",
-    "client_family",
-    "account_hash",
-    "environment",
-    "tenant_id",
-    "repository",
-    "limit_key",
-    "limit_id",
-    "limit_name",
-    "limit_scope",
-    "window_minutes",
-    "quota_period",
-    "provider_resets_at",
-    "inferred_window_start_at",
-    "used_percentage",
-    "remaining_requests",
-    "used_requests",
-    "total_requests",
-    "status",
-    "exhausted",
-    "exhaustion_kind",
-    "reset_hint_seconds",
-    "model",
-    "quota_limit",
-    "quota_used",
-    "quota_remaining",
-    "billing_period_start_at",
-    "billing_period_end_at",
-    "model_family",
-    "model_tier",
-    "parent_limit_key",
-    "session_id",
-    "trace_id",
-    "litellm_call_id",
-    "route_family",
-    "request_model",
-    "response_model",
-    "client_name",
-    "client_version",
-    "client_user_agent",
-    "raw_provider_fields",
-    "evidence",
-    "metadata",
-)
 
 
-def _rate_limit_previous_observation_row_to_dict(row: Any) -> Dict[str, Any]:
-    try:
-        row_dict = dict(row)
-    except Exception:
-        return {key: _maybe_get(row, key) for key in _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS}
-    row_dict.pop("input_limit_key", None)
-    return row_dict
 
 
-async def _fetch_previous_rate_limit_observation(
-    conn: Any,
-    observation: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    quota_key = _rate_limit_storage_quota_key(observation)
-    if not quota_key or not observation.get("observed_at"):
-        return None
-    row = await conn.fetchrow(
-        _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_SQL,
-        quota_key,
-        _rate_limit_storage_provider(observation),
-        _rate_limit_storage_client(observation),
-        observation.get("account_hash"),
-        observation.get("source"),
-        observation["observed_at"],
-    )
-    if row is None:
-        return None
-    return _rate_limit_previous_observation_row_to_dict(row)
 
 
-async def _fetch_previous_rate_limit_observations(
-    conn: Any,
-    observations: List[Dict[str, Any]],
-) -> Dict[str, Optional[Dict[str, Any]]]:
-    first_observation_by_limit_key: Dict[str, Dict[str, Any]] = {}
-    for observation in observations:
-        limit_key = _rate_limit_storage_quota_key(observation)
-        if (
-            not isinstance(limit_key, str)
-            or not limit_key
-            or not observation.get("observed_at")
-            or limit_key in first_observation_by_limit_key
-        ):
-            continue
-        first_observation_by_limit_key[limit_key] = observation
-
-    if not first_observation_by_limit_key:
-        return {}
-
-    limit_keys: List[str] = []
-    providers: List[str] = []
-    clients: List[Optional[str]] = []
-    account_hashes: List[Optional[str]] = []
-    sources: List[Optional[str]] = []
-    observed_ats: List[Any] = []
-    for limit_key, observation in first_observation_by_limit_key.items():
-        limit_keys.append(limit_key)
-        providers.append(_rate_limit_storage_provider(observation))
-        clients.append(_rate_limit_storage_client(observation))
-        account_hashes.append(observation.get("account_hash"))
-        sources.append(observation.get("source"))
-        observed_ats.append(observation["observed_at"])
-
-    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {limit_key: None for limit_key in limit_keys}
-    rows = await conn.fetch(
-        _AAWM_RATE_LIMIT_PREVIOUS_OBSERVATIONS_BATCH_SQL,
-        limit_keys,
-        providers,
-        clients,
-        account_hashes,
-        sources,
-        observed_ats,
-    )
-    for row in rows:
-        limit_key = _maybe_get(row, "input_limit_key")
-        if isinstance(limit_key, str) and limit_key in previous_by_limit_key:
-            previous_by_limit_key[limit_key] = _rate_limit_previous_observation_row_to_dict(row)
-    return previous_by_limit_key
 
 
-async def _derive_rate_limit_transitions(
-    conn: Any,
-    observations: List[Dict[str, Any]],
-    initial_previous_by_limit_key: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
-) -> List[Dict[str, Any]]:
-    transitions: List[Dict[str, Any]] = []
-    previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = dict(initial_previous_by_limit_key or {})
-    ordered_observations = sorted(
-        observations,
-        key=lambda item: (
-            _rate_limit_storage_quota_key(item),
-            item.get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
-        ),
-    )
-    missing_previous_observations: List[Dict[str, Any]] = []
-    for observation in ordered_observations:
-        limit_key = _rate_limit_storage_quota_key(observation)
-        if isinstance(limit_key, str) and limit_key and limit_key not in previous_by_limit_key:
-            previous_by_limit_key[limit_key] = None
-            missing_previous_observations.append(observation)
-    if missing_previous_observations:
-        previous_by_limit_key.update(
-            await _fetch_previous_rate_limit_observations(
-                conn,
-                missing_previous_observations,
-            )
-        )
-    for observation in ordered_observations:
-        limit_key = _rate_limit_storage_quota_key(observation)
-        if not isinstance(limit_key, str) or not limit_key:
-            continue
-        previous = previous_by_limit_key.get(limit_key)
-        if previous is not None:
-            classification = _classify_rate_limit_transition(previous, observation)
-            if classification is not None:
-                transitions.append(_build_rate_limit_transition(previous, observation, classification))
-        previous_by_limit_key[limit_key] = observation
-    return transitions
 
 
-async def _filter_meaningful_rate_limit_observations(
-    conn: Any,
-    observations: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[Dict[str, Any]]]]:
-    kept_by_index: List[Tuple[int, Dict[str, Any]]] = []
-    rolling_previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {}
-    initial_previous_by_limit_key: Dict[str, Optional[Dict[str, Any]]] = {}
-    indexed_observations = [
-        (index, observation)
-        for index, observation in enumerate(observations)
-        if isinstance(observation.get("limit_key"), str) and observation.get("limit_key")
-    ]
-    indexed_observations.sort(
-        key=lambda item: (
-            _rate_limit_storage_quota_key(item[1]),
-            item[1].get("observed_at") or datetime.min.replace(tzinfo=timezone.utc),
-            item[0],
-        )
-    )
-
-    initial_previous_by_limit_key.update(
-        await _fetch_previous_rate_limit_observations(
-            conn,
-            [observation for _index, observation in indexed_observations],
-        )
-    )
-    rolling_previous_by_limit_key.update(initial_previous_by_limit_key)
-
-    for index, observation in indexed_observations:
-        limit_key = _rate_limit_storage_quota_key(observation)
-        previous = rolling_previous_by_limit_key.get(limit_key)
-        if not _rate_limit_observation_has_meaningful_change(previous, observation):
-            continue
-
-        kept_by_index.append((index, observation))
-        rolling_previous_by_limit_key[limit_key] = observation
-
-    kept_by_index.sort(key=lambda item: item[0])
-    return [observation for _index, observation in kept_by_index], initial_previous_by_limit_key
 
 
 # _build_rate_limit_observation_only_record moved to litellm.integrations.aawm_session_history.record
-def _rate_limit_observation_only_requested(kwargs: Dict[str, Any]) -> bool:
-    metadata = _merged_rate_limit_metadata(kwargs)
-    return bool(metadata.get("aawm_rate_limit_observation_only"))
 
 
 # _persist_rate_limit_observations_best_effort moved to litellm.integrations.aawm_session_history.record
@@ -4565,6 +3460,66 @@ _aawm_identity_tenant_agent.install(globals())
 _aawm_identity_repository.install(globals())
 _aawm_identity_runtime.install(globals())
 _aawm_agent_context.install(globals())
+
+
+# --- Wave A4D backfill/storage-fields extraction.
+# These MUST precede _bind_session_history_record_apis() so record-API free
+# names and monkeypatch targets keep resolving through this namespace. ---
+from litellm.integrations.aawm_session_history import backfill as _aawm_sh_backfill
+from litellm.integrations.aawm_session_history import storage_fields as _aawm_sh_storage_fields
+
+# rebind installers: helper __globals__ -> this namespace
+_aawm_sh_backfill.install(globals())
+_aawm_sh_storage_fields.install(globals())
+
+# literal facade assignments (AST-visible; installers above already published
+# the rebound function objects into this namespace, these re-affirm identity).
+# --- Wave A4D backfill facades ---
+_split_spend_log_proxy_server_request = _aawm_sh_backfill._split_spend_log_proxy_server_request
+_extract_trace_id_from_spend_log_row = _aawm_sh_backfill._extract_trace_id_from_spend_log_row
+_coerce_nested_session_id = _aawm_sh_backfill._coerce_nested_session_id
+_extract_session_id_from_spend_log_row = _aawm_sh_backfill._extract_session_id_from_spend_log_row
+_coerce_spend_log_request_tags = _aawm_sh_backfill._coerce_spend_log_request_tags
+_synthesize_result_from_spend_log_row = _aawm_sh_backfill._synthesize_result_from_spend_log_row
+_build_backfill_kwargs_from_spend_log_row = _aawm_sh_backfill._build_backfill_kwargs_from_spend_log_row
+_derive_langfuse_trace_tags_from_spend_log_row = _aawm_sh_backfill._derive_langfuse_trace_tags_from_spend_log_row
+_serialize_searchable_text = _aawm_sh_backfill._serialize_searchable_text
+_extract_agent_context_from_langfuse_trace_observation = _aawm_sh_backfill._extract_agent_context_from_langfuse_trace_observation
+_extract_langfuse_session_id = _aawm_sh_backfill._extract_langfuse_session_id
+_build_usage_object_from_langfuse_observation = _aawm_sh_backfill._build_usage_object_from_langfuse_observation
+_extract_first_langfuse_response_message = _aawm_sh_backfill._extract_first_langfuse_response_message
+_infer_provider_from_langfuse_observation = _aawm_sh_backfill._infer_provider_from_langfuse_observation
+_derive_request_tags_from_langfuse_metadata = _aawm_sh_backfill._derive_request_tags_from_langfuse_metadata
+_derive_langfuse_trace_tags_from_langfuse_trace = _aawm_sh_backfill._derive_langfuse_trace_tags_from_langfuse_trace
+# --- Wave A4D storage_fields facades ---
+_rate_limit_storage_provider = _aawm_sh_storage_fields._rate_limit_storage_provider
+_rate_limit_storage_client = _aawm_sh_storage_fields._rate_limit_storage_client
+_rate_limit_storage_quota_key = _aawm_sh_storage_fields._rate_limit_storage_quota_key
+_rate_limit_storage_quota_type = _aawm_sh_storage_fields._rate_limit_storage_quota_type
+_rate_limit_storage_remaining_pct = _aawm_sh_storage_fields._rate_limit_storage_remaining_pct
+_rate_limit_storage_numeric_detail = _aawm_sh_storage_fields._rate_limit_storage_numeric_detail
+_rate_limit_storage_quota_limit = _aawm_sh_storage_fields._rate_limit_storage_quota_limit
+_rate_limit_storage_quota_used = _aawm_sh_storage_fields._rate_limit_storage_quota_used
+_rate_limit_storage_quota_remaining = _aawm_sh_storage_fields._rate_limit_storage_quota_remaining
+_rate_limit_storage_timestamp_detail = _aawm_sh_storage_fields._rate_limit_storage_timestamp_detail
+_rate_limit_storage_billing_period_start_at = _aawm_sh_storage_fields._rate_limit_storage_billing_period_start_at
+_rate_limit_storage_billing_period_end_at = _aawm_sh_storage_fields._rate_limit_storage_billing_period_end_at
+_build_rate_limit_observation_db_payload = _aawm_sh_storage_fields._build_rate_limit_observation_db_payload
+_build_rate_limit_transition_db_payload = _aawm_sh_storage_fields._build_rate_limit_transition_db_payload
+_build_provider_error_observation_db_payload = _aawm_sh_storage_fields._build_provider_error_observation_db_payload
+_extract_alias_routing_audit_events = _aawm_sh_storage_fields._extract_alias_routing_audit_events
+_alias_routing_audit_observed_at = _aawm_sh_storage_fields._alias_routing_audit_observed_at
+_alias_routing_audit_event_key = _aawm_sh_storage_fields._alias_routing_audit_event_key
+_infer_alias_routing_family = _aawm_sh_storage_fields._infer_alias_routing_family
+_build_alias_routing_audit_db_payload = _aawm_sh_storage_fields._build_alias_routing_audit_db_payload
+_rate_limit_previous_observation_row_to_dict = _aawm_sh_storage_fields._rate_limit_previous_observation_row_to_dict
+_fetch_previous_rate_limit_observation = _aawm_sh_storage_fields._fetch_previous_rate_limit_observation
+_fetch_previous_rate_limit_observations = _aawm_sh_storage_fields._fetch_previous_rate_limit_observations
+_derive_rate_limit_transitions = _aawm_sh_storage_fields._derive_rate_limit_transitions
+_filter_meaningful_rate_limit_observations = _aawm_sh_storage_fields._filter_meaningful_rate_limit_observations
+_rate_limit_observation_only_requested = _aawm_sh_storage_fields._rate_limit_observation_only_requested
+# --- Wave A4D storage_fields constant facade ---
+_AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS = _aawm_sh_storage_fields._AAWM_RATE_LIMIT_PREVIOUS_OBSERVATION_FIELDS
 
 _bind_session_history_record_apis()
 

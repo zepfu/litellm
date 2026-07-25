@@ -54,6 +54,8 @@ packages = ["aawm_litellm_callbacks"]
 "../litellm/integrations/aawm_session_history/identity_selection.py" = "litellm/integrations/aawm_session_history/identity_selection.py"
 "../litellm/integrations/aawm_session_history/normalize.py" = "litellm/integrations/aawm_session_history/normalize.py"
 "../litellm/integrations/aawm_session_history/context_window.py" = "litellm/integrations/aawm_session_history/context_window.py"
+"../litellm/integrations/aawm_session_history/backfill.py" = "litellm/integrations/aawm_session_history/backfill.py"
+"../litellm/integrations/aawm_session_history/storage_fields.py" = "litellm/integrations/aawm_session_history/storage_fields.py"
 "../litellm/integrations/aawm_session_history_sql.py" = "litellm/integrations/aawm_session_history_sql.py"
 
 [tool.hatch.build.targets.sdist.force-include]
@@ -87,4 +89,6 @@ packages = ["aawm_litellm_callbacks"]
 "../litellm/integrations/aawm_session_history/identity_selection.py" = "litellm/integrations/aawm_session_history/identity_selection.py"
 "../litellm/integrations/aawm_session_history/normalize.py" = "litellm/integrations/aawm_session_history/normalize.py"
 "../litellm/integrations/aawm_session_history/context_window.py" = "litellm/integrations/aawm_session_history/context_window.py"
+"../litellm/integrations/aawm_session_history/backfill.py" = "litellm/integrations/aawm_session_history/backfill.py"
+"../litellm/integrations/aawm_session_history/storage_fields.py" = "litellm/integrations/aawm_session_history/storage_fields.py"
 "../litellm/integrations/aawm_session_history_sql.py" = "litellm/integrations/aawm_session_history_sql.py"
