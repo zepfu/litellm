@@ -13,7 +13,7 @@ import copy
 import hashlib
 import json
 import os
-import random
+import random  # noqa: F401 - compatibility binding for extracted Wave 5C facades
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -45,11 +45,13 @@ from fastapi import (
     Request,
     Response,
     WebSocket,
-    status,
+    status as fastapi_status,
 )
 from fastapi.responses import StreamingResponse
 from starlette.websockets import WebSocketState
 from typing_extensions import NotRequired, TypeGuard, TypedDict
+
+globals()["status"] = fastapi_status
 
 import litellm
 from litellm import get_llm_provider
@@ -571,6 +573,11 @@ from .aawm_alias_routing import openrouter_quota as _aawm_openrouter_quota
 # Wave 5B: cooldown_state + selection extraction modules
 from .aawm_alias_routing import cooldown_state as _aawm_cooldown_state
 from .aawm_alias_routing import selection as _aawm_selection
+
+# Wave 5C: error_signals + cooldown_apply + attempt_records extraction modules
+from .aawm_alias_routing import error_signals as _aawm_error_signals
+from .aawm_alias_routing import cooldown_apply as _aawm_cooldown_apply
+from .aawm_alias_routing import attempt_records as _aawm_attempt_records
 
 # -- snapshot_select facades --
 _READ_PILOT_ALIAS_NAME = _aawm_snapshot_select._READ_PILOT_ALIAS_NAME
@@ -3807,533 +3814,68 @@ _attach_aawm_alias_routing_state_sources = _aawm_cooldown_state._attach_aawm_ali
 
 _select_codex_auto_agent_candidate = _aawm_selection._select_codex_auto_agent_candidate
 
+# Wave 5C: error_signals facades
+_add_codex_auto_agent_text_error_tokens = _aawm_error_signals._add_codex_auto_agent_text_error_tokens
+_build_codex_auto_agent_native_grok_continuation_retry_metadata = _aawm_error_signals._build_codex_auto_agent_native_grok_continuation_retry_metadata
+_build_safe_kimi_code_selection_telemetry = _aawm_error_signals._build_safe_kimi_code_selection_telemetry
+_classify_codex_auto_agent_retryable_exhaustion = _aawm_error_signals._classify_codex_auto_agent_retryable_exhaustion
+_classify_kimi_code_auto_agent_probe_failure = _aawm_error_signals._classify_kimi_code_auto_agent_probe_failure
+_codex_auto_agent_error_text = _aawm_error_signals._codex_auto_agent_error_text
+_extract_codex_auto_agent_error_tokens = _aawm_error_signals._extract_codex_auto_agent_error_tokens
+_extract_codex_auto_agent_error_type_and_code = _aawm_error_signals._extract_codex_auto_agent_error_type_and_code
+_get_codex_auto_agent_candidate_cooldown_scope = _aawm_error_signals._get_codex_auto_agent_candidate_cooldown_scope
+_get_codex_auto_agent_cooldown_scope = _aawm_error_signals._get_codex_auto_agent_cooldown_scope
+_get_codex_auto_agent_cooldown_seconds = _aawm_error_signals._get_codex_auto_agent_cooldown_seconds
+_get_codex_auto_agent_grok_account_quota_lane_cooldown_key = _aawm_error_signals._get_codex_auto_agent_grok_account_quota_lane_cooldown_key
+_get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds = _aawm_error_signals._get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds
+_get_codex_auto_agent_native_grok_continuation_transient_max_attempts = _aawm_error_signals._get_codex_auto_agent_native_grok_continuation_transient_max_attempts
+_get_codex_auto_agent_source_error_summary = _aawm_error_signals._get_codex_auto_agent_source_error_summary
+_get_kimi_code_managed_account_cooldown_key = _aawm_error_signals._get_kimi_code_managed_account_cooldown_key
+_get_safe_kimi_code_probe_failure_metadata = _aawm_error_signals._get_safe_kimi_code_probe_failure_metadata
+_is_codex_auto_agent_durable_cooldown_error_class = _aawm_error_signals._is_codex_auto_agent_durable_cooldown_error_class
+_is_codex_auto_agent_grok_4_5_candidate = _aawm_error_signals._is_codex_auto_agent_grok_4_5_candidate
+_is_codex_auto_agent_grok_account_quota_candidate = _aawm_error_signals._is_codex_auto_agent_grok_account_quota_candidate
+_is_codex_auto_agent_grok_account_quota_exhaustion = _aawm_error_signals._is_codex_auto_agent_grok_account_quota_exhaustion
+_is_codex_auto_agent_grok_build_usage_balance_exhausted = _aawm_error_signals._is_codex_auto_agent_grok_build_usage_balance_exhausted
+_is_codex_auto_agent_grok_personal_team_spending_limit = _aawm_error_signals._is_codex_auto_agent_grok_personal_team_spending_limit
+_is_codex_auto_agent_native_grok_4_5_candidate = _aawm_error_signals._is_codex_auto_agent_native_grok_4_5_candidate
+_is_codex_auto_agent_native_grok_continuation_transient_retry_eligible = _aawm_error_signals._is_codex_auto_agent_native_grok_continuation_transient_retry_eligible
+_is_codex_auto_agent_retryable_exhaustion = _aawm_error_signals._is_codex_auto_agent_retryable_exhaustion
+_is_codex_auto_agent_spark_candidate = _aawm_error_signals._is_codex_auto_agent_spark_candidate
+_is_codex_auto_agent_transient_internal_error_class = _aawm_error_signals._is_codex_auto_agent_transient_internal_error_class
+_is_codex_auto_agent_xai_candidate = _aawm_error_signals._is_codex_auto_agent_xai_candidate
+_is_kimi_code_auto_agent_candidate = _aawm_error_signals._is_kimi_code_auto_agent_candidate
+_iter_codex_auto_agent_error_blocks = _aawm_error_signals._iter_codex_auto_agent_error_blocks
+_parse_codex_auto_agent_header_wait_seconds = _aawm_error_signals._parse_codex_auto_agent_header_wait_seconds
+_plan_codex_auto_agent_native_grok_continuation_transient_retry = _aawm_error_signals._plan_codex_auto_agent_native_grok_continuation_transient_retry
+_KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL = _aawm_error_signals._KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL
+_KIMI_CODE_SAFE_FAILURE_KINDS = _aawm_error_signals._KIMI_CODE_SAFE_FAILURE_KINDS
+_KIMI_CODE_SAFE_FAILURE_SCOPES = _aawm_error_signals._KIMI_CODE_SAFE_FAILURE_SCOPES
+_KIMI_CODE_SAFE_METADATA_GATES = _aawm_error_signals._KIMI_CODE_SAFE_METADATA_GATES
+_KIMI_CODE_SAFE_RESET_REASONS = _aawm_error_signals._KIMI_CODE_SAFE_RESET_REASONS
+_KIMI_CODE_SAFE_UPSTREAM_IDS = _aawm_error_signals._KIMI_CODE_SAFE_UPSTREAM_IDS
 
-def _codex_auto_agent_error_text(exc: Any) -> str:
-    detail = _extract_google_adapter_exception_detail(exc)
-    if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="ignore")
-    else:
-        detail_text = str(detail)
-    return " ".join(
-        str(part)
-        for part in (
-            getattr(exc, "message", None),
-            getattr(exc, "code", None),
-            detail_text,
-            str(exc),
-        )
-        if part is not None
-    )
+# Wave 5C: cooldown_apply facades
+_apply_anthropic_auto_agent_alias_cooldown = _aawm_cooldown_apply._apply_anthropic_auto_agent_alias_cooldown
+_apply_auto_agent_alias_cooldown = _aawm_cooldown_apply._apply_auto_agent_alias_cooldown
+_apply_codex_auto_agent_alias_cooldown = _aawm_cooldown_apply._apply_codex_auto_agent_alias_cooldown
+_apply_read_pilot_gated_cooldown = _aawm_cooldown_apply._apply_read_pilot_gated_cooldown
+_persist_anthropic_cooldown_durable = _aawm_cooldown_apply._persist_anthropic_cooldown_durable
+_persist_codex_cooldown_durable = _aawm_cooldown_apply._persist_codex_cooldown_durable
+_resolve_auto_agent_cooldown_publication_plan = _aawm_cooldown_apply._resolve_auto_agent_cooldown_publication_plan
+_set_codex_auto_agent_candidate_cooldowns = _aawm_cooldown_apply._set_codex_auto_agent_candidate_cooldowns
 
+# Wave 5C: attempt_records facades
+_add_anthropic_auto_agent_alias_metadata = _aawm_attempt_records._add_anthropic_auto_agent_alias_metadata
+_add_codex_auto_agent_alias_metadata = _aawm_attempt_records._add_codex_auto_agent_alias_metadata
+_extract_codex_reasoning_effort = _aawm_attempt_records._extract_codex_reasoning_effort
+_get_codex_reasoning_effort_ceiling = _aawm_attempt_records._get_codex_reasoning_effort_ceiling
+_normalize_codex_reasoning_effort_for_resolved_route = _aawm_attempt_records._normalize_codex_reasoning_effort_for_resolved_route
+_record_auto_agent_alias_attempt_failure = _aawm_attempt_records._record_auto_agent_alias_attempt_failure
+_record_auto_agent_alias_attempt_started = _aawm_attempt_records._record_auto_agent_alias_attempt_started
+_record_read_pilot_cooldown_evidence = _aawm_attempt_records._record_read_pilot_cooldown_evidence
+_update_codex_auto_agent_retryable_attempt_record = _aawm_attempt_records._update_codex_auto_agent_retryable_attempt_record
 
-def _add_codex_auto_agent_text_error_tokens(
-    tokens: set[str],
-    text_lower: str,
-) -> None:
-    if "grok build usage balance exhausted" in text_lower:
-        tokens.add(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_TOKEN)
-    if "personal-team-blocked:spending-limit" in text_lower:
-        tokens.add(_CODEX_AUTO_AGENT_GROK_PERSONAL_TEAM_SPENDING_LIMIT_TOKEN)
-    if (
-        "usage_limit_reached" in text_lower
-        or "usage limit" in text_lower
-        or "weekly limit" in text_lower
-        or "quota exceeded" in text_lower
-        or "quota exhausted" in text_lower
-        or "quota limit" in text_lower
-    ):
-        tokens.add("usage_limit_reached")
-    if "resource_exhausted" in text_lower or "resource exhausted" in text_lower:
-        tokens.add("RESOURCE_EXHAUSTED")
-    if "model_capacity_exhausted" in text_lower or "model capacity exhausted" in text_lower:
-        tokens.add("MODEL_CAPACITY_EXHAUSTED")
-    if "currently experiencing high demand" in text_lower or "experiencing high demand" in text_lower:
-        tokens.add("HIGH_DEMAND")
-    if "selected model is at capacity" in text_lower or (
-        "model is at capacity" in text_lower and "try a different model" in text_lower
-    ):
-        tokens.add("MODEL_AT_CAPACITY")
-    if "model is overloaded" in text_lower or "overloaded_error" in text_lower:
-        tokens.add("MODEL_OVERLOADED")
-    if "busy upstream" in text_lower or ("upstream" in text_lower and "busy" in text_lower):
-        tokens.add("UPSTREAM_BUSY")
-    if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
-        tokens.add("RATE_LIMIT_EXCEEDED")
-    if "too many requests" in text_lower:
-        tokens.add("429")
-        tokens.add("RATE_LIMIT_EXCEEDED")
-    if "aawm_codex_auto_agent_candidate_unavailable" in text_lower:
-        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
-    if "not supported when using codex with a chatgpt account" in text_lower and (
-        "model is not supported" in text_lower or " is not supported" in text_lower
-    ):
-        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
-    if "grok-4.5" in text_lower and any(
-        marker in text_lower
-        for marker in (
-            "model not found",
-            "model does not exist",
-            "model is not available",
-            "unknown model",
-            "unsupported model",
-        )
-    ):
-        tokens.add("aawm_codex_auto_agent_candidate_unavailable")
-    if "aawm_auto_agent_failed_responses_payload" in text_lower:
-        tokens.add("aawm_auto_agent_failed_responses_payload")
-    if "aawm_auto_agent_malformed_tool_call_text" in text_lower:
-        tokens.add("aawm_auto_agent_malformed_tool_call_text")
-    if (
-        "permission-denied" in text_lower
-        and "content violates usage guidelines" in text_lower
-        and "safety_check_type_cyber" in text_lower
-    ):
-        tokens.add("safety_policy_denied")
-    if (
-        "error from provider (deepseek)" in text_lower
-        and "assistant message with 'tool_calls' must be followed by tool messages" in text_lower
-    ) or "insufficient tool messages following tool_calls message" in text_lower:
-        tokens.add("DEEPSEEK_TOOL_MESSAGE_MISMATCH")
-    if "invalid message provided" in text_lower and "must have non-empty content or tool calls" in text_lower:
-        tokens.add("OPENROUTER_INVALID_CHAT_MESSAGE")
-    if "invalid tool call provided" in text_lower and "tool arguments must be a stringified json object" in text_lower:
-        tokens.add("OPENROUTER_INVALID_TOOL_CALL_ARGUMENTS")
-
-
-def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
-    tokens: set[str] = set()
-    for parsed in _extract_google_adapter_error_payloads(exc):
-        error_blocks: list[dict[str, Any]] = []
-        if isinstance(parsed, dict):
-            error = parsed.get("error")
-            if isinstance(error, dict):
-                error_blocks.append(error)
-        elif isinstance(parsed, list):
-            for item in parsed:
-                if isinstance(item, dict) and isinstance(item.get("error"), dict):
-                    error_blocks.append(item["error"])
-        for error in error_blocks:
-            for key in ("code", "status", "type"):
-                value = error.get(key)
-                if isinstance(value, str) and value:
-                    tokens.add(value)
-                elif isinstance(value, int):
-                    tokens.add(str(value))
-            details = error.get("details")
-            if isinstance(details, list):
-                for detail in details:
-                    if not isinstance(detail, dict):
-                        continue
-                    reason = detail.get("reason")
-                    if isinstance(reason, str) and reason:
-                        tokens.add(reason)
-            message = error.get("message")
-            if isinstance(message, str) and message:
-                lowered = message.lower()
-                if "usage_limit_reached" in lowered:
-                    tokens.add("usage_limit_reached")
-                if "resource_exhausted" in lowered:
-                    tokens.add("RESOURCE_EXHAUSTED")
-                if "model_capacity_exhausted" in lowered:
-                    tokens.add("MODEL_CAPACITY_EXHAUSTED")
-    text_lower = _codex_auto_agent_error_text(exc).lower()
-    _add_codex_auto_agent_text_error_tokens(tokens, text_lower)
-    if _is_openrouter_adapter_provider_raw_error(exc):
-        tokens.add("OPENROUTER_PROVIDER_RAW_ERROR")
-    return tokens
-
-
-def _is_codex_auto_agent_durable_cooldown_error_class(
-    error_class: Optional[str],
-) -> bool:
-    return error_class in _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES
-
-
-def _is_codex_auto_agent_spark_candidate(candidate: Optional[dict[str, Any]]) -> bool:
-    if not isinstance(candidate, dict):
-        return False
-    return str(candidate.get("model") or "") == _CODEX_AUTO_AGENT_SPARK_MODEL
-
-
-def _is_codex_auto_agent_grok_4_5_candidate(
-    candidate: Optional[dict[str, Any]],
-) -> bool:
-    if not isinstance(candidate, dict):
-        return False
-    if candidate.get("provider") != _CODEX_AUTO_AGENT_XAI_PROVIDER:
-        return False
-    model = str(candidate.get("model") or "")
-    if model in {"oa_xai/grok-4.5", "grok-4.5", "xai/grok-4.5"}:
-        return True
-    route_family = str(candidate.get("route_family") or "")
-    return route_family in {
-        "codex_xai_oauth_responses_adapter",
-        "codex_grok_native_responses_adapter",
-        "anthropic_grok_native_responses_adapter",
-    } and model.endswith("grok-4.5")
-
-
-def _is_codex_auto_agent_native_grok_4_5_candidate(
-    candidate: Optional[dict[str, Any]],
-) -> bool:
-    if not _is_codex_auto_agent_grok_4_5_candidate(candidate):
-        return False
-    route_family = str((candidate or {}).get("route_family") or "")
-    return route_family in {
-        "codex_grok_native_responses_adapter",
-        "anthropic_grok_native_responses_adapter",
-    }
-
-
-def _is_codex_auto_agent_xai_candidate(
-    candidate: Optional[dict[str, Any]],
-) -> bool:
-    if not isinstance(candidate, dict):
-        return False
-    return candidate.get("provider") == _CODEX_AUTO_AGENT_XAI_PROVIDER
-
-
-_KIMI_CODE_SAFE_FAILURE_KINDS = frozenset(
-    {
-        "refresh_required_auth",
-        "quota",
-        "provider_capacity",
-        "transient",
-        "malformed",
-        "unsupported_model",
-        "unsupported_effort",
-        "unsupported_capability",
-        "unknown",
-    }
-)
-_KIMI_CODE_SAFE_FAILURE_SCOPES = frozenset({"managed_account", "candidate", "telemetry", "none"})
-_KIMI_CODE_SAFE_METADATA_GATES = frozenset({"none", "model_id", "think_effort", "capability"})
-_KIMI_CODE_SAFE_RESET_REASONS = frozenset(
-    {
-        "refresh_required",
-        "quota_exhausted",
-        "provider_capacity",
-        "transient_upstream_failure",
-        "malformed_provider_response",
-        "unsupported_model",
-        "unsupported_effort",
-        "unsupported_capability",
-        "unclassified_failure",
-    }
-)
-_KIMI_CODE_SAFE_UPSTREAM_IDS = frozenset({"k3", "kimi-for-coding", "kimi-for-coding-highspeed"})
-_KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL = "__managed_account__"
-
-
-def _is_kimi_code_auto_agent_candidate(candidate: Optional[dict[str, Any]]) -> bool:
-    return isinstance(candidate, dict) and candidate.get("provider") == _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
-
-
-def _get_kimi_code_managed_account_cooldown_key() -> str:
-    # Kimi managed-account keys are deliberately UN-tagged (no epoch_tag):
-    # they represent account-level quota state that is independent of the
-    # routing config generation.  Tagging them would incorrectly reset
-    # account-level cooldowns on every config refresh.
-    return _codex_auto_agent_candidate_key(
-        {
-            "provider": _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
-            "model": _KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL,
-        },
-        _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
-    )
-
-
-def _get_safe_kimi_code_probe_failure_metadata(
-    exc: Any,
-    *,
-    candidate: Optional[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
-    """Return only adapter-classifier allowlisted Kimi probe metadata."""
-
-    if not _is_kimi_code_auto_agent_candidate(candidate):
-        return None
-    raw_metadata = getattr(exc, "kimi_code_probe_failure_metadata", None)
-    if not isinstance(raw_metadata, dict):
-        return None
-    kind = raw_metadata.get("kind")
-    scope = raw_metadata.get("scope")
-    upstream_id = raw_metadata.get("upstream_id")
-    metadata_gate = raw_metadata.get("metadata_gate")
-    reset_reason = raw_metadata.get("reset_reason")
-    status_code = raw_metadata.get("status_code")
-    trace_id = raw_metadata.get("trace_id")
-    if (
-        kind not in _KIMI_CODE_SAFE_FAILURE_KINDS
-        or scope not in _KIMI_CODE_SAFE_FAILURE_SCOPES
-        or upstream_id not in _KIMI_CODE_SAFE_UPSTREAM_IDS
-        or metadata_gate not in _KIMI_CODE_SAFE_METADATA_GATES
-        or reset_reason not in _KIMI_CODE_SAFE_RESET_REASONS
-    ):
-        return None
-    if status_code is not None and (
-        not isinstance(status_code, int) or isinstance(status_code, bool) or status_code < 100 or status_code > 599
-    ):
-        return None
-    if trace_id is not None and (
-        not isinstance(trace_id, str)
-        or len(trace_id) > 256
-        or not trace_id
-        or any(not (character.isalnum() or character in "._-") for character in trace_id)
-    ):
-        return None
-    return {
-        "kind": kind,
-        "scope": scope,
-        "upstream_id": upstream_id,
-        "metadata_gate": metadata_gate,
-        "status_code": status_code,
-        "trace_id": trace_id,
-        "reset_reason": reset_reason,
-    }
-
-
-def _classify_kimi_code_auto_agent_probe_failure(
-    metadata: Optional[dict[str, Any]],
-) -> Optional[str]:
-    if metadata is None:
-        return None
-    scope = metadata["scope"]
-    if scope == "managed_account":
-        return "kimi_code_managed_account"
-    if scope == "candidate":
-        return "kimi_code_candidate_failure"
-    return "kimi_code_no_cooldown"
-
-
-def _build_safe_kimi_code_selection_telemetry(
-    *,
-    alias_model: str,
-    candidate: dict[str, Any],
-    metadata: dict[str, Any],
-) -> dict[str, Any]:
-    """Build an alias-attempt record without copying provider payload details."""
-
-    return {
-        "alias": alias_model,
-        "candidate": candidate["model"],
-        "upstream_id": metadata["upstream_id"],
-        "metadata_gate": metadata["metadata_gate"],
-        "scope": metadata["scope"],
-        "reset_reason": metadata["reset_reason"],
-        "kind": metadata["kind"],
-        "status_code": metadata["status_code"],
-        "trace_id": metadata["trace_id"],
-    }
-
-
-def _is_codex_auto_agent_transient_internal_error_class(
-    error_class: Optional[str],
-) -> bool:
-    # Classifier emits upstream_transient_internal only; do not accept a dead alias.
-    return error_class == "upstream_transient_internal"
-
-
-def _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() -> int:
-    """Request-scoped total provider attempts for native Grok continuation retries.
-
-    Independent of alias candidate-pool length and preserved across outer
-    candidate-selection re-entry within the same request. Default 8 so bursts
-    of 3-6 terminal-event 502s can recover without switching providers.
-    """
-    raw_value = _clean_codex_auth_value(
-        os.getenv(_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS_ENV)
-    )
-    if raw_value is None:
-        return _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS
-    # Conservative clamp: never drop below 6 (live aawm-code pool size) and
-    # never allow unbounded same-candidate storms.
-    return max(6, min(16, parsed))
-
-
-def _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(
-    failed_attempt: int,
-) -> float:
-    """Short exponential backoff with bounded jitter; each delay capped near 1s."""
-    attempt_index = max(1, int(failed_attempt))
-    base_seconds = min(
-        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS,
-        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS * (2 ** (attempt_index - 1)),
-    )
-    jitter_cap = min(
-        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS,
-        base_seconds,
-    )
-    jitter_seconds = random.uniform(0.0, jitter_cap) if jitter_cap > 0 else 0.0
-    return min(
-        _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS,
-        base_seconds + jitter_seconds,
-    )
-
-
-def _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
-    *,
-    is_native_grok_4_5_candidate: bool,
-    has_continuation_state: bool,
-    error_class: Optional[str],
-    cooldown_scope: Optional[str],
-) -> bool:
-    """Whether this failure may consume the native Grok continuation transient budget.
-
-    Deliberately excludes ``candidate_unavailable`` even when native Grok 4.5 uses
-    cooldown scope ``none`` for that class. Generic probe/credential unavailability
-    must not enter the same-candidate 502-style retry budget; only bare transient
-    internal failures (``upstream_transient_internal``) are eligible.
-    """
-    # Keep this allow-list tight: do not treat candidate_unavailable as eligible.
-    return bool(
-        has_continuation_state
-        and cooldown_scope == "none"
-        and is_native_grok_4_5_candidate
-        and _is_codex_auto_agent_transient_internal_error_class(error_class)
-    )
-
-
-def _build_codex_auto_agent_native_grok_continuation_retry_metadata(
-    *,
-    status: str,
-    provider_attempt: int,
-    max_attempts: int,
-    provider: Optional[str],
-    model: Optional[str],
-    route_family: Optional[str],
-    backoff_seconds: Optional[float] = None,
-) -> _NativeGrokContinuationRetryMetadata:
-    metadata: _NativeGrokContinuationRetryMetadata = {
-        "status": status,
-        "provider_attempt": int(provider_attempt),
-        "max_attempts": int(max_attempts),
-        "provider": provider,
-        "model": model,
-        "route_family": route_family,
-    }
-    if backoff_seconds is not None:
-        metadata["backoff_seconds"] = round(float(backoff_seconds), 3)
-    return metadata
-
-
-def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
-    *,
-    is_native_grok_4_5_candidate: bool,
-    has_continuation_state: bool,
-    error_class: Optional[str],
-    cooldown_scope: Optional[str],
-    provider_attempt: int,
-    provider: Optional[str],
-    model: Optional[str],
-    route_family: Optional[str],
-    max_attempts: Optional[int] = None,
-) -> tuple[
-    bool,
-    Optional[float],
-    Optional[_NativeGrokContinuationRetryMetadata],
-]:
-    """Annotate attempt metadata and decide whether to retry the same candidate.
-
-    ``provider_attempt`` must be the request-scoped total of eligible native Grok
-    continuation transient provider attempts so far (not reset on outer
-    candidate-selection re-entry). Backoff is only returned when a same-candidate
-    retry is scheduled; callers must not sleep after the final failed attempt.
-    """
-    if not _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
-        is_native_grok_4_5_candidate=is_native_grok_4_5_candidate,
-        has_continuation_state=has_continuation_state,
-        error_class=error_class,
-        cooldown_scope=cooldown_scope,
-    ):
-        return False, None, None
-
-    resolved_max_attempts = (
-        int(max_attempts)
-        if max_attempts is not None
-        else _get_codex_auto_agent_native_grok_continuation_transient_max_attempts()
-    )
-    if provider_attempt < resolved_max_attempts:
-        backoff_seconds = _get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds(provider_attempt)
-        metadata = _build_codex_auto_agent_native_grok_continuation_retry_metadata(
-            status="scheduled_same_candidate_retry",
-            provider_attempt=provider_attempt,
-            max_attempts=resolved_max_attempts,
-            provider=provider,
-            model=model,
-            route_family=route_family,
-            backoff_seconds=backoff_seconds,
-        )
-        return True, backoff_seconds, metadata
-
-    metadata = _build_codex_auto_agent_native_grok_continuation_retry_metadata(
-        status="same_candidate_retry_exhausted",
-        provider_attempt=provider_attempt,
-        max_attempts=resolved_max_attempts,
-        provider=provider,
-        model=model,
-        route_family=route_family,
-    )
-    return False, None, metadata
-
-
-def _get_codex_auto_agent_cooldown_scope(error_class: Optional[str]) -> str:
-    if _is_codex_auto_agent_durable_cooldown_error_class(error_class):
-        return "candidate"
-    return "request_local"
-
-
-def _get_codex_auto_agent_candidate_cooldown_scope(
-    error_class: Optional[str],
-    *,
-    candidate: Optional[dict[str, Any]] = None,
-    kimi_failure_metadata: Optional[dict[str, Any]] = None,
-) -> str:
-    if _is_kimi_code_auto_agent_candidate(candidate):
-        if (
-            error_class == "kimi_code_managed_account"
-            and kimi_failure_metadata is not None
-            and kimi_failure_metadata.get("scope") == "managed_account"
-        ):
-            return "managed_account"
-        if (
-            error_class == "kimi_code_candidate_failure"
-            and kimi_failure_metadata is not None
-            and kimi_failure_metadata.get("scope") == "candidate"
-        ):
-            return "candidate"
-        if error_class == "kimi_code_no_cooldown":
-            return "none"
-    if error_class == "safety_policy_denied":
-        return "request_local"
-    # Native Grok 4.5 is live. Broad candidate-unavailable probes can still
-    # happen on transient/request-shape blips, so do not evict the native
-    # candidate from routing. Other xAI alias candidates (Composer, Grok Build,
-    # managed OAuth Grok 4.5, etc.) stay request-local so missing/refreshing
-    # credentials cannot leave multi-hour Redis candidate cooldowns.
-    # Explicit rate-limit / capacity / quota classes still use candidate scope.
-    if error_class == "candidate_unavailable" and _is_codex_auto_agent_native_grok_4_5_candidate(candidate):
-        return "none"
-    if error_class == "candidate_unavailable" and _is_codex_auto_agent_xai_candidate(candidate):
-        return "request_local"
-    # Native Grok 4.5 malformed tool-call text remains rejected and can still
-    # redispatch in-flight, but must not write a durable candidate cooldown.
-    # Composer / Grok Build / non-native candidates keep durable candidate
-    # cooldowns for this class.
-    if error_class == "malformed_tool_call_text" and _is_codex_auto_agent_native_grok_4_5_candidate(candidate):
-        return "request_local"
-    if _is_codex_auto_agent_native_grok_4_5_candidate(
-        candidate
-    ) and _is_codex_auto_agent_transient_internal_error_class(error_class):
-        return "none"
-    if _is_codex_auto_agent_spark_candidate(candidate) and _is_codex_auto_agent_transient_internal_error_class(
-        error_class
-    ):
-        return "candidate"
-    return _get_codex_auto_agent_cooldown_scope(error_class)
 
 
 def _aawm_alias_route_verbose_json_enabled() -> bool:
@@ -4375,107 +3917,6 @@ _exclude_codex_auto_agent_request_local_candidate = _aawm_selection._exclude_cod
 _exclude_codex_auto_agent_request_local_candidate_without_cooldown = _aawm_selection._exclude_codex_auto_agent_request_local_candidate_without_cooldown
 
 
-def _resolve_auto_agent_cooldown_publication_plan(
-    *,
-    request: Optional[Request],
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    selected_cooldown_key: str,
-    cooldown_seconds: float,
-    error_class: Optional[str],
-    grok_account_quota_exhausted: bool = False,
-    kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
-) -> _aawm_alias_interfaces.CooldownPublicationPlan:
-    """Pure resolver: classify one failure into an immutable publication plan (R3-1).
-
-    Resolves the cooldown scope and derives the exact memory/durable target
-    keys WITHOUT performing any I/O, so the retry loop can publish the memory
-    keys synchronously inside the probe lock and persist the durable keys after
-    release -- both derived from this single plan so telemetry, waiter
-    visibility, and Redis state cannot disagree.
-
-    Scope targets (preserved exactly from the legacy apply chain):
-      - ``none`` / request-local -> no shared keys (request-local action only)
-      - ``candidate`` / ``model`` -> the selected candidate key
-      - Kimi ``managed_account`` -> the managed-account sentinel ONLY
-      - Grok account-quota -> the selected key PLUS the account-lane key
-
-    The read-pilot lane resolves its scope/duration from the N-of-M evidence
-    gate's current decision (fed earlier by the loop via
-    ``_record_read_pilot_cooldown_evidence``); when the gate says do-not-cool,
-    the plan carries ``applied_scope="none"`` and empty key sets.
-    """
-    if is_read_pilot_lane:
-        decision = _read_pilot_cooldown_gate.current_decision(cooldown_key=selected_cooldown_key)
-        if not decision.should_cool:
-            return _aawm_alias_interfaces.CooldownPublicationPlan(
-                applied_scope="none",
-                duration_seconds=0.0,
-                grok_account_quota_exhausted=grok_account_quota_exhausted,
-                kimi_failure_metadata=kimi_failure_metadata,
-            )
-        return _aawm_alias_interfaces.CooldownPublicationPlan(
-            memory_keys=(selected_cooldown_key,),
-            durable_keys=(selected_cooldown_key,),
-            duration_seconds=float(decision.duration_seconds),
-            applied_scope=decision.scope or "candidate",
-            grok_account_quota_exhausted=grok_account_quota_exhausted,
-            kimi_failure_metadata=kimi_failure_metadata,
-        )
-
-    cooldown_scope = _get_codex_auto_agent_candidate_cooldown_scope(
-        error_class,
-        candidate=candidate,
-        kimi_failure_metadata=kimi_failure_metadata,
-    )
-    duration = max(0.0, float(cooldown_seconds))
-    if cooldown_scope == "none":
-        return _aawm_alias_interfaces.CooldownPublicationPlan(
-            applied_scope="none",
-            duration_seconds=duration,
-            grok_account_quota_exhausted=grok_account_quota_exhausted,
-            kimi_failure_metadata=kimi_failure_metadata,
-        )
-    if cooldown_scope == "managed_account":
-        managed_key = _get_kimi_code_managed_account_cooldown_key()
-        return _aawm_alias_interfaces.CooldownPublicationPlan(
-            memory_keys=(managed_key,),
-            durable_keys=(managed_key,),
-            duration_seconds=duration,
-            applied_scope="managed_account",
-            grok_account_quota_exhausted=grok_account_quota_exhausted,
-            kimi_failure_metadata=kimi_failure_metadata,
-        )
-    if cooldown_scope == "candidate":
-        memory_keys = [selected_cooldown_key]
-        if grok_account_quota_exhausted:
-            lane_cooldown_key = _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
-                candidate,
-                lane_key,
-            )
-            if lane_cooldown_key is not None and lane_cooldown_key != selected_cooldown_key:
-                memory_keys.append(lane_cooldown_key)
-        keys = tuple(memory_keys)
-        return _aawm_alias_interfaces.CooldownPublicationPlan(
-            memory_keys=keys,
-            durable_keys=keys,
-            duration_seconds=duration,
-            applied_scope="candidate",
-            grok_account_quota_exhausted=grok_account_quota_exhausted,
-            kimi_failure_metadata=kimi_failure_metadata,
-        )
-    # request_local: no shared keys; the loop applies the request-local
-    # cooldown + exclusion post-release.
-    return _aawm_alias_interfaces.CooldownPublicationPlan(
-        applied_scope=cooldown_scope,
-        duration_seconds=duration,
-        request_local_action="request_local_cooldown",
-        grok_account_quota_exhausted=grok_account_quota_exhausted,
-        kimi_failure_metadata=kimi_failure_metadata,
-    )
-
-
 _apply_request_local_cooldown_from_plan = _aawm_selection._apply_request_local_cooldown_from_plan
 
 
@@ -4485,910 +3926,10 @@ _publish_codex_cooldown_memory = _aawm_cooldown_state._publish_codex_cooldown_me
 _publish_anthropic_cooldown_memory = _aawm_cooldown_state._publish_anthropic_cooldown_memory
 
 
-async def _persist_codex_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
-    """Persist codex cooldown keys to durable Redis (post-release, R3-1)."""
-    ttl_seconds = max(0.0, float(seconds))
-    if ttl_seconds <= 0:
-        return
-    for key in keys:
-        await _write_aawm_alias_routing_durable_payload(
-            alias_family="codex",
-            state_kind="cooldown",
-            state_key=key,
-            payload={"cooldown_key": key},
-            ttl_seconds=ttl_seconds,
-        )
-
-
-async def _persist_anthropic_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
-    """Persist anthropic cooldown keys to durable Redis (post-release, R3-1)."""
-    ttl_seconds = max(0.0, float(seconds))
-    if ttl_seconds <= 0:
-        return
-    for key in keys:
-        await _write_aawm_alias_routing_durable_payload(
-            alias_family="anthropic",
-            state_kind="cooldown",
-            state_key=key,
-            payload={"cooldown_key": key},
-            ttl_seconds=ttl_seconds,
-        )
-
-
-async def _apply_auto_agent_alias_cooldown(
-    *,
-    request: Request,
-    candidate: Payload,
-    lane_key: Optional[str],
-    selected_cooldown_key: str,
-    cooldown_seconds: float,
-    error_class: Optional[str],
-    set_candidate_cooldown: Callable[[str, float], Awaitable[object]],
-    grok_account_quota_exhausted: bool = False,
-    kimi_failure_metadata: Optional[dict[str, Any]] = None,
-) -> str:
-    """Shared auto-agent cooldown apply (RR-054 #12).
-
-    Codex and Anthropic families share scope resolution and request-local
-    exclusion; only the durable candidate setter differs.
-    """
-    cooldown_scope = _get_codex_auto_agent_candidate_cooldown_scope(
-        error_class,
-        candidate=candidate,
-        kimi_failure_metadata=kimi_failure_metadata,
-    )
-    if cooldown_scope == "none":
-        return cooldown_scope
-    if cooldown_scope == "managed_account":
-        await set_candidate_cooldown(
-            _get_kimi_code_managed_account_cooldown_key(),
-            cooldown_seconds,
-        )
-        return cooldown_scope
-    if cooldown_scope == "candidate":
-        await set_candidate_cooldown(
-            selected_cooldown_key,
-            cooldown_seconds,
-        )
-        if grok_account_quota_exhausted:
-            lane_cooldown_key = _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
-                candidate,
-                lane_key,
-            )
-            if lane_cooldown_key is not None and lane_cooldown_key != selected_cooldown_key:
-                await set_candidate_cooldown(
-                    lane_cooldown_key,
-                    cooldown_seconds,
-                )
-        return cooldown_scope
-
-    request_local_key = _get_codex_auto_agent_request_local_cooldown_key(
-        candidate=candidate,
-        lane_key=lane_key,
-    )
-    _set_codex_auto_agent_request_local_cooldown(
-        request,
-        cooldown_key=request_local_key,
-        cooldown_seconds=cooldown_seconds,
-    )
-    _exclude_codex_auto_agent_request_local_candidate(
-        request,
-        cooldown_key=request_local_key,
-    )
-    return cooldown_scope
-
-
-async def _apply_codex_auto_agent_alias_cooldown(
-    *,
-    request: Request,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    selected_cooldown_key: str,
-    cooldown_seconds: float,
-    error_class: Optional[str],
-    grok_account_quota_exhausted: bool = False,
-    kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
-) -> str:
-    # Route the read-alias lane to the N-of-M evidence gate by ALIAS identity
-    # (``is_read_pilot_lane``), not by a synthetic ``read_pilot:`` key prefix.
-    # The live selector builds ordinary ``provider:model:lane`` cooldown keys,
-    # so the gate now drives the applied cooldown for the read lane using that
-    # exact live key -- the same key the retry loop fed evidence to.
-    if is_read_pilot_lane:
-        return await _apply_read_pilot_gated_cooldown(
-            selected_cooldown_key=selected_cooldown_key,
-            set_candidate_cooldown=_set_codex_auto_agent_cooldown,
-        )
-    return await _apply_auto_agent_alias_cooldown(
-        request=request,
-        candidate=candidate,
-        lane_key=lane_key,
-        selected_cooldown_key=selected_cooldown_key,
-        cooldown_seconds=cooldown_seconds,
-        error_class=error_class,
-        set_candidate_cooldown=_set_codex_auto_agent_cooldown,
-        grok_account_quota_exhausted=grok_account_quota_exhausted,
-        kimi_failure_metadata=kimi_failure_metadata,
-    )
-
-
-async def _apply_read_pilot_gated_cooldown(
-    *,
-    selected_cooldown_key: str,
-    set_candidate_cooldown: Callable[[str, float], Awaitable[object]],
-) -> str:
-    """Apply the ``CooldownEvidenceGate``'s decision for the read-pilot lane.
-
-    Delegates to the pure publication-plan resolver
-    (:func:`_resolve_auto_agent_cooldown_publication_plan`) so this applicator
-    no longer owns a separate memory target or a fire-and-forget durable
-    target: the resolver derives the gate-driven scope/duration and the single
-    candidate key, this function publishes the memory key synchronously, and
-    the durable write is best-effort (must not block the selector-observed
-    value). The read-pilot lane's cooldown-worthiness is decided by
-    ``_read_pilot_cooldown_gate`` (fed via ``_record_read_pilot_cooldown_evidence``
-    on failure); when the gate says "do not cool yet", no cooldown is applied.
-    """
-    plan = _resolve_auto_agent_cooldown_publication_plan(
-        request=None,
-        candidate={},
-        lane_key=None,
-        selected_cooldown_key=selected_cooldown_key,
-        cooldown_seconds=0.0,
-        error_class=None,
-        is_read_pilot_lane=True,
-    )
-    if plan.applied_scope == "none" or not plan.memory_keys:
-        return "none"
-    # Apply to the authoritative in-memory cooldown state synchronously so the
-    # selector observes the full gate-resolved duration; the durable write is
-    # best-effort and must not block that value.
-    for key in plan.memory_keys:
-        _alias_routing_state.codex.set_cooldown_memory(key, plan.duration_seconds)
-    for key in plan.durable_keys:
-        asyncio.ensure_future(set_candidate_cooldown(key, plan.duration_seconds))
-    return plan.applied_scope
-
-
-async def _apply_anthropic_auto_agent_alias_cooldown(
-    *,
-    request: Request,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    selected_cooldown_key: str,
-    cooldown_seconds: float,
-    error_class: Optional[str],
-    grok_account_quota_exhausted: bool = False,
-    kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
-) -> str:
-    # The read pilot lane is Codex-only; the Anthropic applicator accepts the
-    # flag for call-site symmetry with the shared retry loop and ignores it.
-    _ = is_read_pilot_lane
-    return await _apply_auto_agent_alias_cooldown(
-        request=request,
-        candidate=candidate,
-        lane_key=lane_key,
-        selected_cooldown_key=selected_cooldown_key,
-        cooldown_seconds=cooldown_seconds,
-        error_class=error_class,
-        set_candidate_cooldown=_set_anthropic_auto_agent_cooldown,
-        grok_account_quota_exhausted=grok_account_quota_exhausted,
-        kimi_failure_metadata=kimi_failure_metadata,
-    )
-
-
-def _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc: Any) -> bool:
-    status_code = _extract_google_adapter_exception_status_code(exc)
-    return _is_known_grok_build_usage_balance_exhausted_response(
-        url=httpx.URL(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL),
-        custom_llm_provider=litellm.LlmProviders.XAI.value,
-        status_code=status_code,
-        exc=exc,
-    )
-
-
-def _is_codex_auto_agent_grok_personal_team_spending_limit(exc: Any) -> bool:
-    status_code = _extract_google_adapter_exception_status_code(exc)
-    return _is_known_grok_personal_team_spending_limit_response(
-        url=httpx.URL(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL),
-        custom_llm_provider=litellm.LlmProviders.XAI.value,
-        status_code=status_code,
-        exc=exc,
-    )
-
-
-def _is_codex_auto_agent_grok_account_quota_candidate(
-    candidate: Optional[dict[str, Any]],
-) -> bool:
-    if not isinstance(candidate, dict):
-        return False
-    if candidate.get("provider") != _CODEX_AUTO_AGENT_XAI_PROVIDER:
-        return False
-    route_family = str(candidate.get("route_family") or "")
-    return route_family in {
-        "codex_grok_native_responses_adapter",
-        "codex_xai_oauth_responses_adapter",
-        "anthropic_grok_native_responses_adapter",
-        "anthropic_xai_oauth_responses_adapter",
-    }
-
-
 _resolve_codex_auto_agent_xai_lane_key = _aawm_lane_keys._resolve_codex_auto_agent_xai_lane_key
 
 
-def _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(
-    candidate: Payload,
-    lane_key: Optional[str],
-) -> Optional[str]:
-    if not lane_key or not _is_codex_auto_agent_grok_account_quota_candidate(candidate):
-        return None
-    return f"{candidate.get('provider')}:__account_quota__:{lane_key}"
-
-
 _apply_codex_auto_agent_grok_account_lane_cooldown = _aawm_selection._apply_codex_auto_agent_grok_account_lane_cooldown
-
-
-def _is_codex_auto_agent_grok_account_quota_exhaustion(
-    exc: Any,
-    *,
-    candidate: Optional[dict[str, Any]] = None,
-) -> bool:
-    if not (
-        _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc)
-        or _is_codex_auto_agent_grok_personal_team_spending_limit(exc)
-    ):
-        return False
-    if candidate is None:
-        return True
-    return _is_codex_auto_agent_grok_account_quota_candidate(candidate)
-
-
-def _classify_codex_auto_agent_retryable_exhaustion(
-    exc: Any,
-) -> Optional[str]:
-    status_code = _extract_google_adapter_exception_status_code(exc)
-    tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
-        return "capacity_exhausted"
-    if "usage_limit_reached" in tokens:
-        return "usage_limit_reached"
-    if tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
-        return "capacity_exhausted"
-    if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
-        return "rate_limited"
-    if "aawm_codex_auto_agent_candidate_unavailable" in tokens:
-        return "candidate_unavailable"
-    if "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in tokens:
-        return "provider_format_rejected"
-    if "OPENROUTER_INVALID_CHAT_MESSAGE" in tokens:
-        return "provider_format_rejected"
-    if "OPENROUTER_INVALID_TOOL_CALL_ARGUMENTS" in tokens:
-        return "provider_format_rejected"
-    if "OPENROUTER_PROVIDER_RAW_ERROR" in tokens:
-        return "provider_terminal_error"
-    if "aawm_auto_agent_failed_responses_payload" in tokens:
-        return "provider_terminal_error"
-    if "aawm_auto_agent_malformed_tool_call_text" in tokens:
-        return "malformed_tool_call_text"
-    if "safety_policy_denied" in tokens:
-        return "safety_policy_denied"
-    if status_code == 429:
-        return "rate_limited"
-    if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
-        return "upstream_transient_internal"
-    if status_code == 504:
-        return "upstream_timeout"
-    return None
-
-
-def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
-    return _classify_codex_auto_agent_retryable_exhaustion(exc) is not None
-
-
-def _parse_codex_auto_agent_header_wait_seconds(exc: Any) -> Optional[float]:
-    headers = _extract_adapter_upstream_headers(exc)
-    retry_after = _parse_retry_after_seconds_from_headers(headers)
-    if retry_after is not None:
-        return max(1.0, retry_after)
-
-    wait_candidates: list[float] = []
-    for header_name in (
-        "X-RateLimit-Reset",
-        "x-ratelimit-reset",
-        "x-codex-primary-reset-at",
-        "x-codex-secondary-reset-at",
-        "x-codex-bengalfox-primary-reset-at",
-        "x-codex-bengalfox-secondary-reset-at",
-    ):
-        reset_value = _get_adapter_header_value(headers, header_name)
-        if reset_value is None:
-            continue
-        try:
-            reset_number = float(reset_value)
-        except Exception:
-            continue
-        if reset_number > 1_000_000_000_000:
-            reset_epoch_seconds = reset_number / 1000.0
-        else:
-            reset_epoch_seconds = reset_number
-        wait_candidates.append(max(1.0, reset_epoch_seconds - time.time()))
-    if not wait_candidates:
-        return None
-    return min(wait_candidates)
-
-
-def _get_codex_auto_agent_cooldown_seconds(
-    exc: Any,
-    *,
-    candidate: Optional[dict[str, Any]] = None,
-) -> float:
-    header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
-    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
-    tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if header_wait is not None:
-        resolved = max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
-    elif (
-        error_class in {"capacity_exhausted", "upstream_overloaded"} or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
-    ):
-        resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
-    elif _is_codex_auto_agent_transient_internal_error_class(error_class):
-        resolved = _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
-    elif "usage_limit_reached" in tokens:
-        resolved = _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
-    elif error_class == "malformed_tool_call_text":
-        resolved = _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS
-    elif "RESOURCE_EXHAUSTED" in tokens or "RATE_LIMIT_EXCEEDED" in tokens:
-        resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    elif _extract_google_adapter_exception_status_code(exc) in {429, 503, 529}:
-        resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    else:
-        resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
-
-    if _is_codex_auto_agent_spark_candidate(candidate) and _is_codex_auto_agent_durable_cooldown_error_class(
-        error_class
-    ):
-        return _CODEX_AUTO_AGENT_SPARK_DURABLE_COOLDOWN_SECONDS
-    if _is_codex_auto_agent_grok_account_quota_exhaustion(
-        exc,
-        candidate=candidate,
-    ) and _is_codex_auto_agent_durable_cooldown_error_class(error_class):
-        return _CODEX_AUTO_AGENT_GROK_ACCOUNT_QUOTA_DURABLE_COOLDOWN_SECONDS
-    return resolved
-
-
-def _iter_codex_auto_agent_error_blocks(exc: Any) -> list[dict[str, Any]]:
-    payloads: list[Any] = []
-    detail = getattr(exc, "detail", None)
-    if detail is not None:
-        payloads.append(detail)
-    payloads.extend(_extract_google_adapter_error_payloads(exc))
-
-    error_blocks: list[dict[str, Any]] = []
-    for parsed in payloads:
-        if isinstance(parsed, dict):
-            error = parsed.get("error")
-            if isinstance(error, dict):
-                error_blocks.append(error)
-        elif isinstance(parsed, list):
-            error_blocks.extend(
-                item["error"] for item in parsed if isinstance(item, dict) and isinstance(item.get("error"), dict)
-            )
-    return error_blocks
-
-
-def _extract_codex_auto_agent_error_type_and_code(
-    exc: Any,
-) -> tuple[Optional[str], Optional[Any]]:
-    fallback_error_type = _clean_codex_auth_value(getattr(exc, "type", None))
-    fallback_error_code: Optional[Any] = getattr(exc, "code", None)
-    error_type: Optional[str] = None
-    error_code: Optional[Any] = None
-    for error in _iter_codex_auto_agent_error_blocks(exc):
-        if error_type is None:
-            error_type = _clean_codex_auth_value(error.get("type") or error.get("status"))
-        if error_code is None:
-            error_code = error.get("code") or error.get("status")
-        if error_type is not None and error_code is not None:
-            return error_type, error_code
-    return error_type or fallback_error_type, error_code or fallback_error_code
-
-
-async def _set_codex_auto_agent_candidate_cooldowns(
-    *,
-    request: Request,
-    candidate: dict[str, Any],
-    lane_key: Optional[str],
-    selected_cooldown_key: str,
-    cooldown_seconds: float,
-    error_class: Optional[str],
-    grok_account_quota_exhausted: bool = False,
-    kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
-) -> str:
-    return await _apply_codex_auto_agent_alias_cooldown(
-        request=request,
-        candidate=candidate,
-        lane_key=lane_key,
-        selected_cooldown_key=selected_cooldown_key,
-        cooldown_seconds=cooldown_seconds,
-        error_class=error_class,
-        grok_account_quota_exhausted=grok_account_quota_exhausted,
-        kimi_failure_metadata=kimi_failure_metadata,
-        is_read_pilot_lane=is_read_pilot_lane,
-    )
-
-
-def _get_codex_auto_agent_source_error_summary(
-    exc: Any,
-    *,
-    status_code: Optional[int],
-) -> str:
-    raw_message = _extract_openrouter_adapter_raw_message(exc)
-    if isinstance(raw_message, str) and raw_message:
-        for parsed in _parse_json_payloads_from_text_candidates([raw_message]):
-            if not isinstance(parsed, dict):
-                continue
-            message = parsed.get("message")
-            if not isinstance(message, str):
-                error = parsed.get("error")
-                if isinstance(error, dict):
-                    message = error.get("message")
-            if isinstance(message, str) and message:
-                return _get_passthrough_handled_http_error_summary(
-                    HTTPException(
-                        status_code=status_code or status.HTTP_502_BAD_GATEWAY,
-                        detail=message,
-                    ),
-                    status_code=status_code,
-                )
-    return _get_passthrough_handled_http_error_summary(
-        exc,
-        status_code=status_code,
-    )
-
-
-def _update_codex_auto_agent_retryable_attempt_record(
-    *,
-    attempt_record: dict[str, Any],
-    exc: Any,
-    error_class: str,
-    cooldown_seconds: float,
-    cooldown_scope: Optional[str] = None,
-    alias_model: Optional[str] = None,
-    candidate: Optional[dict[str, Any]] = None,
-    kimi_failure_metadata: Optional[dict[str, Any]] = None,
-) -> set[str]:
-    error_tokens = _extract_codex_auto_agent_error_tokens(exc)
-    error_status_code = _extract_google_adapter_exception_status_code(exc)
-    error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
-    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
-    source_error = _get_codex_auto_agent_source_error_summary(
-        exc,
-        status_code=error_status_code,
-    )
-    update: dict[str, Any] = {
-        "status": ("retryable_no_cooldown" if cooldown_scope == "none" else "cooldown_set"),
-        "error_class": error_class,
-        "error_tokens": sorted(error_tokens),
-        "failure_phase": "provider_attempt",
-        "attempted_provider_call": True,
-        "source_error": source_error,
-    }
-    if cooldown_scope != "none":
-        update["cooldown_seconds"] = round(float(cooldown_seconds), 3)
-    if cooldown_scope is not None:
-        update["cooldown_scope"] = cooldown_scope
-    if error_status_code is not None:
-        update["error_status_code"] = error_status_code
-    if error_type is not None:
-        update["error_type"] = error_type
-    if error_code is not None:
-        update["error_code"] = str(error_code)
-    if retry_after_seconds is not None:
-        update["retry_after_seconds"] = round(float(retry_after_seconds), 3)
-    if alias_model is not None and candidate is not None and kimi_failure_metadata is not None:
-        update["kimi_code_failure"] = _build_safe_kimi_code_selection_telemetry(
-            alias_model=alias_model,
-            candidate=candidate,
-            metadata=kimi_failure_metadata,
-        )
-    attempt_record.update(update)
-    return error_tokens
-
-
-def _record_auto_agent_alias_attempt_started(
-    *,
-    alias_family: str,
-    alias_model: str,
-    request: Request,
-    prepared_request_body: dict[str, Any],
-    selection: dict[str, Any],
-    attempts: list[dict[str, Any]],
-    attempt_record: dict[str, Any],
-    add_alias_metadata_fn: Callable[..., dict[str, Any]],
-) -> dict[str, Any]:
-    candidate_body = add_alias_metadata_fn(
-        prepared_request_body,
-        request=request,
-        selection=selection,
-        attempts=attempts,
-    )
-    _safe_set_request_parsed_body(request, candidate_body)
-    candidate_metadata = candidate_body.get("litellm_metadata")
-    audit_events = (
-        candidate_metadata.get("aawm_alias_routing_audit_events") if isinstance(candidate_metadata, dict) else None
-    )
-    if (
-        isinstance(audit_events, list)
-        and audit_events
-        and (_aawm_alias_route_verbose_json_enabled() or _aawm_alias_route_healthy_json_enabled())
-    ):
-        latest_event = audit_events[-1]
-        if isinstance(latest_event, dict):
-            _emit_auto_agent_alias_route_event(latest_event)
-    return candidate_body
-
-
-def _record_read_pilot_cooldown_evidence(
-    *,
-    cooldown_key: Optional[str],
-    exc: Any,
-    attempt_record: dict[str, Any],
-) -> None:
-    """Classify + record the CURRENT read-pilot attempt's failure evidence.
-
-    Called from the retry loop BEFORE the cooldown is applied for the same
-    attempt, so a structured failure cools immediately (N=1) and a marker
-    failure counts toward its N-of-M threshold on this attempt. The evidence
-    is keyed on the live ``provider:model:lane`` cooldown key so the gate and
-    the applied cooldown share one authoritative key. Classification inputs
-    (status code, source-error text, retry-after) are extracted directly from
-    the raised exception rather than the post-apply attempt record, because
-    those record fields are not populated until after the cooldown decision.
-
-    ``origin`` (upstream/client/unknown; only ``upstream`` ever advances a key
-    toward cooling) is stamped on the attempt record for downstream audit.
-    """
-    error_status_code = _extract_google_adapter_exception_status_code(exc)
-    source_error = _get_codex_auto_agent_source_error_summary(exc, status_code=error_status_code)
-    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
-    event = _aawm_alias_classification.classify_failure(
-        status_code=error_status_code,
-        provider=None,
-        message=str(source_error or ""),
-        retry_after_seconds=retry_after_seconds,
-    )
-    attempt_record["origin"] = event.origin
-    _read_pilot_cooldown_gate.record(
-        cooldown_key=cooldown_key or "read_pilot:unknown",
-        event=event,
-    )
-
-
-def _record_auto_agent_alias_attempt_failure(
-    *,
-    alias_family: str,
-    alias_model: str,
-    request: Request,
-    prepared_request_body: dict[str, Any],
-    selection: dict[str, Any],
-    attempts: list[dict[str, Any]],
-    attempt_record: dict[str, Any],
-    error_class: str,
-    add_alias_metadata_fn: Callable[..., dict[str, Any]],
-    redispatch_required: bool = False,
-) -> dict[str, Any]:
-    # Read-pilot cooldown evidence is recorded in the retry loop BEFORE the
-    # cooldown is applied (see ``_record_read_pilot_cooldown_evidence``), so it
-    # is intentionally NOT re-recorded here -- doing so would double-count
-    # marker evidence and double-advance the structured attempt counter.
-    failure_body = add_alias_metadata_fn(
-        prepared_request_body,
-        request=request,
-        selection=selection,
-        attempts=attempts,
-    )
-    _safe_set_request_parsed_body(request, failure_body)
-    failure_metadata = failure_body.get("litellm_metadata")
-    full_audit_events = (
-        failure_metadata.get("aawm_alias_routing_audit_events") if isinstance(failure_metadata, dict) else None
-    )
-    audit_events = [event for event in full_audit_events or [] if isinstance(event, dict)]
-    audit_event = audit_events[-1] if audit_events else None
-    if audit_event is None:
-        audit_event = _build_auto_agent_alias_audit_event(
-            alias_family=alias_family,
-            alias_model=alias_model,
-            request=request,
-            request_body=prepared_request_body,
-            selection=selection,
-            candidate=attempt_record,
-            event_type="redispatch_required" if redispatch_required else "candidate_retryable_failure",
-            candidate_status=attempt_record.get("status") or "cooldown_set",
-            attempt_number=len(attempts),
-            selected=True,
-            selection_reason=selection.get("selection_reason"),
-            lane_key=selection.get("lane_key"),
-            cooldown_key=selection.get("cooldown_key"),
-            cooldown_seconds=attempt_record.get("cooldown_seconds"),
-            cooldown_scope=attempt_record.get("cooldown_scope"),
-            failure_class=error_class,
-            error_status_code=attempt_record.get("error_status_code"),
-            error_type=attempt_record.get("error_type"),
-            error_code=attempt_record.get("error_code"),
-            error_tokens=attempt_record.get("error_tokens"),
-            source_error=attempt_record.get("source_error"),
-            retry_after_seconds=attempt_record.get("retry_after_seconds"),
-            failure_phase=attempt_record.get("failure_phase"),
-            attempted_provider_call=attempt_record.get("attempted_provider_call"),
-            redispatch_required=redispatch_required,
-        )
-        audit_events = [audit_event]
-    _emit_auto_agent_alias_route_event(
-        audit_event,
-        level="warning",
-    )
-    # Only terminal redispatch outcomes use audit-only persistence. Mid-loop
-    # retryable 429s that continue failover still reach a normal success or
-    # no-candidate write path and must not double-write audit rows.
-    if redispatch_required:
-        _persist_auto_agent_alias_audit_only_events_best_effort(
-            audit_events,
-            request_body=prepared_request_body,
-        )
-    return failure_body
-
-
-def _extract_codex_reasoning_effort(
-    request_body: dict[str, Any],
-) -> tuple[Optional[str], Optional[str]]:
-    reasoning = request_body.get("reasoning")
-    if isinstance(reasoning, dict) and "effort" in reasoning:
-        value = reasoning.get("effort")
-        return (value if isinstance(value, str) else None), "reasoning.effort"
-    if "reasoning_effort" in request_body:
-        value = request_body.get("reasoning_effort")
-        return (value if isinstance(value, str) else None), "reasoning_effort"
-    return None, None
-
-
-def _get_codex_reasoning_effort_ceiling(
-    resolved_route: dict[str, Any],
-) -> Optional[str]:
-    if (
-        resolved_route.get("provider") != litellm.LlmProviders.OPENAI.value
-        or resolved_route.get("route_family") != "codex_responses"
-    ):
-        return None
-
-    model = resolved_route.get("model")
-    if not isinstance(model, str) or not model:
-        return None
-    model_info_sources: list[Mapping[str, Any]] = []
-    try:
-        resolved_model_info = litellm.get_model_info(
-            model=model,
-            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
-        )
-        if isinstance(resolved_model_info, dict):
-            model_info_sources.append(resolved_model_info)
-    except Exception:
-        pass
-    for model_cost in (
-        litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_policy(),
-    ):
-        catalog_model_info = model_cost.get(model)
-        if isinstance(catalog_model_info, dict):
-            model_info_sources.append(catalog_model_info)
-
-    if any(model_info.get("supports_max_reasoning_effort") is True for model_info in model_info_sources):
-        return "max"
-    if any(model_info.get("supports_xhigh_reasoning_effort") is True for model_info in model_info_sources):
-        return "xhigh"
-    if any(model_info.get("supports_reasoning") is True for model_info in model_info_sources) and any(
-        model_info.get("supports_xhigh_reasoning_effort") is False for model_info in model_info_sources
-    ):
-        return "high"
-    return None
-
-
-def _normalize_codex_reasoning_effort_for_resolved_route(
-    request_body: dict[str, Any],
-    *,
-    resolved_route: dict[str, Any],
-    attempt_number: Optional[int] = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    requested_effort, native_field = _extract_codex_reasoning_effort(request_body)
-    if requested_effort not in _CODEX_REASONING_EFFORT_TIER_INDEX or native_field is None:
-        return request_body, {}
-
-    supported_ceiling = _get_codex_reasoning_effort_ceiling(resolved_route)
-    if supported_ceiling is None:
-        return request_body, {}
-
-    emitted_effort = requested_effort
-    mapping_reason = "within_supported_ceiling"
-    if _CODEX_REASONING_EFFORT_TIER_INDEX[requested_effort] > _CODEX_REASONING_EFFORT_TIER_INDEX[supported_ceiling]:
-        emitted_effort = supported_ceiling
-        mapping_reason = "requested_effort_above_model_supported_ceiling"
-
-    updated_body = dict(request_body)
-    if emitted_effort != requested_effort:
-        if native_field == "reasoning.effort":
-            reasoning = dict(updated_body.get("reasoning") or {})
-            reasoning["effort"] = emitted_effort
-            updated_body["reasoning"] = reasoning
-        else:
-            updated_body["reasoning_effort"] = emitted_effort
-
-    litellm_metadata = dict(updated_body.get("litellm_metadata") or {})
-    existing_tags = litellm_metadata.get("tags")
-    if isinstance(existing_tags, list):
-        litellm_metadata["tags"] = [
-            tag
-            for tag in existing_tags
-            if not (
-                isinstance(tag, str)
-                and (
-                    tag == "reasoning-effort-clamped"
-                    or tag.startswith("codex-effort:")
-                    or tag.startswith("effort:")
-                    or tag.startswith("reasoning-effort-ceiling:")
-                    or tag.startswith("reasoning-effort-map:")
-                    or tag.startswith("codex-auto-agent-attempt:")
-                )
-            )
-        ]
-    updated_body["litellm_metadata"] = litellm_metadata
-
-    provider = str(resolved_route["provider"])
-    model = str(resolved_route["model"])
-    mapping_metadata: dict[str, Any] = {
-        "codex_reasoning_effort": emitted_effort,
-        "reasoning_effort_requested": requested_effort,
-        "reasoning_effort_source": native_field,
-        "reasoning_effort_native_provider": provider,
-        "reasoning_effort_native_value": emitted_effort,
-        "reasoning_effort_native_field": native_field,
-        "reasoning_effort_supported_ceiling": supported_ceiling,
-        "reasoning_effort_resolved_model": model,
-        "reasoning_effort_resolved_provider": provider,
-        "reasoning_effort_mapping_reason": mapping_reason,
-        "openai_reasoning_effort": emitted_effort,
-    }
-    tags_to_add = [
-        f"codex-effort:{emitted_effort}",
-        f"effort:{emitted_effort}",
-        f"reasoning-effort-ceiling:{supported_ceiling}",
-    ]
-    if attempt_number is not None:
-        mapping_metadata["reasoning_effort_candidate_attempt"] = attempt_number
-        tags_to_add.append(f"codex-auto-agent-attempt:{attempt_number}")
-    if emitted_effort != requested_effort:
-        mapping_metadata.update(
-            {
-                "reasoning_effort_clamped_from": requested_effort,
-                "reasoning_effort_clamp_reason": mapping_reason,
-            }
-        )
-        tags_to_add.extend(
-            [
-                "reasoning-effort-clamped",
-                f"reasoning-effort-map:{requested_effort}-to-{emitted_effort}",
-            ]
-        )
-
-    return (
-        _merge_litellm_metadata(
-            updated_body,
-            tags_to_add=tags_to_add,
-            extra_fields=mapping_metadata,
-        ),
-        mapping_metadata,
-    )
-
-
-def _add_codex_auto_agent_alias_metadata(
-    request_body: dict[str, Any],
-    *,
-    request: Request,
-    selection: dict[str, Any],
-    attempts: list[dict[str, Any]],
-) -> dict[str, Any]:
-    candidate = selection["candidate"]
-    alias_model = (
-        selection.get("alias_model")
-        or _normalize_codex_auto_agent_alias_model(request_body.get("model"))
-        or _CODEX_AUTO_AGENT_MODEL_ALIAS
-    )
-    target_model = candidate["model"]
-    updated_body = copy.deepcopy(request_body)
-    updated_body["model"] = target_model
-    default_reasoning_effort = _normalize_low_cardinality_tag_value(candidate.get("default_reasoning_effort"))
-    default_reasoning_applied = False
-    if default_reasoning_effort and "reasoning_effort" not in updated_body:
-        reasoning = updated_body.get("reasoning")
-        if not isinstance(reasoning, dict):
-            updated_body["reasoning"] = {"effort": default_reasoning_effort}
-            default_reasoning_applied = True
-        elif not reasoning.get("effort"):
-            updated_body["reasoning"] = {
-                **reasoning,
-                "effort": default_reasoning_effort,
-            }
-            default_reasoning_applied = True
-    attempt_number = max(1, len(attempts))
-    (
-        updated_body,
-        reasoning_effort_metadata,
-    ) = _normalize_codex_reasoning_effort_for_resolved_route(
-        updated_body,
-        resolved_route=candidate,
-        attempt_number=attempt_number,
-    )
-    audit_selection = selection
-    if reasoning_effort_metadata:
-        if attempts:
-            attempts[-1].update(reasoning_effort_metadata)
-        else:
-            audit_selection = {
-                **selection,
-                "candidate": {
-                    **candidate,
-                    **reasoning_effort_metadata,
-                },
-            }
-    skipped = selection.get("skipped") or []
-    audit_events = _build_auto_agent_alias_audit_events(
-        alias_family="codex_auto_agent",
-        alias_model=alias_model,
-        request=request,
-        request_body=request_body,
-        selection=audit_selection,
-        attempts=attempts,
-    )
-    return _merge_litellm_metadata(
-        updated_body,
-        tags_to_add=[
-            "codex-auto-agent-alias",
-            f"codex-auto-agent-selected:{target_model}",
-            f"codex-auto-agent-route:{candidate['route_family']}",
-            f"model-alias:{alias_model}",
-            *(["codex-auto-agent-last-resort"] if candidate.get("last_resort") else []),
-            *([f"codex-auto-agent-default-effort:{default_reasoning_effort}"] if default_reasoning_applied else []),
-            f"codex-auto-agent-alias:{alias_model}",
-        ],
-        extra_fields={
-            "model_alias_label": alias_model,
-            "requested_model_alias": alias_model,
-            "codex_auto_agent_alias": alias_model,
-            "codex_auto_agent_selected_provider": candidate["provider"],
-            "codex_auto_agent_selected_model": target_model,
-            "codex_auto_agent_selected_route_family": candidate["route_family"],
-            "codex_auto_agent_selected_last_resort": bool(candidate.get("last_resort")),
-            **(
-                {
-                    "codex_auto_agent_default_reasoning_effort": (default_reasoning_effort),
-                    "codex_reasoning_effort": (
-                        reasoning_effort_metadata.get("codex_reasoning_effort") or default_reasoning_effort
-                    ),
-                }
-                if default_reasoning_applied
-                else {}
-            ),
-            "codex_auto_agent_selection_reason": selection.get("selection_reason"),
-            "codex_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
-            "codex_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),
-            "codex_auto_agent_lane_key": selection.get("lane_key"),
-            "codex_auto_agent_attempts": attempts,
-            "codex_auto_agent_skipped_candidates": skipped,
-            "codex_auto_agent_audit_events": audit_events,
-            "aawm_alias_routing_audit_events": audit_events,
-        },
-    )
 
 
 _normalize_anthropic_auto_agent_alias_model = _aawm_selection._normalize_anthropic_auto_agent_alias_model
@@ -5470,61 +4011,6 @@ _raise_anthropic_auto_agent_redispatch_required = _aawm_selection._raise_anthrop
 
 
 _select_anthropic_auto_agent_candidate = _aawm_selection._select_anthropic_auto_agent_candidate
-
-
-def _add_anthropic_auto_agent_alias_metadata(
-    request_body: dict[str, Any],
-    *,
-    request: Request,
-    selection: dict[str, Any],
-    attempts: list[dict[str, Any]],
-) -> dict[str, Any]:
-    candidate = selection["candidate"]
-    alias_model = (
-        selection.get("alias_model")
-        or _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
-        or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-    )
-    target_model = candidate["model"]
-    updated_body = copy.deepcopy(request_body)
-    updated_body["model"] = target_model
-    skipped = selection.get("skipped") or []
-    audit_events = _build_auto_agent_alias_audit_events(
-        alias_family="anthropic_auto_agent",
-        alias_model=alias_model,
-        request=request,
-        request_body=request_body,
-        selection=selection,
-        attempts=attempts,
-    )
-    return _merge_litellm_metadata(
-        updated_body,
-        tags_to_add=[
-            "anthropic-auto-agent-alias",
-            f"anthropic-auto-agent-selected:{target_model}",
-            f"anthropic-auto-agent-route:{candidate['route_family']}",
-            f"model-alias:{alias_model}",
-            *(["anthropic-auto-agent-last-resort"] if candidate.get("last_resort") else []),
-            f"anthropic-auto-agent-alias:{alias_model}",
-        ],
-        extra_fields={
-            "model_alias_label": alias_model,
-            "requested_model_alias": alias_model,
-            "anthropic_auto_agent_alias": alias_model,
-            "anthropic_auto_agent_selected_provider": candidate["provider"],
-            "anthropic_auto_agent_selected_model": target_model,
-            "anthropic_auto_agent_selected_route_family": candidate["route_family"],
-            "anthropic_auto_agent_selected_last_resort": bool(candidate.get("last_resort")),
-            "anthropic_auto_agent_selection_reason": selection.get("selection_reason"),
-            "anthropic_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
-            "anthropic_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),
-            "anthropic_auto_agent_lane_key": selection.get("lane_key"),
-            "anthropic_auto_agent_attempts": attempts,
-            "anthropic_auto_agent_skipped_candidates": skipped,
-            "anthropic_auto_agent_audit_events": audit_events,
-            "aawm_alias_routing_audit_events": audit_events,
-        },
-    )
 
 
 _resolve_anthropic_openai_responses_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_openai_responses_adapter_model
@@ -6852,6 +5338,76 @@ _aawm_selection.configure_selection_runtime(
     get_grok_account_quota_lane_cooldown_key=lambda *a, **kw: _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(*a, **kw),
     is_kimi_code_candidate=lambda *a, **kw: _is_kimi_code_auto_agent_candidate(*a, **kw),
     get_kimi_managed_account_cooldown_key=lambda *a, **kw: _get_kimi_code_managed_account_cooldown_key(*a, **kw),
+)
+
+# Wave 5C: bind host dependencies into error_signals.
+# Late-binding lambdas ensure god-module names resolve at call time.
+_aawm_error_signals.configure_error_signals_runtime(
+    extract_google_adapter_exception_detail=lambda *a, **kw: _extract_google_adapter_exception_detail(*a, **kw),
+    extract_google_adapter_error_payloads=lambda *a, **kw: _extract_google_adapter_error_payloads(*a, **kw),
+    is_openrouter_adapter_provider_raw_error=lambda *a, **kw: _is_openrouter_adapter_provider_raw_error(*a, **kw),
+    extract_google_adapter_exception_status_code=lambda *a, **kw: _extract_google_adapter_exception_status_code(*a, **kw),
+    extract_adapter_upstream_headers=lambda *a, **kw: _extract_adapter_upstream_headers(*a, **kw),
+    parse_retry_after_seconds_from_headers=lambda *a, **kw: _parse_retry_after_seconds_from_headers(*a, **kw),
+    get_adapter_header_value=lambda *a, **kw: _get_adapter_header_value(*a, **kw),
+    extract_openrouter_adapter_raw_message=lambda *a, **kw: _extract_openrouter_adapter_raw_message(*a, **kw),
+    parse_json_payloads_from_text_candidates=lambda *a, **kw: _parse_json_payloads_from_text_candidates(*a, **kw),
+    get_passthrough_handled_http_error_summary=lambda *a, **kw: _get_passthrough_handled_http_error_summary(*a, **kw),
+    is_known_grok_build_usage_balance_exhausted_response=lambda *a, **kw: _is_known_grok_build_usage_balance_exhausted_response(*a, **kw),
+    is_known_grok_personal_team_spending_limit_response=lambda *a, **kw: _is_known_grok_personal_team_spending_limit_response(*a, **kw),
+    durable_cooldown_error_classes=_CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES,
+    capacity_error_tokens=_CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS,
+    rate_limit_error_tokens=_CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS,
+    native_grok_backoff_base_seconds=_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS,
+    native_grok_backoff_max_seconds=_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS,
+    native_grok_backoff_jitter_seconds=_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS,
+)
+
+# Wave 5C: bind error_signals / selection / cooldown_state / durable / state
+# dependencies into cooldown_apply.
+_aawm_cooldown_apply.configure_cooldown_apply_runtime(
+    get_candidate_cooldown_scope=lambda *a, **kw: _get_codex_auto_agent_candidate_cooldown_scope(*a, **kw),
+    get_kimi_managed_account_cooldown_key=lambda *a, **kw: _get_kimi_code_managed_account_cooldown_key(*a, **kw),
+    get_grok_account_quota_lane_cooldown_key=lambda *a, **kw: _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(*a, **kw),
+    get_request_local_cooldown_key=lambda *a, **kw: _get_codex_auto_agent_request_local_cooldown_key(*a, **kw),
+    set_request_local_cooldown=lambda *a, **kw: _set_codex_auto_agent_request_local_cooldown(*a, **kw),
+    exclude_request_local_candidate=lambda *a, **kw: _exclude_codex_auto_agent_request_local_candidate(*a, **kw),
+    set_codex_cooldown=lambda *a, **kw: _set_codex_auto_agent_cooldown(*a, **kw),
+    set_anthropic_cooldown=lambda *a, **kw: _set_anthropic_auto_agent_cooldown(*a, **kw),
+    write_durable_payload=lambda *a, **kw: _aawm_alias_durable.write_aawm_alias_routing_durable_payload(*a, **kw),
+    read_pilot_gate=_read_pilot_cooldown_gate,
+    state_manager=_alias_routing_state,
+)
+
+# Wave 5C: bind error_signals / classification / host dependencies into
+# attempt_records.
+_aawm_attempt_records.configure_attempt_records_runtime(
+    extract_error_tokens=lambda *a, **kw: _extract_codex_auto_agent_error_tokens(*a, **kw),
+    extract_error_type_and_code=lambda *a, **kw: _extract_codex_auto_agent_error_type_and_code(*a, **kw),
+    parse_header_wait_seconds=lambda *a, **kw: _parse_codex_auto_agent_header_wait_seconds(*a, **kw),
+    get_source_error_summary=lambda *a, **kw: _get_codex_auto_agent_source_error_summary(*a, **kw),
+    build_kimi_telemetry=lambda *a, **kw: _build_safe_kimi_code_selection_telemetry(*a, **kw),
+    extract_status_code=lambda *a, **kw: _extract_google_adapter_exception_status_code(*a, **kw),
+    safe_set_parsed_body=lambda *a, **kw: _safe_set_request_parsed_body(*a, **kw),
+    emit_route_event=lambda *a, **kw: _emit_auto_agent_alias_route_event(*a, **kw),
+    build_audit_event=lambda *a, **kw: _build_auto_agent_alias_audit_event(*a, **kw),
+    build_audit_events=lambda *a, **kw: _build_auto_agent_alias_audit_events(*a, **kw),
+    persist_audit_only_events=lambda *a, **kw: _persist_auto_agent_alias_audit_only_events_best_effort(*a, **kw),
+    verbose_json_enabled=lambda *a, **kw: _aawm_alias_route_verbose_json_enabled(*a, **kw),
+    healthy_json_enabled=lambda *a, **kw: _aawm_alias_route_healthy_json_enabled(*a, **kw),
+    merge_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
+    normalize_tag_value=lambda *a, **kw: _normalize_low_cardinality_tag_value(*a, **kw),
+    normalize_codex_alias_model=lambda *a, **kw: _normalize_codex_auto_agent_alias_model(*a, **kw),
+    normalize_anthropic_alias_model=lambda *a, **kw: _normalize_anthropic_auto_agent_alias_model(*a, **kw),
+    load_bundled_model_cost=lambda *a, **kw: cast(
+        Callable[..., dict[str, Any]],
+        globals()["_load_bundled_model_cost_map_for_codex_policy"],
+    )(*a, **kw),
+    get_model_info=lambda *a, **kw: litellm.get_model_info(*a, **kw),
+    model_cost=litellm.model_cost,
+    openai_provider_value=litellm.LlmProviders.OPENAI.value,
+    classify_failure=lambda *a, **kw: _aawm_alias_classification.classify_failure(*a, **kw),
+    read_pilot_gate_record=lambda *a, **kw: _read_pilot_cooldown_gate.record(*a, **kw),
 )
 
 async def _wait_for_openrouter_adapter_cooldown_if_needed(
@@ -22891,6 +21447,9 @@ def create_generic_websocket_passthrough_endpoint(
 _aawm_lane_keys.install(globals())
 _aawm_selection.install(globals())
 _aawm_cooldown_state.install(globals())
+_aawm_error_signals.install(globals())
+_aawm_cooldown_apply.install(globals())
+_aawm_attempt_records.install(globals())
 _aawm_selection._attach_aawm_alias_routing_state_sources = (
     _aawm_cooldown_state._attach_aawm_alias_routing_state_sources
 )

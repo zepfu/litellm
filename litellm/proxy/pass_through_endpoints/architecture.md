@@ -241,6 +241,9 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Config refresh handler body and YAML source loading (decorator stays in god module) | `aawm_alias_routing/config_refresh.py` |
 | Codex auth-file discovery, JWT decode, token validation, Codex-native-auth request detection | `aawm_alias_routing/codex_oauth.py` |
 | OpenRouter free-daily-quota probe, durable cooldown helpers, alias-probe cooldown gate | `aawm_alias_routing/openrouter_quota.py` |
+| Failure token extraction, retryable-exhaustion classification, cooldown scope/duration derivation, Kimi safe metadata, Grok account-lane keys, native-Grok continuation retry planning | `aawm_alias_routing/error_signals.py` |
+| Immutable cooldown publication-plan resolution, post-lock durable persistence, Codex/Anthropic cooldown application, read-pilot gated application | `aawm_alias_routing/cooldown_apply.py` |
+| Attempt lifecycle mutation, read-pilot evidence recording, reasoning-effort normalization, Codex/Anthropic alias metadata composition | `aawm_alias_routing/attempt_records.py` |
 | Route registration, process-local routing call sites, compatibility re-exports, and residual provider orchestration | `llm_passthrough_endpoints.py` |
 
 The legacy `aawm_alias_routing_policy.py` module is a compatibility facade over
@@ -303,6 +306,34 @@ methods or injected callbacks:
 | Codex/Anthropic active cooldown reads/writes, session affinity, merged-family state, R3-1 memory publication, state-source attachment | `aawm_alias_routing/cooldown_state.py` |
 | Candidate lookup, state construction, availability shaping, request-local cooldown/exclusion, forced/adapter/Kimi/Grok lane application, Codex/Anthropic selectors, in-flight/redispatch errors | `aawm_alias_routing/selection.py` |
 | Read-pilot evidence gate, round-robin cursor, OpenRouter quota cache/lock | `aawm_alias_routing/state.py` (`AliasRoutingStateManager`) |
+
+#### Wave 5C ownership and baseline parity
+
+Wave 5C moves 50 functions from `llm_passthrough_endpoints.py` at baseline
+`79fc94c3a5` into `error_signals.py` (33), `cooldown_apply.py` (8), and
+`attempt_records.py` (9). The god module exposes same-object compatibility
+facades; the functions retain their owning module globals, while host services
+are supplied through explicit runtime configuration callbacks. This preserves
+the existing god-module monkeypatch surface used by `candidate_loop.py` without
+making any Wave 5C module import the god module at module scope.
+
+The normalized AST contract matches all 50 baseline bodies and signatures.
+Raw source differences are limited to extraction mechanics:
+
+| Difference | Scope | Reason |
+|------------|-------|--------|
+| Fail-fast `assert` guards on configured callbacks | 25 frozen functions | Surface incomplete runtime wiring at the owning module boundary instead of failing later with an opaque `NoneType` call |
+| Renamed callback globals and direct `CooldownPublicationPlan` import | Seven `cooldown_apply.py` functions | Keep publication resolution, durable persistence, request-local application, family setters, read-pilot gate, and state manager explicit while preserving control flow and target keys |
+| Classification/gate/model-catalog callback names | Three `attempt_records.py` functions | Keep Wave 5D audit services and model information as configured host dependencies |
+| Local FastAPI/status imports in source-error summarization | `_get_codex_auto_agent_source_error_summary` | Avoid a module-scope god-module dependency while preserving the same `HTTPException` construction |
+| Same-object `install()` facade publication | All three Wave 5C modules | Preserve module globals and explicit callbacks; avoid host-global rebinding that breaks module imports and cross-suite isolation |
+
+`_apply_request_local_cooldown_from_plan` and
+`_apply_codex_auto_agent_grok_account_lane_cooldown` remain defined by
+`selection.py`. Synchronous memory publishers remain defined by
+`cooldown_state.py`. The candidate loop resolves Wave 5C callables through the
+god-module facades at invocation time so existing tests and operators can
+monkeypatch the compatibility surface.
 
 Codex continuation affinity fails closed when its pinned candidate is absent
 from the active enumeration or its route family is incompatible. This applies

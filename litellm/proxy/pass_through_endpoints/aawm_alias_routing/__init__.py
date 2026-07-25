@@ -4,6 +4,9 @@ Layers:
 - ``policy``: static candidate tables, allowlists, cooldown defaults
 - ``state``: process-local cooldown/affinity/lane/oauth maps + locks
 - ``memory`` / ``retry``: shared map bounding and cooldown wait primitives
+- ``error_signals``: failure extraction, classification, cooldown scope, retry planning
+- ``cooldown_apply``: immutable publication plans and cooldown application
+- ``attempt_records``: attempt mutation, evidence, reasoning normalization, metadata
 - ``adapter_config``: config descriptors for Anthropic adapter routes
 - ``oauth_token_cache`` / ``google_oauth``: Google OAuth token cache + I/O
 - ``task_state``: structured/configurable task-state preservation contract
@@ -19,7 +22,10 @@ from __future__ import annotations
 from . import (
     adapter_config,
     adapter_driver,
+    attempt_records,
+    cooldown_apply,
     cooldown_state,
+    error_signals,
     google_oauth,
     memory,
     oauth_token_cache,
@@ -39,7 +45,10 @@ __all__ = [
     "adapter_driver",
     "alias_routing_state",
     "AliasRoutingStateManager",
+    "attempt_records",
+    "cooldown_apply",
     "cooldown_state",
+    "error_signals",
     "google_oauth",
     "memory",
     "oauth_token_cache",

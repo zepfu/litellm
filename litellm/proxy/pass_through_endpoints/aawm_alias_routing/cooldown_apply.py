@@ -1,0 +1,513 @@
+"""Cooldown publication-plan resolution and application for alias routing.
+
+Wave 5C extraction from ``llm_passthrough_endpoints.py``.  Behavior-preserving
+relocation only; no logic changes.
+
+Owns:
+- ``_resolve_auto_agent_cooldown_publication_plan`` (pure resolver)
+- ``_persist_codex_cooldown_durable`` / ``_persist_anthropic_cooldown_durable``
+- ``_apply_auto_agent_alias_cooldown`` (shared apply)
+- ``_apply_codex_auto_agent_alias_cooldown`` / ``_apply_anthropic_auto_agent_alias_cooldown``
+- ``_apply_read_pilot_gated_cooldown``
+- ``_set_codex_auto_agent_candidate_cooldowns`` (compatibility entry point)
+
+Dependencies on error_signals.py, selection.py, cooldown_state.py, durable.py,
+and state.py are injected via :func:`configure_cooldown_apply_runtime`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Awaitable, Callable, Optional, Sequence
+
+from fastapi import Request
+
+from .interfaces import CooldownPublicationPlan
+from .types import Payload
+
+# ---------------------------------------------------------------------------
+# Injected runtime seams
+# ---------------------------------------------------------------------------
+
+# error_signals.py owned
+_get_candidate_cooldown_scope: Optional[
+    Callable[..., str]
+] = None
+_get_kimi_managed_account_cooldown_key: Optional[Callable[[], str]] = None
+_get_grok_account_quota_lane_cooldown_key: Optional[
+    Callable[[Any, Optional[str]], Optional[str]]
+] = None
+
+# selection.py owned (request-local helpers)
+_get_request_local_cooldown_key: Optional[
+    Callable[..., str]
+] = None
+_set_request_local_cooldown: Optional[
+    Callable[..., None]
+] = None
+_exclude_request_local_candidate: Optional[
+    Callable[..., None]
+] = None
+
+# cooldown_state.py owned (durable candidate setters)
+_set_codex_cooldown: Optional[Callable[[str, float], Awaitable[object]]] = None
+_set_anthropic_cooldown: Optional[Callable[[str, float], Awaitable[object]]] = None
+
+# durable.py owned
+_write_durable_payload: Optional[Callable[..., Awaitable[object]]] = None
+
+# state.py owned (read-pilot gate + memory publication)
+_read_pilot_gate: Optional[Any] = None
+_state_manager: Optional[Any] = None
+
+
+# Reference to host_globals set by install(); configure updates it too.
+_host_globals_ref: dict | None = None
+
+
+def configure_cooldown_apply_runtime(
+    *,
+    get_candidate_cooldown_scope: Callable[..., str],
+    get_kimi_managed_account_cooldown_key: Callable[[], str],
+    get_grok_account_quota_lane_cooldown_key: Callable[[Any, Optional[str]], Optional[str]],
+    get_request_local_cooldown_key: Callable[..., str],
+    set_request_local_cooldown: Callable[..., None],
+    exclude_request_local_candidate: Callable[..., None],
+    set_codex_cooldown: Callable[[str, float], Awaitable[object]],
+    set_anthropic_cooldown: Callable[[str, float], Awaitable[object]],
+    write_durable_payload: Callable[..., Awaitable[object]],
+    read_pilot_gate: Any,
+    state_manager: Any,
+
+
+) -> None:
+    """Bind error_signals / selection / cooldown_state / durable / state seams."""
+    global _get_candidate_cooldown_scope
+    _get_candidate_cooldown_scope = get_candidate_cooldown_scope
+    global _get_kimi_managed_account_cooldown_key
+    _get_kimi_managed_account_cooldown_key = get_kimi_managed_account_cooldown_key
+    global _get_grok_account_quota_lane_cooldown_key
+    _get_grok_account_quota_lane_cooldown_key = get_grok_account_quota_lane_cooldown_key
+    global _get_request_local_cooldown_key
+    _get_request_local_cooldown_key = get_request_local_cooldown_key
+    global _set_request_local_cooldown
+    _set_request_local_cooldown = set_request_local_cooldown
+    global _exclude_request_local_candidate
+    _exclude_request_local_candidate = exclude_request_local_candidate
+    global _set_codex_cooldown
+    _set_codex_cooldown = set_codex_cooldown
+    global _set_anthropic_cooldown
+    _set_anthropic_cooldown = set_anthropic_cooldown
+    global _write_durable_payload
+    _write_durable_payload = write_durable_payload
+    global _read_pilot_gate
+    _read_pilot_gate = read_pilot_gate
+    global _state_manager
+    _state_manager = state_manager
+    # If install() has been called, also update host_globals so rebound
+    # functions see the new seam values.
+    if _host_globals_ref is not None:
+        _mod = globals()
+        _host_globals_ref["_get_candidate_cooldown_scope"] = _mod["_get_candidate_cooldown_scope"]
+        _host_globals_ref["_get_kimi_managed_account_cooldown_key"] = _mod["_get_kimi_managed_account_cooldown_key"]
+        _host_globals_ref["_get_grok_account_quota_lane_cooldown_key"] = _mod["_get_grok_account_quota_lane_cooldown_key"]
+        _host_globals_ref["_get_request_local_cooldown_key"] = _mod["_get_request_local_cooldown_key"]
+        _host_globals_ref["_set_request_local_cooldown"] = _mod["_set_request_local_cooldown"]
+        _host_globals_ref["_exclude_request_local_candidate"] = _mod["_exclude_request_local_candidate"]
+        _host_globals_ref["_set_codex_cooldown"] = _mod["_set_codex_cooldown"]
+        _host_globals_ref["_set_anthropic_cooldown"] = _mod["_set_anthropic_cooldown"]
+        _host_globals_ref["_write_durable_payload"] = _mod["_write_durable_payload"]
+        _host_globals_ref["_read_pilot_gate"] = _mod["_read_pilot_gate"]
+        _host_globals_ref["_state_manager"] = _mod["_state_manager"]
+
+
+# ---------------------------------------------------------------------------
+# Publication-plan resolver (R3-1)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_auto_agent_cooldown_publication_plan(
+    *,
+    request: Optional[Request],
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
+) -> CooldownPublicationPlan:
+    """Pure resolver: classify one failure into an immutable publication plan (R3-1).
+
+    Resolves the cooldown scope and derives the exact memory/durable target
+    keys WITHOUT performing any I/O, so the retry loop can publish the memory
+    keys synchronously inside the probe lock and persist the durable keys after
+    release -- both derived from this single plan so telemetry, waiter
+    visibility, and Redis state cannot disagree.
+
+    Scope targets (preserved exactly from the legacy apply chain):
+      - ``none`` / request-local -> no shared keys (request-local action only)
+      - ``candidate`` / ``model`` -> the selected candidate key
+      - Kimi ``managed_account`` -> the managed-account sentinel ONLY
+      - Grok account-quota -> the selected key PLUS the account-lane key
+
+    The read-pilot lane resolves its scope/duration from the N-of-M evidence
+    gate's current decision (fed earlier by the loop via
+    ``_record_read_pilot_cooldown_evidence``); when the gate says do-not-cool,
+    the plan carries ``applied_scope="none"`` and empty key sets.
+    """
+    assert _get_candidate_cooldown_scope is not None
+    assert _get_kimi_managed_account_cooldown_key is not None
+    assert _get_grok_account_quota_lane_cooldown_key is not None
+    assert _read_pilot_gate is not None
+
+    if is_read_pilot_lane:
+        decision = _read_pilot_gate.current_decision(cooldown_key=selected_cooldown_key)
+        if not decision.should_cool:
+            return CooldownPublicationPlan(
+                applied_scope="none",
+                duration_seconds=0.0,
+                grok_account_quota_exhausted=grok_account_quota_exhausted,
+                kimi_failure_metadata=kimi_failure_metadata,
+            )
+        return CooldownPublicationPlan(
+            memory_keys=(selected_cooldown_key,),
+            durable_keys=(selected_cooldown_key,),
+            duration_seconds=float(decision.duration_seconds),
+            applied_scope=decision.scope or "candidate",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+
+    cooldown_scope = _get_candidate_cooldown_scope(
+        error_class,
+        candidate=candidate,
+        kimi_failure_metadata=kimi_failure_metadata,
+    )
+    duration = max(0.0, float(cooldown_seconds))
+    if cooldown_scope == "none":
+        return CooldownPublicationPlan(
+            applied_scope="none",
+            duration_seconds=duration,
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+    if cooldown_scope == "managed_account":
+        managed_key = _get_kimi_managed_account_cooldown_key()
+        return CooldownPublicationPlan(
+            memory_keys=(managed_key,),
+            durable_keys=(managed_key,),
+            duration_seconds=duration,
+            applied_scope="managed_account",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+    if cooldown_scope == "candidate":
+        memory_keys = [selected_cooldown_key]
+        if grok_account_quota_exhausted:
+            lane_cooldown_key = _get_grok_account_quota_lane_cooldown_key(
+                candidate,
+                lane_key,
+            )
+            if lane_cooldown_key is not None and lane_cooldown_key != selected_cooldown_key:
+                memory_keys.append(lane_cooldown_key)
+        keys = tuple(memory_keys)
+        return CooldownPublicationPlan(
+            memory_keys=keys,
+            durable_keys=keys,
+            duration_seconds=duration,
+            applied_scope="candidate",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
+    # request_local: no shared keys; the loop applies the request-local
+    # cooldown + exclusion post-release.
+    return CooldownPublicationPlan(
+        applied_scope=cooldown_scope,
+        duration_seconds=duration,
+        request_local_action="request_local_cooldown",
+        grok_account_quota_exhausted=grok_account_quota_exhausted,
+        kimi_failure_metadata=kimi_failure_metadata,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Durable persistence (post-release, R3-1)
+# ---------------------------------------------------------------------------
+
+
+async def _persist_codex_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
+    """Persist codex cooldown keys to durable Redis (post-release, R3-1)."""
+    assert _write_durable_payload is not None
+    ttl_seconds = max(0.0, float(seconds))
+    if ttl_seconds <= 0:
+        return
+    for key in keys:
+        await _write_durable_payload(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=key,
+            payload={"cooldown_key": key},
+            ttl_seconds=ttl_seconds,
+        )
+
+
+async def _persist_anthropic_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
+    """Persist anthropic cooldown keys to durable Redis (post-release, R3-1)."""
+    assert _write_durable_payload is not None
+    ttl_seconds = max(0.0, float(seconds))
+    if ttl_seconds <= 0:
+        return
+    for key in keys:
+        await _write_durable_payload(
+            alias_family="anthropic",
+            state_kind="cooldown",
+            state_key=key,
+            payload={"cooldown_key": key},
+            ttl_seconds=ttl_seconds,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shared cooldown application (RR-054 #12)
+# ---------------------------------------------------------------------------
+
+
+async def _apply_auto_agent_alias_cooldown(
+    *,
+    request: Request,
+    candidate: Payload,
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+    set_candidate_cooldown: Callable[[str, float], Awaitable[object]],
+    grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
+) -> str:
+    """Shared auto-agent cooldown apply (RR-054 #12).
+
+    Codex and Anthropic families share scope resolution and request-local
+    exclusion; only the durable candidate setter differs.
+    """
+    assert _get_candidate_cooldown_scope is not None
+    assert _get_kimi_managed_account_cooldown_key is not None
+    assert _get_grok_account_quota_lane_cooldown_key is not None
+    assert _get_request_local_cooldown_key is not None
+    assert _set_request_local_cooldown is not None
+    assert _exclude_request_local_candidate is not None
+
+    cooldown_scope = _get_candidate_cooldown_scope(
+        error_class,
+        candidate=candidate,
+        kimi_failure_metadata=kimi_failure_metadata,
+    )
+    if cooldown_scope == "none":
+        return cooldown_scope
+    if cooldown_scope == "managed_account":
+        await set_candidate_cooldown(
+            _get_kimi_managed_account_cooldown_key(),
+            cooldown_seconds,
+        )
+        return cooldown_scope
+    if cooldown_scope == "candidate":
+        await set_candidate_cooldown(
+            selected_cooldown_key,
+            cooldown_seconds,
+        )
+        if grok_account_quota_exhausted:
+            lane_cooldown_key = _get_grok_account_quota_lane_cooldown_key(
+                candidate,
+                lane_key,
+            )
+            if lane_cooldown_key is not None and lane_cooldown_key != selected_cooldown_key:
+                await set_candidate_cooldown(
+                    lane_cooldown_key,
+                    cooldown_seconds,
+                )
+        return cooldown_scope
+
+    request_local_key = _get_request_local_cooldown_key(
+        candidate=candidate,
+        lane_key=lane_key,
+    )
+    _set_request_local_cooldown(
+        request,
+        cooldown_key=request_local_key,
+        cooldown_seconds=cooldown_seconds,
+    )
+    _exclude_request_local_candidate(
+        request,
+        cooldown_key=request_local_key,
+    )
+    return cooldown_scope
+
+
+# ---------------------------------------------------------------------------
+# Codex / Anthropic family wrappers
+# ---------------------------------------------------------------------------
+
+
+async def _apply_codex_auto_agent_alias_cooldown(
+    *,
+    request: Request,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
+) -> str:
+    # Route the read-alias lane to the N-of-M evidence gate by ALIAS identity
+    # (``is_read_pilot_lane``), not by a synthetic ``read_pilot:`` key prefix.
+    # The live selector builds ordinary ``provider:model:lane`` cooldown keys,
+    # so the gate now drives the applied cooldown for the read lane using that
+    # exact live key -- the same key the retry loop fed evidence to.
+    assert _set_codex_cooldown is not None
+    if is_read_pilot_lane:
+        return await _apply_read_pilot_gated_cooldown(
+            selected_cooldown_key=selected_cooldown_key,
+            set_candidate_cooldown=_set_codex_cooldown,
+        )
+    return await _apply_auto_agent_alias_cooldown(
+        request=request,
+        candidate=candidate,
+        lane_key=lane_key,
+        selected_cooldown_key=selected_cooldown_key,
+        cooldown_seconds=cooldown_seconds,
+        error_class=error_class,
+        set_candidate_cooldown=_set_codex_cooldown,
+        grok_account_quota_exhausted=grok_account_quota_exhausted,
+        kimi_failure_metadata=kimi_failure_metadata,
+    )
+
+
+async def _apply_read_pilot_gated_cooldown(
+    *,
+    selected_cooldown_key: str,
+    set_candidate_cooldown: Callable[[str, float], Awaitable[object]],
+) -> str:
+    """Apply the ``CooldownEvidenceGate``'s decision for the read-pilot lane.
+
+    Delegates to the pure publication-plan resolver
+    (:func:`_resolve_auto_agent_cooldown_publication_plan`) so this applicator
+    no longer owns a separate memory target or a fire-and-forget durable
+    target: the resolver derives the gate-driven scope/duration and the single
+    candidate key, this function publishes the memory key synchronously, and
+    the durable write is best-effort (must not block the selector-observed
+    value). The read-pilot lane's cooldown-worthiness is decided by
+    ``_read_pilot_cooldown_gate`` (fed via ``_record_read_pilot_cooldown_evidence``
+    on failure); when the gate says "do not cool yet", no cooldown is applied.
+    """
+    assert _state_manager is not None
+    plan = _resolve_auto_agent_cooldown_publication_plan(
+        request=None,
+        candidate={},
+        lane_key=None,
+        selected_cooldown_key=selected_cooldown_key,
+        cooldown_seconds=0.0,
+        error_class=None,
+        is_read_pilot_lane=True,
+    )
+    if plan.applied_scope == "none" or not plan.memory_keys:
+        return "none"
+    # Apply to the authoritative in-memory cooldown state synchronously so the
+    # selector observes the full gate-resolved duration; the durable write is
+    # best-effort and must not block that value.
+    for key in plan.memory_keys:
+        _state_manager.codex.set_cooldown_memory(key, plan.duration_seconds)
+    for key in plan.durable_keys:
+        asyncio.ensure_future(set_candidate_cooldown(key, plan.duration_seconds))
+    return plan.applied_scope
+
+
+async def _apply_anthropic_auto_agent_alias_cooldown(
+    *,
+    request: Request,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
+) -> str:
+    # The read pilot lane is Codex-only; the Anthropic applicator accepts the
+    # flag for call-site symmetry with the shared retry loop and ignores it.
+    _ = is_read_pilot_lane
+    assert _set_anthropic_cooldown is not None
+    return await _apply_auto_agent_alias_cooldown(
+        request=request,
+        candidate=candidate,
+        lane_key=lane_key,
+        selected_cooldown_key=selected_cooldown_key,
+        cooldown_seconds=cooldown_seconds,
+        error_class=error_class,
+        set_candidate_cooldown=_set_anthropic_cooldown,
+        grok_account_quota_exhausted=grok_account_quota_exhausted,
+        kimi_failure_metadata=kimi_failure_metadata,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compatibility entry point
+# ---------------------------------------------------------------------------
+
+
+async def _set_codex_auto_agent_candidate_cooldowns(
+    *,
+    request: Request,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
+) -> str:
+    return await _apply_codex_auto_agent_alias_cooldown(
+        request=request,
+        candidate=candidate,
+        lane_key=lane_key,
+        selected_cooldown_key=selected_cooldown_key,
+        cooldown_seconds=cooldown_seconds,
+        error_class=error_class,
+        grok_account_quota_exhausted=grok_account_quota_exhausted,
+        kimi_failure_metadata=kimi_failure_metadata,
+        is_read_pilot_lane=is_read_pilot_lane,
+    )
+
+
+# ---------------------------------------------------------------------------
+# God-module facade installation (Wave 5C)
+# ---------------------------------------------------------------------------
+
+_HOST_FUNCTION_NAMES = (
+    "_resolve_auto_agent_cooldown_publication_plan",
+    "_persist_codex_cooldown_durable",
+    "_persist_anthropic_cooldown_durable",
+    "_apply_auto_agent_alias_cooldown",
+    "_apply_codex_auto_agent_alias_cooldown",
+    "_apply_read_pilot_gated_cooldown",
+    "_apply_anthropic_auto_agent_alias_cooldown",
+    "_set_codex_auto_agent_candidate_cooldowns",
+)
+
+
+def install(host_globals: dict) -> None:
+    """Publish same-object god-module facades for the moved functions.
+
+    Functions retain this module's globals. Host-owned dependencies remain
+    late-bound through the callbacks configured by
+    :func:`configure_cooldown_apply_runtime`.
+    """
+    global _host_globals_ref
+    _host_globals_ref = host_globals
+    _mod = globals()
+    for _name in _HOST_FUNCTION_NAMES:
+        host_globals[_name] = _mod[_name]
