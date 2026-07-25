@@ -60,9 +60,9 @@ The same sidecar can also own the scheduled Grok native OIDC credential refresh.
 This is separate from the five-minute provider front-door probes. In shared
 multi-provider compose layouts the sidecar may mount `/home/zepfu/.grok`
 writable. On the operator WSL host, however, native Grok OIDC refresh is owned
-by the dedicated WSL-local single writer described in
-[WSL-local Grok OIDC single writer (XAI-003)](#wsl-local-grok-oidc-single-writer-xai-003)
-so multi-provider sidecars and both LiteLLM proxies stay non-writers. LiteLLM
+by the dedicated WSL-local dual credential writer described in
+[WSL-local dual credential writer (XAI-003 / XAI-004)](#wsl-local-dual-credential-writer-xai-003--xai-004)
+so multi-provider sidecars and both LiteLLM proxies stay non-writers for both native Grok OIDC and managed `oa_xai/*` OAuth. LiteLLM
 mounts that directory read-only and reads the credential directly for
 `xai/grok-composer-2.5-fast`, `xai/grok-build`, and `xai/grok-build-0.1`.
 
@@ -105,11 +105,11 @@ token values and emits `grok_oidc_metadata_repair` only when it repairs the file
 or encounters an error. This bounds damage from another process recreating the
 shared auth file with container-owned metadata between hourly refreshes.
 
-## WSL-local Grok OIDC single writer (XAI-003)
+## WSL-local dual credential writer (XAI-003 / XAI-004)
 
-On the operator WSL host, native Grok OIDC refresh is owned by a dedicated
-single-writer unit, not by the multi-provider `provider-status-observations`
-sidecar and not by either LiteLLM proxy.
+On the operator WSL host, native Grok OIDC and managed `oa_xai/*` OAuth refresh
+are owned by one dedicated dual-writer unit, not by the multi-provider
+`provider-status-observations` sidecar and not by either LiteLLM proxy.
 
 - Compose: `docker-compose.wsl-grok-oidc.yml`
 - Launcher: `scripts/ensure-wsl-grok-oidc-sidecar.sh` (`--status` default,
@@ -118,28 +118,38 @@ sidecar and not by either LiteLLM proxy.
 
 ### Ownership and consumers
 
-- This WSL-local sidecar is the **only automatic writer** of
-  `/home/zepfu/.grok/auth.json` on the WSL host.
-- `aawm-litellm` and `litellm-dev` remain **read-only consumers** of that file.
-  They require **no restart** when the credential is refreshed or replaced
-  under the shared lock.
-- Manual Grok CLI / Grok Build login is **break-glass only**. Use it when the
-  refresh token is revoked, the credential file is missing/corrupt, or the
-  automatic writer cannot recover. After a manual login, the sidecar resumes
-  non-forced refresh from the new file without proxy restarts.
-- Managed `oa_xai/*` OAuth (`~/.litellm/xai/oauth-auth.json`) is a **separate
-  credential family**. Native Grok OIDC must never populate managed xAI OAuth,
-  and this WSL unit does not mount or refresh managed xAI credentials.
+- This WSL-local sidecar is the **only automatic writer** of both:
+  - native Grok OIDC: `/home/zepfu/.grok/auth.json`
+  - managed xAI OAuth (`oa_xai/*`): `/home/zepfu/.litellm/xai/oauth-auth.json`
+- The two families stay independent: separate files, separate lock files,
+  separate sanitized event names (`grok_oidc_*` vs `xai_oauth_*`), and separate
+  metadata env vars. Native Grok OIDC must never populate managed xAI OAuth and
+  the reverse must not happen either.
+- `aawm-litellm` and `litellm-dev` remain **read-only consumers** of both files.
+  They require **no restart** when either credential is refreshed or replaced
+  under its own lock.
+- Manual Grok CLI / Grok Build login is **break-glass only** for the native
+  family. Use it when the native refresh token is revoked, the native credential
+  file is missing/corrupt, or the automatic writer cannot recover. After a
+  manual login, the sidecar resumes non-forced native refresh from the new file
+  without proxy restarts.
+- Managed `oa_xai/*` recovery remains on the managed OAuth path
+  (`scripts/xai_oauth_refresh.py` / operator re-auth for that family). Do not
+  copy native tokens into the managed file.
 
 ### Cadence and safety
 
 The dedicated unit reuses image `aawm-provider-status-observations:prod` but
-overrides the entrypoint to a Grok-only loop around
-`scripts/grok_oidc_refresh.py` so front-door probes, DB apply/schema, anomaly
-scan, billing, Codex/Kimi/Alibaba writers, and managed xAI OAuth refresh stay
-disabled.
+overrides the entrypoint to a dual-family loop around
+`scripts/grok_oidc_refresh.py` and `scripts/xai_oauth_refresh.py`. Front-door
+probes, DB apply/schema, anomaly scan, billing, Codex/Kimi/Alibaba writers, and
+auth health poll stay disabled. Only the two credential directories are mounted
+writable; Codex, Kimi, and Alibaba credential dirs are not mounted.
 
-Rendered defaults:
+A single cycle can run both refresh tasks. Each family keeps independent
+config variables even when both use the same defaults:
+
+Rendered native defaults:
 
 - `AAWM_GROK_OIDC_REFRESH_ENABLED=1`
 - `AAWM_GROK_OIDC_AUTH_FILE=/home/zepfu/.grok/auth.json`
@@ -149,23 +159,56 @@ Rendered defaults:
 - `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=900`
 - `AAWM_GROK_OIDC_FORCE_REFRESH=0`
 - `AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=30`
-- `AAWM_PROVIDER_STATUS_APPLY=0` (no DB writes required)
 
-The launcher preflights the image and credential, captures exact container ID /
-start timestamp / restart count for both LiteLLM proxies, starts or stops only
-`wsl-grok-oidc-refresh` with
+Rendered managed defaults:
+
+- `AAWM_XAI_OAUTH_REFRESH_ENABLED=1`
+- `AAWM_XAI_OAUTH_AUTH_FILE=/home/zepfu/.litellm/xai/oauth-auth.json`
+- `AAWM_XAI_OAUTH_LOCK_FILE=/home/zepfu/.litellm/xai/oauth-auth.json.lock`
+- `AAWM_XAI_OAUTH_AUTH_FILE_UID=0` / `GID=0` / `MODE=0o600`
+- `AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300`
+- `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_XAI_OAUTH_FORCE_REFRESH=0`
+- `AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=30`
+
+Shared unit safety defaults include `AAWM_PROVIDER_STATUS_APPLY=0` (no DB writes
+required). Sanitized events include independent
+`grok_oidc_metadata_repair` / `grok_oidc_refresh` and
+`xai_oauth_metadata_repair` / `xai_oauth_refresh` lines; token material is never
+logged.
+
+### Launcher, health, and proxy isolation
+
+The launcher preflights the image and **both** credentials, captures exact
+container ID / start timestamp / restart count for both LiteLLM proxies, starts
+or stops only `wsl-grok-oidc-refresh` with
 `docker compose -f docker-compose.wsl-grok-oidc.yml ... --no-deps --no-build`,
 and fails if either proxy snapshot changes. Never run a broad compose
 `up`/`down` for this unit, and never mention a proxy service in a mutating
-compose command for this file.
+compose command for this file. Status mode works before activation.
 
-A credential/process healthcheck marks the container unhealthy while remaining
-credential lifetime is still well above LiteLLM's 300-second near-expiry
-rejection boundary (`remaining > 600` seconds required for healthy). The
-healthcheck also requires the expected xAI issuer/client ID and a refresh token.
-The launcher waits for that healthcheck before reporting `apply_ok`. The
-healthcheck and refresh logs emit no access tokens, refresh tokens, id tokens,
-or raw credential payloads.
+Native preflight validates host-readable mode `0600` and uid/gid `1000/1000`
+plus issuer/client/access/refresh/expiry metadata. Managed preflight validates
+mode `0600` and root-family ownership (`0/0`, accepting legacy `65534` until the
+sidecar rewrites ownership). Because the host user often cannot read the
+root/nobody-owned managed file, the launcher validates managed metadata from
+`stat` and, when the file is unreadable, uses a disposable **read-only**
+`docker run` of the existing prod image with a read-only mount to validate JSON
+safely. No secrets are printed.
+
+Combined credential/process health requires **both** credential records to have:
+
+- a current access credential (`key` or `access_token`)
+- a refresh token
+- the expected client ID / scope
+- mode `0600`
+- remaining lifetime well above LiteLLM's 300-second near-expiry rejection
+  boundary (`remaining > 600` seconds)
+
+Native health also requires issuer `https://auth.x.ai`. Managed health may omit
+issuer. The launcher waits for that combined healthcheck before reporting
+`apply_ok`. Healthcheck and refresh logs emit no access tokens, refresh tokens,
+id tokens, or raw credential payloads.
 
 ## Grok Billing Poll Task
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Static smoke checks for the WSL-local Grok OIDC single-writer sidecar.
-# Validates compose invariants and launcher safety without mutating Docker.
+# Static smoke checks for the WSL-local dual-writer Grok OIDC + managed xAI
+# OAuth sidecar. Validates compose invariants and launcher safety without
+# mutating Docker.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,7 +87,7 @@ print(",".join(services))
 INNER
 }
 
-echo "== XAI-003 WSL Grok OIDC sidecar smoke (static) =="
+echo "== XAI-004 WSL dual Grok OIDC + managed xAI OAuth sidecar smoke (static) =="
 
 require_file "$compose_file"
 require_file "$launcher"
@@ -124,8 +125,10 @@ require_contains "$compose_file" 'no-new-privileges:true' \
   "compose sets no-new-privileges"
 require_contains "$compose_file" '/home/zepfu/\.grok:/home/zepfu/\.grok' \
   "compose mounts /home/zepfu/.grok"
-require_absent "$compose_file" '/home/zepfu/\.codex|/home/zepfu/\.litellm/xai|/home/zepfu/\.kimi-code|/home/zepfu/\.alibaba' \
-  "compose does not mount other credential directories"
+require_contains "$compose_file" '/home/zepfu/\.litellm/xai:/home/zepfu/\.litellm/xai' \
+  "compose mounts /home/zepfu/.litellm/xai"
+require_absent "$compose_file" '/home/zepfu/\.codex|/home/zepfu/\.kimi-code|/home/zepfu/\.alibaba' \
+  "compose does not mount Codex/Kimi/Alibaba credential directories"
 require_absent "$compose_file" 'aawm-litellm|litellm-dev' \
   "compose does not reference LiteLLM proxy services"
 require_absent "$compose_file" 'build:|depends_on:' \
@@ -133,16 +136,28 @@ require_absent "$compose_file" 'build:|depends_on:' \
 
 require_contains "$compose_file" 'AAWM_GROK_OIDC_REFRESH_ENABLED=1' \
   "Grok OIDC refresh enabled"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_REFRESH_ENABLED=1' \
+  "managed xAI OAuth refresh enabled"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_AUTH_FILE=/home/zepfu/\.grok/auth\.json' \
   "Grok auth file path set"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_LOCK_FILE=/home/zepfu/\.grok/auth\.json\.lock' \
   "Grok lock file path set"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_AUTH_FILE=/home/zepfu/\.litellm/xai/oauth-auth\.json' \
+  "managed xAI auth file path set"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_LOCK_FILE=/home/zepfu/\.litellm/xai/oauth-auth\.json\.lock' \
+  "managed xAI lock file path set"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_AUTH_FILE_UID=1000' \
   "Grok auth uid 1000"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_AUTH_FILE_GID=1000' \
   "Grok auth gid 1000"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_AUTH_FILE_MODE=0o600' \
   "Grok auth mode 0o600"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_AUTH_FILE_UID=0' \
+  "managed xAI auth uid 0"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_AUTH_FILE_GID=0' \
+  "managed xAI auth gid 0"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_AUTH_FILE_MODE=0o600' \
+  "managed xAI auth mode 0o600"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=300' \
   "Grok refresh interval 300"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=900' \
@@ -151,10 +166,17 @@ require_contains "$compose_file" 'AAWM_GROK_OIDC_FORCE_REFRESH=0' \
   "Grok force refresh disabled"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=30' \
   "Grok HTTP timeout 30"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300' \
+  "managed xAI refresh interval 300"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=900' \
+  "managed xAI refresh buffer 900"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_FORCE_REFRESH=0' \
+  "managed xAI force refresh disabled"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=30' \
+  "managed xAI HTTP timeout 30"
 
 for flag in \
   'AAWM_CODEX_OAUTH_REFRESH_ENABLED=0' \
-  'AAWM_XAI_OAUTH_REFRESH_ENABLED=0' \
   'AAWM_KIMI_OAUTH_REFRESH_ENABLED=0' \
   'AAWM_KIMI_USAGE_POLL_ENABLED=0' \
   'AAWM_ALIBABA_QUOTA_POLL_ENABLED=0' \
@@ -175,14 +197,22 @@ require_contains "$compose_file" 'AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER=0' \
 
 require_contains "$compose_file" 'healthcheck:' \
   "healthcheck defined"
-require_contains "$compose_file" 'remaining > 600' \
+require_contains "$compose_file" '^[[:space:]]+- CMD$' \
+  "healthcheck uses exec-form CMD"
+require_absent "$compose_file" 'CMD-SHELL' \
+  "healthcheck does not embed multiline Python in CMD-SHELL"
+require_contains "$compose_file" 'remaining.* > 600|return .* > 600|total_seconds\(\) > 600' \
   "healthcheck fails before 300s rejection boundary"
-require_contains "$compose_file" "record.get\\('refresh_token'\\)" \
+require_contains "$compose_file" "record.get\\('refresh_token'\\)|refresh_token" \
   "healthcheck requires a refresh token"
-require_contains "$compose_file" "record.get\\('oidc_issuer'\\)" \
-  "healthcheck validates the Grok OIDC issuer"
-require_contains "$compose_file" "record.get\\('oidc_client_id'\\)" \
-  "healthcheck validates the Grok OIDC client id"
+require_contains "$compose_file" "oidc_issuer|require_issuer" \
+  "healthcheck validates native issuer requirement"
+require_contains "$compose_file" "oidc_client_id|client_id" \
+  "healthcheck validates client id"
+require_contains "$compose_file" 'oauth-auth\.json' \
+  "healthcheck covers managed oauth-auth.json"
+require_contains "$compose_file" 'auth\.json' \
+  "healthcheck covers native auth.json"
 
 python3 - "$compose_file" <<'INNER'
 from pathlib import Path
@@ -193,24 +223,46 @@ text = Path(sys.argv[1]).read_text(encoding="utf-8")
 hc = text[text.index("healthcheck:") :]
 if re.search(r"print\(|echo ", hc):
     raise SystemExit("healthcheck must not print or echo")
-if "remaining > 600" not in hc:
+if "total_seconds() > 600" not in hc and "remaining > 600" not in hc:
     raise SystemExit("healthcheck missing remaining > 600 gate")
+if "/home/zepfu/.grok/auth.json" not in hc:
+    raise SystemExit("healthcheck must validate native auth.json")
+if "/home/zepfu/.litellm/xai/oauth-auth.json" not in hc:
+    raise SystemExit("healthcheck must validate managed oauth-auth.json")
+if "require_issuer" not in hc and "oidc_issuer" not in hc:
+    raise SystemExit("healthcheck missing issuer handling")
 if re.search(r"Bearer |Authorization:|client_secret\s*=", text):
     raise SystemExit("compose has credential header/secret assignment literals")
 if "json.dumps(payload" not in text:
     raise SystemExit("command loop missing sanitized JSON emit path")
 if "import scripts.grok_oidc_refresh as grok" not in text:
     raise SystemExit("compose command must use scripts.grok_oidc_refresh")
+if "import scripts.xai_oauth_refresh as xai" not in text:
+    raise SystemExit("compose command must use scripts.xai_oauth_refresh")
+if "event\": \"grok_oidc_refresh\"" not in text and "event\": 'grok_oidc_refresh'" not in text:
+    # YAML embeds python with double quotes
+    if '"event": "grok_oidc_refresh"' not in text:
+        raise SystemExit("compose must emit grok_oidc_refresh events")
+if '"event": "xai_oauth_refresh"' not in text:
+    raise SystemExit("compose must emit xai_oauth_refresh events")
+if '"event": "xai_oauth_metadata_repair"' not in text:
+    raise SystemExit("compose must emit xai_oauth_metadata_repair events")
+if '"event": "grok_oidc_metadata_repair"' not in text:
+    raise SystemExit("compose must emit grok_oidc_metadata_repair events")
 if re.search(
     r"run_provider_status_observations_loop|DEFAULT_ENDPOINTS|collect_observations",
     text,
 ):
     raise SystemExit("compose must not invoke multi-provider observation loop")
 if "entrypoint:" not in text:
-    raise SystemExit("compose must override entrypoint for Grok-only loop")
-print("secret_safe_and_grok_only_ok")
+    raise SystemExit("compose must override entrypoint for dual credential loop")
+# Only the two credential mounts.
+mounts = re.findall(r"^\s*-\s*(/home/zepfu/[^\s:]+):/home/zepfu/", text, re.M)
+if sorted(mounts) != sorted(["/home/zepfu/.grok", "/home/zepfu/.litellm/xai"]):
+    raise SystemExit(f"unexpected volume mounts: {mounts}")
+print("secret_safe_and_dual_credential_ok")
 INNER
-pass "healthcheck/command are secret-safe and Grok-only"
+pass "healthcheck/command are secret-safe and dual-credential"
 
 require_contains "$launcher" '--status' "launcher supports --status"
 require_contains "$launcher" '--apply' "launcher supports --apply"
@@ -234,8 +286,20 @@ require_contains "$launcher" 'litellm-dev' \
   "launcher tracks litellm-dev snapshot"
 require_contains "$launcher" 'preflight_image' \
   "launcher preflights image"
-require_contains "$launcher" 'preflight_credential' \
-  "launcher preflights credential"
+require_contains "$launcher" 'preflight_native_credential|preflight_credentials' \
+  "launcher preflights native credential"
+require_contains "$launcher" 'preflight_managed_credential|preflight_credentials' \
+  "launcher preflights managed credential"
+require_contains "$launcher" 'read_managed_credential_via_docker|docker run --rm --read-only' \
+  "launcher can validate unreadable managed credential via read-only docker"
+require_contains "$launcher" '--entrypoint python' \
+  "launcher overrides the provider-status image entrypoint for managed preflight"
+require_contains "$launcher" 'python3 -c' \
+  "managed credential validator preserves stdin for piped JSON"
+require_absent "$launcher" 'local raw|raw="\$\(read_managed_credential_via_docker' \
+  "launcher does not retain managed credential JSON in a shell variable"
+require_contains "$launcher" 'native_auth_file|managed_auth_file' \
+  "launcher tracks both credential paths"
 
 service_ref="\$service_name"
 while IFS= read -r line; do
@@ -270,18 +334,24 @@ else
   pass "launcher rejects unknown arguments"
 fi
 
-require_contains "$docs_file" 'WSL-local single writer|WSL-local single-writer|WSL host' \
+require_contains "$docs_file" 'WSL-local|WSL host' \
   "docs mention WSL-local writer ownership"
 require_contains "$docs_file" 'break-glass|manual Grok login' \
   "docs state manual Grok login is break-glass"
 require_contains "$docs_file" 'read-only' \
   "docs state LiteLLM consumers are read-only"
 require_contains "$docs_file" 'oa_xai|managed xAI OAuth' \
-  "docs separate managed oa_xai OAuth"
+  "docs cover managed oa_xai OAuth"
 require_contains "$docs_file" 'ensure-wsl-grok-oidc-sidecar|docker-compose.wsl-grok-oidc' \
   "docs reference the WSL sidecar artifacts"
 require_contains "$docs_file" 'no restart|without restart|require no restart' \
   "docs state consumers require no restart"
+require_contains "$docs_file" 'XAI-004|dual|managed xAI OAuth' \
+  "docs cover dual credential ownership (XAI-004)"
+require_contains "$docs_file" 'oauth-auth\.json' \
+  "docs name managed oauth-auth.json path"
+require_contains "$docs_file" 'xai_oauth_refresh' \
+  "docs name managed xai_oauth_refresh events/task"
 
 echo
 echo "summary: pass=${pass_count} fail=${fail_count}"
