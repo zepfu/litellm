@@ -7,6 +7,7 @@ Modules under test do not exist yet:
 from __future__ import annotations
 
 import dataclasses
+import itertools
 
 import pytest
 from pydantic import ValidationError
@@ -180,3 +181,107 @@ aliases:
 """
     with pytest.raises((ValidationError, compiler.ConfigCompileError)):
         compiler.compile_yaml(raw)
+
+
+# ===========================================================================
+# Wave 3: R3-4 -- semantic digest stability across processes and formatting
+# ===========================================================================
+
+
+def test_semantic_key_tag_is_stable_across_processes_and_source_formatting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3-4 RED pre-fix: recompile semantically identical YAML after resetting
+    the compiler counter (simulating restart) and after comment/whitespace/
+    key-order edits; assert identical full semantic digest while config_epoch
+    differs and source_hash may differ. A priority/model/route-family change
+    must change the semantic digest.
+
+    Pre-fix failure: config_hash = sha256(raw_yaml), so any formatting change
+    (comment, whitespace, key order) produces a different hash.
+    """
+    yaml_original = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: openrouter/cohere/north-mini-code:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
+"""
+
+    # Semantically identical: comment added, mapping-key order changed, extra whitespace
+    yaml_reformatted = """
+# Reformatted: comment added, key order changed, extra whitespace
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - route_family: codex_openrouter_completion_adapter
+        provider: openrouter
+        priority: 100
+        model: openrouter/cohere/north-mini-code:free
+      - route_family: codex_responses
+        provider:   openai
+        priority:   0
+        model:   gpt-5.4-mini
+"""
+
+    snapshot_a = compiler.compile_yaml(yaml_original)
+    snapshot_b = compiler.compile_yaml(yaml_reformatted)
+
+    # config_epoch must differ (monotonic counter)
+    assert snapshot_b.config_epoch != snapshot_a.config_epoch, (
+        "config_epoch must be monotonically increasing across compiles"
+    )
+
+    # Semantic digest (config_hash) must be IDENTICAL for semantically
+    # identical YAML regardless of source formatting
+    assert snapshot_b.config_hash == snapshot_a.config_hash, (
+        "R3-4: semantically identical YAML (comment/whitespace/key-order "
+        "changes only) must produce the same config_hash (semantic digest). "
+        f"Pre-fix: config_hash = sha256(raw_yaml) so formatting changes "
+        f"produce different hashes. Got {snapshot_a.config_hash!r} vs "
+        f"{snapshot_b.config_hash!r}"
+    )
+
+    # Simulate a fresh process where the telemetry counter restarts. The
+    # semantic digest must remain stable even when the integer epoch changes
+    # or collides with a prior process's value.
+    monkeypatch.setattr(compiler, "_epoch_counter", itertools.count(1))
+    snapshot_after_restart = compiler.compile_yaml(yaml_reformatted)
+    assert snapshot_after_restart.config_epoch != snapshot_b.config_epoch
+    assert snapshot_after_restart.config_hash == snapshot_a.config_hash
+
+    source_hash_a = getattr(snapshot_a, "source_hash", None)
+    source_hash_b = getattr(snapshot_b, "source_hash", None)
+    if source_hash_a is not None and source_hash_b is not None:
+        assert source_hash_a != source_hash_b
+
+    # A priority change must change the semantic digest
+    yaml_priority_changed = yaml_original.replace("priority: 100", "priority: 200")
+    snapshot_c = compiler.compile_yaml(yaml_priority_changed)
+    assert snapshot_c.config_hash != snapshot_a.config_hash, (
+        "a priority change must produce a different semantic digest"
+    )
+
+    # A model change must change the semantic digest
+    yaml_model_changed = yaml_original.replace("gpt-5.4-mini", "gpt-5.4-max")
+    snapshot_d = compiler.compile_yaml(yaml_model_changed)
+    assert snapshot_d.config_hash != snapshot_a.config_hash, (
+        "a model change must produce a different semantic digest"
+    )
+
+    # A route_family change must change the semantic digest
+    yaml_rf_changed = yaml_original.replace(
+        "codex_openrouter_completion_adapter", "codex_responses"
+    )
+    snapshot_e = compiler.compile_yaml(yaml_rf_changed)
+    assert snapshot_e.config_hash != snapshot_a.config_hash, (
+        "a route_family change must produce a different semantic digest"
+    )

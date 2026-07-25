@@ -41,11 +41,13 @@ values.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any, Callable, Optional, Sequence
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.testclient import TestClient
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
@@ -205,6 +207,22 @@ def _install_openrouter_performer(
         lpe._write_aawm_alias_routing_durable_payload = original_write  # type: ignore[assignment]
 
     return handler, _restore
+
+
+def _install_candidate_request_performer(
+    handler: Callable[..., Any],
+) -> Callable[[], None]:
+    """Patch the wrapper-level candidate performer and durable writer."""
+    original_perform = lpe._perform_codex_auto_agent_alias_candidate_request
+    original_write = lpe._write_aawm_alias_routing_durable_payload
+    lpe._perform_codex_auto_agent_alias_candidate_request = handler  # type: ignore[assignment]
+    lpe._write_aawm_alias_routing_durable_payload = AsyncMock(return_value=True)  # type: ignore[assignment]
+
+    def _restore() -> None:
+        lpe._perform_codex_auto_agent_alias_candidate_request = original_perform  # type: ignore[assignment]
+        lpe._write_aawm_alias_routing_durable_payload = original_write  # type: ignore[assignment]
+
+    return _restore
 
 
 async def _drive_wrapper(
@@ -1312,3 +1330,803 @@ aliases:
     applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == 0.0
     assert lpe._read_pilot_cooldown_gate.is_cooled(cooldown_key=live_key) is False
+
+
+# ===========================================================================
+# Wave 3: R3-4 -- semantic-digest cooldown epochs + continuation-safe affinity
+# ===========================================================================
+
+_REFRESH_PATH = "/aawm/alias-config/refresh"
+
+
+def _refresh_client() -> TestClient:
+    """Build a TestClient wrapping the real passthrough router (refresh route)."""
+    app = FastAPI()
+    app.include_router(lpe.router)
+    return TestClient(app)
+
+
+def _post_refresh(client: TestClient, yaml_str: str) -> Any:
+    return client.post(_REFRESH_PATH, json={"yaml": yaml_str})
+
+
+def _wave3_epoch_keys_enabled() -> bool:
+    return "epoch_tag" in inspect.signature(
+        lpe._codex_auto_agent_candidate_key
+    ).parameters
+
+
+def _snapshot_candidate_key(
+    snapshot: Any,
+    model: str,
+    *,
+    provider: str = "openrouter",
+    lane_key: str = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
+) -> str:
+    candidate = {
+        "provider": provider,
+        "model": model,
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    if not _wave3_epoch_keys_enabled():
+        return lpe._codex_auto_agent_candidate_key(candidate, lane_key)
+
+    expected = f"h{snapshot.config_hash}:{provider}:{model}:{lane_key}"
+    actual = lpe._codex_auto_agent_candidate_key(
+        candidate,
+        lane_key,
+        epoch_tag=snapshot.config_hash,
+    )
+    assert actual == expected
+    return actual
+
+
+# ---------------------------------------------------------------------------
+# (scenario a1) refresh activates snapshot and selection uses it
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_a1_refresh_activates_snapshot_and_selection_uses_it() -> None:
+    """Regression pin (passes pre-fix): POST inline YAML to the REAL refresh
+    HTTP route; assert 200 + changed=True; drive one wrapper request with
+    model='read'; assert the selected candidate is from the snapshot (not the
+    static-table fallback at policy.py:292)."""
+    yaml_str = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: a1-snapshot-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+    client = _refresh_client()
+    resp = _post_refresh(client, yaml_str)
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["changed"] is True
+
+    leaders: list[str] = []
+
+    async def _performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        leaders.append(adapter_model)
+        return _SUCCESS_RESPONSE
+
+    _, restore = _install_openrouter_performer(_performer)
+    try:
+        result = await _drive_wrapper(session_id="a1-session")
+        assert isinstance(result, Response)
+    finally:
+        restore()
+
+    assert leaders == ["a1-snapshot-model"], (
+        f"expected the snapshot candidate to be selected, got {leaders!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (scenario a2) refresh rejects bad YAML with 400
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_a2_refresh_rejects_bad_yaml_with_400() -> None:
+    """Regression pin (passes pre-fix): non-string yaml field -> 400;
+    malformed YAML -> 400 with last-known-good retained."""
+    client = _refresh_client()
+
+    # Non-string yaml field
+    resp_non_string = client.post(_REFRESH_PATH, json={"yaml": 12345})
+    assert resp_non_string.status_code == 400
+
+    # First activate a known-good snapshot
+    good_yaml = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: a2-good-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+    good_resp = _post_refresh(client, good_yaml)
+    assert good_resp.status_code == 200
+    good_hash = good_resp.json()["active_config_hash"]
+
+    # Syntactically malformed YAML -> 400, last-known-good retained
+    bad_yaml = "defaults: {}\naliases: [\n"
+    bad_resp = _post_refresh(client, bad_yaml)
+    assert bad_resp.status_code == 400
+
+    active = lpe.get_active_routing_snapshot()
+    assert active is not None
+    assert active.config_hash == good_hash, (
+        "last-known-good snapshot must remain active after a failed refresh"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (R3-4, scenario d1) changed refresh invalidates cooldown for reused identity
+# ---------------------------------------------------------------------------
+
+_D1_SNAPSHOT_A = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d1-leader
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: d1-fallback
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+_D1_SNAPSHOT_B = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d1-leader
+        route_family: codex_openrouter_completion_adapter
+        priority: 200
+      - provider: openrouter
+        model: d1-fallback
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+
+async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_identity() -> None:
+    """R3-4 RED pre-fix: activate snapshot A (2 candidates); structured-429
+    the leader (cools its epoch-tagged key); verify a second request selects
+    the fallback; POST snapshot B reusing BOTH identities with changed
+    priority (different config_hash); third request must select the leader
+    again and the upstream stub must observe a FRESH probe.
+
+    Pre-fix failure: bare-key cooldown persists across the swap; third request
+    still selects fallback."""
+    client = _refresh_client()
+
+    # Activate snapshot A
+    resp_a = _post_refresh(client, _D1_SNAPSHOT_A)
+    assert resp_a.status_code == 200
+    assert resp_a.json()["changed"] is True
+    snapshot_a = lpe.get_active_routing_snapshot()
+    assert snapshot_a is not None
+    leader_key_a = _snapshot_candidate_key(snapshot_a, "d1-leader")
+
+    calls: list[str] = []
+    fail_leader = True
+
+    async def _performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        calls.append(adapter_model)
+        if adapter_model == "d1-leader" and fail_leader:
+            raise _StructuredUpstream429(retry_after_seconds=60)
+        return _SUCCESS_RESPONSE
+
+    _, restore = _install_openrouter_performer(_performer)
+    try:
+        # Request 1: leader 429s, fallback succeeds
+        result1 = await _drive_wrapper(session_id="d1-session-1")
+        assert isinstance(result1, Response)
+        assert calls[0] == "d1-leader"
+        assert "d1-fallback" in calls
+
+        # Verify leader's cooldown key is cooled
+        remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(
+            leader_key_a
+        )
+        assert remaining > 0, f"expected leader key to be cooled, got remaining={remaining}"
+
+        # Request 2: leader cooled -> fallback selected
+        calls.clear()
+        result2 = await _drive_wrapper(session_id="d1-session-2")
+        assert isinstance(result2, Response)
+        assert calls == ["d1-fallback"], (
+            f"expected fallback while leader cools, got {calls!r}"
+        )
+
+        # Activate snapshot B (changed priority -> different config_hash)
+        resp_b = _post_refresh(client, _D1_SNAPSHOT_B)
+        assert resp_b.status_code == 200
+        assert resp_b.json()["changed"] is True
+        assert resp_b.json()["active_config_hash"] != resp_a.json()["active_config_hash"]
+        snapshot_b = lpe.get_active_routing_snapshot()
+        assert snapshot_b is not None
+        leader_key_b = _snapshot_candidate_key(snapshot_b, "d1-leader")
+
+        # Stop failing the leader
+        fail_leader = False
+
+        # Request 3: epoch-tagged key invalidated -> leader selected again
+        calls.clear()
+        result3 = await _drive_wrapper(session_id="d1-session-3")
+        assert isinstance(result3, Response)
+        assert calls == ["d1-leader"], (
+            "R3-4: after a changed refresh, the epoch-tagged cooldown key must "
+            "differ from the old snapshot's key, so the leader must be probed "
+            f"again (fresh probe). Got calls={calls!r}. Pre-fix: bare-key "
+            "cooldown persists across the swap."
+        )
+        assert leader_key_b != leader_key_a
+        assert lpe._alias_routing_state.codex.get_memory_cooldown_remaining(
+            leader_key_a
+        ) > 0
+        assert (
+            lpe._alias_routing_state.codex.get_memory_cooldown_remaining(
+                leader_key_b
+            )
+            == 0.0
+        )
+    finally:
+        restore()
+
+
+# ---------------------------------------------------------------------------
+# (R3-4, scenario d2) no-op refresh retains cooldown
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_d2_noop_refresh_retains_cooldown() -> None:
+    """Regression pin (passes pre-fix): after a failure under snapshot A,
+    re-POST IDENTICAL YAML (changed=False, same snapshot object); assert the
+    cooldown REMAINS (same semantic config_hash -> same tag -> same key).
+    Guards against counter-based epoch implementations that bump on no-op."""
+    client = _refresh_client()
+
+    yaml_str = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d2-leader
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: d2-fallback
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+    resp1 = _post_refresh(client, yaml_str)
+    assert resp1.status_code == 200
+    assert resp1.json()["changed"] is True
+    snapshot_before = lpe.get_active_routing_snapshot()
+    assert snapshot_before is not None
+
+    # Structured-429 the leader
+    async def _performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        if adapter_model == "d2-leader":
+            raise _StructuredUpstream429(retry_after_seconds=60)
+        return _SUCCESS_RESPONSE
+
+    _, restore = _install_openrouter_performer(_performer)
+    try:
+        result = await _drive_wrapper(session_id="d2-session-1")
+        assert isinstance(result, Response)
+    finally:
+        restore()
+
+    leader_key = _snapshot_candidate_key(snapshot_before, "d2-leader")
+    remaining_before = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
+    assert remaining_before > 0
+
+    # Re-post IDENTICAL YAML -> no-op
+    resp2 = _post_refresh(client, yaml_str)
+    assert resp2.status_code == 200
+    assert resp2.json()["changed"] is False
+
+    # Same snapshot object retained
+    snapshot_after = lpe.get_active_routing_snapshot()
+    assert snapshot_after is snapshot_before, (
+        "no-op refresh must retain the exact same snapshot object"
+    )
+    assert _snapshot_candidate_key(snapshot_after, "d2-leader") == leader_key
+
+    # Cooldown must REMAIN
+    remaining_after = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
+    assert remaining_after > 0, (
+        "no-op refresh must not invalidate the cooldown (same semantic "
+        f"config_hash -> same tag -> same key); remaining={remaining_after}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (R3-4, scenario d3) semantically identical refresh retains state
+# ---------------------------------------------------------------------------
+
+_D3_YAML_ORIGINAL = """
+defaults: {}
+aliases:
+  - name: read
+    distribution_strategy: round_robin
+    candidates:
+      - provider: openrouter
+        model: d3-model-a
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: d3-model-b
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+
+# Semantically identical: comment added, mapping-key order changed, extra whitespace
+_D3_YAML_REFORMATTED = """
+# Reformatted: comment added, key order changed, extra whitespace
+defaults: {}
+aliases:
+  - name: read
+    distribution_strategy: round_robin
+    candidates:
+      - route_family: codex_openrouter_completion_adapter
+        provider: openrouter
+        priority: 100
+        model: d3-model-a
+      - route_family: codex_openrouter_completion_adapter
+        provider:   openrouter
+        priority:   100
+        model:   d3-model-b
+"""
+
+
+async def test_scenario_d3_semantically_identical_refresh_retains_state() -> None:
+    """R3-4 RED pre-fix: re-post YAML with comment, whitespace, and
+    mapping-key-order changes only. Assert changed=False, same active
+    snapshot object, same cooldown key, retained cooldown, retained RR
+    cursor, and retained continuation affinity.
+
+    Pre-fix failure: config_hash = sha256(raw_yaml), so formatting changes
+    produce a different hash -> changed=True."""
+    client = _refresh_client()
+
+    # Activate original
+    resp1 = _post_refresh(client, _D3_YAML_ORIGINAL)
+    assert resp1.status_code == 200
+    assert resp1.json()["changed"] is True
+    snapshot_before = lpe.get_active_routing_snapshot()
+    assert snapshot_before is not None
+
+    # Drive a request to advance the RR cursor and establish affinity
+    leaders: list[str] = []
+
+    async def _performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        leaders.append(adapter_model)
+        return _SUCCESS_RESPONSE
+
+    _, restore = _install_openrouter_performer(_performer)
+    try:
+        await _drive_wrapper(session_id="d3-session-1")
+    finally:
+        restore()
+    affinity_before = {
+        key: dict(value)
+        for key, value in lpe._codex_auto_agent_session_affinity_by_key.items()
+    }
+    assert len(affinity_before) == 1
+    if _wave3_epoch_keys_enabled():
+        assert next(iter(affinity_before.values()))["config_hash"] == (
+            snapshot_before.config_hash
+        )
+
+    # Cool one candidate to have a cooldown to retain
+    model_a_key = _snapshot_candidate_key(snapshot_before, "d3-model-a")
+    await lpe._set_codex_auto_agent_cooldown(model_a_key, 60.0)
+
+    # Capture RR cursor state
+    cursor_before = dict(lpe._round_robin_cursor_by_alias)
+
+    # Re-post reformatted (semantically identical) YAML
+    resp2 = _post_refresh(client, _D3_YAML_REFORMATTED)
+    assert resp2.status_code == 200
+    assert resp2.json()["changed"] is False, (
+        "R3-4: semantically identical YAML (comment/whitespace/key-order "
+        "changes only) must report changed=False. Pre-fix: config_hash = "
+        "sha256(raw_yaml) so formatting changes produce a different hash."
+    )
+
+    # Same active snapshot object
+    snapshot_after = lpe.get_active_routing_snapshot()
+    assert snapshot_after is snapshot_before, (
+        "semantically identical refresh must retain the same snapshot object"
+    )
+    assert _snapshot_candidate_key(snapshot_after, "d3-model-a") == model_a_key
+
+    # Retained cooldown
+    remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(model_a_key)
+    assert remaining > 0, (
+        f"cooldown must be retained across a semantic no-op refresh; remaining={remaining}"
+    )
+
+    # Retained RR cursor
+    cursor_after = dict(lpe._round_robin_cursor_by_alias)
+    assert cursor_after == cursor_before, (
+        f"RR cursor must be retained; before={cursor_before!r}, after={cursor_after!r}"
+    )
+    affinity_after = {
+        key: dict(value)
+        for key, value in lpe._codex_auto_agent_session_affinity_by_key.items()
+    }
+    assert affinity_after == affinity_before
+
+    # Retained continuation affinity: drive a continuation and verify same candidate
+    async def _performer2(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        leaders.append(adapter_model)
+        return _SUCCESS_RESPONSE
+
+    _, restore2 = _install_openrouter_performer(_performer2)
+    try:
+        # Clear the cooldown so the affinity candidate is available
+        lpe._codex_auto_agent_cooldown_until_monotonic_by_key.pop(model_a_key, None)
+        first_leader = leaders[0]
+        await _drive_wrapper(
+            session_id="d3-session-1",
+            body_extra={"previous_response_id": "resp_d3_continuation"},
+        )
+        assert leaders[-1] == first_leader, (
+            "continuation affinity must be retained across a semantic no-op "
+            f"refresh; expected {first_leader!r}, got {leaders[-1]!r}"
+        )
+    finally:
+        restore2()
+
+
+# ---------------------------------------------------------------------------
+# (R3-4, scenario d4) changed refresh preserves compatible continuation affinity
+# ---------------------------------------------------------------------------
+
+_D4_SNAPSHOT_A = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d4-pinned
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: d4-other
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+_D4_SNAPSHOT_B = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d4-pinned
+        route_family: codex_openrouter_completion_adapter
+        priority: 200
+      - provider: openrouter
+        model: d4-other
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+
+async def test_scenario_d4_changed_refresh_preserves_compatible_continuation_affinity() -> None:
+    """Regression pin (passes pre-fix): establish affinity, then submit a
+    continuation, refresh with changed priority while retaining the pinned
+    provider/model/route_family, and assert the continuation remains on the
+    pinned candidate."""
+    client = _refresh_client()
+
+    # Activate snapshot A
+    resp_a = _post_refresh(client, _D4_SNAPSHOT_A)
+    assert resp_a.status_code == 200
+
+    leaders: list[str] = []
+
+    async def _performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        leaders.append(adapter_model)
+        return _SUCCESS_RESPONSE
+
+    _, restore = _install_openrouter_performer(_performer)
+    try:
+        # Cold request: establishes affinity for the leader (d4-pinned)
+        await _drive_wrapper(session_id="d4-session")
+        assert len(leaders) == 1
+        pinned = leaders[0]
+        assert pinned == "d4-pinned"
+        affinity_before = {
+            key: dict(value)
+            for key, value in lpe._codex_auto_agent_session_affinity_by_key.items()
+        }
+        assert len(affinity_before) == 1
+        if _wave3_epoch_keys_enabled():
+            assert next(iter(affinity_before.values()))["config_hash"] == (
+                resp_a.json()["active_config_hash"]
+            )
+
+        # Refresh to snapshot B (changed priority, same provider/model/route_family)
+        resp_b = _post_refresh(client, _D4_SNAPSHOT_B)
+        assert resp_b.status_code == 200
+        assert resp_b.json()["changed"] is True
+
+        # Continuation after refresh: compatible candidate remains pinned
+        await _drive_wrapper(
+            session_id="d4-session",
+            body_extra={"previous_response_id": "resp_d4_cont_2"},
+        )
+        assert leaders[-1] == pinned, (
+            "R3-4: a compatible continuation (same provider/model/route_family) "
+            "must remain pinned after a changed refresh; expected "
+            f"{pinned!r}, got {leaders[-1]!r}"
+        )
+        assert set(lpe._codex_auto_agent_session_affinity_by_key) == set(
+            affinity_before
+        )
+    finally:
+        restore()
+
+
+# ---------------------------------------------------------------------------
+# (R3-4, scenario d5) refresh removing affinity candidate requires redispatch
+# ---------------------------------------------------------------------------
+
+_D5_SNAPSHOT_A = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d5-pinned
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: d5-other
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+_D5_SNAPSHOT_B = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d5-other
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+
+_D5_SNAPSHOT_ROUTE_INCOMPATIBLE = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d5-pinned
+        route_family: codex_responses
+        priority: 100
+      - provider: openrouter
+        model: d5-other
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+
+@pytest.mark.parametrize(
+    "replacement_yaml",
+    [_D5_SNAPSHOT_B, _D5_SNAPSHOT_ROUTE_INCOMPATIBLE],
+    ids=["removed", "route-incompatible"],
+)
+async def test_scenario_d5_refresh_removing_affinity_candidate_requires_redispatch(
+    replacement_yaml: str,
+) -> None:
+    """R3-4 RED pre-fix: establish affinity, refresh to remove the pinned
+    candidate, then submit a continuation. Assert the explicit
+    redispatch-required/fail-closed error and zero upstream calls to another
+    candidate.
+
+    Pre-fix failure: the removed affinity candidate falls through to normal
+    selection, which selects d5-other instead of failing closed."""
+    client = _refresh_client()
+
+    # Activate snapshot A
+    resp_a = _post_refresh(client, _D5_SNAPSHOT_A)
+    assert resp_a.status_code == 200
+
+    leaders: list[str] = []
+
+    async def _performer(
+        *,
+        endpoint: str,
+        request: Request,
+        fastapi_response: Response,
+        user_api_key_dict: Any,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+        target_url: str,
+        api_key: Optional[str],
+        forward_headers: bool,
+    ) -> Response:
+        leaders.append(candidate["model"])
+        return _SUCCESS_RESPONSE
+
+    restore = _install_candidate_request_performer(_performer)
+    try:
+        # Cold request: establishes affinity for d5-pinned
+        await _drive_wrapper(session_id="d5-session")
+        assert leaders[0] == "d5-pinned"
+
+        # Refresh to snapshot B (d5-pinned removed)
+        resp_b = _post_refresh(client, replacement_yaml)
+        assert resp_b.status_code == 200
+        assert resp_b.json()["changed"] is True
+
+        # Continuation after removal: must fail closed with redispatch-required
+        leaders.clear()
+        with pytest.raises(HTTPException) as exc_info:
+            await _drive_wrapper(
+                session_id="d5-session",
+                body_extra={"previous_response_id": "resp_d5_cont"},
+            )
+        exc = exc_info.value
+        assert exc.status_code == 429
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        assert detail.get("redispatch_required") is True or "redispatch" in str(
+            detail.get("code", "")
+        ), (
+            "R3-4: a continuation whose pinned candidate was removed must "
+            f"fail closed with redispatch-required; got detail={detail!r}"
+        )
+        assert len(leaders) == 0, (
+            "R3-4: zero upstream calls to another candidate when the pinned "
+            f"candidate is removed; got calls={leaders!r}"
+        )
+    finally:
+        restore()
+
+
+# ---------------------------------------------------------------------------
+# (R3-4 negative control, scenario d6) legacy alias keys unchanged
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_d6_legacy_alias_keys_unchanged() -> None:
+    """Negative control (passes pre-fix): aawm-low (static-table alias)
+    produces identical bare cooldown keys both before and after snapshot
+    activation. R3-4 epoch tagging must NOT affect legacy non-snapshot
+    aliases or the read lane's no-snapshot fallback."""
+    # Compute the expected bare key for the first aawm-low OpenRouter candidate
+    low_candidates = policy.CODEX_AAWM_LOW_CANDIDATES
+    first_or = next(
+        c for c in low_candidates
+        if c["provider"] == policy.CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+    )
+    lane_key = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+    bare_key_before = lpe._codex_auto_agent_candidate_key(first_or, lane_key)
+    assert not bare_key_before.startswith("h"), (
+        f"expected bare key (no epoch tag), got {bare_key_before!r}"
+    )
+
+    # Drive an aawm-low request pre-snapshot with a failing performer to
+    # observe the cooldown key in the map.
+    async def _failing_performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        if adapter_model == first_or["model"]:
+            raise _StructuredUpstream429(retry_after_seconds=30)
+        return _SUCCESS_RESPONSE
+
+    restore = _install_openrouter_and_opencode_performers(openrouter_handler=_failing_performer)
+    try:
+        result = await _drive_low_alias_wrapper(session_id="d6-pre-snapshot")
+        assert isinstance(result, Response)
+    finally:
+        restore()
+
+    pre_keys = set(lpe._codex_auto_agent_cooldown_until_monotonic_by_key.keys())
+    assert bare_key_before in pre_keys, (
+        f"expected bare key {bare_key_before!r} in cooldown map; keys={pre_keys!r}"
+    )
+
+    # Activate a snapshot through the real refresh route. It must not affect
+    # the static-table aawm-low key format.
+    snapshot_yaml = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d6-snapshot-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+    client = _refresh_client()
+    refresh = _post_refresh(client, snapshot_yaml)
+    assert refresh.status_code == 200
+    assert refresh.json()["changed"] is True
+
+    # Clear cooldowns and drive again
+    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+
+    restore2 = _install_openrouter_and_opencode_performers(openrouter_handler=_failing_performer)
+    try:
+        result = await _drive_low_alias_wrapper(session_id="d6-post-snapshot")
+        assert isinstance(result, Response)
+    finally:
+        restore2()
+
+    post_keys = set(lpe._codex_auto_agent_cooldown_until_monotonic_by_key.keys())
+    bare_key_after = lpe._codex_auto_agent_candidate_key(first_or, lane_key)
+    assert bare_key_after == bare_key_before, (
+        f"legacy alias key must not change after snapshot activation; "
+        f"before={bare_key_before!r}, after={bare_key_after!r}"
+    )
+    assert bare_key_after in post_keys, (
+        f"expected bare key {bare_key_after!r} in cooldown map post-snapshot; keys={post_keys!r}"
+    )
+    assert not bare_key_after.startswith("h"), (
+        f"legacy alias key must remain bare (no epoch tag); got {bare_key_after!r}"
+    )
