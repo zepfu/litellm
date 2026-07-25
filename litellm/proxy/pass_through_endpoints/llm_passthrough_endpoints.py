@@ -7840,7 +7840,20 @@ _get_google_adapter_rate_limit_key = _google_env_policy._get_google_adapter_rate
 _get_google_adapter_rate_limit_key_from_kwargs = _google_env_policy._get_google_adapter_rate_limit_key_from_kwargs
 
 
-_get_google_adapter_semaphore = _google_env_policy._get_google_adapter_semaphore
+def _get_google_adapter_semaphore(
+    model: Optional[str] = None,
+    *,
+    access_token: Optional[str] = None,
+    companion_project: Optional[str] = None,
+    rate_limit_key: Optional[str] = None,
+) -> asyncio.Semaphore:
+    return _anthropic_google_process_cache._get_google_adapter_semaphore(
+        model,
+        runtime=_get_anthropic_google_process_cache_runtime(),
+        access_token=access_token,
+        companion_project=companion_project,
+        rate_limit_key=rate_limit_key,
+    )
 
 
 _get_google_adapter_max_retries = _google_env_policy._get_google_adapter_max_retries

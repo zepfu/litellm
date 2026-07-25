@@ -6,7 +6,6 @@ Do not import llm_passthrough_endpoints at module scope.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import os
 from typing import Any, Optional, cast
@@ -16,7 +15,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     # Host-global modules
     _aawm_alias_retry: Any
-    _anthropic_google_process_cache: Any
     _anthropic_google_shaping: Any
 
     # Host-global constants
@@ -24,7 +22,6 @@ if TYPE_CHECKING:
 
     # Host-global functions
     def _clean_codex_auth_value(value: Any) -> Optional[str]: ...
-    def _get_anthropic_google_process_cache_runtime() -> Any: ...
     def _get_passthrough_hidden_retry_wait_seconds(index: int) -> float: ...
 
 from types import FunctionType
@@ -37,7 +34,6 @@ _HOST_FUNCTION_NAMES = (
     "_get_google_adapter_shared_lane_key",
     "_get_google_adapter_rate_limit_key",
     "_get_google_adapter_rate_limit_key_from_kwargs",
-    "_get_google_adapter_semaphore",
     "_get_google_adapter_max_retries",
     "_coerce_non_negative_int",
     "_coerce_non_negative_float",
@@ -223,21 +219,6 @@ def _get_google_adapter_rate_limit_key_from_kwargs(kwargs: dict[str, Any]) -> st
         cast(Optional[str], model),
         access_token=access_token,
         companion_project=cast(Optional[str], project),
-    )
-
-def _get_google_adapter_semaphore(
-    model: Optional[str] = None,
-    *,
-    access_token: Optional[str] = None,
-    companion_project: Optional[str] = None,
-    rate_limit_key: Optional[str] = None,
-) -> asyncio.Semaphore:
-    return _anthropic_google_process_cache._get_google_adapter_semaphore(  # noqa: F821
-        model,
-        runtime=_get_anthropic_google_process_cache_runtime(),
-        access_token=access_token,
-        companion_project=companion_project,
-        rate_limit_key=rate_limit_key,
     )
 
 def _get_google_adapter_max_retries() -> int:

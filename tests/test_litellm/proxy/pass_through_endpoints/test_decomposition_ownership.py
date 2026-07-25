@@ -117,7 +117,6 @@ GOOGLE_ENV_POLICY_SYMBOLS: set[str] = {
     "_get_google_adapter_shared_lane_key",
     "_get_google_adapter_rate_limit_key",
     "_get_google_adapter_rate_limit_key_from_kwargs",
-    "_get_google_adapter_semaphore",
     "_get_google_adapter_max_retries",
     "_coerce_non_negative_int",
     "_coerce_non_negative_float",
