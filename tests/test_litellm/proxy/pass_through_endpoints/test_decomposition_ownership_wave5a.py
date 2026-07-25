@@ -688,6 +688,14 @@ class TestConfigRefreshParity:
         route_paths = [r.path for r in lpe.router.routes]
         assert "/aawm/alias-config/refresh" in route_paths
 
+    def test_refresh_route_endpoint_preserves_god_module_compatibility(self):
+        route = next(
+            route
+            for route in lpe.router.routes
+            if route.path == "/aawm/alias-config/refresh"
+        )
+        assert route.endpoint.__module__ == lpe.__name__
+
 
 class TestCodexOAuthParity:
     """Golden behavior parity for Codex auth-file/JWT helpers."""
@@ -951,3 +959,84 @@ class TestW5ARR054SeamPreservation:
             assert "_get_google_adapter_semaphore" not in symbols, (
                 f"_get_google_adapter_semaphore incorrectly in {module_key}"
             )
+
+
+# ===========================================================================
+# SECTION 8: God-owned quota cache authority (Wave 5A regression)
+# ===========================================================================
+
+
+class TestW5AGodOwnedQuotaCacheAuthority:
+    """The god-module ``_openrouter_free_daily_quota_cache`` tuple is the
+    single authoritative state.  Wave 5A modules must observe and mutate it
+    through injected getter/setter callbacks, never through a module-local
+    copy."""
+
+    def _save_quota_cache(self):
+        return lpe._openrouter_free_daily_quota_cache
+
+    def _restore_quota_cache(self, saved):
+        # Use the god-module setter so the variable is correctly rebound.
+        lpe._set_openrouter_free_daily_quota_cache(saved)
+
+    def test_reset_through_facade_updates_god_module_variable(self):
+        """_reset_openrouter_free_daily_quota_cache() called via the god-module
+        facade must rebind ``lpe._openrouter_free_daily_quota_cache``."""
+        saved = self._save_quota_cache()
+        try:
+            # Seed a non-default value directly on the god module.
+            lpe._set_openrouter_free_daily_quota_cache((999.0, 12345.0))
+            assert lpe._openrouter_free_daily_quota_cache == (999.0, 12345.0)
+
+            # Reset through the facade (which delegates to openrouter_quota).
+            lpe._reset_openrouter_free_daily_quota_cache()
+
+            # The god-module variable must now be the default.
+            assert lpe._openrouter_free_daily_quota_cache == (None, 0.0)
+        finally:
+            self._restore_quota_cache(saved)
+
+    def test_quota_cache_write_visible_through_god_module(self):
+        """A cache update performed by the openrouter_quota module (via the
+        injected setter) must be visible as the god-module variable."""
+        saved = self._save_quota_cache()
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+                openrouter_quota as oq,
+            )
+
+            # Write through the injected setter.
+            assert oq._set_quota_cache is not None
+            oq._set_quota_cache((42.0, 99.0))
+
+            # Must be visible on the god-module variable.
+            assert lpe._openrouter_free_daily_quota_cache == (42.0, 99.0)
+        finally:
+            self._restore_quota_cache(saved)
+
+    def test_quota_cache_read_observes_god_module(self):
+        """The injected getter must return the current god-module value,
+        not a stale module-local copy."""
+        saved = self._save_quota_cache()
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+                openrouter_quota as oq,
+            )
+
+            # Set a value on the god module directly.
+            lpe._set_openrouter_free_daily_quota_cache((7.0, 8.0))
+
+            # The injected getter must see it.
+            assert oq._get_quota_cache is not None
+            assert oq._get_quota_cache() == (7.0, 8.0)
+        finally:
+            self._restore_quota_cache(saved)
+
+    def test_quota_lock_is_god_module_lock(self):
+        """The lock used by openrouter_quota must be the exact same object
+        as the god-module lock."""
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            openrouter_quota as oq,
+        )
+
+        assert oq._quota_lock is lpe._openrouter_free_daily_quota_lock

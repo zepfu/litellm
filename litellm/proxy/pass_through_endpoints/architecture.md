@@ -237,6 +237,10 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Shared alias candidate retry loop and R3-1 single-flight cooldown publication | `aawm_alias_routing/candidate_loop.py` |
 | Typed alias-route seam contracts (`AliasRouteServices`, cooldown publication plan) | `aawm_alias_routing/interfaces.py` |
 | Structured task-state source selection | `aawm_alias_routing/task_state.py` |
+| Snapshot ordering, distribution strategy, TUI/schedule gates, selection-context memoization, alias-candidate getters | `aawm_alias_routing/snapshot_select.py` |
+| Config refresh handler body and YAML source loading (decorator stays in god module) | `aawm_alias_routing/config_refresh.py` |
+| Codex auth-file discovery, JWT decode, token validation, Codex-native-auth request detection | `aawm_alias_routing/codex_oauth.py` |
+| OpenRouter free-daily-quota probe, durable cooldown helpers, alias-probe cooldown gate | `aawm_alias_routing/openrouter_quota.py` |
 | Route registration, process-local routing call sites, compatibility re-exports, and residual provider orchestration | `llm_passthrough_endpoints.py` |
 
 The legacy `aawm_alias_routing_policy.py` module is a compatibility facade over
@@ -263,6 +267,19 @@ mapping, and final response delivery. Those callbacks do not move substantive
 provider algorithms back into the route module. Responses finalization is
 configured with explicit runtime callbacks so that control flow is
 package-owned without importing the FastAPI route module.
+
+#### Wave 5A deferred state (until Wave 5B)
+
+The following process-local state remains god-module-owned in
+`llm_passthrough_endpoints.py`. Wave 5A modules access them only through
+injected callbacks or shared object references:
+
+| State | Owner | Access seam |
+|-------|-------|-------------|
+| `_openrouter_free_daily_quota_cache` (tuple) | `llm_passthrough_endpoints.py` | getter/setter callbacks injected via `configure_openrouter_quota_runtime` |
+| `_openrouter_free_daily_quota_lock` (asyncio.Lock) | `llm_passthrough_endpoints.py` | shared lock object injected via `configure_openrouter_quota_runtime` |
+| `_round_robin_cursor_by_alias` (dict) | `llm_passthrough_endpoints.py` | accessed directly by snapshot_select via god-module import at call site |
+| FastAPI route registration (`@router.post`, etc.) | `llm_passthrough_endpoints.py` | decorators stay in god module; handler bodies in Wave 5A modules |
 
 Google retry classification retains separate capacity, rate-limit, transient,
 and request budgets through strategy callbacks. The shared retry driver owns

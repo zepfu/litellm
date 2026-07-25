@@ -8,7 +8,6 @@ Use litellm with Anthropic SDK, Vertex AI SDK, Cohere SDK, etc.
 
 import ast
 import asyncio
-import base64
 import codecs
 import copy
 import hashlib
@@ -28,7 +27,6 @@ from typing import (
     Awaitable,
     Callable,
     Mapping,
-    NamedTuple,
     Never,
     Optional,
     Sequence,
@@ -50,7 +48,6 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from pydantic import ValidationError
 from starlette.websockets import WebSocketState
 from typing_extensions import NotRequired, TypeGuard, TypedDict
 
@@ -76,7 +73,6 @@ from litellm.proxy.aawm_runtime_error_logging import (
 )
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_API_BASE,
-    get_chatgpt_default_headers,
 )
 from litellm.llms.anthropic.common_utils import is_anthropic_oauth_key
 from litellm.types.llms.anthropic import ANTHROPIC_OAUTH_BETA_HEADER
@@ -310,7 +306,6 @@ from .aawm_alias_routing_policy import (
     CODEX_AUTO_AGENT_XAI_PROVIDER as _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER,
     CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES as _POLICY_CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES,
     KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS as _POLICY_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,
-    OPENROUTER_FREE_DAILY_QUOTA_MODELS as _POLICY_OPENROUTER_FREE_DAILY_QUOTA_MODELS,
 )
 
 from .aawm_alias_routing import adapter_config as _aawm_adapter_config
@@ -336,15 +331,6 @@ from litellm.llms.anthropic.experimental_pass_through.providers.google import co
 from litellm.llms.anthropic.experimental_pass_through.providers.google import error_signals as _google_error_signals
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import side_channel as _grok_side_channel
 from .aawm_alias_routing import interfaces as _aawm_alias_interfaces
-from .aawm_alias_routing.config_compiler import (
-    ConfigCompileError as _AawmAliasConfigCompileError,
-    compile_yaml as _compile_aawm_alias_routing_yaml,
-)
-from .aawm_alias_routing.config_snapshot import (
-    RoutingCandidate as _RoutingSnapshotCandidate,
-    RoutingSnapshot as _RoutingSnapshot,
-    active_routing_snapshot_holder as _active_routing_snapshot_holder,
-)
 from .aawm_alias_routing.state import AliasFamilyState as _AliasFamilyState
 from .aawm_alias_routing.state import alias_routing_state as _alias_routing_state
 
@@ -573,71 +559,80 @@ _ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS = _POLICY_ALIBABA_TOKEN_PLAN_ADAPTER_
 # routing-decision persistence is introduced here -- selection stays
 # in-memory/process-local, matching the existing auto-agent alias lanes.
 # ---------------------------------------------------------------------------
-_READ_PILOT_ALIAS_NAME = "read"
+
+# ---------------------------------------------------------------------------
+# Wave 5A: facade imports from aawm_alias_routing extraction modules.
+# Each name below is the SAME object as the target module's definition.
+# ---------------------------------------------------------------------------
+from .aawm_alias_routing import snapshot_select as _aawm_snapshot_select
+from .aawm_alias_routing import config_refresh as _aawm_config_refresh
+from .aawm_alias_routing import codex_oauth as _aawm_codex_oauth
+from .aawm_alias_routing import openrouter_quota as _aawm_openrouter_quota
+
+# -- snapshot_select facades --
+_READ_PILOT_ALIAS_NAME = _aawm_snapshot_select._READ_PILOT_ALIAS_NAME
+get_active_routing_snapshot = _aawm_snapshot_select.get_active_routing_snapshot
+set_active_routing_snapshot = _aawm_snapshot_select.set_active_routing_snapshot
+_routing_candidate_to_public_dict = _aawm_snapshot_select._routing_candidate_to_public_dict
+_order_snapshot_candidates_by_priority = _aawm_snapshot_select._order_snapshot_candidates_by_priority
+_select_proportional_snapshot_candidate = _aawm_snapshot_select._select_proportional_snapshot_candidate
+RoundRobinCommitToken = _aawm_snapshot_select.RoundRobinCommitToken
+SelectionEnumeration = _aawm_snapshot_select.SelectionEnumeration
+_select_round_robin_snapshot_candidate = _aawm_snapshot_select._select_round_robin_snapshot_candidate
+_commit_round_robin_selection = _aawm_snapshot_select._commit_round_robin_selection
+_apply_snapshot_alias_distribution_strategy = _aawm_snapshot_select._apply_snapshot_alias_distribution_strategy
+_is_tui_attached_candidate_eligible = _aawm_snapshot_select._is_tui_attached_candidate_eligible
+_is_snapshot_candidate_in_schedule_window = _aawm_snapshot_select._is_snapshot_candidate_in_schedule_window
+_resolve_read_pilot_eligible_candidates = _aawm_snapshot_select._resolve_read_pilot_eligible_candidates
+_select_read_pilot_snapshot_candidates = _aawm_snapshot_select._select_read_pilot_snapshot_candidates
+_derive_round_robin_commit_token = _aawm_snapshot_select._derive_round_robin_commit_token
+_get_aawm_alias_selection_context = _aawm_snapshot_select._get_aawm_alias_selection_context
+_resolve_aawm_alias_selection_enumeration = _aawm_snapshot_select._resolve_aawm_alias_selection_enumeration
+_get_codex_auto_agent_candidates_for_alias = _aawm_snapshot_select._get_codex_auto_agent_candidates_for_alias
+
+# -- config_refresh facades --
+_DEFAULT_AAWM_ALIAS_CONFIG_PATH = _aawm_config_refresh._DEFAULT_AAWM_ALIAS_CONFIG_PATH
+_load_aawm_alias_routing_source_yaml = _aawm_config_refresh._load_aawm_alias_routing_source_yaml
+aawm_alias_config_refresh_route = _aawm_config_refresh.aawm_alias_config_refresh_route
+
+# -- codex_oauth facades --
+_ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS = _aawm_codex_oauth._ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS
+_ANTHROPIC_ADAPTER_CODEX_TOKEN_DIR_ENV_VARS = _aawm_codex_oauth._ANTHROPIC_ADAPTER_CODEX_TOKEN_DIR_ENV_VARS
+_ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS = _aawm_codex_oauth._ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS
+CodexAuthData = _aawm_codex_oauth.CodexAuthData
+CodexTokenData = _aawm_codex_oauth.CodexTokenData
+OAuthJsonData = _aawm_codex_oauth.OAuthJsonData
+_clean_codex_auth_value = _aawm_codex_oauth._clean_codex_auth_value
+_get_anthropic_adapter_codex_auth_file_path = _aawm_codex_oauth._get_anthropic_adapter_codex_auth_file_path
+_decode_jwt_claims_without_validation = _aawm_codex_oauth._decode_jwt_claims_without_validation
+_extract_codex_account_id_from_token = _aawm_codex_oauth._extract_codex_account_id_from_token
+_get_codex_auth_token_data = _aawm_codex_oauth._get_codex_auth_token_data
+_get_codex_auth_token_expiry = _aawm_codex_oauth._get_codex_auth_token_expiry
+_codex_auth_access_token_is_valid = _aawm_codex_oauth._codex_auth_access_token_is_valid
+_load_codex_auth_data_from_path = _aawm_codex_oauth._load_codex_auth_data_from_path
+_load_local_codex_auth_headers = _aawm_codex_oauth._load_local_codex_auth_headers
+_anthropic_adapter_request_uses_codex_native_auth = _aawm_codex_oauth._anthropic_adapter_request_uses_codex_native_auth
+_anthropic_adapter_request_has_openai_client_auth = _aawm_codex_oauth._anthropic_adapter_request_has_openai_client_auth
+_anthropic_adapter_should_forward_direct_auth_headers = _aawm_codex_oauth._anthropic_adapter_should_forward_direct_auth_headers
+_request_uses_codex_native_auth = _aawm_codex_oauth._request_uses_codex_native_auth
+_get_oauth_token_error_code = _aawm_codex_oauth._get_oauth_token_error_code
+_format_oauth_refresh_failure_detail = _aawm_codex_oauth._format_oauth_refresh_failure_detail
+
+# -- openrouter_quota facades --
+_OPENROUTER_DURABLE_QUOTA_DAILY_KEY = _aawm_openrouter_quota._OPENROUTER_DURABLE_QUOTA_DAILY_KEY
+_OPENROUTER_DURABLE_QUOTA_CACHE_TTL_SECONDS = _aawm_openrouter_quota._OPENROUTER_DURABLE_QUOTA_CACHE_TTL_SECONDS
+_OPENROUTER_DURABLE_QUOTA_LOOKUP_TIMEOUT_SECONDS = _aawm_openrouter_quota._OPENROUTER_DURABLE_QUOTA_LOOKUP_TIMEOUT_SECONDS
+_OPENROUTER_FREE_DAILY_QUOTA_MODELS = _aawm_openrouter_quota._OPENROUTER_FREE_DAILY_QUOTA_MODELS
+_raise_openrouter_auto_agent_candidate_unavailable = _aawm_openrouter_quota._raise_openrouter_auto_agent_candidate_unavailable
+_maybe_raise_openrouter_adapter_alias_probe_cooldown = _aawm_openrouter_quota._maybe_raise_openrouter_adapter_alias_probe_cooldown
+_reset_openrouter_free_daily_quota_cache = _aawm_openrouter_quota._reset_openrouter_free_daily_quota_cache
+_parse_openrouter_free_daily_quota_reset_timestamp = _aawm_openrouter_quota._parse_openrouter_free_daily_quota_reset_timestamp
+_fetch_openrouter_free_daily_quota_row = _aawm_openrouter_quota._fetch_openrouter_free_daily_quota_row
+_get_openrouter_free_daily_quota_exhausted_cooldown_seconds = _aawm_openrouter_quota._get_openrouter_free_daily_quota_exhausted_cooldown_seconds
+_is_openrouter_free_quota_candidate = _aawm_openrouter_quota._is_openrouter_free_quota_candidate
+_apply_openrouter_durable_quota_candidate_cooldown = _aawm_openrouter_quota._apply_openrouter_durable_quota_candidate_cooldown
+
 _read_pilot_cooldown_gate = _aawm_alias_classification.CooldownEvidenceGate(family_state=_AliasFamilyState())
-
-
-def get_active_routing_snapshot() -> Optional[_RoutingSnapshot]:
-    """Return the process-local active config-driven routing snapshot, if any."""
-    return _active_routing_snapshot_holder.get()
-
-
-def set_active_routing_snapshot(
-    snapshot: Optional[_RoutingSnapshot],
-) -> Optional[_RoutingSnapshot]:
-    """Atomically activate ``snapshot`` (or clear it with ``None``)."""
-    if snapshot is None:
-        return _active_routing_snapshot_holder.swap(None)  # type: ignore[arg-type]
-    return _active_routing_snapshot_holder.swap(snapshot)
-
-
-def _routing_candidate_to_public_dict(
-    candidate: _RoutingSnapshotCandidate,
-    *,
-    epoch_tag: Optional[str] = None,
-) -> dict[str, Any]:
-    """Shape a compiled ``RoutingCandidate`` into the legacy candidate-dict form.
-
-    When ``epoch_tag`` is provided (snapshot-resolved candidates), it is
-    carried as ``config_epoch_tag`` so downstream state-key construction
-    can prefix cooldown/evidence/probe keys with the semantic digest.
-    """
-    shaped: dict[str, Any] = {
-        "provider": candidate.provider,
-        "model": candidate.model,
-        "route_family": candidate.route_family,
-        "last_resort": candidate.priority == 0,
-    }
-    if epoch_tag:
-        shaped["config_epoch_tag"] = epoch_tag
-    return shaped
-
-
-def _order_snapshot_candidates_by_priority(
-    candidates: Sequence[_RoutingSnapshotCandidate],
-) -> list[_RoutingSnapshotCandidate]:
-    """Pure ordering: descending priority; ``priority: 0`` always placed last."""
-    non_zero = [c for c in candidates if c.priority != 0]
-    zero = [c for c in candidates if c.priority == 0]
-    non_zero_sorted = sorted(non_zero, key=lambda c: c.priority, reverse=True)
-    return non_zero_sorted + zero
-
-
-def _select_proportional_snapshot_candidate(
-    candidates: Sequence[_RoutingSnapshotCandidate],
-    weights: Mapping[str, float],
-    rng: random.Random,
-) -> _RoutingSnapshotCandidate:
-    """Pure weighted tie-break among ``candidates`` using ``weights`` (by model)."""
-    ordered = list(candidates)
-    total = sum(max(0.0, weights.get(c.model, 0.0)) for c in ordered) or 1.0
-    pick = rng.random() * total
-    cumulative = 0.0
-    for candidate in ordered:
-        cumulative += max(0.0, weights.get(candidate.model, 0.0))
-        if pick <= cumulative:
-            return candidate
-    return ordered[-1]
 
 
 # Process-local rotation cursor for ``distribution_strategy: round_robin``,
@@ -646,72 +641,11 @@ def _select_proportional_snapshot_candidate(
 # fresh rotation cycle.  Static/legacy aliases use ``("", alias_name)``.
 _round_robin_cursor_by_alias: dict[tuple[str, str], int] = {}
 
-
-class RoundRobinCommitToken(NamedTuple):
-    """Immutable receipt describing how a round-robin rotation must commit.
-
-    Captured once per request (in the selection context) at enumeration time so
-    the actual selection -- not any getter call multiplicity -- drives the single
-    cursor advance. ``tied_candidate_ids`` is the stable, priority-ordered tied
-    top-tier identity tuple; ``start_index`` is the cursor value read when the
-    enumeration resolved (Wave 3 seam / diagnostics -- the commit itself keys off
-    the actually selected member's position, never blindly ``start_index + 1``).
-    """
-
-    alias_name: str
-    epoch_tag: str
-    tied_candidate_ids: Tuple[Tuple[str, str], ...]
-    start_index: int
-
-
-class SelectionEnumeration(NamedTuple):
-    """Per-request memoized alias enumeration + optional round-robin commit token."""
-
-    candidates: Tuple[dict[str, Any], ...]
-    commit_token: Optional[RoundRobinCommitToken]
-
-
-def _select_round_robin_snapshot_candidate(
-    tied: Sequence[_RoutingSnapshotCandidate],
-    *,
-    alias_name: str,
-    epoch_tag: str = "",
-) -> _RoutingSnapshotCandidate:
-    """Pick the next tied candidate by READING the per-alias rotation cursor.
-
-    Distinct from ``proportional``: this is a deterministic round-robin over the
-    equal-top-priority candidates (in their stable priority ordering). It is a
-    PURE read of the cursor -- it does NOT advance it. The cursor only advances
-    via ``_commit_round_robin_selection`` once per request, keyed on the member
-    that is actually selected, so repeated enumeration getter calls within a
-    single request cannot desync the rotation from live traffic.
-    """
-    cursor = _round_robin_cursor_by_alias.get((epoch_tag, alias_name), 0)
-    return tied[cursor % len(tied)]
-
-
-def _commit_round_robin_selection(
-    token: Optional[RoundRobinCommitToken],
-    *,
-    selected_candidate: dict[str, Any],
-) -> None:
-    """Advance the rotation cursor to the slot AFTER the actually selected member.
-
-    No-op when ``token`` is ``None`` (non-round-robin alias) or when the selected
-    candidate is not a member of the rotated tied tier (affinity, last-resort, or
-    lower-priority fallback selections must never consume top-tier rotation). The
-    next cursor points immediately after the actual selected candidate's stable
-    position -- never a blind ``start_index + 1`` -- so a fallback pick inside the
-    tier (e.g. B chosen while A cools) rotates to C, not back to B.
-    """
-    if token is None:
-        return
-    identity = (selected_candidate.get("provider"), selected_candidate.get("model"))
-    try:
-        index = token.tied_candidate_ids.index(identity)
-    except ValueError:
-        return
-    _round_robin_cursor_by_alias[(token.epoch_tag, token.alias_name)] = (index + 1) % len(token.tied_candidate_ids)
+# Wave 5A: bind the round-robin cursor into snapshot_select.
+_aawm_snapshot_select.configure_snapshot_runtime(
+    round_robin_cursor=_round_robin_cursor_by_alias,
+    get_candidates_for_alias=lambda *a, **kw: globals()["_get_codex_auto_agent_candidates_for_alias"](*a, **kw),
+)
 
 
 def reset_module_singletons() -> None:
@@ -743,243 +677,6 @@ def reset_alias_routing_state_for_tests() -> None:
     """
     _alias_routing_state.reset_for_tests()
     reset_module_singletons()
-
-
-def _apply_snapshot_alias_distribution_strategy(
-    ordered: Sequence[_RoutingSnapshotCandidate],
-    *,
-    distribution_strategy: Optional[str],
-    rng: random.Random,
-    alias_name: str = "",
-    epoch_tag: str = "",
-) -> list[_RoutingSnapshotCandidate]:
-    """Reorder the top priority-tier of ``ordered`` per ``distribution_strategy``.
-
-    ``ordered`` is already sorted descending by priority with ``priority: 0``
-    last (see ``_order_snapshot_candidates_by_priority``). When more than one
-    candidate shares the top (highest, non-zero) priority tier:
-
-    - ``proportional`` uses a weighted random pick to decide which tied
-      candidate leads the returned ordering.
-    - ``round_robin`` rotates a per-alias process-local cursor across the tied
-      candidates so successive selections cycle through them deterministically.
-
-    In both cases the remaining candidates (including any other tiers) keep
-    their existing relative order as the fallback chain. Any other/absent
-    strategy leaves the ordering untouched.
-    """
-    if distribution_strategy not in ("proportional", "round_robin") or len(ordered) < 2:
-        return list(ordered)
-    top_priority = ordered[0].priority
-    tied = [c for c in ordered if c.priority == top_priority]
-    if len(tied) < 2:
-        return list(ordered)
-    if distribution_strategy == "round_robin":
-        winner = _select_round_robin_snapshot_candidate(tied, alias_name=alias_name, epoch_tag=epoch_tag)
-    else:
-        weights = {c.model: c.weight for c in tied}
-        winner = _select_proportional_snapshot_candidate(tied, weights, rng)
-    remainder = [c for c in ordered if c is not winner]
-    return [winner, *remainder]
-
-
-def _is_tui_attached_candidate_eligible(
-    candidate: _RoutingSnapshotCandidate,
-    *,
-    client_product_label: Optional[str],
-) -> bool:
-    """Per-model TUI gate: an undetermined TUI excludes only ``tui_attached`` candidates."""
-    if not candidate.tui_attached:
-        return True
-    if not client_product_label:
-        return False
-    product_name = client_product_label.split("/", 1)[0]
-    return product_name == candidate.tui_attached
-
-
-def _is_snapshot_candidate_in_schedule_window(
-    candidate: _RoutingSnapshotCandidate,
-    *,
-    now_utc: datetime,
-) -> bool:
-    """Schedule gate: only prevents NEW affinity, never evicts existing state."""
-    schedule = candidate.schedule
-    if schedule is None:
-        return True
-    return schedule.start <= now_utc <= schedule.end
-
-
-def _resolve_read_pilot_eligible_candidates(
-    *,
-    client_product_label: Optional[str],
-    now_utc: datetime,
-) -> Optional[list[_RoutingSnapshotCandidate]]:
-    """Return the eligibility-filtered, priority-ordered ``read`` alias candidates.
-
-    ``None`` means there is no active snapshot ``read`` alias (callers use the
-    static fallback table). An empty list means every candidate was gated out
-    (TUI/schedule) -- callers fail closed rather than dispatching a rejected
-    candidate. Shared by the enumeration getter and the round-robin commit-token
-    derivation so both observe the identical tied top-tier ordering.
-    """
-    snapshot = get_active_routing_snapshot()
-    if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
-        return None
-    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
-    ordered = _order_snapshot_candidates_by_priority(alias.candidates)
-    return [
-        candidate
-        for candidate in ordered
-        if _is_tui_attached_candidate_eligible(candidate, client_product_label=client_product_label)
-        and _is_snapshot_candidate_in_schedule_window(candidate, now_utc=now_utc)
-    ]
-
-
-def _select_read_pilot_snapshot_candidates(
-    *,
-    client_product_label: Optional[str] = None,
-    now_utc: Optional[datetime] = None,
-) -> tuple[dict[str, Any], ...]:
-    """Resolve the ordered ``read`` alias candidate tuple from the active snapshot.
-
-    Falls back to the hard-coded ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS`` table
-    when no snapshot has been activated (or the snapshot has no ``read`` alias),
-    so the pilot degrades gracefully instead of raising.
-    """
-    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
-    eligible = _resolve_read_pilot_eligible_candidates(
-        client_product_label=client_product_label,
-        now_utc=resolved_now,
-    )
-    if eligible is None:
-        return _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-            _READ_PILOT_ALIAS_NAME,
-            _CODEX_AUTO_AGENT_CANDIDATES,
-        )
-    # Fail closed: if every candidate is currently ineligible (TUI-gated out
-    # of window, etc), do NOT silently fall back to the unfiltered ordered
-    # list -- that would dispatch to a candidate the eligibility gates just
-    # rejected. Returning empty here means the caller sees "no candidates
-    # available" for this attempt, matching every other alias-routing lane's
-    # fail-closed behavior on exhaustion.
-    if not eligible:
-        return ()
-    snapshot = get_active_routing_snapshot()
-    assert snapshot is not None
-    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
-    epoch_tag = snapshot.config_hash
-    distributed = _apply_snapshot_alias_distribution_strategy(
-        eligible,
-        distribution_strategy=alias.distribution_strategy,
-        rng=random.Random(),
-        alias_name=_READ_PILOT_ALIAS_NAME,
-        epoch_tag=epoch_tag,
-    )
-    return tuple(_routing_candidate_to_public_dict(c, epoch_tag=epoch_tag) for c in distributed)
-
-
-def _derive_round_robin_commit_token(
-    alias_model: str,
-    *,
-    client_product_label: Optional[str],
-    now_utc: Optional[datetime] = None,
-) -> Optional[RoundRobinCommitToken]:
-    """Build the commit token for a ``round_robin`` snapshot alias, else ``None``.
-
-    Only the snapshot-driven ``read`` alias participates in round-robin rotation;
-    every other alias (static-table lanes, non-round-robin strategies, single-
-    candidate tiers) yields ``None`` so the commit path is a no-op for them.
-    """
-    if alias_model != _READ_PILOT_ALIAS_NAME:
-        return None
-    snapshot = get_active_routing_snapshot()
-    if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
-        return None
-    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
-    if alias.distribution_strategy != "round_robin":
-        return None
-    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
-    eligible = _resolve_read_pilot_eligible_candidates(
-        client_product_label=client_product_label,
-        now_utc=resolved_now,
-    )
-    if not eligible or len(eligible) < 2:
-        return None
-    top_priority = eligible[0].priority
-    tied = [c for c in eligible if c.priority == top_priority]
-    if len(tied) < 2:
-        return None
-    epoch_tag = snapshot.config_hash
-    start_index = _round_robin_cursor_by_alias.get((epoch_tag, _READ_PILOT_ALIAS_NAME), 0)
-    return RoundRobinCommitToken(
-        alias_name=_READ_PILOT_ALIAS_NAME,
-        epoch_tag=epoch_tag,
-        tied_candidate_ids=tuple((c.provider, c.model) for c in tied),
-        start_index=start_index,
-    )
-
-
-def _get_aawm_alias_selection_context(
-    request: Request,
-) -> dict[str, SelectionEnumeration]:
-    """Per-request cache of ``alias_model -> SelectionEnumeration`` on ``request.state``.
-
-    Mirrors the ``aawm_alias_request_local_*`` request-state cache pattern so the
-    alias enumeration resolves exactly once per request even though the wrapper,
-    the candidate-state builder, and the affinity resolver each need it.
-    """
-    context = getattr(request.state, "aawm_alias_selection_context", None)
-    if isinstance(context, dict):
-        return context
-    context = {}
-    setattr(request.state, "aawm_alias_selection_context", context)
-    return context
-
-
-def _resolve_aawm_alias_selection_enumeration(
-    request: Request,
-    alias_model: str,
-    *,
-    client_product_label: Optional[str] = None,
-) -> SelectionEnumeration:
-    """Resolve (and memoize) the ordered candidate enumeration + commit token.
-
-    The underlying getter ``_get_codex_auto_agent_candidates_for_alias`` is
-    invoked exactly once per ``(request, alias_model)`` -- every subsequent call
-    site consumes the cached enumeration, so cursor reads stay consistent and the
-    getter cannot advance rotation multiple times per live request.
-    """
-    context = _get_aawm_alias_selection_context(request)
-    cached = context.get(alias_model)
-    if cached is not None:
-        return cached
-    candidates = tuple(
-        _get_codex_auto_agent_candidates_for_alias(
-            alias_model,
-            client_product_label=client_product_label,
-        )
-    )
-    token = _derive_round_robin_commit_token(
-        alias_model,
-        client_product_label=client_product_label,
-    )
-    enumeration = SelectionEnumeration(candidates=candidates, commit_token=token)
-    context[alias_model] = enumeration
-    return enumeration
-
-
-def _get_codex_auto_agent_candidates_for_alias(
-    alias_model: str,
-    *,
-    client_product_label: Optional[str] = None,
-) -> tuple[dict[str, Any], ...]:
-    if alias_model == _READ_PILOT_ALIAS_NAME:
-        return _select_read_pilot_snapshot_candidates(client_product_label=client_product_label)
-    candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-        alias_model,
-        _CODEX_AUTO_AGENT_CANDIDATES,
-    )
-    return candidates
 
 
 def _get_anthropic_auto_agent_candidates_for_alias(
@@ -1277,19 +974,6 @@ _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502
 _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES = sorted(
     PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES - {429}
 )
-_ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS = (
-    "LITELLM_CODEX_AUTH_FILE",
-    "CHATGPT_AUTH_FILE",
-)
-_ANTHROPIC_ADAPTER_CODEX_TOKEN_DIR_ENV_VARS = (
-    "LITELLM_CODEX_TOKEN_DIR",
-    "CHATGPT_TOKEN_DIR",
-)
-_ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS = (
-    "~/.codex/auth.json",
-    "~/.codex/auth.json",
-    "~/.config/litellm/chatgpt/auth.json",
-)
 
 
 vertex_llm_base = VertexBase()
@@ -1309,79 +993,30 @@ passthrough_endpoint_router = PassthroughEndpointRouter()
 # YAML/secrets back; only compiled snapshot identity fields
 # (hash/version/changed) are returned.
 # ---------------------------------------------------------------------------
-_DEFAULT_AAWM_ALIAS_CONFIG_PATH = Path(__file__).resolve().parents[1] / "aawm_alias_config" / "read.yaml"
 
 
-def _load_aawm_alias_routing_source_yaml(*, inline_yaml: Optional[str]) -> str:
-    """Return the raw YAML to compile: an inline override, or the default file."""
-    if inline_yaml is not None:
-        return inline_yaml
-    return _DEFAULT_AAWM_ALIAS_CONFIG_PATH.read_text(encoding="utf-8")
+async def _aawm_alias_config_refresh_route_endpoint(
+    request: Request,
+) -> dict[str, Any]:
+    return await aawm_alias_config_refresh_route(request)
 
 
-@router.post(
+_aawm_alias_config_refresh_route_endpoint.__name__ = (
+    aawm_alias_config_refresh_route.__name__
+)
+_aawm_alias_config_refresh_route_endpoint.__qualname__ = (
+    aawm_alias_config_refresh_route.__qualname__
+)
+_aawm_alias_config_refresh_route_endpoint.__doc__ = (
+    aawm_alias_config_refresh_route.__doc__
+)
+
+
+# Wave 5A: route registration delegates to the extracted config-refresh handler.
+router.post(
     "/aawm/alias-config/refresh",
     tags=["AAWM Alias Routing"],
-)
-async def aawm_alias_config_refresh_route(request: Request) -> dict[str, Any]:
-    """Validate + compile the AAWM alias-routing config and atomically activate it.
-
-    Fails closed: a compile/validation error preserves the previously active
-    (last-known-good) snapshot untouched and returns a secret-safe error body.
-    A no-op re-post (identical content hash) is a successful 200 with
-    ``changed: False``.
-    """
-    try:
-        request_body = await request.json()
-    except Exception:
-        request_body = {}
-    inline_yaml = request_body.get("yaml") if isinstance(request_body, dict) else None
-    if inline_yaml is not None and not isinstance(inline_yaml, str):
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "AAWM alias-routing config 'yaml' field must be a string"},
-        )
-
-    try:
-        source_yaml = _load_aawm_alias_routing_source_yaml(inline_yaml=inline_yaml)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "failed to read AAWM alias-routing config source"},
-        ) from exc
-
-    try:
-        attempted_snapshot = _compile_aawm_alias_routing_yaml(source_yaml)
-    except (_AawmAliasConfigCompileError, ValidationError):
-        last_known_good = get_active_routing_snapshot()
-        error_detail: dict[str, Any] = {
-            "error": "AAWM alias-routing config failed to compile; last-known-good snapshot remains active",
-        }
-        if last_known_good is not None:
-            error_detail["active_config_hash"] = last_known_good.config_hash
-            error_detail["config_version"] = last_known_good.config_version
-        raise HTTPException(status_code=400, detail=error_detail)
-
-    previous_snapshot = get_active_routing_snapshot()
-    changed = previous_snapshot is None or previous_snapshot.config_hash != attempted_snapshot.config_hash
-    active_snapshot: _RoutingSnapshot
-    if changed:
-        set_active_routing_snapshot(attempted_snapshot)
-        active_snapshot = attempted_snapshot
-    else:
-        # No-op: identical content already active. Do not replace the
-        # snapshot object -- in-flight readers holding a reference to the
-        # active snapshot must keep observing the exact same object.
-        assert previous_snapshot is not None
-        active_snapshot = previous_snapshot
-
-    return {
-        "changed": changed,
-        "attempted_config_hash": attempted_snapshot.config_hash,
-        "active_config_hash": active_snapshot.config_hash,
-        "config_version": active_snapshot.config_version,
-        "activated_at": datetime.now(timezone.utc).isoformat(),
-    }
+)(_aawm_alias_config_refresh_route_endpoint)
 
 
 def _decode_http_response_body(body: Any) -> str:
@@ -1439,10 +1074,6 @@ _CLAUDE_POST_REWRITE_CONTEXT_FILE_MARKERS: tuple[tuple[str, str], ...] = (
     ("MEMORY.md", "memory-md"),
     ("CLAUDE.md", "claude-md"),
 )
-_OPENROUTER_DURABLE_QUOTA_DAILY_KEY = "openrouter_free_daily_requests:requests"
-_OPENROUTER_DURABLE_QUOTA_CACHE_TTL_SECONDS = 30.0
-_OPENROUTER_DURABLE_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
-_OPENROUTER_FREE_DAILY_QUOTA_MODELS = _POLICY_OPENROUTER_FREE_DAILY_QUOTA_MODELS
 _openrouter_free_daily_quota_cache: tuple[Optional[float], float] = (None, 0.0)
 _openrouter_free_daily_quota_lock = asyncio.Lock()
 _claude_context_replacement_template_cache: dict[Path, str] = {}
@@ -2106,6 +1737,11 @@ def _get_request_header_or_passthrough_alias(request: Request, header_name: str)
             return value.strip()
     return None
 
+# Wave 5A: bind request-header helper into codex_oauth.
+_aawm_codex_oauth.configure_codex_oauth_runtime(
+    get_request_header_or_passthrough_alias=_get_request_header_or_passthrough_alias,
+)
+
 
 def _get_aawm_tenant_header(request: Request) -> Optional[str]:
     for header_name in _AAWM_TENANT_ID_HEADER_NAMES:
@@ -2143,46 +1779,6 @@ _normalize_anthropic_openrouter_adapter_model_name = _aawm_adapter_model_resolut
 
 
 _get_openrouter_completion_adapter_upstream_model = _aawm_adapter_model_resolution._get_openrouter_completion_adapter_upstream_model
-
-
-def _raise_openrouter_auto_agent_candidate_unavailable(message: str) -> Never:
-    exc = ProxyException(
-        message=message,
-        type="invalid_request_error",
-        param="model",
-        code=502,
-    )
-    setattr(
-        exc,
-        "detail",
-        {
-            "error": {
-                "message": message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        },
-    )
-    raise exc
-
-
-async def _maybe_raise_openrouter_adapter_alias_probe_cooldown(
-    adapter_model: Optional[str],
-    *,
-    use_alias_candidate_probe: bool = False,
-) -> None:
-    if not use_alias_candidate_probe:
-        return
-    cooldown_seconds = await _get_openrouter_adapter_active_cooldown_seconds(adapter_model)
-    if cooldown_seconds <= 0:
-        return
-    rounded_wait = max(1, int(cooldown_seconds))
-    model_label = _get_openrouter_adapter_rate_limit_key(adapter_model)
-    _raise_openrouter_auto_agent_candidate_unavailable(
-        (
-            f"OpenRouter auto-agent candidate {model_label} is temporarily cooling down "
-            f"on the adapter. Retry after ~{rounded_wait}s."
-        )
-    )
 
 
 _normalize_opencode_zen_adapter_model_name = _aawm_adapter_model_resolution._normalize_opencode_zen_adapter_model_name
@@ -2462,130 +2058,6 @@ def _codex_auto_agent_candidate_public_shape(
     if reason is not None:
         shaped["reason"] = reason
     return shaped
-
-
-def _reset_openrouter_free_daily_quota_cache() -> None:
-    global _openrouter_free_daily_quota_cache
-    _openrouter_free_daily_quota_cache = (None, 0.0)
-
-
-def _parse_openrouter_free_daily_quota_reset_timestamp(
-    expected_reset_at: Any,
-) -> Optional[float]:
-    if isinstance(expected_reset_at, (int, float)):
-        return float(expected_reset_at)
-    if isinstance(expected_reset_at, datetime):
-        reset_dt = expected_reset_at
-        if reset_dt.tzinfo is None:
-            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
-        return reset_dt.timestamp()
-    if isinstance(expected_reset_at, str):
-        raw_reset = expected_reset_at.strip()
-        if not raw_reset:
-            return None
-        if raw_reset.endswith("Z"):
-            raw_reset = raw_reset[:-1] + "+00:00"
-        try:
-            reset_dt = datetime.fromisoformat(raw_reset)
-        except (TypeError, ValueError):
-            return None
-        if reset_dt.tzinfo is None:
-            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
-        return reset_dt.timestamp()
-    return None
-
-
-async def _fetch_openrouter_free_daily_quota_row() -> Optional[Any]:
-    pool = await _get_aawm_dynamic_injection_pool()
-    return await pool.fetchrow(
-        """
-        SELECT expected_reset_at, remaining_pct
-        FROM public.rate_limit_observations
-        WHERE provider = $1
-          AND quota_key = $2
-        ORDER BY observed_at DESC
-        LIMIT 1
-        """,
-        _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
-        _OPENROUTER_DURABLE_QUOTA_DAILY_KEY,
-    )
-
-
-async def _get_openrouter_free_daily_quota_exhausted_cooldown_seconds() -> float:
-    global _openrouter_free_daily_quota_cache
-
-    now_monotonic = time.monotonic()
-    cached_reset_at, cached_until = _openrouter_free_daily_quota_cache
-    if cached_until > now_monotonic:
-        if cached_reset_at is None:
-            return 0.0
-        return max(0.0, cached_reset_at - time.time())
-
-    async with _openrouter_free_daily_quota_lock:
-        cached_reset_at, cached_until = _openrouter_free_daily_quota_cache
-        if cached_until > time.monotonic():
-            if cached_reset_at is None:
-                return 0.0
-            return max(0.0, cached_reset_at - time.time())
-
-        reset_at_ts: Optional[float] = None
-        try:
-            row = await asyncio.wait_for(
-                _fetch_openrouter_free_daily_quota_row(),
-                timeout=_OPENROUTER_DURABLE_QUOTA_LOOKUP_TIMEOUT_SECONDS,
-            )
-            if row is not None:
-                remaining_pct = row["remaining_pct"]
-                try:
-                    remaining_pct_float = float(remaining_pct) if remaining_pct is not None else None
-                except (TypeError, ValueError):
-                    remaining_pct_float = None
-                if remaining_pct_float is not None and remaining_pct_float <= 0:
-                    reset_at_ts = _parse_openrouter_free_daily_quota_reset_timestamp(row["expected_reset_at"])
-        except Exception:
-            verbose_proxy_logger.debug(
-                "OpenRouter durable quota check failed; failing open for alias selection",
-                exc_info=True,
-            )
-            reset_at_ts = None
-
-        if reset_at_ts is not None and reset_at_ts <= time.time():
-            reset_at_ts = None
-        _openrouter_free_daily_quota_cache = (
-            reset_at_ts,
-            time.monotonic() + _OPENROUTER_DURABLE_QUOTA_CACHE_TTL_SECONDS,
-        )
-        if reset_at_ts is None:
-            return 0.0
-        return max(0.0, reset_at_ts - time.time())
-
-
-def _is_openrouter_free_quota_candidate(candidate: dict[str, Any]) -> bool:
-    if candidate["provider"] != _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
-        return False
-    model = str(candidate.get("model") or "")
-    return model in _OPENROUTER_FREE_DAILY_QUOTA_MODELS
-
-
-async def _apply_openrouter_durable_quota_candidate_cooldown(
-    *,
-    candidate: dict[str, Any],
-    cooldown_seconds: float,
-    cooldown_state_source: Optional[str],
-    skip_reason: Optional[str],
-) -> tuple[float, Optional[str], Optional[str]]:
-    if not _is_openrouter_free_quota_candidate(candidate):
-        return cooldown_seconds, cooldown_state_source, skip_reason
-
-    durable_cooldown = await _get_openrouter_free_daily_quota_exhausted_cooldown_seconds()
-    if durable_cooldown <= 0:
-        return cooldown_seconds, cooldown_state_source, skip_reason
-
-    if durable_cooldown > cooldown_seconds:
-        cooldown_seconds = durable_cooldown
-        cooldown_state_source = "durable_quota"
-        skip_reason = "durable_quota_exhausted"
-    return cooldown_seconds, cooldown_state_source, skip_reason
 
 
 def _auto_agent_alias_float(value: Any) -> Optional[float]:
@@ -8899,6 +8371,32 @@ async def _get_openrouter_adapter_active_cooldown_seconds(
         adapter_model,
     )
 
+# Wave 5A: bind quota state and adapter helpers into openrouter_quota.
+def _get_openrouter_free_daily_quota_cache() -> tuple[Optional[float], float]:
+    return _openrouter_free_daily_quota_cache
+
+
+def _set_openrouter_free_daily_quota_cache(value: tuple[Optional[float], float]) -> None:
+    global _openrouter_free_daily_quota_cache
+    _openrouter_free_daily_quota_cache = value
+
+
+async def _fetch_openrouter_quota_row_via_facade():
+    """Indirection so monkeypatching ``_fetch_openrouter_free_daily_quota_row``
+    on this module is visible to the openrouter_quota module."""
+    return await _fetch_openrouter_free_daily_quota_row()
+
+
+_aawm_openrouter_quota.configure_openrouter_quota_runtime(
+    get_quota_cache=_get_openrouter_free_daily_quota_cache,
+    set_quota_cache=_set_openrouter_free_daily_quota_cache,
+    quota_lock=_openrouter_free_daily_quota_lock,
+    get_dynamic_injection_pool=_get_aawm_dynamic_injection_pool,
+    get_adapter_active_cooldown_seconds=_get_openrouter_adapter_active_cooldown_seconds,
+    get_adapter_rate_limit_key=_get_openrouter_adapter_rate_limit_key,
+    fetch_quota_row=_fetch_openrouter_quota_row_via_facade,
+)
+
 
 async def _wait_for_openrouter_adapter_cooldown_if_needed(
     rate_limit_keys: Union[str, list[str], tuple[str, ...]],
@@ -11220,53 +10718,6 @@ def _load_claude_agent_declared_model(agent_name: str) -> Optional[str]:
     return model_name
 
 
-def _anthropic_adapter_request_has_openai_client_auth(request: Request) -> bool:
-    # On the Anthropic route, direct Authorization headers are typically Anthropic auth
-    # from Claude clients, not OpenAI/Codex credentials. Treat direct auth as OpenAI
-    # client auth only when the request also carries Codex-native request markers.
-    if _get_request_header_or_passthrough_alias(
-        request, "x-pass-authorization"
-    ) or _get_request_header_or_passthrough_alias(request, "x-pass-api-key"):
-        return True
-
-    if _anthropic_adapter_request_uses_codex_native_auth(request):
-        return bool(
-            _get_request_header_or_passthrough_alias(request, "authorization")
-            or _get_request_header_or_passthrough_alias(request, "api-key")
-        )
-
-    return False
-
-
-def _anthropic_adapter_request_uses_codex_native_auth(request: Request) -> bool:
-    chatgpt_account_id = _get_request_header_or_passthrough_alias(request, "ChatGPT-Account-Id")
-    originator = _get_request_header_or_passthrough_alias(request, "originator")
-    user_agent = _get_request_header_or_passthrough_alias(request, "user-agent")
-    session_id = _get_request_header_or_passthrough_alias(request, "session_id")
-
-    if isinstance(chatgpt_account_id, str) and len(chatgpt_account_id) > 0:
-        return True
-    if isinstance(originator, str) and "codex" in originator.lower():
-        return True
-    return bool(
-        isinstance(user_agent, str)
-        and "codex" in user_agent.lower()
-        and isinstance(session_id, str)
-        and len(session_id) > 0
-    )
-
-
-def _anthropic_adapter_should_forward_direct_auth_headers(request: Request) -> bool:
-    return _anthropic_adapter_request_has_openai_client_auth(request)
-
-
-def _clean_codex_auth_value(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    cleaned = value.strip()
-    return cleaned or None
-
-
 _aawm_alias_durable.configure_durable_runtime(
     clean_value=_clean_codex_auth_value,
     get_dual_cache_override=lambda: (
@@ -11278,9 +10729,6 @@ _aawm_alias_durable.configure_durable_runtime(
 )
 
 
-CodexAuthData = dict[str, object]
-CodexTokenData = dict[str, object]
-OAuthJsonData = dict[str, object]
 AntigravityOAuthTokenData = dict[str, object]
 AntigravityPassthroughRequestBody = dict[str, object]
 PassthroughLoggingMetadata = dict[str, object]
@@ -11302,88 +10750,6 @@ def _build_google_adapter_native_headers(*, access_token: str, model: Optional[s
     return _anthropic_google_shaping._build_google_adapter_native_headers(
         access_token=access_token, model=model, accept=accept
     )
-
-
-def _get_anthropic_adapter_codex_auth_file_path() -> Optional[Path]:
-    for env_name in _ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS:
-        raw_value = _clean_codex_auth_value(os.getenv(env_name))
-        if not raw_value:
-            continue
-        path = Path(raw_value).expanduser()
-        if path.exists():
-            return path
-
-    token_dir: Optional[Path] = None
-    for env_name in _ANTHROPIC_ADAPTER_CODEX_TOKEN_DIR_ENV_VARS:
-        raw_value = _clean_codex_auth_value(os.getenv(env_name))
-        if not raw_value:
-            continue
-        candidate = Path(raw_value).expanduser()
-        if candidate.exists():
-            token_dir = candidate
-            break
-    if token_dir is not None:
-        candidate = token_dir / "auth.json"
-        if candidate.exists():
-            return candidate
-
-    for candidate_str in _ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS:
-        candidate = Path(candidate_str).expanduser()
-        if candidate.exists():
-            return candidate
-
-    return None
-
-
-def _decode_jwt_claims_without_validation(token: str) -> dict[str, Any]:
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return {}
-        payload_b64 = parts[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
-    except Exception:
-        return {}
-
-
-def _extract_codex_account_id_from_token(token: Optional[str]) -> Optional[str]:
-    if not token:
-        return None
-    claims = _decode_jwt_claims_without_validation(token)
-    auth_claims = claims.get("https://api.openai.com/auth")
-    if isinstance(auth_claims, dict):
-        account_id = auth_claims.get("chatgpt_account_id")
-        if isinstance(account_id, str) and account_id:
-            return account_id
-    return None
-
-
-def _get_codex_auth_token_data(auth_data: CodexAuthData) -> CodexTokenData:
-    token_data = auth_data.get("tokens")
-    if isinstance(token_data, dict):
-        return dict(token_data)
-    return auth_data
-
-
-def _get_codex_auth_token_expiry(access_token: str) -> Optional[int]:
-    claims = _decode_jwt_claims_without_validation(access_token)
-    exp = claims.get("exp")
-    if isinstance(exp, (int, float)):
-        return int(exp)
-    return None
-
-
-def _codex_auth_access_token_is_valid(token_data: CodexTokenData) -> bool:
-    access_token = _clean_codex_auth_value(token_data.get("access_token"))
-    if access_token is None:
-        return False
-    expires_at = token_data.get("expires_at")
-    if not isinstance(expires_at, (int, float)):
-        expires_at = _get_codex_auth_token_expiry(access_token)
-    if not isinstance(expires_at, (int, float)):
-        return True
-    return time.time() < float(expires_at) - 60
 
 
 def _write_json_file_atomic(
@@ -11411,58 +10777,6 @@ def _write_json_file_atomic(
             status_code=500,
             detail=f"Failed to persist refreshed {failure_label} auth data to {path}: {exc}",
         ) from exc
-
-
-async def _load_codex_auth_data_from_path(auth_path: Path) -> Optional[CodexAuthData]:
-    try:
-        auth_data = json.loads(auth_path.read_text())
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(auth_data, dict):
-        return None
-    return auth_data
-
-
-async def _load_local_codex_auth_headers(request: Request) -> Optional[dict[str, str]]:
-    auth_path = _get_anthropic_adapter_codex_auth_file_path()
-    if auth_path is None:
-        return None
-
-    auth_data = await _load_codex_auth_data_from_path(auth_path)
-    if auth_data is None:
-        return None
-
-    token_data = _get_codex_auth_token_data(auth_data)
-    access_token = _clean_codex_auth_value(token_data.get("access_token"))
-    if access_token is None:
-        return None
-    if not _codex_auth_access_token_is_valid(token_data):
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Codex OAuth access token is expired or invalid. The "
-                "provider-status sidecar owns Codex auth refresh; confirm the "
-                "sidecar can write the configured auth file and refresh "
-                f"{auth_path}."
-            ),
-        )
-
-    account_id = _clean_codex_auth_value(token_data.get("account_id")) or _extract_codex_account_id_from_token(
-        _clean_codex_auth_value(token_data.get("id_token")) or access_token
-    )
-
-    headers = _safe_get_request_headers(request)
-    session_id = (
-        _get_request_header_or_passthrough_alias(request, "session_id")
-        or headers.get("x-claude-code-session-id")
-        or headers.get("X-Claude-Code-Session-Id")
-    )
-
-    return get_chatgpt_default_headers(
-        access_token=access_token,
-        account_id=account_id,
-        session_id=session_id,
-    )
 
 
 def _get_anthropic_adapter_openai_target_base(
@@ -19665,25 +18979,6 @@ async def _prepare_anthropic_request_body_for_passthrough(
     return updated_body, expanded_count, hooks, billing_header_fields
 
 
-def _request_uses_codex_native_auth(request: Request) -> bool:
-    headers = _safe_get_request_headers(request)
-    chatgpt_account_id = headers.get("chatgpt-account-id") or headers.get("ChatGPT-Account-Id")
-    originator = headers.get("originator") or headers.get("Originator")
-    user_agent = headers.get("user-agent") or headers.get("User-Agent")
-    session_id = headers.get("session_id") or headers.get("Session_Id")
-
-    if isinstance(chatgpt_account_id, str) and len(chatgpt_account_id) > 0:
-        return True
-    if isinstance(originator, str) and "codex" in originator.lower():
-        return True
-    return bool(
-        isinstance(user_agent, str)
-        and "codex" in user_agent.lower()
-        and isinstance(session_id, str)
-        and len(session_id) > 0
-    )
-
-
 def _should_preserve_openai_client_auth(request: Request, endpoint: str) -> bool:
     """
     Preserve inbound client auth only for OpenAI Responses and model-list
@@ -19837,30 +19132,6 @@ _get_antigravity_oauth_client_value_from_token_data = (
 
 
 _get_antigravity_oauth_client_value_candidates = _aawm_antigravity_oauth._get_antigravity_oauth_client_value_candidates
-
-
-def _get_oauth_token_error_code(response: httpx.Response) -> Optional[str]:
-    try:
-        response_body = response.json()
-    except ValueError:
-        return None
-    if not isinstance(response_body, dict):
-        return None
-    return _clean_codex_auth_value(response_body.get("error"))
-
-
-def _format_oauth_refresh_failure_detail(
-    *,
-    provider_label: str,
-    response: httpx.Response,
-) -> str:
-    error_code = _get_oauth_token_error_code(response)
-    suffix = f"status={response.status_code}, error={error_code}" if error_code else f"status={response.status_code}"
-    return (
-        f"Failed to refresh {provider_label} OAuth access token ({suffix}). "
-        f"Re-authenticate {provider_label} CLI or configure valid OAuth client "
-        "environment overrides."
-    )
 
 
 # RR-054 #1: wire Antigravity OAuth package runtime deps after helpers exist.
