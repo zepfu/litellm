@@ -18917,18 +18917,24 @@ def _build_codex_auto_agent_request(session_id: str = "codex-session"):
 
 @pytest.fixture(autouse=True)
 def clear_codex_auto_agent_alias_state(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import (
+        llm_passthrough_endpoints as endpoints,
+    )
+
     monkeypatch.setattr(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
         lambda events, *, request_body=None: None,
     )
     aawm_claude_control_plane._claude_tool_advertisement_compaction_cache.clear()
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+    endpoints._alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
     _codex_auto_agent_google_lane_key_until_monotonic_by_key.clear()
     _codex_auto_agent_google_lane_key_by_key.clear()
     _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.clear()
     _codex_auto_agent_antigravity_lane_key_by_key.clear()
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
+    endpoints._alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
     for candidate_map, aliases in (
         (
@@ -18950,12 +18956,14 @@ def clear_codex_auto_agent_alias_state(monkeypatch):
     yield
     aawm_claude_control_plane._claude_tool_advertisement_compaction_cache.clear()
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+    endpoints._alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
     _codex_auto_agent_google_lane_key_until_monotonic_by_key.clear()
     _codex_auto_agent_google_lane_key_by_key.clear()
     _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.clear()
     _codex_auto_agent_antigravity_lane_key_by_key.clear()
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
+    endpoints._alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
     clear_aawm_route_rollups()
 
@@ -22259,11 +22267,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_malformed_redispatches
         "xai:xai/grok-4.5:xai_grok_native"
     )
     assert durable_seconds == 0.0
-    # Both sources mean "no durable cooldown was written" for this request-local
-    # scope; which one is observed depends on whether a concurrent test left a
-    # negative-cache entry for the shared key (matches the tolerant form used
-    # elsewhere in this file).
-    assert durable_source in {"local_fallback", "negative_cache"}
+    assert durable_source == "local_fallback"
     mock_grok_native.assert_awaited_once()
     mock_xai_oauth.assert_not_called()
     mock_pass_through.assert_not_called()

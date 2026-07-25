@@ -22469,13 +22469,25 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
     (``_handle_codex_auto_agent_alias_route`` /
     ``_handle_anthropic_auto_agent_alias_route``) build the services directly;
     this façade keeps the legacy seam contract for the RR-054 single-flight
-    tests, bridging the per-call ``apply_cooldown_fn`` into the resolver +
-    in-lock publisher via a per-call closure holder (concurrency-safe: each
-    invocation has its own holder).
+    tests. Process-local publication uses the same synchronous family-memory
+    writer as production. The legacy async applicator is isolated in the
+    post-release persistence callback and never enters the typed synchronous
+    publisher contract.
     """
-    # Per-call holder so the resolver can flow the exact apply kwargs to the
-    # in-lock publisher without a global (concurrent requests must not share).
-    apply_holder: dict[str, Any] = {}
+    legacy_request: Optional[Request] = None
+    legacy_candidate: dict[str, Any] = {}
+    legacy_lane_key: Optional[str] = None
+    legacy_selected_cooldown_key = ""
+    legacy_cooldown_seconds = 0.0
+    legacy_error_class: Optional[str] = None
+    legacy_grok_account_quota_exhausted = False
+    legacy_kimi_failure_metadata: Optional[dict[str, Any]] = None
+    legacy_is_read_pilot_lane = False
+    family_state = (
+        _alias_routing_state.anthropic
+        if alias_family == "anthropic_auto_agent"
+        else _alias_routing_state.codex
+    )
 
     def _legacy_resolve_publication(
         *,
@@ -22489,17 +22501,24 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
         kimi_failure_metadata: Optional[dict[str, Any]] = None,
         is_read_pilot_lane: bool = False,
     ) -> _aawm_alias_interfaces.CooldownPublicationPlan:
-        apply_holder["kwargs"] = {
-            "request": request,
-            "candidate": candidate,
-            "lane_key": lane_key,
-            "selected_cooldown_key": selected_cooldown_key,
-            "cooldown_seconds": cooldown_seconds,
-            "error_class": error_class,
-            "grok_account_quota_exhausted": grok_account_quota_exhausted,
-            "kimi_failure_metadata": kimi_failure_metadata,
-            "is_read_pilot_lane": is_read_pilot_lane,
-        }
+        nonlocal legacy_request
+        nonlocal legacy_candidate
+        nonlocal legacy_lane_key
+        nonlocal legacy_selected_cooldown_key
+        nonlocal legacy_cooldown_seconds
+        nonlocal legacy_error_class
+        nonlocal legacy_grok_account_quota_exhausted
+        nonlocal legacy_kimi_failure_metadata
+        nonlocal legacy_is_read_pilot_lane
+        legacy_request = request
+        legacy_candidate = candidate
+        legacy_lane_key = lane_key
+        legacy_selected_cooldown_key = selected_cooldown_key
+        legacy_cooldown_seconds = cooldown_seconds
+        legacy_error_class = error_class
+        legacy_grok_account_quota_exhausted = grok_account_quota_exhausted
+        legacy_kimi_failure_metadata = kimi_failure_metadata
+        legacy_is_read_pilot_lane = is_read_pilot_lane
         return _resolve_auto_agent_cooldown_publication_plan(
             request=request,
             candidate=candidate,
@@ -22512,21 +22531,32 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
             is_read_pilot_lane=is_read_pilot_lane,
         )
 
-    async def _legacy_publish_memory(*, keys: Sequence[str], seconds: float) -> str:
-        # Drive the legacy per-call applicator INSIDE the probe lock (R3-1) so
-        # its injected suspension / cooldown write completes before a queued
-        # follower can acquire the lock and re-probe. The applicator returns the
-        # authoritative applied scope.
-        kwargs = dict(apply_holder.get("kwargs") or {})
-        kwargs.pop("is_read_pilot_lane", None)
-        if apply_holder.get("kwargs", {}).get("is_read_pilot_lane"):
-            kwargs["is_read_pilot_lane"] = True
-        return await apply_cooldown_fn(**kwargs)
+    def _legacy_publish_memory(*, keys: Sequence[str], seconds: float) -> None:
+        for key in keys:
+            family_state.set_cooldown_memory(key, seconds)
 
     async def _legacy_persist(*, keys: Sequence[str], seconds: float) -> None:
-        # The legacy applicator already performed the durable write inside the
-        # lock; nothing to persist post-release on the legacy path.
-        return None
+        if legacy_request is None:
+            raise RuntimeError("legacy cooldown resolver did not capture a request")
+        await apply_cooldown_fn(
+            request=legacy_request,
+            candidate=legacy_candidate,
+            lane_key=legacy_lane_key,
+            selected_cooldown_key=legacy_selected_cooldown_key,
+            cooldown_seconds=legacy_cooldown_seconds,
+            error_class=legacy_error_class,
+            grok_account_quota_exhausted=legacy_grok_account_quota_exhausted,
+            kimi_failure_metadata=legacy_kimi_failure_metadata,
+            is_read_pilot_lane=legacy_is_read_pilot_lane,
+        )
+
+    async def _legacy_get_active_cooldown_state(
+        cooldown_key: str,
+    ) -> tuple[float, str]:
+        memory_seconds = family_state.get_memory_cooldown_remaining(cooldown_key)
+        if memory_seconds > 0:
+            return memory_seconds, "memory"
+        return await get_active_cooldown_state_fn(cooldown_key)
 
     # The legacy seam callables are type-erased (``Callable[..., ...]``); cast
     # them to the typed protocols at this bridge boundary. The production
@@ -22537,9 +22567,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
             _aawm_alias_interfaces.PerformCandidateRequestFn, perform_candidate_request_fn
         ),
         resolve_cooldown_publication_fn=_legacy_resolve_publication,
-        # The legacy publisher returns the applied scope (awaited by the loop);
-        # bridge it to the sync ``PublishCooldownMemoryFn`` contract via Any.
-        publish_cooldown_memory_fn=cast(Any, _legacy_publish_memory),
+        publish_cooldown_memory_fn=_legacy_publish_memory,
         persist_cooldown_fn=_legacy_persist,
         set_session_affinity_fn=cast(_aawm_alias_interfaces.SetSessionAffinityFn, set_session_affinity_fn),
         add_alias_metadata_fn=add_alias_metadata_fn,
@@ -22552,7 +22580,7 @@ async def _handle_auto_agent_alias_route(  # noqa: PLR0915
         request=request,
         prepared_request_body=prepared_request_body,
         max_candidate_attempts=max_candidate_attempts,
-        get_active_cooldown_state_fn=get_active_cooldown_state_fn,
+        get_active_cooldown_state_fn=_legacy_get_active_cooldown_state,
         attempts_metadata_key=attempts_metadata_key,
         skipped_candidates_metadata_key=skipped_candidates_metadata_key,
         no_candidate_detail=no_candidate_detail,

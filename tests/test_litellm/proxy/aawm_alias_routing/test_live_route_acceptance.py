@@ -41,7 +41,7 @@ values.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -53,6 +53,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     policy,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
+    CooldownPublicationPlan,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -777,7 +780,156 @@ aliases:
 # ---------------------------------------------------------------------------
 
 
-async def test_kimi_managed_account_publishes_only_managed_account_key() -> None:
+async def _drive_scope_target_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    candidate: dict[str, Any],
+    lane_key: str,
+    selected_cooldown_key: str,
+    error_class: str,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    grok_account_quota_exhausted: bool = False,
+    cooldown_seconds: float = 30.0,
+) -> tuple[
+    CooldownPublicationPlan,
+    list[tuple[str, tuple[str, ...]]],
+]:
+    """Drive one failure through the real Codex wrapper and candidate loop."""
+    selection = {
+        "candidate": candidate,
+        "lane_key": lane_key,
+        "cooldown_key": selected_cooldown_key,
+        "session_key": "wave2-scope-target",
+        "selection_reason": "first_available",
+        "skipped": [],
+        "in_flight_session": False,
+        "cooldown_seconds": 0.0,
+        "cooldown_state_source": "local_fallback",
+    }
+    probe_lock = await lpe._alias_routing_state.candidate_probe_lock(
+        alias_family="codex_auto_agent",
+        cooldown_key=selected_cooldown_key,
+    )
+    publication_events: list[tuple[str, tuple[str, ...]]] = []
+    plans: list[CooldownPublicationPlan] = []
+    original_resolver = lpe._resolve_auto_agent_cooldown_publication_plan
+    original_memory_publisher = lpe._publish_codex_cooldown_memory
+
+    async def _select_candidate(
+        *,
+        request: Request,
+        request_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        return selection
+
+    def _resolve_publication_plan(
+        *,
+        request: Optional[Request],
+        candidate: dict[str, Any],
+        lane_key: Optional[str],
+        selected_cooldown_key: str,
+        cooldown_seconds: float,
+        error_class: Optional[str],
+        grok_account_quota_exhausted: bool = False,
+        kimi_failure_metadata: Optional[dict[str, Any]] = None,
+        is_read_pilot_lane: bool = False,
+    ) -> CooldownPublicationPlan:
+        plan = original_resolver(
+            request=request,
+            candidate=candidate,
+            lane_key=lane_key,
+            selected_cooldown_key=selected_cooldown_key,
+            cooldown_seconds=cooldown_seconds,
+            error_class=error_class,
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+            is_read_pilot_lane=is_read_pilot_lane,
+        )
+        plans.append(plan)
+        return plan
+
+    def _publish_memory(*, keys: Sequence[str], seconds: float) -> None:
+        assert probe_lock.locked(), "memory publication must happen before probe-lock release"
+        publication_events.append(("memory", tuple(keys)))
+        original_memory_publisher(keys=keys, seconds=seconds)
+
+    async def _persist_durable(*, keys: Sequence[str], seconds: float) -> None:
+        assert not probe_lock.locked(), "durable persistence must happen after probe-lock release"
+        publication_events.append(("durable", tuple(keys)))
+
+    monkeypatch.setattr(lpe, "_select_codex_auto_agent_candidate", _select_candidate)
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_aawm_alias_selection_enumeration",
+        lambda request, alias_model, *, client_product_label=None: MagicMock(
+            candidates=(candidate,)
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_perform_codex_auto_agent_alias_candidate_request",
+        AsyncMock(side_effect=RuntimeError("wave2 scope-target failure")),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_safe_kimi_code_probe_failure_metadata",
+        lambda exc, *, candidate: kimi_failure_metadata,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_kimi_code_auto_agent_probe_failure",
+        lambda metadata: (
+            error_class if kimi_failure_metadata is not None else None
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc: error_class,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_is_codex_auto_agent_grok_account_quota_exhaustion",
+        lambda exc, *, candidate: grok_account_quota_exhausted,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_codex_auto_agent_cooldown_seconds",
+        lambda exc, *, candidate: cooldown_seconds,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_auto_agent_cooldown_publication_plan",
+        _resolve_publication_plan,
+    )
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", _publish_memory)
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", _persist_durable)
+
+    request = _minimal_request("wave2-scope-target")
+    with pytest.raises(Exception):
+        await lpe._handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": "aawm-low",
+                "input": "hello",
+                "stream": False,
+                "litellm_metadata": {"session_id": "wave2-scope-target"},
+            },
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert len(plans) == 1
+    return plans[0], publication_events
+
+
+async def test_kimi_managed_account_publishes_only_managed_account_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A Kimi managed-account failure publishes ONLY the managed-account
     sentinel key under the probe lock -- not the selected candidate's own
     cooldown key."""
@@ -798,8 +950,8 @@ async def test_kimi_managed_account_publishes_only_managed_account_key() -> None
         "reset_reason": "quota_exhausted",
     }
 
-    scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
-        request=_minimal_request("kimi-managed-session"),
+    plan, publication_events = await _drive_scope_target_failure(
+        monkeypatch,
         candidate=candidate,
         lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
         selected_cooldown_key=candidate_key,
@@ -808,17 +960,21 @@ async def test_kimi_managed_account_publishes_only_managed_account_key() -> None
         kimi_failure_metadata=metadata,
     )
 
-    assert scope == "managed_account"
     managed_key = lpe._get_kimi_code_managed_account_cooldown_key()
-    assert (
-        await lpe._get_codex_auto_agent_active_cooldown_seconds(managed_key) > 0
-    ), "managed-account sentinel key must be cooled"
-    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(candidate_key) == 0, (
-        "the selected candidate's own key must NOT be cooled by a " "managed-account-scoped Kimi failure"
-    )
+    assert plan.applied_scope == "managed_account"
+    assert plan.memory_keys == (managed_key,)
+    assert plan.durable_keys == (managed_key,)
+    assert publication_events == [
+        ("memory", plan.memory_keys),
+        ("durable", plan.durable_keys),
+    ]
+    assert lpe._alias_routing_state.codex.get_memory_cooldown_remaining(managed_key) > 0
+    assert candidate_key not in lpe._codex_auto_agent_cooldown_until_monotonic_by_key
 
 
-async def test_kimi_no_cooldown_publishes_no_shared_key() -> None:
+async def test_kimi_no_cooldown_publishes_no_shared_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A Kimi no-cooldown / request-local failure must publish an EMPTY
     shared-memory key set -- neither the candidate key nor the managed-account
     sentinel is cooled."""
@@ -839,8 +995,8 @@ async def test_kimi_no_cooldown_publishes_no_shared_key() -> None:
         "reset_reason": "malformed_provider_response",
     }
 
-    scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
-        request=_minimal_request("kimi-no-cooldown-session"),
+    plan, publication_events = await _drive_scope_target_failure(
+        monkeypatch,
         candidate=candidate,
         lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
         selected_cooldown_key=candidate_key,
@@ -849,10 +1005,13 @@ async def test_kimi_no_cooldown_publishes_no_shared_key() -> None:
         kimi_failure_metadata=metadata,
     )
 
-    assert scope == "none"
     managed_key = lpe._get_kimi_code_managed_account_cooldown_key()
-    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(candidate_key) == 0
-    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(managed_key) == 0
+    assert plan.applied_scope == "none"
+    assert plan.memory_keys == ()
+    assert plan.durable_keys == ()
+    assert publication_events == []
+    assert candidate_key not in lpe._codex_auto_agent_cooldown_until_monotonic_by_key
+    assert managed_key not in lpe._codex_auto_agent_cooldown_until_monotonic_by_key
 
 
 # ---------------------------------------------------------------------------
@@ -860,7 +1019,9 @@ async def test_kimi_no_cooldown_publishes_no_shared_key() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_grok_account_quota_publishes_candidate_and_lane_keys_before_release() -> None:
+async def test_grok_account_quota_publishes_candidate_and_lane_keys_before_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A Grok account-quota exhaustion failure publishes BOTH the selected
     candidate key and the ``provider:__account_quota__:lane`` key -- a
     concurrent sibling candidate on the same lane must observe the lane key
@@ -875,8 +1036,8 @@ async def test_grok_account_quota_publishes_candidate_and_lane_keys_before_relea
     selected_key = lpe._codex_auto_agent_candidate_key(grok_candidate, lane_key)
     lane_cooldown_key = f"{grok_candidate['provider']}:__account_quota__:{lane_key}"
 
-    scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
-        request=_minimal_request("grok-quota-session"),
+    plan, publication_events = await _drive_scope_target_failure(
+        monkeypatch,
         candidate=grok_candidate,
         lane_key=lane_key,
         selected_cooldown_key=selected_key,
@@ -885,14 +1046,16 @@ async def test_grok_account_quota_publishes_candidate_and_lane_keys_before_relea
         grok_account_quota_exhausted=True,
     )
 
-    assert scope == "candidate"
-    assert (
-        await lpe._get_codex_auto_agent_active_cooldown_seconds(selected_key) > 0
-    ), "selected candidate key must be cooled"
-    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(lane_cooldown_key) > 0, (
-        "account-quota lane key must ALSO be cooled so a sibling candidate "
-        "on the same lane observes the account-level exhaustion"
-    )
+    expected_keys = (selected_key, lane_cooldown_key)
+    assert plan.applied_scope == "candidate"
+    assert plan.memory_keys == expected_keys
+    assert plan.durable_keys == expected_keys
+    assert publication_events == [
+        ("memory", plan.memory_keys),
+        ("durable", plan.durable_keys),
+    ]
+    assert lpe._alias_routing_state.codex.get_memory_cooldown_remaining(selected_key) > 0
+    assert lpe._alias_routing_state.codex.get_memory_cooldown_remaining(lane_cooldown_key) > 0
 
     # A concurrent sibling xAI candidate on the SAME lane (native Grok) must
     # see the lane key's cooldown when it builds its own candidate state.

@@ -26,13 +26,24 @@ create the module here.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import inspect
+from typing import Any, Optional, Sequence
+from unittest.mock import MagicMock
 
 import pytest
+from fastapi import Request
+from starlette.responses import Response
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    classification,
     config_compiler as compiler,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
+    AliasRouteServices,
+    CooldownPublicationPlan,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     alias_routing_state,
@@ -179,9 +190,16 @@ def test_reset_alias_routing_state_for_tests_clears_everything() -> None:
     lpe._anthropic_auto_agent_cooldown_negative_until_monotonic_by_key["seed"] = 1.0
     lpe._anthropic_auto_agent_session_affinity_by_key["seed"] = {"provider": "p", "model": "m"}
     alias_routing_state.anthropic.evidence_events_by_key["seed"] = [1.0]
-    alias_routing_state.candidate_probe_locks["seed"] = object()
-    lpe._read_pilot_cooldown_gate._key_state["seed"] = object()
-    lpe._read_pilot_cooldown_gate._family_state.evidence_events_by_key["seed"] = [1.0]
+    alias_routing_state.candidate_probe_locks["seed"] = asyncio.Lock()
+    evidence = classification.classify_failure(
+        status_code=429,
+        provider="openrouter",
+        message="rate limited",
+    )
+    lpe._read_pilot_cooldown_gate.record(
+        cooldown_key="seed",
+        event=evidence,
+    )
     lpe._round_robin_cursor_by_alias["seed"] = 1
 
     raw_yaml = """
@@ -236,84 +254,311 @@ _ALIAS_ROUTE_SERVICES_CALLBACK_FIELDS = (
 _PUBLISH_COOLDOWN_MEMORY_FN_REQUIRED_KWARGS = ("keys", "seconds")
 
 
-def test_alias_route_services_signature_contracts() -> None:
-    """The production ``AliasRouteServices`` bundle exposes every typed
-    callback field the Wave-2 candidate_loop extraction consumes, and
-    ``PublishCooldownMemoryFn`` declares its documented required keyword
-    parameters.
+_CALLBACK_PARAMETER_KINDS: dict[str, dict[str, inspect._ParameterKind]] = {
+    "select_candidate_fn": {
+        "request": inspect.Parameter.KEYWORD_ONLY,
+        "request_body": inspect.Parameter.KEYWORD_ONLY,
+    },
+    "perform_candidate_request_fn": {
+        "candidate": inspect.Parameter.KEYWORD_ONLY,
+        "candidate_body": inspect.Parameter.KEYWORD_ONLY,
+    },
+    "resolve_cooldown_publication_fn": {
+        "request": inspect.Parameter.KEYWORD_ONLY,
+        "candidate": inspect.Parameter.KEYWORD_ONLY,
+        "lane_key": inspect.Parameter.KEYWORD_ONLY,
+        "selected_cooldown_key": inspect.Parameter.KEYWORD_ONLY,
+        "cooldown_seconds": inspect.Parameter.KEYWORD_ONLY,
+        "error_class": inspect.Parameter.KEYWORD_ONLY,
+        "grok_account_quota_exhausted": inspect.Parameter.KEYWORD_ONLY,
+        "kimi_failure_metadata": inspect.Parameter.KEYWORD_ONLY,
+        "is_read_pilot_lane": inspect.Parameter.KEYWORD_ONLY,
+    },
+    "publish_cooldown_memory_fn": {
+        "keys": inspect.Parameter.KEYWORD_ONLY,
+        "seconds": inspect.Parameter.KEYWORD_ONLY,
+    },
+    "persist_cooldown_fn": {
+        "keys": inspect.Parameter.KEYWORD_ONLY,
+        "seconds": inspect.Parameter.KEYWORD_ONLY,
+    },
+    "set_session_affinity_fn": {
+        "session_key": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "candidate": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    },
+    "add_alias_metadata_fn": {
+        "request_body": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "request": inspect.Parameter.KEYWORD_ONLY,
+        "selection": inspect.Parameter.KEYWORD_ONLY,
+        "attempts": inspect.Parameter.KEYWORD_ONLY,
+    },
+    "raise_redispatch_fn": {
+        "candidate": inspect.Parameter.KEYWORD_ONLY,
+        "lane_key": inspect.Parameter.KEYWORD_ONLY,
+        "cooldown_seconds": inspect.Parameter.KEYWORD_ONLY,
+        "error_tokens": inspect.Parameter.KEYWORD_ONLY,
+        "alias_model": inspect.Parameter.KEYWORD_ONLY,
+        "error_class": inspect.Parameter.KEYWORD_ONLY,
+        "cooldown_scope": inspect.Parameter.KEYWORD_ONLY,
+        "error_status_code": inspect.Parameter.KEYWORD_ONLY,
+        "error_type": inspect.Parameter.KEYWORD_ONLY,
+        "error_code": inspect.Parameter.KEYWORD_ONLY,
+        "retry_after_seconds": inspect.Parameter.KEYWORD_ONLY,
+        "failure_phase": inspect.Parameter.KEYWORD_ONLY,
+        "attempted_provider_call": inspect.Parameter.KEYWORD_ONLY,
+        "audit_events": inspect.Parameter.KEYWORD_ONLY,
+        "attempts": inspect.Parameter.KEYWORD_ONLY,
+        "skipped_candidates": inspect.Parameter.KEYWORD_ONLY,
+    },
+}
 
-    RED until the Wave-2 engineer creates
-    ``aawm_alias_routing.interfaces`` -- the ``ImportError`` is the correct
-    signal until then; do not create the module here.
-    """
-    try:
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
-            interfaces as alias_route_interfaces,
-        )
-    except ImportError as exc:
-        pytest.fail(
-            "aawm_alias_routing.interfaces does not exist yet -- expected "
-            f"RED until the Wave-2 engineer lands AliasRouteServices ({exc})"
-        )
+_CALLBACK_COROUTINE_STATUS = {
+    "select_candidate_fn": True,
+    "perform_candidate_request_fn": True,
+    "resolve_cooldown_publication_fn": False,
+    "publish_cooldown_memory_fn": False,
+    "persist_cooldown_fn": True,
+    "set_session_affinity_fn": True,
+    "add_alias_metadata_fn": False,
+    "raise_redispatch_fn": False,
+}
 
-    services_cls = alias_route_interfaces.AliasRouteServices
-    field_names = {f.name for f in __import__("dataclasses").fields(services_cls)}
+
+def _signature_contract_request() -> MagicMock:
+    request = MagicMock(spec=Request)
+    request.method = "POST"
+    request.headers = {"session_id": "signature-contract"}
+    request.query_params = {}
+    request.url = MagicMock()
+    request.scope = {
+        "path": "/openai_passthrough/v1/responses",
+        "query_string": b"",
+        "parsed_body": None,
+    }
+    request.state = MagicMock()
+    request.state.aawm_alias_request_local_cooldown_until = {}
+    request.state.aawm_alias_request_local_excluded_keys = set()
+    return request
+
+
+@pytest.mark.asyncio
+async def test_alias_route_services_signature_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inspect every callback actually bound by both production wrappers."""
+    captured: dict[str, AliasRouteServices] = {}
+
+    async def _capture_services(
+        services: AliasRouteServices,
+        *,
+        alias_family: str,
+        alias_model: str,
+        request: Request,
+        prepared_request_body: dict[str, Any],
+        max_candidate_attempts: int,
+        get_active_cooldown_state_fn: object,
+        attempts_metadata_key: str,
+        skipped_candidates_metadata_key: str,
+        no_candidate_detail: str,
+        log_label: str,
+    ) -> Response:
+        captured[alias_family] = services
+        return Response(content="{}")
+
+    monkeypatch.setattr(
+        lpe._aawm_alias_candidate_loop,
+        "handle_alias_route",
+        _capture_services,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_aawm_alias_selection_enumeration",
+        lambda request, alias_model, *, client_product_label=None: MagicMock(
+            candidates=({},)
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_anthropic_auto_agent_candidates_for_alias",
+        lambda alias_model: ({},),
+    )
+
+    request = _signature_contract_request()
+    await lpe._handle_codex_auto_agent_alias_route(
+        endpoint="/v1/responses",
+        request=request,
+        fastapi_response=MagicMock(spec=Response),
+        user_api_key_dict=MagicMock(),
+        prepared_request_body={"model": "aawm-low"},
+        target_url="https://chatgpt.com/backend-api/codex/responses",
+        api_key=None,
+        forward_headers=True,
+    )
+    await lpe._handle_anthropic_auto_agent_alias_route(
+        endpoint="/v1/messages",
+        request=request,
+        fastapi_response=MagicMock(spec=Response),
+        user_api_key_dict=MagicMock(),
+        prepared_request_body={"model": "aawm-low-anthropic"},
+        target_url="https://api.anthropic.com/v1/messages",
+        custom_headers={},
+    )
+
+    field_names = {field.name for field in dataclasses.fields(AliasRouteServices)}
     missing_fields = set(_ALIAS_ROUTE_SERVICES_CALLBACK_FIELDS) - field_names
     assert not missing_fields, f"AliasRouteServices is missing typed callback fields: {missing_fields}"
+    assert set(captured) == {"codex_auto_agent", "anthropic_auto_agent"}
+    for alias_family, services in captured.items():
+        for field_name, expected_parameters in _CALLBACK_PARAMETER_KINDS.items():
+            callback = getattr(services, field_name)
+            signature = inspect.signature(callback)
+            actual_parameters = signature.parameters
+            variadic_parameters = [
+                parameter.name
+                for parameter in actual_parameters.values()
+                if parameter.kind
+                in {
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                }
+            ]
+            assert not variadic_parameters, (
+                f"{alias_family}.{field_name} must not declare variadic "
+                f"parameters: {variadic_parameters}"
+            )
+            unexpected_required = [
+                parameter.name
+                for parameter in actual_parameters.values()
+                if parameter.name not in expected_parameters
+                and parameter.default is inspect.Parameter.empty
+            ]
+            assert not unexpected_required, (
+                f"{alias_family}.{field_name} has unexpected required "
+                f"parameters: {unexpected_required}"
+            )
+            assert tuple(actual_parameters) == tuple(expected_parameters), (
+                f"{alias_family}.{field_name} parameters "
+                f"{tuple(actual_parameters)} do not exactly match "
+                f"{tuple(expected_parameters)}"
+            )
+            for parameter_name, expected_kind in expected_parameters.items():
+                parameter = actual_parameters.get(parameter_name)
+                assert parameter is not None, (
+                    f"{alias_family}.{field_name} is missing {parameter_name!r}: "
+                    f"{signature}"
+                )
+                assert parameter.kind is expected_kind, (
+                    f"{alias_family}.{field_name}.{parameter_name} has "
+                    f"{parameter.kind}, expected {expected_kind}"
+                )
+            assert (
+                inspect.iscoroutinefunction(callback)
+                is _CALLBACK_COROUTINE_STATUS[field_name]
+            ), (
+                f"{alias_family}.{field_name} coroutine status does not match "
+                f"the production contract"
+            )
 
-    publish_cooldown_memory_fn = alias_route_interfaces.PublishCooldownMemoryFn
-    # Runtime-checkable Protocol identity check is only an attribute-presence
-    # smoke check -- not signature proof. The real proof is the explicit
-    # keyword-only parameter check below, applied against a conforming
-    # implementation constructed here.
-    assert hasattr(publish_cooldown_memory_fn, "__call__")
 
-    def _conforming_publish(*, keys, seconds) -> None:  # type: ignore[no-untyped-def]
-        return None
+async def _typed_select_candidate(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    return {}
 
-    signature = inspect.signature(_conforming_publish)
-    for kwarg_name in _PUBLISH_COOLDOWN_MEMORY_FN_REQUIRED_KWARGS:
-        parameter = signature.parameters.get(kwarg_name)
-        assert parameter is not None, f"conforming PublishCooldownMemoryFn callable must declare {kwarg_name!r}"
-        assert parameter.kind in (
-            inspect.Parameter.KEYWORD_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ), f"{kwarg_name!r} must be passable as a keyword argument"
 
-    # A typed assignment fixture: constructing AliasRouteServices with every
-    # field bound to a conforming callable must type-check under
-    # ``make lint-mypy`` (verified by CI/lint, not by this runtime test) and
-    # must not raise at construction time.
-    async def _select_candidate_fn(*, request, request_body):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
+async def _typed_perform_candidate_request(
+    *,
+    candidate: dict[str, Any],
+    candidate_body: dict[str, Any],
+) -> Response:
+    return Response(content="{}")
 
-    async def _perform_candidate_request_fn(*, candidate, candidate_body):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
 
-    def _resolve_cooldown_publication_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
+def _typed_resolve_cooldown_publication(
+    *,
+    request: Optional[Request],
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    selected_cooldown_key: str,
+    cooldown_seconds: float,
+    error_class: Optional[str],
+    grok_account_quota_exhausted: bool = False,
+    kimi_failure_metadata: Optional[dict[str, Any]] = None,
+    is_read_pilot_lane: bool = False,
+) -> CooldownPublicationPlan:
+    return CooldownPublicationPlan()
 
-    async def _persist_cooldown_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
 
-    async def _set_session_affinity_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
+def _typed_publish_cooldown_memory(
+    *,
+    keys: Sequence[str],
+    seconds: float,
+) -> None:
+    return None
 
-    def _add_alias_metadata_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
 
-    def _raise_redispatch_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise NotImplementedError
+async def _typed_persist_cooldown(
+    *,
+    keys: Sequence[str],
+    seconds: float,
+) -> None:
+    return None
 
-    services = services_cls(
-        select_candidate_fn=_select_candidate_fn,
-        perform_candidate_request_fn=_perform_candidate_request_fn,
-        resolve_cooldown_publication_fn=_resolve_cooldown_publication_fn,
-        publish_cooldown_memory_fn=_conforming_publish,
-        persist_cooldown_fn=_persist_cooldown_fn,
-        set_session_affinity_fn=_set_session_affinity_fn,
-        add_alias_metadata_fn=_add_alias_metadata_fn,
-        raise_redispatch_fn=_raise_redispatch_fn,
+
+async def _typed_set_session_affinity(
+    session_key: Optional[str],
+    candidate: dict[str, Any],
+) -> object:
+    return None
+
+
+def _typed_add_alias_metadata(
+    request_body: dict[str, Any],
+    *,
+    request: Request,
+    selection: dict[str, Any],
+    attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return request_body
+
+
+def _typed_raise_redispatch(
+    *,
+    candidate: dict[str, Any],
+    lane_key: Optional[str],
+    cooldown_seconds: float,
+    error_tokens: set[str],
+    alias_model: str,
+    error_class: str,
+    cooldown_scope: Optional[str],
+    error_status_code: Optional[int] = None,
+    error_type: Optional[str] = None,
+    error_code: Optional[str] = None,
+    retry_after_seconds: Optional[float] = None,
+    failure_phase: Optional[str] = None,
+    attempted_provider_call: Optional[bool] = None,
+    audit_events: Optional[list[Any]] = None,
+    attempts: Optional[list[Any]] = None,
+    skipped_candidates: Optional[list[Any]] = None,
+) -> None:
+    return None
+
+
+def _build_typed_alias_route_services_fixture() -> AliasRouteServices:
+    return AliasRouteServices(
+        select_candidate_fn=_typed_select_candidate,
+        perform_candidate_request_fn=_typed_perform_candidate_request,
+        resolve_cooldown_publication_fn=_typed_resolve_cooldown_publication,
+        publish_cooldown_memory_fn=_typed_publish_cooldown_memory,
+        persist_cooldown_fn=_typed_persist_cooldown,
+        set_session_affinity_fn=_typed_set_session_affinity,
+        add_alias_metadata_fn=_typed_add_alias_metadata,
+        raise_redispatch_fn=_typed_raise_redispatch,
     )
-    for field_name in _ALIAS_ROUTE_SERVICES_CALLBACK_FIELDS:
-        assert getattr(services, field_name) is not None
+
+
+def test_alias_route_services_typed_assignment_fixture() -> None:
+    services: AliasRouteServices = _build_typed_alias_route_services_fixture()
+    assert services.publish_cooldown_memory_fn is _typed_publish_cooldown_memory

@@ -20,11 +20,9 @@ Memory and durable targets are derived once from the same plan so telemetry,
 waiter visibility, and Redis state cannot disagree, and no target-key logic is
 duplicated between the in-lock and post-release paths.
 
-Lock order is ``probe_lock -> family_lock`` at most: the production memory
-publish writes ``state.py`` directly (no awaitable lock); the legacy façade
-adapter may await a family applicator inside the lock, which acquires only the
-family lock. The durable Redis write is post-release so the probe lock is never
-held across network I/O on the production path.
+The production memory publish writes ``state.py`` directly with no awaitable
+lock. Durable Redis writes and the legacy async applicator are post-release, so
+the probe lock is never held across network I/O.
 
 The god-module is imported lazily inside :func:`handle_alias_route` to avoid a
 module-scope import cycle (the god-module imports this package); the loop
@@ -34,14 +32,25 @@ otherwise depends only on the typed :class:`AliasRouteServices` seams.
 from __future__ import annotations
 
 import asyncio
-import inspect
 from typing import TYPE_CHECKING, Any, Optional
 
 from litellm.proxy.aawm_route_logging import (
     register_aawm_route_rollup_access_log_replacement,
 )
 
-from .interfaces import AliasRouteServices, CooldownPublicationPlan, GetActiveCooldownStateFn
+from .interfaces import (
+    AliasRouteServices,
+    ClassifyKimiFailureFn,
+    ClassifyRetryableFailureFn,
+    CooldownPublicationPlan,
+    GetCooldownSecondsFn,
+    GetActiveCooldownStateFn,
+    GetKimiFailureMetadataFn,
+    IsGrokAccountQuotaFailureFn,
+    PublishCooldownMemoryFn,
+    RecordReadPilotEvidenceFn,
+    ResolveCooldownPublicationFn,
+)
 from .state import alias_routing_state
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -210,7 +219,6 @@ async def handle_alias_route(  # noqa: PLR0915
             # acquire the lock and re-probe.
             probe_failure_exc: Optional[Exception] = None
             probe_failure_plan: Optional[CooldownPublicationPlan] = None
-            probe_applied_scope: Optional[str] = None
             skip_after_probe_wait = False
             response: Optional[Response] = None
             probe_lock = await alias_routing_state.candidate_probe_lock(
@@ -234,14 +242,14 @@ async def handle_alias_route(  # noqa: PLR0915
             finally:
                 # Resolve the publication plan + publish its memory keys
                 # BEFORE releasing the lock so the single-flight invariant
-                # holds across any suspension in the publish path.
+                # holds when the synchronous publisher returns.
                 # The nested try/finally guarantees the lock is released
                 # even if the resolver or publisher raises or is cancelled,
                 # preventing a permanent lock leak that would hang all
                 # subsequent same-key requests.
                 try:
                     if probe_failure_exc is not None:
-                        probe_failure_plan, probe_applied_scope = await _resolve_and_publish_failure_memory(
+                        probe_failure_plan = _resolve_and_publish_failure_memory(
                             resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
                             publish_cooldown_memory_fn=publish_cooldown_memory_fn,
                             record_read_pilot_evidence_fn=_record_read_pilot_cooldown_evidence,
@@ -302,7 +310,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     lane_key=selection.get("lane_key"),
                     cooldown_seconds=plan.duration_seconds,
                 )
-            cooldown_scope = probe_applied_scope or plan.applied_scope
+            cooldown_scope = plan.applied_scope
             error_tokens = _update_codex_auto_agent_retryable_attempt_record(
                 attempt_record=attempt_record,
                 exc=failure_exc,
@@ -447,11 +455,11 @@ async def handle_alias_route(  # noqa: PLR0915
     )
 
 
-async def _resolve_and_publish_failure_memory(
+def _resolve_and_publish_failure_memory(
     *,
-    resolve_cooldown_publication_fn: Any,
-    publish_cooldown_memory_fn: Any,
-    record_read_pilot_evidence_fn: Any,
+    resolve_cooldown_publication_fn: ResolveCooldownPublicationFn,
+    publish_cooldown_memory_fn: PublishCooldownMemoryFn,
+    record_read_pilot_evidence_fn: RecordReadPilotEvidenceFn,
     request: "Request",
     candidate: dict[str, Any],
     selection: dict[str, Any],
@@ -459,25 +467,20 @@ async def _resolve_and_publish_failure_memory(
     attempt_record: dict[str, Any],
     exc: Exception,
     is_read_pilot_lane: bool,
-    kimi_failure_metadata_fn: Any,
-    classify_kimi_fn: Any,
-    classify_retryable_fn: Any,
-    grok_quota_fn: Any,
-    cooldown_seconds_fn: Any,
-) -> tuple[CooldownPublicationPlan, Optional[str]]:
+    kimi_failure_metadata_fn: GetKimiFailureMetadataFn,
+    classify_kimi_fn: ClassifyKimiFailureFn,
+    classify_retryable_fn: ClassifyRetryableFailureFn,
+    grok_quota_fn: IsGrokAccountQuotaFailureFn,
+    cooldown_seconds_fn: GetCooldownSecondsFn,
+) -> CooldownPublicationPlan:
     """Resolve ONE publication plan for ``exc`` and publish its memory keys.
 
     Called while the probe lock is held. The resolver is pure (it records
     read-pilot evidence and resolves scope/target keys but performs no I/O);
     this helper then publishes every ``plan.memory_keys`` so a queued follower
-    observes the cooldown before the lock is released. Returns the plan plus
-    the scope the publisher actually applied (some publishers -- e.g. the
-    legacy façade adapter -- compute the scope themselves; production publishers
-    return ``None`` and the plan's ``applied_scope`` is authoritative).
-
-    ``publish_cooldown_memory_fn`` may be sync (production direct ``state.py``
-    write) or async (legacy façade adapter wrapping the family applicator); an
-    awaitable result is awaited here, inside the probe lock.
+    observes the cooldown before the lock is released. The publisher is
+    strictly synchronous; durable I/O remains post-release. The plan's
+    ``applied_scope`` is authoritative.
     """
     kimi_failure_metadata = kimi_failure_metadata_fn(exc, candidate=candidate)
     error_class = classify_kimi_fn(kimi_failure_metadata)
@@ -506,9 +509,9 @@ async def _resolve_and_publish_failure_memory(
         kimi_failure_metadata=kimi_failure_metadata,
         is_read_pilot_lane=is_read_pilot_lane,
     )
-    applied_scope: Optional[str] = None
     if plan.memory_keys:
-        publish_result = publish_cooldown_memory_fn(keys=plan.memory_keys, seconds=plan.duration_seconds)
-        if inspect.isawaitable(publish_result):
-            applied_scope = await publish_result
-    return plan, applied_scope
+        publish_cooldown_memory_fn(
+            keys=plan.memory_keys,
+            seconds=plan.duration_seconds,
+        )
+    return plan

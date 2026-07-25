@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Optional, cast
+from typing import Any, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -256,12 +256,11 @@ async def test_publisher_failure_surfaces_and_lock_released() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancellation_during_publisher_releases_lock_and_next_request_completes() -> None:
-    """Cancellation while an async legacy publisher is suspended propagates,
-    releases the probe lock, and does not hang the next same-key request."""
+async def test_publisher_cancellation_releases_lock_and_next_request_completes() -> None:
+    """A synchronous publisher cancellation propagates, releases the probe
+    lock, and does not hang the next same-key request."""
     perform_call_count = 0
-    publisher_started = asyncio.Event()
-    publisher_blocker = asyncio.Event()
+    publisher_called = False
 
     async def _select(*, request: Any, request_body: Any) -> dict[str, Any]:
         return _selection()
@@ -281,9 +280,10 @@ async def test_cancellation_during_publisher_releases_lock_and_next_request_comp
             applied_scope="candidate",
         )
 
-    async def _publish(*, keys: Any, seconds: Any) -> None:
-        publisher_started.set()
-        await publisher_blocker.wait()
+    def _publish(*, keys: Any, seconds: Any) -> None:
+        nonlocal publisher_called
+        publisher_called = True
+        raise asyncio.CancelledError
 
     async def _persist(*, keys: Any, seconds: Any) -> None:
         pass
@@ -301,7 +301,7 @@ async def test_cancellation_during_publisher_releases_lock_and_next_request_comp
         select_candidate_fn=_select,
         perform_candidate_request_fn=_perform,
         resolve_cooldown_publication_fn=_resolve,
-        publish_cooldown_memory_fn=cast(Any, _publish),
+        publish_cooldown_memory_fn=_publish,
         persist_cooldown_fn=_persist,
         set_session_affinity_fn=_set_affinity,
         add_alias_metadata_fn=_add_metadata,
@@ -323,13 +323,9 @@ async def test_cancellation_during_publisher_releases_lock_and_next_request_comp
             log_label="Test",
         )
 
-    first_request = asyncio.create_task(
-        _run_route(_minimal_request("cancelled-session"))
-    )
-    await asyncio.wait_for(publisher_started.wait(), timeout=1.0)
-    first_request.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await first_request
+        await _run_route(_minimal_request("cancelled-session"))
+    assert publisher_called
 
     cooldown_key = "openrouter:openrouter/test-model:openrouter"
     lock = await alias_routing_state.candidate_probe_lock(

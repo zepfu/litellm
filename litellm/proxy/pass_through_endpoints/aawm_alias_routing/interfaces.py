@@ -217,6 +217,78 @@ class PublishCooldownMemoryFn(Protocol):
 
 
 @runtime_checkable
+class RecordReadPilotEvidenceFn(Protocol):
+    """Synchronously record one read-pilot failure observation."""
+
+    def __call__(
+        self,
+        *,
+        cooldown_key: str,
+        exc: Exception,
+        attempt_record: dict[str, Any],
+    ) -> None:
+        ...
+
+
+@runtime_checkable
+class GetKimiFailureMetadataFn(Protocol):
+    """Extract allowlisted Kimi failure metadata without suspension."""
+
+    def __call__(
+        self,
+        exc: Exception,
+        *,
+        candidate: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        ...
+
+
+@runtime_checkable
+class ClassifyKimiFailureFn(Protocol):
+    """Classify allowlisted Kimi failure metadata synchronously."""
+
+    def __call__(
+        self,
+        metadata: Optional[dict[str, Any]],
+    ) -> Optional[str]:
+        ...
+
+
+@runtime_checkable
+class ClassifyRetryableFailureFn(Protocol):
+    """Classify a provider exception into the retry vocabulary."""
+
+    def __call__(self, exc: Exception) -> Optional[str]:
+        ...
+
+
+@runtime_checkable
+class IsGrokAccountQuotaFailureFn(Protocol):
+    """Return whether a failure exhausted the selected Grok account lane."""
+
+    def __call__(
+        self,
+        exc: Exception,
+        *,
+        candidate: dict[str, Any],
+    ) -> bool:
+        ...
+
+
+@runtime_checkable
+class GetCooldownSecondsFn(Protocol):
+    """Resolve the cooldown duration for one candidate failure."""
+
+    def __call__(
+        self,
+        exc: Exception,
+        *,
+        candidate: dict[str, Any],
+    ) -> float:
+        ...
+
+
+@runtime_checkable
 class PersistCooldownFn(Protocol):
     """Persist cooldown keys to durable Redis (post-release, may await)."""
 
