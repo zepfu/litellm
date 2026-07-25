@@ -17,6 +17,7 @@ partial/silent activation.
 from __future__ import annotations
 
 import hashlib
+import json
 import itertools
 import threading
 
@@ -81,6 +82,52 @@ def _compile_alias(alias: schema.AliasConfig) -> RoutingAlias:
     )
 
 
+def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
+    """Build a deterministic canonical JSON string from compiled aliases.
+
+    Aliases are sorted by name (mapping-key order is not semantic).
+    Candidate list ordering IS preserved (it encodes priority / round-robin
+    fallback semantics).  All mapping keys within each object are sorted via
+    json.dumps(sort_keys=True) so that YAML mapping-key order, comments,
+    and whitespace never affect the digest.
+    """
+    canonical_aliases: list[dict[str, object]] = []
+    for name in sorted(aliases):
+        alias = aliases[name]
+        canonical_candidates: list[dict[str, object]] = []
+        for candidate in alias.candidates:
+            canonical_candidates.append(
+                {
+                    "error_rules": [
+                        {"class_name": r.class_name, "cools": r.cools}
+                        for r in candidate.error_rules
+                    ],
+                    "model": candidate.model,
+                    "priority": candidate.priority,
+                    "provider": candidate.provider,
+                    "route_family": candidate.route_family,
+                    "schedule": (
+                        {
+                            "end": candidate.schedule.end.isoformat(),
+                            "start": candidate.schedule.start.isoformat(),
+                        }
+                        if candidate.schedule is not None
+                        else None
+                    ),
+                    "tui_attached": candidate.tui_attached,
+                    "weight": candidate.weight,
+                }
+            )
+        canonical_aliases.append(
+            {
+                "candidates": canonical_candidates,
+                "distribution_strategy": alias.distribution_strategy,
+                "name": alias.name,
+            }
+        )
+    return json.dumps({"aliases": canonical_aliases}, sort_keys=True, separators=(",", ":"))
+
+
 def compile_yaml(raw_yaml: str) -> RoutingSnapshot:
     """Validate and compile ``raw_yaml`` into an immutable ``RoutingSnapshot``."""
     try:
@@ -95,7 +142,9 @@ def compile_yaml(raw_yaml: str) -> RoutingSnapshot:
     resolved = schema.resolve_inheritance(document)
 
     aliases = {alias.name: _compile_alias(alias) for alias in resolved.aliases}
-    config_hash = hashlib.sha256(raw_yaml.encode("utf-8")).hexdigest()
+    source_hash = hashlib.sha256(raw_yaml.encode("utf-8")).hexdigest()
+    semantic_repr = _canonical_snapshot_repr(aliases)
+    config_hash = hashlib.sha256(semantic_repr.encode("utf-8")).hexdigest()
     config_version = config_hash[:12]
 
     return RoutingSnapshot(
@@ -103,4 +152,5 @@ def compile_yaml(raw_yaml: str) -> RoutingSnapshot:
         config_epoch=_next_epoch(),
         config_hash=config_hash,
         config_version=config_version,
+        source_hash=source_hash,
     )

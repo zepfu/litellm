@@ -16,14 +16,38 @@ This plan introduces, as one program built in dependency order:
 
 1. **An open error-class vocabulary + typed `FailureEvent`** (the shared seam). 584 owns and grows it; 583 keys cooldown policy on it. Class names are an **open registry**, not a closed enum, so later taxonomy growth never forces a 583 schema change.
 2. **Confidence-tiered N-of-M cooldown evidence** with a three-valued `origin` (`upstream`/`client`/`unknown`); only `upstream` cools, `unknown` never cools, replacing today's single-event flat-3h behavior.
-3. **A typed, validated YAML schema + compiler** producing an **immutable routing snapshot** with first-class numeric priority (descending; ties → declared distribution strategy → declaration order; `0` reserved = last resort), proportional routing weights, a per-model `tui_attached` flag, schedule windows, and a deferred `config_epoch`.
+3. **A typed, validated YAML schema + compiler** producing an **immutable routing snapshot** with first-class numeric priority (descending; ties → declared distribution strategy → declaration order; `0` reserved = last resort), proportional routing weights, a per-model `tui_attached` flag, schedule windows, a semantic `config_hash`, diagnostic `source_hash`, and telemetry-only `config_epoch`.
 4. **Selector integration for the `read` pilot only** — the new `read` alias (go-forward replacement for `aawm-read`/`aawm-read-anthropic`, additive until operator-approved cutover) is resolved from the compiled snapshot; all other aliases keep their hard-coded tables untouched.
 5. **An unauthenticated LAN refresh endpoint** that validates→compiles→atomically swaps the snapshot, fail-closed preserving last-known-good.
 6. **error-archive-seeded classification fixtures** with the unified error CSV as a coverage checklist, plus a **shadow parity harness** proving the pilot reproduces today's `read`/`low` lane selection.
 
-**No database change and no new routing-decision recording.** Per operator, routing decisions are NOT recorded beyond what `session_history` already persists as-routed (`inbound_model_alias`, `provider`, `model` — `sql.py:20-22`). The pilot adds no config-hash/version persistence, no telemetry, no DDL, no migration, no DB Foundation gate. (`config_hash`/`config_version` remain in-memory properties of the compiled snapshot for identity and the refresh-endpoint response only — never persisted.)
+**No database change and no new routing-decision recording.** Per operator, routing decisions are NOT recorded beyond what `session_history` already persists as-routed (`inbound_model_alias`, `provider`, `model` — `sql.py:20-22`). The pilot adds no routing-outcome persistence, database telemetry, DDL, migration, or DB Foundation gate. `config_hash`/`config_version` remain snapshot identity surfaced by the refresh endpoint; `config_hash` is additionally stored in TTL continuation-affinity payloads as compatibility metadata, not as a routing-decision record.
 
 Out of scope (explicitly deferred, not dispatched): migrating the other six alias families to config; full error-policy enforcement beyond cooldown; multi-worker config consensus (deployment is single-worker); cutover of `aawm-read` → `read`.
+
+### Current Snapshot And Continuation Contract
+
+- `config_hash` is the deterministic SHA-256 semantic digest of the fully
+  validated, inheritance-resolved compiled representation. Source comments,
+  whitespace, and mapping-key order do not change it; priority, model,
+  route-family, schedule, weight, or other routing-semantic changes do.
+- `source_hash` is the SHA-256 of the raw YAML source and exists only for
+  diagnostics. It never controls routing state.
+- `config_epoch` is monotonic process-local telemetry ordering only. It is not
+  a cooldown, evidence, probe-lock, round-robin, affinity, or refresh identity.
+- Only candidates resolved from the active snapshot carry
+  `config_epoch_tag=config_hash` inside candidate-scoped cooldown, evidence,
+  probe-lock, request-local, and round-robin state keys. This does not change
+  the durable state-key namespace or hashing construction. Static aliases,
+  legacy fallback tables, and Kimi managed-account quota keys remain untagged.
+- Session lookup keys remain stable across refreshes. Affinity payloads retain
+  provider, model, route family, and the establishing semantic config hash.
+  Continuations remain pinned when the exact provider/model/route-family
+  identity still exists in the active snapshot, even if priority, weight, or
+  schedule eligibility changed. Removed candidates and any route-family
+  transition, including `None` to or from a concrete value, fail closed with
+  redispatch-required before another upstream candidate is called. Cold
+  selections continue to apply current schedule and TUI eligibility gates.
 
 ---
 
@@ -147,7 +171,7 @@ Wave 7: Backlog reconciliation + promotion — orchestrator-inline, at close-out
   - `test_tui_attached_flag_compiles` — a candidate may declare `tui_attached: <client>`; compiler records it for per-model gating.
   - `test_schedule_windows_utc_only` — windows UTC; overlaps resolve deterministically; non-UTC rejected.
   - `test_inheritance_resolves` — typed inheritance (defaults → alias → candidate) merges without duplicate-definition ambiguity.
-  - `test_config_epoch_and_hash_present` — snapshot carries `config_epoch`, content `config_hash`, `config_version`.
+  - `test_config_epoch_and_hash_present` — snapshot carries telemetry-only `config_epoch`, semantic `config_hash`, diagnostic `source_hash`, and `config_version`.
   - `test_snapshot_is_immutable` — compiled snapshot is frozen (mutation raises).
   - `test_error_class_refs_open_vocabulary` — error rules may reference class names not yet in the seed registry without failing compile.
 **Assertions:** exact rejection, ordering, tie semantics, immutability, open-vocabulary tolerance.
@@ -155,7 +179,7 @@ Wave 7: Backlog reconciliation + promotion — orchestrator-inline, at close-out
 #### Source Spec (engineer's input)
 **Source files:**
   - `config_schema.py` — typed schema (pydantic v2) for alias/candidate/schedule/error-rule with inheritance; validation rejecting malformed/ambiguous/arbitrary-behavior YAML.
-  - `config_compiler.py` — compile validated YAML → immutable `RoutingSnapshot` (numeric priority, normalized weights, `tui_attached`, schedule windows, open error-class refs), with `config_hash`, `config_version`, `config_epoch`.
+  - `config_compiler.py` — compile validated YAML → immutable `RoutingSnapshot` (numeric priority, normalized weights, `tui_attached`, schedule windows, open error-class refs), with canonical semantic `config_hash`, raw-source diagnostic `source_hash`, `config_version`, and telemetry-only `config_epoch`.
   - `config_snapshot.py` — the frozen snapshot type + process-local holder with an atomic swap primitive (used by Wave 5).
   - `litellm/proxy/aawm_alias_config/read.yaml` — the `read` pilot mirroring current `CODEX_AAWM_LOW_CANDIDATES` order (`policy.py:227-277`): `cohere/north-mini-code:free`, `owl-alpha`, `deepseek-v4-flash`, `big-pickle`, `gpt-5.6-luna`, `qwen3.6-flash`, `kimi-for-coding`, then `gpt-5.4-mini` at `priority: 0`; plus `alibaba_token_plan/qwen3.8-max-preview` highest during its promo window. Priorities assigned descending to match that order (operator to confirm exact integers + promo-window boundaries).
 
@@ -172,7 +196,7 @@ Wave 7: Backlog reconciliation + promotion — orchestrator-inline, at close-out
 **Callers/importers:** `_dispatch_auto_agent_alias_candidate_request` (`:22886`) is the single dispatch path; the candidate getters are the single lookup path. For `read` these consult the snapshot; **all other aliases fall through to the existing `CANDIDATES_BY_ALIAS` tables unchanged** (`policy.py:292-305`, `:498-509`).
 **Grep verification (run at execution):** `grep -rn "_get_codex_auto_agent_candidates_for_alias\|_get_anthropic_auto_agent_candidates_for_alias\|CANDIDATES_BY_ALIAS" litellm/` — confirm the snapshot branch is gated on `read` and every other caller is untouched.
 **TUI gate correctness:** per-model — `_extract_auto_agent_alias_client_product_label` (`:2839`) already normalizes to `Claude/x.y`. On undetermined TUI, exclude only `tui_attached` candidates; the chain continues to non-TUI candidates so the alias still resolves.
-**Persistence:** none added. Routing decisions are NOT recorded per operator — `session_history` keeps its existing as-routed behavior unchanged (`inbound_model_alias`/`provider`/`model`). The selector adds no session_history write path and no config-hash/version persistence.
+**Persistence:** no routing-decision persistence is added. `session_history` keeps its existing as-routed behavior unchanged (`inbound_model_alias`/`provider`/`model`). The selector adds no session-history routing-decision write path; the semantic `config_hash` is stored only as compatibility metadata in TTL continuation-affinity payloads.
 
 #### Test Spec (tester's input)
 **Test files:**
@@ -185,12 +209,12 @@ Wave 7: Backlog reconciliation + promotion — orchestrator-inline, at close-out
   - `test_tui_attached_excluded_on_unknown_tui` — with no client-product label, a `tui_attached: Claude` candidate is skipped and a non-TUI candidate is selected; alias still resolves.
   - `test_tui_attached_selected_when_identified` — with `Claude/x.y` present, the `tui_attached: Claude` candidate is eligible.
   - `test_schedule_window_close_stops_new_affinity` — after a window closes, no NEW affinity to the out-of-window model; an existing affinity-pinned session continues on it (`AliasFamilyState.get_affinity_memory`, `state.py:102`).
-  - `test_no_new_routing_decision_recording` — selecting a `read` candidate adds no new session_history write path and no config-hash/version persistence; existing as-routed recording is unchanged.
+  - `test_no_new_routing_decision_recording` — selecting a `read` candidate adds no new session-history routing-decision write path; existing as-routed recording is unchanged, while continuation affinity may retain semantic-hash compatibility metadata.
 **Assertions:** exact selection order, TUI gating truth table, affinity-vs-schedule rule, no new recording path added.
 
 #### Source Spec (engineer's input)
 **Source files:**
-  - `llm_passthrough_endpoints.py` — for `read`, resolve from the snapshot; apply numeric-priority ordering + proportional tie distribution + per-model TUI gate + schedule-window/affinity rule. Add NO new session_history/recording logic — routing decisions are not recorded per operator. Reuse existing candidate-scoped cooldown/affinity state (`state.py`); thread `config_epoch` so a later swap invalidates stale keys.
+  - `llm_passthrough_endpoints.py` — for `read`, resolve from the snapshot; apply numeric-priority ordering + proportional tie distribution + per-model TUI gate + schedule-window/affinity rule. Add NO new session-history routing-decision logic. Reuse existing candidate-scoped cooldown/affinity state (`state.py`); embed semantic `config_hash` in snapshot-resolved candidate state keys so a semantic swap uses fresh candidate state, while stable session keys and compatible affinity survive refresh.
 
 ---
 
@@ -417,7 +441,7 @@ Required smoke assertions:
 1. **Design decisions pre-settled** — numeric priority, proportional-not-account YAML, session-history-outcomes-only, three-valued origin, per-model TUI fail-closed, schedule/affinity rule, open-LAN refresh endpoint, N-of-M evidence model — encoded as fixed constraints.
 2. **Author the spec in-session** — operator directed the plan be authored directly, not offloaded.
 3. **No DB change; DB is up; skip gate check** (2026-07-22) — I mis-read an `mcppg` MCP tool checkout timeout as "DB down" and had planned a session_history migration + DB Foundation gate. Operator corrected: the DB is up (tool was flaky), no schema change is required, and the gate check can be skipped. Plan revised: DB waves removed, validation is litellm-native (`make test-unit`/`poetry pytest` + ruff/mypy), gate check dropped from close-out.
-4. **No routing-decision recording** (2026-07-22) — after removing the DB columns I still tried to persist config hash/version via existing metadata. Operator clarified they had already stated routing decisions are not to be recorded beyond `session_history`'s existing as-routed fields. Removed all routing-outcome persistence from Wave 4; the selector adds zero recording logic. `config_hash`/`config_version` remain in-memory only (snapshot identity + refresh response).
+4. **No routing-decision recording** (2026-07-22) — after removing the DB columns I still tried to persist config hash/version as routing-outcome metadata. Operator clarified they had already stated routing decisions are not to be recorded beyond `session_history`'s existing as-routed fields. Removed all routing-outcome persistence from Wave 4; the selector adds zero session-history recording logic. `config_hash`/`config_version` identify snapshots and refresh responses, and `config_hash` is retained only as TTL continuation-affinity compatibility metadata.
 
 ## Tool Errors and Infrastructure Failures
 
@@ -474,7 +498,7 @@ Spot-checked; all four files assert exact values a wrong implementation would fa
 - `test_cooldown_evidence.py:49-54` asserts `is_coolable(...) is False` AND `decision.should_cool is False` for both client-origin (`asyncio.CancelledError`) and unknown-origin events; `:63` single structured 429 cools immediately despite `marker_n=5`; `:70-74` sliding-window expiry with explicit `now_monotonic` values.
 - `test_config_compiler.py:63-66` exact compiled candidate order by model name; `:91-93` normalized weights sum to 1.0 with exact per-model values; `:47-48` frozen-snapshot mutation raises; `:54` unknown top-level key rejects compile; `:181` unregistered provider rejects compile.
 - `test_refresh_endpoint.py:60-66` exact response contract (`changed is True`, attempted==active hash); `:79` no-op re-post `changed is False` with same hash; `:91-99` invalid YAML → 400/422, raw YAML not echoed, last-known-good hash still active via `config_snapshot.get_active_snapshot()`; `:115-117` in-flight prior-snapshot immutability across swap.
-- config_hash stability: `config_hash = sha256(raw_yaml)` (`config_compiler.py:98`); the no-op refresh test (`test_refresh_endpoint.py:69-80`) pins hash stability across identical re-posts.
+- config-hash stability: `config_hash` is SHA-256 over deterministic canonical JSON from the fully validated, inheritance-resolved compiled representation; `source_hash` is SHA-256 over raw YAML. Refresh tests pin no-op behavior for both identical and formatting-only-equivalent sources.
 
 ### 3. Scope containment: `read`-only gating — PASS (critical check)
 - Getter: `llm_passthrough_endpoints.py:674-682` — `_get_codex_auto_agent_candidates_for_alias` branches to `_select_read_pilot_snapshot_candidates()` ONLY when `alias_model == _READ_PILOT_ALIAS_NAME` (`"read"`, defined `:561`); all other aliases fall through to `_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(...)` unchanged. The Anthropic getter (`:685-691`) is entirely untouched by the snapshot path.
@@ -484,7 +508,7 @@ Spot-checked; all four files assert exact values a wrong implementation would fa
 
 ### 4. No new routing-decision recording — PASS
 - `test_no_new_routing_decision_recording` (`test_read_pilot_selection.py:229-251`) is a real assertion: it inspects `llm_passthrough_endpoints` source around every `inbound_model_alias` (session_history-write marker) region and asserts `config_hash`/`config_version` never appear there, plus asserts no `_record_read_pilot_routing_decision` / `_persist_routing_snapshot_selection` symbols exist.
-- Source confirms: the read-pilot lane adds only in-memory evidence bookkeeping (`_record_read_pilot_cooldown_evidence`, `:6479-6504` — writes to `attempt_record["origin"]` and the process-local gate; explicit docstring: "additional, read-pilot-only evidence bookkeeping"). `config_snapshot.py:66-69` documents epoch/hash/version as "in-memory-only ... Neither is persisted".
+- Source confirms: the read-pilot lane adds only process-local evidence bookkeeping (`_record_read_pilot_cooldown_evidence`, `:6479-6504` — writes to `attempt_record["origin"]` and the process-local gate; explicit docstring: "additional, read-pilot-only evidence bookkeeping"). Snapshot-resolved candidate keys embed the semantic hash without changing the durable namespace, and TTL affinity payloads retain it only for continuation compatibility.
 
 ### 5. Cooldown gate + three-valued origin — PASS
 - Read-pilot failures route through `CooldownEvidenceGate`: module-level `_read_pilot_cooldown_gate` (`llm_passthrough_endpoints.py:562`), fed via `classify_failure(...)` → `gate.record(...)` in `_record_read_pilot_cooldown_evidence` (`:6494-6503`); `attempt_record["origin"] = event.origin` records the three-valued origin.

@@ -146,15 +146,55 @@ async def _run_read_lane_once(
 
 
 def _live_cooldown_key() -> str:
-    """The ``provider:model:lane`` key the live selector builds for the snapshot candidate."""
-    candidate = {
+    """Return the exact state key for the resolved ``read`` snapshot candidate."""
+    candidate: dict[str, Any] = {
         "provider": "openrouter",
         "model": "openrouter/round2-live-model",
         "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     }
     lane_key = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    return lpe._codex_auto_agent_candidate_key(candidate, lane_key)
+    snapshot = lpe.get_active_routing_snapshot()
+    epoch_tag: str | None = None
+    if snapshot is not None:
+        alias = snapshot.aliases.get("read")
+        identity = (
+            candidate["provider"],
+            candidate["model"],
+            candidate["route_family"],
+        )
+        if alias is not None and any(
+            (compiled.provider, compiled.model, compiled.route_family) == identity
+            for compiled in alias.candidates
+        ):
+            epoch_tag = snapshot.config_hash
+    return lpe._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
+
+
+def test_live_cooldown_key_requires_exact_read_alias_ownership() -> None:
+    assert not _live_cooldown_key().startswith("h")
+
+    snapshot = compiler.compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: other
+    candidates:
+      - provider: openrouter
+        model: openrouter/round2-live-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+  - name: read
+    candidates:
+      - provider: opencode_zen
+        model: openrouter/round2-live-model
+        route_family: codex_opencode_zen_adapter
+        priority: 100
+"""
+    )
+    lpe.set_active_routing_snapshot(snapshot)
+
+    assert not _live_cooldown_key().startswith("h")
 
 
 @pytest.mark.asyncio

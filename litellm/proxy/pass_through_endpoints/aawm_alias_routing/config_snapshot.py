@@ -63,17 +63,26 @@ class RoutingSnapshot:
     """Immutable compiled routing configuration.
 
     ``config_epoch`` is a monotonically increasing integer bumped on every
-    successful compile/activation (used by Wave 4 to invalidate stale
-    candidate-scoped cooldown/affinity keys). ``config_hash`` is a content
-    hash of the source YAML; ``config_version`` is a human-facing identity
-    string. Neither is persisted -- both are in-memory-only snapshot
-    identity fields surfaced by the (Wave 5) refresh endpoint response.
+    successful compile; it is **telemetry ordering only** and MUST NOT be
+    used to invalidate runtime routing state.  ``config_hash`` is a
+    deterministic SHA-256 *semantic digest* of the fully validated,
+    inheritance-resolved compiled representation. Snapshot-resolved
+    candidate state keys embed the full digest as a tag; the durable state-key
+    namespace itself is unchanged. Affinity payloads intentionally persist
+    ``config_hash`` as compatibility metadata for continuation validation.
+    ``config_version`` is a human-facing identity string (first 12 hex chars
+    of ``config_hash``).
+    ``source_hash`` (optional) is the SHA-256 of the raw source YAML,
+    retained for diagnostics only -- it MUST NOT control routing state.
+    ``config_epoch`` and ``source_hash`` remain process-local snapshot fields;
+    snapshot identity is also surfaced by the refresh endpoint response.
     """
 
     aliases: Mapping[str, RoutingAlias]
     config_epoch: int
     config_hash: str
     config_version: str
+    source_hash: Optional[str] = None
 
     def __post_init__(self) -> None:
         # ``aliases`` is typed as ``Mapping`` for callers, but callers may

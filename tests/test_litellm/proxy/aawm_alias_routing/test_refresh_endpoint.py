@@ -10,10 +10,13 @@ the correct red signal (assertions on status_code != 404 will fail).
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import router
+from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (  # type: ignore[import-not-found]
     config_snapshot,
 )
@@ -49,8 +52,19 @@ aliases:
 
 def _client() -> TestClient:
     app = FastAPI()
-    app.include_router(router)
+    app.include_router(lpe.router)
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_alias_routing_state() -> Iterator[None]:
+    previous_snapshot = lpe.get_active_routing_snapshot()
+    lpe.reset_alias_routing_state_for_tests()
+    try:
+        yield
+    finally:
+        lpe.reset_alias_routing_state_for_tests()
+        lpe.set_active_routing_snapshot(previous_snapshot)
 
 
 def test_valid_refresh_compiles_and_activates() -> None:
@@ -96,6 +110,7 @@ def test_invalid_refresh_fails_closed() -> None:
 
     # Last-known-good remains active after a failed refresh.
     active_snapshot = config_snapshot.get_active_snapshot()
+    assert active_snapshot is not None
     assert active_snapshot.config_hash == good_hash
 
 
@@ -105,6 +120,7 @@ def test_in_flight_uses_prior_snapshot() -> None:
     first = client.post(REFRESH_PATH, json={"yaml": _VALID_YAML})
     assert first.status_code == 200
     prior_snapshot = config_snapshot.get_active_snapshot()
+    assert prior_snapshot is not None
 
     updated_yaml = _VALID_YAML.replace("openrouter/refresh-test-model", "openrouter/refresh-test-model-v2")
     second = client.post(REFRESH_PATH, json={"yaml": updated_yaml})

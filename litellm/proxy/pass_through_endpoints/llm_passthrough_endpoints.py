@@ -580,14 +580,24 @@ def set_active_routing_snapshot(
 
 def _routing_candidate_to_public_dict(
     candidate: _RoutingSnapshotCandidate,
+    *,
+    epoch_tag: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Shape a compiled ``RoutingCandidate`` into the legacy candidate-dict form."""
-    return {
+    """Shape a compiled ``RoutingCandidate`` into the legacy candidate-dict form.
+
+    When ``epoch_tag`` is provided (snapshot-resolved candidates), it is
+    carried as ``config_epoch_tag`` so downstream state-key construction
+    can prefix cooldown/evidence/probe keys with the semantic digest.
+    """
+    shaped: dict[str, Any] = {
         "provider": candidate.provider,
         "model": candidate.model,
         "route_family": candidate.route_family,
         "last_resort": candidate.priority == 0,
     }
+    if epoch_tag:
+        shaped["config_epoch_tag"] = epoch_tag
+    return shaped
 
 
 def _order_snapshot_candidates_by_priority(
@@ -618,11 +628,10 @@ def _select_proportional_snapshot_candidate(
 
 
 # Process-local rotation cursor for ``distribution_strategy: round_robin``,
-# keyed per alias name so each alias rotates independently across proxy calls.
-# Wave 3 seam: the key becomes ``(semantic_epoch_tag, alias_name)`` once epoch
-# keying lands; for now it stays ``(alias_name)`` and epoch tags are carried on
-# the commit token but not yet folded into this map's key.
-_round_robin_cursor_by_alias: dict[str, int] = {}
+# keyed per ``(epoch_tag, alias_name)`` so each alias rotates independently
+# across proxy calls AND a semantic config change (new epoch_tag) starts a
+# fresh rotation cycle.  Static/legacy aliases use ``("", alias_name)``.
+_round_robin_cursor_by_alias: dict[tuple[str, str], int] = {}
 
 
 class RoundRobinCommitToken(NamedTuple):
@@ -653,6 +662,7 @@ def _select_round_robin_snapshot_candidate(
     tied: Sequence[_RoutingSnapshotCandidate],
     *,
     alias_name: str,
+    epoch_tag: str = "",
 ) -> _RoutingSnapshotCandidate:
     """Pick the next tied candidate by READING the per-alias rotation cursor.
 
@@ -663,7 +673,7 @@ def _select_round_robin_snapshot_candidate(
     that is actually selected, so repeated enumeration getter calls within a
     single request cannot desync the rotation from live traffic.
     """
-    cursor = _round_robin_cursor_by_alias.get(alias_name, 0)
+    cursor = _round_robin_cursor_by_alias.get((epoch_tag, alias_name), 0)
     return tied[cursor % len(tied)]
 
 
@@ -688,7 +698,7 @@ def _commit_round_robin_selection(
         index = token.tied_candidate_ids.index(identity)
     except ValueError:
         return
-    _round_robin_cursor_by_alias[token.alias_name] = (index + 1) % len(token.tied_candidate_ids)
+    _round_robin_cursor_by_alias[(token.epoch_tag, token.alias_name)] = (index + 1) % len(token.tied_candidate_ids)
 
 
 def reset_module_singletons() -> None:
@@ -728,6 +738,7 @@ def _apply_snapshot_alias_distribution_strategy(
     distribution_strategy: Optional[str],
     rng: random.Random,
     alias_name: str = "",
+    epoch_tag: str = "",
 ) -> list[_RoutingSnapshotCandidate]:
     """Reorder the top priority-tier of ``ordered`` per ``distribution_strategy``.
 
@@ -751,7 +762,7 @@ def _apply_snapshot_alias_distribution_strategy(
     if len(tied) < 2:
         return list(ordered)
     if distribution_strategy == "round_robin":
-        winner = _select_round_robin_snapshot_candidate(tied, alias_name=alias_name)
+        winner = _select_round_robin_snapshot_candidate(tied, alias_name=alias_name, epoch_tag=epoch_tag)
     else:
         weights = {c.model: c.weight for c in tied}
         winner = _select_proportional_snapshot_candidate(tied, weights, rng)
@@ -840,14 +851,18 @@ def _select_read_pilot_snapshot_candidates(
     # fail-closed behavior on exhaustion.
     if not eligible:
         return ()
-    alias = get_active_routing_snapshot().aliases[_READ_PILOT_ALIAS_NAME]  # type: ignore[union-attr]
+    snapshot = get_active_routing_snapshot()
+    assert snapshot is not None
+    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    epoch_tag = snapshot.config_hash
     distributed = _apply_snapshot_alias_distribution_strategy(
         eligible,
         distribution_strategy=alias.distribution_strategy,
         rng=random.Random(),
         alias_name=_READ_PILOT_ALIAS_NAME,
+        epoch_tag=epoch_tag,
     )
-    return tuple(_routing_candidate_to_public_dict(c) for c in distributed)
+    return tuple(_routing_candidate_to_public_dict(c, epoch_tag=epoch_tag) for c in distributed)
 
 
 def _derive_round_robin_commit_token(
@@ -881,10 +896,11 @@ def _derive_round_robin_commit_token(
     tied = [c for c in eligible if c.priority == top_priority]
     if len(tied) < 2:
         return None
-    start_index = _round_robin_cursor_by_alias.get(_READ_PILOT_ALIAS_NAME, 0)
+    epoch_tag = snapshot.config_hash
+    start_index = _round_robin_cursor_by_alias.get((epoch_tag, _READ_PILOT_ALIAS_NAME), 0)
     return RoundRobinCommitToken(
         alias_name=_READ_PILOT_ALIAS_NAME,
-        epoch_tag="",
+        epoch_tag=epoch_tag,
         tied_candidate_ids=tuple((c.provider, c.model) for c in tied),
         start_index=start_index,
     )
@@ -2818,12 +2834,31 @@ def _resolve_codex_auto_agent_session_key(
 def _codex_auto_agent_candidate_key(
     candidate: dict[str, Any],
     lane_key: str,
+    *,
+    epoch_tag: Optional[str] = None,
 ) -> str:
-    return "{}:{}:{}".format(
+    """Build the canonical cooldown/evidence/probe state key for a candidate.
+
+    When ``epoch_tag`` is set (snapshot-resolved aliases only), the key is
+    prefixed with ``h{epoch_tag}:`` so that a semantic config change
+    invalidates cooldowns earned under the previous config generation.
+    Static/legacy routes and Kimi managed-account keys pass no epoch_tag
+    and keep bare keys.
+
+    Deliberate cooldown semantics: a cooldown earned under semantic config N
+    vanishes for semantic config N+1 requests (operator-intended re-probe).
+    Wave-2 exact-key single-flight limits the resulting probe storm.
+    Affinity is explicitly excluded from this invalidation rule -- session
+    pins survive config changes as long as the candidate remains compatible.
+    """
+    base = "{}:{}:{}".format(
         candidate["provider"],
         candidate["model"],
         lane_key or "__default__",
     )
+    if epoch_tag:
+        return "h{}:{}".format(epoch_tag, base)
+    return base
 
 
 def _codex_auto_agent_candidate_public_shape(
@@ -4441,7 +4476,9 @@ def _build_auto_agent_alias_audit_event(
     if lane_key is None:
         lane_key = selection.get("lane_key")
     if cooldown_key is None and lane_key is not None:
-        cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
+        cooldown_key = _codex_auto_agent_candidate_key(
+            candidate, lane_key, epoch_tag=candidate.get("config_epoch_tag"),
+        )
     context = _get_auto_agent_alias_request_context(
         request,
         request_body,
@@ -4964,26 +5001,35 @@ async def _set_codex_auto_agent_session_affinity(
 ) -> None:
     if session_key is None:
         return
+    # Wave 3 R3-4: carry the semantic config digest observed when affinity
+    # was established.  Continuations validate provider/model/route_family
+    # compatibility against the active enumeration -- NOT the config hash --
+    # so a priority/weight/schedule change does not break a valid pin.
+    config_hash = candidate.get("config_epoch_tag")
     async with _codex_auto_agent_lock:
         _codex_auto_agent_session_affinity_by_key[session_key] = {
             "provider": candidate["provider"],
             "model": candidate["model"],
             "route_family": candidate["route_family"],
             "last_resort": bool(candidate.get("last_resort")),
+            "config_hash": config_hash,
             "expires_at_monotonic": (time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS),
             "affinity_state_source": "memory",
         }
         _bound_aawm_alias_routing_memory_map(_codex_auto_agent_session_affinity_by_key)
+    durable_payload: dict[str, Any] = {
+        "provider": candidate["provider"],
+        "model": candidate["model"],
+        "route_family": candidate["route_family"],
+        "last_resort": bool(candidate.get("last_resort")),
+    }
+    if config_hash is not None:
+        durable_payload["config_hash"] = config_hash
     await _write_aawm_alias_routing_durable_payload(
         alias_family="codex",
         state_kind="affinity",
         state_key=session_key,
-        payload={
-            "provider": candidate["provider"],
-            "model": candidate["model"],
-            "route_family": candidate["route_family"],
-            "last_resort": bool(candidate.get("last_resort")),
-        },
+        payload=durable_payload,
         ttl_seconds=_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS,
     )
 
@@ -5011,6 +5057,48 @@ def _find_codex_auto_agent_candidate(
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
+
+
+def _find_codex_auto_agent_affinity_candidate(
+    affinity: dict[str, Any],
+    *,
+    alias_model: str,
+    client_product_label: Optional[str],
+    request: Request,
+) -> Optional[dict[str, Any]]:
+    """Resolve a pinned candidate without applying new-request eligibility gates.
+
+    Snapshot-established affinity is checked against the active snapshot's full
+    alias membership so schedule-only changes do not evict an in-flight
+    continuation. Static/legacy affinity keeps the existing lookup path.
+    """
+    if (
+        alias_model == _READ_PILOT_ALIAS_NAME
+        and affinity.get("config_hash") is not None
+    ):
+        snapshot = get_active_routing_snapshot()
+        if snapshot is None:
+            return None
+        alias = snapshot.aliases.get(alias_model)
+        if alias is None:
+            return None
+        for candidate in alias.candidates:
+            if (
+                candidate.provider == affinity.get("provider")
+                and candidate.model == affinity.get("model")
+            ):
+                return _routing_candidate_to_public_dict(
+                    candidate,
+                    epoch_tag=snapshot.config_hash,
+                )
+        return None
+    return _find_codex_auto_agent_candidate(
+        affinity.get("provider"),
+        affinity.get("model"),
+        alias_model=alias_model,
+        client_product_label=client_product_label,
+        request=request,
+    )
 
 
 def _is_auto_agent_candidate_state_available(state: dict[str, Any]) -> bool:
@@ -5186,7 +5274,10 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     else:
         lane_key = openai_lane_key
-    cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
+    # Wave 3 R3-4: snapshot-resolved candidates carry config_epoch_tag;
+    # static/legacy candidates do not, keeping bare keys.
+    _epoch_tag = candidate.get("config_epoch_tag")
+    cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=_epoch_tag)
     (
         cooldown_seconds,
         initial_cooldown_state_source,
@@ -5262,6 +5353,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         "cooldown_seconds": cooldown_seconds,
         "cooldown_state_source": cooldown_state_source,
     }
+    if _epoch_tag is not None:
+        state["config_epoch_tag"] = _epoch_tag
     if skip_reason is not None:
         state["skip_reason"] = skip_reason
     if failure_phase is not None:
@@ -5341,7 +5434,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = anthropic_lane_key
     else:
         lane_key = openai_lane_key
-    cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key)
+    _epoch_tag = candidate.get("config_epoch_tag")
+    cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=_epoch_tag)
     (
         cooldown_seconds,
         initial_cooldown_state_source,
@@ -5425,6 +5519,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         "cooldown_seconds": cooldown_seconds,
         "cooldown_state_source": cooldown_state_source,
     }
+    if _epoch_tag is not None:
+        state["config_epoch_tag"] = _epoch_tag
     if skip_reason is not None:
         state["skip_reason"] = skip_reason
     if failure_phase is not None:
@@ -5507,13 +5603,36 @@ async def _select_codex_auto_agent_candidate(
     if affinity is not None and not has_continuation_state:
         affinity = None
     if affinity is not None and has_continuation_state:
-        affinity_candidate = _find_codex_auto_agent_candidate(
-            affinity.get("provider"),
-            affinity.get("model"),
+        affinity_candidate = _find_codex_auto_agent_affinity_candidate(
+            affinity,
             alias_model=alias_model,
             client_product_label=client_product_label,
             request=request,
         )
+        # Wave 3 R3-4: continuation-safe affinity.  If the pinned candidate
+        # was removed from the active enumeration or its route_family changed
+        # (route-incompatible), fail closed with redispatch-required BEFORE
+        # any alternate upstream call.  Compatible candidates (same
+        # provider/model/route_family) remain pinned regardless of
+        # priority/weight/schedule changes.
+        if affinity_candidate is None or (
+            affinity_candidate.get("route_family") != affinity.get("route_family")
+        ):
+            _pinned_candidate_shape = {
+                "provider": affinity.get("provider"),
+                "model": affinity.get("model"),
+                "route_family": affinity.get("route_family"),
+                "last_resort": bool(affinity.get("last_resort")),
+            }
+            _raise_codex_auto_agent_redispatch_required(
+                candidate=_pinned_candidate_shape,
+                lane_key=None,
+                cooldown_seconds=0.0,
+                error_tokens=set(),
+                alias_model=alias_model,
+                failure_phase="affinity_continuation_removed",
+                attempted_provider_call=False,
+            )
         if affinity_candidate is not None:
             affinity_state = await _build_codex_auto_agent_candidate_state(
                 request,
@@ -5883,6 +6002,10 @@ def _is_kimi_code_auto_agent_candidate(candidate: Optional[dict[str, Any]]) -> b
 
 
 def _get_kimi_code_managed_account_cooldown_key() -> str:
+    # Kimi managed-account keys are deliberately UN-tagged (no epoch_tag):
+    # they represent account-level quota state that is independent of the
+    # routing config generation.  Tagging them would incorrectly reset
+    # account-level cooldowns on every config refresh.
     return _codex_auto_agent_candidate_key(
         {
             "provider": _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
@@ -6211,6 +6334,7 @@ def _get_codex_auto_agent_request_local_cooldown_key(
     return _codex_auto_agent_candidate_key(
         candidate,
         lane_key or "__default__",
+        epoch_tag=candidate.get("config_epoch_tag"),
     )
 
 

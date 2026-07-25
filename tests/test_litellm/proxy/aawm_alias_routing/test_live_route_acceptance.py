@@ -57,6 +57,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     policy,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
+    CandidateSelection,
     CooldownPublicationPlan,
 )
 
@@ -175,6 +176,29 @@ aliases:
 """
 
 
+def _snapshot_epoch_tag_for_candidate(
+    alias_name: str,
+    candidate: dict[str, Any],
+) -> str | None:
+    snapshot = lpe.get_active_routing_snapshot()
+    if snapshot is None:
+        return None
+    alias = snapshot.aliases.get(alias_name)
+    if alias is None:
+        return None
+    identity = (
+        candidate.get("provider"),
+        candidate.get("model"),
+        candidate.get("route_family"),
+    )
+    if any(
+        (compiled.provider, compiled.model, compiled.route_family) == identity
+        for compiled in alias.candidates
+    ):
+        return snapshot.config_hash
+    return None
+
+
 def _lane_key_for_model(model: str) -> str:
     candidate = {
         "provider": "openrouter",
@@ -183,7 +207,8 @@ def _lane_key_for_model(model: str) -> str:
         "last_resort": False,
     }
     lane_key = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    return lpe._codex_auto_agent_candidate_key(candidate, lane_key)
+    epoch_tag = _snapshot_epoch_tag_for_candidate("read", candidate)
+    return lpe._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
 
 
 class _StructuredCapacityError(RuntimeError):
@@ -633,7 +658,10 @@ def _low_alias_openrouter_lane_key_for_model(model: str) -> str:
         "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     }
-    return lpe._codex_auto_agent_candidate_key(candidate, lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY)
+    return lpe._codex_auto_agent_candidate_key(
+        candidate,
+        lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1178,8 +1206,8 @@ aliases:
     assert leaders[0] == "e3-leader"
     assert "e3-sibling" in leaders, f"expected the sibling candidate to be attempted: leaders={leaders!r}"
 
-    leader_key = _low_alias_openrouter_lane_key_for_model("e3-leader")
-    sibling_key = _low_alias_openrouter_lane_key_for_model("e3-sibling")
+    leader_key = _lane_key_for_model("e3-leader")
+    sibling_key = _lane_key_for_model("e3-sibling")
 
     leader_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
     sibling_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(sibling_key)
@@ -1266,7 +1294,7 @@ aliases:
     finally:
         restore()
 
-    live_key = _low_alias_openrouter_lane_key_for_model("openrouter/b1-live-model")
+    live_key = _lane_key_for_model("openrouter/b1-live-model")
     applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == pytest.approx(12.0, abs=1.5)
 
@@ -1326,7 +1354,7 @@ aliases:
     finally:
         restore()
 
-    live_key = _low_alias_openrouter_lane_key_for_model("openrouter/b2-live-model")
+    live_key = _lane_key_for_model("openrouter/b2-live-model")
     applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == 0.0
     assert lpe._read_pilot_cooldown_gate.is_cooled(cooldown_key=live_key) is False
@@ -1337,6 +1365,79 @@ aliases:
 # ===========================================================================
 
 _REFRESH_PATH = "/aawm/alias-config/refresh"
+
+
+async def test_snapshot_epoch_tag_requires_exact_alias_candidate_identity() -> None:
+    candidate = {
+        "provider": "openrouter",
+        "model": "shared-model",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    lane_key = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+
+    assert _snapshot_epoch_tag_for_candidate("read", candidate) is None
+    assert not lpe._codex_auto_agent_candidate_key(candidate, lane_key).startswith("h")
+
+    snapshot = compiler.compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: other
+    candidates:
+      - provider: openrouter
+        model: shared-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+  - name: read
+    candidates:
+      - provider: opencode_zen
+        model: shared-model
+        route_family: codex_opencode_zen_adapter
+        priority: 100
+"""
+    )
+    lpe.set_active_routing_snapshot(snapshot)
+
+    assert _snapshot_epoch_tag_for_candidate("read", candidate) is None
+    assert _snapshot_epoch_tag_for_candidate("aawm-low", candidate) is None
+    assert _snapshot_epoch_tag_for_candidate("other", candidate) == snapshot.config_hash
+    assert not lpe._codex_auto_agent_candidate_key(
+        candidate,
+        lane_key,
+        epoch_tag=_snapshot_epoch_tag_for_candidate("read", candidate),
+    ).startswith("h")
+
+
+async def test_snapshot_selection_exposes_top_level_config_epoch_tag() -> None:
+    snapshot = compiler.compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: tagged-selection
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+    )
+    lpe.set_active_routing_snapshot(snapshot)
+    request = _minimal_request("tagged-selection-session")
+    request_body = {
+        "model": "read",
+        "input": [{"role": "user", "content": "hello"}],
+        "litellm_metadata": {"session_id": "tagged-selection-session"},
+    }
+
+    selection = await lpe._select_codex_auto_agent_candidate(
+        request=request,
+        request_body=request_body,
+    )
+    typed_selection = CandidateSelection.from_legacy_dict(selection)
+
+    assert selection["config_epoch_tag"] == snapshot.config_hash
+    assert typed_selection.config_epoch_tag == snapshot.config_hash
 
 
 def _refresh_client() -> TestClient:
@@ -1924,6 +2025,78 @@ async def test_scenario_d4_changed_refresh_preserves_compatible_continuation_aff
         restore()
 
 
+_D4_SCHEDULE_SNAPSHOT_A = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d4-scheduled-pinned
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: d4-scheduled-other
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+_D4_SCHEDULE_SNAPSHOT_B = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d4-scheduled-pinned
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+        schedule:
+          start: "2020-01-01T00:00:00Z"
+          end: "2020-01-02T00:00:00Z"
+      - provider: openrouter
+        model: d4-scheduled-other
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+
+
+async def test_scenario_d4_schedule_only_refresh_preserves_continuation_affinity() -> None:
+    client = _refresh_client()
+    response_a = _post_refresh(client, _D4_SCHEDULE_SNAPSHOT_A)
+    assert response_a.status_code == 200
+
+    leaders: list[str] = []
+
+    async def _performer(
+        *,
+        request: Request,
+        adapter_model: str,
+        request_body: dict[str, Any],
+        use_alias_candidate_probe: bool = False,
+    ) -> Response:
+        leaders.append(adapter_model)
+        return _SUCCESS_RESPONSE
+
+    _, restore = _install_openrouter_performer(_performer)
+    try:
+        await _drive_wrapper(session_id="d4-schedule-session")
+        assert leaders == ["d4-scheduled-pinned"]
+
+        response_b = _post_refresh(client, _D4_SCHEDULE_SNAPSHOT_B)
+        assert response_b.status_code == 200
+        assert response_b.json()["changed"] is True
+
+        await _drive_wrapper(
+            session_id="d4-schedule-session",
+            body_extra={"previous_response_id": "resp_d4_schedule_continuation"},
+        )
+        assert leaders[-1] == "d4-scheduled-pinned"
+
+        await _drive_wrapper(session_id="d4-schedule-cold-session")
+        assert leaders[-1] == "d4-scheduled-other"
+    finally:
+        restore()
+
+
 # ---------------------------------------------------------------------------
 # (R3-4, scenario d5) refresh removing affinity candidate requires redispatch
 # ---------------------------------------------------------------------------
@@ -2029,7 +2202,7 @@ async def test_scenario_d5_refresh_removing_affinity_candidate_requires_redispat
             )
         exc = exc_info.value
         assert exc.status_code == 429
-        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
         assert detail.get("redispatch_required") is True or "redispatch" in str(
             detail.get("code", "")
         ), (
@@ -2040,6 +2213,84 @@ async def test_scenario_d5_refresh_removing_affinity_candidate_requires_redispat
             "R3-4: zero upstream calls to another candidate when the pinned "
             f"candidate is removed; got calls={leaders!r}"
         )
+    finally:
+        restore()
+
+
+async def test_scenario_d5_none_to_concrete_route_family_requires_redispatch() -> None:
+    client = _refresh_client()
+    response = _post_refresh(
+        client,
+        """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: d5-none-route-pinned
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: d5-none-route-other
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+""",
+    )
+    assert response.status_code == 200
+    snapshot = lpe.get_active_routing_snapshot()
+    assert snapshot is not None
+
+    request = _minimal_request("d5-none-route-session")
+    request_body = {
+        "model": "read",
+        "input": [{"role": "user", "content": "hello"}],
+        "litellm_metadata": {"session_id": "d5-none-route-session"},
+    }
+    session_key = lpe._resolve_codex_auto_agent_session_key(
+        request,
+        request_body,
+        alias_model="read",
+    )
+    await lpe._set_codex_auto_agent_session_affinity(
+        session_key,
+        {
+            "provider": "openrouter",
+            "model": "d5-none-route-pinned",
+            "route_family": None,
+            "last_resort": False,
+            "config_epoch_tag": "prior-semantic-config",
+        },
+    )
+
+    leaders: list[str] = []
+
+    async def _performer(
+        *,
+        endpoint: str,
+        request: Request,
+        fastapi_response: Response,
+        user_api_key_dict: Any,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+        target_url: str,
+        api_key: Optional[str],
+        forward_headers: bool,
+    ) -> Response:
+        leaders.append(candidate["model"])
+        return _SUCCESS_RESPONSE
+
+    restore = _install_candidate_request_performer(_performer)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await _drive_wrapper(
+                session_id="d5-none-route-session",
+                body_extra={"previous_response_id": "resp_d5_none_route"},
+            )
+        detail = exc_info.value.detail
+        assert exc_info.value.status_code == 429
+        assert isinstance(detail, dict)
+        assert detail.get("redispatch_required") is True
+        assert leaders == []
     finally:
         restore()
 
@@ -2093,13 +2344,13 @@ async def test_scenario_d6_legacy_alias_keys_unchanged() -> None:
 
     # Activate a snapshot through the real refresh route. It must not affect
     # the static-table aawm-low key format.
-    snapshot_yaml = """
-defaults: {}
+    snapshot_yaml = f"""
+defaults: {{}}
 aliases:
   - name: read
     candidates:
       - provider: openrouter
-        model: d6-snapshot-model
+        model: {first_or["model"]}
         route_family: codex_openrouter_completion_adapter
         priority: 100
 """
@@ -2107,6 +2358,7 @@ aliases:
     refresh = _post_refresh(client, snapshot_yaml)
     assert refresh.status_code == 200
     assert refresh.json()["changed"] is True
+    assert _low_alias_openrouter_lane_key_for_model(first_or["model"]) == bare_key_before
 
     # Clear cooldowns and drive again
     lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
