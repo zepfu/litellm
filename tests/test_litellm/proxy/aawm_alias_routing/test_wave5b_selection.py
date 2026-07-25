@@ -735,6 +735,55 @@ class TestCodexRedispatch:
         assert exc.detail["error"]["code"] == "aawm_codex_auto_agent_redispatch_required"
         assert exc.detail["failure_phase"] == "affinity_continuation_removed"
 
+    @pytest.mark.asyncio
+    async def test_durable_affinity_removed_raises_before_alternate_selection(self):
+        request = _make_request()
+        affinity = {
+            "provider": "antigravity",
+            "model": "removed-durable-model",
+            "route_family": "codex_antigravity_code_assist_adapter",
+            "last_resort": False,
+            "affinity_state_source": "durable_cache",
+        }
+        candidates = (_candidate("openai", "gpt-4o"),)
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import SelectionEnumeration
+
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+        alternate_states = AsyncMock(
+            side_effect=AssertionError("alternate selection must not run")
+        )
+        _set_selection_runtime(
+            "_get_codex_session_affinity",
+            AsyncMock(return_value=affinity),
+        )
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
+        _set_selection_runtime(
+            "_resolve_codex_session_key",
+            lambda r, b, **kw: "session:durable-removed",
+        )
+
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda *a, **kw: mock_enum
+                ),
+                "_build_codex_auto_agent_candidate_states": alternate_states,
+            },
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request,
+                    request_body={"model": "aawm-codex-agent-auto"},
+                )
+
+        detail = exc_info.value.detail
+        assert exc_info.value.status_code == 429
+        assert detail["redispatch_required"] is True
+        assert detail["failure_phase"] == "affinity_continuation_removed"
+        assert detail["attempted_provider_call"] is False
+        alternate_states.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Candidate state construction: Google auth-degraded

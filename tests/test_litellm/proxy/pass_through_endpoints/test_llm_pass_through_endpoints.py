@@ -36953,7 +36953,7 @@ async def test_aawm_alias_routing_durable_affinity_payload_is_sanitized():
 
 
 @pytest.mark.asyncio
-async def test_aawm_code_alias_ignores_stale_antigravity_durable_affinity():
+async def test_aawm_code_alias_redispatches_stale_antigravity_durable_affinity():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
     body = {
@@ -36988,19 +36988,27 @@ async def test_aawm_code_alias_ignores_stale_antigravity_durable_affinity():
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
             new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
         ) as mock_antigravity_lane:
-            selection = await _select_codex_auto_agent_candidate(
-                request=request,
-                request_body=body,
-            )
+            with patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_codex_auto_agent_candidate_states",
+                new=AsyncMock(
+                    side_effect=AssertionError("alternate selection must not run")
+                ),
+            ) as mock_alternate_selection:
+                with pytest.raises(HTTPException) as exc_info:
+                    await _select_codex_auto_agent_candidate(
+                        request=request,
+                        request_body=body,
+                    )
 
-    assert selection["candidate"]["provider"] == "openai"
-    assert selection["candidate"]["model"] == "gpt-5.3-codex-spark"
-    assert selection["selection_reason"] == "first_available"
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["failure_phase"] == "affinity_continuation_removed"
+    assert exc_info.value.detail["attempted_provider_call"] is False
     mock_antigravity_lane.assert_not_called()
+    mock_alternate_selection.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_aawm_low_alias_ignores_stale_antigravity_durable_affinity():
+async def test_aawm_low_alias_redispatches_stale_antigravity_durable_affinity():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
     body = {
@@ -37035,15 +37043,23 @@ async def test_aawm_low_alias_ignores_stale_antigravity_durable_affinity():
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_antigravity_lane_key",
             new=AsyncMock(side_effect=AssertionError("Antigravity must not resolve")),
         ) as mock_antigravity_lane:
-            selection = await _select_codex_auto_agent_candidate(
-                request=request,
-                request_body=body,
-            )
+            with patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._build_codex_auto_agent_candidate_states",
+                new=AsyncMock(
+                    side_effect=AssertionError("alternate selection must not run")
+                ),
+            ) as mock_alternate_selection:
+                with pytest.raises(HTTPException) as exc_info:
+                    await _select_codex_auto_agent_candidate(
+                        request=request,
+                        request_body=body,
+                    )
 
-    assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
-    assert selection["selection_reason"] == "first_available"
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["failure_phase"] == "affinity_continuation_removed"
+    assert exc_info.value.detail["attempted_provider_call"] is False
     mock_antigravity_lane.assert_not_called()
+    mock_alternate_selection.assert_not_awaited()
 
 
 @pytest.mark.asyncio

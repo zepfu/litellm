@@ -289,6 +289,13 @@ methods or injected callbacks:
 | Codex/Anthropic active cooldown reads/writes, session affinity, merged-family state, R3-1 memory publication, state-source attachment | `aawm_alias_routing/cooldown_state.py` |
 | Candidate lookup, state construction, availability shaping, request-local cooldown/exclusion, forced/adapter/Kimi/Grok lane application, Codex/Anthropic selectors, in-flight/redispatch errors | `aawm_alias_routing/selection.py` |
 | Read-pilot evidence gate, round-robin cursor, OpenRouter quota cache/lock | `aawm_alias_routing/state.py` (`AliasRoutingStateManager`) |
+
+Codex continuation affinity fails closed when its pinned candidate is absent
+from the active enumeration or its route family is incompatible. This applies
+equally to memory and durable-cache affinity: the selector raises
+redispatch-required before resolving a provider lane or selecting an alternate
+upstream.
+
 Google retry classification retains separate capacity, rate-limit, transient,
 and request budgets through strategy callbacks. The shared retry driver owns
 only identical attempt sequencing; it does not collapse Google's multi-budget

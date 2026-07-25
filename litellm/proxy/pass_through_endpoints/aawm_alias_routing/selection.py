@@ -1278,12 +1278,7 @@ async def _select_codex_auto_agent_candidate(
         # any alternate upstream call.  Compatible candidates (same
         # provider/model/route_family) remain pinned regardless of
         # priority/weight/schedule changes.
-        if (
-            affinity_candidate is None
-            and affinity.get("affinity_state_source") == "durable_cache"
-        ):
-            affinity = None
-        elif affinity_candidate is None or (
+        if affinity_candidate is None or (
             affinity_candidate.get("route_family") != affinity.get("route_family")
         ):
             _pinned_candidate_shape = {
