@@ -882,7 +882,7 @@ class TestA4CStructuralRed:
             for node in tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        assign_targets: Dict[str, ast.AST] = {}
+        assign_targets: Dict[str, ast.Assign] = {}
         for node in tree.body:
             if isinstance(node, ast.Assign):
                 for target in node.targets:

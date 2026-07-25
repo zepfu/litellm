@@ -6,6 +6,8 @@ Owns durable persistence concerns as disjoint modules:
 - `writer.py` — bounded queue, daemon worker, batch flush, asyncpg pool lifecycle
 - `spool.py` — filesystem degraded-mode spool + drainer
 - `retry.py` — flush retry/backoff/exhaustion policy
+- `normalize.py` — record normalization chain (trust/sync/quality/latency)
+- `context_window.py` — Anthropic 1M context-window beta classification
 - `record.py` — record builders, shared field derivation, persist entrypoints
 - `sql.py` — DDL/DML constants
 - `identity_selection.py` — ordered first-match selection for scripts
@@ -21,6 +23,16 @@ surfaces for historical script/test imports.
 """
 
 from __future__ import annotations
+
+from litellm.integrations.aawm_session_history.normalize import (  # noqa: F401
+    _normalize_session_history_record,
+    _sync_session_history_record_metadata,
+)
+from litellm.integrations.aawm_session_history.context_window import (  # noqa: F401
+    _enrich_anthropic_context_window_metadata,
+    _enrich_backfill_anthropic_context_window_metadata,
+    _classify_anthropic_context_window_from_retained_evidence,
+)
 
 from litellm.integrations.aawm_session_history.identity_selection import (  # noqa: F401
     IdentityCandidate,
@@ -201,6 +213,11 @@ from litellm.integrations.aawm_session_history.record import (  # noqa: F401
 
 # Explicit export surface: star-import would drop underscore names.
 __all__ = [
+    "_normalize_session_history_record",
+    "_sync_session_history_record_metadata",
+    "_enrich_anthropic_context_window_metadata",
+    "_enrich_backfill_anthropic_context_window_metadata",
+    "_classify_anthropic_context_window_from_retained_evidence",
     "IdentityCandidate",
     "IdentitySource",
     "iter_identity_candidates",

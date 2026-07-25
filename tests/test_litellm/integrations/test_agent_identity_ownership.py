@@ -134,9 +134,9 @@ def _function_def_names(tree: ast.Module) -> set:
     return names
 
 
-def _module_level_assign_targets(tree: ast.Module) -> Dict[str, ast.AST]:
+def _module_level_assign_targets(tree: ast.Module) -> Dict[str, ast.Assign]:
     """Map assigned name -> the AST node of its (first) module-level Assign."""
-    targets: Dict[str, ast.AST] = {}
+    targets: Dict[str, ast.Assign] = {}
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -1912,7 +1912,7 @@ def test_a4b_tool_activity_monkeypatchable_through_facade(monkeypatch: Any) -> N
     namespace after extraction."""
     import litellm.integrations.aawm_agent_identity as identity_pkg
 
-    sentinel = {"called_with": None}
+    sentinel: Dict[str, Any] = {"called_with": None}
     original = identity_pkg._classify_tool_kind
 
     def _stub_classify(tool_name: str) -> str:

@@ -314,6 +314,8 @@ def test_installed_wheel_smoke(tmp_path: Path) -> None:
         "    'litellm.integrations.aawm_agent_identity.provider_normalize',\n"
         "    'litellm.integrations.aawm_agent_identity.request_signals',\n"
         "    'litellm.integrations.aawm_agent_identity.prompt_overhead',\n"
+        "    'litellm.integrations.aawm_session_history.normalize',\n"
+        "    'litellm.integrations.aawm_session_history.context_window',\n"
         ")\n"
         "modules = [importlib.import_module(name) for name in module_names]\n"
         "assert callback_identity.aawm_agent_identity_instance is "
