@@ -1,0 +1,1047 @@
+{
+  "sf_full": {
+    "provider": {
+      "type": "str",
+      "value": "openai"
+    },
+    "client": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_key": {
+      "type": "str",
+      "value": "gpt-4o"
+    },
+    "quota_type": {
+      "type": "str",
+      "value": "rate_limit"
+    },
+    "remaining_pct": {
+      "type": "float",
+      "value": 55.0
+    },
+    "quota_limit": {
+      "type": "float",
+      "value": 10000.0
+    },
+    "quota_used": {
+      "type": "float",
+      "value": 4500.0
+    },
+    "quota_remaining": {
+      "type": "float",
+      "value": 5500.0
+    },
+    "bp_start": {
+      "type": "datetime",
+      "value": "2026-07-01T00:00:00+00:00"
+    },
+    "bp_end": {
+      "type": "datetime",
+      "value": "2026-08-01T00:00:00+00:00"
+    }
+  },
+  "sf_minimal": {
+    "provider": {
+      "type": "str",
+      "value": "unknown"
+    },
+    "client": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_key": {
+      "type": "str",
+      "value": "claude-sonnet-4-20250514"
+    },
+    "quota_type": {
+      "type": "str",
+      "value": "unknown"
+    },
+    "remaining_pct": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_limit": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_used": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_remaining": {
+      "type": "NoneType",
+      "value": null
+    },
+    "bp_start": {
+      "type": "NoneType",
+      "value": null
+    },
+    "bp_end": {
+      "type": "NoneType",
+      "value": null
+    }
+  },
+  "sf_none": {
+    "provider": {
+      "type": "str",
+      "value": "unknown"
+    },
+    "client": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_key": {
+      "type": "str",
+      "value": "unknown_quota"
+    },
+    "quota_type": {
+      "type": "str",
+      "value": "unknown"
+    },
+    "remaining_pct": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_limit": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_used": {
+      "type": "NoneType",
+      "value": null
+    },
+    "quota_remaining": {
+      "type": "NoneType",
+      "value": null
+    }
+  },
+  "numeric_detail": {
+    "int": {
+      "type": "float",
+      "value": 100.0
+    },
+    "float": {
+      "type": "float",
+      "value": 99.5
+    },
+    "str_num": {
+      "type": "float",
+      "value": 42.0
+    },
+    "missing": {
+      "type": "NoneType",
+      "value": null
+    },
+    "none": {
+      "type": "NoneType",
+      "value": null
+    }
+  },
+  "timestamp_detail": {
+    "iso": {
+      "type": "datetime",
+      "value": "2026-07-25T12:00:00+00:00"
+    },
+    "missing": {
+      "type": "NoneType",
+      "value": null
+    },
+    "none": {
+      "type": "NoneType",
+      "value": null
+    }
+  },
+  "rl_obs_payload": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "str",
+        "value": "2026-07-25T12:00:00Z"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "openai"
+      },
+      {
+        "type": "str",
+        "value": "gpt-4o"
+      },
+      {
+        "type": "str",
+        "value": "gpt-4o"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "rate_limit"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "float",
+        "value": 55.0
+      },
+      {
+        "type": "float",
+        "value": 10000.0
+      },
+      {
+        "type": "float",
+        "value": 4500.0
+      },
+      {
+        "type": "float",
+        "value": 5500.0
+      },
+      {
+        "type": "datetime",
+        "value": "2026-07-01T00:00:00+00:00"
+      },
+      {
+        "type": "datetime",
+        "value": "2026-08-01T00:00:00+00:00"
+      },
+      {
+        "type": "str",
+        "value": "{}"
+      },
+      {
+        "type": "str",
+        "value": "{}"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      }
+    ]
+  },
+  "rl_trans_payload": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "str",
+        "value": "openai:gpt-4o:daily:exhaustion"
+      },
+      {
+        "type": "str",
+        "value": "openai:gpt-4o:daily"
+      },
+      {
+        "type": "str",
+        "value": "openai"
+      },
+      {
+        "type": "str",
+        "value": "codex"
+      },
+      {
+        "type": "str",
+        "value": "abc123"
+      },
+      {
+        "type": "str",
+        "value": "exhaustion"
+      },
+      {
+        "type": "float",
+        "value": 0.95
+      },
+      {
+        "type": "str",
+        "value": "[{\"type\": \"remaining_pct_drop\"}]"
+      },
+      {
+        "type": "str",
+        "value": "rate_limit_callback"
+      },
+      {
+        "type": "str",
+        "value": "2026-07-25T12:00:00Z"
+      },
+      {
+        "type": "str",
+        "value": "2026-07-25T14:00:00Z"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "2026-07-26T00:00:00Z"
+      },
+      {
+        "type": "float",
+        "value": 95.0
+      },
+      {
+        "type": "float",
+        "value": 100.0
+      },
+      {
+        "type": "int",
+        "value": 500
+      },
+      {
+        "type": "int",
+        "value": 0
+      },
+      {
+        "type": "int",
+        "value": 9500
+      },
+      {
+        "type": "int",
+        "value": 10000
+      },
+      {
+        "type": "int",
+        "value": 10000
+      },
+      {
+        "type": "int",
+        "value": 10000
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "2026-07-25T12:00:00Z"
+      },
+      {
+        "type": "str",
+        "value": "2026-07-25T14:00:00Z"
+      },
+      {
+        "type": "str",
+        "value": "{\"total_requests\": 10000}"
+      },
+      {
+        "type": "str",
+        "value": "{\"remaining_pct\": 5.0}"
+      },
+      {
+        "type": "str",
+        "value": "{\"remaining_pct\": 0.0}"
+      },
+      {
+        "type": "str",
+        "value": "{\"trigger\": \"automatic\"}"
+      }
+    ]
+  },
+  "prov_err_payload": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "str",
+        "value": "2026-07-25T15:00:00Z"
+      },
+      {
+        "type": "str",
+        "value": "production"
+      },
+      {
+        "type": "str",
+        "value": "openai"
+      },
+      {
+        "type": "str",
+        "value": "gpt-4o"
+      },
+      {
+        "type": "str",
+        "value": "gpt-4o-group"
+      },
+      {
+        "type": "str",
+        "value": "openai"
+      },
+      {
+        "type": "int",
+        "value": 429
+      },
+      {
+        "type": "str",
+        "value": "rate_limit_error"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "RateLimitError"
+      },
+      {
+        "type": "int",
+        "value": 30
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "sess-789"
+      },
+      {
+        "type": "str",
+        "value": "trace-456"
+      },
+      {
+        "type": "str",
+        "value": "call-123"
+      },
+      {
+        "type": "str",
+        "value": "{\"source\": \"docker_logs\"}"
+      }
+    ]
+  },
+  "audit_payload": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "str",
+        "value": "call-audit:alias-routing:66c0a667b08150af90b889ad"
+      },
+      {
+        "type": "datetime",
+        "value": "2026-07-25T16:00:00+00:00"
+      },
+      {
+        "type": "str",
+        "value": "sess-audit"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "trace-audit"
+      },
+      {
+        "type": "str",
+        "value": "call-audit"
+      },
+      {
+        "type": "str",
+        "value": "gpt-4o"
+      },
+      {
+        "type": "str",
+        "value": "codex_auto_agent"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "openai"
+      },
+      {
+        "type": "str",
+        "value": "gpt-4o"
+      },
+      {
+        "type": "str",
+        "value": "openai:gpt-4o"
+      },
+      {
+        "type": "str",
+        "value": "openai:gpt-4o:model"
+      },
+      {
+        "type": "int",
+        "value": 1
+      },
+      {
+        "type": "str",
+        "value": "cooldown_applied"
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "model"
+      },
+      {
+        "type": "float",
+        "value": 60.0
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "bool",
+        "value": true
+      },
+      {
+        "type": "bool",
+        "value": false
+      },
+      {
+        "type": "bool",
+        "value": false
+      },
+      {
+        "type": "bool",
+        "value": false
+      },
+      {
+        "type": "bool",
+        "value": false
+      },
+      {
+        "type": "bool",
+        "value": false
+      },
+      {
+        "type": "str",
+        "value": "{\"event_type\": \"cooldown_applied\", \"observed_at\": \"2026-07-25T16:00:00Z\", \"alias_model\": \"gpt-4o\", \"provider\": \"openai\", \"model\": \"gpt-4o\", \"lane_key\": \"openai:gpt-4o\", \"cooldown_key\": \"openai:gpt-4o:model\", \"attempt_number\": 1, \"cooldown_scope\": \"model\", \"cooldown_seconds\": 60.0, \"selected\": true, \"event_index\": 0, \"session_history_provider\": \"openai\", \"session_history_model\": \"gpt-4o\", \"session_history_model_group\": \"gpt-4o-group\", \"session_history_repository\": \"org/repo\"}"
+      }
+    ]
+  },
+  "extract_audit_events_empty": {
+    "type": "list",
+    "value": []
+  },
+  "extract_audit_events_with": {
+    "type": "list",
+    "value": [
+      {
+        "type": "dict",
+        "value": {
+          "event_type": {
+            "type": "str",
+            "value": "cooldown"
+          },
+          "observed_at": {
+            "type": "str",
+            "value": "2026-07-25T10:00:00Z"
+          }
+        }
+      }
+    ]
+  },
+  "audit_observed_at": {
+    "type": "datetime",
+    "value": "2026-07-25T16:00:00+00:00"
+  },
+  "audit_event_key": {
+    "type": "str",
+    "value": "call-audit:alias-routing:66c0a667b08150af90b889ad"
+  },
+  "infer_family": {
+    "codex": {
+      "type": "str",
+      "value": "codex_auto_agent"
+    },
+    "empty": {
+      "type": "str",
+      "value": "unknown"
+    },
+    "anthropic": {
+      "type": "str",
+      "value": "anthropic_auto_agent"
+    }
+  },
+  "row_to_dict": {
+    "type": "dict",
+    "value": {
+      "provider": {
+        "type": "str",
+        "value": "openai"
+      },
+      "remaining_pct": {
+        "type": "float",
+        "value": 55.0
+      }
+    }
+  },
+  "row_to_dict_none": {
+    "type": "dict",
+    "value": {
+      "observed_at": {
+        "type": "NoneType",
+        "value": null
+      },
+      "source": {
+        "type": "NoneType",
+        "value": null
+      },
+      "provider": {
+        "type": "NoneType",
+        "value": null
+      },
+      "client_family": {
+        "type": "NoneType",
+        "value": null
+      },
+      "account_hash": {
+        "type": "NoneType",
+        "value": null
+      },
+      "environment": {
+        "type": "NoneType",
+        "value": null
+      },
+      "tenant_id": {
+        "type": "NoneType",
+        "value": null
+      },
+      "repository": {
+        "type": "NoneType",
+        "value": null
+      },
+      "limit_key": {
+        "type": "NoneType",
+        "value": null
+      },
+      "limit_id": {
+        "type": "NoneType",
+        "value": null
+      },
+      "limit_name": {
+        "type": "NoneType",
+        "value": null
+      },
+      "limit_scope": {
+        "type": "NoneType",
+        "value": null
+      },
+      "window_minutes": {
+        "type": "NoneType",
+        "value": null
+      },
+      "quota_period": {
+        "type": "NoneType",
+        "value": null
+      },
+      "provider_resets_at": {
+        "type": "NoneType",
+        "value": null
+      },
+      "inferred_window_start_at": {
+        "type": "NoneType",
+        "value": null
+      },
+      "used_percentage": {
+        "type": "NoneType",
+        "value": null
+      },
+      "remaining_requests": {
+        "type": "NoneType",
+        "value": null
+      },
+      "used_requests": {
+        "type": "NoneType",
+        "value": null
+      },
+      "total_requests": {
+        "type": "NoneType",
+        "value": null
+      },
+      "status": {
+        "type": "NoneType",
+        "value": null
+      },
+      "exhausted": {
+        "type": "NoneType",
+        "value": null
+      },
+      "exhaustion_kind": {
+        "type": "NoneType",
+        "value": null
+      },
+      "reset_hint_seconds": {
+        "type": "NoneType",
+        "value": null
+      },
+      "model": {
+        "type": "NoneType",
+        "value": null
+      },
+      "quota_limit": {
+        "type": "NoneType",
+        "value": null
+      },
+      "quota_used": {
+        "type": "NoneType",
+        "value": null
+      },
+      "quota_remaining": {
+        "type": "NoneType",
+        "value": null
+      },
+      "billing_period_start_at": {
+        "type": "NoneType",
+        "value": null
+      },
+      "billing_period_end_at": {
+        "type": "NoneType",
+        "value": null
+      },
+      "model_family": {
+        "type": "NoneType",
+        "value": null
+      },
+      "model_tier": {
+        "type": "NoneType",
+        "value": null
+      },
+      "parent_limit_key": {
+        "type": "NoneType",
+        "value": null
+      },
+      "session_id": {
+        "type": "NoneType",
+        "value": null
+      },
+      "trace_id": {
+        "type": "NoneType",
+        "value": null
+      },
+      "litellm_call_id": {
+        "type": "NoneType",
+        "value": null
+      },
+      "route_family": {
+        "type": "NoneType",
+        "value": null
+      },
+      "request_model": {
+        "type": "NoneType",
+        "value": null
+      },
+      "response_model": {
+        "type": "NoneType",
+        "value": null
+      },
+      "client_name": {
+        "type": "NoneType",
+        "value": null
+      },
+      "client_version": {
+        "type": "NoneType",
+        "value": null
+      },
+      "client_user_agent": {
+        "type": "NoneType",
+        "value": null
+      },
+      "raw_provider_fields": {
+        "type": "NoneType",
+        "value": null
+      },
+      "evidence": {
+        "type": "NoneType",
+        "value": null
+      },
+      "metadata": {
+        "type": "NoneType",
+        "value": null
+      }
+    }
+  },
+  "obs_only_true": {
+    "type": "bool",
+    "value": false
+  },
+  "obs_only_false": {
+    "type": "bool",
+    "value": false
+  },
+  "obs_only_missing": {
+    "type": "bool",
+    "value": false
+  },
+  "split_req": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "dict",
+        "value": {
+          "method": {
+            "type": "str",
+            "value": "POST"
+          },
+          "url": {
+            "type": "str",
+            "value": "/v1/chat/completions"
+          }
+        }
+      },
+      {
+        "type": "dict",
+        "value": {}
+      }
+    ]
+  },
+  "split_req_missing": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "dict",
+        "value": {}
+      },
+      {
+        "type": "dict",
+        "value": {}
+      }
+    ]
+  },
+  "trace_id": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "missing"
+      }
+    ]
+  },
+  "trace_id_missing": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "str",
+        "value": "missing"
+      }
+    ]
+  },
+  "session_id_str": {
+    "type": "str",
+    "value": "session-abc"
+  },
+  "session_id_dict": {
+    "type": "str",
+    "value": "sess-123"
+  },
+  "session_id_none": {
+    "type": "NoneType",
+    "value": null
+  },
+  "extract_session_id": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "str",
+        "value": "sess-direct"
+      },
+      {
+        "type": "str",
+        "value": "legacy_spend_log_session_field"
+      }
+    ]
+  },
+  "tags_list": {
+    "type": "list",
+    "value": [
+      {
+        "type": "str",
+        "value": "tag1"
+      },
+      {
+        "type": "str",
+        "value": "tag2"
+      }
+    ]
+  },
+  "tags_str": {
+    "type": "list",
+    "value": []
+  },
+  "tags_none": {
+    "type": "list",
+    "value": []
+  },
+  "searchable_str": {
+    "type": "str",
+    "value": "hello world"
+  },
+  "searchable_dict": {
+    "type": "str",
+    "value": "{\"key\": \"value\"}"
+  },
+  "searchable_none": {
+    "type": "str",
+    "value": ""
+  },
+  "lf_session_id": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "str",
+        "value": "lf-session-1"
+      },
+      {
+        "type": "str",
+        "value": "trace.session_id"
+      }
+    ]
+  },
+  "usage_from_obs": {
+    "type": "dict",
+    "value": {
+      "input": {
+        "type": "int",
+        "value": 100
+      },
+      "output": {
+        "type": "int",
+        "value": 50
+      },
+      "total": {
+        "type": "int",
+        "value": 150
+      },
+      "prompt_tokens": {
+        "type": "int",
+        "value": 100
+      },
+      "completion_tokens": {
+        "type": "int",
+        "value": 50
+      },
+      "output_tokens": {
+        "type": "int",
+        "value": 50
+      },
+      "total_tokens": {
+        "type": "int",
+        "value": 150
+      }
+    }
+  },
+  "usage_from_obs_empty": {
+    "type": "dict",
+    "value": {}
+  },
+  "first_resp_msg": {
+    "type": "dict",
+    "value": {
+      "role": {
+        "type": "str",
+        "value": "assistant"
+      },
+      "content": {
+        "type": "str",
+        "value": "Hello"
+      }
+    }
+  },
+  "first_resp_msg_none": {
+    "type": "NoneType",
+    "value": null
+  },
+  "infer_prov_openai": {
+    "type": "str",
+    "value": "openai"
+  },
+  "infer_prov_anthropic": {
+    "type": "str",
+    "value": "anthropic"
+  },
+  "derive_tags": {
+    "type": "list",
+    "value": [
+      {
+        "type": "str",
+        "value": "production"
+      },
+      {
+        "type": "str",
+        "value": "v2"
+      }
+    ]
+  },
+  "derive_tags_empty": {
+    "type": "list",
+    "value": []
+  },
+  "derive_trace_tags_spend": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "list",
+        "value": []
+      }
+    ]
+  },
+  "agent_context": {
+    "type": "tuple",
+    "value": [
+      {
+        "type": "NoneType",
+        "value": null
+      },
+      {
+        "type": "NoneType",
+        "value": null
+      }
+    ]
+  }
+}

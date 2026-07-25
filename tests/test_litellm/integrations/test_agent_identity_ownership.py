@@ -530,43 +530,85 @@ _A4C_SYMBOLS = frozenset(
     }
 )
 
-_A4D_SYMBOLS = frozenset(
-    {
-        # aawm_session_history/backfill.py (spend-log/langfuse synthesis)
-        "_split_spend_log_proxy_server_request",
-        "_extract_trace_id_from_spend_log_row",
-        "_coerce_nested_session_id",
-        "_extract_session_id_from_spend_log_row",
-        "_coerce_spend_log_request_tags",
-        "_synthesize_result_from_spend_log_row",
-        "_build_backfill_kwargs_from_spend_log_row",
-        "_derive_langfuse_trace_tags_from_spend_log_row",
-        "_serialize_searchable_text",
-        "_extract_agent_context_from_langfuse_trace_observation",
-        "_extract_langfuse_session_id",
-        "_build_usage_object_from_langfuse_observation",
-        "_extract_first_langfuse_response_message",
-        "_infer_provider_from_langfuse_observation",
-        "_derive_request_tags_from_langfuse_metadata",
-        "_derive_langfuse_trace_tags_from_langfuse_trace",
-        "_iter_litellm_metadata_sources",
-        # aawm_session_history/storage_fields.py (rate-limit storage + DB payloads)
-        "_rate_limit_storage_provider",
-        "_rate_limit_storage_client",
-        "_rate_limit_storage_quota_key",
-        "_rate_limit_storage_quota_type",
-        "_rate_limit_storage_remaining_pct",
-        "_rate_limit_storage_numeric_detail",
-        "_rate_limit_storage_quota_limit",
-        "_rate_limit_storage_quota_used",
-        "_rate_limit_storage_quota_remaining",
-        "_tool_definition_snapshot_from_metadata",
-        "_build_tool_definition_snapshot_db_payload",
-        "_update_session_history_previous_gap_ms",
-        "_extract_session_history_call_ids_from_payloads",
-        "_strip_postgres_nul_bytes",
-    }
+# =========================================================================
+# Wave A4D: aawm_session_history/backfill.py + storage_fields.py
+#
+# Full inventory derived from baseline e3dc89f634 line bands:
+#   backfill.py:       :13803-14392 (spend-log/langfuse backfill synthesis, 16 fns)
+#   storage_fields.py: :15473-16157 (rate-limit storage + DB payloads + async, 26 fns)
+#
+# Inclusion/exclusion rationale:
+#   INCLUDE  all 16 FunctionDefs in :13803-14392 (backfill synthesis)
+#   EXCLUDE  _iter_litellm_metadata_sources (:14393) -- outside plan band
+#   EXCLUDE  _bound_worker_context_exhaustion_string etc (:14426-14491) -- A4B
+#   EXCLUDE  all A4C normalize/context_window symbols (:11114-12880, :14492-14796)
+#   INCLUDE  all 26 FunctionDefs in :15473-16157 (storage mappers + DB payloads)
+#   EXCLUDE  5 gap symbols :15307-15463 (strip_nul, tool_def, call_ids, gap_ms)
+#            -- outside plan band; remain as existing facades/functions
+#   EXCLUDE  _lookup_claude_auto_review_parent_identity (:15395) -- A4B claude_review
+#   EXCLUDE  _apply_claude_auto_review_parent_identity_from_store (:15429) -- A4B
+#
+# Counts: backfill.py = 16, storage_fields.py = 26, total = 42
+# =========================================================================
+
+_A4D_BACKFILL_FUNCTIONS: List[str] = [
+    # :13803-14392 -- spend-log/langfuse backfill synthesis
+    "_split_spend_log_proxy_server_request",
+    "_extract_trace_id_from_spend_log_row",
+    "_coerce_nested_session_id",
+    "_extract_session_id_from_spend_log_row",
+    "_coerce_spend_log_request_tags",
+    "_synthesize_result_from_spend_log_row",
+    "_build_backfill_kwargs_from_spend_log_row",
+    "_derive_langfuse_trace_tags_from_spend_log_row",
+    "_serialize_searchable_text",
+    "_extract_agent_context_from_langfuse_trace_observation",
+    "_extract_langfuse_session_id",
+    "_build_usage_object_from_langfuse_observation",
+    "_extract_first_langfuse_response_message",
+    "_infer_provider_from_langfuse_observation",
+    "_derive_request_tags_from_langfuse_metadata",
+    "_derive_langfuse_trace_tags_from_langfuse_trace",
+]
+
+_A4D_STORAGE_FIELDS_FUNCTIONS: List[str] = [
+    # :15473-16157 -- rate-limit storage mappers + DB payload builders
+    "_rate_limit_storage_provider",
+    "_rate_limit_storage_client",
+    "_rate_limit_storage_quota_key",
+    "_rate_limit_storage_quota_type",
+    "_rate_limit_storage_remaining_pct",
+    "_rate_limit_storage_numeric_detail",
+    "_rate_limit_storage_quota_limit",
+    "_rate_limit_storage_quota_used",
+    "_rate_limit_storage_quota_remaining",
+    "_rate_limit_storage_timestamp_detail",
+    "_rate_limit_storage_billing_period_start_at",
+    "_rate_limit_storage_billing_period_end_at",
+    "_build_rate_limit_observation_db_payload",
+    "_build_rate_limit_transition_db_payload",
+    "_build_provider_error_observation_db_payload",
+    "_extract_alias_routing_audit_events",
+    "_alias_routing_audit_observed_at",
+    "_alias_routing_audit_event_key",
+    "_infer_alias_routing_family",
+    "_build_alias_routing_audit_db_payload",
+    "_rate_limit_previous_observation_row_to_dict",
+    "_fetch_previous_rate_limit_observation",
+    "_fetch_previous_rate_limit_observations",
+    "_derive_rate_limit_transitions",
+    "_filter_meaningful_rate_limit_observations",
+    "_rate_limit_observation_only_requested",
+]
+
+_A4D_ALL_MOVED_NAMES: List[str] = (
+    _A4D_BACKFILL_FUNCTIONS + _A4D_STORAGE_FIELDS_FUNCTIONS
 )
+
+_A4D_FUNCTION_NAMES: List[str] = _A4D_ALL_MOVED_NAMES  # all are functions
+
+# Backward-compatible sentinel used by A4A/A4B/A4C boundary guards.
+_A4D_SYMBOLS = frozenset(_A4D_ALL_MOVED_NAMES)
 
 
 # =========================================================================
@@ -2838,3 +2880,310 @@ def test_a4c_submodules_do_not_import_init_at_module_scope() -> None:
         f"these A4C submodules import the identity __init__ package at "
         f"module scope: {offending}"
     )
+
+
+# =========================================================================
+# Wave A4D RED structural ownership tests (fail until engineer extracts
+# aawm_session_history/backfill.py + storage_fields.py)
+# =========================================================================
+
+
+def test_a4d_moved_functions_not_defined_in_init() -> None:
+    """A4D-moved functions must not remain as FunctionDef in
+    aawm_agent_identity/__init__.py. RED until extraction."""
+    tree = _parse_init_module()
+    defined_functions = _function_def_names(tree)
+
+    still_defined = sorted(
+        name for name in _A4D_FUNCTION_NAMES if name in defined_functions
+    )
+    assert not still_defined, (
+        "expected these A4D functions to no longer be defined directly in "
+        f"aawm_agent_identity/__init__.py: {still_defined}"
+    )
+
+
+def test_a4d_target_submodules_exist() -> None:
+    """The two A4D target submodule files must exist after extraction."""
+    missing = [
+        mod
+        for mod in ("backfill", "storage_fields")
+        if not (_SESSION_HISTORY_PKG_DIR / f"{mod}.py").is_file()
+    ]
+    assert not missing, f"expected these A4D target files to exist: {missing}"
+
+
+def test_a4d_facade_identity() -> None:
+    """getattr(identity_pkg, name) is getattr(sh_module, name) for every
+    A4D-moved name."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+
+    modules_to_check = {
+        "litellm.integrations.aawm_session_history.backfill": _A4D_BACKFILL_FUNCTIONS,
+        "litellm.integrations.aawm_session_history.storage_fields": _A4D_STORAGE_FIELDS_FUNCTIONS,
+    }
+
+    missing_modules: List[str] = []
+    mismatched: List[tuple] = []
+    for module_path, names in modules_to_check.items():
+        try:
+            submodule = importlib.import_module(module_path)
+        except ModuleNotFoundError:
+            missing_modules.append(module_path)
+            continue
+        for name in names:
+            pkg_value = getattr(identity_pkg, name, None)
+            sub_value = getattr(submodule, name, None)
+            if pkg_value is None or sub_value is None or pkg_value is not sub_value:
+                mismatched.append((module_path, name))
+
+    assert not missing_modules, (
+        f"expected these A4D target submodules to exist: {missing_modules}"
+    )
+    assert not mismatched, (
+        "expected facade identity for each A4D-moved name; "
+        f"mismatches (module, name): {mismatched}"
+    )
+
+
+def test_a4d_globals_rebound_to_identity_package() -> None:
+    """Every A4D function's __globals__ must be the identity package dict
+    after extraction (FunctionType-rebinding installer pattern)."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+
+    modules_to_check = {
+        "litellm.integrations.aawm_session_history.backfill": _A4D_BACKFILL_FUNCTIONS,
+        "litellm.integrations.aawm_session_history.storage_fields": _A4D_STORAGE_FIELDS_FUNCTIONS,
+    }
+    missing_modules: List[str] = []
+    wrong_globals: List[tuple] = []
+    for module_path, names in modules_to_check.items():
+        try:
+            submodule = importlib.import_module(module_path)
+        except ModuleNotFoundError:
+            missing_modules.append(module_path)
+            continue
+        for name in names:
+            function = getattr(submodule, name, None)
+            if (
+                function is None
+                or getattr(function, "__globals__", None)
+                is not identity_pkg.__dict__
+            ):
+                wrong_globals.append((module_path, name))
+
+    assert not missing_modules, (
+        f"expected these A4D target submodules to exist: {missing_modules}"
+    )
+    assert not wrong_globals, (
+        "A4D functions not rebound to identity package globals: "
+        f"{wrong_globals}"
+    )
+
+
+def test_a4d_generic_install_not_published() -> None:
+    """A4D submodules must NOT publish a generic install() on the identity
+    package namespace. The rebinding installer is internal to each module."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+
+    assert not hasattr(identity_pkg, "install"), (
+        "identity package must not publish a generic install() callable"
+    )
+
+
+def test_a4d_package_reexports() -> None:
+    """aawm_session_history/__init__.py must re-export A4D modules after
+    extraction so script imports remain stable."""
+    sh_init = _SESSION_HISTORY_PKG_DIR / "__init__.py"
+    if not sh_init.is_file():
+        # Pre-extraction: session_history package exists but may not
+        # re-export backfill/storage_fields yet. This is RED.
+        pass
+    tree = ast.parse(sh_init.read_text(encoding="utf-8"), filename=str(sh_init))
+    imported_names: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name)
+    # At minimum the DB payload builders must be re-exported for scripts
+    required_reexports = [
+        "_build_rate_limit_observation_db_payload",
+        "_build_rate_limit_transition_db_payload",
+        "_build_provider_error_observation_db_payload",
+        "_build_alias_routing_audit_db_payload",
+    ]
+    missing = [n for n in required_reexports if n not in imported_names]
+    assert not missing, (
+        f"aawm_session_history/__init__.py must re-export these A4D "
+        f"symbols for script compatibility: {missing}"
+    )
+
+
+def test_a4d_wheel_sdist_mappings() -> None:
+    """backfill.py and storage_fields.py must appear exactly once in both
+    wheel and sdist force-include sections of .wheel-build/pyproject.toml."""
+    import tomllib
+
+    pyproject_path = REPO_ROOT / ".wheel-build" / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+
+    targets = data.get("tool", {}).get("hatch", {}).get("build", {}).get("targets", {})
+    a4d_modules = ("backfill.py", "storage_fields.py")
+
+    for target_name in ("wheel", "sdist"):
+        force_include = targets.get(target_name, {}).get("force-include", {})
+        for mod in a4d_modules:
+            matches = [
+                k for k in force_include
+                if k.endswith(f"aawm_session_history/{mod}")
+            ]
+            assert len(matches) == 1, (
+                f"expected exactly one {target_name} force-include mapping for "
+                f"aawm_session_history/{mod}, found {len(matches)}: {matches}"
+            )
+
+
+def test_a4d_installed_wheel_smoke_imports() -> None:
+    """The paired installed-wheel smoke test in
+    test_agent_identity_package_conversion.py must contain hard-import
+    entries for both A4D modules. RED until the engineer adds them."""
+    conversion_test = (
+        Path(__file__).resolve().parent
+        / "test_agent_identity_package_conversion.py"
+    )
+    assert conversion_test.is_file(), (
+        f"expected paired wheel smoke test to exist: {conversion_test}"
+    )
+    source = conversion_test.read_text(encoding="utf-8")
+    required_modules = (
+        "litellm.integrations.aawm_session_history.backfill",
+        "litellm.integrations.aawm_session_history.storage_fields",
+    )
+    missing = [mod for mod in required_modules if mod not in source]
+    assert not missing, (
+        f"paired installed-wheel smoke test must hard-import these A4D "
+        f"modules: {missing}"
+    )
+
+
+def test_a4d_submodules_do_not_import_init_at_module_scope() -> None:
+    """A4D submodules must not import the identity __init__ package at
+    module scope (circular import risk)."""
+    missing_modules: List[str] = []
+    offending: List[str] = []
+    for module_name in ("backfill", "storage_fields"):
+        module_path = _SESSION_HISTORY_PKG_DIR / f"{module_name}.py"
+        if not module_path.is_file():
+            missing_modules.append(module_name)
+            continue
+        tree = ast.parse(
+            module_path.read_text(encoding="utf-8"), filename=str(module_path)
+        )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "litellm.integrations.aawm_agent_identity"
+            ):
+                offending.append(module_name)
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "litellm.integrations.aawm_agent_identity":
+                        offending.append(module_name)
+
+    assert not missing_modules, (
+        f"expected these A4D target submodule files to exist: {missing_modules}"
+    )
+    assert not offending, (
+        f"these A4D submodules import the identity __init__ package at "
+        f"module scope: {offending}"
+    )
+
+
+def test_a4d_rebind_order_facades_before_record_install() -> None:
+    """Every A4D facade assignment in __init__.py must precede the
+    _bind_session_history_record_apis() call."""
+    tree = _parse_init_module()
+
+    call_line = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_bind_session_history_record_apis"
+        ):
+            call_line = node.lineno
+            break
+
+    assert call_line is not None, (
+        "expected a call to _bind_session_history_record_apis() in __init__.py"
+    )
+
+    defined_functions = _function_def_names(tree)
+    assign_targets = _module_level_assign_targets(tree)
+
+    expected_facades = set(_A4D_FUNCTION_NAMES)
+    remaining_definitions = sorted(expected_facades & defined_functions)
+    present_facades = expected_facades & set(assign_targets)
+    missing_facades = sorted(expected_facades - present_facades)
+
+    late_facades = [
+        name
+        for name in sorted(present_facades)
+        if assign_targets[name].lineno >= call_line
+    ]
+    assert not remaining_definitions and not missing_facades and not late_facades, (
+        "A4D facade/rebind contract failed: "
+        f"remaining FunctionDefs={remaining_definitions}; "
+        f"missing facade assignments={missing_facades}; "
+        f"late facade assignments (must precede line {call_line})={late_facades}"
+    )
+
+
+# =========================================================================
+# Wave A4D boundary guards (GREEN now, must stay GREEN)
+# =========================================================================
+
+
+def test_a4d_inventory_excludes_a4a_symbols() -> None:
+    overlap = sorted(set(_A4A_ALL_MOVED_NAMES) & set(_A4D_ALL_MOVED_NAMES))
+    assert not overlap, f"A4D inventory must not claim A4A symbols: {overlap}"
+
+
+def test_a4d_inventory_excludes_a4b_symbols() -> None:
+    overlap = sorted(set(_A4B_ALL_MOVED_NAMES) & set(_A4D_ALL_MOVED_NAMES))
+    assert not overlap, f"A4D inventory must not claim A4B symbols: {overlap}"
+
+
+def test_a4d_inventory_excludes_a4c_symbols() -> None:
+    overlap = sorted(set(_A4C_ALL_MOVED_NAMES) & set(_A4D_ALL_MOVED_NAMES))
+    assert not overlap, f"A4D inventory must not claim A4C symbols: {overlap}"
+
+
+def test_a4d_inventory_has_no_duplicate_across_modules() -> None:
+    overlap = sorted(
+        set(_A4D_BACKFILL_FUNCTIONS) & set(_A4D_STORAGE_FIELDS_FUNCTIONS)
+    )
+    assert not overlap, f"A4D symbols in both modules: {overlap}"
+
+
+def test_a4d_inventory_counts() -> None:
+    assert len(_A4D_BACKFILL_FUNCTIONS) == 16, (
+        f"expected 16 backfill.py functions, got {len(_A4D_BACKFILL_FUNCTIONS)}"
+    )
+    assert len(_A4D_STORAGE_FIELDS_FUNCTIONS) == 26, (
+        f"expected 26 storage_fields.py functions, got {len(_A4D_STORAGE_FIELDS_FUNCTIONS)}"
+    )
+    assert len(_A4D_ALL_MOVED_NAMES) == 42
+
+
+def test_a4d_all_functions_callable_in_identity_pkg() -> None:
+    """Every A4D function must be callable on the identity package (pre-move)."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+
+    missing = [
+        name
+        for name in _A4D_ALL_MOVED_NAMES
+        if not callable(getattr(identity_pkg, name, None))
+    ]
+    assert not missing, f"A4D functions missing from identity package: {missing}"
