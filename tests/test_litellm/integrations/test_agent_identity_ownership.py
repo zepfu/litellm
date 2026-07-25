@@ -2498,3 +2498,343 @@ def test_a4b_enrich_moves_last_documented() -> None:
         "_apply_claude_auto_review_metadata"
         not in _A4B_MOVED_NAMES_BY_MODULE["enrich"]
     )
+
+
+# =========================================================================
+# Wave A4C: aawm_session_history/normalize.py + context_window.py
+#
+# Full inventory derived from baseline e3dc89f634 line bands:
+#   normalize.py:      :11114-12880 (record normalization chain)
+#   context_window.py: :14492-14796 (Anthropic 1M context-window)
+#
+# Inclusion/exclusion rationale:
+#   INCLUDE  _normalize_reasoning_state through _normalize_reporting_exclusion_state_on_record
+#            (all record-side functions in :11121-12880)
+#   EXCLUDE  _positive_int_or_none (:11114) — already moved by A4A prompt_overhead
+#   EXCLUDE  _promote_worker_context_exhaustion_metadata (:14426-14491) — A4B enrich
+#   EXCLUDE  all A4D backfill/storage symbols (:13803-14392, :15473-16157)
+#   INCLUDE  all 10 context-window functions (:14492-14796)
+#
+# The five-name _A4C_SYMBOLS sentinel near line ~521 is a boundary-exclusion
+# sentinel for A4A/A4B tests only; the authoritative inventory is below.
+# =========================================================================
+
+_A4C_NORMALIZE_FUNCTIONS: List[str] = [
+    # record-state normalizers (:11121-11266)
+    "_normalize_reasoning_state",
+    "_row_usage_object_from_record",
+    "_normalize_provider_cache_state_on_record",
+    "_normalize_session_runtime_identity_on_record",
+    # trust band (:11267-11888) — 33 functions
+    "_is_harness_tenant_identity",
+    "_normalize_request_header_tenant_repository",
+    "_normalize_repository_trust_source",
+    "_repository_source_has_codex_memory_workflow",
+    "_is_repository_source_trusted_common",
+    "_is_repository_source_trusted_for_tenant",
+    "_is_codex_trace_user_tenant_source",
+    "_is_codex_passthrough_tenant_extraction_context",
+    "_is_repository_source_trusted_for_codex_tenant",
+    "_is_codex_session_history_record",
+    "_is_claude_session_history_record",
+    "_is_claude_project_repository_source",
+    "_is_claude_metadata_tenant_source",
+    "_claude_project_identity_is_trusted",
+    "_codex_repository_source_trusted_for_record",
+    "_clear_untrusted_codex_trace_user_tenant_on_record",
+    "_mark_codex_trace_user_tenant_skipped",
+    "_codex_untrusted_repository_reason",
+    "_mark_repository_unresolved_metadata",
+    "_session_history_missing_repository_reason",
+    "_mark_missing_repository_unresolved",
+    "_clear_untrusted_claude_project_repository_on_record",
+    "_clear_untrusted_claude_metadata_tenant_on_record",
+    "_clear_repository_unresolved_metadata",
+    "_mark_codex_repository_tenant_skipped",
+    "_clear_codex_trace_user_tenant_source_on_record",
+    "_clear_untrusted_codex_tenant_on_record",
+    "_codex_tenant_source_trusted_for_record",
+    "_clear_untrusted_codex_repository_tenant_on_record",
+    "_normalize_session_repository_on_record",
+    "_can_promote_known_codex_repository_to_tenant",
+    "_normalize_session_tenant_on_record",
+    # _sync_session_history_record_metadata (:11889-12077)
+    "_sync_session_history_record_metadata",
+    # record-side state normalizers (:12080-12159)
+    "_normalize_prompt_overhead_state_on_record",
+    "_normalize_invalid_tool_call_state_on_record",
+    "_normalize_structured_output_state_on_record",
+    "_normalize_compact_summary_state_on_record",
+    # agent-quality scoring glue (:12160-12498)
+    "_optional_metadata_bool",
+    "_normalize_agent_score_reasons",
+    "_append_agent_quality_text",
+    "_append_agent_quality_command_from_arguments",
+    "_append_agent_quality_commands_from_message",
+    "_collect_agent_quality_context_from_request_body",
+    "_collect_agent_quality_response_texts",
+    "_agent_quality_commands_from_tool_activity",
+    "_apply_runtime_agent_quality_scores",
+    "_normalize_agent_score_state_on_record",
+    # latency + zero-token (:12499-12655)
+    "_normalize_session_latency_state_on_record",
+    "_extract_gemini_control_plane_method_from_record",
+    "_session_history_record_provider_usage_token_total",
+    "_classify_zero_token_session_history_record",
+    # orchestrator (:12656)
+    "_normalize_session_history_record",
+    # post-orchestrator record normalizers (:12687-12880)
+    "_normalize_agent_id_on_record",
+    "_normalize_inbound_model_alias_on_record",
+    "_extract_inline_tool_definition_snapshot_from_metadata",
+    "_normalize_reporting_exclusion_state_on_record",
+]
+
+_A4C_CONTEXT_WINDOW_FUNCTIONS: List[str] = [
+    "_is_anthropic_session_history_context",
+    "_iter_anthropic_beta_header_candidates",
+    "_split_anthropic_beta_values",
+    "_extract_context_1m_beta_values",
+    "_model_strings_indicate_context_1m_suffix",
+    "_select_safe_anthropic_context_window_beta",
+    "_apply_anthropic_context_window_metadata_fields",
+    "_classify_anthropic_context_window_from_retained_evidence",
+    "_enrich_anthropic_context_window_metadata",
+    "_enrich_backfill_anthropic_context_window_metadata",
+]
+
+_A4C_ALL_MOVED_NAMES: List[str] = (
+    _A4C_NORMALIZE_FUNCTIONS + _A4C_CONTEXT_WINDOW_FUNCTIONS
+)
+
+_A4C_FUNCTION_NAMES: List[str] = _A4C_ALL_MOVED_NAMES  # all are functions
+
+
+# =========================================================================
+# Wave A4C boundary guards (GREEN now, must stay GREEN)
+# =========================================================================
+
+
+def test_a4c_inventory_excludes_a4a_symbols() -> None:
+    overlap = sorted(set(_A4A_ALL_MOVED_NAMES) & set(_A4C_ALL_MOVED_NAMES))
+    assert not overlap, f"A4C inventory must not claim A4A symbols: {overlap}"
+
+
+def test_a4c_inventory_excludes_a4b_symbols() -> None:
+    overlap = sorted(set(_A4B_ALL_MOVED_NAMES) & set(_A4C_ALL_MOVED_NAMES))
+    assert not overlap, f"A4C inventory must not claim A4B symbols: {overlap}"
+
+
+def test_a4c_inventory_excludes_a4d_symbols() -> None:
+    overlap = sorted(_A4D_SYMBOLS & set(_A4C_ALL_MOVED_NAMES))
+    assert not overlap, f"A4C inventory must not claim A4D symbols: {overlap}"
+
+
+def test_a4c_inventory_has_no_duplicate_across_modules() -> None:
+    overlap = sorted(
+        set(_A4C_NORMALIZE_FUNCTIONS) & set(_A4C_CONTEXT_WINDOW_FUNCTIONS)
+    )
+    assert not overlap, f"A4C symbols in both modules: {overlap}"
+
+
+def test_a4c_inventory_counts() -> None:
+    assert len(_A4C_NORMALIZE_FUNCTIONS) == 60, (
+        f"expected 60 normalize.py functions, got {len(_A4C_NORMALIZE_FUNCTIONS)}"
+    )
+    assert len(_A4C_CONTEXT_WINDOW_FUNCTIONS) == 10, (
+        f"expected 10 context_window.py functions, got {len(_A4C_CONTEXT_WINDOW_FUNCTIONS)}"
+    )
+    assert len(_A4C_ALL_MOVED_NAMES) == 70
+
+
+def test_a4c_all_functions_callable_in_identity_pkg() -> None:
+    """Every A4C function must be callable on the identity package (pre-move)."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+
+    missing = [
+        name
+        for name in _A4C_ALL_MOVED_NAMES
+        if not callable(getattr(identity_pkg, name, None))
+    ]
+    assert not missing, f"A4C functions missing from identity package: {missing}"
+
+
+# =========================================================================
+# Wave A4C RED structural ownership tests (fail until engineer extracts)
+# =========================================================================
+
+_SESSION_HISTORY_PKG_DIR = (
+    REPO_ROOT / "litellm" / "integrations" / "aawm_session_history"
+)
+
+
+def test_a4c_moved_functions_not_defined_in_init() -> None:
+    """A4C-moved functions must not remain as FunctionDef in
+    aawm_agent_identity/__init__.py. RED until extraction."""
+    tree = _parse_init_module()
+    defined_functions = _function_def_names(tree)
+
+    still_defined = sorted(
+        name for name in _A4C_FUNCTION_NAMES if name in defined_functions
+    )
+    assert not still_defined, (
+        "expected these A4C functions to no longer be defined directly in "
+        f"aawm_agent_identity/__init__.py: {still_defined}"
+    )
+
+
+def test_a4c_target_submodules_exist() -> None:
+    """The two A4C target submodule files must exist after extraction."""
+    missing = [
+        mod
+        for mod in ("normalize", "context_window")
+        if not (_SESSION_HISTORY_PKG_DIR / f"{mod}.py").is_file()
+    ]
+    assert not missing, f"expected these A4C target files to exist: {missing}"
+
+
+def test_a4c_facade_identity() -> None:
+    """getattr(identity_pkg, name) is getattr(sh_module, name) for every
+    A4C-moved name."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+
+    modules_to_check = {
+        "litellm.integrations.aawm_session_history.normalize": _A4C_NORMALIZE_FUNCTIONS,
+        "litellm.integrations.aawm_session_history.context_window": _A4C_CONTEXT_WINDOW_FUNCTIONS,
+    }
+
+    missing_modules: List[str] = []
+    mismatched: List[tuple] = []
+    for module_path, names in modules_to_check.items():
+        try:
+            submodule = importlib.import_module(module_path)
+        except ModuleNotFoundError:
+            missing_modules.append(module_path)
+            continue
+        for name in names:
+            pkg_value = getattr(identity_pkg, name, None)
+            sub_value = getattr(submodule, name, None)
+            if pkg_value is None or sub_value is None or pkg_value is not sub_value:
+                mismatched.append((module_path, name))
+
+    assert not missing_modules, (
+        f"expected these A4C target submodules to exist: {missing_modules}"
+    )
+    assert not mismatched, (
+        "expected facade identity for each A4C-moved name; "
+        f"mismatches (module, name): {mismatched}"
+    )
+
+
+def test_a4c_host_global_install_pattern() -> None:
+    """Every A4C export must be rebound to identity host globals."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+
+    missing_modules: List[str] = []
+    missing_install: List[str] = []
+    wrong_globals: List[tuple] = []
+    modules_to_check = {
+        "litellm.integrations.aawm_session_history.normalize": _A4C_NORMALIZE_FUNCTIONS,
+        "litellm.integrations.aawm_session_history.context_window": _A4C_CONTEXT_WINDOW_FUNCTIONS,
+    }
+    for module_path, names in modules_to_check.items():
+        try:
+            submodule = importlib.import_module(module_path)
+        except ModuleNotFoundError:
+            missing_modules.append(module_path)
+            continue
+        if not callable(getattr(submodule, "install", None)):
+            missing_install.append(module_path)
+        for name in names:
+            function = getattr(submodule, name, None)
+            if (
+                function is None
+                or getattr(function, "__globals__", None)
+                is not identity_pkg.__dict__
+            ):
+                wrong_globals.append((module_path, name))
+
+    assert not missing_modules, (
+        f"expected these A4C target submodules to exist: {missing_modules}"
+    )
+    assert not missing_install, (
+        "expected each A4C submodule to expose an install() callable "
+        f"for __globals__ rebinding: {missing_install}"
+    )
+    assert not wrong_globals, (
+        "A4C functions not rebound to identity package globals: "
+        f"{wrong_globals}"
+    )
+
+
+def test_a4c_rebind_order_facades_before_record_install() -> None:
+    """Every A4C facade assignment in __init__.py must precede the
+    _bind_session_history_record_apis() call."""
+    tree = _parse_init_module()
+
+    call_line = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_bind_session_history_record_apis"
+        ):
+            call_line = node.lineno
+            break
+
+    assert call_line is not None, (
+        "expected a call to _bind_session_history_record_apis() in __init__.py"
+    )
+
+    defined_functions = _function_def_names(tree)
+    assign_targets = _module_level_assign_targets(tree)
+
+    expected_facades = set(_A4C_FUNCTION_NAMES)
+    remaining_definitions = sorted(expected_facades & defined_functions)
+    present_facades = expected_facades & set(assign_targets)
+    missing_facades = sorted(expected_facades - present_facades)
+
+    late_facades = [
+        name
+        for name in sorted(present_facades)
+        if assign_targets[name].lineno >= call_line
+    ]
+    assert not remaining_definitions and not missing_facades and not late_facades, (
+        "A4C facade/rebind contract failed: "
+        f"remaining FunctionDefs={remaining_definitions}; "
+        f"missing facade assignments={missing_facades}; "
+        f"late facade assignments (must precede line {call_line})={late_facades}"
+    )
+
+
+def test_a4c_submodules_do_not_import_init_at_module_scope() -> None:
+    """A4C submodules must not import the identity __init__ package at
+    module scope (circular import risk)."""
+    missing_modules: List[str] = []
+    offending: List[str] = []
+    for module_name in ("normalize", "context_window"):
+        module_path = _SESSION_HISTORY_PKG_DIR / f"{module_name}.py"
+        if not module_path.is_file():
+            missing_modules.append(module_name)
+            continue
+        tree = ast.parse(
+            module_path.read_text(encoding="utf-8"), filename=str(module_path)
+        )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "litellm.integrations.aawm_agent_identity"
+            ):
+                offending.append(module_name)
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "litellm.integrations.aawm_agent_identity":
+                        offending.append(module_name)
+
+    assert not missing_modules, (
+        f"expected these A4C target submodule files to exist: {missing_modules}"
+    )
+    assert not offending, (
+        f"these A4C submodules import the identity __init__ package at "
+        f"module scope: {offending}"
+    )
