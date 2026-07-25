@@ -14,8 +14,8 @@ services:
     ports:
       - "127.0.0.1:4001:4001"
     volumes:
-      # Mount source for live code changes (key files only)
-      - ./litellm/integrations/aawm_agent_identity.py:/app/litellm/integrations/aawm_agent_identity.py
+      # Mount source for live code changes (identity package + key files)
+      - ./litellm/integrations/aawm_agent_identity:/app/litellm/integrations/aawm_agent_identity
       - ./litellm/integrations/aawm_session_history/record.py:/app/litellm/integrations/aawm_session_history/record.py
       - ./litellm/integrations/aawm_agent_quality_rules.py:/app/litellm/integrations/aawm_agent_quality_rules.py
       - ./litellm/integrations/aawm_agent_quality_rules.json:/app/litellm/integrations/aawm_agent_quality_rules.json

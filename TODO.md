@@ -292,7 +292,7 @@ these docs only as needed:
   fallback `tenant_id`, and `metadata.tenant_id` for repository-only rows, and
   should include non-harness-header Codex and Gemini workspace-text proofs;
   relevant files are
-  `litellm/integrations/aawm_agent_identity.py`,
+  `litellm/integrations/aawm_agent_identity/`,
   `.wheel-build/aawm_litellm_callbacks/agent_identity.py`,
   `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`,
   `scripts/local-ci/run_anthropic_adapter_acceptance.py`, and

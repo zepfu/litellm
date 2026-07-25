@@ -11,7 +11,7 @@ on:
       - "model_prices_and_context_window.json"
       - "litellm/bundled_model_prices_and_context_window_fallback.json"
       - "scripts/build_model_config_bundle.py"
-      - "litellm/integrations/aawm_agent_identity.py"
+      - "litellm/integrations/aawm_agent_identity/**"
       - "litellm/integrations/aawm_payload_capture.py"
       - "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py"
       - "context-replacement/**"

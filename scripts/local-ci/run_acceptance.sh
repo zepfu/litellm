@@ -145,7 +145,6 @@ exclude_prefixes = [
 ]
 exclude_exact = {
     "langfuse-traces.png",
-    "litellm/integrations/aawm_agent_identity.py",
     "litellm/integrations/aawm_payload_capture.py",
     "litellm-dev-config.yaml",
     ".env",

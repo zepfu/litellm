@@ -25,7 +25,7 @@ GROUPS = (
         name="callback",
         paths=(
             ".wheel-build/",
-            "litellm/integrations/aawm_agent_identity.py",
+            "litellm/integrations/aawm_agent_identity/",
             "litellm/integrations/aawm_payload_capture.py",
         ),
         version_file=ROOT / ".wheel-build" / "pyproject.toml",

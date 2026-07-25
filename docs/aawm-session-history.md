@@ -36,11 +36,13 @@ the sole owner of every persistence artifact:
       underscore SQL/writer APIs via explicit `__all__` (not bare `import *`).
     - The `aawm-litellm-callbacks` wheel force-includes this package under
       `litellm/integrations/aawm_session_history/` plus the sql shim so the
-      wheel-shipped agent_identity module can import package-owned surfaces.
-- `litellm/integrations/aawm_agent_identity.py` — request-time identity
-  extraction, Langfuse enrichment, and alias/routing helpers. Session-history
-  record builders and durable writer services are package-owned and re-exported
-  for compatibility.
+      wheel-shipped agent identity package can import package-owned surfaces.
+- `litellm/integrations/aawm_agent_identity/` — request-time identity
+  extraction, provider/request normalization, prompt-overhead analysis,
+  Langfuse enrichment, and alias/routing helpers. `__init__.py` preserves
+  historical imports and monkeypatch surfaces while concern-specific helpers
+  live in sibling modules. Session-history record builders and durable writer
+  services are package-owned and re-exported for compatibility.
 - Primary history + tool-activity rows are written inside one transaction when
   asyncpg transactions are available. Optional side tables (rate limits,
   provider errors, alias routing audit, tool-definition snapshots) remain

@@ -1,15 +1,12 @@
-"""Wave A1 (agent_identity package conversion) contract-pinning tests.
+"""Agent identity package-conversion contract tests.
 
-`litellm/integrations/aawm_agent_identity.py` is CURRENTLY a single ~16.7k
-line module. Wave A1's engineer will `git mv` it verbatim to
-`litellm/integrations/aawm_agent_identity/__init__.py` and remap the
-`.wheel-build/pyproject.toml` force-include from single-file to package form.
+The canonical implementation lives in
+`litellm/integrations/aawm_agent_identity/`, with `__init__.py` preserving the
+historical dotted import and monkeypatch surfaces while concern-specific
+helpers live in sibling modules.
 
-These tests PIN the invariants that conversion must preserve. They must pass
-against the CURRENT single-file form (module `__init__.py` boundary doesn't
-exist yet) AND, by design, against the post-conversion package form, because
-every assertion below is expressed in terms of the importable dotted path
-`litellm.integrations.aawm_agent_identity`, not the file layout.
+These tests pin the import, rebinding, script, and installed-wheel invariants
+that the package layout must preserve.
 
 See `.analysis/plan-godmodule-decomposition-r3-remediation-2026-07-23.md`
 ### Wave A1 for the full Impact Analysis / Test Spec / Source Spec.
@@ -24,9 +21,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from poetry.core.factory import Factory
+from poetry.core.masonry.builders.wheel import WheelBuilder
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WHEEL_BUILD_DIR = REPO_ROOT / ".wheel-build"
+IDENTITY_PACKAGE_DIR = (
+    REPO_ROOT / "litellm" / "integrations" / "aawm_agent_identity"
+)
 
 # The 12 names `scripts/backfill_rate_limit_observations.py` imports from the
 # identity namespace (Wave A1 Test Spec: "13-symbol set" — the script actually
@@ -46,6 +48,20 @@ _SCRIPT_IMPORT_SURFACE = (
     "_rate_limit_storage_quota_used",
     "_rate_limit_storage_remaining_pct",
 )
+
+
+def test_current_package_layout() -> None:
+    """The converted package is canonical and the deleted module stays absent."""
+    assert IDENTITY_PACKAGE_DIR.is_dir()
+    assert not IDENTITY_PACKAGE_DIR.with_suffix(".py").exists()
+    for module_name in (
+        "__init__.py",
+        "usage_extract.py",
+        "provider_normalize.py",
+        "request_signals.py",
+        "prompt_overhead.py",
+    ):
+        assert (IDENTITY_PACKAGE_DIR / module_name).is_file()
 
 
 def test_instance_import_path_stable() -> None:
@@ -201,68 +217,58 @@ def test_patched_repo_normalizer_intercepts_record_api() -> None:
 
 @pytest.mark.integration
 def test_installed_wheel_smoke(tmp_path: Path) -> None:
-    """HARD GATE for Wave A2+: the built-and-installed wheel must still expose
-    `aawm_litellm_callbacks.agent_identity.aawm_agent_identity_instance` and a
-    callable `_extract_agent_context`, exercised from a real subprocess against
-    a clean scratch venv -- not the in-process test interpreter's sys.path.
-
-    Skips (does not fail) only when pip/network/build tooling is unavailable
-    in this environment; otherwise it must run and pass.
-    """
+    """Build and import paired main/callback wheels outside the checkout."""
     if not WHEEL_BUILD_DIR.is_dir():
         pytest.skip(f".wheel-build directory not found at {WHEEL_BUILD_DIR}")
 
-    # Clean-build guard: stale build/dist/egg-info artifacts under
-    # .wheel-build have previously caused a silent install of stale code
-    # (documented prod incident). Always start from a clean slate.
-    for stale_dir_name in ("build", "dist"):
-        stale_dir = WHEEL_BUILD_DIR / stale_dir_name
-        if stale_dir.exists():
-            import shutil
+    smoke_root = tmp_path.resolve()
+    assert not smoke_root.is_relative_to(REPO_ROOT.resolve())
+    main_dist = smoke_root / "main-dist"
+    callback_dist = smoke_root / "callback-dist"
+    work_dir = smoke_root / "work"
+    main_dist.mkdir()
+    callback_dist.mkdir()
+    work_dir.mkdir()
 
-            shutil.rmtree(stale_dir)
-    for egg_info in WHEEL_BUILD_DIR.glob("*.egg-info"):
-        import shutil
-
-        shutil.rmtree(egg_info)
-
+    main_wheel = WheelBuilder(Factory().create_poetry(REPO_ROOT)).build(
+        target_dir=main_dist
+    )
+    assert main_wheel.is_file()
     build_env = dict(**__import__("os").environ)
-
     build_proc = subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", "dist/"],
-        cwd=str(WHEEL_BUILD_DIR),
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(callback_dist),
+            str(WHEEL_BUILD_DIR),
+        ],
+        cwd=str(work_dir),
         capture_output=True,
         text=True,
         timeout=300,
         env=build_env,
     )
-    if build_proc.returncode != 0:
-        combined_output = (build_proc.stdout or "") + (build_proc.stderr or "")
-        network_or_tooling_signatures = (
-            "No module named build",
-            "Could not find a version that satisfies",
-            "Temporary failure in name resolution",
-            "Network is unreachable",
-            "Connection refused",
-            "ConnectionError",
-        )
-        if any(sig in combined_output for sig in network_or_tooling_signatures):
-            pytest.skip(
-                "wheel build failed due to unavailable pip/build tooling or "
-                f"network access:\n{combined_output[-2000:]}"
-            )
-        raise AssertionError(f"wheel build failed (exit={build_proc.returncode}):\n" f"{combined_output[-4000:]}")
-
-    dist_dir = WHEEL_BUILD_DIR / "dist"
-    wheels = sorted(dist_dir.glob("aawm_litellm_callbacks-*.whl"))
-    assert wheels, f"no wheel produced under {dist_dir}"
-    wheel_path = wheels[-1]
+    assert build_proc.returncode == 0, (
+        "callback wheel build failed "
+        f"(exit={build_proc.returncode}):\nstdout={build_proc.stdout}\n"
+        f"stderr={build_proc.stderr}"
+    )
+    callback_wheels = sorted(
+        callback_dist.glob("aawm_litellm_callbacks-*.whl")
+    )
+    assert len(callback_wheels) == 1, callback_wheels
+    callback_wheel = callback_wheels[0]
 
     scratch_venv_dir = tmp_path / "aawm_wheel_smoke_venv"
-    try:
-        venv.EnvBuilder(with_pip=True, clear=True).create(str(scratch_venv_dir))
-    except Exception as exc:  # pragma: no cover - environment-dependent
-        pytest.skip(f"could not create scratch venv: {exc}")
+    venv.EnvBuilder(
+        with_pip=True,
+        clear=True,
+        system_site_packages=True,
+    ).create(str(scratch_venv_dir))
 
     if sys.platform == "win32":  # pragma: no cover - not the target platform here
         venv_python = scratch_venv_dir / "Scripts" / "python.exe"
@@ -270,14 +276,6 @@ def test_installed_wheel_smoke(tmp_path: Path) -> None:
         venv_python = scratch_venv_dir / "bin" / "python"
     assert venv_python.is_file(), f"scratch venv python missing: {venv_python}"
 
-    # The wheel's own dependency closure (`dependencies = ["litellm"]` in
-    # `.wheel-build/pyproject.toml`) pulls generic PyPI litellm without the
-    # optional `fastapi` extra. `aawm_agent_identity` has a top-level import
-    # of `litellm.proxy.aawm_route_logging`, which needs `fastapi` -- a
-    # pre-existing packaging gap unrelated to the A1 conversion itself.
-    # Install it alongside the wheel so this test validates the conversion
-    # invariant (package installs + exposes the right symbols) rather than
-    # failing on that unrelated gap.
     install_proc = subprocess.run(
         [
             str(venv_python),
@@ -285,44 +283,70 @@ def test_installed_wheel_smoke(tmp_path: Path) -> None:
             "pip",
             "install",
             "--quiet",
-            str(wheel_path),
-            "fastapi",
+            "--no-index",
+            "--no-deps",
+            str(main_wheel),
+            str(callback_wheel),
         ],
         capture_output=True,
         text=True,
         timeout=300,
+        cwd=str(work_dir),
+        env={key: value for key, value in build_env.items() if key != "PYTHONPATH"},
     )
-    if install_proc.returncode != 0:
-        combined_output = (install_proc.stdout or "") + (install_proc.stderr or "")
-        network_or_tooling_signatures = (
-            "Could not find a version that satisfies",
-            "Temporary failure in name resolution",
-            "Network is unreachable",
-            "Connection refused",
-            "ConnectionError",
-            "No matching distribution found",
-        )
-        if any(sig in combined_output for sig in network_or_tooling_signatures):
-            pytest.skip("wheel install failed due to unavailable pip/network access:\n" f"{combined_output[-2000:]}")
-        raise AssertionError(f"wheel install failed (exit={install_proc.returncode}):\n" f"{combined_output[-4000:]}")
+    assert install_proc.returncode == 0, (
+        "paired offline wheel install failed "
+        f"(exit={install_proc.returncode}):\nstdout={install_proc.stdout}\n"
+        f"stderr={install_proc.stderr}"
+    )
 
     smoke_script = (
-        "from aawm_litellm_callbacks.agent_identity import "
-        "aawm_agent_identity_instance\n"
-        "from aawm_litellm_callbacks.agent_identity import _extract_agent_context\n"
-        "assert callable(_extract_agent_context)\n"
-        "assert aawm_agent_identity_instance is not None\n"
-        "print('AAWM_WHEEL_SMOKE_OK')\n"
+        "import importlib\n"
+        "import importlib.metadata\n"
+        "from pathlib import Path\n"
+        "import litellm\n"
+        "import aawm_litellm_callbacks.agent_identity as callback_identity\n"
+        "import litellm.integrations.aawm_agent_identity as main_identity\n"
+        f"repo_root = Path({str(REPO_ROOT.resolve())!r})\n"
+        f"venv_root = Path({str(scratch_venv_dir.resolve())!r})\n"
+        "module_names = (\n"
+        "    'litellm.integrations.aawm_agent_identity.usage_extract',\n"
+        "    'litellm.integrations.aawm_agent_identity.provider_normalize',\n"
+        "    'litellm.integrations.aawm_agent_identity.request_signals',\n"
+        "    'litellm.integrations.aawm_agent_identity.prompt_overhead',\n"
+        ")\n"
+        "modules = [importlib.import_module(name) for name in module_names]\n"
+        "assert callback_identity.aawm_agent_identity_instance is "
+        "main_identity.aawm_agent_identity_instance\n"
+        "assert callback_identity._extract_agent_context is "
+        "main_identity._extract_agent_context\n"
+        "for module in [litellm, callback_identity, main_identity, *modules]:\n"
+        "    module_path = Path(module.__file__).resolve()\n"
+        "    assert not module_path.is_relative_to(repo_root), module_path\n"
+        "    assert module_path.is_relative_to(venv_root), module_path\n"
+        "for distribution_name in ('litellm', 'aawm-litellm-callbacks'):\n"
+        "    distribution_path = Path(\n"
+        "        importlib.metadata.distribution(distribution_name).locate_file('')\n"
+        "    ).resolve()\n"
+        "    assert distribution_path.is_relative_to(venv_root), distribution_path\n"
+        "for module in modules:\n"
+        "    assert callable(module.install)\n"
+        "print('AAWM_PAIRED_WHEEL_SMOKE_OK')\n"
     )
+    smoke_env = {
+        key: value for key, value in build_env.items() if key != "PYTHONPATH"
+    }
     run_proc = subprocess.run(
         [str(venv_python), "-c", smoke_script],
         capture_output=True,
         text=True,
         timeout=60,
+        cwd=str(work_dir),
+        env=smoke_env,
     )
     assert run_proc.returncode == 0, (
         "installed-wheel subprocess smoke failed "
         f"(exit={run_proc.returncode}):\nstdout={run_proc.stdout}\n"
         f"stderr={run_proc.stderr}"
     )
-    assert "AAWM_WHEEL_SMOKE_OK" in run_proc.stdout
+    assert "AAWM_PAIRED_WHEEL_SMOKE_OK" in run_proc.stdout

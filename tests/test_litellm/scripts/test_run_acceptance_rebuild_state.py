@@ -122,7 +122,6 @@ def test_fingerprint_exclude_logic_skips_sample_paths() -> None:
     ]
     exclude_exact = {
         "langfuse-traces.png",
-        "litellm/integrations/aawm_agent_identity.py",
         "litellm/integrations/aawm_payload_capture.py",
         "litellm-dev-config.yaml",
         ".env",
@@ -189,12 +188,15 @@ def test_fingerprint_exclude_logic_skips_sample_paths() -> None:
         "pyproject.toml",
         "requirements.txt",
         "ui/litellm-dashboard/src/app/page.tsx",
+        "litellm/integrations/aawm_agent_identity/__init__.py",
+        "litellm/integrations/aawm_agent_identity/usage_extract.py",
     ]
     for rel in must_include:
         assert include(rel) is True, f"expected include: {rel}"
 
     # Cross-check script still lists the same heavy prefixes (drift guard)
     block = _fingerprint_python_block()
+    assert "litellm/integrations/aawm_agent_identity.py" not in block
     for prefix in (".venv/", "node_modules/", "__pycache__/", "dist/", ".pytest_cache/"):
         assert f'"{prefix}"' in block or f"'{prefix}'" in block
 

@@ -15,6 +15,8 @@ _WORKFLOW = _REPO / ".github" / "workflows" / "aawm-artifact-autobump.yml"
 _BUNDLED_REL = "litellm/bundled_model_prices_and_context_window_fallback.json"
 _BACKUP_REL = "litellm/model_prices_and_context_window_backup.json"
 _CANONICAL_REL = "model_prices_and_context_window.json"
+_IDENTITY_PACKAGE_REL = "litellm/integrations/aawm_agent_identity/"
+_IDENTITY_PACKAGE_GLOB = "litellm/integrations/aawm_agent_identity/**"
 
 
 def _load_bump_module():
@@ -38,6 +40,26 @@ def _config_group(bump_mod):
     return groups["config"]
 
 
+def _callback_group(bump_mod):
+    groups = {g.name: g for g in bump_mod.GROUPS}
+    assert "callback" in groups
+    return groups["callback"]
+
+
+def test_callback_group_watches_identity_package_recursively(bump_mod) -> None:
+    callback = _callback_group(bump_mod)
+    assert _IDENTITY_PACKAGE_REL in callback.paths
+    assert "litellm/integrations/aawm_agent_identity.py" not in callback.paths
+    assert bump_mod._path_matches(
+        "litellm/integrations/aawm_agent_identity/__init__.py",
+        callback.paths,
+    )
+    assert bump_mod._path_matches(
+        "litellm/integrations/aawm_agent_identity/future_module.py",
+        callback.paths,
+    )
+
+
 def test_config_group_watches_bundled_fallback_not_nonexistent_backup(bump_mod) -> None:
     config = _config_group(bump_mod)
     assert _BUNDLED_REL in config.paths
@@ -55,6 +77,7 @@ def test_workflow_watch_paths_derived_from_groups_include_bundled(bump_mod) -> N
     assert _CANONICAL_REL in paths
     # directory prefixes become recursive globs used by Actions path filters
     assert ".wheel-build/**" in paths
+    assert _IDENTITY_PACKAGE_GLOB in paths
     assert "scripts/local-ci/**" in paths
     assert "context-replacement/**" in paths
     assert paths == tuple(dict.fromkeys(paths))  # de-duplicated, order-stable
@@ -131,6 +154,7 @@ def test_workflow_yaml_paths_are_superset_of_derived_paths(bump_mod) -> None:
         assert f'"{path}"' in text or f"'{path}'" in text, path
     assert _BUNDLED_REL in text
     assert _BACKUP_REL not in text
+    assert f'"{_IDENTITY_PACKAGE_GLOB}"' in text
 
 
 def test_forbidden_backup_path_rejected_from_groups(bump_mod) -> None:

@@ -29,9 +29,13 @@ red-before-green is the intended TDD signal for this wave.
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib
+import inspect
+import sys
+import typing
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 IDENTITY_PKG_DIR = REPO_ROOT / "litellm" / "integrations" / "aawm_agent_identity"
@@ -646,6 +650,223 @@ def test_a4a_host_global_install_pattern() -> None:
     assert not missing_install, (
         "expected each A4A submodule to expose an install(globals_dict) "
         f"callable for __globals__ rebinding: {missing_install}"
+    )
+
+
+def test_a4a_cached_helper_rebinds_wrapped_globals_and_preserves_cache(
+    monkeypatch,
+) -> None:
+    """Cached moved helpers must resolve dependencies through package facades."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+    import litellm.integrations.aawm_agent_identity.provider_normalize as provider_normalize
+    import litellm.utils as litellm_utils
+
+    helper = identity_pkg._session_history_provider_from_model_catalog
+    assert helper is provider_normalize._session_history_provider_from_model_catalog
+    assert helper.__wrapped__.__globals__ is identity_pkg.__dict__
+    assert helper.cache_parameters() == {"maxsize": 512, "typed": False}
+
+    calls = {"catalog": 0, "normalize": 0}
+
+    def fake_get_model_info(*, model: str):
+        calls["catalog"] += 1
+        return {"litellm_provider": f"catalog:{model}"}
+
+    def fake_normalize(candidate):
+        calls["normalize"] += 1
+        return f"patched:{candidate}"
+
+    monkeypatch.setattr(litellm_utils, "get_model_info", fake_get_model_info)
+    monkeypatch.setattr(
+        identity_pkg,
+        "_normalize_session_history_provider_name",
+        fake_normalize,
+    )
+    helper.cache_clear()
+    try:
+        expected = "patched:catalog:a4a-cache-rebind-probe"
+        assert helper("a4a-cache-rebind-probe") == expected
+        assert helper("a4a-cache-rebind-probe") == expected
+        assert calls == {"catalog": 1, "normalize": 1}
+        assert helper.cache_info().hits == 1
+        assert helper.cache_info().misses == 1
+    finally:
+        helper.cache_clear()
+
+
+def test_a4a_moved_annotations_are_runtime_objects() -> None:
+    """Moved annotations retain the baseline module's evaluated-object form."""
+    string_annotations = []
+    for module_name, names in _A4A_MOVED_NAMES_BY_MODULE.items():
+        submodule = importlib.import_module(
+            f"litellm.integrations.aawm_agent_identity.{module_name}"
+        )
+        for name in names:
+            if name in _A4A_CONSTANT_NAMES:
+                continue
+            annotations = getattr(getattr(submodule, name), "__annotations__", {})
+            for annotation_name, annotation_value in annotations.items():
+                if isinstance(annotation_value, str):
+                    string_annotations.append(
+                        (module_name, name, annotation_name, annotation_value)
+                    )
+
+    assert not string_annotations, (
+        "A4A moved functions must expose evaluated annotation objects, not "
+        f"postponed strings: {string_annotations}"
+    )
+
+    provider_normalize = importlib.import_module(
+        "litellm.integrations.aawm_agent_identity.provider_normalize"
+    )
+    annotations = (
+        provider_normalize._session_history_provider_from_model_catalog
+        .__wrapped__.__annotations__
+    )
+    assert annotations["model"] is str
+    assert annotations["return"] == Optional[str]
+    assert (
+        provider_normalize._session_history_provider_from_model_catalog
+        .__wrapped__.__globals__
+        is sys.modules["litellm.integrations.aawm_agent_identity"].__dict__
+    )
+
+
+def test_a4a_type_checking_host_callable_signatures_match_runtime() -> None:
+    """Type-only host declarations must match runtime callable contracts."""
+    import litellm.integrations.aawm_agent_identity as identity_pkg
+
+    annotation_namespace = dict(vars(typing))
+    annotation_namespace.update(vars(builtins))
+    mismatches = []
+
+    def evaluate_annotation(annotation: ast.expr | None):
+        if annotation is None:
+            return inspect.Signature.empty
+        expression = ast.Expression(body=annotation)
+        ast.fix_missing_locations(expression)
+        value = eval(
+            compile(expression, "<a4a-type-contract>", "eval"),
+            annotation_namespace,
+        )
+        return type(None) if value is None else value
+
+    def declared_parameters(function: ast.FunctionDef):
+        arguments = function.args
+        positional = [
+            (argument, inspect.Parameter.POSITIONAL_ONLY)
+            for argument in arguments.posonlyargs
+        ] + [
+            (argument, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            for argument in arguments.args
+        ]
+        positional_defaults = [None] * (
+            len(positional) - len(arguments.defaults)
+        ) + list(arguments.defaults)
+        parameters = []
+        for (argument, kind), default_node in zip(
+            positional,
+            positional_defaults,
+        ):
+            default = (
+                inspect.Parameter.empty
+                if default_node is None
+                else ast.literal_eval(default_node)
+            )
+            parameters.append(
+                inspect.Parameter(
+                    argument.arg,
+                    kind,
+                    default=default,
+                    annotation=evaluate_annotation(argument.annotation),
+                )
+            )
+        if arguments.vararg is not None:
+            parameters.append(
+                inspect.Parameter(
+                    arguments.vararg.arg,
+                    inspect.Parameter.VAR_POSITIONAL,
+                    annotation=evaluate_annotation(arguments.vararg.annotation),
+                )
+            )
+        for argument, default_node in zip(
+            arguments.kwonlyargs,
+            arguments.kw_defaults,
+        ):
+            default = (
+                inspect.Parameter.empty
+                if default_node is None
+                else ast.literal_eval(default_node)
+            )
+            parameters.append(
+                inspect.Parameter(
+                    argument.arg,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    default=default,
+                    annotation=evaluate_annotation(argument.annotation),
+                )
+            )
+        if arguments.kwarg is not None:
+            parameters.append(
+                inspect.Parameter(
+                    arguments.kwarg.arg,
+                    inspect.Parameter.VAR_KEYWORD,
+                    annotation=evaluate_annotation(arguments.kwarg.annotation),
+                )
+            )
+        return parameters
+
+    for module_name in _A4A_MOVED_NAMES_BY_MODULE:
+        module_path = IDENTITY_PKG_DIR / f"{module_name}.py"
+        tree = ast.parse(
+            module_path.read_text(encoding="utf-8"),
+            filename=str(module_path),
+        )
+        for node in tree.body:
+            if not (
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.Name)
+                and node.test.id == "TYPE_CHECKING"
+            ):
+                continue
+            for declaration in node.body:
+                if not isinstance(declaration, ast.FunctionDef):
+                    continue
+                runtime_callable = getattr(identity_pkg, declaration.name)
+                declared_signature = inspect.Signature(
+                    declared_parameters(declaration),
+                    return_annotation=evaluate_annotation(declaration.returns),
+                )
+                runtime_signature = inspect.signature(runtime_callable)
+                runtime_hints = typing.get_type_hints(runtime_callable)
+                runtime_signature = runtime_signature.replace(
+                    parameters=[
+                        parameter.replace(
+                            annotation=runtime_hints.get(
+                                parameter.name,
+                                inspect.Signature.empty,
+                            )
+                        )
+                        for parameter in runtime_signature.parameters.values()
+                    ],
+                    return_annotation=runtime_hints.get(
+                        "return",
+                        inspect.Signature.empty,
+                    ),
+                )
+                if declared_signature != runtime_signature:
+                    mismatches.append(
+                        (
+                            module_name,
+                            declaration.name,
+                            declared_signature,
+                            runtime_signature,
+                        )
+                    )
+
+    assert not mismatches, (
+        "A4A TYPE_CHECKING host callable declarations drifted from runtime "
+        f"signatures: {mismatches}"
     )
 
 
