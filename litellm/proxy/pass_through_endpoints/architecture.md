@@ -252,6 +252,20 @@ re-exports functions owned by focused implementation modules and
 modules preserve import and monkeypatch compatibility without creating a second
 policy or shaping owner.
 
+### Managed Kimi native contract boundary
+
+The local `/kimi/v1/models`, `/kimi/v1/usages`, and
+`/kimi/v1/chat/completions` facade routes resolve to the exact managed upstream
+base `https://api.kimi.com/coding/v1` through the shared Kimi native-contract
+resolver. Managed `kimi_code/*` traffic is OAuth-only. The descriptor controls
+the native header contract with service-owned, non-personal identity values;
+caller authorization, user-agent, `X-Msh-*`, device, session, and endpoint
+identity cannot override it.
+
+Generic `moonshot/*` API-key routes and generic `/v1` behavior are separate
+upstream LiteLLM functionality. They are not consumers of the managed Kimi
+descriptor and are never a fallback for the local `/kimi/v1` facade.
+
 The nine Anthropic adapter route entrypoints delegate provider preparation to
 the corresponding `providers/<provider>/adapter.py` module, then delegate
 execution to the shared package drivers. The provider modules own transform

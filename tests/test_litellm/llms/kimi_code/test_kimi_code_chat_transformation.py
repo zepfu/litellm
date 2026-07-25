@@ -178,9 +178,21 @@ def test_should_use_managed_endpoint_and_honest_headers(monkeypatch: pytest.Monk
     _write_credentials(credentials_path)
     config = KimiCodeChatConfig()
 
+    # Canonical base (with trailing slash) is accepted as a no-op
     assert (
         config.get_complete_url(
-            api_base="https://api.moonshot.ai/v1",
+            api_base=KIMI_CODE_API_BASE + "/",
+            api_key="moonshot-key",
+            model="k3",
+            optional_params={},
+            litellm_params={},
+        )
+        == KIMI_CODE_CHAT_COMPLETIONS_URL
+    )
+    # None api_base is accepted
+    assert (
+        config.get_complete_url(
+            api_base=None,
             api_key="moonshot-key",
             model="k3",
             optional_params={},
@@ -201,7 +213,7 @@ def test_should_use_managed_endpoint_and_honest_headers(monkeypatch: pytest.Monk
     )
 
     assert headers["Authorization"] == "Bearer current-access-token"
-    assert headers["User-Agent"].startswith("litellm/")
+    assert headers["User-Agent"] == "kimi-code-cli/0.29.1"
     assert not any(header.lower().startswith("x-msh-") for header in headers)
     assert sum(header.lower() == "authorization" for header in headers) == 1
 
@@ -366,8 +378,9 @@ def test_should_send_managed_k3_request_through_litellm_completion(
     request_body = json.loads(request.content)
     assert str(request.url) == KIMI_CODE_CHAT_COMPLETIONS_URL
     assert request.headers["Authorization"] == "Bearer current-access-token"
-    assert request.headers["User-Agent"].startswith("litellm/")
-    assert request.headers["X-Custom-Header"] == "preserved"
+    assert request.headers["User-Agent"] == "kimi-code-cli/0.29.1"
+    # Caller headers are never forwarded; only managed headers are emitted.
+    assert "X-Custom-Header" not in request.headers
     assert not any(header.lower().startswith("x-msh-") for header in request.headers)
     assert request_body["model"] == "k3"
     assert request_body["max_completion_tokens"] == 5678
@@ -504,3 +517,316 @@ def test_should_preserve_reasoning_content_tool_deltas_and_usage_only_chunks():
     assert delta.content == "I will make the change."
     assert delta.tool_calls[0].function.name == "read_file"
     assert usage_chunk.usage.total_tokens == 7
+
+
+# ---------------------------------------------------------------------------
+# MS-030/MS-031: descriptor-present consumer tests
+# ---------------------------------------------------------------------------
+
+
+def _write_contract_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    client_version: str = "0.29.1",
+) -> Path:
+    """Write a valid contract descriptor and set the env path."""
+    import time as _time
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_BASE_URL,
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+        KIMI_NATIVE_SCHEMA_VERSION,
+        compute_canonical_digest,
+    )
+
+    now = _time.time()
+    payload = {
+        "schema_version": KIMI_NATIVE_SCHEMA_VERSION,
+        "client_name": "kimi-code",
+        "client_version": client_version,
+        "base_url": KIMI_NATIVE_BASE_URL,
+        "user_agent": f"kimi-code-cli/{client_version}",
+        "issued_at": now - 60,
+        "expires_at": now + 3600,
+        "x_msh_platform": "kimi_code_cli",
+        "x_msh_version": client_version,
+        "x_msh_device_name": "aawm-service-node",
+        "x_msh_device_model": "aawm-managed",
+        "x_msh_os_version": "linux-6.x",
+        "x_msh_device_id": "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6",
+    }
+    payload["digest"] = compute_canonical_digest(payload)
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_PATH_ENV, str(contract_path))
+    return contract_path
+
+
+def test_should_emit_descriptor_user_agent_and_x_msh_headers_when_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """With a valid descriptor, headers carry the descriptor UA and all six
+    X-Msh identity headers, Content-Type for chat, and no caller spoofing."""
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    _write_contract_descriptor(tmp_path, monkeypatch, client_version="0.29.1")
+
+    config = KimiCodeChatConfig()
+    headers = config.validate_environment(
+        headers={
+            "User-Agent": "spoofed-client",
+            "X-Msh-Device-Id": "spoofed-device",
+            "X-Msh-Platform": "spoofed-platform",
+        },
+        model="k3",
+        messages=[],
+        optional_params={},
+        litellm_params={},
+    )
+
+    # Descriptor-owned User-Agent
+    assert headers["User-Agent"] == "kimi-code-cli/0.29.1"
+    # All six X-Msh descriptor headers
+    assert headers["X-Msh-Platform"] == "kimi_code_cli"
+    assert headers["X-Msh-Version"] == "0.29.1"
+    assert headers["X-Msh-Device-Name"] == "aawm-service-node"
+    assert headers["X-Msh-Device-Model"] == "aawm-managed"
+    assert headers["X-Msh-Os-Version"] == "linux-6.x"
+    assert headers["X-Msh-Device-Id"] == "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6"
+    # Content-Type for chat (json_body=True)
+    assert headers["Content-Type"] == "application/json"
+    # Authorization present
+    assert headers["Authorization"] == "Bearer current-access-token"
+    # Caller spoof headers omitted
+    assert "spoofed-client" not in headers.values()
+    assert "spoofed-device" not in headers.values()
+    assert "spoofed-platform" not in headers.values()
+
+
+def test_should_use_honest_fallback_ua_without_descriptor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Without a descriptor, the fallback UA is kimi-code-cli/0.29.1 and no
+    X-Msh headers are emitted."""
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+    )
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    monkeypatch.delenv(KIMI_NATIVE_CONTRACT_PATH_ENV, raising=False)
+
+    config = KimiCodeChatConfig()
+    headers = config.validate_environment(
+        headers={},
+        model="k3",
+        messages=[],
+        optional_params={},
+        litellm_params={},
+    )
+
+    assert headers["User-Agent"] == "kimi-code-cli/0.29.1"
+    assert not any(k.lower().startswith("x-msh-") for k in headers)
+
+
+def test_should_fail_closed_when_contract_required_but_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """When LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=true and no descriptor path
+    is set, the provider raises KimiCodeContractError (503) without making an
+    upstream call."""
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+        KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
+    )
+    from litellm.llms.kimi_code.chat.transformation import KimiCodeContractError
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    monkeypatch.delenv(KIMI_NATIVE_CONTRACT_PATH_ENV, raising=False)
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
+
+    config = KimiCodeChatConfig()
+    with pytest.raises(KimiCodeContractError) as exc_info:
+        config.validate_environment(
+            headers={},
+            model="k3",
+            messages=[],
+            optional_params={},
+            litellm_params={},
+        )
+
+    assert exc_info.value.status_code == 503
+    assert "native contract descriptor" in str(exc_info.value)
+
+
+def test_should_send_descriptor_headers_through_litellm_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    respx_mock,
+):
+    """End-to-end: descriptor-present request emits descriptor UA, all six
+    X-Msh headers, Content-Type, and omits caller spoof headers."""
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    _write_contract_descriptor(tmp_path, monkeypatch, client_version="0.29.1")
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+
+    respx_mock.post(KIMI_CODE_CHAT_COMPLETIONS_URL).respond(
+        json={
+            "id": "chatcmpl-kimi",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "k3",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    )
+
+    response = litellm.completion(
+        model="kimi_code/k3",
+        messages=[{"role": "user", "content": "hello"}],
+        extra_headers={
+            "User-Agent": "spoofed-client",
+            "X-Msh-Device-Id": "spoofed-device",
+        },
+    )
+
+    assert response.choices[0].message.content == "done"
+    request = respx_mock.calls[0].request
+    assert request.headers["User-Agent"] == "kimi-code-cli/0.29.1"
+    assert request.headers["X-Msh-Platform"] == "kimi_code_cli"
+    assert request.headers["X-Msh-Version"] == "0.29.1"
+    assert request.headers["X-Msh-Device-Name"] == "aawm-service-node"
+    assert request.headers["X-Msh-Device-Model"] == "aawm-managed"
+    assert request.headers["X-Msh-Os-Version"] == "linux-6.x"
+    assert request.headers["X-Msh-Device-Id"] == "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6"
+    assert request.headers["Content-Type"] == "application/json"
+    assert "spoofed-client" not in dict(request.headers).values()
+    assert "spoofed-device" not in dict(request.headers).values()
+
+
+# ---------------------------------------------------------------------------
+# MS-030/MS-031: caller-supplied api_base rejection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "https://api.moonshot.ai/v1",
+        "https://api.moonshot.ai/v1/",
+        "https://api.openai.com/v1",
+        "https://evil.example.com/v1",
+        "http://localhost:8080",
+    ],
+)
+def test_should_reject_noncanonical_api_base_in_get_complete_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api_base: str
+):
+    from litellm.llms.kimi_code.chat.transformation import KimiCodeApiBaseError
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    config = KimiCodeChatConfig()
+
+    with pytest.raises(KimiCodeApiBaseError) as exc_info:
+        config.get_complete_url(
+            api_base=api_base,
+            api_key=None,
+            model="k3",
+            optional_params={},
+            litellm_params={},
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "api_base" in str(exc_info.value)
+    # Sanitized: no caller-supplied URL leaked into the error
+    assert api_base not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "https://api.moonshot.ai/v1",
+        "https://api.openai.com/v1",
+    ],
+)
+def test_should_reject_noncanonical_api_base_in_validate_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api_base: str
+):
+    from litellm.llms.kimi_code.chat.transformation import KimiCodeApiBaseError
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    config = KimiCodeChatConfig()
+
+    with pytest.raises(KimiCodeApiBaseError):
+        config.validate_environment(
+            headers={},
+            model="k3",
+            messages=[],
+            optional_params={},
+            litellm_params={},
+            api_base=api_base,
+        )
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "https://api.moonshot.ai/v1",
+        "https://api.openai.com/v1",
+    ],
+)
+def test_should_reject_noncanonical_api_base_in_provider_info(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api_base: str
+):
+    from litellm.llms.kimi_code.chat.transformation import KimiCodeApiBaseError
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    config = KimiCodeChatConfig()
+
+    with pytest.raises(KimiCodeApiBaseError):
+        config._get_openai_compatible_provider_info(api_base, None)
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        None,
+        KIMI_CODE_API_BASE,
+        KIMI_CODE_API_BASE + "/",
+    ],
+)
+def test_should_accept_canonical_or_none_api_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api_base
+):
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    config = KimiCodeChatConfig()
+
+    # None and canonical base (with optional trailing slash) are no-ops
+    url = config.get_complete_url(
+        api_base=api_base,
+        api_key=None,
+        model="k3",
+        optional_params={},
+        litellm_params={},
+    )
+    assert url == KIMI_CODE_CHAT_COMPLETIONS_URL

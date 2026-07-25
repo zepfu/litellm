@@ -3,6 +3,23 @@ import TabItem from '@theme/TabItem';
 
 # Moonshot AI
 
+## AAWM route boundary
+
+The generic `moonshot/` integration in this page is upstream LiteLLM library
+functionality. It uses a Moonshot API key and Moonshot API endpoints. It is
+not converted to OAuth, governed by the native Kimi descriptor, or selected as
+an AAWM route or fallback.
+
+All AAWM Moonshot traffic is OAuth-only through managed `kimi_code/*` routes.
+AAWM does not use Moonshot API keys. If the managed OAuth credential, native
+endpoint, or required contract descriptor is unavailable, the AAWM route fails
+closed; it must not fall back to `moonshot/*`, an API key, or another provider.
+
+The authoritative native client for the managed contract is the WSL
+installation at `/home/zepfu/.kimi-code/bin/kimi`, version `0.29.1`. The
+separate Thoth updater tracked by `MS-032` is paused and is not a prerequisite
+for this contract.
+
 ## Overview
 
 | Property | Details |
@@ -82,7 +99,7 @@ only for the recognized empty collaboration envelope before translating it to
 chat completions. Ordinary encrypted reasoning and continuation state is never
 treated as task text or sent to Kimi as plaintext.
 
-Kimi Code `0.27.0` cannot use a custom `KIMI_CODE_BASE_URL` while retaining
+Kimi Code `0.29.1` cannot use a custom `KIMI_CODE_BASE_URL` while retaining
 the official default credential slot. It derives a separate environment-scoped
 OAuth slot for every custom base URL. Do not copy or symlink
 `~/.kimi-code/credentials/kimi-code.json`, and do not enroll a second grant to
@@ -98,6 +115,44 @@ observation semantics are maintained in
 alias cooldown provenance are maintained in `docs/aawm-session-history.md`.
 
 ## Usage - LiteLLM Python SDK
+
+## Managed native contract descriptor
+
+Managed chat, the Codex and Claude adapters, the raw gateway, and usage
+polling consume one sanitized native contract descriptor. It is authoritative
+for the managed route:
+
+| Field | Descriptor contract |
+| --- | --- |
+| Endpoint | `https://api.kimi.com/coding/v1` exactly |
+| Native client | Sanitized client name and version |
+| Headers | Native header names, safe static values, and service-owned non-personal identity values |
+| Freshness | Issued-at and expiry timestamps |
+| Integrity | Digest of the sanitized descriptor |
+| Consumers | Managed chat, both adapters, raw gateway, and usage poller |
+| Identity | No workstation hostname, hardware model, kernel release, personal device ID, account, session, or caller identity |
+
+Managed model allowlisting remains in existing `kimi_code` provider
+metadata/config; models are not descriptor fields. The descriptor does not
+define usage-to-chat correlation. Any such join belongs to the polling and
+persistence runtime contract, not descriptor model metadata.
+
+The descriptor is sanitized and not caller-overridable. Reject endpoint,
+native-header/version, freshness, digest, or identity spoofing. A complete
+validated replacement is published atomically and is visible to new requests
+without a restart. Readers may retain the immutable snapshot captured for an
+in-flight request. The host directory selected by
+`AAWM_KIMI_NATIVE_DESCRIPTOR_DIR` is mounted read-only at
+`/app/kimi-descriptor`; the consumer file is
+`kimi-native-contract.json`.
+
+The standalone image default
+`LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode and does
+not establish exact-parity acceptance. Managed dev Compose defaults the gate
+to `true`, as must fail-closed managed deployments. In required mode, a
+missing, stale, malformed, digest-invalid, endpoint-mismatched,
+version-incoherent, or hostile descriptor fails closed; there is no generic
+`moonshot/*` fallback, API-key fallback, or alternate endpoint.
 
 ### Non-streaming
 

@@ -11,10 +11,16 @@ from typing import Any, AsyncIterator, Iterator, List, Optional, Tuple, Union, c
 
 import httpx
 
-from litellm._version import version as litellm_version
 from litellm.llms.kimi_code.model_metadata import (
     MANAGED_KIMI_CODE_MODEL_IDS,
     is_managed_kimi_code_model_id,
+)
+from litellm.secret_managers.kimi_native_contract import (
+    KIMI_NATIVE_BASE_URL,
+    KimiNativeContractError,
+    build_outbound_headers,
+    resolve_contract,
+    resolve_endpoint_url,
 )
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import ModelResponse, ModelResponseStream
@@ -27,11 +33,12 @@ from ...openai.chat.gpt_transformation import (
 from ...openai.common_utils import OpenAIError
 
 
-KIMI_CODE_API_BASE = "https://api.kimi.com/coding/v1"
-KIMI_CODE_CHAT_COMPLETIONS_URL = f"{KIMI_CODE_API_BASE}/chat/completions"
+KIMI_CODE_API_BASE = KIMI_NATIVE_BASE_URL
+KIMI_CODE_CHAT_COMPLETIONS_URL = f"{KIMI_NATIVE_BASE_URL}/chat/completions"
 KIMI_CODE_CREDENTIAL_PATH_ENV = "LITELLM_KIMI_OAUTH_AUTH_FILE"
 KIMI_CODE_DEFAULT_CREDENTIAL_PATH = "~/.kimi-code/credentials/kimi-code.json"
 KIMI_CODE_REASONING_EFFORT_LEVELS = ("low", "high", "max")
+KIMI_CODE_NATIVE_FALLBACK_USER_AGENT = "kimi-code-cli/0.29.1"
 
 
 class KimiCodeAuthenticationError(OpenAIError):
@@ -43,6 +50,35 @@ class KimiCodeAuthenticationError(OpenAIError):
             message=(
                 "Kimi Code OAuth credentials are unavailable or invalid: "
                 f"{reason}. Refresh the existing Kimi Code CLI credential in place."
+            ),
+            headers={},
+        )
+
+
+class KimiCodeContractError(OpenAIError):
+    """The native contract descriptor is required but unavailable or invalid."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            status_code=503,
+            message=(
+                "Kimi Code native contract descriptor is unavailable: "
+                f"{reason}. Ensure the descriptor file is mounted and valid."
+            ),
+            headers={},
+        )
+
+
+class KimiCodeApiBaseError(OpenAIError):
+    """A caller-supplied api_base does not match the canonical Kimi Code endpoint."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=400,
+            message=(
+                "Kimi Code is a managed provider; caller-supplied api_base "
+                "overrides are not permitted. Remove the api_base parameter "
+                "or use the canonical endpoint."
             ),
             headers={},
         )
@@ -127,28 +163,44 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
 
     @staticmethod
     def _user_agent() -> str:
-        version = litellm_version if litellm_version else "unknown"
-        return f"litellm/{version}"
+        return KIMI_CODE_NATIVE_FALLBACK_USER_AGENT
+
+    @staticmethod
+    def _validate_api_base(api_base: Optional[str]) -> None:
+        """Reject noncanonical caller-supplied api_base before egress.
+
+        The canonical base (with optional trailing slash) is accepted as a
+        no-op.  Any other value, including generic Moonshot endpoints, fails
+        with a sanitized controlled error.
+        """
+        if api_base is None:
+            return
+        canonical = KIMI_CODE_API_BASE.rstrip("/")
+        supplied = api_base.rstrip("/")
+        if supplied == canonical:
+            return
+        raise KimiCodeApiBaseError()
 
     @classmethod
-    def _managed_headers(cls, headers: object, include_authorization: bool) -> dict:
-        if headers is None:
-            managed_headers = {}
-        elif isinstance(headers, dict):
-            managed_headers = {
-                name: value
-                for name, value in headers.items()
-                if not name.lower().startswith("x-msh-") and name.lower() not in {"authorization", "user-agent"}
-            }
-        else:
-            raise ValueError("Kimi Code extra_headers must be an object")
+    def _managed_headers(cls, include_authorization: bool) -> dict:
+        """Build outbound headers via the shared contract builder.
 
-        managed_headers["User-Agent"] = cls._user_agent()
-        if not any(name.lower() == "content-type" for name in managed_headers):
-            managed_headers["Content-Type"] = "application/json"
-        if include_authorization:
-            managed_headers["Authorization"] = f"Bearer {cls._get_access_token()}"
-        return managed_headers
+        No caller headers enter this builder.  Only Authorization,
+        descriptor User-Agent, and Content-Type are emitted.
+        """
+        try:
+            contract = resolve_contract()
+        except KimiNativeContractError as exc:
+            raise KimiCodeContractError(
+                "required descriptor is missing or invalid"
+            ) from exc
+        access_token = cls._get_access_token() if include_authorization else None
+        return build_outbound_headers(
+            contract,
+            access_token,
+            json_body=True,
+            fallback_user_agent=cls._user_agent(),
+        )
 
     @classmethod
     def _supported_reasoning_efforts(cls, model: str) -> Tuple[str, ...]:
@@ -171,9 +223,17 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
     def _get_openai_compatible_provider_info(
         self, api_base: Optional[str], api_key: Optional[str]
     ) -> Tuple[Optional[str], Optional[str]]:
-        # Ignore external API-key and base overrides: this managed provider is
-        # authenticated only with the current Kimi Code OAuth credential.
-        return KIMI_CODE_API_BASE, self._get_access_token()
+        # Reject noncanonical api_base; this managed provider is authenticated
+        # only with the current Kimi Code OAuth credential.
+        self._validate_api_base(api_base)
+        try:
+            contract = resolve_contract()
+        except KimiNativeContractError as exc:
+            raise KimiCodeContractError(
+                "required descriptor is missing or invalid"
+            ) from exc
+        base = contract.base_url if contract is not None else KIMI_CODE_API_BASE
+        return base, self._get_access_token()
 
     def get_complete_url(
         self,
@@ -185,7 +245,14 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
         stream: Optional[bool] = None,
     ) -> str:
         self._model_id(model)
-        return KIMI_CODE_CHAT_COMPLETIONS_URL
+        self._validate_api_base(api_base)
+        try:
+            contract = resolve_contract()
+        except KimiNativeContractError as exc:
+            raise KimiCodeContractError(
+                "required descriptor is missing or invalid"
+            ) from exc
+        return resolve_endpoint_url(contract, "chat_completions")
 
     def get_supported_openai_params(self, model: str) -> list:
         if model.split("/", maxsplit=1)[-1] not in {"k3-low", "k3-high", "k3-max"}:
@@ -270,14 +337,7 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
     ) -> dict:
         self._model_id(model)
         optional_params = dict(optional_params)
-        combined_headers = dict(headers)
-        caller_extra_headers = optional_params.get("extra_headers")
-        if caller_extra_headers is not None:
-            if not isinstance(caller_extra_headers, dict):
-                raise ValueError("Kimi Code extra_headers must be an object")
-            combined_headers.update(caller_extra_headers)
         optional_params["extra_headers"] = self._managed_headers(
-            combined_headers,
             include_authorization=True,
         )
         if optional_params.get("stream"):
@@ -308,7 +368,8 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
         api_base: Optional[str] = None,
     ) -> dict:
         self._model_id(model)
-        return self._managed_headers(headers, include_authorization=True)
+        self._validate_api_base(api_base)
+        return self._managed_headers(include_authorization=True)
 
     def get_model_response_iterator(
         self,

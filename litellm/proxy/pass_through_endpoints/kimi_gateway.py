@@ -1,4 +1,14 @@
-"""Trusted-local raw gateway for the Kimi Code CLI."""
+"""Trusted-local raw gateway for the Kimi Code CLI.
+
+All upstream URL resolution and outbound header construction delegates to the
+canonical ``kimi_native_contract`` resolver so that the gateway, sidecar usage
+polling, and managed chat/adapters share a single source of truth.
+
+``KIMI_CODE_BASE_URL`` is accepted only when its value is the exact canonical
+base (compatibility no-op).  Any other value -- generic Moonshot, alternate
+host/path/port, embedded credentials, query, fragment, IP literal, or custom
+base -- fails closed before egress.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +17,6 @@ import json
 import os
 from collections.abc import AsyncIterator
 from typing import Optional
-from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -15,7 +24,6 @@ from fastapi.responses import Response, StreamingResponse
 
 from litellm._logging import _redact_string, verbose_proxy_logger
 from litellm.llms.kimi_code.chat.transformation import (
-    KIMI_CODE_API_BASE,
     KimiCodeAuthenticationError,
     KimiCodeChatConfig,
 )
@@ -25,6 +33,25 @@ from litellm.proxy.aawm_route_logging import (
     record_aawm_route_rollup_turn,
     register_aawm_route_rollup_access_log_replacement,
 )
+
+# ---------------------------------------------------------------------------
+# Canonical resolver integration (MS-030/MS-031)
+# ---------------------------------------------------------------------------
+# Uses litellm/secret_managers/kimi_native_contract.py (pure-stdlib, owned by
+# the contract agent).  The descriptor is read per-request so atomic file
+# replacement is restart-free.  When the descriptor is absent and not marked
+# required, the resolver returns None and we fall back to built-in constants.
+# ---------------------------------------------------------------------------
+from litellm.secret_managers.kimi_native_contract import (
+    KIMI_NATIVE_BASE_URL,
+    KimiNativeContract,
+    KimiNativeContractError,
+    build_outbound_headers,
+    resolve_contract,
+    resolve_endpoint_url,
+)
+
+KIMI_CODE_CANONICAL_BASE = KIMI_NATIVE_BASE_URL  # "https://api.kimi.com/coding/v1"
 
 
 KIMI_CODE_BASE_URL_ENV = "KIMI_CODE_BASE_URL"
@@ -42,32 +69,6 @@ class _GatewayRouteKwargs(dict[str, object]):
     pass
 
 
-_KIMI_CODE_GATEWAY_UPSTREAM_SUFFIXES = {
-    "models": "/models",
-    "usages": "/usages",
-    "chat_completions": "/chat/completions",
-}
-_KIMI_CODE_GATEWAY_REQUEST_HOP_BY_HOP_HEADERS = frozenset(
-    {
-        "connection",
-        "content-length",
-        "host",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    }
-)
-_KIMI_CODE_GATEWAY_REQUEST_STRIPPED_HEADERS = frozenset(
-    {
-        "authorization",
-        "forwarded",
-        "user-agent",
-    }
-)
 _KIMI_CODE_GATEWAY_RESPONSE_HEADERS = frozenset(
     {
         "content-type",
@@ -99,45 +100,31 @@ def _require_current_bearer(request: Request, access_token: str) -> None:
         )
 
 
-def _get_kimi_code_base_url() -> str:
-    configured_base_url = os.getenv(KIMI_CODE_BASE_URL_ENV, KIMI_CODE_API_BASE)
-    try:
-        parsed_base_url = urlsplit(configured_base_url)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Kimi Code gateway upstream is unavailable.",
-        ) from exc
+def _validate_base_url_override() -> None:
+    """Fail closed if KIMI_CODE_BASE_URL is set to a non-canonical value.
 
-    if (
-        parsed_base_url.scheme != "https"
-        or not parsed_base_url.netloc
-        or parsed_base_url.username is not None
-        or parsed_base_url.password is not None
-        or parsed_base_url.query
-        or parsed_base_url.fragment
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail="Kimi Code gateway upstream is unavailable.",
-        )
-
-    return urlunsplit(
-        SplitResult(
-            scheme=parsed_base_url.scheme,
-            netloc=parsed_base_url.netloc,
-            path=parsed_base_url.path.rstrip("/"),
-            query="",
-            fragment="",
-        )
+    The exact canonical base is accepted as a compatibility no-op.  Any other
+    value -- generic Moonshot, alternate host/path/port, embedded credentials,
+    query, fragment, IP literal, or custom base -- is rejected before egress.
+    """
+    configured = os.getenv(KIMI_CODE_BASE_URL_ENV)
+    if configured is None:
+        return
+    normalized = configured.rstrip("/")
+    if normalized == KIMI_CODE_CANONICAL_BASE:
+        return
+    raise HTTPException(
+        status_code=503,
+        detail="Kimi Code gateway upstream is unavailable.",
     )
 
 
-def _get_upstream_url(endpoint: str) -> str:
-    return "{}{}".format(
-        _get_kimi_code_base_url(),
-        _KIMI_CODE_GATEWAY_UPSTREAM_SUFFIXES[endpoint],
-    )
+def _resolve_upstream_url(
+    endpoint: str,
+    contract: Optional[KimiNativeContract],
+) -> str:
+    """Resolve every gateway join through the canonical contract module."""
+    return resolve_endpoint_url(contract, endpoint)
 
 
 def _get_upstream_transport() -> Optional[httpx.AsyncBaseTransport]:
@@ -146,18 +133,25 @@ def _get_upstream_transport() -> Optional[httpx.AsyncBaseTransport]:
     return None
 
 
-def _get_upstream_headers(request: Request, access_token: str) -> dict[str, str]:
-    headers = {
-        name: value
-        for name, value in request.headers.items()
-        if name.lower() not in _KIMI_CODE_GATEWAY_REQUEST_HOP_BY_HOP_HEADERS
-        and name.lower() not in _KIMI_CODE_GATEWAY_REQUEST_STRIPPED_HEADERS
-        and not name.lower().startswith("x-forwarded-")
-        and not name.lower().startswith("x-msh-")
-    }
-    headers["Authorization"] = f"Bearer {access_token}"
-    headers["User-Agent"] = KimiCodeChatConfig._user_agent()
-    return headers
+def _get_upstream_headers(
+    access_token: str,
+    contract: Optional[KimiNativeContract],
+    *,
+    json_body: bool,
+    accept_json: bool = False,
+) -> dict[str, str]:
+    """Build outbound headers exclusively from the canonical contract builder.
+
+    No inbound headers are forwarded.  The canonical builder emits only
+    Authorization, the descriptor User-Agent, and Content-Type for JSON bodies.
+    """
+    return build_outbound_headers(
+        contract,
+        access_token,
+        json_body=json_body,
+        accept_json=accept_json,
+        fallback_user_agent=KimiCodeChatConfig._user_agent(),
+    )
 
 
 def _get_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -190,13 +184,6 @@ def _get_gateway_route_model(endpoint: str, request_body: bytes) -> str:
     if "/" in normalized_model:
         return normalized_model
     return f"kimi_code/{normalized_model}"
-
-
-def _get_gateway_logging_target(endpoint: str) -> str:
-    return "{}{}".format(
-        KIMI_CODE_API_BASE,
-        _KIMI_CODE_GATEWAY_UPSTREAM_SUFFIXES[endpoint],
-    )
 
 
 def _extract_gateway_error_value(payload: object) -> Optional[str]:
@@ -372,7 +359,7 @@ async def _stream_response(
         await client.aclose()
 
 
-async def _proxy_kimi_code_request(request: Request, endpoint: str) -> Response:
+async def _proxy_kimi_code_request(request: Request, endpoint: str) -> Response:  # noqa: PLR0915
     register_aawm_route_rollup_access_log_replacement(request)
     request_body = await request.body()
     request_payload, route_kwargs = _build_gateway_route_state(
@@ -380,14 +367,51 @@ async def _proxy_kimi_code_request(request: Request, endpoint: str) -> Response:
         endpoint=endpoint,
         request_body=request_body,
     )
-    logging_target = _get_gateway_logging_target(endpoint)
+    # Read the native contract descriptor per-request (restart-free hot swap).
+    try:
+        contract = resolve_contract()
+    except KimiNativeContractError as exc:
+        canonical_target = _resolve_upstream_url(endpoint, None)
+        _log_gateway_failure(
+            request=request,
+            target=canonical_target,
+            request_payload=request_payload,
+            kwargs=route_kwargs,
+            status_code=503,
+            detail="Kimi Code gateway upstream is unavailable.",
+            failure_kind="gateway_contract_unavailable",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Kimi Code gateway upstream is unavailable.",
+        ) from exc
+
+    # Validate KIMI_CODE_BASE_URL override (compatibility no-op or fail closed).
+    try:
+        _validate_base_url_override()
+    except HTTPException as exc:
+        canonical_target = _resolve_upstream_url(endpoint, contract)
+        _log_gateway_failure(
+            request=request,
+            target=canonical_target,
+            request_payload=request_payload,
+            kwargs=route_kwargs,
+            status_code=exc.status_code,
+            detail=exc.detail,
+            failure_kind="gateway_configuration_unavailable",
+        )
+        raise
+
+    # Resolve the upstream URL once.  The same URL is used for the actual
+    # egress, route-access logging, and rollup target.
+    upstream_url = _resolve_upstream_url(endpoint, contract)
 
     try:
         access_token = KimiCodeChatConfig._get_access_token()
     except KimiCodeAuthenticationError as exc:
         _log_gateway_failure(
             request=request,
-            target=logging_target,
+            target=upstream_url,
             request_payload=request_payload,
             kwargs=route_kwargs,
             status_code=401,
@@ -401,26 +425,12 @@ async def _proxy_kimi_code_request(request: Request, endpoint: str) -> Response:
     except HTTPException as exc:
         _log_gateway_failure(
             request=request,
-            target=logging_target,
+            target=upstream_url,
             request_payload=request_payload,
             kwargs=route_kwargs,
             status_code=exc.status_code,
             detail=exc.detail,
             failure_kind="gateway_authentication_rejected",
-        )
-        raise
-
-    try:
-        upstream_url = _get_upstream_url(endpoint)
-    except HTTPException as exc:
-        _log_gateway_failure(
-            request=request,
-            target=logging_target,
-            request_payload=request_payload,
-            kwargs=route_kwargs,
-            status_code=exc.status_code,
-            detail=exc.detail,
-            failure_kind="gateway_configuration_unavailable",
         )
         raise
 
@@ -430,6 +440,8 @@ async def _proxy_kimi_code_request(request: Request, endpoint: str) -> Response:
         request_payload=request_payload,
         kwargs=route_kwargs,
     )
+    is_json_body = endpoint == "chat_completions"
+    is_get_json_endpoint = endpoint in ("models", "usages")
     client = httpx.AsyncClient(
         timeout=KIMI_CODE_GATEWAY_TIMEOUT_SECONDS,
         transport=_get_upstream_transport(),
@@ -438,7 +450,12 @@ async def _proxy_kimi_code_request(request: Request, endpoint: str) -> Response:
         upstream_request = client.build_request(
             method=request.method,
             url=upstream_url,
-            headers=_get_upstream_headers(request, access_token),
+            headers=_get_upstream_headers(
+                access_token,
+                contract,
+                json_body=is_json_body,
+                accept_json=is_get_json_endpoint,
+            ),
             content=request_body,
         )
         upstream_response = await client.send(upstream_request, stream=True)

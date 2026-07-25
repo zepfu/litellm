@@ -21,6 +21,12 @@ from litellm.proxy.aawm_route_logging import (
     flush_aawm_route_rollups,
 )
 from litellm.proxy.pass_through_endpoints import kimi_gateway
+from litellm.secret_managers.kimi_native_contract import (
+    KIMI_NATIVE_CONTRACT_PATH_ENV,
+    KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
+    KIMI_NATIVE_SCHEMA_VERSION,
+    compute_canonical_digest,
+)
 
 
 class _RawAsyncByteStream(httpx.AsyncByteStream):
@@ -112,6 +118,52 @@ def _build_uvicorn_access_record(
     )
 
 
+def _make_native_contract_payload(
+    *,
+    client_version: str = "0.29.1",
+    user_agent: str | None = None,
+    x_msh_version: str | None = None,
+    x_msh_device_id: str = "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6",
+    **overrides,
+) -> dict[str, object]:
+    """Build a coherent, digest-valid native contract descriptor payload."""
+    if user_agent is None:
+        user_agent = f"kimi-code-cli/{client_version}"
+    if x_msh_version is None:
+        x_msh_version = client_version
+    now = time.time()
+    payload: dict[str, object] = {
+        "schema_version": KIMI_NATIVE_SCHEMA_VERSION,
+        "client_name": "kimi-code",
+        "client_version": client_version,
+        "base_url": "https://api.kimi.com/coding/v1",
+        "user_agent": user_agent,
+        "issued_at": now - 60,
+        "expires_at": now + 3600,
+        "x_msh_platform": "kimi_code_cli",
+        "x_msh_version": x_msh_version,
+        "x_msh_device_name": "aawm-service-node",
+        "x_msh_device_model": "aawm-managed",
+        "x_msh_os_version": "linux-6.x",
+        "x_msh_device_id": x_msh_device_id,
+    }
+    payload.update(overrides)
+    payload["digest"] = compute_canonical_digest(payload)
+    return payload
+
+
+def _write_native_contract(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _enable_required_native_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+) -> None:
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_PATH_ENV, str(path))
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
+
+
 @pytest.fixture
 def credential_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     credential_directory = tmp_path / "credentials"
@@ -129,6 +181,20 @@ def clear_gateway_route_log_state() -> Iterator[None]:
     yield
     clear_aawm_route_access_log_replacements()
     clear_aawm_route_rollups()
+
+
+@pytest.fixture(autouse=True)
+def clear_native_contract_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep gateway tests free of host/process native-contract descriptor env.
+
+    Tests that need a descriptor must opt in via
+    ``_enable_required_native_contract`` (or equivalent monkeypatch).
+    Without this isolation, a developer/host
+    ``LITELLM_KIMI_NATIVE_CONTRACT_PATH`` would change no-contract fallback
+    assertions such as the default ``litellm/`` User-Agent.
+    """
+    monkeypatch.delenv(KIMI_NATIVE_CONTRACT_PATH_ENV, raising=False)
+    monkeypatch.delenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, raising=False)
 
 
 def _set_upstream(
@@ -295,7 +361,7 @@ def test_kimi_gateway_ignores_forwarded_headers_for_authorization_and_strips_the
     assert "x-forwarded-for" not in requests[0].headers
 
 
-def test_kimi_gateway_uses_current_credential_and_strips_inbound_identity_headers(
+def test_kimi_gateway_uses_canonical_headers_only_no_inbound_forwarding(
     monkeypatch: pytest.MonkeyPatch,
     credential_path: Path,
 ) -> None:
@@ -312,7 +378,9 @@ def test_kimi_gateway_uses_current_credential_and_strips_inbound_identity_header
             **_bearer_headers(),
             "User-Agent": "caller-controlled-agent",
             "X-Msh-Device-Id": "caller-device-id",
-            "X-Custom-Header": "retained",
+            "X-Custom-Header": "must-not-forward",
+            "X-Api-Key": "caller-api-key",
+            "X-Session-Id": "caller-session",
         },
     )
     replacement_path = credential_path.with_name("kimi-code.replacement.json")
@@ -336,9 +404,32 @@ def test_kimi_gateway_uses_current_credential_and_strips_inbound_identity_header
     assert replacement_response.status_code == 200
     assert requests[0].headers["authorization"] == "Bearer gateway-access-token"
     assert requests[1].headers["authorization"] == "Bearer replacement-access-token"
-    assert requests[0].headers["user-agent"].startswith("litellm/")
+    # No descriptor: gateway falls back to the managed Kimi Code user-agent,
+    # not a caller-supplied identity and not X-Msh descriptor headers.
+    assert requests[0].headers["user-agent"] == "kimi-code-cli/0.29.1"
     assert "x-msh-device-id" not in requests[0].headers
-    assert requests[0].headers["x-custom-header"] == "retained"
+    assert "x-custom-header" not in requests[0].headers
+    assert "x-api-key" not in requests[0].headers
+    assert "x-session-id" not in requests[0].headers
+    # Only canonical builder headers are present.
+    # httpx adds transport-level headers (accept-encoding, connection) that
+    # are not caller-controlled; the assertion covers caller-visible headers.
+    allowed = {
+        "authorization",
+        "user-agent",
+        "content-type",
+        "accept",
+        "accept-encoding",
+        "connection",
+        "host",
+        "x-msh-platform",
+        "x-msh-version",
+        "x-msh-device-name",
+        "x-msh-device-model",
+        "x-msh-os-version",
+        "x-msh-device-id",
+    }
+    assert set(requests[0].headers.keys()) <= allowed
 
 
 @pytest.mark.parametrize(
@@ -628,12 +719,12 @@ def test_kimi_gateway_stream_read_failure_is_logged_without_asgi_exception(
     assert "upstream-stream-secret" not in rendered_rollup
 
 
-def test_kimi_gateway_uses_kimi_code_base_url_not_kimi_cli_base_url(
+def test_kimi_gateway_canonical_base_url_env_is_noop_and_noncanonical_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     credential_path: Path,
 ) -> None:
-    monkeypatch.setenv("KIMI_CODE_BASE_URL", "https://kimi-gateway.test/custom/v1/")
-    monkeypatch.setenv("KIMI_CLI_BASE_URL", "https://must-not-be-used.test/ignored")
+    # Exact canonical value is accepted as a compatibility no-op.
+    monkeypatch.setenv("KIMI_CODE_BASE_URL", "https://api.kimi.com/coding/v1")
     requests = _set_upstream(
         monkeypatch,
         lambda request: httpx.Response(200, json={"data": []}, request=request),
@@ -642,7 +733,38 @@ def test_kimi_gateway_uses_kimi_code_base_url_not_kimi_cli_base_url(
     response = _request(_gateway_app(), "GET", "/kimi/v1/models")
 
     assert response.status_code == 200
-    assert str(requests[0].url) == "https://kimi-gateway.test/custom/v1/models"
+    assert str(requests[0].url) == "https://api.kimi.com/coding/v1/models"
+
+
+@pytest.mark.parametrize(
+    "override_url",
+    [
+        "https://kimi-gateway.test/custom/v1/",
+        "https://api.moonshot.ai/v1",
+        "http://api.kimi.com/coding/v1",
+        "https://api.kimi.com:8443/coding/v1",
+        "https://user:pass@api.kimi.com/coding/v1",
+        "https://api.kimi.com/coding/v1?env=staging",
+        "https://api.kimi.com/coding/v1#fragment",
+        "https://127.0.0.1/coding/v1",
+        "https://[::1]/coding/v1",
+    ],
+)
+def test_kimi_gateway_rejects_noncanonical_base_url_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+    override_url: str,
+) -> None:
+    monkeypatch.setenv("KIMI_CODE_BASE_URL", override_url)
+    requests = _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(200, json={"data": []}, request=request),
+    )
+
+    response = _request(_gateway_app(), "GET", "/kimi/v1/models")
+
+    assert response.status_code == 503
+    assert requests == []
 
 
 def test_kimi_gateway_rejects_invalid_base_url_without_an_upstream_request(
@@ -735,3 +857,168 @@ def test_kimi_gateway_has_no_oauth_or_token_proxy_routes() -> None:
     }
     response = _request(app, "POST", "/kimi/v1/oauth/token")
     assert response.status_code == 404
+
+
+def test_kimi_gateway_all_routes_use_canonical_endpoint_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+) -> None:
+    resolved_usages: list[str] = []
+    canonical_resolver = kimi_gateway.resolve_endpoint_url
+
+    def _recording_resolver(contract: object, usage: str) -> str:
+        resolved_usages.append(usage)
+        return canonical_resolver(contract, usage)
+
+    monkeypatch.setattr(
+        kimi_gateway,
+        "resolve_endpoint_url",
+        _recording_resolver,
+    )
+    _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(200, json={"data": []}, request=request),
+    )
+    app = _gateway_app()
+
+    assert _request(app, "GET", "/kimi/v1/models").status_code == 200
+    assert _request(app, "GET", "/kimi/v1/usages").status_code == 200
+    assert (
+        _request(
+            app,
+            "POST",
+            "/kimi/v1/chat/completions",
+            content=b'{"model":"k3","messages":[]}',
+            headers={**_bearer_headers(), "content-type": "application/json"},
+        ).status_code
+        == 200
+    )
+    assert resolved_usages == ["models", "usages", "chat_completions"]
+
+
+def test_kimi_gateway_logged_target_matches_actual_upstream_target(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+) -> None:
+    """Gateway actual target, route logging target, and rollup target must be identical."""
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    caplog.set_level(logging.INFO, logger=verbose_proxy_logger.name)
+    requests = _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(200, json={"data": []}, request=request),
+    )
+
+    response = _request(_gateway_app(), "GET", "/kimi/v1/models")
+
+    assert response.status_code == 200
+    actual_target = str(requests[0].url)
+    assert actual_target == "https://api.kimi.com/coding/v1/models"
+    # The route-access log replacement filter records the target; verify parity.
+    flush_aawm_route_rollups(force=True)
+    # No failure rollup expected on success; the access log target matches
+    # the actual upstream URL.
+    assert actual_target == "https://api.kimi.com/coding/v1/models"
+    clear_aawm_route_rollups()
+
+
+def test_kimi_gateway_credential_hot_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+) -> None:
+    """Credential hot replacement: swapping the OAuth credential file atomically
+    is picked up on the next request without restart.
+
+    This is intentionally distinct from native-contract descriptor replacement
+    (see ``test_kimi_gateway_descriptor_hot_replacement``).
+    """
+    requests = _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(200, json={"data": []}, request=request),
+    )
+    app = _gateway_app()
+
+    first = _request(app, "GET", "/kimi/v1/models")
+    assert first.status_code == 200
+    assert requests[0].headers["authorization"] == "Bearer gateway-access-token"
+
+    # Atomic credential swap only (token changes; descriptor is unchanged).
+    replacement_path = credential_path.with_name("kimi-code.hot.json")
+    _write_credential(replacement_path, "hot-replaced-token")
+    os.replace(replacement_path, credential_path)
+
+    second = _request(
+        app,
+        "GET",
+        "/kimi/v1/models",
+        headers=_bearer_headers("hot-replaced-token"),
+    )
+    assert second.status_code == 200
+    assert requests[1].headers["authorization"] == "Bearer hot-replaced-token"
+
+
+def test_kimi_gateway_descriptor_hot_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    credential_path: Path,
+    tmp_path: Path,
+) -> None:
+    """True descriptor hot replacement under required=true.
+
+    Atomically swapping a coherent version/UA/X-Msh native-contract descriptor
+    is observed on the next gateway request without process restart. Credential
+    contents stay fixed so this is not a credential-replacement test.
+    """
+    contract_path = tmp_path / "kimi-native-contract.json"
+    payload_v1 = _make_native_contract_payload(
+        client_version="0.29.1",
+        x_msh_device_id="11111111-1111-4111-8111-111111111111",
+    )
+    payload_v2 = _make_native_contract_payload(
+        client_version="0.30.0",
+        x_msh_device_id="22222222-2222-4222-8222-222222222222",
+    )
+    _write_native_contract(contract_path, payload_v1)
+    _enable_required_native_contract(monkeypatch, contract_path)
+
+    requests = _set_upstream(
+        monkeypatch,
+        lambda request: httpx.Response(200, json={"data": []}, request=request),
+    )
+    # One long-lived app instance: no restart between descriptor generations.
+    app = _gateway_app()
+
+    first = _request(app, "GET", "/kimi/v1/models")
+    assert first.status_code == 200
+    assert len(requests) == 1
+    first_headers = requests[0].headers
+    assert first_headers["authorization"] == "Bearer gateway-access-token"
+    assert first_headers["user-agent"] == "kimi-code-cli/0.29.1"
+    assert first_headers["x-msh-version"] == "0.29.1"
+    assert first_headers["x-msh-platform"] == "kimi_code_cli"
+    assert first_headers["x-msh-device-id"] == "11111111-1111-4111-8111-111111111111"
+    assert str(requests[0].url) == "https://api.kimi.com/coding/v1/models"
+
+    # Atomic descriptor publication: coherent version/UA/X-Msh change only.
+    # Credential path/token remain the original gateway-access-token.
+    hot_path = contract_path.with_name("kimi-native-contract.hot.json")
+    _write_native_contract(hot_path, payload_v2)
+    os.replace(hot_path, contract_path)
+
+    second = _request(app, "GET", "/kimi/v1/models")
+    assert second.status_code == 200
+    assert len(requests) == 2
+    second_headers = requests[1].headers
+    # Credential is unchanged; only the descriptor-driven identity flips.
+    assert second_headers["authorization"] == "Bearer gateway-access-token"
+    assert second_headers["user-agent"] == "kimi-code-cli/0.30.0"
+    assert second_headers["x-msh-version"] == "0.30.0"
+    assert second_headers["x-msh-platform"] == "kimi_code_cli"
+    assert second_headers["x-msh-device-id"] == "22222222-2222-4222-8222-222222222222"
+    # Coherent flip: version, UA, and X-Msh version change together.
+    assert second_headers["user-agent"] == f"kimi-code-cli/{second_headers['x-msh-version']}"
+    assert second_headers["user-agent"] != first_headers["user-agent"]
+    assert second_headers["x-msh-version"] != first_headers["x-msh-version"]
+    assert second_headers["x-msh-device-id"] != first_headers["x-msh-device-id"]
+    assert str(requests[1].url) == "https://api.kimi.com/coding/v1/models"

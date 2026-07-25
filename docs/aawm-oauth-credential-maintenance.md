@@ -1,5 +1,48 @@
 # AAWM OAuth Credential Maintenance
 
+## MS-030/MS-031: managed Kimi contract boundary
+
+The authoritative native client for this contract is the WSL installation at
+`/home/zepfu/.kimi-code/bin/kimi`, version `0.29.1`. Older Thoth state is not
+authoritative. `MS-032`, the Thoth daily updater, is paused by operator
+decision and is not a prerequisite for this contract. Do not resume that
+updater or publish a Thoth-derived descriptor without separate authorization.
+
+All AAWM Moonshot traffic is OAuth-only through `kimi_code/*` and the Kimi Code
+`/coding/v1` upstream; no AAWM route uses a Moonshot API key. Generic upstream
+LiteLLM `moonshot/*` support remains unchanged caller-supplied API-key
+functionality. It is not converted to OAuth, governed by this descriptor, or
+selected as an AAWM route or fallback.
+
+Managed chat, the Codex and Claude adapters, the raw gateway, and usage
+polling consume one sanitized native contract descriptor. It contains the
+exact endpoint `https://api.kimi.com/coding/v1`, native client name/version,
+the native `User-Agent` and header names, service-owned non-personal identity
+values, issued/expiry timestamps, and an integrity digest. It contains no
+bearer or refresh token and no workstation hostname, hardware model, kernel
+release, personal device identifier, account, session, or caller identity.
+
+Managed model allowlisting remains in existing `kimi_code` provider
+metadata/config and is not part of this descriptor. Native usage/chat
+correlation remains polling and persistence behavior outside the descriptor.
+
+The descriptor is authoritative and caller-spoof rejection is mandatory.
+Validate and publish replacements atomically so readers see a new snapshot
+without a restart. The host descriptor directory is configured by
+`AAWM_KIMI_NATIVE_DESCRIPTOR_DIR` and mounted read-only at
+`/app/kimi-descriptor`; consumers read
+`/app/kimi-descriptor/kimi-native-contract.json`. The image contains the
+resolver, not a captured descriptor or OAuth credential.
+
+The standalone image default
+`LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode and does
+not establish exact-parity acceptance. Managed dev Compose defaults the gate
+to `true`, as must any fail-closed managed deployment. In required mode, a
+missing, stale, malformed, digest-invalid, endpoint-mismatched,
+version-incoherent, or hostile descriptor fails closed. Do not use a guessed
+contract, alternate endpoint, Moonshot API key, generic `moonshot/*` route, or
+another provider to recover.
+
 This document is the operator-facing maintenance guide for AAWM OAuth and OIDC
 credential files used by LiteLLM and the provider-status sidecar. It covers the
 shared publish path introduced and hardened under RR-065, RR-074, RR-075, and
@@ -180,7 +223,7 @@ The compose contract controls credential ownership and hot-reload visibility;
 it does not enable a Kimi route by itself. Managed-route behavior, exact model
 IDs, and `/models` capability gating are documented in
 [`moonshot.md`](my-website/docs/providers/moonshot.md#managed-kimi-code-oauth-aawm).
-Kimi Code `0.27.0` derives a separate OAuth storage slot for a custom
+Kimi Code `0.29.1` derives a separate OAuth storage slot for a custom
 `KIMI_CODE_BASE_URL`, so the CLI cannot currently use the local gateway while
 retaining this exact default credential file. Do not work around that client
 limitation by copying or symlinking the credential or enrolling another grant.
