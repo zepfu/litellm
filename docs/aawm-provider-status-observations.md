@@ -57,10 +57,13 @@ Relevant environment variables:
 ## Grok OIDC Refresh Task
 
 The same sidecar can also own the scheduled Grok native OIDC credential refresh.
-This is separate from the five-minute provider front-door probes. In dev compose
-the sidecar mounts `/home/zepfu/.grok` writable and refreshes
-`/home/zepfu/.grok/auth.json` on a one-hour cadence. The LiteLLM container mounts
-that directory read-only and reads the credential directly for
+This is separate from the five-minute provider front-door probes. In shared
+multi-provider compose layouts the sidecar may mount `/home/zepfu/.grok`
+writable. On the operator WSL host, however, native Grok OIDC refresh is owned
+by the dedicated WSL-local single writer described in
+[WSL-local Grok OIDC single writer (XAI-003)](#wsl-local-grok-oidc-single-writer-xai-003)
+so multi-provider sidecars and both LiteLLM proxies stay non-writers. LiteLLM
+mounts that directory read-only and reads the credential directly for
 `xai/grok-composer-2.5-fast`, `xai/grok-build`, and `xai/grok-build-0.1`.
 
 Relevant environment variables:
@@ -101,6 +104,68 @@ It applies the configured auth-file uid/gid/mode without reading or rewriting
 token values and emits `grok_oidc_metadata_repair` only when it repairs the file
 or encounters an error. This bounds damage from another process recreating the
 shared auth file with container-owned metadata between hourly refreshes.
+
+## WSL-local Grok OIDC single writer (XAI-003)
+
+On the operator WSL host, native Grok OIDC refresh is owned by a dedicated
+single-writer unit, not by the multi-provider `provider-status-observations`
+sidecar and not by either LiteLLM proxy.
+
+- Compose: `docker-compose.wsl-grok-oidc.yml`
+- Launcher: `scripts/ensure-wsl-grok-oidc-sidecar.sh` (`--status` default,
+  `--apply`, `--stop`)
+- Static smoke: `tests/wsl-grok-oidc-sidecar-smoke.sh`
+
+### Ownership and consumers
+
+- This WSL-local sidecar is the **only automatic writer** of
+  `/home/zepfu/.grok/auth.json` on the WSL host.
+- `aawm-litellm` and `litellm-dev` remain **read-only consumers** of that file.
+  They require **no restart** when the credential is refreshed or replaced
+  under the shared lock.
+- Manual Grok CLI / Grok Build login is **break-glass only**. Use it when the
+  refresh token is revoked, the credential file is missing/corrupt, or the
+  automatic writer cannot recover. After a manual login, the sidecar resumes
+  non-forced refresh from the new file without proxy restarts.
+- Managed `oa_xai/*` OAuth (`~/.litellm/xai/oauth-auth.json`) is a **separate
+  credential family**. Native Grok OIDC must never populate managed xAI OAuth,
+  and this WSL unit does not mount or refresh managed xAI credentials.
+
+### Cadence and safety
+
+The dedicated unit reuses image `aawm-provider-status-observations:prod` but
+overrides the entrypoint to a Grok-only loop around
+`scripts/grok_oidc_refresh.py` so front-door probes, DB apply/schema, anomaly
+scan, billing, Codex/Kimi/Alibaba writers, and managed xAI OAuth refresh stay
+disabled.
+
+Rendered defaults:
+
+- `AAWM_GROK_OIDC_REFRESH_ENABLED=1`
+- `AAWM_GROK_OIDC_AUTH_FILE=/home/zepfu/.grok/auth.json`
+- `AAWM_GROK_OIDC_LOCK_FILE=/home/zepfu/.grok/auth.json.lock`
+- `AAWM_GROK_OIDC_AUTH_FILE_UID=1000` / `GID=1000` / `MODE=0o600`
+- `AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=300`
+- `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_GROK_OIDC_FORCE_REFRESH=0`
+- `AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=30`
+- `AAWM_PROVIDER_STATUS_APPLY=0` (no DB writes required)
+
+The launcher preflights the image and credential, captures exact container ID /
+start timestamp / restart count for both LiteLLM proxies, starts or stops only
+`wsl-grok-oidc-refresh` with
+`docker compose -f docker-compose.wsl-grok-oidc.yml ... --no-deps --no-build`,
+and fails if either proxy snapshot changes. Never run a broad compose
+`up`/`down` for this unit, and never mention a proxy service in a mutating
+compose command for this file.
+
+A credential/process healthcheck marks the container unhealthy while remaining
+credential lifetime is still well above LiteLLM's 300-second near-expiry
+rejection boundary (`remaining > 600` seconds required for healthy). The
+healthcheck also requires the expected xAI issuer/client ID and a refresh token.
+The launcher waits for that healthcheck before reporting `apply_ok`. The
+healthcheck and refresh logs emit no access tokens, refresh tokens, id tokens,
+or raw credential payloads.
 
 ## Grok Billing Poll Task
 

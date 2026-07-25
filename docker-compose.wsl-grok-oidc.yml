@@ -1,0 +1,192 @@
+# WSL-local single-writer sidecar for native Grok OIDC credential refresh.
+#
+# Owns only /home/zepfu/.grok/auth.json refresh on this WSL host. Do not put
+# LiteLLM proxies, managed xAI OAuth, Codex, Kimi, or Alibaba writers here.
+# Activate with scripts/ensure-wsl-grok-oidc-sidecar.sh --apply so both local
+# LiteLLM proxies stay read-only consumers without recreate/restart.
+
+name: aawm-wsl-grok-oidc
+
+services:
+  wsl-grok-oidc-refresh:
+    image: aawm-provider-status-observations:prod
+    # Override the default provider-status entrypoint so this unit never runs
+    # front-door probes, DB writers, or unrelated credential refresh/poll tasks.
+    # Reuses scripts/grok_oidc_refresh.py already present in the prod image.
+    entrypoint: ["python", "-u"]
+    command:
+      - -c
+      - |
+        import json, os, signal, time
+        from datetime import datetime, timezone
+        from pathlib import Path
+        import scripts.grok_oidc_refresh as grok
+
+        stopping = False
+
+        def _stop(signum, frame):
+            global stopping
+            stopping = True
+
+        signal.signal(signal.SIGINT, _stop)
+        signal.signal(signal.SIGTERM, _stop)
+
+        def env_str(name, default):
+            value = os.getenv(name, default)
+            return default if value is None or value == "" else value
+
+        def env_int(name, default):
+            raw = os.getenv(name)
+            if raw is None or raw == "":
+                return int(default)
+            return int(raw)
+
+        def env_bool(name, default):
+            raw = os.getenv(name)
+            if raw is None or raw == "":
+                return bool(default)
+            value = raw.strip().lower()
+            if value in {"1", "true", "yes", "on"}:
+                return True
+            if value in {"0", "false", "no", "off"}:
+                return False
+            raise SystemExit(f"{name} must be a boolean")
+
+        def emit(payload):
+            payload = dict(payload)
+            payload.setdefault("observed_at", datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
+            payload.setdefault("environment", env_str("AAWM_LITELLM_ENVIRONMENT", "wsl-grok-oidc"))
+            print(json.dumps(payload, sort_keys=True), flush=True)
+
+        auth_file = env_str("AAWM_GROK_OIDC_AUTH_FILE", "/home/zepfu/.grok/auth.json")
+        lock_file = env_str("AAWM_GROK_OIDC_LOCK_FILE", str(Path(auth_file).with_name(Path(auth_file).name + ".lock")))
+        interval = env_int("AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS", 300)
+        buffer_seconds = env_int("AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS", 900)
+        force = env_bool("AAWM_GROK_OIDC_FORCE_REFRESH", False)
+        timeout = float(env_str("AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS", "30"))
+        if interval <= 0:
+            raise SystemExit("AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS must be > 0")
+        if buffer_seconds < 0:
+            raise SystemExit("AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS must be >= 0")
+        if timeout <= 0:
+            raise SystemExit("AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS must be > 0")
+
+        emit({
+            "event": "wsl_grok_oidc_refresh_started",
+            "auth_file": auth_file,
+            "lock_file": lock_file,
+            "interval_seconds": interval,
+            "buffer_seconds": buffer_seconds,
+            "force_refresh": force,
+            "http_timeout_seconds": timeout,
+        })
+
+        while not stopping:
+            cycle_started = time.monotonic()
+            try:
+                repair = grok.repair_grok_oidc_auth_file_metadata(auth_file, lock_file=lock_file)
+                if repair.get("repaired") or repair.get("error_class"):
+                    emit({"event": "grok_oidc_metadata_repair", **repair})
+            except Exception as exc:
+                emit({
+                    "event": "grok_oidc_metadata_repair",
+                    "attempted": True,
+                    "repaired": False,
+                    "auth_file": auth_file,
+                    "error_class": exc.__class__.__name__,
+                    "error_message": grok._sanitize_error_message(str(exc)),
+                })
+            try:
+                summary = grok.refresh_grok_oidc_auth_file(
+                    auth_file,
+                    buffer_seconds=buffer_seconds,
+                    force=force,
+                    lock_file=lock_file,
+                    http_timeout_seconds=timeout,
+                )
+                emit({"event": "grok_oidc_refresh", **summary})
+            except Exception as exc:
+                emit({
+                    "event": "grok_oidc_refresh",
+                    "attempted": True,
+                    "refreshed": False,
+                    "skipped": False,
+                    "auth_file": auth_file,
+                    "error_class": exc.__class__.__name__,
+                    "error_message": grok._sanitize_error_message(str(exc)),
+                })
+            remaining = interval - (time.monotonic() - cycle_started)
+            while remaining > 0 and not stopping:
+                time.sleep(min(remaining, 1.0))
+                remaining = interval - (time.monotonic() - cycle_started)
+
+        emit({"event": "wsl_grok_oidc_refresh_stopped", "auth_file": auth_file})
+    container_name: aawm-wsl-grok-oidc-refresh
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # Sole writable mount: native Grok OIDC credential storage on this host.
+      - /home/zepfu/.grok:/home/zepfu/.grok
+    environment:
+      - AAWM_LITELLM_ENVIRONMENT=wsl-grok-oidc
+      # Independent of provider-status DB writers / schema / PgBouncer.
+      - AAWM_PROVIDER_STATUS_APPLY=0
+      - AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START=0
+      - AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER=0
+      - AAWM_PROVIDER_STATUS_SKIP_ICMP=1
+      - AAWM_PROVIDER_STATUS_INTERVAL_SECONDS=300
+      - AAWM_PROVIDER_STATUS_TIMEOUT=2
+      - AAWM_PROVIDER_STATUS_PING_COUNT=1
+      - AAWM_PROVIDER_STATUS_PING_TIMEOUT=2
+      # Native Grok OIDC refresh (single writer on this WSL host).
+      - AAWM_GROK_OIDC_REFRESH_ENABLED=1
+      - AAWM_GROK_OIDC_AUTH_FILE=/home/zepfu/.grok/auth.json
+      - AAWM_GROK_OIDC_LOCK_FILE=/home/zepfu/.grok/auth.json.lock
+      - AAWM_GROK_OIDC_AUTH_FILE_UID=1000
+      - AAWM_GROK_OIDC_AUTH_FILE_GID=1000
+      - AAWM_GROK_OIDC_AUTH_FILE_MODE=0o600
+      - AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=300
+      - AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=900
+      - AAWM_GROK_OIDC_FORCE_REFRESH=0
+      - AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=30
+      # Disable every other credential writer / poller on this dedicated unit.
+      - AAWM_CODEX_OAUTH_REFRESH_ENABLED=0
+      - AAWM_XAI_OAUTH_REFRESH_ENABLED=0
+      - AAWM_KIMI_OAUTH_REFRESH_ENABLED=0
+      - AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED=0
+      - AAWM_KIMI_USAGE_POLL_ENABLED=0
+      - AAWM_ALIBABA_QUOTA_POLL_ENABLED=0
+      - AAWM_CODEX_RESET_CREDIT_POLL_ENABLED=0
+      - AAWM_GROK_BILLING_POLL_ENABLED=0
+      - AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED=0
+    healthcheck:
+      # Credential/process health only. Never print or log token material.
+      # Fail while remaining lifetime is still well above LiteLLM's 300s
+      # near-expiry rejection window. With 30s checks and three retries, the
+      # 600s threshold leaves bounded scheduling margin before consumers reject.
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json,stat,sys; from datetime import datetime,timezone; from pathlib import Path; path=Path('/home/zepfu/.grok/auth.json');
+          sys.exit(1) if not path.is_file() else None;
+          st=path.stat();
+          sys.exit(1) if stat.S_IMODE(st.st_mode) != 0o600 else None;
+          payload=json.loads(path.read_text(encoding='utf-8'));
+          scope='https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828';
+          record=payload.get(scope) if isinstance(payload, dict) else None;
+          sys.exit(1) if not isinstance(record, dict) else None;
+          sys.exit(1) if record.get('oidc_issuer') != 'https://auth.x.ai' else None;
+          sys.exit(1) if record.get('oidc_client_id') != 'b1a00492-073a-47ea-816f-4c329264a828' else None;
+          sys.exit(1) if not record.get('refresh_token') else None;
+          raw=str(record.get('expires_at') or '').strip();
+          sys.exit(1) if not raw else None;
+          normalized=raw[:-1]+'+00:00' if raw.endswith('Z') else raw;
+          expires=datetime.fromisoformat(normalized);
+          expires=expires if expires.tzinfo is not None else expires.replace(tzinfo=timezone.utc);
+          remaining=(expires.astimezone(timezone.utc)-datetime.now(timezone.utc)).total_seconds();
+          sys.exit(0 if remaining > 600 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
