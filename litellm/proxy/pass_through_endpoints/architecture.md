@@ -224,6 +224,11 @@ sequencing, stream validation, and response finalization, are package-owned:
 | OpenCode Zen constants (base URL, provider ID, auth paths, free models) | `providers/opencode_zen/constants.py` |
 | Antigravity constants (forward header allowlist) | `providers/antigravity/constants.py` |
 | Model resolution and adapter model normalization | `aawm_adapter_runtime/model_resolution.py` |
+| Response-body inspection, malformed intake context, Grok Composer repair, schema validation, custom-tool argument parsing | `aawm_adapter_runtime/request_build.py` |
+| Provider-neutral Responses SSE framing, parsing, summaries, repaired IDs, and Anthropic stream wrappers | `aawm_adapter_runtime/sse.py` |
+| Custom and namespace tool-call restoration for response bodies and SSE streams | `aawm_adapter_runtime/tool_call_restore.py` |
+| Responses stream accumulation, output merging, finalization, and empty-success diagnostics | `aawm_adapter_runtime/stream_collect.py` |
+| Responses payload validation, failure taxonomy, bounded replay, and malformed/empty-success rejection | `aawm_adapter_runtime/payload_validation.py` |
 | Lane key generation and session affinity | `aawm_alias_routing/lane_keys.py` |
 | Google environment policy and configuration | `providers/google/env_policy.py` |
 | Google context window management | `providers/google/context_window.py` |
@@ -395,6 +400,37 @@ Behavior-preservation invariants:
 - Terminal audit context memoization on `request.state` is unchanged.
 - Event ordering, omission rules, sanitization, persistence dispositions,
   and synchronous/async behavior are preserved exactly.
+
+#### Wave 6A adapter-runtime ownership
+
+Wave 6A moves exactly 70 functions from `llm_passthrough_endpoints.py` into
+five focused `aawm_adapter_runtime` modules:
+
+| Module | Owned functions |
+|--------|-----------------|
+| `request_build.py` | 22 |
+| `sse.py` | 11 |
+| `tool_call_restore.py` | 14 |
+| `stream_collect.py` | 9 |
+| `payload_validation.py` | 14 |
+
+`aawm_adapter_runtime.__init__.install()` installs these modules in dependency
+order: request building, SSE, tool restoration, stream collection, then payload
+validation. `llm_passthrough_endpoints.py` calls that installer during normal
+module initialization; callers and tests do not manually install Wave 6A.
+
+Every moved name is a same-object compatibility facade on the god module. The
+installed functions use the live `llm_passthrough_endpoints` globals dictionary,
+so existing monkeypatches remain reachable at call time. The one
+`lru_cache`-decorated runtime factory is reconstructed around a host-rebound
+callable while preserving its cache configuration and same-object facade.
+
+`sse.py` is the canonical owner of `_mapping_or_attr_get` and
+`_responses_repaired_output_item_id`. Dependent Wave 6A modules resolve those
+names through host-global lookup and do not define or import duplicate owners.
+None of the five extracted modules imports `llm_passthrough_endpoints` at module
+scope. Constants, route definitions, compatibility wrappers, and provider
+runtime paths remain in their pre-Wave 6A owners.
 
 ### Runtime invariants
 

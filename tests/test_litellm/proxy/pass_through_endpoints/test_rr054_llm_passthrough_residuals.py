@@ -831,11 +831,23 @@ def test_rr054_issue10_shared_auto_agent_handler_is_wired() -> None:
 
 
 def test_rr054_issue27_sse_iterator_yields_dicts_not_namespaces() -> None:
-    source = Path(lpe.__file__).read_text()
+    import inspect
+
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import sse as sse_mod
+
+    # Authoritative implementation lives in the extracted sse module.
+    sse_source = Path(sse_mod.__file__).read_text()
     # Hot path yields parsed dicts; no coerce-to-namespace on emit.
-    assert "yield parsed_chunk" in source
-    iterate_src = __import__("inspect").getsource(lpe._iterate_responses_sse_events)
+    assert "yield parsed_chunk" in sse_source
+    iterate_src = inspect.getsource(sse_mod._iterate_responses_sse_events)
     assert "_coerce_mapping_to_namespace" not in iterate_src
+
+    # The lpe facade must point to the moved function (same code object).
+    assert hasattr(lpe, "_iterate_responses_sse_events")
+    assert lpe._iterate_responses_sse_events.__code__ is sse_mod._iterate_responses_sse_events.__code__
+    # Facade behavioral assertion: no namespace coercion on yield path.
+    facade_src = inspect.getsource(lpe._iterate_responses_sse_events)
+    assert "_coerce_mapping_to_namespace" not in facade_src
 
 
 # ---------------------------------------------------------------------------

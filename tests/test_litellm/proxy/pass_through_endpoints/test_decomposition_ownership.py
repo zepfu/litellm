@@ -55,6 +55,28 @@ TARGET_MODULE_IMPORT_PATHS: dict[str, str] = {
     "grok_side_channel": "litellm.llms.anthropic.experimental_pass_through.providers.grok.side_channel",
 }
 
+WAVE6A_MODULE_ORDER: tuple[str, ...] = (
+    "request_build",
+    "sse",
+    "tool_call_restore",
+    "stream_collect",
+    "payload_validation",
+)
+WAVE6A_MODULE_IMPORT_PATHS: dict[str, str] = {
+    name: (
+        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime."
+        f"{name}"
+    )
+    for name in WAVE6A_MODULE_ORDER
+}
+WAVE6A_EXPECTED_COUNTS: dict[str, int] = {
+    "request_build": 22,
+    "sse": 11,
+    "tool_call_restore": 14,
+    "stream_collect": 9,
+    "payload_validation": 14,
+}
+
 # ---------------------------------------------------------------------------
 # Symbol inventory: target_module_key -> set of symbol names
 # Built from current source AST analysis (develop @ 6138438678).
@@ -1202,3 +1224,130 @@ class TestInventoryUniqueness:
             assert not overlap, (
                 f"{module_key} overlaps with restored constants: {sorted(overlap)}"
             )
+
+
+# ===========================================================================
+# SECTION 8: Wave 6A adapter-runtime ownership and production installation
+# ===========================================================================
+
+
+class TestWave6AAdapterRuntimeOwnership:
+    @staticmethod
+    def _modules() -> dict[str, object]:
+        return {
+            name: importlib.import_module(import_path)
+            for name, import_path in WAVE6A_MODULE_IMPORT_PATHS.items()
+        }
+
+    def test_exact_70_symbol_union_without_duplicate_ownership(self):
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+        modules = self._modules()
+
+        for module_name in WAVE6A_MODULE_ORDER:
+            owned = tuple(getattr(modules[module_name], "_HOST_FUNCTION_NAMES"))
+            assert len(owned) == WAVE6A_EXPECTED_COUNTS[module_name]
+            for symbol in owned:
+                if symbol in seen:
+                    duplicates.append(
+                        f"{symbol}: {seen[symbol]} and {module_name}"
+                    )
+                seen[symbol] = module_name
+
+        assert len(seen) == 70
+        assert not duplicates
+
+    def test_no_wave6a_symbol_remains_a_god_module_function_def(self):
+        modules = self._modules()
+        owned = {
+            symbol
+            for module in modules.values()
+            for symbol in getattr(module, "_HOST_FUNCTION_NAMES")
+        }
+        remaining = owned & _top_level_function_defs(_parse_god_module())
+        assert not remaining
+
+    def test_all_70_facades_share_identity_and_host_globals(self):
+        checked = 0
+        for module in self._modules().values():
+            for symbol in getattr(module, "_HOST_FUNCTION_NAMES"):
+                facade = getattr(lpe, symbol)
+                assert facade is getattr(module, symbol)
+                function = getattr(facade, "__wrapped__", facade)
+                assert function.__globals__ is vars(lpe)
+                checked += 1
+        assert checked == 70
+
+    def test_sse_retains_canonical_shared_helper_ownership(self):
+        modules = self._modules()
+        sse = modules["sse"]
+        assert lpe._mapping_or_attr_get is getattr(sse, "_mapping_or_attr_get")
+        assert lpe._responses_repaired_output_item_id is getattr(
+            sse, "_responses_repaired_output_item_id"
+        )
+
+        dependent_seams = {
+            "tool_call_restore": {"_responses_repaired_output_item_id"},
+            "stream_collect": {"_mapping_or_attr_get"},
+            "payload_validation": {"_mapping_or_attr_get"},
+        }
+        for module_name, seams in dependent_seams.items():
+            module = modules[module_name]
+            owned = set(getattr(module, "_HOST_FUNCTION_NAMES"))
+            assert not seams & owned
+            for seam in seams:
+                assert not hasattr(module, seam)
+
+    def test_package_import_layering_and_install_order(self):
+        package = importlib.import_module(
+            "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime"
+        )
+        for module_name, module in self._modules().items():
+            assert getattr(package, module_name) is module
+
+        package_tree = ast.parse(Path(package.__file__).read_text(encoding="utf-8"))
+        install = next(
+            node
+            for node in package_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "install"
+        )
+        order = [
+            node.value.func.value.id
+            for node in install.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "install"
+            and isinstance(node.value.func.value, ast.Name)
+        ]
+        assert order == list(WAVE6A_MODULE_ORDER)
+
+        for module in self._modules().values():
+            tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    assert all(
+                        "llm_passthrough_endpoints" not in alias.name
+                        for alias in node.names
+                    )
+                elif isinstance(node, ast.ImportFrom):
+                    assert (
+                        node.module is None
+                        or "llm_passthrough_endpoints" not in node.module
+                    )
+
+    def test_production_import_initializes_facades_without_manual_install(self):
+        tree = _parse_god_module()
+        install_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "_aawm_adapter_runtime"
+            and node.func.attr == "install"
+        ]
+        assert len(install_calls) == 1
+        for module in self._modules().values():
+            for symbol in getattr(module, "_HOST_FUNCTION_NAMES"):
+                assert getattr(lpe, symbol) is getattr(module, symbol)
