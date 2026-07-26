@@ -24,6 +24,10 @@ from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lp
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
+    audit_build,
+    audit_context,
+    audit_events,
+    audit_persist,
     durable,
     google_oauth,
     memory,
@@ -51,6 +55,10 @@ EXPECTED_PACKAGE_MODULES = {
     "adapter_config",
     "adapter_driver",
     "antigravity_oauth",
+    "audit_build",
+    "audit_context",
+    "audit_events",
+    "audit_persist",
     "durable",
     "google_oauth",
     "memory",
@@ -137,6 +145,10 @@ def test_rr054_package_public_surface_matches_init() -> None:
         "alias_routing_state",
         "AliasRoutingStateManager",
         "attempt_records",
+        "audit_build",
+        "audit_context",
+        "audit_events",
+        "audit_persist",
         "cooldown_apply",
         "cooldown_state",
         "error_signals",
@@ -155,6 +167,10 @@ def test_rr054_package_public_surface_matches_init() -> None:
     assert package.alias_routing_state is alias_routing_state
     assert package.AliasRoutingStateManager is AliasRoutingStateManager
     assert package.policy is policy
+    assert package.audit_build is audit_build
+    assert package.audit_context is audit_context
+    assert package.audit_events is audit_events
+    assert package.audit_persist is audit_persist
     assert package.memory is memory
     assert package.retry is retry
     assert package.adapter_config is adapter_config

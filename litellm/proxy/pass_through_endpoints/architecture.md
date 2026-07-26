@@ -346,6 +346,56 @@ and request budgets through strategy callbacks. The shared retry driver owns
 only identical attempt sequencing; it does not collapse Google's multi-budget
 semantics into OpenRouter policy.
 
+#### Wave 5D ownership and baseline parity
+
+Wave 5D moves 23 symbols (14 functions, 1 TypedDict class, 6 constants, and 2
+integrator-owned orchestration functions) from `llm_passthrough_endpoints.py`
+at baseline `66963d07ce` into four modules:
+
+| Concern | Module | Symbols |
+|---------|--------|---------|
+| Request context extraction, agent dispatch fields, role inference, prior-tool traversal, activity classification, request-call ID, terminal context attachment | `aawm_alias_routing/audit_context.py` | 14 functions + 1 TypedDict + 6 constants |
+| Audit event construction, in-flight exception detection, continuation-state recursion | `aawm_alias_routing/audit_build.py` | 4 functions |
+| Route-event emission filtering, audit-only spool/enqueue persistence | `aawm_alias_routing/audit_persist.py` | 3 functions |
+| Cross-module terminal-event orchestration, attempt enrichment, no-candidate event emission | `aawm_alias_routing/audit_events.py` | 2 functions |
+
+`audit_events.py` is the integrator-owned compatibility aggregator. It owns
+`_enrich_auto_agent_alias_terminal_event_from_attempts` and
+`_emit_auto_agent_alias_no_candidate_event`, which orchestrate across
+audit_context, audit_build, and audit_persist through injected runtime seams.
+
+The god module exposes same-object facades for every moved symbol. No Wave 5D
+module imports `llm_passthrough_endpoints.py` at module scope. Host
+dependencies are supplied through `configure_audit_context_runtime`,
+`configure_audit_build_runtime`, `configure_audit_persist_runtime`, and
+`configure_audit_events_runtime` with late-binding lambdas.
+
+`selection.py` retains exclusive ownership of the five redispatch/in-flight
+exception builders (`_raise_codex_auto_agent_in_flight_cooldown`,
+`_raise_anthropic_auto_agent_in_flight_cooldown`,
+`_build_auto_agent_redispatch_http_exception_detail`,
+`_raise_codex_auto_agent_redispatch_required`,
+`_raise_anthropic_auto_agent_redispatch_required`). Wave 5D does not create
+`redispatch.py` or duplicate these functions.
+
+Behavior-preservation invariants:
+
+- All frozen function bodies and signatures are AST-identical to baseline
+  `66963d07ce`, ignoring only explicit fail-fast seam assertions added by the
+  author contract.
+- `attempt_records.py` receives audit callbacks (`emit_route_event`,
+  `build_audit_event`, `build_audit_events`, `persist_audit_only_events`)
+  through its existing `configure_attempt_records_runtime` seam, resolving to
+  the Wave 5D module functions via god-module facades.
+- `candidate_loop.py` resolves `_emit_auto_agent_alias_no_candidate_event`,
+  `_codex_auto_agent_request_has_continuation_state`, and
+  `_is_auto_agent_alias_in_flight_cooldown_http_exception` through the
+  god-module facade surface (`_lpe.<name>`), preserving the existing
+  monkeypatch contract.
+- Terminal audit context memoization on `request.state` is unchanged.
+- Event ordering, omission rules, sanitization, persistence dispositions,
+  and synchronous/async behavior are preserved exactly.
+
 ### Runtime invariants
 
 - Durable Redis keys use
