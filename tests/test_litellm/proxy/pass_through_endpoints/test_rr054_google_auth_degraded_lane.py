@@ -62,11 +62,7 @@ def _antigravity_candidate_template() -> dict[str, Any]:
 
 def _reset_google_lane_negative_cache() -> None:
     """Best-effort reset of the google-lane negative cache across ownership seams."""
-    if hasattr(lpe, "_codex_auto_agent_google_lane_negative_until_monotonic"):
-        lpe._codex_auto_agent_google_lane_negative_until_monotonic = 0.0
-    state = getattr(lpe, "_alias_routing_state", None)
-    if state is not None and hasattr(state, "google_lane_negative_until_monotonic"):
-        state.google_lane_negative_until_monotonic = 0.0
+    lpe._alias_routing_state.google_lane_negative_until_monotonic = 0.0
     lpe._codex_auto_agent_google_lane_key_by_key.clear()
     lpe._codex_auto_agent_google_lane_key_until_monotonic_by_key.clear()
 
@@ -133,11 +129,10 @@ async def test_rr054_google_lane_negative_cache_suppresses_second_resolve_call()
         "second resolve should be suppressed by the google-lane negative cache"
     )
     # Negative-cache TTL should still be active after the first failure.
-    if hasattr(lpe, "_codex_auto_agent_google_lane_negative_until_monotonic"):
-        assert (
-            lpe._codex_auto_agent_google_lane_negative_until_monotonic
-            > time.monotonic()
-        )
+    assert (
+        lpe._alias_routing_state.google_lane_negative_until_monotonic
+        > time.monotonic()
+    )
 
 
 def test_rr054_antigravity_auth_degraded_exception_classifier() -> None:
