@@ -497,9 +497,11 @@ def test_rr054_issue59_shared_error_payload_extract() -> None:
 
 @pytest.mark.asyncio
 async def test_rr054_issue15_google_lane_negative_cache() -> None:
-    lpe._codex_auto_agent_google_lane_negative_until_monotonic = time.monotonic() + 30
+    lpe._alias_routing_state.google_lane_negative_until_monotonic = (
+        time.monotonic() + 30
+    )
     assert await lpe._resolve_codex_auto_agent_google_lane_key() == lpe._CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY
-    lpe._codex_auto_agent_google_lane_negative_until_monotonic = 0.0
+    lpe._alias_routing_state.google_lane_negative_until_monotonic = 0.0
 
 
 def test_rr054_issue8_change_accumulator_preserves_colliding_keys() -> None:
