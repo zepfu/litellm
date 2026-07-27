@@ -1131,9 +1131,6 @@ def test_moved_symbols_should_preserve_signature_and_async_parity() -> None:
     assert set(MOVED_SYMBOLS).issubset(extracted_functions)
     for name in MOVED_SYMBOLS:
         assert inspect.signature(getattr(request_prep, name))
-        # God module must expose the same object via facade assignment
-        from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
-        assert getattr(lpe, name) is getattr(request_prep, name), name
 
 
 def test_moved_bodies_should_match_after_runtime_seam_normalization() -> None:

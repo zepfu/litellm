@@ -719,6 +719,123 @@ wrapper, native Anthropic routes, route decorators and registrations, candidate
 loop/cooldown ownership, and the aawm.2 OAuth and aawm.5 audit patches remain in
 their prior owners.
 
+
+#### Wave 7 consolidated system state
+
+Wave 7 is the final documentation consolidation. It records the settled
+ownership map, residual god-module responsibilities, facade deletion policy,
+install-order contract, and the native-Anthropic egress boundary as the
+authoritative reference for the pass-through subsystem.
+
+##### Extracted module ownership (Waves 6D-6F)
+
+| Module | Package | Owned concern |
+|--------|---------|---------------|
+| `alias_guidance.py` | `aawm_request_policy/` | Alias-specific system instruction shaping: prevention guidance, read-agent guidance |
+| `observability_metadata.py` | `aawm_request_policy/` | Shared metadata primitives, session/repository extraction, tool-definition snapshots, Claude/Gemini/Codex breakouts, Anthropic billing headers, route-family logging |
+| `persisted_output.py` | `aawm_request_policy/` | Claude persisted-output expansion, Google adapter compaction delegates, content-text estimation |
+| `anthropic_body_prep.py` | `aawm_request_policy/` | OpenAI-adapter Claude-context compaction, Anthropic tool-block validation / tool-use-id repair, final `_prepare_anthropic_request_body_for_passthrough` orchestration |
+| `claude_prompt_replacement.py` | `aawm_request_policy/` | Claude auto-memory section replacement, prompt-patch manifest application, logging-metadata helpers |
+| `codex_tool_policy.py` | `aawm_request_policy/` | Codex spawn-agent / core-tool description patches, model-capability policy, custom-tool-to-function and namespace-tool adaptation, unsupported-field drops, tool-choice cleanup, Grok-native input-item policy |
+| `anthropic_adapter_calls.py` | `aawm_adapter_runtime/` | Shared Anthropic adapter request policies, execution, streaming, response finalization, route logging support |
+| `anthropic_dispatch.py` | `aawm_adapter_runtime/` | Anthropic-shaped adapter recognition and optional dispatch through explicit `AnthropicDispatchRuntime` |
+| `codex_candidate_calls.py` | `aawm_adapter_runtime/` | Codex auto-agent candidate execution plus Kimi, Alibaba, OpenCode, and OpenRouter candidate calls |
+| `codex_dispatch.py` | `aawm_adapter_runtime/` | Codex Responses adapter recognition and optional dispatch |
+
+##### Residual god-module responsibilities
+
+`llm_passthrough_endpoints.py` retains only integration-layer concerns:
+
+- **FastAPI route registration and decorators** -- all `@router.post`,
+  `@router.get`, `@router.websocket` decorators and their route paths.
+- **Route orchestration** -- handler bodies that sequence preparation,
+  dispatch, and response delivery for each provider route.
+- **`try_dispatch` ingress and fall-through** -- the top-level dispatch gate
+  that invokes the Codex and Anthropic dispatch modules and falls through to
+  native pass-through when dispatch returns `None`.
+- **Explicit install order and runtime assembly** -- constructing `Runtime`
+  dataclasses, calling `configure_*` functions, and invoking `install()`
+  entrypoints in the contractual order (see install-order summary below).
+- **Proven late-host callbacks** -- callbacks that must resolve against live
+  god-module globals at call time (monkeypatch compatibility).
+- **12 prepare/handle route delegates** -- the concrete Anthropic
+  prepare/handle route-family pairs, including the asymmetric Google pair
+  `_prepare_anthropic_google_completion_adapter_request` /
+  `_handle_anthropic_google_completion_adapter_route`.
+- **Combined OpenCode wrapper** -- the unified OpenCode Zen route handler that
+  composes normalization, dispatch, and streaming.
+- **Compatibility re-exports** -- same-object facades and thin callback
+  wrappers exist solely for current consumers (monkeypatch surfaces, test
+  fixtures, sibling module imports). No new logic is added to compatibility
+  surfaces; they are deletion candidates once consumers migrate.
+
+##### Facade deletion policy
+
+Pure owner bindings (same-object assignments where the god-module name is
+never monkeypatched and no external consumer imports the name from the god
+module) are removed after an exact `rg` grep confirms zero call-site
+references outside the god module itself.
+
+Route-layer seams and host-global seams are retained indefinitely:
+
+- Names that appear in `@router` handler bodies.
+- Names resolved through `host_globals[name]` lookups by installed modules.
+- Names referenced by `configure_*` / `install()` runtime assembly.
+- Names imported by sibling modules (`aawm_claude_control_plane.py`,
+  `aawm_alias_routing/`, provider packages) for compatibility.
+
+Deletion is per-name, not per-module. A module may have most facades deleted
+while retaining a handful of route or host-global seams.
+
+##### Module-scope import boundary
+
+No extracted module (Waves 4 through 6F) imports
+`llm_passthrough_endpoints` at module scope. All host dependencies flow
+through:
+
+1. Explicit `configure_*_runtime(...)` calls with frozen dataclass contracts.
+2. `install(host_globals)` rebinding for monkeypatch-compatible facades.
+3. Per-call `Runtime` arguments (Antigravity pattern).
+
+This boundary is enforced by lint and is a prerequisite for future god-module
+decomposition or replacement.
+
+##### Install-order summary
+
+The god module executes configuration and installation in this contractual
+order during module initialization:
+
+1. Wave 6D: `observability_metadata.configure_observability_metadata_runtime`
+2. Wave 6D: `persisted_output.bind_runtime` +
+   `configure_persisted_output_logging_callback` + `persisted_output.install`
+3. Wave 6D: `alias_guidance.configure_alias_guidance_runtime`
+4. Wave 6E: `codex_tool_policy` callback assembly from configured
+   observability callbacks + host-global resolvers
+5. Wave 6E: `anthropic_body_prep.configure_anthropic_body_prep_runtime`
+6. Wave 6C: `configure_google_retry_runtime` then `codex_code_assist.install`
+7. Wave 6B: `configure_openrouter_runtime`, `configure_nvidia_runtime`,
+   `configure_runtime` (OpenCode Zen), `configure_xai_request_prep_runtime`
+8. Wave 6F: `aawm_adapter_runtime.install_wave6f()` (Anthropic adapter calls,
+   then Codex candidate calls, then Codex dispatch)
+9. Wave 6F: `AnthropicDispatchRuntime` construction with late-binding
+   resolver and handler callbacks
+
+Each step may depend on all prior steps. Reordering breaks runtime wiring.
+
+##### Native-Anthropic egress fail-closed boundary
+
+When the Anthropic dispatch gate (`anthropic_dispatch.py`) returns `None`
+(no adapter candidate matched), the request falls through to native Anthropic
+normalization, context-1m handling, and passthrough. This native path sends
+traffic exclusively through the Anthropic-native provider route using
+credentials accepted for that route.
+
+If the native Anthropic route or credential is unavailable, the system fails
+closed with an explicit routing/authentication error and audit evidence. It
+does not reroute Anthropic-model traffic through Codex, ChatGPT OAuth, or any
+cross-provider egress path. This boundary applies to normal routing, alias
+candidates, cross-provider fallbacks, retries, cooldown recovery, probes,
+smoke tests, and acceptance harnesses.
 ### Runtime invariants
 
 - Durable Redis keys use
