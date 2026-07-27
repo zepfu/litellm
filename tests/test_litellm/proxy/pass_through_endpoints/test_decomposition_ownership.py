@@ -148,7 +148,6 @@ GOOGLE_ENV_POLICY_SYMBOLS: set[str] = {
     "_get_google_adapter_default_thinking_level",
     "_get_google_adapter_max_contents_window",
     "_get_google_adapter_max_contents_text_chars",
-    "_estimate_google_content_text_chars",
     "_google_content_has_text",
     "_get_google_adapter_oversized_text_part_char_cap",
     "_get_google_adapter_pure_context_text_part_char_cap",
@@ -1351,3 +1350,308 @@ class TestWave6AAdapterRuntimeOwnership:
         for module in self._modules().values():
             for symbol in getattr(module, "_HOST_FUNCTION_NAMES"):
                 assert getattr(lpe, symbol) is getattr(module, symbol)
+
+
+# ===========================================================================
+# SECTION 9: Wave 6D request-policy ownership and facade identity
+# ===========================================================================
+
+WAVE6D_MODULE_ORDER: tuple[str, ...] = (
+    "persisted_output",
+    "observability_metadata",
+    "alias_guidance",
+)
+WAVE6D_MODULE_IMPORT_PATHS: dict[str, str] = {
+    name: (
+        "litellm.proxy.pass_through_endpoints.aawm_request_policy."
+        f"{name}"
+    )
+    for name in WAVE6D_MODULE_ORDER
+}
+WAVE6D_EXPECTED_COUNTS: dict[str, int] = {
+    "persisted_output": 14,
+    "observability_metadata": 43,
+    "alias_guidance": 6,
+}
+
+WAVE6D_PERSISTED_OUTPUT_SYMBOLS: set[str] = {
+    "_is_claude_persisted_output_expansion_enabled",
+    "_get_claude_persisted_output_root",
+    "_resolve_claude_persisted_output_path",
+    "_build_claude_persisted_output_source_metadata",
+    "_compact_google_adapter_persisted_output_preview_and_expanded_text",
+    "_compact_expanded_claude_persisted_output_text_for_google_adapter",
+    "_compact_google_adapter_text_part_sequence",
+    "_compact_google_adapter_followup_request_contents",
+    "_compact_google_adapter_persisted_output_value",
+    "_compact_google_adapter_persisted_output_in_anthropic_request_body",
+    "_expand_claude_persisted_output_text",
+    "_expand_claude_persisted_output_value",
+    "_expand_claude_persisted_output_in_anthropic_request_body",
+    "_estimate_google_content_text_chars",
+}
+
+WAVE6D_OBSERVABILITY_METADATA_SYMBOLS: set[str] = {
+    "_merge_litellm_metadata",
+    "_format_langfuse_span_timestamp",
+    "_build_langfuse_span_descriptor",
+    "_normalize_low_cardinality_tag_value",
+    "_dedupe_sorted_str_list",
+    "_iter_anthropic_text_fragments",
+    "_extract_claude_agent_and_tenant_from_request_body",
+    "_add_claude_child_agent_observability_metadata",
+    "_detect_claude_post_rewrite_context_files",
+    "_add_claude_post_rewrite_context_file_logging_metadata",
+    "_get_nested_str_value",
+    "_extract_passthrough_session_id",
+    "_normalize_passthrough_repository",
+    "_extract_passthrough_repository_from_text",
+    "_walk_request_value_with_budget",
+    "_extract_passthrough_repository_from_body_text",
+    "_extract_passthrough_repository",
+    "_get_passthrough_trace_environment",
+    "_add_passthrough_trace_context_metadata",
+    "_truncate_tool_definition_string",
+    "_redact_tool_definition_string",
+    "_sanitize_tool_definition_value",
+    "_tool_definition_name",
+    "_tool_definition_description",
+    "_tool_definition_parameters",
+    "_build_tool_definition_snapshot_entry",
+    "_tool_definition_snapshot_hash",
+    "_build_passthrough_tool_definition_metadata",
+    "_add_passthrough_tool_definition_metadata",
+    "_prepare_request_body_for_passthrough_observability",
+    "_extract_openai_passthrough_tool_choice",
+    "_extract_claude_request_breakout_fields",
+    "_add_claude_request_breakout_logging_metadata",
+    "_extract_gemini_request_breakout_fields",
+    "_add_gemini_request_breakout_logging_metadata",
+    "_extract_codex_request_breakout_fields",
+    "_add_codex_request_breakout_logging_metadata",
+    "_parse_anthropic_billing_header_text",
+    "_extract_anthropic_billing_header_fields",
+    "_extract_anthropic_billing_header_fields_from_request_body",
+    "_add_anthropic_billing_header_logging_metadata",
+    "_add_claude_persisted_output_logging_metadata",
+    "_add_route_family_logging_metadata",
+}
+
+WAVE6D_ALIAS_GUIDANCE_SYMBOLS: set[str] = {
+    "_append_codex_auto_agent_prevention_guidance_to_instructions",
+    "_is_aawm_read_agent_alias_model",
+    "_append_aawm_read_agent_guidance_to_text",
+    "_append_aawm_read_agent_guidance_to_anthropic_system",
+    "_apply_aawm_read_agent_guidance_to_request_body",
+    "_apply_codex_auto_agent_prevention_guidance_to_request_body",
+}
+
+WAVE6D_SYMBOL_INVENTORY: dict[str, set[str]] = {
+    "persisted_output": WAVE6D_PERSISTED_OUTPUT_SYMBOLS,
+    "observability_metadata": WAVE6D_OBSERVABILITY_METADATA_SYMBOLS,
+    "alias_guidance": WAVE6D_ALIAS_GUIDANCE_SYMBOLS,
+}
+
+ALL_WAVE6D_FUNCTIONS: set[str] = set()
+for _syms in WAVE6D_SYMBOL_INVENTORY.values():
+    ALL_WAVE6D_FUNCTIONS |= _syms
+
+
+class TestWave6DRequestPolicyOwnership:
+    """Wave 6D structural ownership: 63 functions across 3 modules."""
+
+    @staticmethod
+    def _modules() -> dict[str, object]:
+        return {
+            name: importlib.import_module(import_path)
+            for name, import_path in WAVE6D_MODULE_IMPORT_PATHS.items()
+        }
+
+    def test_exact_63_symbol_union_without_duplicate_ownership(self):
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+
+        for module_name in WAVE6D_MODULE_ORDER:
+            symbols = WAVE6D_SYMBOL_INVENTORY[module_name]
+            assert len(symbols) == WAVE6D_EXPECTED_COUNTS[module_name], (
+                f"{module_name}: expected {WAVE6D_EXPECTED_COUNTS[module_name]}, "
+                f"got {len(symbols)}"
+            )
+            for symbol in symbols:
+                if symbol in seen:
+                    duplicates.append(
+                        f"{symbol}: {seen[symbol]} and {module_name}"
+                    )
+                seen[symbol] = module_name
+
+        assert len(seen) == 63
+        assert not duplicates
+
+    def test_no_wave6d_symbol_remains_a_god_module_function_def(self):
+        func_defs = _top_level_function_defs(_parse_god_module())
+        remaining = ALL_WAVE6D_FUNCTIONS & func_defs
+        assert not remaining, (
+            f"Wave 6D symbols still defined as FunctionDef in god module: "
+            f"{sorted(remaining)}"
+        )
+
+    def test_persisted_output_host_function_names_match_inventory(self):
+        modules = self._modules()
+        po = modules["persisted_output"]
+        host_names = set(getattr(po, "_HOST_FUNCTION_NAMES"))
+        assert host_names == WAVE6D_PERSISTED_OUTPUT_SYMBOLS
+
+    def test_all_63_facades_share_identity_with_god_module(self):
+        modules = self._modules()
+        checked = 0
+
+        # persisted_output: installed via install(globals()), rebound
+        for symbol in WAVE6D_PERSISTED_OUTPUT_SYMBOLS:
+            facade = getattr(lpe, symbol)
+            module_fn = getattr(modules["persisted_output"], symbol)
+            assert facade is module_fn, (
+                f"persisted_output.{symbol}: facade identity mismatch"
+            )
+            checked += 1
+
+        # observability_metadata: direct same-object assignment
+        for symbol in WAVE6D_OBSERVABILITY_METADATA_SYMBOLS:
+            facade = getattr(lpe, symbol)
+            module_fn = getattr(modules["observability_metadata"], symbol)
+            assert facade is module_fn, (
+                f"observability_metadata.{symbol}: facade identity mismatch"
+            )
+            checked += 1
+
+        # alias_guidance: direct same-object assignment
+        for symbol in WAVE6D_ALIAS_GUIDANCE_SYMBOLS:
+            facade = getattr(lpe, symbol)
+            module_fn = getattr(modules["alias_guidance"], symbol)
+            assert facade is module_fn, (
+                f"alias_guidance.{symbol}: facade identity mismatch"
+            )
+            checked += 1
+
+        assert checked == 63
+
+    def test_persisted_output_facades_use_host_globals(self):
+        """Installed persisted-output functions resolve through host globals."""
+        for symbol in WAVE6D_PERSISTED_OUTPUT_SYMBOLS:
+            facade = getattr(lpe, symbol)
+            function = getattr(facade, "__wrapped__", facade)
+            assert function.__globals__ is vars(lpe), (
+                f"{symbol}: expected host globals dict"
+            )
+
+    def test_no_wave6d_module_imports_god_module_at_scope(self):
+        for module_name, import_path in WAVE6D_MODULE_IMPORT_PATHS.items():
+            mod = importlib.import_module(import_path)
+            mod_path = Path(mod.__file__).resolve()
+            tree = ast.parse(mod_path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    assert all(
+                        "llm_passthrough_endpoints" not in alias.name
+                        for alias in node.names
+                    ), f"{module_name} imports god module"
+                elif isinstance(node, ast.ImportFrom):
+                    assert (
+                        node.module is None
+                        or "llm_passthrough_endpoints" not in node.module
+                    ), f"{module_name} imports from god module"
+
+    def test_callback_and_install_ordering(self):
+        """God module configures observability, then persisted-output, then
+        alias guidance -- in that contractual order."""
+        tree = _parse_god_module()
+        configure_lines: dict[str, int] = {}
+        install_lines: dict[str, int] = {}
+
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+            ):
+                if (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_aawm_observability_metadata"
+                    and node.func.attr == "configure_observability_metadata_runtime"
+                ):
+                    configure_lines["observability"] = node.lineno
+                elif (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_aawm_persisted_output"
+                    and node.func.attr == "install"
+                ):
+                    install_lines["persisted_output"] = node.lineno
+                elif (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_aawm_alias_guidance"
+                    and node.func.attr == "configure_alias_guidance_runtime"
+                ):
+                    configure_lines["alias_guidance"] = node.lineno
+
+        assert "observability" in configure_lines
+        assert "persisted_output" in install_lines
+        assert "alias_guidance" in configure_lines
+        assert configure_lines["observability"] < install_lines["persisted_output"]
+        assert install_lines["persisted_output"] < configure_lines["alias_guidance"]
+
+    def test_estimate_google_content_text_chars_owned_by_persisted_output(self):
+        """_estimate_google_content_text_chars is Wave 6D persisted_output owned,
+        not google env_policy owned."""
+        assert "_estimate_google_content_text_chars" not in GOOGLE_ENV_POLICY_SYMBOLS
+        assert "_estimate_google_content_text_chars" in WAVE6D_PERSISTED_OUTPUT_SYMBOLS
+
+    def test_control_plane_preserves_distinct_get_nested_str_value(self):
+        """The control plane retains its own local _get_nested_str_value,
+        distinct from the observability_metadata facade."""
+        from litellm.proxy.pass_through_endpoints import (
+            aawm_claude_control_plane as cp,
+        )
+
+        cp_fn = cp._get_nested_str_value
+        obs_fn = lpe._get_nested_str_value
+        # Control plane defines its own; observability_metadata owns the facade
+        assert cp_fn is not obs_fn
+        # Both are callable and behavior-compatible
+        assert cp_fn({"a": {"b": "v"}}, ("a", "b")) == "v"
+        assert obs_fn({"a": {"b": "v"}}, ("a", "b")) == "v"
+
+    def test_control_plane_canonicalizes_from_observability_metadata(self):
+        """Control plane imports canonical helpers from observability_metadata."""
+        from litellm.proxy.pass_through_endpoints import (
+            aawm_claude_control_plane as cp,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+            observability_metadata as obs,
+        )
+
+        assert cp._iter_anthropic_text_fragments is obs._iter_anthropic_text_fragments
+        assert (
+            cp._extract_claude_agent_and_tenant_from_request_body
+            is obs._extract_claude_agent_and_tenant_from_request_body
+        )
+        assert (
+            cp._detect_claude_post_rewrite_context_files
+            is obs._detect_claude_post_rewrite_context_files
+        )
+
+    def test_no_cross_wave6d_duplicates(self):
+        """Each Wave 6D symbol appears in exactly one module."""
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+        for module_key, symbols in WAVE6D_SYMBOL_INVENTORY.items():
+            for sym in symbols:
+                if sym in seen:
+                    duplicates.append(f"{sym} in both {seen[sym]} and {module_key}")
+                else:
+                    seen[sym] = module_key
+        assert not duplicates
+
+    def test_no_overlap_with_prior_wave_inventories(self):
+        """Wave 6D symbols do not overlap with Wave 4 or Wave 6A inventories."""
+        prior = ALL_MOVED_FUNCTIONS | ALL_RESTORED_CONSTANTS
+        overlap = ALL_WAVE6D_FUNCTIONS & prior
+        # _estimate_google_content_text_chars was removed from env_policy
+        assert not overlap, f"Wave 6D overlaps prior waves: {sorted(overlap)}"

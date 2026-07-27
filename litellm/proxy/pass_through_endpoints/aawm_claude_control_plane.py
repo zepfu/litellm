@@ -9,6 +9,7 @@ from time import monotonic
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from litellm.proxy.pass_through_endpoints.aawm_request_policy import observability_metadata as _observability_metadata
 
 _REPO_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
     Path(__file__).resolve().parents[3] / "context-replacement" / "claude-code"
@@ -1624,37 +1625,13 @@ def _get_nested_str_value(source: Any, path: tuple[str, ...]) -> Optional[str]:
     return None
 
 
-def _iter_anthropic_text_fragments(value: Any):
-    if isinstance(value, str):
-        yield value
-        return
-
-    if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
-            yield value["text"]
-            return
-        for child in value.values():
-            yield from _iter_anthropic_text_fragments(child)
-        return
-
-    if isinstance(value, list):
-        for child in value:
-            yield from _iter_anthropic_text_fragments(child)
-
-
-def _extract_claude_agent_and_tenant_from_request_body(
-    request_body: dict[str, Any]
-) -> tuple[Optional[str], Optional[str]]:
-    for top_level_key in ("messages", "system"):
-        for fragment in _iter_anthropic_text_fragments(request_body.get(top_level_key)):
-            match = _CLAUDE_AGENT_TENANT_PATTERN.search(fragment)
-            if match is None:
-                continue
-            agent = match.group("agent").strip()
-            tenant = match.group("tenant").strip()
-            if agent and tenant:
-                return agent, tenant
-    return None, None
+_iter_anthropic_text_fragments = _observability_metadata._iter_anthropic_text_fragments
+_extract_claude_agent_and_tenant_from_request_body = (
+    _observability_metadata._extract_claude_agent_and_tenant_from_request_body
+)
+_detect_claude_post_rewrite_context_files = (
+    _observability_metadata._detect_claude_post_rewrite_context_files
+)
 
 
 def _extract_aawm_session_id_from_request_body(
@@ -1686,24 +1663,6 @@ def _build_aawm_context_for_anthropic_request(
     if session_id:
         context["session_id"] = session_id
     return context
-
-
-def _detect_claude_post_rewrite_context_files(
-    request_body: dict[str, Any]
-) -> list[str]:
-    present_files: list[str] = []
-    seen_files: set[str] = set()
-
-    for top_level_key in ("system", "messages"):
-        for fragment in _iter_anthropic_text_fragments(request_body.get(top_level_key)):
-            for marker, _tag_suffix in _CLAUDE_POST_REWRITE_CONTEXT_FILE_MARKERS:
-                if marker in seen_files:
-                    continue
-                if marker in fragment:
-                    present_files.append(marker)
-                    seen_files.add(marker)
-
-    return present_files
 
 
 def add_claude_post_rewrite_context_file_logging_metadata(

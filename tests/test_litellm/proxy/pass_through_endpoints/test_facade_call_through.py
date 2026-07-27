@@ -328,3 +328,136 @@ def test_wave6c_response_collection_uses_late_host_model_normalizer(
         )
 
     assert calls == ["gemini-raw-6c"]
+
+
+# ---------------------------------------------------------------------------
+# Wave 6D: request-policy facade call-through tests
+# ---------------------------------------------------------------------------
+
+from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+    alias_guidance,
+    observability_metadata,
+    persisted_output,
+)
+
+
+def test_wave6d_persisted_output_estimate_facade_call_through() -> None:
+    """_estimate_google_content_text_chars facade resolves through host globals."""
+    assert lpe._estimate_google_content_text_chars is (
+        persisted_output._estimate_google_content_text_chars
+    )
+    block = {"parts": [{"text": "abc"}, {"text": "de"}]}
+    assert lpe._estimate_google_content_text_chars(block) == 5
+    assert persisted_output._estimate_google_content_text_chars(block) == 5
+    assert lpe._estimate_google_content_text_chars("not a dict") == 0
+
+
+def test_wave6d_persisted_output_expansion_enabled_facade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expansion-enabled facade reads env through host globals at call time."""
+    assert lpe._is_claude_persisted_output_expansion_enabled is (
+        persisted_output._is_claude_persisted_output_expansion_enabled
+    )
+    monkeypatch.setenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "1")
+    assert lpe._is_claude_persisted_output_expansion_enabled() is True
+    monkeypatch.setenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "0")
+    assert lpe._is_claude_persisted_output_expansion_enabled() is False
+
+
+def test_wave6d_observability_merge_metadata_facade_call_through() -> None:
+    """_merge_litellm_metadata facade is same-object and behavior-compatible."""
+    assert lpe._merge_litellm_metadata is (
+        observability_metadata._merge_litellm_metadata
+    )
+    body: dict[str, Any] = {"model": "test"}
+    result = lpe._merge_litellm_metadata(
+        body,
+        tags_to_add=["wave6d"],
+        extra_fields={"trace_id": "t1"},
+    )
+    assert result["litellm_metadata"]["tags"] == ["wave6d"]
+    assert result["litellm_metadata"]["trace_id"] == "t1"
+    assert "litellm_metadata" not in body  # original unchanged
+
+
+def test_wave6d_observability_iter_anthropic_text_fragments_facade() -> None:
+    """_iter_anthropic_text_fragments facade yields text from Anthropic shapes."""
+    assert lpe._iter_anthropic_text_fragments is (
+        observability_metadata._iter_anthropic_text_fragments
+    )
+    fragments = list(lpe._iter_anthropic_text_fragments("plain string"))
+    assert fragments == ["plain string"]
+    # Non-text dicts are walked recursively; only type=="text" dicts yield text
+    fragments = list(
+        lpe._iter_anthropic_text_fragments(
+            [{"type": "text", "text": "hello"}, "tail"]
+        )
+    )
+    assert fragments == ["hello", "tail"]
+
+
+def test_wave6d_observability_extract_agent_tenant_facade() -> None:
+    """_extract_claude_agent_and_tenant_from_request_body facade call-through."""
+    assert lpe._extract_claude_agent_and_tenant_from_request_body is (
+        observability_metadata._extract_claude_agent_and_tenant_from_request_body
+    )
+    body = {
+        "system": "You are 'alibaba' and you are working on the 'litellm' project."
+    }
+    agent, tenant = lpe._extract_claude_agent_and_tenant_from_request_body(body)
+    assert agent == "alibaba"
+    assert tenant == "litellm"
+
+
+def test_wave6d_observability_detect_post_rewrite_context_files_facade() -> None:
+    """_detect_claude_post_rewrite_context_files facade call-through."""
+    assert lpe._detect_claude_post_rewrite_context_files is (
+        observability_metadata._detect_claude_post_rewrite_context_files
+    )
+    body: dict[str, Any] = {"system": "see MEMORY.md for details"}
+    result = lpe._detect_claude_post_rewrite_context_files(body)
+    assert "MEMORY.md" in result
+
+
+def test_wave6d_alias_guidance_prevention_facade_call_through() -> None:
+    """Prevention guidance facade is same-object and appends to instructions."""
+    assert lpe._append_codex_auto_agent_prevention_guidance_to_instructions is (
+        alias_guidance._append_codex_auto_agent_prevention_guidance_to_instructions
+    )
+    result = lpe._append_codex_auto_agent_prevention_guidance_to_instructions(
+        "base instructions"
+    )
+    assert result.startswith("base instructions")
+    assert len(result) > len("base instructions")
+
+
+def test_wave6d_alias_guidance_read_agent_model_facade() -> None:
+    """_is_aawm_read_agent_alias_model facade call-through."""
+    assert lpe._is_aawm_read_agent_alias_model is (
+        alias_guidance._is_aawm_read_agent_alias_model
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        CODEX_AAWM_READ_ALIAS,
+    )
+
+    assert lpe._is_aawm_read_agent_alias_model(CODEX_AAWM_READ_ALIAS) is True
+    assert lpe._is_aawm_read_agent_alias_model("gpt-4o") is False
+
+
+def test_wave6d_observability_get_nested_str_value_facade() -> None:
+    """_get_nested_str_value facade is observability-owned, not control-plane."""
+    from litellm.proxy.pass_through_endpoints import (
+        aawm_claude_control_plane as cp,
+    )
+
+    assert lpe._get_nested_str_value is (
+        observability_metadata._get_nested_str_value
+    )
+    # Control plane has its own distinct copy
+    assert cp._get_nested_str_value is not lpe._get_nested_str_value
+    # Both work
+    nested = {"x": {"y": {"z": "deep"}}}
+    assert lpe._get_nested_str_value(nested, ("x", "y", "z")) == "deep"
+    assert cp._get_nested_str_value(nested, ("x", "y", "z")) == "deep"
+    assert lpe._get_nested_str_value(nested, ("x", "missing")) is None

@@ -545,6 +545,71 @@ wave does not claim ownership of Wave 6D-6F concerns (additional provider
 extractions, further route-body decomposition, or cross-provider runtime
 consolidation).
 
+#### Wave 6D request-policy ownership
+
+Wave 6D extracts request-policy concerns from `llm_passthrough_endpoints.py`
+into three focused modules under
+`litellm/proxy/pass_through_endpoints/aawm_request_policy/`:
+
+| Concern | Module | Functions |
+|---------|--------|-----------|
+| Claude persisted-output expansion, Google adapter compaction delegates, content-text estimation | `persisted_output.py` | 14 |
+| Shared metadata primitives, session/repository extraction, tool-definition snapshots, Claude/Gemini/Codex breakouts, Anthropic billing headers, route-family logging | `observability_metadata.py` | 43 |
+| Alias-specific system instruction shaping: prevention guidance, read-agent guidance | `alias_guidance.py` | 6 |
+
+Total: 63 functions. No symbol is owned by more than one Wave 6D module, and
+no Wave 6D symbol remains a `FunctionDef` in the god module.
+
+**Estimator ownership.** `_estimate_google_content_text_chars` is owned by
+`persisted_output.py`, not by `providers/google/env_policy.py`. The
+persisted-output module provides a single behavior-compatible implementation
+used by both direct module callers and installed host facades, eliminating the
+prior dual-path divergence.
+
+**Facade and monkeypatch contract.** `persisted_output.py` publishes
+same-object facades via `install(host_globals)`, rebinding each function's
+`__globals__` to the live god-module namespace so existing monkeypatches
+remain reachable at call time. `observability_metadata.py` and
+`alias_guidance.py` facades are direct same-object assignments on the god
+module (no rebinding needed; they resolve dependencies through explicit
+runtime configuration seams).
+
+**Callback seams and configuration order.** The god module configures Wave 6D
+in contractual order:
+
+1. `observability_metadata.configure_observability_metadata_runtime(...)` --
+   binds tenant, headers, and env callbacks.
+2. `persisted_output.bind_runtime(globals())` +
+   `persisted_output.configure_persisted_output_logging_callback(...)` +
+   `persisted_output.install(globals())` -- binds runtime deps, sets the
+   observability-owned logging callback, then installs rebound facades.
+3. `alias_guidance.configure_alias_guidance_runtime(...)` -- binds canonical
+   `_merge_litellm_metadata` and `_build_langfuse_span_descriptor` callbacks
+   from the observability module.
+
+This ordering is contractual: observability metadata must be configured before
+persisted-output installation (which references the logging callback), and
+alias guidance must be configured after observability (which supplies its
+merge/span callbacks).
+
+**Control-plane canonicalization.** `aawm_claude_control_plane.py` imports
+three canonical helpers from `observability_metadata`:
+
+- `_iter_anthropic_text_fragments`
+- `_extract_claude_agent_and_tenant_from_request_body`
+- `_detect_claude_post_rewrite_context_files`
+
+These are same-object references to the observability module's definitions.
+The control plane retains its own distinct local `_get_nested_str_value`
+implementation, which is intentionally separate from the
+observability-metadata facade of the same name.
+
+**Import boundary.** No Wave 6D module imports `llm_passthrough_endpoints` at
+module scope. `persisted_output.py` imports from `providers/google/env_policy`,
+`providers/google/persisted_output` (shaping), and `aawm_alias_routing/lane_keys`
+for patterns and caps. `alias_guidance.py` imports from `lane_keys` (policy
+constants) and `aawm_alias_routing/policy` (alias names).
+
 ### Runtime invariants
 
 - Durable Redis keys use

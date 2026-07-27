@@ -324,6 +324,9 @@ from litellm.llms.anthropic.experimental_pass_through.providers.antigravity impo
 from .aawm_alias_routing import lane_keys as _aawm_lane_keys
 from .aawm_adapter_runtime import model_resolution as _aawm_adapter_model_resolution
 from . import aawm_adapter_runtime as _aawm_adapter_runtime
+from .aawm_request_policy import alias_guidance as _aawm_alias_guidance
+from .aawm_request_policy import observability_metadata as _aawm_observability_metadata
+from .aawm_request_policy import persisted_output as _aawm_persisted_output
 from litellm.llms.anthropic.experimental_pass_through.providers.google import env_policy as _google_env_policy
 from litellm.llms.anthropic.experimental_pass_through.providers.google import context_window as _google_context_window
 from litellm.llms.anthropic.experimental_pass_through.providers.google import error_signals as _google_error_signals
@@ -2718,7 +2721,7 @@ _get_google_adapter_max_contents_window = _google_env_policy._get_google_adapter
 _get_google_adapter_max_contents_text_chars = _google_env_policy._get_google_adapter_max_contents_text_chars
 
 
-_estimate_google_content_text_chars = _google_env_policy._estimate_google_content_text_chars
+_estimate_google_content_text_chars = _aawm_persisted_output._estimate_google_content_text_chars
 
 
 _google_content_has_text = _google_env_policy._google_content_has_text
@@ -6486,50 +6489,6 @@ def _normalize_aawm_sslmode(value: Optional[str]) -> Optional[str]:
     return cleaned
 
 
-def _is_claude_persisted_output_expansion_enabled() -> bool:
-    value = os.getenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _get_claude_persisted_output_root() -> Path:
-    # RR-054 #47: prefer env override; default to the current user home rather than a
-    # hard-coded operator path so other hosts do not silently depend on /home/zepfu.
-    raw = os.getenv("LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT")
-    if raw and str(raw).strip():
-        return Path(str(raw).strip()).expanduser()
-    return Path.home() / ".claude" / "projects"
-
-
-def _resolve_claude_persisted_output_path(path_str: str) -> Optional[Path]:
-    try:
-        root = _get_claude_persisted_output_root().resolve(strict=True)
-        candidate = Path(path_str).expanduser().resolve(strict=True)
-    except Exception:
-        return None
-
-    if not candidate.is_file():
-        return None
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        return None
-    if "tool-results" not in candidate.parts:
-        return None
-    if not candidate.name.endswith("-additionalContext.txt"):
-        return None
-    return candidate
-
-
-def _build_claude_persisted_output_source_metadata(*, resolved_path: Path, file_text: str) -> dict[str, Any]:
-    file_bytes = file_text.encode("utf-8")
-    return {
-        "path": str(resolved_path),
-        "basename": resolved_path.name,
-        "content_hash": hashlib.sha256(file_bytes).hexdigest(),
-        "bytes": len(file_bytes),
-    }
-
-
 _get_google_adapter_persisted_output_char_cap = _google_env_policy._get_google_adapter_persisted_output_char_cap
 
 
@@ -6540,46 +6499,6 @@ _get_google_adapter_followup_persisted_output_char_cap = _google_env_policy._get
 
 
 _get_google_adapter_followup_auxiliary_context_char_cap = _google_env_policy._get_google_adapter_followup_auxiliary_context_char_cap
-
-
-def _compact_google_adapter_persisted_output_preview_and_expanded_text(
-    text: str, *, cap: int
-) -> tuple[str, int, set[str], list[dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_persisted_output_preview_and_expanded_text(text, cap=cap)
-
-
-def _compact_expanded_claude_persisted_output_text_for_google_adapter(
-    text: str, *, persisted_output_char_cap: Optional[int] = None, auxiliary_context_char_cap: Optional[int] = None
-) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_expanded_claude_persisted_output_text_for_google_adapter(
-        text, persisted_output_char_cap=persisted_output_char_cap, auxiliary_context_char_cap=auxiliary_context_char_cap
-    )
-
-
-def _compact_google_adapter_text_part_sequence(
-    parts: list[Any],
-) -> Tuple[list[Any], int, set[str], list[dict[str, Any]], bool]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_text_part_sequence(parts)
-
-
-def _compact_google_adapter_followup_request_contents(request_block: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_followup_request_contents(request_block)
-
-
-def _compact_google_adapter_persisted_output_value(value: Any) -> Tuple[Any, int, set[str], list[dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_persisted_output_value(value)
-
-
-def _compact_google_adapter_persisted_output_in_anthropic_request_body(
-    request_body: dict[str, Any],
-) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_persisted_output_in_anthropic_request_body(request_body)
 
 
 def _detect_openai_adapter_claude_context_markers(text: str) -> set[str]:
@@ -6836,946 +6755,6 @@ def _compact_openai_adapter_claude_context_in_anthropic_request_body(
     )
     return updated_body, compacted_count, markers, metadata_items
 
-
-def _expand_claude_persisted_output_text(
-    text: str,
-) -> Tuple[str, bool, Optional[str], Optional[dict[str, Any]]]:
-    if not _is_claude_persisted_output_expansion_enabled():
-        return text, False, None, None
-
-    match = _CLAUDE_PERSISTED_OUTPUT_PATTERN.match(text)
-    if match is None:
-        return text, False, None, None
-
-    resolved_path = _resolve_claude_persisted_output_path(match.group("path"))
-    if resolved_path is None:
-        return text, False, None, None
-
-    try:
-        file_text = resolved_path.read_text(encoding="utf-8", errors="replace").rstrip("\n")
-    except Exception:
-        return text, False, None, None
-
-    hook = match.group("hook")
-    expanded = (
-        "<system-reminder>\n"
-        f"{hook} hook additional context: <persisted-output>\n"
-        f"{file_text}\n"
-        "</persisted-output>\n"
-        "</system-reminder>\n"
-    )
-    return (
-        expanded,
-        True,
-        hook.lower(),
-        _build_claude_persisted_output_source_metadata(
-            resolved_path=resolved_path,
-            file_text=file_text,
-        ),
-    )
-
-
-def _expand_claude_persisted_output_value(
-    value: Any,
-) -> Tuple[Any, int, set[str], list[dict[str, Any]]]:
-    if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
-            (
-                expanded_text,
-                was_expanded,
-                hook_name,
-                source_metadata,
-            ) = _expand_claude_persisted_output_text(value["text"])
-            if was_expanded:
-                updated_value = dict(value)
-                updated_value["text"] = expanded_text
-                return (
-                    updated_value,
-                    1,
-                    {hook_name} if hook_name else set(),
-                    [source_metadata] if source_metadata else [],
-                )
-            return value, 0, set(), []
-
-        updated_dict: dict[str, Any] = {}
-        expanded_count = 0
-        hooks: set[str] = set()
-        source_metadata_items: list[dict[str, Any]] = []
-        changed = False
-        for key, child in value.items():
-            (
-                updated_child,
-                child_expanded_count,
-                child_hooks,
-                child_source_metadata_items,
-            ) = _expand_claude_persisted_output_value(child)
-            updated_dict[key] = updated_child
-            expanded_count += child_expanded_count
-            hooks.update(child_hooks)
-            source_metadata_items.extend(child_source_metadata_items)
-            if updated_child is not child:
-                changed = True
-        return (
-            updated_dict if changed else value,
-            expanded_count,
-            hooks,
-            source_metadata_items,
-        )
-
-    if isinstance(value, list):
-        updated_list = []
-        expanded_count = 0
-        list_hooks: set[str] = set()
-        list_source_metadata_items: list[dict[str, Any]] = []
-        changed = False
-        for child in value:
-            (
-                updated_child,
-                child_expanded_count,
-                child_hooks,
-                child_source_metadata_items,
-            ) = _expand_claude_persisted_output_value(child)
-            updated_list.append(updated_child)
-            expanded_count += child_expanded_count
-            list_hooks.update(child_hooks)
-            list_source_metadata_items.extend(child_source_metadata_items)
-            if updated_child is not child:
-                changed = True
-        return (
-            updated_list if changed else value,
-            expanded_count,
-            list_hooks,
-            list_source_metadata_items,
-        )
-
-    return value, 0, set(), []
-
-
-def _merge_litellm_metadata(
-    request_body: dict[str, Any],
-    *,
-    tags_to_add: Optional[list[str]] = None,
-    extra_fields: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    updated_body = dict(request_body)
-    litellm_metadata = dict(updated_body.get("litellm_metadata") or {})
-    existing_tags = litellm_metadata.get("tags") or []
-    if not isinstance(existing_tags, list):
-        existing_tags = []
-
-    merged_tags = list(existing_tags)
-    for tag in tags_to_add or []:
-        if tag not in merged_tags:
-            merged_tags.append(tag)
-
-    litellm_metadata["tags"] = merged_tags
-    if extra_fields:
-        existing_spans = litellm_metadata.get("langfuse_spans")
-        incoming_spans = extra_fields.get("langfuse_spans")
-        if isinstance(existing_spans, list) and isinstance(incoming_spans, list):
-            merged_extra_fields = dict(extra_fields)
-            merged_extra_fields["langfuse_spans"] = list(existing_spans) + list(incoming_spans)
-            litellm_metadata.update(merged_extra_fields)
-        else:
-            litellm_metadata.update(extra_fields)
-
-    updated_body["litellm_metadata"] = litellm_metadata
-    return updated_body
-
-
-def _format_langfuse_span_timestamp(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _build_langfuse_span_descriptor(
-    *,
-    name: str,
-    metadata: Optional[dict[str, Any]] = None,
-    input_data: Any = None,
-    output_data: Any = None,
-    start_time: Optional[datetime] = None,
-    end_time: Optional[datetime] = None,
-) -> dict[str, Any]:
-    descriptor: dict[str, Any] = {"name": name}
-    if input_data is not None:
-        descriptor["input"] = input_data
-    if output_data is not None:
-        descriptor["output"] = output_data
-    if metadata:
-        descriptor["metadata"] = metadata
-    if start_time is not None:
-        descriptor["start_time"] = _format_langfuse_span_timestamp(start_time)
-    if end_time is not None:
-        descriptor["end_time"] = _format_langfuse_span_timestamp(end_time)
-    return descriptor
-
-
-def _get_nested_str_value(source: Any, path: tuple[str, ...]) -> Optional[str]:
-    current = source
-    for key in path:
-        if isinstance(current, str):
-            stripped_current = current.strip()
-            if not stripped_current:
-                return None
-            try:
-                current = json.loads(stripped_current)
-            except json.JSONDecodeError:
-                return None
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    if isinstance(current, str) and current.strip():
-        return current.strip()
-    return None
-
-
-def _extract_passthrough_session_id(request: Request, request_body: Optional[dict[str, Any]] = None) -> Optional[str]:
-    if isinstance(request_body, dict):
-        for path in (
-            ("session_id",),
-            ("request", "session_id"),
-            ("metadata", "session_id"),
-            ("metadata", "user_id", "session_id"),
-        ):
-            value = _get_nested_str_value(request_body, path)
-            if value:
-                return value
-
-    headers = _safe_get_request_headers(request)
-    for header_name in _PASSTHROUGH_SESSION_ID_HEADER_NAMES:
-        value = headers.get(header_name)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _normalize_passthrough_repository(value: str) -> Optional[str]:
-    cleaned = value.strip().strip("`'\"")
-    if not cleaned:
-        return None
-    if cleaned.startswith("git@") and ":" in cleaned:
-        cleaned = cleaned.split(":", 1)[1]
-    elif "://" in cleaned:
-        parsed = urlparse(cleaned)
-        path = parsed.path.strip("/")
-        netloc = parsed.netloc.split("@", 1)[-1]
-        if parsed.scheme == "file" and path:
-            cleaned = path.rstrip("/").rsplit("/", 1)[-1]
-        elif netloc.lower().endswith("github.com") and path:
-            cleaned = path
-        else:
-            cleaned = f"{netloc}/{path}".strip("/")
-    elif cleaned.startswith("/"):
-        cleaned = cleaned.rstrip("/").rsplit("/", 1)[-1]
-    if cleaned.endswith(".git"):
-        cleaned = cleaned[:-4]
-    cleaned = cleaned.strip("/")
-    if not cleaned:
-        return None
-
-    normalized = cleaned.lower()
-    if normalized.endswith(" (memory)"):
-        normalized = normalized[: -len(" (memory)")]
-    if (
-        normalized in _PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES
-        or _PASSTHROUGH_REPOSITORY_TRANSCRIPT_ARTIFACT_RE.fullmatch(normalized)
-        or normalized in _PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES
-        or _PASSTHROUGH_REPOSITORY_AGENT_ID_RE.fullmatch(normalized)
-        or _PASSTHROUGH_REPOSITORY_WAVE_AGENT_RE.fullmatch(normalized)
-    ):
-        return None
-
-    return cleaned
-
-
-def _extract_passthrough_repository_from_text(value: str) -> Optional[str]:
-    for pattern in _PASSTHROUGH_REPOSITORY_TEXT_PATTERNS:
-        matches = list(pattern.finditer(value))
-        for match in reversed(matches):
-            repository = _normalize_passthrough_repository(match.group("path"))
-            if repository:
-                return repository
-    return None
-
-
-def _walk_request_value_with_budget(
-    value: object,
-    *,
-    visitor: Callable[[object, int], Optional[_WalkResultT]],
-    max_depth: int = _AAWM_REQUEST_BODY_WALK_MAX_DEPTH,
-    max_nodes: int = _AAWM_REQUEST_BODY_WALK_MAX_NODES,
-    _depth: int = 0,
-    _state: Optional[dict[str, int]] = None,
-) -> Optional[_WalkResultT]:
-    """Bounded recursive walk used by request-body sanitizers/extractors (RR-054 #25/#28)."""
-    if _state is None:
-        _state = {"nodes": 0}
-    if _depth > max_depth:
-        return None
-    _state["nodes"] += 1
-    if _state["nodes"] > max_nodes:
-        return None
-    result = visitor(value, _depth)
-    if result is not None:
-        return result
-    if isinstance(value, dict):
-        for child in value.values():
-            found = _walk_request_value_with_budget(
-                child,
-                visitor=visitor,
-                max_depth=max_depth,
-                max_nodes=max_nodes,
-                _depth=_depth + 1,
-                _state=_state,
-            )
-            if found is not None:
-                return found
-    elif isinstance(value, list):
-        # Conversation histories are chronological; prefer the latest workspace
-        # marker so stale context cannot override the current request cwd.
-        for child in reversed(value):
-            found = _walk_request_value_with_budget(
-                child,
-                visitor=visitor,
-                max_depth=max_depth,
-                max_nodes=max_nodes,
-                _depth=_depth + 1,
-                _state=_state,
-            )
-            if found is not None:
-                return found
-    return None
-
-
-def _extract_passthrough_repository_from_body_text(value: Any) -> Optional[str]:
-    # RR-054 #28: depth/node-budgeted walk so huge histories cannot dominate CPU.
-    def _visitor(node: object, _depth: int) -> Optional[str]:
-        if isinstance(node, str):
-            return _extract_passthrough_repository_from_text(node)
-        if isinstance(node, dict):
-            for key, child in node.items():
-                if key in _PASSTHROUGH_REPOSITORY_BODY_KEYS and isinstance(child, str):
-                    repository = _normalize_passthrough_repository(child)
-                    if repository:
-                        return repository
-        return None
-
-    # Prefer shallow dict key hits first for common metadata shapes.
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key in _PASSTHROUGH_REPOSITORY_BODY_KEYS and isinstance(child, str):
-                repository = _normalize_passthrough_repository(child)
-                if repository:
-                    return repository
-    return _walk_request_value_with_budget(value, visitor=_visitor)
-
-
-def _extract_passthrough_repository(request: Request, request_body: Optional[dict[str, Any]] = None) -> Optional[str]:
-    if isinstance(request_body, dict):
-        for path in (
-            ("repository",),
-            ("repo",),
-            ("workspace_root",),
-            ("workspaceRoot",),
-            ("project_root",),
-            ("projectRoot",),
-            ("root_path",),
-            ("rootPath",),
-            ("working_directory",),
-            ("workingDirectory",),
-            ("cwd_path",),
-            ("cwdPath",),
-            ("cwd_uri",),
-            ("cwdUri",),
-            ("metadata", "repository"),
-            ("metadata", "repo"),
-            ("metadata", "workspace_root"),
-            ("metadata", "workspaceRoot"),
-            ("litellm_metadata", "repository"),
-            ("request", "repository"),
-            ("request", "workspace_root"),
-            ("request", "workspaceRoot"),
-            ("request", "project_root"),
-            ("request", "projectRoot"),
-            ("request", "root_path"),
-            ("request", "rootPath"),
-            ("request", "working_directory"),
-            ("request", "workingDirectory"),
-            ("request", "cwd_path"),
-            ("request", "cwdPath"),
-            ("request", "cwd_uri"),
-            ("request", "cwdUri"),
-            ("request", "metadata", "repository"),
-            ("request", "metadata", "workspace_root"),
-            ("request", "metadata", "workspaceRoot"),
-        ):
-            value = _get_nested_str_value(request_body, path)
-            if value:
-                return _normalize_passthrough_repository(value)
-        repository = _extract_passthrough_repository_from_body_text(request_body)
-        if repository:
-            return repository
-
-    headers = _safe_get_request_headers(request)
-    for header_name in _PASSTHROUGH_REPOSITORY_HEADER_NAMES:
-        value = headers.get(header_name)
-        if isinstance(value, str) and value.strip():
-            return _normalize_passthrough_repository(value)
-    return None
-
-
-def _get_passthrough_trace_environment() -> Optional[str]:
-    for env_var in (
-        "LITELLM_LANGFUSE_TRACE_ENVIRONMENT",
-        "LANGFUSE_TRACING_ENVIRONMENT",
-    ):
-        value = os.getenv(env_var)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _add_passthrough_trace_context_metadata(
-    request_body: dict[str, Any],
-    *,
-    session_id: Optional[str],
-    trace_environment: Optional[str],
-    repository: Optional[str] = None,
-) -> dict[str, Any]:
-    updated_body = dict(request_body)
-    litellm_metadata = dict(updated_body.get("litellm_metadata") or {})
-    changed = False
-
-    if session_id and not litellm_metadata.get("session_id"):
-        litellm_metadata["session_id"] = session_id
-        changed = True
-
-    if trace_environment:
-        existing_trace_environment = litellm_metadata.get("trace_environment")
-        if existing_trace_environment != trace_environment:
-            if existing_trace_environment and not litellm_metadata.get("source_trace_environment"):
-                litellm_metadata["source_trace_environment"] = existing_trace_environment
-            litellm_metadata["trace_environment"] = trace_environment
-            changed = True
-
-    if repository and not litellm_metadata.get("repository"):
-        litellm_metadata["repository"] = repository
-        changed = True
-
-    if not changed:
-        return request_body
-
-    updated_body["litellm_metadata"] = litellm_metadata
-    return updated_body
-
-
-_AAWM_TOOL_DEFINITION_CAPTURE_VERSION = "v1"
-_AAWM_TOOL_DEFINITION_MAX_TOOLS = 64
-_AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS = 128
-_AAWM_TOOL_DEFINITION_MAX_STRING_CHARS = 4096
-_AAWM_TOOL_DEFINITION_MAX_DEPTH = 20
-_AAWM_TOOL_DEFINITION_REDACTED = "redacted-by-litellm"
-_AAWM_TOOL_DEFINITION_SECRET_KEY_RE = re.compile(
-    r"("
-    r"authorization|api[_-]?key|bearer|credential|password|secret|^token$"
-    r"|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token"
-    r")",
-    re.IGNORECASE,
-)
-_AAWM_TOOL_DEFINITION_SECRET_VALUE_RES = (
-    # RR-054 #55: broader secret-shaped redaction beyond Bearer/sk-/pk- only.
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{6,}", re.IGNORECASE),
-    re.compile(r"\b(?:sk|pk|rk|ak)-[A-Za-z0-9._-]{8,}\b", re.IGNORECASE),
-    re.compile(r"\b(?:xox[baprs]-)[A-Za-z0-9-]{10,}\b"),
-    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bAIza[0-9A-Za-z\-_]{20,}\b"),
-    re.compile(r"\bya29\.[0-9A-Za-z\-_.]{20,}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
-    re.compile(r"(?i)\b(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?([^\s'\"]{8,})"),
-)
-
-
-def _truncate_tool_definition_string(value: str) -> tuple[str, bool]:
-    if len(value) <= _AAWM_TOOL_DEFINITION_MAX_STRING_CHARS:
-        return value, False
-    return value[:_AAWM_TOOL_DEFINITION_MAX_STRING_CHARS], True
-
-
-def _redact_tool_definition_string(value: str) -> str:
-    redacted = value
-    for pattern in _AAWM_TOOL_DEFINITION_SECRET_VALUE_RES:
-        redacted = pattern.sub(_AAWM_TOOL_DEFINITION_REDACTED, redacted)
-    return redacted
-
-
-def _sanitize_tool_definition_value(
-    value: Any,
-    *,
-    depth: int = 0,
-    key_hint: Optional[str] = None,
-) -> tuple[Any, bool]:
-    if depth > _AAWM_TOOL_DEFINITION_MAX_DEPTH:
-        return {"__truncated__": "max_depth"}, True
-    if key_hint and _AAWM_TOOL_DEFINITION_SECRET_KEY_RE.search(key_hint):
-        return _AAWM_TOOL_DEFINITION_REDACTED, False
-    if isinstance(value, str):
-        return _truncate_tool_definition_string(_redact_tool_definition_string(value))
-    if value is None or isinstance(value, (bool, int, float)):
-        return value, False
-    if isinstance(value, list):
-        truncated = len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
-        sanitized_items: list[Any] = []
-        for item in value[:_AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS]:
-            sanitized_item, item_truncated = _sanitize_tool_definition_value(
-                item,
-                depth=depth + 1,
-                key_hint=key_hint,
-            )
-            truncated = truncated or item_truncated
-            sanitized_items.append(sanitized_item)
-        if len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS:
-            sanitized_items.append({"__truncated_items__": len(value) - _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS})
-        return sanitized_items, truncated
-    if isinstance(value, dict):
-        truncated = len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
-        sanitized_dict: dict[str, Any] = {}
-        for index, (key, item) in enumerate(value.items()):
-            if index >= _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS:
-                break
-            sanitized_item, item_truncated = _sanitize_tool_definition_value(
-                item,
-                depth=depth + 1,
-                key_hint=str(key),
-            )
-            truncated = truncated or item_truncated
-            sanitized_dict[str(key)] = sanitized_item
-        if len(value) > _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS:
-            sanitized_dict["__truncated_keys__"] = len(value) - _AAWM_TOOL_DEFINITION_MAX_CONTAINER_ITEMS
-        return sanitized_dict, truncated
-    return str(value), False
-
-
-def _tool_definition_name(tool: dict[str, Any]) -> Optional[str]:
-    function_definition = tool.get("function")
-    for candidate in (
-        tool.get("name"),
-        function_definition.get("name") if isinstance(function_definition, dict) else None,
-        tool.get("tool_name"),
-    ):
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return None
-
-
-def _tool_definition_description(tool: dict[str, Any]) -> Optional[str]:
-    function_definition = tool.get("function")
-    for candidate in (
-        tool.get("description"),
-        function_definition.get("description") if isinstance(function_definition, dict) else None,
-    ):
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return None
-
-
-def _tool_definition_parameters(tool: dict[str, Any]) -> Any:
-    function_definition = tool.get("function")
-    if isinstance(function_definition, dict) and "parameters" in function_definition:
-        return function_definition.get("parameters")
-    for key in ("parameters", "input_schema", "schema", "json_schema"):
-        if key in tool:
-            return tool.get(key)
-    return None
-
-
-def _build_tool_definition_snapshot_entry(
-    *,
-    source: str,
-    index: int,
-    tool: Any,
-) -> tuple[Optional[dict[str, Any]], bool]:
-    if not isinstance(tool, dict):
-        return None, False
-
-    sanitized_definition, definition_truncated = _sanitize_tool_definition_value(tool)
-    sanitized_parameters, parameters_truncated = _sanitize_tool_definition_value(_tool_definition_parameters(tool))
-    description, description_truncated = _truncate_tool_definition_string(
-        _redact_tool_definition_string(_tool_definition_description(tool) or "")
-    )
-    entry = {
-        "source": source,
-        "index": index,
-        "type": tool.get("type"),
-        "name": _tool_definition_name(tool),
-        "description": description,
-        "parameters": sanitized_parameters,
-        "definition": sanitized_definition,
-    }
-    return entry, bool(definition_truncated or parameters_truncated or description_truncated)
-
-
-def _tool_definition_snapshot_hash(snapshot: list[dict[str, Any]]) -> str:
-    encoded = json.dumps(
-        snapshot,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _build_passthrough_tool_definition_metadata(
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    tool_sources: tuple[tuple[str, Any], ...] = (
-        ("tools", request_body.get("tools")),
-        ("functions", request_body.get("functions")),
-    )
-    snapshot: list[dict[str, Any]] = []
-    available_count = 0
-    truncated = False
-    source_names: list[str] = []
-
-    for source, tools in tool_sources:
-        if not isinstance(tools, list):
-            continue
-        source_names.append(source)
-        available_count += len(tools)
-        for index, tool in enumerate(tools):
-            if len(snapshot) >= _AAWM_TOOL_DEFINITION_MAX_TOOLS:
-                truncated = True
-                break
-            entry, entry_truncated = _build_tool_definition_snapshot_entry(
-                source=source,
-                index=index,
-                tool=tool,
-            )
-            if entry is None:
-                continue
-            snapshot.append(entry)
-            truncated = truncated or entry_truncated
-
-    if not snapshot:
-        return {}
-
-    names = [entry["name"] for entry in snapshot if isinstance(entry.get("name"), str) and entry.get("name")]
-    tool_types = [entry["type"] for entry in snapshot if isinstance(entry.get("type"), str) and entry.get("type")]
-    # RR-054 #40: keep full snapshots opt-in; default metadata is names/types/hash only.
-    include_full_snapshot = os.getenv("AAWM_TOOL_DEFINITION_INCLUDE_FULL_SNAPSHOT", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    metadata = {
-        "aawm_tool_definition_capture_version": (_AAWM_TOOL_DEFINITION_CAPTURE_VERSION),
-        "aawm_tool_definition_capture_source": "passthrough_request_body",
-        "aawm_tool_definition_count": available_count,
-        "aawm_tool_definition_captured_count": len(snapshot),
-        "aawm_tool_definition_sources": source_names,
-        "aawm_tool_definition_names": names,
-        "aawm_tool_definition_types": tool_types,
-        "aawm_tool_definition_snapshot_hash": (_tool_definition_snapshot_hash(snapshot)),
-        "aawm_tool_definition_snapshot_truncated": truncated or available_count > len(snapshot),
-        "aawm_tool_definition_snapshot_storage": ("session_history_tool_definition_snapshots"),
-        "aawm_tool_definition_snapshot_storage_key": ("session_id,aawm_tool_definition_snapshot_hash"),
-    }
-    if include_full_snapshot:
-        metadata["aawm_tool_definition_snapshot"] = snapshot
-    return metadata
-
-
-def _add_passthrough_tool_definition_metadata(
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    tool_definition_metadata = _build_passthrough_tool_definition_metadata(request_body)
-    if not tool_definition_metadata:
-        return request_body
-    return _merge_litellm_metadata(
-        request_body,
-        extra_fields=tool_definition_metadata,
-    )
-
-
-def _prepare_request_body_for_passthrough_observability(
-    request: Request, request_body: dict[str, Any]
-) -> dict[str, Any]:
-    session_id = _extract_passthrough_session_id(request=request, request_body=request_body)
-    repository = _extract_passthrough_repository(request=request, request_body=request_body)
-    trace_environment = _get_passthrough_trace_environment()
-    prepared_body = _add_passthrough_trace_context_metadata(
-        request_body,
-        session_id=session_id,
-        trace_environment=trace_environment,
-        repository=repository,
-    )
-    return _add_passthrough_tool_definition_metadata(prepared_body)
-
-
-def _add_route_family_logging_metadata(request_body: dict[str, Any], route_family: str) -> dict[str, Any]:
-    normalized_route_family = _normalize_low_cardinality_tag_value(route_family)
-    if not normalized_route_family:
-        return request_body
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=[f"route:{normalized_route_family}"],
-        extra_fields={"passthrough_route_family": normalized_route_family},
-    )
-
-
-def _append_codex_auto_agent_prevention_guidance_to_instructions(
-    instructions: Optional[str],
-) -> str:
-    existing_instructions = instructions.strip() if isinstance(instructions, str) else ""
-    if _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT in existing_instructions:
-        return existing_instructions
-    if not existing_instructions:
-        return _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT
-    return f"{existing_instructions}\n\n" f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT}"
-
-
-def _is_aawm_read_agent_alias_model(alias_model: Any) -> bool:
-    if not isinstance(alias_model, str):
-        return False
-    return alias_model in {
-        _CODEX_AAWM_READ_ALIAS,
-        _ANTHROPIC_AAWM_READ_ALIAS,
-    }
-
-
-def _append_aawm_read_agent_guidance_to_text(value: Optional[str]) -> str:
-    existing_value = value.strip() if isinstance(value, str) else ""
-    if _AAWM_READ_AGENT_GUIDANCE_PROMPT in existing_value:
-        return existing_value
-    if not existing_value:
-        return _AAWM_READ_AGENT_GUIDANCE_PROMPT
-    return f"{existing_value}\n\n{_AAWM_READ_AGENT_GUIDANCE_PROMPT}"
-
-
-def _append_aawm_read_agent_guidance_to_anthropic_system(
-    system_value: Any,
-) -> tuple[Any, bool, int]:
-    if system_value is None or isinstance(system_value, str):
-        original_chars = len(system_value) if isinstance(system_value, str) else 0
-        updated_system = _append_aawm_read_agent_guidance_to_text(system_value)
-        return updated_system, updated_system != system_value, original_chars
-
-    if not isinstance(system_value, list):
-        return system_value, False, 0
-
-    original_chars = 0
-    for item in system_value:
-        text_value: Optional[str] = None
-        if isinstance(item, str):
-            text_value = item
-        elif isinstance(item, dict) and isinstance(item.get("text"), str):
-            text_value = item["text"]
-        if text_value is None:
-            continue
-        original_chars += len(text_value)
-        if _AAWM_READ_AGENT_GUIDANCE_PROMPT in text_value:
-            return system_value, False, original_chars
-
-    return (
-        [
-            *system_value,
-            {"type": "text", "text": _AAWM_READ_AGENT_GUIDANCE_PROMPT},
-        ],
-        True,
-        original_chars,
-    )
-
-
-def _apply_aawm_read_agent_guidance_to_request_body(
-    request_body: dict[str, Any],
-    *,
-    alias_model: Any,
-    target_field: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not _is_aawm_read_agent_alias_model(alias_model):
-        return request_body, {}
-
-    updated_body = dict(request_body)
-    original_chars = 0
-    if target_field == "instructions":
-        existing_instructions = request_body.get("instructions")
-        if existing_instructions is not None and not isinstance(existing_instructions, str):
-            return request_body, {}
-        updated_value = _append_aawm_read_agent_guidance_to_text(existing_instructions)
-        if updated_value == existing_instructions:
-            return request_body, {}
-        updated_body["instructions"] = updated_value
-        original_chars = len(existing_instructions) if isinstance(existing_instructions, str) else 0
-    elif target_field == "system":
-        (
-            updated_system,
-            changed,
-            original_chars,
-        ) = _append_aawm_read_agent_guidance_to_anthropic_system(request_body.get("system"))
-        if not changed:
-            return request_body, {}
-        updated_body["system"] = updated_system
-    else:
-        return request_body, {}
-
-    guidance_metadata = {
-        "aawm_read_agent_guidance_policy_name": (_AAWM_READ_AGENT_GUIDANCE_POLICY_NAME),
-        "aawm_read_agent_guidance_policy_version": (_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION),
-        "aawm_read_agent_guidance_applied": True,
-        "aawm_read_agent_guidance_alias": alias_model,
-        "aawm_read_agent_guidance_target_field": target_field,
-        "aawm_read_agent_guidance_original_chars": original_chars,
-        "aawm_read_agent_guidance_prompt_chars": len(_AAWM_READ_AGENT_GUIDANCE_PROMPT),
-    }
-    updated_body = _merge_litellm_metadata(
-        updated_body,
-        tags_to_add=[
-            "aawm-read-agent-guidance",
-            ("aawm-read-agent-guidance:" f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}"),
-            f"aawm-read-agent-guidance-alias:{alias_model}",
-        ],
-        extra_fields={
-            **guidance_metadata,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="aawm.read_agent_guidance",
-                    metadata=guidance_metadata,
-                )
-            ],
-        },
-    )
-    return updated_body, guidance_metadata
-
-
-def _apply_codex_auto_agent_prevention_guidance_to_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    existing_instructions = request_body.get("instructions")
-    if existing_instructions is not None and not isinstance(existing_instructions, str):
-        return request_body, {}
-
-    updated_instructions = _append_codex_auto_agent_prevention_guidance_to_instructions(existing_instructions)
-    if updated_instructions == existing_instructions:
-        return request_body, {}
-
-    updated_body = dict(request_body)
-    updated_body["instructions"] = updated_instructions
-    original_chars = len(existing_instructions) if isinstance(existing_instructions, str) else 0
-    guidance_metadata = {
-        "codex_auto_agent_prevention_guidance_policy_name": (_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_NAME),
-        "codex_auto_agent_prevention_guidance_policy_version": (_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION),
-        "codex_auto_agent_prevention_guidance_applied": True,
-        "codex_auto_agent_prevention_guidance_original_instruction_chars": (original_chars),
-        "codex_auto_agent_prevention_guidance_prompt_chars": len(_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT),
-    }
-    updated_body = _merge_litellm_metadata(
-        updated_body,
-        tags_to_add=[
-            "codex-auto-agent-prevention-guidance",
-            ("codex-auto-agent-prevention-guidance:" f"{_CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION}"),
-        ],
-        extra_fields={
-            **guidance_metadata,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="codex.auto_agent_prevention_guidance",
-                    metadata=guidance_metadata,
-                )
-            ],
-        },
-    )
-    return updated_body, guidance_metadata
-
-
-def _normalize_low_cardinality_tag_value(value: Any) -> Optional[str]:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        cleaned = value.strip().lower()
-        return cleaned or None
-    return None
-
-
-def _dedupe_sorted_str_list(values: list[str]) -> list[str]:
-    return sorted({value for value in values if isinstance(value, str) and value})
-
-
-def _extract_claude_request_breakout_fields(
-    request_body: dict[str, Any],
-) -> tuple[list[str], dict[str, Any]]:
-    tags_to_add: list[str] = []
-    extra_fields: dict[str, Any] = {}
-
-    thinking = request_body.get("thinking")
-    if isinstance(thinking, dict):
-        thinking_type = _normalize_low_cardinality_tag_value(thinking.get("type"))
-        if thinking_type:
-            tags_to_add.extend(
-                [
-                    f"claude-thinking-type:{thinking_type}",
-                    f"thinking-type:{thinking_type}",
-                ]
-            )
-            extra_fields["claude_thinking_type"] = thinking_type
-
-    output_config = request_body.get("output_config")
-    if isinstance(output_config, dict):
-        effort = _normalize_low_cardinality_tag_value(output_config.get("effort"))
-        if effort:
-            tags_to_add.extend([f"claude-effort:{effort}", f"effort:{effort}"])
-            extra_fields["claude_effort"] = effort
-
-    context_management = request_body.get("context_management")
-    context_edits = []
-    if isinstance(context_management, dict):
-        edits = context_management.get("edits")
-        if isinstance(edits, list):
-            context_edits = [edit for edit in edits if isinstance(edit, dict)]
-
-    edit_types: list[str] = []
-    keep_values: list[str] = []
-    for edit in context_edits:
-        edit_type = _normalize_low_cardinality_tag_value(edit.get("type"))
-        if edit_type:
-            edit_types.append(edit_type)
-            tags_to_add.append(f"claude-context-edit:{edit_type}")
-        keep_value = _normalize_low_cardinality_tag_value(edit.get("keep"))
-        if keep_value:
-            keep_values.append(keep_value)
-            tags_to_add.append(f"claude-context-keep:{keep_value}")
-
-    if context_edits:
-        extra_fields["claude_context_edit_count"] = len(context_edits)
-    if edit_types:
-        extra_fields["claude_context_edit_types"] = _dedupe_sorted_str_list(edit_types)
-    if keep_values:
-        extra_fields["claude_context_keep_values"] = _dedupe_sorted_str_list(keep_values)
-
-    account_uuid = _get_nested_str_value(request_body, ("metadata", "user_id", "account_uuid"))
-    if account_uuid:
-        extra_fields["claude_account_uuid"] = account_uuid
-    device_id = _get_nested_str_value(request_body, ("metadata", "user_id", "device_id"))
-    if device_id:
-        extra_fields["claude_device_id"] = device_id
-
-    return tags_to_add, extra_fields
-
-
-def _add_claude_request_breakout_logging_metadata(
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    tags_to_add, extra_fields = _extract_claude_request_breakout_fields(request_body)
-    if not tags_to_add and not extra_fields:
-        return request_body
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
-    )
-
-
 def _is_anthropic_web_search_tool(value: dict[str, Any]) -> bool:
     tool_type = value.get("type")
     tool_name = value.get("name")
@@ -7841,89 +6820,6 @@ def _sanitize_anthropic_web_search_empty_domain_lists(
         },
     )
     return updated_body, sanitized_count
-
-
-def _extract_gemini_request_breakout_fields(
-    request_body: dict[str, Any],
-) -> tuple[list[str], dict[str, Any]]:
-    tags_to_add: list[str] = []
-    extra_fields: dict[str, Any] = {}
-
-    generation_config = request_body.get("generationConfig")
-    if not isinstance(generation_config, dict):
-        request_block = request_body.get("request")
-        if isinstance(request_block, dict):
-            nested_generation_config = request_block.get("generationConfig")
-            if isinstance(nested_generation_config, dict):
-                generation_config = nested_generation_config
-
-    if isinstance(generation_config, dict):
-        thinking_config = generation_config.get("thinkingConfig")
-        if isinstance(thinking_config, dict):
-            tags_to_add.append("gemini-thinking-config-present")
-            extra_fields["gemini_thinking_config_present"] = True
-
-            include_thoughts = thinking_config.get("includeThoughts")
-            if isinstance(include_thoughts, bool):
-                include_thoughts_tag = "true" if include_thoughts else "false"
-                tags_to_add.extend(
-                    [
-                        f"gemini-include-thoughts:{include_thoughts_tag}",
-                        f"include-thoughts:{include_thoughts_tag}",
-                    ]
-                )
-                extra_fields["gemini_include_thoughts"] = include_thoughts
-
-            thinking_level = thinking_config.get("thinkingLevel")
-            normalized_thinking_level = _normalize_low_cardinality_tag_value(thinking_level)
-            if normalized_thinking_level:
-                tags_to_add.extend(
-                    [
-                        f"gemini-thinking-level:{normalized_thinking_level}",
-                        f"thinking-level:{normalized_thinking_level}",
-                    ]
-                )
-                extra_fields["gemini_thinking_level"] = normalized_thinking_level
-
-            thinking_budget = thinking_config.get("thinkingBudget")
-            if isinstance(thinking_budget, (int, float)) and thinking_budget > 0:
-                tags_to_add.append("gemini-thinking-budget-configured")
-                extra_fields["gemini_thinking_budget"] = thinking_budget
-
-    tools = request_body.get("tools")
-    if not isinstance(tools, list):
-        request_block = request_body.get("request")
-        if isinstance(request_block, dict):
-            nested_tools = request_block.get("tools")
-            if isinstance(nested_tools, list):
-                tools = nested_tools
-
-    if isinstance(tools, list) and tools:
-        tags_to_add.append("gemini-tools-present")
-        extra_fields["gemini_tools_present"] = True
-        extra_fields["gemini_tool_count"] = len(tools)
-
-    for key in ("user_prompt_id", "project"):
-        value = request_body.get(key)
-        if not value and isinstance(request_body.get("request"), dict):
-            value = request_body["request"].get(key)
-        if isinstance(value, str) and value.strip():
-            extra_fields[f"gemini_{key}"] = value.strip()
-
-    return tags_to_add, extra_fields
-
-
-def _add_gemini_request_breakout_logging_metadata(
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    tags_to_add, extra_fields = _extract_gemini_request_breakout_fields(request_body)
-    if not tags_to_add and not extra_fields:
-        return request_body
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
-    )
 
 
 def _patch_codex_spawn_agent_description_text(description: str) -> tuple[str, int]:
@@ -9491,170 +8387,6 @@ def _apply_codex_tool_description_patches_to_request_body(
     return updated_body, patch_events
 
 
-def _extract_openai_passthrough_tool_choice(value: Any) -> Optional[str]:
-    if isinstance(value, str):
-        return _normalize_low_cardinality_tag_value(value)
-    if isinstance(value, dict):
-        for key in ("type", "name"):
-            normalized = _normalize_low_cardinality_tag_value(value.get(key))
-            if normalized:
-                return normalized
-    return None
-
-
-def _extract_codex_request_breakout_fields(
-    request_body: dict[str, Any],
-) -> tuple[list[str], dict[str, Any]]:
-    tags_to_add: list[str] = []
-    extra_fields: dict[str, Any] = {}
-
-    reasoning = request_body.get("reasoning")
-    if isinstance(reasoning, dict):
-        effort = _normalize_low_cardinality_tag_value(reasoning.get("effort"))
-        if effort:
-            tags_to_add.extend([f"codex-effort:{effort}", f"effort:{effort}"])
-            extra_fields["codex_reasoning_effort"] = effort
-
-    tool_choice = _extract_openai_passthrough_tool_choice(request_body.get("tool_choice"))
-    if tool_choice:
-        tags_to_add.append(f"codex-tool-choice:{tool_choice}")
-        extra_fields["codex_tool_choice"] = tool_choice
-
-    parallel_tool_calls = request_body.get("parallel_tool_calls")
-    if isinstance(parallel_tool_calls, bool):
-        tags_to_add.append(f"codex-parallel-tools:{'true' if parallel_tool_calls else 'false'}")
-        extra_fields["codex_parallel_tool_calls"] = parallel_tool_calls
-
-    include = request_body.get("include")
-    normalized_includes: list[str] = []
-    if isinstance(include, list):
-        for value in include:
-            normalized = _normalize_low_cardinality_tag_value(value)
-            if normalized:
-                normalized_includes.append(normalized)
-                tags_to_add.append(f"codex-include:{normalized}")
-    if normalized_includes:
-        extra_fields["codex_include"] = _dedupe_sorted_str_list(normalized_includes)
-
-    prompt_cache_key = request_body.get("prompt_cache_key")
-    if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
-        extra_fields["codex_prompt_cache_key_present"] = True
-
-    return tags_to_add, extra_fields
-
-
-def _add_codex_request_breakout_logging_metadata(
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    tags_to_add, extra_fields = _extract_codex_request_breakout_fields(request_body)
-    if not tags_to_add and not extra_fields:
-        return request_body
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
-    )
-
-
-def _add_claude_persisted_output_logging_metadata(
-    request_body: dict[str, Any],
-    expanded_count: int,
-    hooks: set[str],
-    source_metadata_items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    span_metadata: dict[str, Any] = {
-        "expanded_count": expanded_count,
-        "hook_count": len(hooks),
-    }
-    if hooks:
-        span_metadata["hooks"] = sorted(hooks)
-    if source_metadata_items:
-        span_metadata["source_count"] = len(source_metadata_items)
-        span_metadata["source_paths"] = [
-            item["path"] for item in source_metadata_items if isinstance(item.get("path"), str)
-        ]
-        span_metadata["source_content_hashes"] = [
-            item["content_hash"] for item in source_metadata_items if isinstance(item.get("content_hash"), str)
-        ]
-        span_metadata["source_bytes"] = [
-            item["bytes"] for item in source_metadata_items if isinstance(item.get("bytes"), int)
-        ]
-    tags_to_add = ["claude-persisted-output-expanded"]
-    tags_to_add.extend(f"claude-persisted-output-hook:{hook}" for hook in sorted(hooks) if hook)
-    extra_fields: dict[str, Any] = {
-        "claude_persisted_output_expanded": True,
-        "claude_persisted_output_expanded_count": expanded_count,
-        "langfuse_spans": [
-            _build_langfuse_span_descriptor(
-                name="claude.persisted_output_expand",
-                metadata=span_metadata,
-            )
-        ],
-    }
-    if hooks:
-        extra_fields["claude_persisted_output_hooks"] = sorted(hooks)
-    if source_metadata_items:
-        extra_fields["claude_persisted_output_source_paths"] = [
-            item["path"] for item in source_metadata_items if isinstance(item.get("path"), str)
-        ]
-        extra_fields["claude_persisted_output_source_basenames"] = [
-            item["basename"] for item in source_metadata_items if isinstance(item.get("basename"), str)
-        ]
-        extra_fields["claude_persisted_output_source_content_hashes"] = [
-            item["content_hash"] for item in source_metadata_items if isinstance(item.get("content_hash"), str)
-        ]
-        extra_fields["claude_persisted_output_source_bytes"] = [
-            item["bytes"] for item in source_metadata_items if isinstance(item.get("bytes"), int)
-        ]
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
-    )
-
-
-def _parse_anthropic_billing_header_text(text: str) -> dict[str, str]:
-    parsed_fields: dict[str, str] = {}
-    for line in text.splitlines():
-        stripped_line = line.strip()
-        if not stripped_line.lower().startswith(_ANTHROPIC_BILLING_HEADER_PREFIX):
-            continue
-        raw_header_value = stripped_line.split(":", 1)[1].strip()
-        for segment in raw_header_value.split(";"):
-            cleaned_segment = segment.strip()
-            if not cleaned_segment or "=" not in cleaned_segment:
-                continue
-            key, value = cleaned_segment.split("=", 1)
-            cleaned_key = key.strip()
-            cleaned_value = value.strip()
-            if cleaned_key and cleaned_value:
-                parsed_fields[cleaned_key] = cleaned_value
-    return parsed_fields
-
-
-def _extract_anthropic_billing_header_fields(value: Any) -> dict[str, str]:
-    parsed_fields: dict[str, str] = {}
-
-    if isinstance(value, str):
-        return _parse_anthropic_billing_header_text(value)
-
-    if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
-            parsed_fields.update(_parse_anthropic_billing_header_text(value["text"]))
-        for child in value.values():
-            parsed_fields.update(_extract_anthropic_billing_header_fields(child))
-        return parsed_fields
-
-    if isinstance(value, list):
-        for child in value:
-            parsed_fields.update(_extract_anthropic_billing_header_fields(child))
-
-    return parsed_fields
-
-
-def _extract_anthropic_billing_header_fields_from_request_body(request_body: dict[str, Any]) -> dict[str, str]:
-    return _extract_anthropic_billing_header_fields(request_body.get("system"))
-
 
 def _parse_claude_code_version(
     cc_version: Optional[str],
@@ -10151,176 +8883,6 @@ def _apply_claude_prompt_patches_to_anthropic_request_body(
                     span_descriptor["start_time"] = _format_langfuse_span_timestamp(span_started_at)
                     span_descriptor["end_time"] = _format_langfuse_span_timestamp(datetime.now(timezone.utc))
     return updated_body, patch_events
-
-
-def _add_anthropic_billing_header_logging_metadata(
-    request_body: dict[str, Any],
-    billing_header_fields: dict[str, str],
-) -> dict[str, Any]:
-    tags_to_add = ["anthropic-billing-header"]
-    for key in sorted(billing_header_fields):
-        value = billing_header_fields[key]
-        tags_to_add.append(f"anthropic-billing-header-key:{key}")
-        tags_to_add.append(f"anthropic-billing-header:{key}={value}")
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "anthropic_billing_header_present": True,
-            "anthropic_billing_header_keys": sorted(billing_header_fields),
-            "anthropic_billing_header_fields": dict(billing_header_fields),
-        },
-    )
-
-
-def _expand_claude_persisted_output_in_anthropic_request_body(
-    request_body: dict[str, Any],
-) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
-    span_started_at = datetime.now(timezone.utc)
-    (
-        updated_body,
-        expanded_count,
-        hooks,
-        source_metadata_items,
-    ) = _expand_claude_persisted_output_value(request_body)
-    if isinstance(updated_body, dict):
-        if expanded_count > 0:
-            updated_body = _add_claude_persisted_output_logging_metadata(
-                updated_body,
-                expanded_count,
-                hooks,
-                source_metadata_items,
-            )
-            litellm_metadata = updated_body.get("litellm_metadata")
-            if isinstance(litellm_metadata, dict):
-                langfuse_spans = litellm_metadata.get("langfuse_spans")
-                if isinstance(langfuse_spans, list):
-                    for span_descriptor in langfuse_spans:
-                        if (
-                            isinstance(span_descriptor, dict)
-                            and span_descriptor.get("name") == "claude.persisted_output_expand"
-                        ):
-                            span_descriptor["start_time"] = _format_langfuse_span_timestamp(span_started_at)
-                            span_descriptor["end_time"] = _format_langfuse_span_timestamp(datetime.now(timezone.utc))
-        return updated_body, expanded_count, hooks, source_metadata_items
-    return request_body, 0, set(), []
-
-
-def _iter_anthropic_text_fragments(value: Any):
-    if isinstance(value, str):
-        yield value
-        return
-
-    if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
-            yield value["text"]
-            return
-        for child in value.values():
-            yield from _iter_anthropic_text_fragments(child)
-        return
-
-    if isinstance(value, list):
-        for child in value:
-            yield from _iter_anthropic_text_fragments(child)
-
-
-def _extract_claude_agent_and_tenant_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[Optional[str], Optional[str]]:
-    for top_level_key in ("messages", "system"):
-        for fragment in _iter_anthropic_text_fragments(request_body.get(top_level_key)):
-            match = _CLAUDE_AGENT_TENANT_PATTERN.search(fragment)
-            if match is None:
-                continue
-            agent = match.group("agent").strip()
-            tenant = match.group("tenant").strip()
-            if agent and tenant:
-                return agent, tenant
-    return None, None
-
-
-def _add_claude_child_agent_observability_metadata(
-    request_body: dict[str, Any],
-    *,
-    explicit_tenant_id: Optional[str] = None,
-) -> dict[str, Any]:
-    agent, tenant = _extract_claude_agent_and_tenant_from_request_body(request_body)
-    if not agent and not tenant:
-        return request_body
-
-    extra_fields: dict[str, Any] = {}
-    tags_to_add: list[str] = []
-    litellm_metadata = request_body.get("litellm_metadata")
-    if not isinstance(litellm_metadata, dict):
-        litellm_metadata = {}
-
-    if agent:
-        extra_fields["agent_name"] = agent
-        extra_fields["aawm_claude_agent_name"] = agent
-        normalized_agent = _normalize_low_cardinality_tag_value(agent) or "unknown"
-        tags_to_add.append(f"claude-agent:{normalized_agent}")
-
-        existing_trace_name = litellm_metadata.get("trace_name")
-        child_trace_name = f"claude-code.{agent}"
-        if existing_trace_name != child_trace_name:
-            if existing_trace_name and not litellm_metadata.get("source_trace_name"):
-                extra_fields["source_trace_name"] = existing_trace_name
-            extra_fields["trace_name"] = child_trace_name
-
-    if tenant:
-        tenant_for_identity = explicit_tenant_id or tenant
-        extra_fields["tenant_id"] = tenant_for_identity
-        extra_fields["aawm_tenant_id"] = tenant_for_identity
-        extra_fields["aawm_claude_project"] = tenant
-        existing_trace_user_id = litellm_metadata.get("trace_user_id")
-        if existing_trace_user_id != tenant_for_identity:
-            if existing_trace_user_id and not litellm_metadata.get("source_trace_user_id"):
-                extra_fields["source_trace_user_id"] = existing_trace_user_id
-            extra_fields["trace_user_id"] = tenant_for_identity
-        tags_to_add.append(f"claude-project:{_normalize_low_cardinality_tag_value(tenant) or 'unknown'}")
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
-    )
-
-
-def _detect_claude_post_rewrite_context_files(request_body: dict[str, Any]) -> list[str]:
-    present_files: list[str] = []
-    seen_files: set[str] = set()
-
-    for top_level_key in ("system", "messages"):
-        for fragment in _iter_anthropic_text_fragments(request_body.get(top_level_key)):
-            for marker, _tag_suffix in _CLAUDE_POST_REWRITE_CONTEXT_FILE_MARKERS:
-                if marker in seen_files:
-                    continue
-                if marker in fragment:
-                    present_files.append(marker)
-                    seen_files.add(marker)
-
-    return present_files
-
-
-def _add_claude_post_rewrite_context_file_logging_metadata(request_body: dict[str, Any]) -> dict[str, Any]:
-    present_files = _detect_claude_post_rewrite_context_files(request_body)
-    if not present_files:
-        return request_body
-
-    tags_to_add = ["claude-post-rewrite-context-file-present"]
-    for marker, tag_suffix in _CLAUDE_POST_REWRITE_CONTEXT_FILE_MARKERS:
-        if marker in present_files:
-            tags_to_add.append(f"claude-post-rewrite-context-file:{tag_suffix}")
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "claude_post_rewrite_context_files_present": present_files,
-            "claude_post_rewrite_context_file_count": len(present_files),
-        },
-    )
 
 
 def _validate_anthropic_tool_blocks_for_passthrough(
@@ -15967,6 +14529,102 @@ _aawm_audit_events.configure_audit_events_runtime(
     emit_route_event=_emit_auto_agent_alias_route_event,
     build_audit_events=_build_auto_agent_alias_audit_events,
     persist_audit_only_events=_persist_auto_agent_alias_audit_only_events_best_effort,
+)
+
+
+# ---------------------------------------------------------------------------
+# Wave 6D observability-metadata same-object facades
+# ---------------------------------------------------------------------------
+_merge_litellm_metadata = _aawm_observability_metadata._merge_litellm_metadata
+_format_langfuse_span_timestamp = _aawm_observability_metadata._format_langfuse_span_timestamp
+_build_langfuse_span_descriptor = _aawm_observability_metadata._build_langfuse_span_descriptor
+_normalize_low_cardinality_tag_value = _aawm_observability_metadata._normalize_low_cardinality_tag_value
+_dedupe_sorted_str_list = _aawm_observability_metadata._dedupe_sorted_str_list
+_iter_anthropic_text_fragments = _aawm_observability_metadata._iter_anthropic_text_fragments
+_extract_claude_agent_and_tenant_from_request_body = _aawm_observability_metadata._extract_claude_agent_and_tenant_from_request_body
+_add_claude_child_agent_observability_metadata = _aawm_observability_metadata._add_claude_child_agent_observability_metadata
+_detect_claude_post_rewrite_context_files = _aawm_observability_metadata._detect_claude_post_rewrite_context_files
+_add_claude_post_rewrite_context_file_logging_metadata = _aawm_observability_metadata._add_claude_post_rewrite_context_file_logging_metadata
+_get_nested_str_value = _aawm_observability_metadata._get_nested_str_value
+_extract_passthrough_session_id = _aawm_observability_metadata._extract_passthrough_session_id
+_normalize_passthrough_repository = _aawm_observability_metadata._normalize_passthrough_repository
+_extract_passthrough_repository_from_text = _aawm_observability_metadata._extract_passthrough_repository_from_text
+_walk_request_value_with_budget = _aawm_observability_metadata._walk_request_value_with_budget
+_extract_passthrough_repository_from_body_text = _aawm_observability_metadata._extract_passthrough_repository_from_body_text
+_extract_passthrough_repository = _aawm_observability_metadata._extract_passthrough_repository
+_get_passthrough_trace_environment = _aawm_observability_metadata._get_passthrough_trace_environment
+_add_passthrough_trace_context_metadata = _aawm_observability_metadata._add_passthrough_trace_context_metadata
+_truncate_tool_definition_string = _aawm_observability_metadata._truncate_tool_definition_string
+_redact_tool_definition_string = _aawm_observability_metadata._redact_tool_definition_string
+_sanitize_tool_definition_value = _aawm_observability_metadata._sanitize_tool_definition_value
+_tool_definition_name = _aawm_observability_metadata._tool_definition_name
+_tool_definition_description = _aawm_observability_metadata._tool_definition_description
+_tool_definition_parameters = _aawm_observability_metadata._tool_definition_parameters
+_build_tool_definition_snapshot_entry = _aawm_observability_metadata._build_tool_definition_snapshot_entry
+_tool_definition_snapshot_hash = _aawm_observability_metadata._tool_definition_snapshot_hash
+_build_passthrough_tool_definition_metadata = _aawm_observability_metadata._build_passthrough_tool_definition_metadata
+_add_passthrough_tool_definition_metadata = _aawm_observability_metadata._add_passthrough_tool_definition_metadata
+_prepare_request_body_for_passthrough_observability = _aawm_observability_metadata._prepare_request_body_for_passthrough_observability
+_extract_openai_passthrough_tool_choice = _aawm_observability_metadata._extract_openai_passthrough_tool_choice
+_extract_claude_request_breakout_fields = _aawm_observability_metadata._extract_claude_request_breakout_fields
+_add_claude_request_breakout_logging_metadata = _aawm_observability_metadata._add_claude_request_breakout_logging_metadata
+_extract_gemini_request_breakout_fields = _aawm_observability_metadata._extract_gemini_request_breakout_fields
+_add_gemini_request_breakout_logging_metadata = _aawm_observability_metadata._add_gemini_request_breakout_logging_metadata
+_extract_codex_request_breakout_fields = _aawm_observability_metadata._extract_codex_request_breakout_fields
+_add_codex_request_breakout_logging_metadata = _aawm_observability_metadata._add_codex_request_breakout_logging_metadata
+_parse_anthropic_billing_header_text = _aawm_observability_metadata._parse_anthropic_billing_header_text
+_extract_anthropic_billing_header_fields = _aawm_observability_metadata._extract_anthropic_billing_header_fields
+_extract_anthropic_billing_header_fields_from_request_body = _aawm_observability_metadata._extract_anthropic_billing_header_fields_from_request_body
+_add_anthropic_billing_header_logging_metadata = _aawm_observability_metadata._add_anthropic_billing_header_logging_metadata
+_add_claude_persisted_output_logging_metadata = _aawm_observability_metadata._add_claude_persisted_output_logging_metadata
+_add_route_family_logging_metadata = _aawm_observability_metadata._add_route_family_logging_metadata
+_ANTHROPIC_BILLING_HEADER_PREFIX = _aawm_observability_metadata._ANTHROPIC_BILLING_HEADER_PREFIX
+_AAWM_TOOL_DEFINITION_CAPTURE_VERSION = _aawm_observability_metadata._AAWM_TOOL_DEFINITION_CAPTURE_VERSION
+_AAWM_TOOL_DEFINITION_MAX_TOOLS = _aawm_observability_metadata._AAWM_TOOL_DEFINITION_MAX_TOOLS
+_PASSTHROUGH_SESSION_ID_HEADER_NAMES = _aawm_observability_metadata._PASSTHROUGH_SESSION_ID_HEADER_NAMES
+_PASSTHROUGH_REPOSITORY_HEADER_NAMES = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_HEADER_NAMES
+_PASSTHROUGH_REPOSITORY_BODY_KEYS = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_BODY_KEYS
+_PASSTHROUGH_REPOSITORY_TEXT_PATTERNS = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_TEXT_PATTERNS
+_PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES
+_PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES
+_append_codex_auto_agent_prevention_guidance_to_instructions = _aawm_alias_guidance._append_codex_auto_agent_prevention_guidance_to_instructions
+_is_aawm_read_agent_alias_model = _aawm_alias_guidance._is_aawm_read_agent_alias_model
+_append_aawm_read_agent_guidance_to_text = _aawm_alias_guidance._append_aawm_read_agent_guidance_to_text
+_append_aawm_read_agent_guidance_to_anthropic_system = _aawm_alias_guidance._append_aawm_read_agent_guidance_to_anthropic_system
+_apply_aawm_read_agent_guidance_to_request_body = _aawm_alias_guidance._apply_aawm_read_agent_guidance_to_request_body
+_apply_codex_auto_agent_prevention_guidance_to_request_body = _aawm_alias_guidance._apply_codex_auto_agent_prevention_guidance_to_request_body
+
+
+# ---------------------------------------------------------------------------
+# Wave 6D request-policy runtime configuration and facade installation
+# ---------------------------------------------------------------------------
+
+# 1. Observability metadata: bind host callbacks for tenant, headers, env.
+_aawm_observability_metadata.configure_observability_metadata_runtime(
+    get_explicit_tenant_id=_get_aawm_tenant_header,
+    get_request_headers=_safe_get_request_headers,
+    get_env=os.getenv,
+)
+
+# 2. Persisted-output logging callback: publish into host globals so rebound
+#    persisted-output functions resolve the callback at call time.
+_persisted_output_logging_callback = (
+    _aawm_observability_metadata._add_claude_persisted_output_logging_metadata
+)
+
+# 3. Persisted-output: bind runtime deps, configure callback, install facades.
+_aawm_persisted_output.bind_runtime(globals())
+_aawm_persisted_output.configure_persisted_output_logging_callback(
+    _persisted_output_logging_callback
+)
+_aawm_persisted_output.install(globals())
+
+# 4. Alias guidance: bind canonical observability merge/span callbacks.
+_aawm_alias_guidance.configure_alias_guidance_runtime(
+    callbacks=_aawm_alias_guidance.AliasGuidanceCallbacks(
+        merge_litellm_metadata=_merge_litellm_metadata,
+        build_langfuse_span_descriptor=_build_langfuse_span_descriptor,
+    ),
 )
 
 
