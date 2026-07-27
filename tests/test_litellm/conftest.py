@@ -109,15 +109,15 @@ def setup_and_teardown():
     # Only reload if NOT running in parallel (module reload + parallel = bad)
     worker_id = os.environ.get('PYTEST_XDIST_WORKER', None)
     if worker_id is None:
-        # Single process mode - safe to reload
+        # Single process mode - reload the lightweight top-level package only.
         importlib.reload(litellm)
 
-        try:
-            if hasattr(litellm, "proxy") and hasattr(litellm.proxy, "proxy_server"):
-                import litellm.proxy.proxy_server
-                importlib.reload(litellm.proxy.proxy_server)
-        except Exception as e:
-            print(f"Error reloading litellm.proxy.proxy_server: {e}")
+        # NOTE: proxy_server reload removed (D1-591 Wave 6 deadlock fix).
+        # importlib.reload(proxy_server) re-executes the 13k+ line god module
+        # including FastAPI route registration, whose inspect.signature(eval_str=True)
+        # calls trigger annotation evaluation that needs the import lock already
+        # held by reload -- a deterministic self-deadlock in single-process mode.
+        # Per-function state isolation is handled by isolate_litellm_state above.
 
         # Flush cache after reload (prevents stale client instances)
         if hasattr(litellm, "in_memory_llm_clients_cache"):
