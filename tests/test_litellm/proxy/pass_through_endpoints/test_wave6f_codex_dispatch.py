@@ -176,7 +176,7 @@ class TestNoneFallThrough:
             "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**kwargs)
+        result = await host["try_dispatch_codex_request"](**kwargs)
         assert result is None
 
     @pytest.mark.asyncio
@@ -193,7 +193,7 @@ class TestNoneFallThrough:
             "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**kwargs)
+        result = await host["try_dispatch_codex_request"](**kwargs)
         assert result is None
 
     @pytest.mark.asyncio
@@ -210,7 +210,7 @@ class TestNoneFallThrough:
             "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**kwargs)
+        result = await host["try_dispatch_codex_request"](**kwargs)
         assert result is None
 
     @pytest.mark.asyncio
@@ -239,7 +239,7 @@ class TestNoneFallThrough:
         }
         codex_dispatch.install(host)
 
-        result = await codex_dispatch.try_dispatch_codex_request(**kwargs)
+        result = await host["try_dispatch_codex_request"](**kwargs)
 
         assert result is None
         assert body["reasoning"] == {"effort": "high"}
@@ -302,7 +302,7 @@ class TestSupportedDispatch:
             adapter_model="codex-auto-agent",
         )
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is sentinel
 
     @pytest.mark.asyncio
@@ -311,7 +311,7 @@ class TestSupportedDispatch:
             matching_adapter="_resolve_codex_opencode_zen_adapter_model",
         )
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is sentinel
 
     @pytest.mark.asyncio
@@ -320,7 +320,7 @@ class TestSupportedDispatch:
             matching_adapter="_resolve_codex_kimi_chat_completions_adapter_model",
         )
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is sentinel
 
     @pytest.mark.asyncio
@@ -329,7 +329,7 @@ class TestSupportedDispatch:
             matching_adapter="_resolve_codex_alibaba_token_plan_adapter_model",
         )
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is sentinel
 
     @pytest.mark.asyncio
@@ -338,7 +338,7 @@ class TestSupportedDispatch:
             matching_adapter="_resolve_codex_antigravity_code_assist_adapter_model",
         )
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is sentinel
 
     @pytest.mark.asyncio
@@ -347,7 +347,7 @@ class TestSupportedDispatch:
             matching_adapter="_resolve_codex_google_code_assist_adapter_model",
         )
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is sentinel
 
 
@@ -390,7 +390,7 @@ class TestDispatchOrdering:
             "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
-        result = await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is alias_resp
 
 
@@ -428,7 +428,7 @@ class TestErrorPropagation:
         }
         codex_dispatch.install(host)
         with pytest.raises(RuntimeError, match="upstream failure"):
-            await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+            await host["try_dispatch_codex_request"](**_dispatch_kwargs())
 
     @pytest.mark.asyncio
     async def test_resolver_exception_propagates(self) -> None:
@@ -447,7 +447,7 @@ class TestErrorPropagation:
         }
         codex_dispatch.install(host)
         with pytest.raises(ValueError, match="resolver boom"):
-            await codex_dispatch.try_dispatch_codex_request(**_dispatch_kwargs())
+            await host["try_dispatch_codex_request"](**_dispatch_kwargs())
 
 
 # ===================================================================

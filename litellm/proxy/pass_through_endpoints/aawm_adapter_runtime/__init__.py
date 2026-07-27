@@ -95,5 +95,11 @@ def install_wave6f(host_globals: dict[str, Any]) -> None:
         host_globals["_add_route_family_logging_metadata"] = (
             canonical_route_metadata
         )
-    codex_candidate_calls.install(host_globals)
-    codex_dispatch.install(host_globals)
+    codex_candidate_calls.install(
+        host_globals,
+        publish_to_module=True,
+    )
+    codex_dispatch.install(
+        host_globals,
+        publish_to_module=True,
+    )

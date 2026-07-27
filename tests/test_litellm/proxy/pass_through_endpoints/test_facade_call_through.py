@@ -645,6 +645,15 @@ def test_wave6b_xai_oauth_god_module_patch_reaches_production_runtime(
 
 
 def test_wave6f_adapter_call_facades_are_same_object() -> None:
+    synthetic_candidate_host: dict[str, Any] = {
+        "__builtins__": __builtins__,
+    }
+    synthetic_dispatch_host: dict[str, Any] = {
+        "__builtins__": __builtins__,
+    }
+    codex_candidate_calls.install(synthetic_candidate_host)
+    codex_dispatch.install(synthetic_dispatch_host)
+
     for symbol in anthropic_adapter_calls._EXTRACTED_FUNCTION_NAMES:
         assert getattr(lpe, symbol) is getattr(
             anthropic_adapter_calls,

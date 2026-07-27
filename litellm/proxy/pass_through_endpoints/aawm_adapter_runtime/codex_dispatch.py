@@ -114,12 +114,18 @@ _HOST_FUNCTION_NAMES = (
 )
 
 
-def install(host_globals: dict[str, Any]) -> None:
+def install(
+    host_globals: dict[str, Any],
+    *,
+    publish_to_module: bool = False,
+) -> None:
     """Rebind moved functions to *host_globals* for live lookup.
 
     Each named function's ``__globals__`` is replaced with the host module's
-    live namespace dict, preserving monkeypatch compatibility.  The same
-    rebound object is published to both this module and the host module.
+    live namespace dict, preserving monkeypatch compatibility. Production
+    installation may also publish the rebound object to this module; secondary
+    hosts receive isolated rebound copies without replacing the canonical
+    production facade.
     """
     _mod = globals()
     for _name in _HOST_FUNCTION_NAMES:
@@ -141,7 +147,8 @@ def install(host_globals: dict[str, Any]) -> None:
         _rebound.__qualname__ = _obj.__qualname__
         if _obj.__dict__:
             _rebound.__dict__.update(_obj.__dict__)
-        _mod[_name] = _rebound
+        if publish_to_module:
+            _mod[_name] = _rebound
         host_globals[_name] = _rebound
 
 
