@@ -432,6 +432,71 @@ None of the five extracted modules imports `llm_passthrough_endpoints` at module
 scope. Constants, route definitions, compatibility wrappers, and provider
 runtime paths remain in their pre-Wave 6A owners.
 
+#### Wave 6B provider consumer architecture (pending acceptance)
+
+Wave 6B extracts provider-shaped route runtime and request-preparation
+functions from `llm_passthrough_endpoints.py` into focused consumer modules
+under `litellm/proxy/pass_through_endpoints/providers/`. Each module owns the
+route-layer orchestration for one provider family while delegating retry
+algorithms, normalization, constants, and OAuth to their existing upstream
+owners. Host dependencies are injected through frozen `Runtime` dataclasses so
+no Wave 6B module imports the god module at module scope.
+
+| Concern | Module | Functions |
+|---------|--------|-----------|
+| OpenRouter route-layer runtime: credential resolution, rate-limit key/wait-key derivation, retry orchestration delegation, response assembly | `providers/openrouter/runtime.py` | 45 |
+| NVIDIA adapter target, credential resolution, retryable-status policy, and retry execution | `providers/nvidia/runtime.py` | 15 |
+| OpenCode Zen target/auth/header resolution, streaming normalization handoff, Responses SSE framing, and chat-completion sanitization | `providers/opencode_zen/runtime.py` | 28 |
+| xAI and Grok-native request preparation: OAuth model detection, upstream model resolution, Codex unsupported-field drops, tool-choice normalization, and Grok passthrough target assembly | `providers/xai/request_prep.py` | 24 |
+| Antigravity pass-through runtime: CLI binary discovery, OAuth refresh failure formatting, native header construction, endpoint normalization, and request body preparation | `providers/antigravity/runtime.py` | 14 |
+| Shared candidate-unavailable error vocabulary: per-provider detail extraction and structured `ProxyException` raising | `providers/common.py` | 12 |
+
+**Façade and delegate ownership.** Each Wave 6B module delegates substantive
+algorithms to pre-existing owners and does not duplicate them:
+
+| Delegate owner | Consumed by |
+|---------------|-------------|
+| `providers/openrouter/retry_transport.py` (retry mechanics, rate-limit keys, free-model classification) | `providers/openrouter/runtime.py` |
+| `providers/opencode_zen/normalization.py` and `providers/opencode_zen/constants.py` | `providers/opencode_zen/runtime.py` |
+| `providers/antigravity/adapter.py`, `providers/antigravity/constants.py`, `aawm_alias_routing/antigravity_oauth.py` | `providers/antigravity/runtime.py` |
+| `litellm.llms.xai.oauth` (model detection, token acquisition, request preparation) and `providers/grok/normalization.py` | `providers/xai/request_prep.py` |
+| `providers/common.py` candidate-unavailable raisers | `providers/opencode_zen/runtime.py`, `providers/antigravity/runtime.py`, `providers/xai/request_prep.py` |
+
+**Configuration and monkeypatch behavior.** All five provider modules receive
+host callbacks through explicit `configure_*_runtime()` functions with frozen
+dataclass contracts:
+
+- `configure_openrouter_runtime(Runtime)` -- OpenRouter
+- `configure_nvidia_runtime(NvidiaRuntimeDependencies)` -- NVIDIA (ships
+  `DEFAULT_NVIDIA_RUNTIME_DEPENDENCIES` for standalone use)
+- `configure_runtime(Runtime)` -- OpenCode Zen
+- `configure_xai_request_prep_runtime(XAIRequestPrepRuntime)` -- xAI/Grok
+- Antigravity passes its `Runtime` per-call through function arguments rather
+  than a module-global seam.
+
+OpenCode Zen additionally provides `install(host_globals)`, which publishes
+same-object facades for every name in `_HOST_FUNCTION_NAMES` into the god
+module's globals dictionary. Installed functions resolve host dependencies
+through live `host_globals[name]` lookups at call time, so existing
+monkeypatches on the god module remain reachable without rebinding.
+
+`providers/xai/request_prep.py` documents its seam contract in
+`XAI_REQUEST_PREP_SEAM_DISPOSITION`, mapping each callback name to its
+`runtime.<field>` resolution path.
+
+**Candidate-unavailable vocabulary.** `providers/common.py` owns the shared
+`_raise_candidate_unavailable` primitive and per-provider wrappers
+(`_raise_opencode_zen_auto_agent_candidate_unavailable`,
+`_raise_antigravity_auto_agent_candidate_unavailable`,
+`_raise_codex_native_openai_auto_agent_candidate_unavailable`,
+`_raise_xai_oauth_auto_agent_candidate_unavailable`,
+`_raise_grok_native_auto_agent_candidate_unavailable`). Each wrapper extracts
+provider-specific detail through an injected `Runtime` (status-code and
+detail extraction callbacks) and raises a structured `ProxyException` with
+code `aawm_codex_auto_agent_candidate_unavailable`, error type
+`rate_limit_error`, and status 429. Provider modules import these raisers
+directly; the god module re-exports them for backward compatibility.
+
 ### Runtime invariants
 
 - Durable Redis keys use

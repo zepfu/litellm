@@ -82,15 +82,10 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
 )
 from litellm.llms.xai.oauth import (
-    build_grok_native_oauth_metadata,
-    get_grok_native_oauth_access_token,
-    is_grok_native_oauth_model,
     is_oa_xai_model,
     normalize_grok_native_oauth_model,
-    prepare_oa_xai_request,
     resolve_oa_xai_upstream_model,
 )
-from litellm.llms.xai.responses.transformation import XAIResponsesAPIConfig
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
 from litellm.proxy.auth.route_checks import RouteChecks
@@ -222,7 +217,6 @@ from litellm.proxy.utils import is_known_model
 from litellm.proxy.vector_store_endpoints.utils import (
     is_allowed_to_call_vector_store_endpoint,
 )
-from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str
 from litellm.llms.alibaba_token_plan.adapters import (
     adapter as _alibaba_token_plan_adapters,
@@ -333,6 +327,15 @@ from litellm.llms.anthropic.experimental_pass_through.providers.google import en
 from litellm.llms.anthropic.experimental_pass_through.providers.google import context_window as _google_context_window
 from litellm.llms.anthropic.experimental_pass_through.providers.google import error_signals as _google_error_signals
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import side_channel as _grok_side_channel
+
+# Wave 6B extracted provider modules
+from litellm.proxy.pass_through_endpoints.providers import common as _wave6b_common
+from litellm.proxy.pass_through_endpoints.providers.antigravity import runtime as _wave6b_antigravity_runtime
+from litellm.proxy.pass_through_endpoints.providers.openrouter import runtime as _wave6b_openrouter_runtime
+from litellm.proxy.pass_through_endpoints.providers.nvidia import runtime as _wave6b_nvidia_runtime
+from litellm.proxy.pass_through_endpoints.providers.opencode_zen import runtime as _wave6b_opencode_zen_runtime
+from litellm.proxy.pass_through_endpoints.providers.xai import request_prep as _wave6b_xai_request_prep
+
 from .aawm_alias_routing import interfaces as _aawm_alias_interfaces
 from .aawm_alias_routing.state import alias_routing_state as _alias_routing_state
 
@@ -1315,12 +1318,10 @@ def _get_openai_passthrough_route_family(endpoint: str) -> str:
     return "openai_passthrough"
 
 
-def _is_oa_xai_request_body(request_body: dict[str, Any]) -> bool:
-    return is_oa_xai_model(request_body.get("model"))
+_is_oa_xai_request_body = _wave6b_xai_request_prep._is_oa_xai_request_body
 
 
-def _is_grok_native_oauth_request_body(request_body: dict[str, Any]) -> bool:
-    return is_grok_native_oauth_model(request_body.get("model"))
+_is_grok_native_oauth_request_body = _wave6b_xai_request_prep._is_grok_native_oauth_request_body
 
 
 @lru_cache(maxsize=1)
@@ -1354,360 +1355,52 @@ def _get_model_metadata_entry(model: Any) -> Optional[dict[str, Any]]:
     return None
 
 
-def _is_oa_xai_responses_model(model: Any) -> bool:
-    if not is_oa_xai_model(model):
-        return False
-
-    candidate_models = [model]
-    try:
-        candidate_models.append(resolve_oa_xai_upstream_model(cast(str, model)))
-    except Exception:
-        pass
-
-    for candidate_model in candidate_models:
-        model_info = _get_model_metadata_entry(candidate_model)
-        if isinstance(model_info, dict) and model_info.get("mode") == "responses":
-            return True
-    return False
+_is_oa_xai_responses_model = _wave6b_xai_request_prep._is_oa_xai_responses_model
 
 
-def _to_xai_native_passthrough_model(model: Any) -> Any:
-    if isinstance(model, str) and model.startswith("xai/"):
-        return model[len("xai/") :]
-    return model
+_to_xai_native_passthrough_model = _wave6b_xai_request_prep._to_xai_native_passthrough_model
 
 
-def _xai_responses_sanitized_tool_changes(
-    original_tools: Any,
-    sanitized_tools: Any,
-) -> list[dict[str, Any]]:
-    if not isinstance(original_tools, list) or not isinstance(sanitized_tools, list):
-        return []
-
-    tool_changes: list[dict[str, Any]] = []
-    for index, original_tool in enumerate(original_tools):
-        sanitized_tool = sanitized_tools[index] if index < len(sanitized_tools) else None
-        if original_tool == sanitized_tool:
-            continue
-
-        change: dict[str, Any] = {"index": index}
-        if isinstance(original_tool, dict):
-            tool_type = _get_openai_tool_type(original_tool)
-            if tool_type:
-                change["type"] = tool_type
-            if isinstance(sanitized_tool, dict):
-                removed_fields = [key for key in original_tool.keys() if key not in sanitized_tool]
-                if removed_fields:
-                    change["removed_fields"] = sorted(removed_fields)
-        elif isinstance(original_tool, str):
-            change["type"] = original_tool
-
-        tool_changes.append(change)
-    return tool_changes
+_xai_responses_sanitized_tool_changes = _wave6b_xai_request_prep._xai_responses_sanitized_tool_changes
 
 
-def _sanitize_xai_responses_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
-    sanitized_body = XAIResponsesAPIConfig().map_openai_params(
-        cast(ResponsesAPIOptionalRequestParams, request_body),
-        model=str(request_body.get("model") or ""),
-        drop_params=True,
-    )
-    removed_params = [key for key in request_body.keys() if key not in sanitized_body and key != "litellm_metadata"]
-    tool_changes = _xai_responses_sanitized_tool_changes(
-        request_body.get("tools"),
-        sanitized_body.get("tools"),
-    )
-    decoded_previous_response_id = False
-    previous_response_id = sanitized_body.get("previous_response_id")
-    if isinstance(previous_response_id, str) and previous_response_id:
-        decoded = ResponsesAPIRequestUtils.decode_previous_response_id_to_original_previous_response_id(
-            previous_response_id
-        )
-        if decoded != previous_response_id:
-            sanitized_body = dict(sanitized_body)
-            sanitized_body["previous_response_id"] = decoded
-            decoded_previous_response_id = True
-
-    if not removed_params and not tool_changes and not decoded_previous_response_id:
-        return request_body, [], []
-
-    tool_types = _dedupe_sorted_str_list(
-        [tool_change["type"] for tool_change in tool_changes if isinstance(tool_change.get("type"), str)]
-    )
-    normalized_removed_params = _dedupe_sorted_str_list(
-        [normalized for param in removed_params if (normalized := _normalize_low_cardinality_tag_value(param))]
-    )
-    updated_body = _merge_litellm_metadata(
-        sanitized_body,
-        tags_to_add=[
-            "xai-responses-request-sanitized",
-            *(["xai-responses-previous-response-id-decoded"] if decoded_previous_response_id else []),
-            *(f"xai-responses-removed-param:{param}" for param in normalized_removed_params),
-            *(f"xai-responses-sanitized-tool:{tool}" for tool in tool_types),
-        ],
-        extra_fields={
-            "xai_responses_request_sanitized": True,
-            "xai_responses_sanitized_removed_params": normalized_removed_params,
-            "xai_responses_sanitized_tool_count": len(tool_changes),
-            "xai_responses_sanitized_tool_types": tool_types,
-            "xai_responses_sanitized_tools": tool_changes,
-            "xai_responses_previous_response_id_decoded": (decoded_previous_response_id),
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="xai.responses_request_sanitized",
-                    metadata={
-                        "removed_params": normalized_removed_params,
-                        "tool_count": len(tool_changes),
-                        "tool_types": tool_types,
-                        "previous_response_id_decoded": (decoded_previous_response_id),
-                    },
-                )
-            ],
-        },
-    )
-    return updated_body, removed_params, tool_changes
+_sanitize_xai_responses_request_body = _wave6b_xai_request_prep._sanitize_xai_responses_request_body
 
 
-def _coerce_grok_native_function_call_arguments_value(
-    arguments_value: Any,
-) -> tuple[dict[str, Any], Optional[str]]:
-    return _anthropic_grok_normalization.coerce_function_call_arguments_value(arguments_value)
+_coerce_grok_native_function_call_arguments_value = _wave6b_xai_request_prep._coerce_grok_native_function_call_arguments_value
 
 
-def _get_anthropic_grok_normalization_runtime() -> _anthropic_grok_normalization.Runtime:
-    return _anthropic_grok_normalization.Runtime(
-        normalize_tag=_normalize_low_cardinality_tag_value,
-        dedupe_sorted=_dedupe_sorted_str_list,
-        merge_metadata=_merge_litellm_metadata,
-        build_span=_build_langfuse_span_descriptor,
-        get_rewrite_input_item_types=_get_rewrite_input_item_types_for_model,
-    )
+_get_anthropic_grok_normalization_runtime = _wave6b_xai_request_prep._get_anthropic_grok_normalization_runtime
 
 
-def _sanitize_grok_native_function_call_arguments_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    return _anthropic_grok_normalization.sanitize_function_call_arguments_request_body(request_body)
+_sanitize_grok_native_function_call_arguments_request_body = _wave6b_xai_request_prep._sanitize_grok_native_function_call_arguments_request_body
 
 
-def _sanitize_grok_native_function_call_arguments_in_place(
-    request_body: dict[str, Any],
-) -> list[dict[str, Any]]:
-    return _anthropic_grok_normalization.sanitize_function_call_arguments_in_place(
-        _get_anthropic_grok_normalization_runtime(),
-        request_body,
-    )
+_sanitize_grok_native_function_call_arguments_in_place = _wave6b_xai_request_prep._sanitize_grok_native_function_call_arguments_in_place
 
 
-def _sanitize_xai_responses_request_body_in_place(
-    request_body: dict[str, Any],
-) -> tuple[list[str], list[dict[str, Any]]]:
-    updated_body, removed_params, tool_changes = _sanitize_xai_responses_request_body(request_body)
-    if updated_body is not request_body:
-        request_body.clear()
-        request_body.update(updated_body)
-    return removed_params, tool_changes
+_sanitize_xai_responses_request_body_in_place = _wave6b_xai_request_prep._sanitize_xai_responses_request_body_in_place
 
 
-async def _prepare_oa_xai_passthrough_request(
-    request_body: dict[str, Any],
-    *,
-    sanitize_responses_request: bool = False,
-) -> tuple[bool, Optional[str], Optional[str]]:
-    if is_oa_xai_model(request_body.get("model")) and not isinstance(request_body.get("litellm_metadata"), dict):
-        request_body["litellm_metadata"] = {}
-    prepared = await prepare_oa_xai_request(request_body)
-    if not prepared:
-        return False, None, None
-
-    if sanitize_responses_request:
-        (
-            updated_body,
-            _xai_unsupported_hosted_tools,
-        ) = _drop_unsupported_codex_hosted_tools_from_request_body(request_body)
-        _replace_request_body_in_place(request_body, updated_body)
-        (
-            updated_body,
-            _xai_unsupported_request_params,
-        ) = _drop_unsupported_codex_request_params_from_request_body(request_body)
-        _replace_request_body_in_place(request_body, updated_body)
-        (
-            updated_body,
-            _xai_unsupported_input_items,
-        ) = _drop_unsupported_codex_input_items_from_request_body(request_body)
-        _replace_request_body_in_place(request_body, updated_body)
-        _sanitize_xai_responses_request_body_in_place(request_body)
-        (
-            updated_body,
-            _removed_tool_choice,
-        ) = _drop_tool_choice_without_tools_from_request_body(request_body)
-        _replace_request_body_in_place(request_body, updated_body)
-
-    api_base = request_body.pop("api_base", None)
-    api_key = request_body.pop("api_key", None)
-    request_body.pop("custom_llm_provider", None)
-    return (
-        True,
-        api_base if isinstance(api_base, str) and api_base.strip() else None,
-        api_key if isinstance(api_key, str) and api_key.strip() else None,
-    )
+_prepare_oa_xai_passthrough_request = _wave6b_xai_request_prep._prepare_oa_xai_passthrough_request
 
 
-def _get_grok_native_oauth_client_version() -> str:
-    return get_secret_str("LITELLM_XAI_GROK_CLIENT_VERSION") or get_secret_str("GROK_CLIENT_VERSION") or "0.1.210"
+_get_grok_native_oauth_client_version = _wave6b_xai_request_prep._get_grok_native_oauth_client_version
 
 
-def _get_grok_native_oauth_session_id(
-    *,
-    request: Request,
-    request_body: dict[str, Any],
-) -> Optional[str]:
-    metadata = request_body.get("litellm_metadata")
-    if isinstance(metadata, dict):
-        session_id = metadata.get("session_id")
-        if isinstance(session_id, str) and session_id.strip():
-            return session_id.strip()
-
-    for header_name in (
-        "x-grok-session-id",
-        "session_id",
-        "x-session-id",
-        "x-grok-conv-id",
-    ):
-        header_value = _get_case_insensitive_header(
-            _safe_get_request_headers(request),
-            header_name,
-        )
-        if header_value:
-            return header_value
-    return None
+_get_grok_native_oauth_session_id = _wave6b_xai_request_prep._get_grok_native_oauth_session_id
 
 
-def _get_grok_native_oauth_request_id(request: Request) -> str:
-    for header_name in ("x-grok-req-id", "x-request-id", "request_id"):
-        header_value = _get_case_insensitive_header(
-            _safe_get_request_headers(request),
-            header_name,
-        )
-        if header_value:
-            return header_value
-    return str(uuid4())
+_get_grok_native_oauth_request_id = _wave6b_xai_request_prep._get_grok_native_oauth_request_id
 
 
-def _build_grok_native_oauth_headers(
-    *,
-    access_token: str,
-    model: str,
-    request: Request,
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    client_version = _get_grok_native_oauth_client_version()
-    request_id = _get_grok_native_oauth_request_id(request)
-    headers: dict[str, Any] = {
-        "accept": "application/json",
-        "authorization": f"Bearer {access_token}",
-        "content-type": "application/json",
-        "user-agent": (get_secret_str("LITELLM_XAI_GROK_USER_AGENT") or f"grok/{client_version}"),
-        "x-grok-client-identifier": (get_secret_str("LITELLM_XAI_GROK_CLIENT_IDENTIFIER") or "grok-cli"),
-        "x-grok-client-version": client_version,
-        "x-grok-model-override": model,
-        "x-grok-req-id": request_id,
-        "x-request-id": request_id,
-        "x-xai-token-auth": (get_secret_str("LITELLM_XAI_GROK_XAI_TOKEN_AUTH") or "xai-grok-cli"),
-    }
-    session_id = _get_grok_native_oauth_session_id(
-        request=request,
-        request_body=request_body,
-    )
-    if session_id:
-        headers["x-grok-session-id"] = session_id
-    return headers
+_build_grok_native_oauth_headers = _wave6b_xai_request_prep._build_grok_native_oauth_headers
 
 
-def _add_grok_native_oauth_metadata(
-    request_body: dict[str, Any],
-    *,
-    model: str,
-    tags_to_add: Optional[list[str]] = None,
-    extra_fields: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    metadata = build_grok_native_oauth_metadata(model)
-    metadata_tags = metadata.pop("tags", [])
-    existing_litellm_metadata = request_body.get("litellm_metadata")
-    preserved_route_family: Optional[str] = None
-    if isinstance(existing_litellm_metadata, dict):
-        for route_family_key in ("passthrough_route_family", "route_family"):
-            route_family_value = existing_litellm_metadata.get(route_family_key)
-            if isinstance(route_family_value, str) and route_family_value.strip():
-                preserved_route_family = route_family_value.strip()
-                break
-
-    merged_extra_fields = {
-        **metadata,
-        **(extra_fields or {}),
-    }
-    if preserved_route_family:
-        merged_extra_fields.setdefault("source_passthrough_route_family", preserved_route_family)
-        merged_extra_fields.setdefault("source_route_family", preserved_route_family)
-        merged_extra_fields["grok_cli_chat_proxy_used"] = True
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=[
-            *(metadata_tags if isinstance(metadata_tags, list) else []),
-            *(tags_to_add or []),
-        ],
-        extra_fields=merged_extra_fields,
-    )
+_add_grok_native_oauth_metadata = _wave6b_xai_request_prep._add_grok_native_oauth_metadata
 
 
-async def _prepare_grok_native_oauth_passthrough_request(
-    request_body: dict[str, Any],
-    *,
-    request: Request,
-    tags_to_add: Optional[list[str]] = None,
-    extra_fields: Optional[dict[str, Any]] = None,
-) -> tuple[bool, Optional[str], dict[str, Any], dict[str, Any]]:
-    model = normalize_grok_native_oauth_model(request_body.get("model"))
-    if model is None:
-        return False, None, {}, request_body
-
-    prepared_body = dict(request_body)
-    prepared_body["model"] = model
-    prepared_body = _add_grok_native_oauth_metadata(
-        prepared_body,
-        model=model,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
-    )
-    (
-        prepared_body,
-        _grok_unsupported_hosted_tools,
-    ) = _drop_unsupported_codex_hosted_tools_from_request_body(prepared_body)
-    (
-        prepared_body,
-        _grok_unsupported_request_params,
-    ) = _drop_unsupported_codex_request_params_from_request_body(prepared_body)
-    (
-        prepared_body,
-        _grok_unsupported_input_items,
-    ) = _drop_unsupported_codex_input_items_from_request_body(prepared_body)
-    _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
-    _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
-    _sanitize_xai_responses_request_body_in_place(prepared_body)
-    (
-        prepared_body,
-        _removed_tool_choice,
-    ) = _drop_tool_choice_without_tools_from_request_body(prepared_body)
-    access_token = await get_grok_native_oauth_access_token()
-    headers = _build_grok_native_oauth_headers(
-        access_token=access_token,
-        model=model,
-        request=request,
-        request_body=prepared_body,
-    )
-    return True, _get_grok_passthrough_target_base(), headers, prepared_body
+_prepare_grok_native_oauth_passthrough_request = _wave6b_xai_request_prep._prepare_grok_native_oauth_passthrough_request
 
 
 def _get_gemini_passthrough_route_family(endpoint: str) -> Optional[str]:
@@ -3822,222 +3515,79 @@ _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME = _anthropic_openrouter_retry_tran
 )
 
 
-def _get_openrouter_adapter_rate_limit_key(model: Optional[str]) -> str:
-    return _anthropic_openrouter_retry_transport.get_rate_limit_key(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        model,
-    )
+_get_openrouter_adapter_rate_limit_key = _wave6b_openrouter_runtime._get_openrouter_adapter_rate_limit_key
 
 
-def _is_openrouter_adapter_free_model(model: Optional[str]) -> bool:
-    return _anthropic_openrouter_retry_transport.is_free_model(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        model,
-    )
+_is_openrouter_adapter_free_model = _wave6b_openrouter_runtime._is_openrouter_adapter_free_model
 
 
-def _get_openrouter_adapter_wait_keys(model: Optional[str]) -> str:
-    return _anthropic_openrouter_retry_transport.get_wait_keys(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        model,
-    )
+_get_openrouter_adapter_wait_keys = _wave6b_openrouter_runtime._get_openrouter_adapter_wait_keys
 
 
-def _extract_openrouter_adapter_exception_status_code(exc: Any) -> Optional[int]:
-    return _anthropic_openrouter_retry_transport.extract_exception_status_code(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-    )
+_extract_openrouter_adapter_exception_status_code = _wave6b_openrouter_runtime._extract_openrouter_adapter_exception_status_code
 
 
-def _extract_openrouter_adapter_error_payload(
-    exc: Any,
-) -> Optional[dict[str, Any]]:
-    return _anthropic_openrouter_retry_transport.extract_error_payload(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-    )
+_extract_openrouter_adapter_error_payload = _wave6b_openrouter_runtime._extract_openrouter_adapter_error_payload
 
 
-def _extract_openrouter_adapter_provider_name(exc: Any) -> Optional[str]:
-    return _anthropic_openrouter_retry_transport.extract_provider_name(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-    )
+_extract_openrouter_adapter_provider_name = _wave6b_openrouter_runtime._extract_openrouter_adapter_provider_name
 
 
-def _extract_openrouter_adapter_retry_after_seconds(exc: Any) -> Optional[float]:
-    return _anthropic_openrouter_retry_transport.extract_retry_after_seconds(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-    )
+_extract_openrouter_adapter_retry_after_seconds = _wave6b_openrouter_runtime._extract_openrouter_adapter_retry_after_seconds
 
 
-def _extract_openrouter_adapter_raw_message(exc: Any) -> Optional[str]:
-    return _anthropic_openrouter_retry_transport.extract_raw_message(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-    )
+_extract_openrouter_adapter_raw_message = _wave6b_openrouter_runtime._extract_openrouter_adapter_raw_message
 
 
-def _is_openrouter_adapter_no_endpoint_candidate_error(
-    exc: Any,
-    *,
-    status_code: Optional[int] = None,
-    raw_message: Optional[str] = None,
-) -> bool:
-    return _anthropic_openrouter_retry_transport.is_no_endpoint_candidate_error(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-        status_code=status_code,
-        raw_message=raw_message,
-    )
+_is_openrouter_adapter_no_endpoint_candidate_error = _wave6b_openrouter_runtime._is_openrouter_adapter_no_endpoint_candidate_error
 
 
-def _maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable(
-    exc: Any,
-    *,
-    adapter_model: Optional[str],
-    use_alias_candidate_probe: bool,
-    status_code: Optional[int] = None,
-    raw_message: Optional[str] = None,
-) -> None:
-    return _anthropic_openrouter_retry_transport.maybe_raise_alias_probe_no_endpoint_unavailable(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-        adapter_model=adapter_model,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-        status_code=status_code,
-        raw_message=raw_message,
-    )
+_maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable = _wave6b_openrouter_runtime._maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable
 
 
-def _is_openrouter_adapter_provider_raw_error(exc: Any) -> bool:
-    return _anthropic_openrouter_retry_transport.is_provider_raw_error(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-    )
+_is_openrouter_adapter_provider_raw_error = _wave6b_openrouter_runtime._is_openrouter_adapter_provider_raw_error
 
 
-def _extract_openrouter_adapter_error_headers(exc: Any) -> dict[str, Any]:
-    return dict(
-        _anthropic_openrouter_retry_transport.extract_error_headers(
-            _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-            exc,
-        )
-    )
+_extract_openrouter_adapter_error_headers = _wave6b_openrouter_runtime._extract_openrouter_adapter_error_headers
 
 
-def _get_openrouter_adapter_header_value(
-    headers: dict[str, Any],
-    header_name: str,
-) -> Optional[str]:
-    return _anthropic_openrouter_retry_transport.get_header_value(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        headers,
-        header_name,
-    )
+_get_openrouter_adapter_header_value = _wave6b_openrouter_runtime._get_openrouter_adapter_header_value
 
 
-def _extract_openrouter_adapter_reset_wait_seconds(exc: Any) -> Optional[float]:
-    return _anthropic_openrouter_retry_transport.extract_reset_wait_seconds(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-    )
+_extract_openrouter_adapter_reset_wait_seconds = _wave6b_openrouter_runtime._extract_openrouter_adapter_reset_wait_seconds
 
 
-def _is_openrouter_adapter_long_window_rate_limit(
-    exc: Any,
-    *,
-    hidden_retry_budget_seconds: float,
-) -> bool:
-    return _anthropic_openrouter_retry_transport.is_long_window_rate_limit(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-        hidden_retry_budget_seconds=hidden_retry_budget_seconds,
-    )
+_is_openrouter_adapter_long_window_rate_limit = _wave6b_openrouter_runtime._is_openrouter_adapter_long_window_rate_limit
 
 
-def _get_openrouter_adapter_cooldown_keys(
-    *,
-    model: Optional[str],
-    exc: Any,
-) -> str:
-    return _anthropic_openrouter_retry_transport.get_cooldown_keys(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        model=model,
-        exc=exc,
-    )
+_get_openrouter_adapter_cooldown_keys = _wave6b_openrouter_runtime._get_openrouter_adapter_cooldown_keys
 
 
-def _get_openrouter_adapter_retry_wait_seconds(exc: Any, attempt: int) -> float:
-    return _anthropic_openrouter_retry_transport.get_retry_wait_seconds(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        exc,
-        attempt,
-    )
+_get_openrouter_adapter_retry_wait_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_retry_wait_seconds
 
 
-def _get_openrouter_adapter_max_retries() -> int:
-    return _anthropic_openrouter_retry_transport.get_max_retries(_ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME)
+_get_openrouter_adapter_max_retries = _wave6b_openrouter_runtime._get_openrouter_adapter_max_retries
 
 
-def _get_openrouter_adapter_backoff_seconds(attempt: int) -> float:
-    return _anthropic_openrouter_retry_transport.get_backoff_seconds(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        attempt,
-    )
+_get_openrouter_adapter_backoff_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_backoff_seconds
 
 
-def _get_openrouter_adapter_hidden_retry_budget_seconds() -> float:
-    return _anthropic_openrouter_retry_transport.get_hidden_retry_budget_seconds(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME
-    )
+_get_openrouter_adapter_hidden_retry_budget_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_hidden_retry_budget_seconds
 
 
-def _get_openrouter_adapter_post_failure_cooldown_seconds() -> float:
-    return _anthropic_openrouter_retry_transport.get_post_failure_cooldown_seconds(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME
-    )
+_get_openrouter_adapter_post_failure_cooldown_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_post_failure_cooldown_seconds
 
 
-async def _maybe_raise_openrouter_adapter_failure_circuit_open(
-    adapter_model: Optional[str],
-) -> None:
-    return await _anthropic_openrouter_retry_transport.maybe_raise_failure_circuit_open(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        adapter_model,
-    )
+_maybe_raise_openrouter_adapter_failure_circuit_open = _wave6b_openrouter_runtime._maybe_raise_openrouter_adapter_failure_circuit_open
 
 
-async def _openrouter_adapter_open_failure_circuit(
-    adapter_model: Optional[str],
-    *,
-    exc: Any,
-) -> None:
-    return await _anthropic_openrouter_retry_transport.open_failure_circuit(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        adapter_model,
-        exc=exc,
-    )
+_openrouter_adapter_open_failure_circuit = _wave6b_openrouter_runtime._openrouter_adapter_open_failure_circuit
 
 
-def _clear_openrouter_adapter_failure_circuit(
-    adapter_model: Optional[str],
-) -> None:
-    return _anthropic_openrouter_retry_transport.clear_failure_circuit(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        adapter_model,
-    )
+_clear_openrouter_adapter_failure_circuit = _wave6b_openrouter_runtime._clear_openrouter_adapter_failure_circuit
 
 
-async def _get_openrouter_adapter_active_cooldown_seconds(
-    adapter_model: Optional[str],
-) -> float:
-    return await _anthropic_openrouter_retry_transport.get_active_cooldown_seconds(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        adapter_model,
-    )
+_get_openrouter_adapter_active_cooldown_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_active_cooldown_seconds
 
 # Wave 5A: bind quota state and adapter helpers into openrouter_quota.
 def _get_openrouter_free_daily_quota_cache() -> tuple[Optional[float], float]:
@@ -4171,81 +3721,19 @@ _aawm_attempt_records.configure_attempt_records_runtime(
     read_pilot_gate_record=lambda *a, **kw: _read_pilot_cooldown_gate.record(*a, **kw),
 )
 
-async def _wait_for_openrouter_adapter_cooldown_if_needed(
-    rate_limit_keys: Union[str, list[str], tuple[str, ...]],
-    *,
-    adapter_model: Optional[str] = None,
-    use_alias_candidate_probe: bool = False,
-) -> None:
-    return await _anthropic_openrouter_retry_transport.wait_for_cooldown_if_needed(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        rate_limit_keys,
-        adapter_model=adapter_model,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-    )
+_wait_for_openrouter_adapter_cooldown_if_needed = _wave6b_openrouter_runtime._wait_for_openrouter_adapter_cooldown_if_needed
 
 
-async def _set_openrouter_adapter_cooldown(
-    rate_limit_keys: Union[str, list[str], tuple[str, ...]],
-    wait_seconds: float,
-) -> None:
-    return await _anthropic_openrouter_retry_transport.set_cooldown(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        rate_limit_keys,
-        wait_seconds,
-    )
+_set_openrouter_adapter_cooldown = _wave6b_openrouter_runtime._set_openrouter_adapter_cooldown
 
 
-async def _run_openrouter_adapter_retry_loop(
-    *,
-    adapter_model: Optional[str],
-    operation: Callable[[], Awaitable[_RetryResultT]],
-    log_warnings: bool = True,
-    use_alias_candidate_probe: bool = False,
-    attempt_label: str,
-    rate_limit_key_for_log: Optional[str] = None,
-) -> _RetryResultT:
-    return await _anthropic_openrouter_retry_transport.run_retry_loop(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        adapter_model=adapter_model,
-        operation=operation,
-        log_warnings=log_warnings,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-        attempt_label=attempt_label,
-        rate_limit_key_for_log=rate_limit_key_for_log,
-    )
+_run_openrouter_adapter_retry_loop = _wave6b_openrouter_runtime._run_openrouter_adapter_retry_loop
 
 
-async def _perform_openrouter_completion_adapter_operation(
-    *,
-    adapter_model: Optional[str],
-    operation: Callable[[], Awaitable[Any]],
-    log_warnings: bool = True,
-    use_alias_candidate_probe: bool = False,
-) -> Any:
-    return await _anthropic_openrouter_retry_transport.perform_completion_operation(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        adapter_model=adapter_model,
-        operation=operation,
-        log_warnings=log_warnings,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-    )
+_perform_openrouter_completion_adapter_operation = _wave6b_openrouter_runtime._perform_openrouter_completion_adapter_operation
 
 
-async def _perform_openrouter_adapter_pass_through_request(
-    *,
-    adapter_model: Optional[str],
-    log_warnings: bool = True,
-    use_alias_candidate_probe: bool = False,
-    **kwargs: Any,
-) -> Response:
-    return await _anthropic_openrouter_retry_transport.perform_pass_through_request(
-        _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        adapter_model=adapter_model,
-        log_warnings=log_warnings,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-        **kwargs,
-    )
+_perform_openrouter_adapter_pass_through_request = _wave6b_openrouter_runtime._perform_openrouter_adapter_pass_through_request
 
 
 async def _prime_google_code_assist_session(
@@ -5387,979 +4875,182 @@ def _wrap_streaming_response_with_release_callback(
     return response
 
 
-def _get_openrouter_api_key() -> Optional[str]:
-    return _get_first_secret_value(_ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS)
-
-
-def _get_anthropic_adapter_openrouter_api_key() -> Optional[str]:
-    return _get_openrouter_api_key()
-
-
-def _get_anthropic_adapter_nvidia_api_key() -> Optional[str]:
-    return _get_first_secret_value(_ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS)
-
-
-def _get_anthropic_adapter_nvidia_target_base() -> str:
-    cleaned = (
-        _clean_secret_string(os.getenv("NVIDIA_NIM_API_BASE"))
-        or _clean_secret_string(os.getenv("AAWM_NVIDIA_API_BASE"))
-        or "https://integrate.api.nvidia.com/v1"
-    )
-    cleaned = cleaned.rstrip("/")
-    if cleaned.endswith("/v1"):
-        return cleaned[: -len("/v1")]
-    return cleaned
-
-
-def _get_nvidia_adapter_max_retries() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_MAX_RETRIES"))
-    if raw_value is None:
-        return 1
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 1
-    return max(0, parsed)
-
-
-def _get_nvidia_adapter_request_timeout_seconds(
-    adapter_model: Optional[str] = None,
-) -> float:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_REQUEST_TIMEOUT_SECONDS"))
-    if raw_value is None:
-        if _should_force_fake_stream_for_nvidia_adapter_model(adapter_model):
-            return 240.0
-        return 120.0
-    try:
-        parsed = float(raw_value)
-    except Exception:
-        if _should_force_fake_stream_for_nvidia_adapter_model(adapter_model):
-            return 240.0
-        return 120.0
-    return max(5.0, parsed)
-
-
-def _get_nvidia_adapter_inner_max_retries() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_INNER_MAX_RETRIES"))
-    if raw_value is None:
-        return 0
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 0
-    return max(0, parsed)
-
-
-def _should_force_fake_stream_for_nvidia_adapter_model(
-    adapter_model: Optional[str],
-) -> bool:
-    configured_models = _clean_codex_auth_value(os.getenv("AAWM_NVIDIA_ADAPTER_FORCE_FAKE_STREAM_MODELS"))
-    if configured_models is None:
-        normalized_models = {"minimaxai/minimax-m2.7"}
-    else:
-        normalized_models = {item.strip() for item in configured_models.split(",") if item.strip()}
-    return bool(adapter_model and adapter_model in normalized_models)
-
-
-def _extract_nvidia_adapter_exception_status_code(exc: Any) -> Optional[int]:
-    for attr in ("status_code", "code"):
-        value = getattr(exc, attr, None)
-        if isinstance(value, int):
-            return value
-        try:
-            if value is not None:
-                return int(value)
-        except Exception:
-            continue
-
-    text_value = str(exc)
-    if "Timeout Error" in text_value or exc.__class__.__name__.lower() == "timeout":
-        return 504
-
-    match = re.search(r"\b(408|429|500|502|503|504)\b", text_value)
-    if match is not None:
-        try:
-            return int(match.group(1))
-        except Exception:
-            return None
-    return None
-
-
-def _get_nvidia_adapter_retry_wait_seconds(attempt: int) -> float:
-    return min(float(2 ** max(0, attempt - 1)), 8.0)
-
+_get_openrouter_api_key = _wave6b_openrouter_runtime._get_openrouter_api_key
 
-async def _perform_nvidia_completion_adapter_operation(
-    *,
-    adapter_model: Optional[str],
-    operation: Callable[[], Awaitable[Any]],
-) -> Any:
-    max_retries = _get_nvidia_adapter_max_retries()
-    total_attempts = max_retries + 1
-    attempt = 0
-    while True:
-        attempt += 1
-        verbose_proxy_logger.debug(
-            "NVIDIA completion adapter upstream attempt %s/%s for model=%s",
-            attempt,
-            total_attempts,
-            adapter_model,
-        )
-        try:
-            return await operation()
-        except Exception as exc:
-            status_code = _extract_nvidia_adapter_exception_status_code(exc)
-            raw_message = str(exc)
-            if status_code not in _ANTHROPIC_ADAPTER_NVIDIA_RETRYABLE_STATUS_CODES or attempt >= total_attempts:
-                verbose_proxy_logger.warning(
-                    "NVIDIA completion adapter upstream attempt %s failed with %s (%s, raw=%s) and will not be retried",
-                    attempt,
-                    status_code,
-                    exc.__class__.__name__,
-                    raw_message,
-                )
-                raise HTTPException(
-                    status_code=status_code or 502,
-                    detail=raw_message,
-                )
-            wait_seconds = _get_nvidia_adapter_retry_wait_seconds(attempt)
-            verbose_proxy_logger.warning(
-                "NVIDIA completion adapter upstream attempt %s hit %s (%s, raw=%s); backoff %.1fs",
-                attempt,
-                status_code,
-                exc.__class__.__name__,
-                raw_message,
-                wait_seconds,
-            )
-            await asyncio.sleep(wait_seconds)
-
-
-def _get_openrouter_target_base() -> str:
-    cleaned = (_clean_secret_string(os.getenv("OPENROUTER_API_BASE")) or "https://openrouter.ai/api").rstrip("/")
-    if cleaned.endswith("/api/v1"):
-        return cleaned[: -len("/v1")]
-    return cleaned
-
-
-def _get_anthropic_adapter_openrouter_target_base() -> str:
-    return _get_openrouter_target_base()
-
-
-def _get_opencode_zen_target_base() -> str:
-    cleaned = (
-        _clean_secret_string(get_secret_str("OPENCODE_ZEN_API_BASE"))
-        or _clean_secret_string(get_secret_str("AAWM_OPENCODE_ZEN_API_BASE"))
-        or _clean_secret_string(os.getenv("OPENCODE_ZEN_API_BASE"))
-        or _clean_secret_string(os.getenv("AAWM_OPENCODE_ZEN_API_BASE"))
-        or _OPENCODE_ZEN_DEFAULT_BASE_URL
-    ).rstrip("/")
-    if cleaned.endswith("/v1"):
-        return cleaned[: -len("/v1")]
-    return cleaned
-
-
-def _get_opencode_zen_auth_file_path() -> Optional[Path]:
-    for env_name in _OPENCODE_ZEN_AUTH_FILE_ENV_VARS:
-        value = _clean_secret_string(os.getenv(env_name))
-        if value:
-            candidate = Path(value).expanduser()
-            if candidate.is_file():
-                return candidate
-
-    for candidate_str in _OPENCODE_ZEN_DEFAULT_AUTH_PATHS:
-        candidate = Path(candidate_str).expanduser()
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-async def _load_local_opencode_zen_api_key() -> str:
-    explicit_key = _get_first_secret_value(_OPENCODE_ZEN_API_KEY_ENV_VARS)
-    if explicit_key is not None:
-        return explicit_key
-
-    auth_path = _get_opencode_zen_auth_file_path()
-    if auth_path is None:
-        raise FileNotFoundError(
-            "OpenCode Zen auth file not found. Expected "
-            "'~/.local/share/opencode/auth.json' or set 'LITELLM_OPENCODE_AUTH_FILE'."
-        )
-
-    try:
-        auth_data = json.loads(auth_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Unable to read OpenCode Zen auth file at {auth_path}") from exc
-
-    provider_auth = auth_data.get("opencode") if isinstance(auth_data, dict) else None
-    api_key = _clean_secret_string(provider_auth.get("key")) if isinstance(provider_auth, dict) else None
-    auth_type = _clean_secret_string(provider_auth.get("type")) if isinstance(provider_auth, dict) else None
-    if api_key is None or auth_type not in {None, "api"}:
-        raise ValueError("OpenCode Zen auth file must contain provider 'opencode' with API-key auth.")
-    return api_key
-
-
-def _raise_opencode_zen_auto_agent_candidate_unavailable(exc: Exception) -> None:
-    proxy_exc = ProxyException(
-        message=("OpenCode Zen auto-agent candidate requires a valid OpenCode API-key " f"credential: {exc}"),
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    setattr(
-        proxy_exc,
-        "detail",
-        {
-            "error": {
-                "message": proxy_exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        },
-    )
-    raise proxy_exc from exc
-
-
-def _opencode_zen_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    status_code = _extract_google_adapter_exception_status_code(exc)
-    detail = _extract_google_adapter_exception_detail(exc)
-    if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="ignore")
-    else:
-        detail_text = str(detail or exc)
-    detail_text = " ".join(
-        str(part)
-        for part in (
-            getattr(exc, "message", None),
-            getattr(exc, "code", None),
-            detail_text,
-            str(exc),
-        )
-        if part is not None
-    )
-    normalized = detail_text.lower()
-    if any(
-        marker in normalized
-        for marker in (
-            "freeusagelimiterror",
-            "free usage limit",
-            "creditserror",
-            "no payment method",
-            "add a payment method",
-            "billing",
-            "payment required",
-        )
-    ):
-        return detail_text
-    if "not supported for format openai" in normalized:
-        return detail_text
-    if status_code in {401, 402, 403} and any(
-        marker in normalized
-        for marker in (
-            "authentication",
-            "authorization",
-            "unauthorized",
-            "forbidden",
-            "invalid api key",
-            "api-key",
-            "api key",
-            "credential",
-            "opencode",
-        )
-    ):
-        return detail_text
-    return None
-
-
-def _antigravity_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    if not isinstance(exc, HTTPException):
-        return None
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, (dict, list)):
-        detail_text = json.dumps(detail, sort_keys=True, default=str)
-    else:
-        detail_text = str(detail or exc)
-    normalized = detail_text.lower()
-    if "agy cli" in normalized and "auth refresh" in normalized:
-        return detail_text
-    if "antigravity oauth" in normalized or "antigravity cli" in normalized:
-        return detail_text
-    if "antigravity" not in normalized:
-        return None
-    if not any(
-        marker in normalized
-        for marker in (
-            "auth provider",
-            "authentication",
-            "authorization",
-            "credential",
-            "credentials",
-            "log in",
-            "login",
-            "not logged in",
-            "not logged into",
-            "oauth",
-            "token source",
-        )
-    ):
-        return None
-    return detail_text
-
-
-def _raise_antigravity_auto_agent_candidate_unavailable(exc: Exception) -> None:
-    detail = _antigravity_candidate_unavailable_detail(exc) or str(exc)
-    proxy_exc = ProxyException(
-        message=("Antigravity auto-agent candidate requires a valid Antigravity OAuth " f"credential: {detail}"),
-        type="invalid_request_error",
-        param="model",
-        code=502,
-    )
-    setattr(
-        proxy_exc,
-        "detail",
-        {
-            "error": {
-                "message": proxy_exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        },
-    )
-    raise proxy_exc from exc
-
-
-def _is_grok_unsupported_reasoning_parameter_detail(normalized_detail: str) -> bool:
-    if "grok" not in normalized_detail:
-        return False
-    if not any(
-        marker in normalized_detail
-        for marker in (
-            "reasoningeffort",
-            "reasoning_effort",
-            "output_config.effort",
-            "reasoning",
-        )
-    ):
-        return False
-    return any(
-        marker in normalized_detail
-        for marker in (
-            "does not support parameter",
-            "unsupported parameter",
-            "invalid-argument",
-            "invalid argument",
-        )
-    )
-
-
-def _codex_native_openai_candidate_unavailable_detail(exc: Any) -> Optional[str]:
-    status_code = _extract_google_adapter_exception_status_code(exc)
-    if status_code != 400:
-        return None
-    detail = _extract_google_adapter_exception_detail(exc)
-    if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="ignore")
-    elif isinstance(detail, (dict, list)):
-        detail_text = json.dumps(detail, sort_keys=True, default=str)
-    elif detail is not None:
-        detail_text = str(detail)
-    else:
-        detail_text = str(exc)
-    normalized = detail_text.lower()
-    if "not supported when using codex with a chatgpt account" not in normalized:
-        return None
-    if "model is not supported" not in normalized and "is not supported" not in normalized:
-        return None
-    return detail_text
-
-
-def _raise_codex_native_openai_auto_agent_candidate_unavailable(exc: Exception) -> None:
-    detail = _codex_native_openai_candidate_unavailable_detail(exc) or str(exc)
-    proxy_exc = ProxyException(
-        message=("ChatGPT/Codex native OpenAI auto-agent candidate is unavailable for " f"this account: {detail}"),
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    setattr(
-        proxy_exc,
-        "detail",
-        {
-            "error": {
-                "message": proxy_exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        },
-    )
-    raise proxy_exc from exc
-
-
-def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    status_code = _extract_google_adapter_exception_status_code(exc)
-    detail = _extract_google_adapter_exception_detail(exc)
-    if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="ignore")
-    elif isinstance(detail, (dict, list)):
-        detail_text = json.dumps(detail, sort_keys=True, default=str)
-    elif detail is not None:
-        detail_text = str(detail)
-    else:
-        detail_text = str(exc)
-    normalized = detail_text.lower()
-    if _is_grok_unsupported_reasoning_parameter_detail(normalized):
-        return detail_text
-    if "could not decode the compaction blob" in normalized:
-        return detail_text
-    if (
-        status_code == 403
-        and "permission-denied" in normalized
-        and "access to the chat endpoint is denied" in normalized
-        and ("correct credentials" in normalized or "update the permissions" in normalized)
-    ):
-        return detail_text
-    if (
-        "xai oauth credential" not in normalized
-        and "grok oidc credential" not in normalized
-        and "grok native" not in normalized
-    ):
-        return None
-    return detail_text
-
-
-def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]:
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, (dict, list)):
-        detail_text = json.dumps(detail, sort_keys=True, default=str)
-    elif detail is not None:
-        detail_text = str(detail)
-    else:
-        detail_text = str(exc)
-    normalized = detail_text.lower()
-    if _is_grok_unsupported_reasoning_parameter_detail(normalized):
-        return detail_text
-    if "could not decode the compaction blob" in normalized:
-        return detail_text
-    if not any(
-        marker in normalized
-        for marker in (
-            "xai oauth credential",
-            "xai oauth-managed",
-            "managed xai oauth",
-            "litellm_xai_oauth_auth_file",
-        )
-    ):
-        return None
-    return detail_text
-
-
-def _raise_xai_oauth_auto_agent_candidate_unavailable(exc: Exception) -> Never:
-    detail = _xai_oauth_candidate_unavailable_detail(exc) or str(exc)
-    proxy_exc = ProxyException(
-        message=("xAI OAuth auto-agent candidate requires a valid managed xAI OAuth " f"credential: {detail}"),
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    setattr(
-        proxy_exc,
-        "detail",
-        {
-            "error": {
-                "message": proxy_exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        },
-    )
-    raise proxy_exc from exc
-
-
-def _raise_grok_native_auto_agent_candidate_unavailable(exc: Exception) -> Never:
-    detail = _grok_native_candidate_unavailable_detail(exc) or str(exc)
-    proxy_exc = ProxyException(
-        message=("Grok native auto-agent candidate requires a valid managed xAI/Grok " f"credential: {detail}"),
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    setattr(
-        proxy_exc,
-        "detail",
-        {
-            "error": {
-                "message": proxy_exc.message,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
-            }
-        },
-    )
-    raise proxy_exc from exc
-
-
-async def _load_opencode_zen_api_key_for_candidate(
-    *,
-    use_alias_candidate_probe: bool = False,
-) -> str:
-    try:
-        return await _load_local_opencode_zen_api_key()
-    except (FileNotFoundError, ValueError) as exc:
-        if use_alias_candidate_probe:
-            _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
-        raise
-
-
-async def _build_opencode_zen_headers(
-    request: Request,
-    *,
-    use_alias_candidate_probe: bool = False,
-) -> dict[str, str]:
-    api_key = await _load_opencode_zen_api_key_for_candidate(
-        use_alias_candidate_probe=use_alias_candidate_probe,
-    )
-    return BaseOpenAIPassThroughHandler._assemble_headers(
-        api_key=api_key,
-        request=request,
-    )
-
-
-def _add_opencode_zen_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    route_family: str,
-    tag_prefix: str,
-    requested_model: Any,
-    adapter_model: Optional[str] = None,
-    input_shape: Optional[str] = None,
-    output_shape: Optional[str] = None,
-    client_name: Optional[str] = None,
-) -> dict[str, Any]:
-    extra_fields: dict[str, Any] = {
-        "opencode_zen": True,
-        "opencode_zen_requested_model": requested_model,
-    }
-    if client_name is not None:
-        extra_fields["client_name"] = client_name
-    if adapter_model is not None:
-        extra_fields["opencode_zen_adapter_model"] = adapter_model
-    if input_shape is not None:
-        extra_fields["codex_adapter_input_shape"] = input_shape
-    if output_shape is not None:
-        extra_fields["codex_adapter_output_shape"] = output_shape
-
-    tags = [tag_prefix, "opencode-zen"]
-    if adapter_model is not None:
-        tags.append(f"opencode-zen-model:{adapter_model}")
-
-    return _merge_litellm_metadata(
-        _add_route_family_logging_metadata(request_body, route_family),
-        tags_to_add=tags,
-        extra_fields=extra_fields,
-    )
-
-
-@lru_cache(maxsize=1)
-def _get_anthropic_opencode_zen_normalization_runtime() -> _anthropic_opencode_zen_normalization.Runtime:
-    from litellm.responses.litellm_completion_transformation.transformation import (
-        LiteLLMCompletionResponsesConfig,
-    )
-
-    return _anthropic_opencode_zen_normalization.Runtime(
-        clean_secret_string=lambda value: _clean_secret_string(value if isinstance(value, str) else None),
-        merge_metadata=_merge_litellm_metadata,
-        add_logging_metadata=_add_opencode_zen_logging_metadata,
-        build_span=_build_langfuse_span_descriptor,
-        transform_responses_api_request_to_chat_completion_request=(
-            LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request
-        ),
-        async_responses_api_session_handler=(LiteLLMCompletionResponsesConfig.async_responses_api_session_handler),
-        iterate_responses_sse_events=_iterate_responses_sse_events,
-        coerce_namespace_to_mapping=_coerce_namespace_to_mapping,
-        responses_output_item_has_meaningful_content=(_responses_output_item_has_meaningful_content),
-        streaming_response_factory=StreamingResponse,
-    )
-
-
-def _get_opencode_zen_responses_tool_name(tool: Any) -> Optional[str]:
-    return _anthropic_opencode_zen_normalization.get_responses_tool_name(
-        _get_anthropic_opencode_zen_normalization_runtime(),
-        tool,
-    )
-
-
-def _ordered_unique_str_values(values: list[Optional[str]]) -> list[str]:
-    unique_values: list[str] = []
-    for value in values:
-        if not isinstance(value, str) or not value:
-            continue
-        if value not in unique_values:
-            unique_values.append(value)
-    return unique_values
-
-
-def _strip_opencode_zen_unsupported_responses_tools(
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    return _anthropic_opencode_zen_normalization.strip_unsupported_responses_tools(
-        _get_anthropic_opencode_zen_normalization_runtime(),
-        request_body,
-    )
-
-
-def _opencode_zen_chat_message_role(message: Any) -> Optional[str]:
-    return _anthropic_opencode_zen_normalization.chat_message_role(message)
-
-
-def _opencode_zen_chat_tool_call_id(tool_call: Any) -> Optional[str]:
-    return _anthropic_opencode_zen_normalization.chat_tool_call_id(tool_call)
-
-
-def _opencode_zen_chat_message_tool_call_ids(message: Any) -> list[str]:
-    return _anthropic_opencode_zen_normalization.chat_message_tool_call_ids(message)
-
-
-def _opencode_zen_chat_message_tool_result_id(message: Any) -> Optional[str]:
-    return _anthropic_opencode_zen_normalization.chat_message_tool_result_id(message)
-
-
-def _collect_opencode_zen_following_tool_block(
-    messages: list[Any],
-    start_index: int,
-) -> tuple[list[Any], list[Optional[str]], int]:
-    return _anthropic_opencode_zen_normalization.collect_following_tool_block(
-        messages,
-        start_index,
-    )
-
-
-def _sanitize_opencode_zen_completion_messages_for_chat_completion(
-    completion_kwargs: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    return _anthropic_opencode_zen_normalization.sanitize_completion_messages_for_chat_completion(completion_kwargs)
-
-
-def _openrouter_chat_message_function_call(message: Any) -> Any:
-    if isinstance(message, dict):
-        return message.get("function_call")
-    return getattr(message, "function_call", None)
-
-
-def _openrouter_chat_message_has_valid_content_or_tool_calls(message: Any) -> bool:
-    role = _opencode_zen_chat_message_role(message)
-    if role == "tool":
-        return _opencode_zen_chat_message_tool_result_id(message) is not None
-
-    if _opencode_zen_chat_message_tool_call_ids(message):
-        return True
-    if _openrouter_chat_message_function_call(message):
-        return True
-
-    if isinstance(message, dict):
-        content = message.get("content")
-    else:
-        content = getattr(message, "content", None)
-    return not _is_codex_google_code_assist_empty_text_content(content)
-
-
-def _copy_openrouter_message_value(
-    value: Any,
-    *,
-    field_name: str,
-    field_value: Any,
-) -> Any:
-    if isinstance(value, dict):
-        updated = dict(value)
-        updated[field_name] = field_value
-        return updated
-
-    updated = copy.deepcopy(value)
-    setattr(updated, field_name, field_value)
-    return updated
-
-
-def _serialize_openrouter_tool_call_arguments(arguments: Any) -> tuple[str, str]:
-    if isinstance(arguments, dict):
-        argument_kind = "object"
-    elif isinstance(arguments, (list, tuple)):
-        argument_kind = "array"
-    else:
-        argument_kind = "scalar"
-
-    try:
-        serialized = json.dumps(
-            arguments,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-            default=str,
-        )
-    except (TypeError, ValueError):
-        serialized = json.dumps(
-            str(arguments),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-    return serialized, argument_kind
-
-
-def _normalize_openrouter_chat_message_tool_call_arguments(
-    message: Any,
-) -> tuple[Any, dict[str, int]]:
-    if isinstance(message, dict):
-        tool_calls = message.get("tool_calls")
-    else:
-        tool_calls = getattr(message, "tool_calls", None)
-    if not isinstance(tool_calls, list):
-        return message, {}
-
-    updated_tool_calls: list[Any] = []
-    normalized_counts = {
-        "object": 0,
-        "array": 0,
-        "scalar": 0,
-    }
-    changed = False
-    for tool_call in tool_calls:
-        if isinstance(tool_call, dict):
-            function = tool_call.get("function")
-        else:
-            function = getattr(tool_call, "function", None)
-        if function is None:
-            updated_tool_calls.append(tool_call)
-            continue
-
-        if isinstance(function, dict):
-            if "arguments" not in function:
-                updated_tool_calls.append(tool_call)
-                continue
-            arguments = function.get("arguments")
-        else:
-            if not hasattr(function, "arguments"):
-                updated_tool_calls.append(tool_call)
-                continue
-            arguments = getattr(function, "arguments", None)
-        if isinstance(arguments, str):
-            updated_tool_calls.append(tool_call)
-            continue
-
-        normalized_arguments, argument_kind = _serialize_openrouter_tool_call_arguments(arguments)
-        updated_function = _copy_openrouter_message_value(
-            function,
-            field_name="arguments",
-            field_value=normalized_arguments,
-        )
-        updated_tool_calls.append(
-            _copy_openrouter_message_value(
-                tool_call,
-                field_name="function",
-                field_value=updated_function,
-            )
-        )
-        normalized_counts[argument_kind] += 1
-        changed = True
-
-    if not changed:
-        return message, {}
-    return (
-        _copy_openrouter_message_value(
-            message,
-            field_name="tool_calls",
-            field_value=updated_tool_calls,
-        ),
-        normalized_counts,
-    )
-
-
-def _sanitize_openrouter_completion_messages_for_chat_completion(
-    completion_kwargs: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    (
-        completion_kwargs,
-        adjacency_changes,
-    ) = _sanitize_opencode_zen_completion_messages_for_chat_completion(completion_kwargs)
-
-    messages = completion_kwargs.get("messages")
-    if not isinstance(messages, list):
-        return completion_kwargs, adjacency_changes
-
-    updated_messages: list[Any] = []
-    removed_empty_message_count = 0
-    normalized_tool_argument_message_count = 0
-    normalized_tool_argument_counts = {
-        "object": 0,
-        "array": 0,
-        "scalar": 0,
-    }
-    for message in messages:
-        if not _openrouter_chat_message_has_valid_content_or_tool_calls(message):
-            removed_empty_message_count += 1
-            continue
-        normalized_message, normalized_counts = _normalize_openrouter_chat_message_tool_call_arguments(message)
-        updated_messages.append(normalized_message)
-        if normalized_counts:
-            normalized_tool_argument_message_count += 1
-            for key, count in normalized_counts.items():
-                normalized_tool_argument_counts[key] += count
-
-    normalized_tool_argument_count = sum(normalized_tool_argument_counts.values())
-    if removed_empty_message_count == 0 and normalized_tool_argument_count == 0 and not adjacency_changes:
-        return completion_kwargs, {}
-
-    updated_kwargs = dict(completion_kwargs)
-    updated_kwargs["messages"] = updated_messages
-    changes: dict[str, Any] = {
-        "openrouter_chat_message_shape_sanitized": True,
-        "openrouter_chat_message_shape_messages_from_count": len(messages),
-        "openrouter_chat_message_shape_messages_to_count": len(updated_messages),
-        "openrouter_chat_message_shape_removed_empty_message_count": (removed_empty_message_count),
-    }
-    if normalized_tool_argument_count:
-        changes.update(
-            {
-                "openrouter_chat_tool_arguments_sanitized": True,
-                "openrouter_chat_tool_arguments_normalized_count": (normalized_tool_argument_count),
-                "openrouter_chat_tool_arguments_message_count": (normalized_tool_argument_message_count),
-                "openrouter_chat_tool_arguments_object_count": (normalized_tool_argument_counts["object"]),
-                "openrouter_chat_tool_arguments_array_count": (normalized_tool_argument_counts["array"]),
-                "openrouter_chat_tool_arguments_scalar_count": (normalized_tool_argument_counts["scalar"]),
-            }
-        )
-    if adjacency_changes:
-        changes.update(adjacency_changes)
-        changes["openrouter_chat_tool_adjacency_sanitized"] = True
-    return updated_kwargs, changes
-
-
-def _apply_openrouter_completion_message_sanitization(
-    *,
-    request_body: dict[str, Any],
-    completion_kwargs: dict[str, Any],
-    litellm_metadata: dict[str, Any],
-    span_name: str,
-    tag: str,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    (
-        completion_kwargs,
-        sanitization_changes,
-    ) = _sanitize_openrouter_completion_messages_for_chat_completion(completion_kwargs)
-    if not sanitization_changes:
-        return request_body, completion_kwargs, litellm_metadata
-
-    metadata_body = _merge_litellm_metadata(
-        {"litellm_metadata": litellm_metadata},
-        tags_to_add=[tag],
-        extra_fields={
-            **sanitization_changes,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name=span_name,
-                    metadata=sanitization_changes,
-                )
-            ],
-        },
-    )
-    litellm_metadata = dict(metadata_body.get("litellm_metadata") or {})
-    request_body = dict(request_body)
-    request_body["litellm_metadata"] = litellm_metadata
-    completion_kwargs = dict(completion_kwargs)
-    completion_kwargs["metadata"] = litellm_metadata
-    return request_body, completion_kwargs, litellm_metadata
-
-
-def _opencode_zen_responses_sse_event(event_type: str, payload: dict[str, Any]) -> str:
-    return _anthropic_opencode_zen_normalization.responses_sse_event(
-        event_type,
-        payload,
-    )
-
-
-def _opencode_zen_response_payload_for_stream(
-    *,
-    response_id: str,
-    model: str,
-    status: str,
-    output: Optional[list[dict[str, Any]]] = None,
-    usage: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    return _anthropic_opencode_zen_normalization.response_payload_for_stream(
-        response_id=response_id,
-        model=model,
-        status=status,
-        output=output,
-        usage=usage,
-    )
-
-
-def _opencode_zen_message_item_for_stream(
-    *,
-    message_id: str,
-    status: str,
-    output_text: str = "",
-) -> dict[str, Any]:
-    return _anthropic_opencode_zen_normalization.message_item_for_stream(
-        message_id=message_id,
-        status=status,
-        output_text=output_text,
-    )
-
-
-def _opencode_zen_completed_response_for_stream(
-    *,
-    response_event: dict[str, Any],
-    response_id: str,
-    model: str,
-    message_id: Optional[str],
-    output_text: str,
-) -> dict[str, Any]:
-    return _anthropic_opencode_zen_normalization.completed_response_for_stream(
-        _get_anthropic_opencode_zen_normalization_runtime(),
-        response_event=response_event,
-        response_id=response_id,
-        model=model,
-        message_id=message_id,
-        output_text=output_text,
-    )
-
-
-async def _normalize_opencode_zen_responses_stream_for_codex(
-    response: StreamingResponse,
-    *,
-    adapter_model: str,
-) -> Any:
-    async for chunk in _anthropic_opencode_zen_normalization.normalize_responses_stream_for_codex(
-        _get_anthropic_opencode_zen_normalization_runtime(),
-        response,
-        adapter_model=adapter_model,
-    ):
-        yield chunk
-
-
-def _build_codex_opencode_zen_streaming_response(
-    response: StreamingResponse,
-    *,
-    adapter_model: str,
-) -> StreamingResponse:
-    return _anthropic_opencode_zen_normalization.build_codex_streaming_response(
-        _get_anthropic_opencode_zen_normalization_runtime(),
-        response,
-        adapter_model=adapter_model,
-    )
-
-
-def _join_opencode_zen_passthrough_url(base_target_url: str, endpoint: str) -> str:
-    normalized_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
-        endpoint=endpoint,
-        base_target_url=base_target_url,
-    )
-    return str(
-        BaseOpenAIPassThroughHandler._join_url_paths(
-            httpx.URL(base_target_url),
-            normalized_endpoint,
-            _OPENCODE_ZEN_PROVIDER,
-        )
-    )
-
-
-def _build_openrouter_default_headers() -> dict[str, str]:
-    headers = {
-        "HTTP-Referer": _clean_secret_string(get_secret_str("OR_SITE_URL")) or "https://litellm.ai",
-        "X-Title": _clean_secret_string(get_secret_str("OR_APP_NAME")) or "liteLLM",
-    }
-    return headers
+
+_get_anthropic_adapter_openrouter_api_key = _wave6b_openrouter_runtime._get_anthropic_adapter_openrouter_api_key
+
+
+_get_anthropic_adapter_nvidia_api_key = _wave6b_nvidia_runtime._get_anthropic_adapter_nvidia_api_key
+
+
+_get_anthropic_adapter_nvidia_target_base = _wave6b_nvidia_runtime._get_anthropic_adapter_nvidia_target_base
+
+
+_get_nvidia_adapter_max_retries = _wave6b_nvidia_runtime._get_nvidia_adapter_max_retries
+
+
+_get_nvidia_adapter_request_timeout_seconds = _wave6b_nvidia_runtime._get_nvidia_adapter_request_timeout_seconds
+
+
+_get_nvidia_adapter_inner_max_retries = _wave6b_nvidia_runtime._get_nvidia_adapter_inner_max_retries
+
+
+_should_force_fake_stream_for_nvidia_adapter_model = _wave6b_nvidia_runtime._should_force_fake_stream_for_nvidia_adapter_model
+
+
+_extract_nvidia_adapter_exception_status_code = _wave6b_nvidia_runtime._extract_nvidia_adapter_exception_status_code
+
+
+_get_nvidia_adapter_retry_wait_seconds = _wave6b_nvidia_runtime._get_nvidia_adapter_retry_wait_seconds
+
+
+_perform_nvidia_completion_adapter_operation = _wave6b_nvidia_runtime._perform_nvidia_completion_adapter_operation
+
+
+_get_openrouter_target_base = _wave6b_openrouter_runtime._get_openrouter_target_base
+
+
+_get_anthropic_adapter_openrouter_target_base = _wave6b_openrouter_runtime._get_anthropic_adapter_openrouter_target_base
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+def _antigravity_candidate_unavailable_detail(__exc, *__, **___):
+    return _wave6b_common._antigravity_candidate_unavailable_detail(__exc, runtime=_wave6b_common_live_runtime())
+
+
+def _raise_antigravity_auto_agent_candidate_unavailable(__exc, *__, **___):
+    return _wave6b_common._raise_antigravity_auto_agent_candidate_unavailable(__exc, runtime=_wave6b_common_live_runtime())
+
+
+_is_grok_unsupported_reasoning_parameter_detail = _wave6b_common._is_grok_unsupported_reasoning_parameter_detail
+
+
+def _codex_native_openai_candidate_unavailable_detail(__exc, *__, **___):
+    return _wave6b_common._codex_native_openai_candidate_unavailable_detail(__exc, runtime=_wave6b_common_live_runtime())
+
+
+def _raise_codex_native_openai_auto_agent_candidate_unavailable(__exc, *__, **___):
+    return _wave6b_common._raise_codex_native_openai_auto_agent_candidate_unavailable(__exc, runtime=_wave6b_common_live_runtime())
+
+
+def _grok_native_candidate_unavailable_detail(__exc, *__, **___):
+    return _wave6b_common._grok_native_candidate_unavailable_detail(__exc, runtime=_wave6b_common_live_runtime())
+
+
+_xai_oauth_candidate_unavailable_detail = _wave6b_common._xai_oauth_candidate_unavailable_detail
+
+
+_raise_xai_oauth_auto_agent_candidate_unavailable = _wave6b_common._raise_xai_oauth_auto_agent_candidate_unavailable
+
+
+def _raise_grok_native_auto_agent_candidate_unavailable(__exc, *__, **___):
+    return _wave6b_common._raise_grok_native_auto_agent_candidate_unavailable(__exc, runtime=_wave6b_common_live_runtime())
+
+
+
+def _opencode_zen_candidate_unavailable_detail(__exc, *__, **___):
+    return _wave6b_common._opencode_zen_candidate_unavailable_detail(__exc, runtime=_wave6b_common_live_runtime())
+
+
+_raise_opencode_zen_auto_agent_candidate_unavailable = _wave6b_common._raise_opencode_zen_auto_agent_candidate_unavailable
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+_openrouter_chat_message_function_call = _wave6b_openrouter_runtime._openrouter_chat_message_function_call
+
+
+_openrouter_chat_message_has_valid_content_or_tool_calls = _wave6b_openrouter_runtime._openrouter_chat_message_has_valid_content_or_tool_calls
+
+
+_copy_openrouter_message_value = _wave6b_openrouter_runtime._copy_openrouter_message_value
+
+
+_serialize_openrouter_tool_call_arguments = _wave6b_openrouter_runtime._serialize_openrouter_tool_call_arguments
+
+
+_normalize_openrouter_chat_message_tool_call_arguments = _wave6b_openrouter_runtime._normalize_openrouter_chat_message_tool_call_arguments
+
+
+_sanitize_openrouter_completion_messages_for_chat_completion = _wave6b_openrouter_runtime._sanitize_openrouter_completion_messages_for_chat_completion
+
+
+_apply_openrouter_completion_message_sanitization = _wave6b_openrouter_runtime._apply_openrouter_completion_message_sanitization
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+# Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
+
+
+_build_openrouter_default_headers = _wave6b_openrouter_runtime._build_openrouter_default_headers
 
 
 def _get_claude_agent_spec_dir() -> Optional[Path]:
@@ -11371,21 +10062,10 @@ def _add_grok_native_input_item_rewrite_logging_metadata(
     )
 
 
-def _rewrite_grok_native_unsupported_input_items_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    return _anthropic_grok_normalization.rewrite_unsupported_input_items_from_request_body(
-        _get_anthropic_grok_normalization_runtime(), request_body
-    )
+_rewrite_grok_native_unsupported_input_items_from_request_body = _wave6b_xai_request_prep._rewrite_grok_native_unsupported_input_items_from_request_body
 
 
-def _rewrite_grok_native_unsupported_input_items_in_place(
-    request_body: dict[str, Any],
-) -> list[dict[str, Any]]:
-    return _anthropic_grok_normalization.rewrite_unsupported_input_items_in_place(
-        _get_anthropic_grok_normalization_runtime(),
-        request_body,
-    )
+_rewrite_grok_native_unsupported_input_items_in_place = _wave6b_xai_request_prep._rewrite_grok_native_unsupported_input_items_in_place
 
 
 def _drop_unsupported_codex_hosted_tools_from_request_body(
@@ -12777,30 +11457,8 @@ _antigravity_oauth_cached_token_is_valid = _aawm_antigravity_oauth._antigravity_
 _get_antigravity_oauth_expiry_date = _aawm_antigravity_oauth._get_antigravity_oauth_expiry_date
 
 
-def _iter_antigravity_cli_binary_candidates() -> list[Path]:
-    candidate_files: list[Path] = []
-    seen_paths: set[str] = set()
-    for env_name in _ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS:
-        raw_value = _clean_codex_auth_value(os.getenv(env_name))
-        if not raw_value:
-            continue
-        candidate = Path(raw_value).expanduser()
-        if candidate.is_file():
-            resolved = str(candidate.resolve())
-            if resolved not in seen_paths:
-                seen_paths.add(resolved)
-                candidate_files.append(candidate)
-
-    for candidate_str in _ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS:
-        candidate = Path(candidate_str).expanduser()
-        if not candidate.is_file():
-            continue
-        resolved = str(candidate.resolve())
-        if resolved in seen_paths:
-            continue
-        seen_paths.add(resolved)
-        candidate_files.append(candidate)
-    return candidate_files
+def _iter_antigravity_cli_binary_candidates(*__args, **__kwargs):
+    return _wave6b_antigravity_runtime._iter_antigravity_cli_binary_candidates(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
 
 
 _extract_antigravity_oauth_client_values_from_cli_text = (
@@ -12866,103 +11524,49 @@ _refresh_local_antigravity_oauth_token_data = _aawm_antigravity_oauth._refresh_l
 _load_valid_local_antigravity_access_token = _aawm_antigravity_oauth._load_valid_local_antigravity_access_token
 
 
-def _get_antigravity_passthrough_target_base() -> str:
-    return (
-        os.getenv("ANTIGRAVITY_CODE_ASSIST_ENDPOINT")
-        or os.getenv("ANTIGRAVITY_CLI_CODE_ASSIST_ENDPOINT")
-        or _ANTIGRAVITY_CODE_ASSIST_DEFAULT_BASE_URL
-    )
+def _get_antigravity_passthrough_target_base(*__args, **__kwargs):
+    return _wave6b_antigravity_runtime._get_antigravity_passthrough_target_base(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
 
 
-def _get_antigravity_client_header() -> str:
-    return _clean_codex_auth_value(os.getenv("AAWM_ANTIGRAVITY_CLIENT_HEADER")) or _ANTIGRAVITY_CLIENT_HEADER_DEFAULT
+def _get_antigravity_client_header(*__args, **__kwargs):
+    return _wave6b_antigravity_runtime._get_antigravity_client_header(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
 
 
 @lru_cache(maxsize=1)
-def _get_anthropic_antigravity_runtime() -> _anthropic_antigravity_provider.Runtime:
-    return _anthropic_antigravity_provider.Runtime(
-        get_client_header=lambda: _get_antigravity_client_header(),
-        merge_metadata=_merge_litellm_metadata,
-        prepare_observability=lambda **kwargs: (_prepare_request_body_for_passthrough_observability(**kwargs)),
-        split_provider_prefix=_split_anthropic_adapter_provider_prefix,
-        allowed_models=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS,
-        http_exception_type=HTTPException,
-    )
+def _get_anthropic_antigravity_runtime():
+    return _wave6b_antigravity_runtime._get_anthropic_antigravity_runtime(runtime=_wave6b_antigravity_live_runtime())
 
 
-def _build_antigravity_native_headers(access_token: str) -> dict[str, str]:
-    return _anthropic_antigravity_provider._build_antigravity_native_headers(
-        access_token,
-        runtime=_get_anthropic_antigravity_runtime(),
-    )
+def _build_antigravity_native_headers(*__args, **__kwargs):
+    return _wave6b_antigravity_runtime._build_antigravity_native_headers(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
 
 
-def _request_has_google_oauth_bearer(request: Request) -> bool:
-    authorization = request.headers.get("authorization", "").strip()
-    return authorization.lower().startswith("bearer ya29.")
+_request_has_google_oauth_bearer = _wave6b_antigravity_runtime._request_has_google_oauth_bearer
 
 
-def _get_antigravity_litellm_auth_header(request: Request) -> str:
-    header_key = request.headers.get("x-litellm-api-key")
-    if header_key:
-        return _format_litellm_passthrough_api_key(header_key)
-
-    query_key = request.query_params.get("key")
-    if query_key:
-        return _format_litellm_passthrough_api_key(query_key)
-
-    return request.headers.get("authorization", "")
+def _get_antigravity_litellm_auth_header(*__args, **__kwargs):
+    return _wave6b_antigravity_runtime._get_antigravity_litellm_auth_header(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
 
 
-def _prepare_antigravity_request_body_for_passthrough(
-    *,
-    request: Request,
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    return _anthropic_antigravity_provider._prepare_antigravity_request_body_for_passthrough(
-        runtime=_get_anthropic_antigravity_runtime(),
-        request=request,
-        request_body=request_body,
-    )
+def _prepare_antigravity_request_body_for_passthrough(*__args, **__kwargs):
+    return _wave6b_antigravity_runtime._prepare_antigravity_request_body_for_passthrough(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
 
 
-def _get_antigravity_request_project(
-    request_body: AntigravityPassthroughRequestBody,
-) -> Optional[str]:
-    return _clean_codex_auth_value(request_body.get("project"))
+def _get_antigravity_request_project(*__args, **__kwargs):
+    return _wave6b_antigravity_runtime._get_antigravity_request_project(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
 
 
-def _get_antigravity_passthrough_logging_metadata(
-    request: Request,
-) -> PassthroughLoggingMetadata:
-    logging_body = _prepare_antigravity_request_body_for_passthrough(
-        request=request,
-        request_body={},
-    )
-    litellm_metadata = logging_body.get("litellm_metadata")
-    if isinstance(litellm_metadata, dict):
-        return dict(litellm_metadata)
-    return {}
+def _get_antigravity_passthrough_logging_metadata(*__args, **__kwargs):
+    return _wave6b_antigravity_runtime._get_antigravity_passthrough_logging_metadata(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
 
 
-def _normalize_antigravity_endpoint_for_target(endpoint: str) -> str:
-    return _anthropic_antigravity_provider._normalize_antigravity_endpoint_for_target(endpoint)
+_normalize_antigravity_endpoint_for_target = _wave6b_antigravity_runtime._normalize_antigravity_endpoint_for_target
 
 
-def _join_antigravity_passthrough_url(base_target_url: str, endpoint: str) -> str:
-    endpoint_path = _normalize_antigravity_endpoint_for_target(endpoint)
-    base_url = httpx.URL(base_target_url)
-    base_path = base_url.path.rstrip("/")
-    if base_path:
-        endpoint_path = f"{base_path}/{endpoint_path.lstrip('/')}"
-    return str(base_url.copy_with(path=endpoint_path))
+_join_antigravity_passthrough_url = _wave6b_antigravity_runtime._join_antigravity_passthrough_url
 
 
-def _is_antigravity_streaming_endpoint(endpoint: str, request: Request) -> bool:
-    return _anthropic_antigravity_provider._is_antigravity_streaming_endpoint(
-        endpoint,
-        request,
-    )
+_is_antigravity_streaming_endpoint = _wave6b_antigravity_runtime._is_antigravity_streaming_endpoint
 
 
 def _get_grok_passthrough_target_base() -> str:
@@ -18130,6 +16734,88 @@ def create_generic_websocket_passthrough_endpoint(
         _forward_headers=forward_headers,
         cost_per_request=cost_per_request,
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave 6B runtime configuration and facade installation
+# ---------------------------------------------------------------------------
+
+def _wave6b_common_live_runtime() -> _wave6b_common.Runtime:
+    """Build a common Runtime with live host-global lookup."""
+    return _wave6b_common.Runtime(
+        extract_status_code=lambda exc: _extract_google_adapter_exception_status_code(exc),
+        extract_detail=lambda exc: _extract_google_adapter_exception_detail(exc),
+    )
+
+
+def _wave6b_antigravity_live_runtime() -> _wave6b_antigravity_runtime.Runtime:
+    """Build an Antigravity Runtime with live host-global lookup."""
+    return _wave6b_antigravity_runtime.Runtime(
+        clean_value=lambda v: _clean_codex_auth_value(v),
+        merge_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
+        prepare_observability=lambda **kw: _prepare_request_body_for_passthrough_observability(**kw),
+        split_provider_prefix=lambda v: _split_anthropic_adapter_provider_prefix(v),
+        format_api_key=lambda v: _format_litellm_passthrough_api_key(v),
+        oauth_error_code=lambda r: _get_oauth_token_error_code(r),
+        allowed_models=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS,
+    )
+
+
+# -- OpenRouter runtime configuration --
+_wave6b_openrouter_runtime.configure_openrouter_runtime(
+    _wave6b_openrouter_runtime.Runtime(
+        retry_transport_runtime=_ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
+        clean_secret_string=lambda v: _clean_secret_string(v),
+        get_first_secret_value=lambda names: _get_first_secret_value(names),
+        getenv=lambda name: os.getenv(name),
+        get_secret_str=lambda name: get_secret_str(name),
+        sanitize_opencode_zen_completion_messages=lambda kw: _sanitize_opencode_zen_completion_messages_for_chat_completion(kw),
+        chat_message_role=lambda msg: _opencode_zen_chat_message_role(msg),
+        chat_message_tool_call_ids=lambda msg: _opencode_zen_chat_message_tool_call_ids(msg),
+        chat_message_tool_result_id=lambda msg: _opencode_zen_chat_message_tool_result_id(msg),
+        is_empty_text_content=lambda c: _is_codex_google_code_assist_empty_text_content(c),
+        merge_litellm_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
+        build_langfuse_span_descriptor=lambda *a, **kw: _build_langfuse_span_descriptor(*a, **kw),
+    )
+)
+
+# -- NVIDIA runtime configuration --
+_wave6b_nvidia_runtime.configure_nvidia_runtime(
+    _wave6b_nvidia_runtime.NvidiaRuntimeDependencies(
+        get_first_secret_value=lambda names: _get_first_secret_value(names),
+        clean_secret_string=lambda v: _clean_secret_string(v),
+        clean_auth_value=lambda v: _clean_codex_auth_value(v),
+        get_env=lambda name: os.getenv(name),
+        sleep=lambda seconds: asyncio.sleep(seconds),
+        log_debug=verbose_proxy_logger.debug,
+        log_warning=verbose_proxy_logger.warning,
+    )
+)
+
+# -- xAI request-prep runtime configuration --
+_wave6b_xai_request_prep.configure_xai_request_prep_runtime(
+    _wave6b_xai_request_prep.build_default_xai_request_prep_runtime(
+        get_model_metadata_entry=lambda m: _get_model_metadata_entry(m),
+        get_openai_tool_type=lambda t: _get_openai_tool_type(t),
+        normalize_low_cardinality_tag_value=lambda v: _normalize_low_cardinality_tag_value(v),
+        dedupe_sorted_str_list=lambda lst: _dedupe_sorted_str_list(lst),
+        merge_litellm_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
+        build_langfuse_span_descriptor=lambda *a, **kw: _build_langfuse_span_descriptor(*a, **kw),
+        drop_unsupported_codex_hosted_tools_from_request_body=lambda b: _drop_unsupported_codex_hosted_tools_from_request_body(b),
+        drop_unsupported_codex_request_params_from_request_body=lambda b: _drop_unsupported_codex_request_params_from_request_body(b),
+        drop_unsupported_codex_input_items_from_request_body=lambda b: _drop_unsupported_codex_input_items_from_request_body(b),
+        drop_tool_choice_without_tools_from_request_body=lambda b: _drop_tool_choice_without_tools_from_request_body(b),
+        replace_request_body_in_place=lambda orig, new: _replace_request_body_in_place(orig, new),
+        safe_get_request_headers=lambda req: _safe_get_request_headers(req),
+        get_case_insensitive_header=lambda hdrs, name: _get_case_insensitive_header(hdrs, name),
+        get_rewrite_input_item_types_for_model=lambda m: _get_rewrite_input_item_types_for_model(m),
+        get_grok_passthrough_target_base=lambda: _get_grok_passthrough_target_base(),
+    )
+)
+
+# -- OpenCode Zen install (configures runtime + publishes same-object facades) --
+_wave6b_opencode_zen_runtime.install(globals())
+
 
 # Wave 4 runtime injection -- FunctionType rebind for live host-global lookup
 _aawm_lane_keys.install(globals())

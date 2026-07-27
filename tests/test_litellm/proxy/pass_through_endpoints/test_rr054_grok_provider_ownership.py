@@ -182,15 +182,55 @@ def test_rr054_grok_normalization_helpers_delegate_within_owner() -> None:
 
 def test_rr054_grok_proxy_request_shaping_names_are_thin_delegates() -> None:
     proxy_tree = _parse(PROXY_PATH)
+    proxy_assignments = {
+        target.id: node.value
+        for node in proxy_tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
 
     for function_name, expected_call in PROXY_DELEGATES.items():
-        function = _function(proxy_tree, function_name)
-        assert expected_call in _calls(function), (
-            f"{function_name} must delegate to {expected_call}; "
-            f"calls={sorted(_calls(function))}"
-        )
-        statements = _non_docstring_statements(function)
-        assert len(statements) == 1, (
-            f"{function_name} retains Grok request-shaping logic "
-            f"({len(statements)} statements)"
-        )
+        function = None
+        for node in proxy_tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
+                function = node
+                break
+
+        if function is not None:
+            # Legacy thin-delegate pattern
+            assert expected_call in _calls(function), (
+                f"{function_name} must delegate to {expected_call}; "
+                f"calls={sorted(_calls(function))}"
+            )
+            statements = _non_docstring_statements(function)
+            assert len(statements) == 1, (
+                f"{function_name} retains Grok request-shaping logic "
+                f"({len(statements)} statements)"
+            )
+        else:
+            # Wave 6B pattern: same-object assignment to extracted module
+            assert function_name in proxy_assignments, (
+                f"{function_name} must be defined as a thin delegate or "
+                f"same-object facade assignment"
+            )
+            assigned_value = proxy_assignments[function_name]
+            assert isinstance(assigned_value, ast.Attribute), (
+                f"{function_name} must be assigned from the extracted Wave 6B module"
+            )
+            assert isinstance(assigned_value.value, ast.Name), (
+                f"{function_name} assignment must reference the extracted module"
+            )
+            assert assigned_value.value.id == "_wave6b_xai_request_prep", (
+                f"{function_name} must be assigned from _wave6b_xai_request_prep, "
+                f"got {assigned_value.value.id}"
+            )
+            assert assigned_value.attr == function_name, (
+                f"{function_name} must be assigned the same-named function"
+            )
+            # Runtime same-object identity proof
+            from litellm.proxy.pass_through_endpoints.providers.xai import request_prep
+            assert getattr(lpe, function_name) is getattr(request_prep, function_name), (
+                f"{function_name} must be the same object as "
+                f"_wave6b_xai_request_prep.{function_name}"
+            )

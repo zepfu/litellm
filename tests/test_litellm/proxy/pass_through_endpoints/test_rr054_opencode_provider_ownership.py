@@ -12,6 +12,8 @@ import ast
 from pathlib import Path
 from typing import Optional
 
+from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 GOD_PATH = (
     REPO_ROOT
@@ -281,15 +283,29 @@ def test_rr054_opencode_god_file_builds_normalization_runtime() -> None:
         "_get_anthropic_opencode_zen_normalization_runtime",
     )
 
-    assert runtime_factory is not None
-    assert (
-        "_anthropic_opencode_zen_normalization.Runtime"
-        in _called_names(runtime_factory)
-    )
-    statements = _non_docstring_statements(runtime_factory)
-    assert len(statements) <= 2, (
-        "OpenCode Zen normalization runtime binding must remain a thin factory"
-    )
+    if runtime_factory is not None:
+        # Legacy pattern: AST-visible thin factory in the god module
+        assert (
+            "_anthropic_opencode_zen_normalization.Runtime"
+            in _called_names(runtime_factory)
+        )
+        statements = _non_docstring_statements(runtime_factory)
+        assert len(statements) <= 2, (
+            "OpenCode Zen normalization runtime binding must remain a thin factory"
+        )
+    else:
+        # Wave 6B pattern: published by install(globals()) from extracted module
+        from litellm.proxy.pass_through_endpoints.providers.opencode_zen import (
+            runtime as zen_runtime,
+        )
+        assert hasattr(lpe, "_get_anthropic_opencode_zen_normalization_runtime"), (
+            "_get_anthropic_opencode_zen_normalization_runtime must be available "
+            "on the god module via Wave 6B install()"
+        )
+        assert (
+            getattr(lpe, "_get_anthropic_opencode_zen_normalization_runtime")
+            is zen_runtime._get_anthropic_opencode_zen_normalization_runtime
+        ), "must be the same object as the extracted module owner"
 
 
 def test_rr054_opencode_god_compatibility_functions_are_thin_delegates() -> None:
@@ -297,23 +313,32 @@ def test_rr054_opencode_god_compatibility_functions_are_thin_delegates() -> None
 
     for wrapper_name, provider_attr in GOD_COMPAT_DELEGATES.items():
         node = _function_node(god_tree, wrapper_name)
-        assert node is not None or _assigned_provider_attr(
-            god_tree,
-            wrapper_name,
-            provider_attr,
-        ), f"missing OpenCode normalization delegate {wrapper_name}"
-        if node is None:
-            continue
-
-        expected_call = f"_anthropic_opencode_zen_normalization.{provider_attr}"
-        assert expected_call in _called_names(node), (
-            f"{wrapper_name} must delegate to {expected_call}"
-        )
-        statements = _non_docstring_statements(node)
-        assert len(statements) <= 2, (
-            f"{wrapper_name} has {len(statements)} statements; "
-            "compatibility wrappers must not retain normalization logic"
-        )
+        if node is not None:
+            # Legacy pattern: AST-visible thin delegate
+            expected_call = f"_anthropic_opencode_zen_normalization.{provider_attr}"
+            assert expected_call in _called_names(node), (
+                f"{wrapper_name} must delegate to {expected_call}"
+            )
+            statements = _non_docstring_statements(node)
+            assert len(statements) <= 2, (
+                f"{wrapper_name} has {len(statements)} statements; "
+                "compatibility wrappers must not retain normalization logic"
+            )
+        elif _assigned_provider_attr(god_tree, wrapper_name, provider_attr):
+            # Wave 5 pattern: direct assignment to provider attr
+            pass
+        else:
+            # Wave 6B pattern: published by install(globals()) from extracted module
+            from litellm.proxy.pass_through_endpoints.providers.opencode_zen import (
+                runtime as zen_runtime,
+            )
+            assert hasattr(lpe, wrapper_name), (
+                f"missing OpenCode normalization delegate {wrapper_name}"
+            )
+            assert getattr(lpe, wrapper_name) is getattr(zen_runtime, wrapper_name), (
+                f"{wrapper_name} must be the same object as the extracted "
+                f"Wave 6B module owner"
+            )
 
 
 def test_rr054_codex_opencode_route_delegates_request_normalization() -> None:

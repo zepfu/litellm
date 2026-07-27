@@ -200,6 +200,24 @@ def _provider_shaping_seams(
         and name.startswith(SHAPING_VERB_PREFIXES)
         and name not in GOOGLE_PROCESS_CACHE_SEAMS
     }
+    # Wave 6B: also discover same-object assignments from extracted provider modules
+    # Only the antigravity Wave 6B runtime may publish antigravity seams.
+    # Google seams must not be accepted from any Wave 6B module.
+    _WAVE6B_MODULE_ALIASES = (
+        frozenset({"_wave6b_antigravity_runtime"})
+        if provider_marker == "antigravity"
+        else frozenset()
+    )
+    for name, value in _top_level_assignments(god_tree).items():
+        if (
+            provider_marker in name
+            and name.startswith(SHAPING_VERB_PREFIXES)
+            and name not in GOOGLE_PROCESS_CACHE_SEAMS
+            and isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id in _WAVE6B_MODULE_ALIASES
+        ):
+            discovered.add(name)
     assert representative_seams.issubset(discovered), (
         f"shaping discovery lost required {provider_marker} seams: "
         f"{sorted(representative_seams - discovered)}"
@@ -250,34 +268,68 @@ def _assert_thin_god_delegates(
     function_names: set[str],
     module_alias: str,
 ) -> None:
+    god_assignments = _top_level_assignments(god_tree)
+    # Only the antigravity Wave 6B runtime may publish antigravity seams.
+    # Google seams must not be accepted from any Wave 6B module.
+    _WAVE6B_MODULE_ALIASES = (
+        frozenset({"_wave6b_antigravity_runtime"})
+        if "antigravity" in module_alias
+        else frozenset()
+    )
     for name in sorted(function_names):
         function = _function(god_tree, name)
-        assert function is not None, (
-            f"compatibility entry point {name} must remain available on the god file"
-        )
-        statements = _operational_statements(function)
-        assert len(statements) <= 3, (
-            f"{name} still owns implementation in llm_passthrough_endpoints.py; "
-            f"expected at most three delegate statements, found {len(statements)}"
-        )
-        assert not any(
-            isinstance(
-                node,
-                (
-                    ast.For,
-                    ast.While,
-                    ast.Try,
-                    ast.If,
-                    ast.Match,
-                    ast.With,
-                    ast.AsyncWith,
-                ),
+        if function is not None:
+            # Legacy thin-delegate pattern
+            statements = _operational_statements(function)
+            assert len(statements) <= 3, (
+                f"{name} still owns implementation in llm_passthrough_endpoints.py; "
+                f"expected at most three delegate statements, found {len(statements)}"
             )
-            for node in ast.walk(function)
-        ), f"{name} must be a thin provider delegate without local orchestration"
-        assert _calls_module(function, module_alias, name), (
-            f"{name} must delegate to {module_alias}.{name}"
-        )
+            assert not any(
+                isinstance(
+                    node,
+                    (
+                        ast.For,
+                        ast.While,
+                        ast.Try,
+                        ast.If,
+                        ast.Match,
+                        ast.With,
+                        ast.AsyncWith,
+                    ),
+                )
+                for node in ast.walk(function)
+            ), f"{name} must be a thin provider delegate without local orchestration"
+            if not _calls_module(function, module_alias, name):
+                # Wave 6B: accept delegation to extracted provider module aliases
+                assert any(
+                    _calls_module(function, wave6b_alias, name)
+                    for wave6b_alias in _WAVE6B_MODULE_ALIASES
+                ), (
+                    f"{name} must delegate to {module_alias}.{name} or a "
+                    f"Wave 6B extracted module alias"
+                )
+        else:
+            # Wave 6B pattern: same-object assignment from extracted provider module
+            assert name in god_assignments, (
+                f"compatibility entry point {name} must remain available on the "
+                f"god file as a thin delegate or same-object facade assignment"
+            )
+            assigned_value = god_assignments[name]
+            assert isinstance(assigned_value, ast.Attribute), (
+                f"{name} must be assigned from a Wave 6B extracted module"
+            )
+            assert isinstance(assigned_value.value, ast.Name), (
+                f"{name} assignment must reference a Wave 6B module alias"
+            )
+            assert assigned_value.value.id in _WAVE6B_MODULE_ALIASES, (
+                f"{name} must be assigned from a known Wave 6B module, "
+                f"got {assigned_value.value.id}"
+            )
+            assert assigned_value.attr == name, (
+                f"{name} must be assigned the same-named function from "
+                f"{assigned_value.value.id}, got {assigned_value.attr}"
+            )
 
 
 def test_rr054_google_and_antigravity_provider_packages_are_real() -> None:
