@@ -8214,7 +8214,7 @@ async def test_route_streaming_logging_captures_code_assist_quota_observation(
 
 @pytest.mark.asyncio
 async def test_openai_responses_passthrough_sanitizes_and_restores_function_names():
-    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.anthropic_adapter_calls import (
         _build_anthropic_responses_adapter_request_body,
     )
 
