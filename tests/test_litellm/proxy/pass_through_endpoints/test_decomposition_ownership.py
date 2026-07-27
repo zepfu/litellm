@@ -1806,31 +1806,29 @@ class TestWave6ERequestPolicyOwnership:
         assert not duplicates
 
     # Same-object facades still on god module: these must NOT be FunctionDefs.
-    # 11 anthropic_body_prep + 9 pure codex.
-    # (14 claude_prompt_replacement symbols were removed from the god module.)
-    WAVE6E_SAME_OBJECT_SYMBOLS: set[str] = (
-        WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS
-        | {
-            "_get_openai_tool_name",
-            "_get_openai_tool_type",
-            "_patch_codex_spawn_agent_description_text",
-            "_patch_codex_spawn_agent_payload_parameters",
-            "_load_bundled_model_cost_map_for_codex_policy",
-            "_adapted_custom_tool_function_schema",
-            "_request_has_openai_tool_definitions",
-            "_apply_spawn_agent_parameter_patches",
-            "_lookup_model_info_field",
-        }
-    )
+    WAVE6E_SAME_OBJECT_SYMBOLS: set[str] = WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS
+
+    WAVE6E_CODEX_TOOL_POLICY_MODULE_ONLY_SYMBOLS: set[str] = {
+        "_get_openai_tool_name",
+        "_get_openai_tool_type",
+        "_patch_codex_spawn_agent_description_text",
+        "_patch_codex_spawn_agent_payload_parameters",
+        "_load_bundled_model_cost_map_for_codex_policy",
+        "_adapted_custom_tool_function_schema",
+        "_request_has_openai_tool_definitions",
+        "_apply_spawn_agent_parameter_patches",
+        "_lookup_model_info_field",
+    }
 
     # Thin callback wrappers: these ARE intentional FunctionDefs in the god
     # module (they bind CodexToolPolicyCallbacks or normalize_tag_value).
     WAVE6E_WRAPPER_SYMBOLS: set[str] = (
-        WAVE6E_CODEX_TOOL_POLICY_SYMBOLS - WAVE6E_SAME_OBJECT_SYMBOLS
+        WAVE6E_CODEX_TOOL_POLICY_SYMBOLS
+        - WAVE6E_CODEX_TOOL_POLICY_MODULE_ONLY_SYMBOLS
     )
 
     def test_same_object_facades_not_function_defs(self):
-        """20 same-object facades must not be FunctionDefs in the god module."""
+        """11 same-object facades must not be FunctionDefs in the god module."""
         func_defs = _top_level_function_defs(_parse_god_module())
         violations = self.WAVE6E_SAME_OBJECT_SYMBOLS & func_defs
         assert not violations, (
@@ -1847,10 +1845,10 @@ class TestWave6ERequestPolicyOwnership:
         )
 
     def test_all_wave6e_symbols_accessible(self):
-        """62 symbols callable on god module; 14 claude_prompt_replacement
-        symbols callable on their module and absent from the god module."""
+        """All 76 symbols remain callable on their owning public surface."""
         claude_symbols = WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS
-        god_symbols = ALL_WAVE6E_FUNCTIONS - claude_symbols
+        codex_module_symbols = self.WAVE6E_CODEX_TOOL_POLICY_MODULE_ONLY_SYMBOLS
+        god_symbols = ALL_WAVE6E_FUNCTIONS - claude_symbols - codex_module_symbols
         for symbol in god_symbols:
             facade = getattr(lpe, symbol, None)
             assert facade is not None, f"{symbol} not on god module"
@@ -1864,6 +1862,21 @@ class TestWave6ERequestPolicyOwnership:
                 f"{symbol} not on claude_prompt_replacement module"
             )
             assert callable(module_fn), f"{symbol} not callable on module"
+            assert not hasattr(lpe, symbol), (
+                f"{symbol} should be absent from god module"
+            )
+        codex_mod = importlib.import_module(
+            WAVE6E_MODULE_IMPORT_PATHS["codex_tool_policy"]
+        )
+        for symbol in codex_module_symbols:
+            module_name = symbol.lstrip("_")
+            module_fn = getattr(codex_mod, module_name, None) or getattr(
+                codex_mod, symbol, None
+            )
+            assert module_fn is not None, (
+                f"{module_name} not on codex_tool_policy module"
+            )
+            assert callable(module_fn), f"{module_name} not callable on module"
             assert not hasattr(lpe, symbol), (
                 f"{symbol} should be absent from god module"
             )
@@ -1891,28 +1904,18 @@ class TestWave6ERequestPolicyOwnership:
                 f"anthropic_body_prep.{symbol}: facade identity mismatch"
             )
 
-    def test_codex_tool_policy_pure_function_identity(self):
-        """codex_tool_policy pure functions (no callbacks) are same-object."""
+    def test_codex_tool_policy_pure_functions_absent_from_god_module(self):
+        """Pure codex policy functions are module-owned, not god-module aliases."""
         mod = importlib.import_module(WAVE6E_MODULE_IMPORT_PATHS["codex_tool_policy"])
-        pure_symbols = {
-            "_get_openai_tool_name",
-            "_get_openai_tool_type",
-            "_patch_codex_spawn_agent_description_text",
-            "_patch_codex_spawn_agent_payload_parameters",
-            "_load_bundled_model_cost_map_for_codex_policy",
-            "_adapted_custom_tool_function_schema",
-            "_request_has_openai_tool_definitions",
-            "_apply_spawn_agent_parameter_patches",
-            "_lookup_model_info_field",
-        }
-        for symbol in pure_symbols:
-            facade = getattr(lpe, symbol)
-            # Map god-module name to module name (strip leading _)
+        for symbol in self.WAVE6E_CODEX_TOOL_POLICY_MODULE_ONLY_SYMBOLS:
             module_name = symbol.lstrip("_")
             module_fn = getattr(mod, module_name, None) or getattr(mod, symbol, None)
             assert module_fn is not None, f"{module_name} not on codex_tool_policy"
-            assert facade is module_fn, (
-                f"codex_tool_policy.{symbol}: facade identity mismatch"
+            assert callable(module_fn), (
+                f"codex_tool_policy.{module_name}: not callable on module"
+            )
+            assert not hasattr(lpe, symbol), (
+                f"codex_tool_policy.{symbol}: still present on god module"
             )
 
     def test_no_wave6e_module_imports_god_module_at_scope(self):

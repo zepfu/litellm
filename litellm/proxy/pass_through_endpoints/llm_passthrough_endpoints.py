@@ -3367,7 +3367,7 @@ _aawm_attempt_records.configure_attempt_records_runtime(
     normalize_anthropic_alias_model=lambda *a, **kw: _normalize_anthropic_auto_agent_alias_model(*a, **kw),
     load_bundled_model_cost=lambda *a, **kw: cast(
         Callable[..., dict[str, Any]],
-        globals()["_load_bundled_model_cost_map_for_codex_policy"],
+        _aawm_codex_tool_policy.load_bundled_model_cost_map_for_codex_policy,
     )(*a, **kw),
     get_model_info=lambda *a, **kw: litellm.get_model_info(*a, **kw),
     model_cost=litellm.model_cost,
@@ -9621,7 +9621,7 @@ _wave6b_nvidia_runtime.configure_nvidia_runtime(
 _wave6b_xai_request_prep.configure_xai_request_prep_runtime(
     _wave6b_xai_request_prep.build_default_xai_request_prep_runtime(
         get_model_metadata_entry=lambda m: _get_model_metadata_entry(m),
-        get_openai_tool_type=lambda t: _get_openai_tool_type(t),
+        get_openai_tool_type=lambda t: _aawm_codex_tool_policy.get_openai_tool_type(t),
         normalize_low_cardinality_tag_value=lambda v: _normalize_low_cardinality_tag_value(v),
         dedupe_sorted_str_list=lambda lst: _dedupe_sorted_str_list(lst),
         merge_litellm_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
@@ -9825,15 +9825,6 @@ _CODEX_TOOL_POLICY_CALLBACKS = _aawm_codex_tool_policy.CodexToolPolicyCallbacks(
 )
 
 # -- Pure functions (same-object identity) --
-_get_openai_tool_name = _aawm_codex_tool_policy.get_openai_tool_name
-_get_openai_tool_type = _aawm_codex_tool_policy.get_openai_tool_type
-_patch_codex_spawn_agent_description_text = _aawm_codex_tool_policy.patch_codex_spawn_agent_description_text
-_patch_codex_spawn_agent_payload_parameters = _aawm_codex_tool_policy.patch_codex_spawn_agent_payload_parameters
-_load_bundled_model_cost_map_for_codex_policy = _aawm_codex_tool_policy.load_bundled_model_cost_map_for_codex_policy
-_adapted_custom_tool_function_schema = _aawm_codex_tool_policy.adapted_custom_tool_function_schema
-_request_has_openai_tool_definitions = _aawm_codex_tool_policy.request_has_openai_tool_definitions
-_apply_spawn_agent_parameter_patches = _aawm_codex_tool_policy._apply_spawn_agent_parameter_patches
-_lookup_model_info_field = _aawm_codex_tool_policy._lookup_model_info_field
 
 # -- Functions binding normalize_tag_value --
 
