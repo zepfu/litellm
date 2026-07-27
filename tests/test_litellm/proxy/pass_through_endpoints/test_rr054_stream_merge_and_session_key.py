@@ -22,6 +22,15 @@ from fastapi import HTTPException, Request
 from starlette.responses import StreamingResponse
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.stream_collect import (
+    _collect_responses_response_from_stream,
+    _finalize_collected_responses_stream_response,
+    _merge_responses_output_lists,
+    _responses_output_stream_key,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_events import (
+    _emit_auto_agent_alias_no_candidate_event,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +105,7 @@ def test_rr054_issue46_merge_fallback_keyed_stream_item_gaining_call_id_does_not
         }
     ]
 
-    merged = lpe._merge_responses_output_lists(completed_output, streamed_output)
+    merged = _merge_responses_output_lists(completed_output, streamed_output)
     function_calls = _function_calls(merged)
 
     assert len(function_calls) == 1, (
@@ -134,7 +143,7 @@ def test_rr054_issue46_merge_with_stream_correlation_maps_does_not_duplicate() -
         }
     ]
 
-    merged = lpe._merge_responses_output_lists(
+    merged = _merge_responses_output_lists(
         completed_output,
         streamed_output,
         streamed_ordered_keys=[stream_key],
@@ -181,7 +190,7 @@ def test_rr054_issue46_finalize_preserves_stream_args_when_completed_gains_call_
         ],
     }
 
-    finalized = lpe._finalize_collected_responses_stream_response(
+    finalized = _finalize_collected_responses_stream_response(
         response_dict=response_dict,
         output_text_parts=[],
         output_items=output_items,
@@ -249,7 +258,7 @@ async def test_rr054_issue46_collect_stream_without_midstream_ids_then_completed
             yield chunk
 
     response = StreamingResponse(_gen(), media_type="text/event-stream")
-    collected = await lpe._collect_responses_response_from_stream(response)
+    collected = await _collect_responses_response_from_stream(response)
     function_calls = _function_calls(collected.get("output"))
     assert len(function_calls) == 1, (
         "RR-054 #46 stream collect: item that only later gains call_id must not "
@@ -266,7 +275,7 @@ def test_rr054_issue46_merge_does_not_duplicate_when_completed_only_has_call_id(
         "name": "Bash",
         "arguments": '{"cmd":"ls"}',
     }
-    synthetic_key = lpe._responses_output_stream_key(
+    synthetic_key = _responses_output_stream_key(
         item=stream_item,
         output_index=0,
         fallback_index=0,
@@ -284,7 +293,7 @@ def test_rr054_issue46_merge_does_not_duplicate_when_completed_only_has_call_id(
             "status": "completed",
         }
     ]
-    merged = lpe._merge_responses_output_lists(
+    merged = _merge_responses_output_lists(
         completed_output,
         [stream_item],
         streamed_ordered_keys=[synthetic_key],
@@ -354,7 +363,7 @@ def test_rr054_issue50_no_candidate_audit_uses_lane_scoped_session_key() -> None
         "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
         return_value=True,
     ):
-        lpe._emit_auto_agent_alias_no_candidate_event(
+        _emit_auto_agent_alias_no_candidate_event(
             alias_family="codex_auto_agent",
             alias_model=alias_model,
             request=request,
@@ -457,7 +466,7 @@ def test_rr054_issue50_no_candidate_default_lane_session_key_not_none() -> None:
         "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
         return_value=True,
     ):
-        lpe._emit_auto_agent_alias_no_candidate_event(
+        _emit_auto_agent_alias_no_candidate_event(
             alias_family="codex_auto_agent",
             alias_model=alias_model,
             request=request,

@@ -22,6 +22,7 @@ from fastapi import HTTPException, Request, Response
 from starlette.responses import StreamingResponse
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import anthropic_adapter_calls as aac
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import adapter_config
 from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
 
@@ -50,8 +51,8 @@ NINE_ADAPTER_LABELS = [name for name, _ in RESPONSES_ADAPTERS] + [
     name for name, _ in COMPLETION_ADAPTERS
 ]
 
-DEFAULT_RETRYABLE = list(lpe._AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT)
-PROBE_RETRYABLE = list(lpe._AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES)
+DEFAULT_RETRYABLE = list(aac._AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT)
+PROBE_RETRYABLE = list(aac._AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES)
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +559,7 @@ def test_rr054_issue9_responses_empty_success_config_and_builder(
         assert kwargs.get("response_builder_kwargs", {}).get("reject_empty_success") is True
         assert kwargs.get("stream_builder_kwargs", {}).get("reject_empty_success") is True
         with pytest.raises(HTTPException) as exc_info:
-            lpe._build_anthropic_response_from_responses_response(
+            aac._build_anthropic_response_from_responses_response(
                 _empty_success_responses_body(model="m"),
                 **kwargs["response_builder_kwargs"],
             )
@@ -573,7 +574,7 @@ def test_rr054_issue9_responses_empty_success_config_and_builder(
         # Translation may still succeed or depend on adapter internals; ensure no
         # empty-success HTTPException is raised by the reject gate.
         try:
-            result = lpe._build_anthropic_response_from_responses_response(
+            result = aac._build_anthropic_response_from_responses_response(
                 _empty_success_responses_body(model="m"),
                 reject_empty_success=False,
             )
@@ -612,7 +613,7 @@ def test_rr054_issue9_parallel_policy_routing_by_config(
     translated = _parallel_policy_body()
     original_instructions = translated["instructions"]
 
-    updated = lpe._apply_anthropic_responses_adapter_policies_from_config(
+    updated = aac._apply_anthropic_responses_adapter_policies_from_config(
         prepared,
         dict(translated),
         config=config,
@@ -621,7 +622,7 @@ def test_rr054_issue9_parallel_policy_routing_by_config(
     if config.use_openai_parallel_policy:
         assert original_instructions in (updated.get("instructions") or "")
         assert (updated.get("instructions") or "").startswith(
-            lpe._OPENAI_ADAPTER_PARALLEL_FUNCTION_TOOL_INSTRUCTIONS[:40]
+            aac._OPENAI_ADAPTER_PARALLEL_FUNCTION_TOOL_INSTRUCTIONS[:40]
         ) or original_instructions in (updated.get("instructions") or "")
         # RR-054 #20: never wipe original system prompt.
         assert original_instructions in (updated.get("instructions") or "")
@@ -642,7 +643,7 @@ def test_rr054_issue9_parallel_policy_routing_by_config(
 def test_rr054_issue9_openrouter_family_parallel_helper_still_applies() -> None:
     """Routes that set use_openai_parallel_policy=False still have a parallel helper."""
     body = _parallel_policy_body()
-    updated, changes = lpe._apply_openrouter_adapter_parallel_instruction_policy(body)
+    updated, changes = aac._apply_openrouter_adapter_parallel_instruction_policy(body)
     assert changes.get("openrouter_adapter_parallel_instruction_policy_applied") is True
     assert body["instructions"] in (updated.get("instructions") or "")
     assert changes.get("openrouter_adapter_parallel_instruction_mode") == "prepend"
@@ -708,7 +709,7 @@ def test_rr054_issue9_responses_forced_bash_parity(
     translated = _forced_bash_translated_body()
 
     if config.use_openai_parallel_policy:
-        updated = lpe._apply_anthropic_responses_adapter_policies_from_config(
+        updated = aac._apply_anthropic_responses_adapter_policies_from_config(
             prepared,
             dict(translated),
             config=config,
@@ -716,7 +717,7 @@ def test_rr054_issue9_responses_forced_bash_parity(
     else:
         # OpenRouter / OpenCode Zen apply forced bash via the shared helper
         # outside the openai parallel config path.
-        updated, changes = lpe._apply_forced_bash_tool_choice_for_responses_adapter(
+        updated, changes = aac._apply_forced_bash_tool_choice_for_responses_adapter(
             prepared,
             dict(translated),
         )
@@ -735,7 +736,7 @@ def test_rr054_issue9_completion_forced_bash_parity(
     config: adapter_config.AnthropicCompletionAdapterConfig,
 ) -> None:
     prepared = _forced_bash_prepared_body()
-    updated = lpe._prepare_anthropic_completion_adapter_request_body(
+    updated = aac._prepare_anthropic_completion_adapter_request_body(
         dict(prepared),
         adapter_model="m",
         route_family=config.route_family,
@@ -754,13 +755,13 @@ def test_rr054_issue9_forced_bash_skips_when_tool_choice_already_set() -> None:
     translated = _forced_bash_translated_body()
     translated["tool_choice"] = {"type": "function", "name": "Read"}
 
-    resp_body, resp_changes = lpe._apply_forced_bash_tool_choice_for_responses_adapter(
+    resp_body, resp_changes = aac._apply_forced_bash_tool_choice_for_responses_adapter(
         prepared, dict(translated)
     )
     assert resp_changes == {}
     assert resp_body.get("tool_choice") == {"type": "function", "name": "Read"}
 
-    completion_changes = lpe._maybe_force_explicit_bash_tool_choice_for_completion_adapter(
+    completion_changes = aac._maybe_force_explicit_bash_tool_choice_for_completion_adapter(
         dict(prepared)
     )
     assert completion_changes == {}
@@ -771,11 +772,11 @@ def test_rr054_issue9_forced_bash_skips_without_explicit_prompt() -> None:
     prepared["messages"] = [{"role": "user", "content": "just say hi"}]
     translated = _forced_bash_translated_body()
 
-    _, resp_changes = lpe._apply_forced_bash_tool_choice_for_responses_adapter(
+    _, resp_changes = aac._apply_forced_bash_tool_choice_for_responses_adapter(
         prepared, dict(translated)
     )
     assert resp_changes == {}
-    completion_changes = lpe._maybe_force_explicit_bash_tool_choice_for_completion_adapter(
+    completion_changes = aac._maybe_force_explicit_bash_tool_choice_for_completion_adapter(
         dict(prepared)
     )
     assert completion_changes == {}

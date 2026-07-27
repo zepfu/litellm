@@ -15,8 +15,13 @@ import pytest
 from fastapi import HTTPException, Request
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable as durable_mod
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    audit_events as audit_events_mod,
+    cooldown_state as cooldown_state_mod,
+    durable as durable_mod,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.memory import (
+    DEFAULT_MEMORY_STATE_MAX_SIZE,
     bound_memory_map,
 )
 
@@ -55,8 +60,8 @@ async def test_rr054_issue17_18_codex_cooldown_set_bounds_map() -> None:
         m.clear()
 
     with patch.object(
-        lpe,
-        "_write_aawm_alias_routing_durable_payload",
+        cooldown_state_mod,
+        "write_aawm_alias_routing_durable_payload",
         new=AsyncMock(return_value=True),
     ):
         async def _set_with_bound(cooldown_key: str, cooldown_seconds: float) -> None:
@@ -78,7 +83,7 @@ async def test_rr054_issue17_18_codex_cooldown_set_bounds_map() -> None:
                         max_size=3,
                     )
             if ttl_seconds > 0:
-                await lpe._write_aawm_alias_routing_durable_payload(
+                await cooldown_state_mod.write_aawm_alias_routing_durable_payload(
                     alias_family="codex",
                     state_kind="cooldown",
                     state_key=cooldown_key,
@@ -114,36 +119,36 @@ async def test_rr054_issue17_18_anthropic_and_codex_affinity_sets_bound() -> Non
     lpe._anthropic_auto_agent_session_affinity_by_key.clear()
 
     with patch.object(
-        lpe,
-        "_write_aawm_alias_routing_durable_payload",
+        cooldown_state_mod,
+        "write_aawm_alias_routing_durable_payload",
         new=AsyncMock(return_value=True),
     ):
         # Seed beyond default max so bound_memory_map path is exercised on writes.
-        for i in range(lpe._AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE + 3):
-            await lpe._set_codex_auto_agent_session_affinity(
+        for i in range(DEFAULT_MEMORY_STATE_MAX_SIZE + 3):
+            await cooldown_state_mod._set_codex_auto_agent_session_affinity(
                 f"rr054-aff-codex-{i}", candidate
             )
-            await lpe._set_anthropic_auto_agent_session_affinity(
+            await cooldown_state_mod._set_anthropic_auto_agent_session_affinity(
                 f"rr054-aff-anth-{i}", anth_candidate
             )
 
     assert (
         len(lpe._codex_auto_agent_session_affinity_by_key)
-        <= lpe._AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE
+        <= DEFAULT_MEMORY_STATE_MAX_SIZE
     )
     assert (
         len(lpe._anthropic_auto_agent_session_affinity_by_key)
-        <= lpe._AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE
+        <= DEFAULT_MEMORY_STATE_MAX_SIZE
     )
     # Oldest FIFO keys should be gone; newest retained.
     assert "rr054-aff-codex-0" not in lpe._codex_auto_agent_session_affinity_by_key
     assert (
-        f"rr054-aff-codex-{lpe._AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE + 2}"
+        f"rr054-aff-codex-{DEFAULT_MEMORY_STATE_MAX_SIZE + 2}"
         in lpe._codex_auto_agent_session_affinity_by_key
     )
     assert "rr054-aff-anth-0" not in lpe._anthropic_auto_agent_session_affinity_by_key
     assert (
-        f"rr054-aff-anth-{lpe._AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE + 2}"
+        f"rr054-aff-anth-{DEFAULT_MEMORY_STATE_MAX_SIZE + 2}"
         in lpe._anthropic_auto_agent_session_affinity_by_key
     )
 
@@ -164,19 +169,19 @@ async def test_rr054_issue17_18_anthropic_cooldown_set_bounds_via_real_helper() 
         size = (
             max_size
             if max_size is not None
-            else lpe._AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE
+            else DEFAULT_MEMORY_STATE_MAX_SIZE
         )
         bound_memory_map(cache, max_size=size)
 
     with patch.object(
         lpe,
-        "_write_aawm_alias_routing_durable_payload",
+        "write_aawm_alias_routing_durable_payload",
         new=AsyncMock(return_value=True),
     ), patch.object(
-        lpe, "_bound_aawm_alias_routing_memory_map", side_effect=_tracking_bound
+        lpe, "bound_memory_map", side_effect=_tracking_bound
     ):
-        await lpe._set_anthropic_auto_agent_cooldown("rr054-anth-cd-a", 12.0)
-        await lpe._set_anthropic_auto_agent_cooldown("rr054-anth-cd-b", 12.0)
+        await cooldown_state_mod._set_anthropic_auto_agent_cooldown("rr054-anth-cd-a", 12.0)
+        await cooldown_state_mod._set_anthropic_auto_agent_cooldown("rr054-anth-cd-b", 12.0)
 
     assert bound_calls
     assert any("rr054-anth-cd-b" in c for c in bound_calls if isinstance(c, dict))
@@ -205,7 +210,7 @@ async def test_rr054_issue26_durable_write_writes_through_dualcache_memory() -> 
         "build_aawm_alias_routing_durable_cache_key",
         return_value="rr054:dual:cache-key",
     ):
-        ok = await lpe._write_aawm_alias_routing_durable_payload(
+        ok = await durable_mod.write_aawm_alias_routing_durable_payload(
             alias_family="codex",
             state_kind="cooldown",
             state_key="rr054-dual-coherency",
@@ -271,7 +276,7 @@ async def test_rr054_issue26_memory_write_through_failure_does_not_fail_redis_wr
         "build_aawm_alias_routing_durable_cache_key",
         return_value="rr054:dual:mem-fail",
     ):
-        ok = await lpe._write_aawm_alias_routing_durable_payload(
+        ok = await durable_mod.write_aawm_alias_routing_durable_payload(
             alias_family="codex",
             state_kind="cooldown",
             state_key="rr054-mem-fail",
@@ -299,12 +304,12 @@ async def test_rr054_issue30_codex_negative_cache_skips_repeat_redis_read() -> N
     read_mock = AsyncMock(return_value=None)
 
     with patch.object(
-        lpe, "_get_aawm_alias_routing_dual_cache", return_value=dual
+        lpe, "get_aawm_alias_routing_dual_cache", return_value=dual
     ), patch.object(
-        lpe, "_read_aawm_alias_routing_durable_payload", new=read_mock
+        lpe, "read_aawm_alias_routing_durable_payload", new=read_mock
     ), patch.object(lpe, "_AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS", 30.0):
-        first = await lpe._get_codex_auto_agent_active_cooldown_state(key)
-        second = await lpe._get_codex_auto_agent_active_cooldown_state(key)
+        first = await cooldown_state_mod._get_codex_auto_agent_active_cooldown_state(key)
+        second = await cooldown_state_mod._get_codex_auto_agent_active_cooldown_state(key)
 
     assert first == (0.0, "local_fallback")
     assert second == (0.0, "negative_cache")
@@ -325,12 +330,12 @@ async def test_rr054_issue30_anthropic_negative_cache_skips_repeat_redis_read() 
     read_mock = AsyncMock(return_value=None)
 
     with patch.object(
-        lpe, "_get_aawm_alias_routing_dual_cache", return_value=dual
+        lpe, "get_aawm_alias_routing_dual_cache", return_value=dual
     ), patch.object(
-        lpe, "_read_aawm_alias_routing_durable_payload", new=read_mock
+        lpe, "read_aawm_alias_routing_durable_payload", new=read_mock
     ), patch.object(lpe, "_AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS", 30.0):
-        first = await lpe._get_anthropic_auto_agent_active_cooldown_state(key)
-        second = await lpe._get_anthropic_auto_agent_active_cooldown_state(key)
+        first = await cooldown_state_mod._get_anthropic_auto_agent_active_cooldown_state(key)
+        second = await cooldown_state_mod._get_anthropic_auto_agent_active_cooldown_state(key)
 
     assert first == (0.0, "local_fallback")
     assert second == (0.0, "negative_cache")
@@ -349,14 +354,14 @@ async def test_rr054_issue30_positive_cooldown_clears_negative_cache() -> None:
     )
 
     with patch.object(
-        lpe,
-        "_write_aawm_alias_routing_durable_payload",
+        cooldown_state_mod,
+        "write_aawm_alias_routing_durable_payload",
         new=AsyncMock(return_value=True),
     ):
-        await lpe._set_codex_auto_agent_cooldown(key, 25.0)
+        await cooldown_state_mod._set_codex_auto_agent_cooldown(key, 25.0)
 
     assert key not in lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key
-    seconds, source = await lpe._get_codex_auto_agent_active_cooldown_state(key)
+    seconds, source = await cooldown_state_mod._get_codex_auto_agent_active_cooldown_state(key)
     assert seconds > 0
     assert source == "memory"
 
@@ -417,16 +422,16 @@ async def test_rr054_issue42_terminal_persist_uses_executor_when_loop_running() 
     mock_loop.run_in_executor = MagicMock(side_effect=_tracking_run_in_executor)
 
     with patch.object(
-        lpe,
+        audit_events_mod,
         "_persist_auto_agent_alias_audit_only_events_best_effort",
         return_value=None,
     ), patch.object(
-        lpe, "_emit_auto_agent_alias_route_event", return_value=None
+        audit_events_mod, "_emit_auto_agent_alias_route_event", return_value=None
     ), patch(
         "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
         side_effect=_fake_persist,
     ), patch.object(asyncio, "get_running_loop", return_value=mock_loop):
-        lpe._emit_auto_agent_alias_no_candidate_event(
+        audit_events_mod._emit_auto_agent_alias_no_candidate_event(
             alias_family="codex_auto_agent",
             alias_model="aawm-code",
             request=request,
@@ -463,7 +468,7 @@ async def test_rr054_issue42_terminal_persist_uses_executor_when_loop_running() 
 def test_rr054_issue42_terminal_persist_source_uses_run_in_executor() -> None:
     import inspect
 
-    source = inspect.getsource(lpe._emit_auto_agent_alias_no_candidate_event)
+    source = inspect.getsource(audit_events_mod._emit_auto_agent_alias_no_candidate_event)
     assert "run_in_executor" in source
     assert "persist_agent_terminal_error" in source
     # Must not only call persist synchronously on the hot path when a loop exists.

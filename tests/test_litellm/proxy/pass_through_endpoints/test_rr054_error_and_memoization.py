@@ -22,6 +22,10 @@ from fastapi.responses import Response
 
 from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import payload_validation
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import tool_call_restore
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import audit_build
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import audit_context
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +197,7 @@ def test_rr054_issue23_malformed_adapted_custom_tool_raise_is_non_rate_limit_502
         "reason": "input_not_string",
     }
     with pytest.raises(ProxyException) as exc_info:
-        lpe._raise_codex_auto_agent_malformed_adapted_custom_tool_call(
+        tool_call_restore._raise_codex_auto_agent_malformed_adapted_custom_tool_call(
             response_body=_malformed_adapted_custom_tool_response_body(),
             adapter_model="grok-build",
             adapter="codex_auto_agent_xai_oauth_responses",
@@ -250,7 +254,7 @@ def test_rr054_issue23_restore_adapter_error_paths_feed_non_rate_limit_raise(
         "tools": [_apply_patch_custom_tool()],
     }
 
-    restored_body, restored_count, adapter_error = lpe._restore_adapted_custom_tool_calls_in_response_body(
+    restored_body, restored_count, adapter_error = tool_call_restore._restore_adapted_custom_tool_calls_in_response_body(
         response_body,
         request_body=request_body,
         adapter_model="grok-build",
@@ -262,7 +266,7 @@ def test_rr054_issue23_restore_adapter_error_paths_feed_non_rate_limit_raise(
     assert adapter_error.get("reason")
 
     with pytest.raises(ProxyException) as exc_info:
-        lpe._raise_codex_auto_agent_malformed_adapted_custom_tool_call(
+        tool_call_restore._raise_codex_auto_agent_malformed_adapted_custom_tool_call(
             response_body=response_body,
             adapter_model="grok-build",
             adapter="codex_auto_agent_xai_oauth_responses",
@@ -281,7 +285,7 @@ async def test_rr054_issue23_validate_payload_malformed_adapted_custom_is_502_no
         media_type="application/json",
     )
     with pytest.raises(ProxyException) as exc_info:
-        await lpe._validate_codex_auto_agent_responses_payload(
+        await payload_validation._validate_codex_auto_agent_responses_payload(
             upstream,
             adapter_model="grok-build",
             adapter="codex_auto_agent_xai_oauth_responses",
@@ -310,14 +314,14 @@ async def test_rr054_issue23_validate_payload_malformed_adapted_custom_is_502_no
 def test_rr054_issue23_adapted_custom_matches_sibling_non_rate_limit_contract() -> None:
     """Adapted custom raise must align with other #23 non-capacity raise helpers."""
     with pytest.raises(ProxyException) as text_exc:
-        lpe._raise_codex_auto_agent_malformed_tool_call_text_payload(
+        payload_validation._raise_codex_auto_agent_malformed_tool_call_text_payload(
             response_body={"output": []},
             adapter_model="m",
             adapter="a",
             adapter_label="L",
         )
     with pytest.raises(ProxyException) as adapted_exc:
-        lpe._raise_codex_auto_agent_malformed_adapted_custom_tool_call(
+        tool_call_restore._raise_codex_auto_agent_malformed_adapted_custom_tool_call(
             response_body=_malformed_adapted_custom_tool_response_body(),
             adapter_model="m",
             adapter="a",
@@ -352,7 +356,7 @@ def test_rr054_issue29_prior_tool_activity_summary_once_across_multi_event_audit
     request_body = _request_body_with_prior_tools_and_identity()
     selection, attempts = _selection_and_attempts_for_multi_event_audit()
 
-    real_summarize = lpe._summarize_auto_agent_alias_actual_prior_tool_activity
+    real_summarize = audit_context._summarize_auto_agent_alias_actual_prior_tool_activity
     summarize_calls: list[int] = []
 
     def _counting_summarize(body: dict[str, Any]) -> dict[str, Any]:
@@ -364,7 +368,7 @@ def test_rr054_issue29_prior_tool_activity_summary_once_across_multi_event_audit
         "_summarize_auto_agent_alias_actual_prior_tool_activity",
         side_effect=_counting_summarize,
     ), patch.object(
-        lpe,
+        audit_context,
         "_resolve_auto_agent_alias_route_host_attribution",
         return_value={
             "client_ip": "100.64.0.10",
@@ -373,7 +377,7 @@ def test_rr054_issue29_prior_tool_activity_summary_once_across_multi_event_audit
             "host_name_source": "magicdns_reverse",
         },
     ):
-        events = lpe._build_auto_agent_alias_audit_events(
+        events = audit_build._build_auto_agent_alias_audit_events(
             alias_family="codex",
             alias_model="aawm-code",
             request=request,
@@ -419,9 +423,9 @@ def test_rr054_issue29_host_repository_client_dispatch_extract_once_per_request(
     dispatch_calls = {"n": 0}
     repository_lookups = {"n": 0}
 
-    real_client = lpe._extract_auto_agent_alias_client_product_label
-    real_dispatch = lpe._extract_auto_agent_alias_agent_dispatch_fields
-    real_meta = lpe._extract_auto_agent_alias_metadata_value
+    real_client = audit_context._extract_auto_agent_alias_client_product_label
+    real_dispatch = audit_context._extract_auto_agent_alias_agent_dispatch_fields
+    real_meta = audit_context._extract_auto_agent_alias_metadata_value
 
     def _counting_host(req: Request) -> dict[str, Any]:
         host_calls["n"] += 1
@@ -452,11 +456,11 @@ def test_rr054_issue29_host_repository_client_dispatch_extract_once_per_request(
         return real_meta(body, *keys, **kwargs)
 
     with patch.object(
-        lpe,
+        audit_context,
         "_resolve_auto_agent_alias_route_host_attribution",
         side_effect=_counting_host,
     ), patch.object(
-        lpe,
+        audit_context,
         "_extract_auto_agent_alias_client_product_label",
         side_effect=_counting_client,
     ), patch.object(
@@ -464,11 +468,11 @@ def test_rr054_issue29_host_repository_client_dispatch_extract_once_per_request(
         "_extract_auto_agent_alias_agent_dispatch_fields",
         side_effect=_counting_dispatch,
     ), patch.object(
-        lpe,
+        audit_context,
         "_extract_auto_agent_alias_metadata_value",
         side_effect=_counting_meta,
     ):
-        events = lpe._build_auto_agent_alias_audit_events(
+        events = audit_build._build_auto_agent_alias_audit_events(
             alias_family="codex",
             alias_model="aawm-code",
             request=request,
@@ -521,7 +525,7 @@ def test_rr054_issue29_attach_terminal_context_reuses_request_scoped_prior_summa
     request = _minimal_request()
     request_body = _request_body_with_prior_tools_and_identity()
 
-    real_summarize = lpe._summarize_auto_agent_alias_actual_prior_tool_activity
+    real_summarize = audit_context._summarize_auto_agent_alias_actual_prior_tool_activity
     summarize_calls = {"n": 0}
 
     def _counting_summarize(body: dict[str, Any]) -> dict[str, Any]:
@@ -535,7 +539,7 @@ def test_rr054_issue29_attach_terminal_context_reuses_request_scoped_prior_summa
     ), patch.object(
         lpe,
         "_extract_auto_agent_alias_agent_dispatch_fields",
-        wraps=lpe._extract_auto_agent_alias_agent_dispatch_fields,
+        wraps=audit_context._extract_auto_agent_alias_agent_dispatch_fields,
     ) as dispatch_mock:
         for event_type in (
             "no_candidate_available",
@@ -543,7 +547,7 @@ def test_rr054_issue29_attach_terminal_context_reuses_request_scoped_prior_summa
             "agent_session_terminated",
         ):
             event: dict[str, Any] = {"event_type": event_type}
-            lpe._attach_auto_agent_alias_terminal_context_fields(
+            audit_context._attach_auto_agent_alias_terminal_context_fields(
                 event,
                 request=request,
                 request_body=request_body,
@@ -596,12 +600,12 @@ def test_rr054_issue29_build_audit_event_reuses_host_attribution_on_repeated_cal
     }
 
     with patch.object(
-        lpe,
+        audit_context,
         "_resolve_auto_agent_alias_route_host_attribution",
         side_effect=_counting_host,
     ):
         for i in range(3):
-            event = lpe._build_auto_agent_alias_audit_event(
+            event = audit_build._build_auto_agent_alias_audit_event(
                 alias_family="codex",
                 alias_model="aawm-code",
                 request=request,

@@ -108,11 +108,11 @@ def _reset_alias_routing_state() -> None:
         reset_fn()
         return
     _clear_probe_locks()
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+    alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.codex.session_affinity_by_key.clear()
+    alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.session_affinity_by_key.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -120,8 +120,8 @@ def _clear_singleflight_state() -> Any:
     _reset_alias_routing_state()
     yield
     _reset_alias_routing_state()
-    lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+    alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.session_affinity_by_key.clear()
 
 
 class _ProbeCounter:

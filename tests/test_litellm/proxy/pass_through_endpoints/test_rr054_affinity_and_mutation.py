@@ -26,6 +26,8 @@ import pytest
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable as durable_mod
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import cooldown_state as cooldown_state_mod
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import alias_routing_state
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +320,7 @@ async def test_rr054_issue56_set_codex_affinity_durable_key_is_hashed_not_raw() 
     )
     dual = _dual_cache()
     _clear_durable_affinity_cardinality_state()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
+    alias_routing_state.codex.session_affinity_by_key.clear()
 
     try:
         with patch.object(
@@ -326,7 +328,7 @@ async def test_rr054_issue56_set_codex_affinity_durable_key_is_hashed_not_raw() 
         ), patch.object(
             lpe, "_get_aawm_alias_routing_dual_cache", return_value=dual
         ):
-            await lpe._set_codex_auto_agent_session_affinity(
+            await cooldown_state_mod._set_codex_auto_agent_session_affinity(
                 raw_session, _sample_candidate()
             )
 
@@ -336,10 +338,10 @@ async def test_rr054_issue56_set_codex_affinity_durable_key_is_hashed_not_raw() 
         assert raw_session not in redis_key
         assert _sha256_hex(raw_session) in redis_key
         # Memory map may still use the process-local session_key identity.
-        assert raw_session in lpe._codex_auto_agent_session_affinity_by_key
+        assert raw_session in alias_routing_state.codex.session_affinity_by_key
     finally:
         _clear_durable_affinity_cardinality_state()
-        lpe._codex_auto_agent_session_affinity_by_key.clear()
+        alias_routing_state.codex.session_affinity_by_key.clear()
 
 
 @pytest.mark.asyncio
@@ -352,7 +354,7 @@ async def test_rr054_issue56_set_anthropic_affinity_durable_key_is_hashed_not_ra
     )
     dual = _dual_cache()
     _clear_durable_affinity_cardinality_state()
-    lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+    alias_routing_state.anthropic.session_affinity_by_key.clear()
 
     try:
         with patch.object(
@@ -360,7 +362,7 @@ async def test_rr054_issue56_set_anthropic_affinity_durable_key_is_hashed_not_ra
         ), patch.object(
             lpe, "_get_aawm_alias_routing_dual_cache", return_value=dual
         ):
-            await lpe._set_anthropic_auto_agent_session_affinity(
+            await cooldown_state_mod._set_anthropic_auto_agent_session_affinity(
                 raw_session,
                 _sample_candidate(
                     provider="anthropic",
@@ -375,7 +377,7 @@ async def test_rr054_issue56_set_anthropic_affinity_durable_key_is_hashed_not_ra
         assert _sha256_hex(raw_session) in redis_key
     finally:
         _clear_durable_affinity_cardinality_state()
-        lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+        alias_routing_state.anthropic.session_affinity_by_key.clear()
 
 
 def test_rr054_issue56_affinity_key_limit_env_is_positive_and_bounded() -> None:

@@ -31,6 +31,7 @@ from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     payload_validation as pv,
+    sse as sse_mod,
 )
 
 GOD_PATH = Path(lpe.__file__).resolve()
@@ -192,13 +193,15 @@ class TestPayloadValidationInstallContract:
 # ---------------------------------------------------------------------------
 class TestPureDetectors:
     def test_mapping_or_attr_get_dict(self):
-        assert lpe._mapping_or_attr_get({"a": 1}, "a") == 1
-        assert lpe._mapping_or_attr_get({"a": 1}, "b", 9) == 9
+        # _mapping_or_attr_get is owned by aawm_adapter_runtime.sse, not
+        # payload_validation; call through the extracted owner directly.
+        assert sse_mod._mapping_or_attr_get({"a": 1}, "a") == 1
+        assert sse_mod._mapping_or_attr_get({"a": 1}, "b", 9) == 9
 
     def test_mapping_or_attr_get_object(self):
         obj = SimpleNamespace(a=5)
-        assert lpe._mapping_or_attr_get(obj, "a") == 5
-        assert lpe._mapping_or_attr_get(obj, "b", 7) == 7
+        assert sse_mod._mapping_or_attr_get(obj, "a") == 5
+        assert sse_mod._mapping_or_attr_get(obj, "b", 7) == 7
 
     def test_coerce_optional_int(self):
         assert pv._coerce_optional_int(None) is None

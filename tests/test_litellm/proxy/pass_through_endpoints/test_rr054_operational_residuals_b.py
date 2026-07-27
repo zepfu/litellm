@@ -16,6 +16,20 @@ import pytest
 from fastapi import Request
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.request_build import (
+    _parse_grok_composer_literal_tool_label_blocks,
+    _parse_grok_composer_literal_tool_payload_json,
+    _repair_grok_composer_literal_tool_calls_in_text,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
+    _build_auto_agent_alias_audit_events,
+)
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep import (
+    _compact_openai_adapter_claude_context_text,
+)
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.persisted_output import (
+    _compact_expanded_claude_persisted_output_text_for_google_adapter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,18 +87,18 @@ def test_rr054_issue44_trailing_valid_json_after_newline_not_absorbed_into_paylo
         'Input payload: {"cmd": "pwd"}'
     )
 
-    blocks = lpe._parse_grok_composer_literal_tool_label_blocks(text)
+    blocks = _parse_grok_composer_literal_tool_label_blocks(text)
     assert len(blocks) == 2
     first = blocks[0]
     # Payload must be only the tool JSON object, not the following freeform JSON.
     assert first["payload"].strip() == '{"cmd": "ls"}'
     first_span = text[int(first["start"]) : int(first["end"])]
     assert '{"note": "free form json text that must remain visible"}' not in first_span
-    assert lpe._parse_grok_composer_literal_tool_payload_json(first["payload"]) == {
+    assert _parse_grok_composer_literal_tool_payload_json(first["payload"]) == {
         "cmd": "ls"
     }
 
-    leftover, items = lpe._repair_grok_composer_literal_tool_calls_in_text(
+    leftover, items = _repair_grok_composer_literal_tool_calls_in_text(
         text,
         advertised_tools=_exec_command_advertised_tools(),
     )
@@ -109,14 +123,14 @@ def test_rr054_issue44_end_marker_branch_does_not_absorb_trailing_freeform() -> 
         'Input payload: {"cmd": "pwd"}'
     )
 
-    blocks = lpe._parse_grok_composer_literal_tool_label_blocks(text)
+    blocks = _parse_grok_composer_literal_tool_label_blocks(text)
     assert len(blocks) == 2
     assert blocks[0]["payload"].strip() == '{"cmd": "ls"}'
     first_span = text[int(blocks[0]["start"]) : int(blocks[0]["end"])]
     assert "Trailing freeform" not in first_span
     assert "<|tool_call_end|>" not in blocks[0]["payload"]
 
-    leftover, items = lpe._repair_grok_composer_literal_tool_calls_in_text(
+    leftover, items = _repair_grok_composer_literal_tool_calls_in_text(
         text,
         advertised_tools=_exec_command_advertised_tools(),
     )
@@ -137,7 +151,7 @@ def test_rr054_issue44_non_json_trailing_text_still_preserved() -> None:
         "Correlation ref: call-2\n"
         'Input payload: {"cmd": "pwd"}'
     )
-    leftover, items = lpe._repair_grok_composer_literal_tool_calls_in_text(
+    leftover, items = _repair_grok_composer_literal_tool_calls_in_text(
         text,
         advertised_tools=_exec_command_advertised_tools(),
     )
@@ -169,7 +183,7 @@ def test_rr054_issue45_non_advertised_tool_literal_left_in_text() -> None:
         'Input payload: {"cmd": "git status -sb"}'
     )
 
-    leftover, items = lpe._repair_grok_composer_literal_tool_calls_in_text(
+    leftover, items = _repair_grok_composer_literal_tool_calls_in_text(
         text,
         advertised_tools=_exec_command_advertised_tools(),
     )
@@ -193,7 +207,7 @@ def test_rr054_issue45_only_non_advertised_does_not_claim_success_repair() -> No
         "Correlation ref: call-spawn\n"
         'Input payload: {"agent_type": "worker"}'
     )
-    leftover, items = lpe._repair_grok_composer_literal_tool_calls_in_text(
+    leftover, items = _repair_grok_composer_literal_tool_calls_in_text(
         text,
         advertised_tools=_exec_command_advertised_tools(),
     )
@@ -364,7 +378,7 @@ def test_rr054_issue51_audit_events_use_per_attempt_cooldown_key() -> None:
     ), patch.object(
         lpe, "_attach_auto_agent_alias_terminal_context_fields", return_value=None
     ):
-        events = lpe._build_auto_agent_alias_audit_events(
+        events = _build_auto_agent_alias_audit_events(
             alias_family="codex",
             alias_model="aawm-code",
             request=request,
@@ -449,7 +463,7 @@ def test_rr054_issue51_early_attempt_with_own_key_not_overwritten_by_selection()
     ), patch.object(
         lpe, "_attach_auto_agent_alias_terminal_context_fields", return_value=None
     ):
-        events = lpe._build_auto_agent_alias_audit_events(
+        events = _build_auto_agent_alias_audit_events(
             alias_family="codex",
             alias_model="aawm-code",
             request=request,
@@ -486,7 +500,7 @@ def test_rr054_issue54_adversarial_unclosed_system_reminders_complete_quickly() 
     assert len(adversarial) > 200_000
 
     t0 = time.perf_counter()
-    out, compacted, markers, meta = lpe._compact_openai_adapter_claude_context_text(
+    out, compacted, markers, meta = _compact_openai_adapter_claude_context_text(
         adversarial,
         cap=128,
     )
@@ -510,7 +524,7 @@ def test_rr054_issue54_adversarial_unclosed_openers_google_auxiliary_bound() -> 
         compacted,
         hooks,
         meta,
-    ) = lpe._compact_expanded_claude_persisted_output_text_for_google_adapter(
+    ) = _compact_expanded_claude_persisted_output_text_for_google_adapter(
         adversarial,
         auxiliary_context_char_cap=128,
     )
@@ -534,7 +548,7 @@ def test_rr054_issue54_closed_system_reminders_still_compact() -> None:
         )
         for i in range(5)
     )
-    out, compacted, markers, meta = lpe._compact_openai_adapter_claude_context_text(
+    out, compacted, markers, meta = _compact_openai_adapter_claude_context_text(
         closed,
         cap=80,
     )

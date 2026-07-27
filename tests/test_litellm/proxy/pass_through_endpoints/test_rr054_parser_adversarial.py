@@ -10,7 +10,17 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.request_build import (
+    _parse_grok_composer_literal_tool_label_blocks,
+    _parse_grok_composer_literal_tool_payload_json,
+    _repair_grok_composer_literal_tool_calls_in_text,
+)
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep import (
+    _compact_openai_adapter_claude_context_text,
+)
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.persisted_output import (
+    _compact_expanded_claude_persisted_output_text_for_google_adapter,
+)
 
 
 def _exec_command_advertised_tools() -> dict[str, dict[str, Any]]:
@@ -42,18 +52,18 @@ def test_rr054_parser_trailing_valid_json_after_grok_tool_payload() -> None:
         'Input payload: {"cmd": "pwd"}'
     )
 
-    blocks = lpe._parse_grok_composer_literal_tool_label_blocks(text)
+    blocks = _parse_grok_composer_literal_tool_label_blocks(text)
     assert len(blocks) == 2
 
     first = blocks[0]
     assert first["payload"].strip() == '{"cmd": "ls"}'
     first_span = text[int(first["start"]) : int(first["end"])]
     assert trailing_json not in first_span
-    assert lpe._parse_grok_composer_literal_tool_payload_json(first["payload"]) == {
+    assert _parse_grok_composer_literal_tool_payload_json(first["payload"]) == {
         "cmd": "ls"
     }
 
-    leftover, items = lpe._repair_grok_composer_literal_tool_calls_in_text(
+    leftover, items = _repair_grok_composer_literal_tool_calls_in_text(
         text,
         advertised_tools=_exec_command_advertised_tools(),
     )
@@ -83,7 +93,7 @@ def test_rr054_parser_thousands_of_unmatched_system_reminder_openers_bounded() -
 
     t0 = time.perf_counter()
     openai_out, openai_compacted, _markers, _meta = (
-        lpe._compact_openai_adapter_claude_context_text(
+        _compact_openai_adapter_claude_context_text(
             adversarial,
             cap=128,
         )
@@ -104,7 +114,7 @@ def test_rr054_parser_thousands_of_unmatched_system_reminder_openers_bounded() -
         google_compacted,
         _hooks,
         _meta,
-    ) = lpe._compact_expanded_claude_persisted_output_text_for_google_adapter(
+    ) = _compact_expanded_claude_persisted_output_text_for_google_adapter(
         adversarial,
         auxiliary_context_char_cap=128,
     )

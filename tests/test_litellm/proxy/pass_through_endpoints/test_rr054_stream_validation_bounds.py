@@ -23,6 +23,10 @@ import pytest
 from starlette.responses import StreamingResponse
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+    codex_candidate_calls as ccc,
+    payload_validation as pv,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -174,14 +178,14 @@ def test_rr054_stream_validation_openrouter_source_declares_bound_helpers() -> N
 
     RR-054 #14 / OpenRouter parity: unbounded double-buffer is the residual gap.
     """
-    source = inspect.getsource(lpe._validate_codex_auto_agent_openrouter_responses_stream)
+    source = inspect.getsource(ccc._validate_codex_auto_agent_openrouter_responses_stream)
     assert "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS" in source
     assert "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES" in source
     assert "peek.exhausted" in source
 
 
 def test_rr054_stream_validation_main_path_source_enforces_bounds() -> None:
-    source = inspect.getsource(lpe._validate_codex_auto_agent_responses_payload)
+    source = inspect.getsource(pv._validate_codex_auto_agent_responses_payload)
     assert "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS" in source
     assert "_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES" in source
     assert "peek.exhausted" in source
@@ -201,7 +205,7 @@ async def test_rr054_stream_validation_under_bounds_replays_all_chunks_in_order(
     original = _minimal_valid_stream_chunks(text="under-bounds")
     upstream = await _upstream_from_chunks(original)
 
-    response = await lpe._validate_codex_auto_agent_responses_payload(
+    response = await pv._validate_codex_auto_agent_responses_payload(
         upstream,
         adapter_model="test-model",
         adapter="codex_auto_agent_openai_responses",
@@ -227,7 +231,7 @@ async def test_rr054_stream_validation_preserves_terminal_completed_event() -> N
     )
     upstream = await _upstream_from_chunks(original)
 
-    response = await lpe._validate_codex_auto_agent_responses_payload(
+    response = await pv._validate_codex_auto_agent_responses_payload(
         upstream,
         adapter_model="test-model",
         adapter="codex_auto_agent_openai_responses",
@@ -276,7 +280,7 @@ async def test_rr054_stream_validation_chunk_overflow_replays_losslessly(
     with patch.object(
         lpe, "_should_log_aawm_alias_routing_event", return_value=True
     ), patch.object(lpe.verbose_proxy_logger, "warning") as warning_mock:
-        response = await lpe._validate_codex_auto_agent_responses_payload(
+        response = await pv._validate_codex_auto_agent_responses_payload(
             upstream,
             adapter_model="test-model",
             adapter="codex_auto_agent_openai_responses",
@@ -325,7 +329,7 @@ async def test_rr054_stream_validation_byte_overflow_replays_losslessly(
     with patch.object(
         lpe, "_should_log_aawm_alias_routing_event", return_value=True
     ), patch.object(lpe.verbose_proxy_logger, "warning") as warning_mock:
-        response = await lpe._validate_codex_auto_agent_responses_payload(
+        response = await pv._validate_codex_auto_agent_responses_payload(
             upstream,
             adapter_model="test-model",
             adapter="codex_auto_agent_openai_responses",
@@ -361,7 +365,7 @@ async def test_rr054_stream_validation_pending_stream_is_not_logged_as_overflow(
     with patch.object(lpe.verbose_proxy_logger, "warning") as warning_mock, patch.object(
         lpe.verbose_proxy_logger, "debug"
     ) as debug_mock:
-        response = await lpe._validate_codex_auto_agent_responses_payload(
+        response = await pv._validate_codex_auto_agent_responses_payload(
             upstream,
             adapter_model="kimi_code/k3-max",
             adapter="codex_kimi_chat_completions_adapter",
@@ -429,7 +433,7 @@ async def test_rr054_stream_validation_overflow_bypasses_validation_without_trun
     ]
     upstream = await _upstream_from_chunks(chunks)
 
-    response = await lpe._validate_codex_auto_agent_responses_payload(
+    response = await pv._validate_codex_auto_agent_responses_payload(
         upstream,
         adapter_model="test-model",
         adapter="codex_auto_agent_openai_responses",
@@ -533,7 +537,7 @@ async def test_rr054_kimi_stream_overflow_restores_parallel_collaboration_calls(
     ]
     upstream = await _upstream_from_chunks(chunks)
 
-    response = await lpe._validate_codex_auto_agent_responses_payload(
+    response = await pv._validate_codex_auto_agent_responses_payload(
         upstream,
         adapter_model="kimi_code/k3-max",
         adapter="codex_kimi_chat_completions_adapter",
@@ -606,7 +610,7 @@ async def test_rr054_stream_validation_openrouter_under_bounds_non_truncating_re
     )
     upstream = await _upstream_from_chunks(original)
 
-    response = await lpe._validate_codex_auto_agent_openrouter_responses_stream(
+    response = await ccc._validate_codex_auto_agent_openrouter_responses_stream(
         upstream,
         adapter_model="openrouter/test",
     )
@@ -635,7 +639,7 @@ async def test_rr054_stream_validation_openrouter_chunk_overflow_matches_main_bo
     assert len(original) > 2
     upstream = await _upstream_from_chunks(original)
 
-    response = await lpe._validate_codex_auto_agent_openrouter_responses_stream(
+    response = await ccc._validate_codex_auto_agent_openrouter_responses_stream(
         upstream,
         adapter_model="openrouter/test",
     )
@@ -664,7 +668,7 @@ async def test_rr054_stream_validation_openrouter_byte_overflow_matches_main_bou
     )
 
     upstream = await _upstream_from_chunks(original)
-    response = await lpe._validate_codex_auto_agent_openrouter_responses_stream(
+    response = await ccc._validate_codex_auto_agent_openrouter_responses_stream(
         upstream,
         adapter_model="openrouter/test",
     )
@@ -684,7 +688,7 @@ async def test_rr054_stream_validation_replay_preserves_first_chunk_identity() -
     original = _minimal_valid_stream_chunks(text="first-byte-order")
     upstream = await _upstream_from_chunks(original)
 
-    response = await lpe._validate_codex_auto_agent_responses_payload(
+    response = await pv._validate_codex_auto_agent_responses_payload(
         upstream,
         adapter_model="test-model",
         adapter="codex_auto_agent_openai_responses",
@@ -724,7 +728,7 @@ async def test_rr054_stream_validation_ttfb_does_not_wait_for_full_upstream_comp
 
     upstream = StreamingResponse(_slow_upstream(), media_type="text/event-stream")
 
-    validated = await lpe._validate_codex_auto_agent_responses_payload(
+    validated = await pv._validate_codex_auto_agent_responses_payload(
         upstream,
         adapter_model="test-model",
         adapter="codex_auto_agent_openai_responses",
@@ -765,7 +769,7 @@ async def test_rr054_stream_validation_ttfb_does_not_wait_for_full_upstream_comp
     upstream2 = StreamingResponse(_instrumented(), media_type="text/event-stream")
 
     async def _validate_and_read_first() -> None:
-        validated2 = await lpe._validate_codex_auto_agent_responses_payload(
+        validated2 = await pv._validate_codex_auto_agent_responses_payload(
             upstream2,
             adapter_model="test-model",
             adapter="codex_auto_agent_openai_responses",
@@ -810,7 +814,7 @@ async def test_rr054_stream_validation_openrouter_ttfb_parity_with_main_contract
             yield chunk
 
     upstream = StreamingResponse(_instrumented(), media_type="text/event-stream")
-    validated = await lpe._validate_codex_auto_agent_openrouter_responses_stream(
+    validated = await ccc._validate_codex_auto_agent_openrouter_responses_stream(
         upstream,
         adapter_model="openrouter/test",
     )
