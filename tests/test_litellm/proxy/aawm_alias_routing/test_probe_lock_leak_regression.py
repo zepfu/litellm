@@ -28,6 +28,10 @@ from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lp
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.candidate_loop import (
     handle_alias_route,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+    _get_anthropic_auto_agent_active_cooldown_state,
+    _get_codex_auto_agent_active_cooldown_state,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
     CooldownPublicationPlan,
@@ -457,8 +461,8 @@ async def test_production_get_active_cooldown_state_fn_signatures(
     ``(float, str)`` tuple, matching ``GetActiveCooldownStateFn``."""
     lpe.reset_alias_routing_state_for_tests()
     monkeypatch.setattr(lpe, "_get_aawm_alias_routing_dual_cache", lambda: None)
-    codex_fn = lpe._get_codex_auto_agent_active_cooldown_state
-    anthropic_fn = lpe._get_anthropic_auto_agent_active_cooldown_state
+    codex_fn = _get_codex_auto_agent_active_cooldown_state
+    anthropic_fn = _get_anthropic_auto_agent_active_cooldown_state
 
     for fn, name in [(codex_fn, "codex"), (anthropic_fn, "anthropic")]:
         sig = inspect.signature(fn)

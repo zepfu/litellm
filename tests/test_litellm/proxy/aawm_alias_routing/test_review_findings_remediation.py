@@ -14,13 +14,21 @@ so each finding's fix can be validated independently.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
-from fastapi.testclient import TestClient
 
-from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+# Retained only for lpe.router (FastAPI route wrapper).
+from litellm.proxy.pass_through_endpoints import (
+    llm_passthrough_endpoints as lpe,
+)
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+    model_resolution,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     classification as lpe_classification,
 )
@@ -29,6 +37,10 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_snapshot,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    snapshot_select,
+    state,
 )
 
 REFRESH_PATH = "/aawm/alias-config/refresh"
@@ -45,10 +57,16 @@ def _minimal_request(session_id: str = "review-findings-session") -> MagicMock:
     return request
 
 
-def _client() -> TestClient:
+@asynccontextmanager
+async def _client() -> AsyncIterator[httpx.AsyncClient]:
     app = FastAPI()
     app.include_router(lpe.router)
-    return TestClient(app, raise_server_exceptions=False)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        yield client
 
 
 @pytest.fixture(autouse=True)
@@ -59,13 +77,13 @@ def _reset_alias_routing_ambient_state():
     ``test_read_pilot_shadow_parity``'s reset fixture so these tests cannot
     flap on state left over from other tests in the same process.
     """
-    previous_snapshot = lpe.get_active_routing_snapshot()
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    state.alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    state.alias_routing_state.codex.session_affinity_by_key.clear()
     yield
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe.set_active_routing_snapshot(previous_snapshot)
+    state.alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    state.alias_routing_state.codex.session_affinity_by_key.clear()
+    snapshot_select.set_active_routing_snapshot(previous_snapshot)
 
 
 _SNAPSHOT_YAML = """
@@ -95,24 +113,24 @@ aliases:
 
 def test_read_is_recognized_as_a_codex_auto_agent_alias_model() -> None:
     """``read`` must be recognized by the live alias-model normalizer."""
-    assert lpe._is_codex_auto_agent_alias_model("read") is True
+    assert model_resolution._is_codex_auto_agent_alias_model("read") is True
 
 
 def test_read_resolves_through_the_live_request_body_resolver() -> None:
     """A real inbound request body with ``model: "read"`` must resolve to "read"."""
     request_body = {"model": "read"}
-    resolved = lpe._resolve_codex_auto_agent_alias_model(request_body, "/v1/responses")
+    resolved = model_resolution._resolve_codex_auto_agent_alias_model(request_body, "/v1/responses")
     assert resolved == "read"
 
 
 def test_recognized_read_routes_to_snapshot_derived_candidates() -> None:
     """Once reachable, a recognized ``read`` alias must resolve from the active snapshot."""
     snapshot = compiler.compile_yaml(_SNAPSHOT_YAML)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
-    alias_model = lpe._resolve_codex_auto_agent_alias_model({"model": "read"}, "/v1/responses")
+    alias_model = model_resolution._resolve_codex_auto_agent_alias_model({"model": "read"}, "/v1/responses")
     assert alias_model is not None
-    candidates = lpe._get_codex_auto_agent_candidates_for_alias(alias_model)
+    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias(alias_model)
     models = [c["model"] for c in candidates]
     assert "openrouter/snapshot-only-model" in models
 
@@ -193,12 +211,12 @@ aliases:
         weight: 3
 """
     snapshot = compiler.compile_yaml(raw)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     counts: dict[str, int] = {"a": 0, "b": 0}
     n_trials = 2000
     for _ in range(n_trials):
-        selected = lpe._select_read_pilot_snapshot_candidates()
+        selected = snapshot_select._select_read_pilot_snapshot_candidates()
         top_model = selected[0]["model"]
         counts[top_model] = counts.get(top_model, 0) + 1
 
@@ -234,11 +252,11 @@ aliases:
         priority: 0
 """
     snapshot = compiler.compile_yaml(raw)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     # No client_product_label supplied -- must default to "no known TUI",
     # excluding the tui_attached candidate.
-    candidates = lpe._get_codex_auto_agent_candidates_for_alias("read")
+    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias("read")
     models = [c["model"] for c in candidates]
     assert "claude-only-model" not in models
 
@@ -247,7 +265,7 @@ aliases:
     # eligible when the request presents a matching Claude/x.y label. This
     # proves the threading is real (not just an exclusion default that would
     # pass vacuously even if client_product_label were silently dropped).
-    candidates_with_claude_label = lpe._get_codex_auto_agent_candidates_for_alias(
+    candidates_with_claude_label = snapshot_select._get_codex_auto_agent_candidates_for_alias(
         "read",
         client_product_label="Claude/1.2",
     )
@@ -271,9 +289,9 @@ aliases:
         tui_attached: Claude
 """
     snapshot = compiler.compile_yaml(raw)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
-    selected = lpe._select_read_pilot_snapshot_candidates(client_product_label=None)
+    selected = snapshot_select._select_read_pilot_snapshot_candidates(client_product_label=None)
     models = [c["model"] for c in selected]
     # Fail-closed: the ineligible tui_attached-only candidate must not be
     # returned once all candidates are ineligible.
@@ -291,14 +309,15 @@ aliases:
     [5, [1, 2], {"k": "v"}],
     ids=["int", "list", "dict"],
 )
-def test_non_string_yaml_payload_returns_400(bad_yaml_payload: object) -> None:
-    client = _client()
-    response = client.post(REFRESH_PATH, json={"yaml": bad_yaml_payload})
+@pytest.mark.asyncio
+async def test_non_string_yaml_payload_returns_400(bad_yaml_payload: object) -> None:
+    async with _client() as client:
+        response = await client.post(REFRESH_PATH, json={"yaml": bad_yaml_payload})
     assert response.status_code == 400
 
 
-def test_valid_string_yaml_payload_still_returns_200() -> None:
-    client = _client()
+@pytest.mark.asyncio
+async def test_valid_string_yaml_payload_still_returns_200() -> None:
     valid_yaml = """
 defaults: {}
 aliases:
@@ -313,7 +332,8 @@ aliases:
         route_family: codex_responses
         priority: 0
 """
-    response = client.post(REFRESH_PATH, json={"yaml": valid_yaml})
+    async with _client() as client:
+        response = await client.post(REFRESH_PATH, json={"yaml": valid_yaml})
     assert response.status_code == 200
 
 

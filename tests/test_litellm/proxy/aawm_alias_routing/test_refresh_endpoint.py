@@ -10,14 +10,16 @@ the correct red signal (assertions on status_code != 404 will fail).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 
+import httpx
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (  # type: ignore[import-not-found]
+    config_refresh,
     config_snapshot,
 )
 
@@ -50,21 +52,37 @@ aliases:
 """
 
 
-def _client() -> TestClient:
+class _ASGIClient:
+    def __init__(self, app: FastAPI) -> None:
+        self._app = app
+
+    def post(self, path: str, *, json: object) -> httpx.Response:
+        async def _post() -> httpx.Response:
+            transport = httpx.ASGITransport(app=self._app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                return await client.post(path, json=json)
+
+        return asyncio.run(_post())
+
+
+def _client() -> _ASGIClient:
     app = FastAPI()
     app.include_router(lpe.router)
-    return TestClient(app)
+    return _ASGIClient(app)
 
 
 @pytest.fixture(autouse=True)
 def _reset_alias_routing_state() -> Iterator[None]:
-    previous_snapshot = lpe.get_active_routing_snapshot()
+    previous_snapshot = config_refresh.get_active_routing_snapshot()
     lpe.reset_alias_routing_state_for_tests()
     try:
         yield
     finally:
         lpe.reset_alias_routing_state_for_tests()
-        lpe.set_active_routing_snapshot(previous_snapshot)
+        config_refresh.set_active_routing_snapshot(previous_snapshot)
 
 
 def test_valid_refresh_compiles_and_activates() -> None:

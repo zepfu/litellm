@@ -3,11 +3,12 @@ refresh-endpoint route registration for the AAWM alias config framework."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
-from fastapi.testclient import TestClient
+import httpx
 
 REFRESH_PATH = "/aawm/alias-config/refresh"
 
@@ -65,22 +66,30 @@ def test_refresh_endpoint_registered() -> None:
 
     app = FastAPI()
     app.include_router(router)
-    client = TestClient(app)
-    response = client.post(
-        REFRESH_PATH,
-        json={
-            "yaml": (
-                "defaults: {}\n"
-                "aliases:\n"
-                "  - name: read\n"
-                "    candidates:\n"
-                "      - provider: openai\n"
-                "        model: gpt-5.4-mini\n"
-                "        route_family: codex_responses\n"
-                "        priority: 0\n"
+
+    async def _post() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.post(
+                REFRESH_PATH,
+                json={
+                    "yaml": (
+                        "defaults: {}\n"
+                        "aliases:\n"
+                        "  - name: read\n"
+                        "    candidates:\n"
+                        "      - provider: openai\n"
+                        "        model: gpt-5.4-mini\n"
+                        "        route_family: codex_responses\n"
+                        "        priority: 0\n"
+                    )
+                },
             )
-        },
-    )
+
+    response = asyncio.run(_post())
     assert response.status_code == 200
     payload = response.json()
     assert "active_config_hash" in payload

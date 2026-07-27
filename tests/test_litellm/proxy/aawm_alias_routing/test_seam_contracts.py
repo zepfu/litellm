@@ -38,8 +38,12 @@ from starlette.responses import Response
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    candidate_loop,
     classification,
     config_compiler as compiler,
+    cooldown_apply,
+    selection,
+    snapshot_select,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
@@ -90,14 +94,14 @@ def _accepts_all_kwargs(fn: object, kwarg_names: list[str]) -> bool:
 def test_apply_cooldown_fn_call_site_kwargs_match_applicators() -> None:
     """Both production ``apply_cooldown_fn`` applicators accept the full call-site kwarg set."""
     assert _accepts_all_kwargs(
-        lpe._set_codex_auto_agent_candidate_cooldowns,
+        cooldown_apply._set_codex_auto_agent_candidate_cooldowns,
         _APPLY_COOLDOWN_CALL_SITE_KWARGS,
     ), (
         "_set_codex_auto_agent_candidate_cooldowns no longer accepts every "
         f"kwarg the loop passes at its call site: {_APPLY_COOLDOWN_CALL_SITE_KWARGS}"
     )
     assert _accepts_all_kwargs(
-        lpe._apply_anthropic_auto_agent_alias_cooldown,
+        cooldown_apply._apply_anthropic_auto_agent_alias_cooldown,
         _APPLY_COOLDOWN_CALL_SITE_KWARGS,
     ), (
         "_apply_anthropic_auto_agent_alias_cooldown no longer accepts every "
@@ -124,11 +128,11 @@ aliases:
         priority: 900
 """
     snapshot = compiler.compile_yaml(raw_yaml)
-    previous_snapshot = lpe.get_active_routing_snapshot()
-    lpe.set_active_routing_snapshot(snapshot)
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
     session_key = "read:seam-contract-session:session:seam-contract-session"
-    previous_affinity = lpe._codex_auto_agent_session_affinity_by_key.get(session_key)
-    lpe._codex_auto_agent_session_affinity_by_key[session_key] = {
+    previous_affinity = alias_routing_state.codex.session_affinity_by_key.get(session_key)
+    alias_routing_state.codex.session_affinity_by_key[session_key] = {
         "provider": "openrouter",
         "model": "openrouter/seam-contract-model",
         "route_family": "codex_openrouter_completion_adapter",
@@ -148,21 +152,21 @@ aliases:
         request.state.aawm_alias_request_local_cooldown_until = {}
         request.state.aawm_alias_request_local_excluded_keys = set()
 
-        selection = await lpe._select_codex_auto_agent_candidate(
+        selection_result = await selection._select_codex_auto_agent_candidate(
             request=request,
             request_body={"model": "read", "previous_response_id": "resp_seam_contract"},
         )
     finally:
-        lpe.set_active_routing_snapshot(previous_snapshot)
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
         if previous_affinity is None:
-            lpe._codex_auto_agent_session_affinity_by_key.pop(session_key, None)
+            alias_routing_state.codex.session_affinity_by_key.pop(session_key, None)
         else:
-            lpe._codex_auto_agent_session_affinity_by_key[session_key] = previous_affinity
+            alias_routing_state.codex.session_affinity_by_key[session_key] = previous_affinity
 
-    assert selection.get("selection_reason") == "session_affinity"
-    assert _SELECT_CANDIDATE_REQUIRED_KEYS <= set(selection.keys()), (
+    assert selection_result.get("selection_reason") == "session_affinity"
+    assert _SELECT_CANDIDATE_REQUIRED_KEYS <= set(selection_result.keys()), (
         "_select_codex_auto_agent_candidate no longer returns every key the "
-        f"retry loop consumes: missing {_SELECT_CANDIDATE_REQUIRED_KEYS - set(selection.keys())}"
+        f"retry loop consumes: missing {_SELECT_CANDIDATE_REQUIRED_KEYS - set(selection_result.keys())}"
     )
 
 
@@ -182,13 +186,13 @@ def test_reset_alias_routing_state_for_tests_clears_everything() -> None:
     )
 
     # Seed every piece of state the helper is required to clear.
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key["seed"] = 1.0
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key["seed"] = 1.0
-    lpe._codex_auto_agent_session_affinity_by_key["seed"] = {"provider": "p", "model": "m"}
+    alias_routing_state.codex.cooldown_until_monotonic_by_key["seed"] = 1.0
+    alias_routing_state.codex.cooldown_negative_until_monotonic_by_key["seed"] = 1.0
+    alias_routing_state.codex.session_affinity_by_key["seed"] = {"provider": "p", "model": "m"}
     alias_routing_state.codex.evidence_events_by_key["seed"] = [1.0]
-    lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key["seed"] = 1.0
-    lpe._anthropic_auto_agent_cooldown_negative_until_monotonic_by_key["seed"] = 1.0
-    lpe._anthropic_auto_agent_session_affinity_by_key["seed"] = {"provider": "p", "model": "m"}
+    alias_routing_state.anthropic.cooldown_until_monotonic_by_key["seed"] = 1.0
+    alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key["seed"] = 1.0
+    alias_routing_state.anthropic.session_affinity_by_key["seed"] = {"provider": "p", "model": "m"}
     alias_routing_state.anthropic.evidence_events_by_key["seed"] = [1.0]
     alias_routing_state.candidate_probe_locks["seed"] = asyncio.Lock()
     evidence = classification.classify_failure(
@@ -196,11 +200,11 @@ def test_reset_alias_routing_state_for_tests_clears_everything() -> None:
         provider="openrouter",
         message="rate limited",
     )
-    lpe._read_pilot_cooldown_gate.record(
+    alias_routing_state.read_pilot_gate.record(
         cooldown_key="seed",
         event=evidence,
     )
-    lpe._round_robin_cursor_by_alias["seed"] = 1
+    alias_routing_state.round_robin_cursor["seed"] = 1
 
     raw_yaml = """
 defaults: {}
@@ -212,23 +216,23 @@ aliases:
         route_family: codex_openrouter_completion_adapter
         priority: 900
 """
-    lpe.set_active_routing_snapshot(compiler.compile_yaml(raw_yaml))
+    snapshot_select.set_active_routing_snapshot(compiler.compile_yaml(raw_yaml))
 
     reset_fn()
 
-    assert lpe._codex_auto_agent_cooldown_until_monotonic_by_key == {}
-    assert lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key == {}
-    assert lpe._codex_auto_agent_session_affinity_by_key == {}
+    assert alias_routing_state.codex.cooldown_until_monotonic_by_key == {}
+    assert alias_routing_state.codex.cooldown_negative_until_monotonic_by_key == {}
+    assert alias_routing_state.codex.session_affinity_by_key == {}
     assert alias_routing_state.codex.evidence_events_by_key == {}
-    assert lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key == {}
-    assert lpe._anthropic_auto_agent_cooldown_negative_until_monotonic_by_key == {}
-    assert lpe._anthropic_auto_agent_session_affinity_by_key == {}
+    assert alias_routing_state.anthropic.cooldown_until_monotonic_by_key == {}
+    assert alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key == {}
+    assert alias_routing_state.anthropic.session_affinity_by_key == {}
     assert alias_routing_state.anthropic.evidence_events_by_key == {}
     assert alias_routing_state.candidate_probe_locks == {}
-    assert lpe._read_pilot_cooldown_gate._key_state == {}
-    assert lpe._read_pilot_cooldown_gate._family_state.evidence_events_by_key == {}
-    assert lpe._round_robin_cursor_by_alias == {}
-    assert lpe.get_active_routing_snapshot() is None
+    assert alias_routing_state.read_pilot_gate._key_state == {}
+    assert alias_routing_state.read_pilot_gate._family_state.evidence_events_by_key == {}
+    assert alias_routing_state.round_robin_cursor == {}
+    assert snapshot_select.get_active_routing_snapshot() is None
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +370,11 @@ async def test_alias_route_services_signature_contracts(
         return Response(content="{}")
 
     monkeypatch.setattr(
-        lpe._aawm_alias_candidate_loop,
+        candidate_loop,
         "handle_alias_route",
         _capture_services,
     )
+    # The facade wrappers resolve these globals at call time.
     monkeypatch.setattr(
         lpe,
         "_resolve_aawm_alias_selection_enumeration",
@@ -384,6 +389,7 @@ async def test_alias_route_services_signature_contracts(
     )
 
     request = _signature_contract_request()
+    # Exercise the actual facade wrappers that bind the service bundle.
     await lpe._handle_codex_auto_agent_alias_route(
         endpoint="/v1/responses",
         request=request,

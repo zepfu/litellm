@@ -45,16 +45,23 @@ import inspect
 from typing import Any, Callable, Optional, Sequence
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.testclient import TestClient
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    cooldown_apply,
+    cooldown_state,
+    error_signals,
+    lane_keys,
     policy,
+    selection,
+    snapshot_select,
+    state as alias_state,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     CandidateSelection,
@@ -102,11 +109,11 @@ def _reset_all_alias_routing_state() -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_state() -> Any:
-    previous_snapshot = lpe.get_active_routing_snapshot()
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
     _reset_all_alias_routing_state()
     yield
     _reset_all_alias_routing_state()
-    lpe.set_active_routing_snapshot(previous_snapshot)
+    snapshot_select.set_active_routing_snapshot(previous_snapshot)
 
 
 def _two_candidate_round_robin_yaml(
@@ -180,7 +187,7 @@ def _snapshot_epoch_tag_for_candidate(
     alias_name: str,
     candidate: dict[str, Any],
 ) -> str | None:
-    snapshot = lpe.get_active_routing_snapshot()
+    snapshot = snapshot_select.get_active_routing_snapshot()
     if snapshot is None:
         return None
     alias = snapshot.aliases.get(alias_name)
@@ -206,9 +213,9 @@ def _lane_key_for_model(model: str) -> str:
         "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     }
-    lane_key = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+    lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     epoch_tag = _snapshot_epoch_tag_for_candidate("read", candidate)
-    return lpe._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
+    return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
 
 
 class _StructuredCapacityError(RuntimeError):
@@ -286,7 +293,7 @@ _SUCCESS_RESPONSE = Response(content='{"ok":true}', media_type="application/json
 
 async def test_scenario_e1_round_robin_rotation_reaches_live_traffic() -> None:
     snapshot = compiler.compile_yaml(_two_candidate_round_robin_yaml())
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     leaders: list[str] = []
 
@@ -324,7 +331,7 @@ async def test_scenario_e1_round_robin_rotation_reaches_live_traffic() -> None:
 
 async def test_scenario_e2_affinity_does_not_consume_rotation() -> None:
     snapshot = compiler.compile_yaml(_two_candidate_round_robin_yaml())
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     leaders: list[str] = []
 
@@ -374,7 +381,7 @@ async def test_scenario_e2_affinity_does_not_consume_rotation() -> None:
 
 async def test_selection_context_enumeration_called_once_per_request() -> None:
     snapshot = compiler.compile_yaml(_two_candidate_round_robin_yaml())
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     call_count = 0
     original_getter = lpe._get_codex_auto_agent_candidates_for_alias
@@ -415,11 +422,11 @@ async def test_selection_context_enumeration_called_once_per_request() -> None:
 
 async def test_round_robin_commit_tracks_selected_tier_member() -> None:
     snapshot = compiler.compile_yaml(_three_candidate_round_robin_yaml())
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     # Pre-cool A so the first cold request must fall through to B.
     a_key = _lane_key_for_model("rr-a")
-    await lpe._set_codex_auto_agent_cooldown(a_key, 30.0)
+    await cooldown_state._set_codex_auto_agent_cooldown(a_key, 30.0)
 
     leaders: list[str] = []
 
@@ -439,7 +446,7 @@ async def test_round_robin_commit_tracks_selected_tier_member() -> None:
         assert leaders == ["rr-b"], f"expected B selected while A cools: {leaders!r}"
 
         # Clear A's cooldown before the next cold request.
-        lpe._codex_auto_agent_cooldown_until_monotonic_by_key.pop(a_key, None)
+        alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.pop(a_key, None)
 
         await _drive_wrapper(session_id="commit-tracks-2")
         assert leaders[-1] == "rr-c", (
@@ -458,13 +465,13 @@ async def test_round_robin_commit_tracks_selected_tier_member() -> None:
 
 async def test_lower_priority_fallback_does_not_consume_top_tier_rotation() -> None:
     snapshot = compiler.compile_yaml(_lower_priority_fallback_yaml())
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     top_tier_a_key = _lane_key_for_model("rr-a")
     top_tier_b_key = _lane_key_for_model("rr-b")
     # Cool BOTH top-tier candidates so selection falls through to rr-fallback.
-    await lpe._set_codex_auto_agent_cooldown(top_tier_a_key, 30.0)
-    await lpe._set_codex_auto_agent_cooldown(top_tier_b_key, 30.0)
+    await cooldown_state._set_codex_auto_agent_cooldown(top_tier_a_key, 30.0)
+    await cooldown_state._set_codex_auto_agent_cooldown(top_tier_b_key, 30.0)
 
     leaders: list[str] = []
 
@@ -484,8 +491,8 @@ async def test_lower_priority_fallback_does_not_consume_top_tier_rotation() -> N
         assert leaders == ["rr-fallback"], f"expected fallback selected: {leaders!r}"
 
         # Recover top tier.
-        lpe._codex_auto_agent_cooldown_until_monotonic_by_key.pop(top_tier_a_key, None)
-        lpe._codex_auto_agent_cooldown_until_monotonic_by_key.pop(top_tier_b_key, None)
+        alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.pop(top_tier_a_key, None)
+        alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.pop(top_tier_b_key, None)
 
         await _drive_wrapper(session_id="lowtier-2")
         first_recovered_leader = leaders[-1]
@@ -495,11 +502,11 @@ async def test_lower_priority_fallback_does_not_consume_top_tier_rotation() -> N
         # position was NOT advanced by the earlier lower-tier selection --
         # i.e. the top-tier rotation still starts from its original position
         # (rr-a) rather than having silently advanced during the fallback.
-        lpe._codex_auto_agent_cooldown_until_monotonic_by_key.pop(top_tier_a_key, None)
-        lpe._codex_auto_agent_cooldown_until_monotonic_by_key.pop(top_tier_b_key, None)
+        alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.pop(top_tier_a_key, None)
+        alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.pop(top_tier_b_key, None)
         # Reset rotation to a known baseline and re-derive expected leader.
         lpe.reset_module_singletons()
-        lpe.set_active_routing_snapshot(snapshot)
+        snapshot_select.set_active_routing_snapshot(snapshot)
 
         await _drive_wrapper(session_id="lowtier-3")
         baseline_leader = leaders[-1]
@@ -520,7 +527,7 @@ async def test_lower_priority_fallback_does_not_consume_top_tier_rotation() -> N
 
 async def test_retry_failover_commits_each_actual_rotated_selection() -> None:
     snapshot = compiler.compile_yaml(_three_candidate_round_robin_yaml())
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     leaders: list[str] = []
 
@@ -658,9 +665,9 @@ def _low_alias_openrouter_lane_key_for_model(model: str) -> str:
         "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     }
-    return lpe._codex_auto_agent_candidate_key(
+    return lane_keys._codex_auto_agent_candidate_key(
         candidate,
-        lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
+        policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
     )
 
 
@@ -689,7 +696,7 @@ async def test_scenario_c1_concurrent_cold_probes_single_flight_under_contention
     secondary_model = "openrouter/owl-alpha"
     probe = _ProbeCounter(hold_seconds=0.05)
 
-    original_set_cooldown = lpe._set_codex_auto_agent_cooldown
+    original_set_cooldown = cooldown_state._set_codex_auto_agent_cooldown
 
     async def _delayed_set_cooldown(cooldown_key: str, cooldown_seconds: float) -> None:
         # Suspend AFTER the probe has already failed (and, pre-fix, after the
@@ -710,7 +717,7 @@ async def test_scenario_c1_concurrent_cold_probes_single_flight_under_contention
         return _SUCCESS_RESPONSE
 
     restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
-    lpe._set_codex_auto_agent_cooldown = _delayed_set_cooldown  # type: ignore[assignment]
+    cooldown_state._set_codex_auto_agent_cooldown = _delayed_set_cooldown  # type: ignore[assignment]
     try:
         results = await asyncio.gather(
             _drive_low_alias_wrapper(session_id="c1-session-1"),
@@ -720,7 +727,7 @@ async def test_scenario_c1_concurrent_cold_probes_single_flight_under_contention
             return_exceptions=True,
         )
     finally:
-        lpe._set_codex_auto_agent_cooldown = original_set_cooldown  # type: ignore[assignment]
+        cooldown_state._set_codex_auto_agent_cooldown = original_set_cooldown  # type: ignore[assignment]
         restore()
 
     assert probe.max_current == 1, (
@@ -765,7 +772,7 @@ aliases:
         priority: 900
 """
     snapshot = compiler.compile_yaml(raw_yaml)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     probe = _ProbeCounter(hold_seconds=0.05)
 
@@ -852,14 +859,14 @@ async def _drive_scope_target_failure(
         "cooldown_seconds": 0.0,
         "cooldown_state_source": "local_fallback",
     }
-    probe_lock = await lpe._alias_routing_state.candidate_probe_lock(
+    probe_lock = await alias_state.alias_routing_state.candidate_probe_lock(
         alias_family="codex_auto_agent",
         cooldown_key=selected_cooldown_key,
     )
     publication_events: list[tuple[str, tuple[str, ...]]] = []
     plans: list[CooldownPublicationPlan] = []
-    original_resolver = lpe._resolve_auto_agent_cooldown_publication_plan
-    original_memory_publisher = lpe._publish_codex_cooldown_memory
+    original_resolver = cooldown_apply._resolve_auto_agent_cooldown_publication_plan
+    original_memory_publisher = cooldown_state._publish_codex_cooldown_memory
 
     async def _select_candidate(
         *,
@@ -1006,7 +1013,7 @@ async def test_kimi_managed_account_publishes_only_managed_account_key(
         kimi_failure_metadata=metadata,
     )
 
-    managed_key = lpe._get_kimi_code_managed_account_cooldown_key()
+    managed_key = error_signals._get_kimi_code_managed_account_cooldown_key()
     assert plan.applied_scope == "managed_account"
     assert plan.memory_keys == (managed_key,)
     assert plan.durable_keys == (managed_key,)
@@ -1014,8 +1021,8 @@ async def test_kimi_managed_account_publishes_only_managed_account_key(
         ("memory", plan.memory_keys),
         ("durable", plan.durable_keys),
     ]
-    assert lpe._alias_routing_state.codex.get_memory_cooldown_remaining(managed_key) > 0
-    assert candidate_key not in lpe._codex_auto_agent_cooldown_until_monotonic_by_key
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(managed_key) > 0
+    assert candidate_key not in alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key
 
 
 async def test_kimi_no_cooldown_publishes_no_shared_key(
@@ -1051,13 +1058,13 @@ async def test_kimi_no_cooldown_publishes_no_shared_key(
         kimi_failure_metadata=metadata,
     )
 
-    managed_key = lpe._get_kimi_code_managed_account_cooldown_key()
+    managed_key = error_signals._get_kimi_code_managed_account_cooldown_key()
     assert plan.applied_scope == "none"
     assert plan.memory_keys == ()
     assert plan.durable_keys == ()
     assert publication_events == []
-    assert candidate_key not in lpe._codex_auto_agent_cooldown_until_monotonic_by_key
-    assert managed_key not in lpe._codex_auto_agent_cooldown_until_monotonic_by_key
+    assert candidate_key not in alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key
+    assert managed_key not in alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key
 
 
 # ---------------------------------------------------------------------------
@@ -1078,8 +1085,8 @@ async def test_grok_account_quota_publishes_candidate_and_lane_keys_before_relea
         "route_family": "codex_grok_native_responses_adapter",
         "last_resort": False,
     }
-    lane_key = lpe._CODEX_AUTO_AGENT_XAI_LANE_KEY
-    selected_key = lpe._codex_auto_agent_candidate_key(grok_candidate, lane_key)
+    lane_key = policy.CODEX_AUTO_AGENT_XAI_LANE_KEY
+    selected_key = lane_keys._codex_auto_agent_candidate_key(grok_candidate, lane_key)
     lane_cooldown_key = f"{grok_candidate['provider']}:__account_quota__:{lane_key}"
 
     plan, publication_events = await _drive_scope_target_failure(
@@ -1100,8 +1107,8 @@ async def test_grok_account_quota_publishes_candidate_and_lane_keys_before_relea
         ("memory", plan.memory_keys),
         ("durable", plan.durable_keys),
     ]
-    assert lpe._alias_routing_state.codex.get_memory_cooldown_remaining(selected_key) > 0
-    assert lpe._alias_routing_state.codex.get_memory_cooldown_remaining(lane_cooldown_key) > 0
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(selected_key) > 0
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(lane_cooldown_key) > 0
 
     # A concurrent sibling xAI candidate on the SAME lane (native Grok) must
     # see the lane key's cooldown when it builds its own candidate state.
@@ -1111,7 +1118,7 @@ async def test_grok_account_quota_publishes_candidate_and_lane_keys_before_relea
         "route_family": "codex_grok_native_responses_adapter",
         "last_resort": False,
     }
-    sibling_state = await lpe._build_codex_auto_agent_candidate_state(
+    sibling_state = await selection._build_codex_auto_agent_candidate_state(
         _minimal_request("grok-quota-sibling-session"),
         candidate_template=sibling_candidate_template,
     )
@@ -1159,7 +1166,7 @@ aliases:
         priority: 10
 """
     snapshot = compiler.compile_yaml(raw_yaml)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     leaders: list[str] = []
     request_bodies: list[dict[str, Any]] = []
@@ -1209,8 +1216,8 @@ aliases:
     leader_key = _lane_key_for_model("e3-leader")
     sibling_key = _lane_key_for_model("e3-sibling")
 
-    leader_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
-    sibling_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(sibling_key)
+    leader_remaining = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
+    sibling_remaining = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(sibling_key)
 
     assert leader_remaining == pytest.approx(
         12.0, abs=2.0
@@ -1257,7 +1264,7 @@ aliases:
         priority: 500
 """
     snapshot = compiler.compile_yaml(raw_yaml)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     async def _openrouter_performer(
         *,
@@ -1295,7 +1302,7 @@ aliases:
         restore()
 
     live_key = _lane_key_for_model("openrouter/b1-live-model")
-    applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
+    applied_remaining = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == pytest.approx(12.0, abs=1.5)
 
 
@@ -1317,7 +1324,7 @@ aliases:
         priority: 500
 """
     snapshot = compiler.compile_yaml(raw_yaml)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     async def _openrouter_performer(
         *,
@@ -1355,9 +1362,9 @@ aliases:
         restore()
 
     live_key = _lane_key_for_model("openrouter/b2-live-model")
-    applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
+    applied_remaining = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == 0.0
-    assert lpe._read_pilot_cooldown_gate.is_cooled(cooldown_key=live_key) is False
+    assert alias_state.alias_routing_state.read_pilot_gate.is_cooled(cooldown_key=live_key) is False
 
 
 # ===========================================================================
@@ -1374,10 +1381,10 @@ async def test_snapshot_epoch_tag_requires_exact_alias_candidate_identity() -> N
         "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     }
-    lane_key = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+    lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
 
     assert _snapshot_epoch_tag_for_candidate("read", candidate) is None
-    assert not lpe._codex_auto_agent_candidate_key(candidate, lane_key).startswith("h")
+    assert not lane_keys._codex_auto_agent_candidate_key(candidate, lane_key).startswith("h")
 
     snapshot = compiler.compile_yaml(
         """
@@ -1397,12 +1404,12 @@ aliases:
         priority: 100
 """
     )
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     assert _snapshot_epoch_tag_for_candidate("read", candidate) is None
     assert _snapshot_epoch_tag_for_candidate("aawm-low", candidate) is None
     assert _snapshot_epoch_tag_for_candidate("other", candidate) == snapshot.config_hash
-    assert not lpe._codex_auto_agent_candidate_key(
+    assert not lane_keys._codex_auto_agent_candidate_key(
         candidate,
         lane_key,
         epoch_tag=_snapshot_epoch_tag_for_candidate("read", candidate),
@@ -1422,7 +1429,7 @@ aliases:
         priority: 100
 """
     )
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
     request = _minimal_request("tagged-selection-session")
     request_body = {
         "model": "read",
@@ -1430,30 +1437,43 @@ aliases:
         "litellm_metadata": {"session_id": "tagged-selection-session"},
     }
 
-    selection = await lpe._select_codex_auto_agent_candidate(
+    selection_result = await selection._select_codex_auto_agent_candidate(
         request=request,
         request_body=request_body,
     )
-    typed_selection = CandidateSelection.from_legacy_dict(selection)
+    typed_selection = CandidateSelection.from_legacy_dict(selection_result)
 
-    assert selection["config_epoch_tag"] == snapshot.config_hash
+    assert selection_result["config_epoch_tag"] == snapshot.config_hash
     assert typed_selection.config_epoch_tag == snapshot.config_hash
 
 
-def _refresh_client() -> TestClient:
-    """Build a TestClient wrapping the real passthrough router (refresh route)."""
+class _ASGIClient:
+    def __init__(self, app: FastAPI) -> None:
+        self._app = app
+
+    async def post(self, path: str, *, json: object) -> httpx.Response:
+        transport = httpx.ASGITransport(app=self._app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.post(path, json=json)
+
+
+def _refresh_client() -> _ASGIClient:
+    """Build an async client wrapping the real passthrough refresh router."""
     app = FastAPI()
     app.include_router(lpe.router)
-    return TestClient(app)
+    return _ASGIClient(app)
 
 
-def _post_refresh(client: TestClient, yaml_str: str) -> Any:
-    return client.post(_REFRESH_PATH, json={"yaml": yaml_str})
+async def _post_refresh(client: _ASGIClient, yaml_str: str) -> httpx.Response:
+    return await client.post(_REFRESH_PATH, json={"yaml": yaml_str})
 
 
 def _wave3_epoch_keys_enabled() -> bool:
     return "epoch_tag" in inspect.signature(
-        lpe._codex_auto_agent_candidate_key
+        lane_keys._codex_auto_agent_candidate_key
     ).parameters
 
 
@@ -1462,7 +1482,7 @@ def _snapshot_candidate_key(
     model: str,
     *,
     provider: str = "openrouter",
-    lane_key: str = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
+    lane_key: str = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
 ) -> str:
     candidate = {
         "provider": provider,
@@ -1471,10 +1491,10 @@ def _snapshot_candidate_key(
         "last_resort": False,
     }
     if not _wave3_epoch_keys_enabled():
-        return lpe._codex_auto_agent_candidate_key(candidate, lane_key)
+        return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key)
 
     expected = f"h{snapshot.config_hash}:{provider}:{model}:{lane_key}"
-    actual = lpe._codex_auto_agent_candidate_key(
+    actual = lane_keys._codex_auto_agent_candidate_key(
         candidate,
         lane_key,
         epoch_tag=snapshot.config_hash,
@@ -1504,7 +1524,7 @@ aliases:
         priority: 100
 """
     client = _refresh_client()
-    resp = _post_refresh(client, yaml_str)
+    resp = await _post_refresh(client, yaml_str)
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["changed"] is True
@@ -1544,7 +1564,7 @@ async def test_scenario_a2_refresh_rejects_bad_yaml_with_400() -> None:
     client = _refresh_client()
 
     # Non-string yaml field
-    resp_non_string = client.post(_REFRESH_PATH, json={"yaml": 12345})
+    resp_non_string = await client.post(_REFRESH_PATH, json={"yaml": 12345})
     assert resp_non_string.status_code == 400
 
     # First activate a known-good snapshot
@@ -1558,16 +1578,16 @@ aliases:
         route_family: codex_openrouter_completion_adapter
         priority: 100
 """
-    good_resp = _post_refresh(client, good_yaml)
+    good_resp = await _post_refresh(client, good_yaml)
     assert good_resp.status_code == 200
     good_hash = good_resp.json()["active_config_hash"]
 
     # Syntactically malformed YAML -> 400, last-known-good retained
     bad_yaml = "defaults: {}\naliases: [\n"
-    bad_resp = _post_refresh(client, bad_yaml)
+    bad_resp = await _post_refresh(client, bad_yaml)
     assert bad_resp.status_code == 400
 
-    active = lpe.get_active_routing_snapshot()
+    active = snapshot_select.get_active_routing_snapshot()
     assert active is not None
     assert active.config_hash == good_hash, (
         "last-known-good snapshot must remain active after a failed refresh"
@@ -1621,10 +1641,10 @@ async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_ident
     client = _refresh_client()
 
     # Activate snapshot A
-    resp_a = _post_refresh(client, _D1_SNAPSHOT_A)
+    resp_a = await _post_refresh(client, _D1_SNAPSHOT_A)
     assert resp_a.status_code == 200
     assert resp_a.json()["changed"] is True
-    snapshot_a = lpe.get_active_routing_snapshot()
+    snapshot_a = snapshot_select.get_active_routing_snapshot()
     assert snapshot_a is not None
     leader_key_a = _snapshot_candidate_key(snapshot_a, "d1-leader")
 
@@ -1652,7 +1672,7 @@ async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_ident
         assert "d1-fallback" in calls
 
         # Verify leader's cooldown key is cooled
-        remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(
+        remaining = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(
             leader_key_a
         )
         assert remaining > 0, f"expected leader key to be cooled, got remaining={remaining}"
@@ -1666,11 +1686,11 @@ async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_ident
         )
 
         # Activate snapshot B (changed priority -> different config_hash)
-        resp_b = _post_refresh(client, _D1_SNAPSHOT_B)
+        resp_b = await _post_refresh(client, _D1_SNAPSHOT_B)
         assert resp_b.status_code == 200
         assert resp_b.json()["changed"] is True
         assert resp_b.json()["active_config_hash"] != resp_a.json()["active_config_hash"]
-        snapshot_b = lpe.get_active_routing_snapshot()
+        snapshot_b = snapshot_select.get_active_routing_snapshot()
         assert snapshot_b is not None
         leader_key_b = _snapshot_candidate_key(snapshot_b, "d1-leader")
 
@@ -1688,11 +1708,11 @@ async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_ident
             "cooldown persists across the swap."
         )
         assert leader_key_b != leader_key_a
-        assert lpe._alias_routing_state.codex.get_memory_cooldown_remaining(
+        assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(
             leader_key_a
         ) > 0
         assert (
-            lpe._alias_routing_state.codex.get_memory_cooldown_remaining(
+            alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(
                 leader_key_b
             )
             == 0.0
@@ -1727,10 +1747,10 @@ aliases:
         route_family: codex_openrouter_completion_adapter
         priority: 50
 """
-    resp1 = _post_refresh(client, yaml_str)
+    resp1 = await _post_refresh(client, yaml_str)
     assert resp1.status_code == 200
     assert resp1.json()["changed"] is True
-    snapshot_before = lpe.get_active_routing_snapshot()
+    snapshot_before = snapshot_select.get_active_routing_snapshot()
     assert snapshot_before is not None
 
     # Structured-429 the leader
@@ -1753,23 +1773,23 @@ aliases:
         restore()
 
     leader_key = _snapshot_candidate_key(snapshot_before, "d2-leader")
-    remaining_before = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
+    remaining_before = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
     assert remaining_before > 0
 
     # Re-post IDENTICAL YAML -> no-op
-    resp2 = _post_refresh(client, yaml_str)
+    resp2 = await _post_refresh(client, yaml_str)
     assert resp2.status_code == 200
     assert resp2.json()["changed"] is False
 
     # Same snapshot object retained
-    snapshot_after = lpe.get_active_routing_snapshot()
+    snapshot_after = snapshot_select.get_active_routing_snapshot()
     assert snapshot_after is snapshot_before, (
         "no-op refresh must retain the exact same snapshot object"
     )
     assert _snapshot_candidate_key(snapshot_after, "d2-leader") == leader_key
 
     # Cooldown must REMAIN
-    remaining_after = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
+    remaining_after = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
     assert remaining_after > 0, (
         "no-op refresh must not invalidate the cooldown (same semantic "
         f"config_hash -> same tag -> same key); remaining={remaining_after}"
@@ -1826,10 +1846,10 @@ async def test_scenario_d3_semantically_identical_refresh_retains_state() -> Non
     client = _refresh_client()
 
     # Activate original
-    resp1 = _post_refresh(client, _D3_YAML_ORIGINAL)
+    resp1 = await _post_refresh(client, _D3_YAML_ORIGINAL)
     assert resp1.status_code == 200
     assert resp1.json()["changed"] is True
-    snapshot_before = lpe.get_active_routing_snapshot()
+    snapshot_before = snapshot_select.get_active_routing_snapshot()
     assert snapshot_before is not None
 
     # Drive a request to advance the RR cursor and establish affinity
@@ -1852,7 +1872,7 @@ async def test_scenario_d3_semantically_identical_refresh_retains_state() -> Non
         restore()
     affinity_before = {
         key: dict(value)
-        for key, value in lpe._codex_auto_agent_session_affinity_by_key.items()
+        for key, value in alias_state.alias_routing_state.codex.session_affinity_by_key.items()
     }
     assert len(affinity_before) == 1
     if _wave3_epoch_keys_enabled():
@@ -1862,13 +1882,13 @@ async def test_scenario_d3_semantically_identical_refresh_retains_state() -> Non
 
     # Cool one candidate to have a cooldown to retain
     model_a_key = _snapshot_candidate_key(snapshot_before, "d3-model-a")
-    await lpe._set_codex_auto_agent_cooldown(model_a_key, 60.0)
+    await cooldown_state._set_codex_auto_agent_cooldown(model_a_key, 60.0)
 
     # Capture RR cursor state
-    cursor_before = dict(lpe._round_robin_cursor_by_alias)
+    cursor_before = dict(alias_state.alias_routing_state.round_robin_cursor)
 
     # Re-post reformatted (semantically identical) YAML
-    resp2 = _post_refresh(client, _D3_YAML_REFORMATTED)
+    resp2 = await _post_refresh(client, _D3_YAML_REFORMATTED)
     assert resp2.status_code == 200
     assert resp2.json()["changed"] is False, (
         "R3-4: semantically identical YAML (comment/whitespace/key-order "
@@ -1877,26 +1897,26 @@ async def test_scenario_d3_semantically_identical_refresh_retains_state() -> Non
     )
 
     # Same active snapshot object
-    snapshot_after = lpe.get_active_routing_snapshot()
+    snapshot_after = snapshot_select.get_active_routing_snapshot()
     assert snapshot_after is snapshot_before, (
         "semantically identical refresh must retain the same snapshot object"
     )
     assert _snapshot_candidate_key(snapshot_after, "d3-model-a") == model_a_key
 
     # Retained cooldown
-    remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(model_a_key)
+    remaining = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(model_a_key)
     assert remaining > 0, (
         f"cooldown must be retained across a semantic no-op refresh; remaining={remaining}"
     )
 
     # Retained RR cursor
-    cursor_after = dict(lpe._round_robin_cursor_by_alias)
+    cursor_after = dict(alias_state.alias_routing_state.round_robin_cursor)
     assert cursor_after == cursor_before, (
         f"RR cursor must be retained; before={cursor_before!r}, after={cursor_after!r}"
     )
     affinity_after = {
         key: dict(value)
-        for key, value in lpe._codex_auto_agent_session_affinity_by_key.items()
+        for key, value in alias_state.alias_routing_state.codex.session_affinity_by_key.items()
     }
     assert affinity_after == affinity_before
 
@@ -1914,7 +1934,7 @@ async def test_scenario_d3_semantically_identical_refresh_retains_state() -> Non
     _, restore2 = _install_openrouter_performer(_performer2)
     try:
         # Clear the cooldown so the affinity candidate is available
-        lpe._codex_auto_agent_cooldown_until_monotonic_by_key.pop(model_a_key, None)
+        alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.pop(model_a_key, None)
         first_leader = leaders[0]
         await _drive_wrapper(
             session_id="d3-session-1",
@@ -1971,7 +1991,7 @@ async def test_scenario_d4_changed_refresh_preserves_compatible_continuation_aff
     client = _refresh_client()
 
     # Activate snapshot A
-    resp_a = _post_refresh(client, _D4_SNAPSHOT_A)
+    resp_a = await _post_refresh(client, _D4_SNAPSHOT_A)
     assert resp_a.status_code == 200
 
     leaders: list[str] = []
@@ -1995,7 +2015,7 @@ async def test_scenario_d4_changed_refresh_preserves_compatible_continuation_aff
         assert pinned == "d4-pinned"
         affinity_before = {
             key: dict(value)
-            for key, value in lpe._codex_auto_agent_session_affinity_by_key.items()
+            for key, value in alias_state.alias_routing_state.codex.session_affinity_by_key.items()
         }
         assert len(affinity_before) == 1
         if _wave3_epoch_keys_enabled():
@@ -2004,7 +2024,7 @@ async def test_scenario_d4_changed_refresh_preserves_compatible_continuation_aff
             )
 
         # Refresh to snapshot B (changed priority, same provider/model/route_family)
-        resp_b = _post_refresh(client, _D4_SNAPSHOT_B)
+        resp_b = await _post_refresh(client, _D4_SNAPSHOT_B)
         assert resp_b.status_code == 200
         assert resp_b.json()["changed"] is True
 
@@ -2018,7 +2038,7 @@ async def test_scenario_d4_changed_refresh_preserves_compatible_continuation_aff
             "must remain pinned after a changed refresh; expected "
             f"{pinned!r}, got {leaders[-1]!r}"
         )
-        assert set(lpe._codex_auto_agent_session_affinity_by_key) == set(
+        assert set(alias_state.alias_routing_state.codex.session_affinity_by_key) == set(
             affinity_before
         )
     finally:
@@ -2061,7 +2081,7 @@ aliases:
 
 async def test_scenario_d4_schedule_only_refresh_preserves_continuation_affinity() -> None:
     client = _refresh_client()
-    response_a = _post_refresh(client, _D4_SCHEDULE_SNAPSHOT_A)
+    response_a = await _post_refresh(client, _D4_SCHEDULE_SNAPSHOT_A)
     assert response_a.status_code == 200
 
     leaders: list[str] = []
@@ -2081,7 +2101,7 @@ async def test_scenario_d4_schedule_only_refresh_preserves_continuation_affinity
         await _drive_wrapper(session_id="d4-schedule-session")
         assert leaders == ["d4-scheduled-pinned"]
 
-        response_b = _post_refresh(client, _D4_SCHEDULE_SNAPSHOT_B)
+        response_b = await _post_refresh(client, _D4_SCHEDULE_SNAPSHOT_B)
         assert response_b.status_code == 200
         assert response_b.json()["changed"] is True
 
@@ -2162,7 +2182,7 @@ async def test_scenario_d5_refresh_removing_affinity_candidate_requires_redispat
     client = _refresh_client()
 
     # Activate snapshot A
-    resp_a = _post_refresh(client, _D5_SNAPSHOT_A)
+    resp_a = await _post_refresh(client, _D5_SNAPSHOT_A)
     assert resp_a.status_code == 200
 
     leaders: list[str] = []
@@ -2189,7 +2209,7 @@ async def test_scenario_d5_refresh_removing_affinity_candidate_requires_redispat
         assert leaders[0] == "d5-pinned"
 
         # Refresh to snapshot B (d5-pinned removed)
-        resp_b = _post_refresh(client, replacement_yaml)
+        resp_b = await _post_refresh(client, replacement_yaml)
         assert resp_b.status_code == 200
         assert resp_b.json()["changed"] is True
 
@@ -2219,7 +2239,7 @@ async def test_scenario_d5_refresh_removing_affinity_candidate_requires_redispat
 
 async def test_scenario_d5_none_to_concrete_route_family_requires_redispatch() -> None:
     client = _refresh_client()
-    response = _post_refresh(
+    response = await _post_refresh(
         client,
         """
 defaults: {}
@@ -2237,7 +2257,7 @@ aliases:
 """,
     )
     assert response.status_code == 200
-    snapshot = lpe.get_active_routing_snapshot()
+    snapshot = snapshot_select.get_active_routing_snapshot()
     assert snapshot is not None
 
     request = _minimal_request("d5-none-route-session")
@@ -2251,7 +2271,7 @@ aliases:
         request_body,
         alias_model="read",
     )
-    await lpe._set_codex_auto_agent_session_affinity(
+    await cooldown_state._set_codex_auto_agent_session_affinity(
         session_key,
         {
             "provider": "openrouter",
@@ -2311,8 +2331,8 @@ async def test_scenario_d6_legacy_alias_keys_unchanged() -> None:
         c for c in low_candidates
         if c["provider"] == policy.CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
     )
-    lane_key = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    bare_key_before = lpe._codex_auto_agent_candidate_key(first_or, lane_key)
+    lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+    bare_key_before = lane_keys._codex_auto_agent_candidate_key(first_or, lane_key)
     assert not bare_key_before.startswith("h"), (
         f"expected bare key (no epoch tag), got {bare_key_before!r}"
     )
@@ -2337,7 +2357,7 @@ async def test_scenario_d6_legacy_alias_keys_unchanged() -> None:
     finally:
         restore()
 
-    pre_keys = set(lpe._codex_auto_agent_cooldown_until_monotonic_by_key.keys())
+    pre_keys = set(alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.keys())
     assert bare_key_before in pre_keys, (
         f"expected bare key {bare_key_before!r} in cooldown map; keys={pre_keys!r}"
     )
@@ -2355,13 +2375,13 @@ aliases:
         priority: 100
 """
     client = _refresh_client()
-    refresh = _post_refresh(client, snapshot_yaml)
+    refresh = await _post_refresh(client, snapshot_yaml)
     assert refresh.status_code == 200
     assert refresh.json()["changed"] is True
     assert _low_alias_openrouter_lane_key_for_model(first_or["model"]) == bare_key_before
 
     # Clear cooldowns and drive again
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
+    alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
 
     restore2 = _install_openrouter_and_opencode_performers(openrouter_handler=_failing_performer)
     try:
@@ -2370,8 +2390,8 @@ aliases:
     finally:
         restore2()
 
-    post_keys = set(lpe._codex_auto_agent_cooldown_until_monotonic_by_key.keys())
-    bare_key_after = lpe._codex_auto_agent_candidate_key(first_or, lane_key)
+    post_keys = set(alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.keys())
+    bare_key_after = lane_keys._codex_auto_agent_candidate_key(first_or, lane_key)
     assert bare_key_after == bare_key_before, (
         f"legacy alias key must not change after snapshot activation; "
         f"before={bare_key_before!r}, after={bare_key_after!r}"

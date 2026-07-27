@@ -27,9 +27,22 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import Request, Response
 
-from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+# Retained only for _handle_auto_agent_alias_route (route orchestrator).
+from litellm.proxy.pass_through_endpoints import (
+    llm_passthrough_endpoints as lpe,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    attempt_records,
+    cooldown_apply,
+    cooldown_state,
+    lane_keys,
+    policy,
+    selection,
+    snapshot_select,
+    state,
 )
 
 
@@ -45,35 +58,19 @@ def _minimal_request(session_id: str = "round2-live-session") -> MagicMock:
 
 
 def _reset_alias_routing_ambient_state_now() -> None:
-    """Migrated to the Wave-0 reset helper (RED-guarded until it lands).
-
-    ``getattr`` guard so this fixture also runs against pre-helper develop
-    (falling back to the previous per-map clearing), letting each test fail
-    on its own behavioral assertion rather than an AttributeError here.
-    """
-    reset_fn = getattr(lpe, "reset_alias_routing_state_for_tests", None)
-    if reset_fn is not None:
-        reset_fn()
-        return
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe._read_pilot_cooldown_gate._key_state.clear()
-    lpe._read_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
-    # ``getattr`` guard so the fixture also runs against pre-fix develop (where
-    # ``_round_robin_cursor_by_alias`` does not exist), letting each test fail
-    # on its behavioral assertion rather than a fixture AttributeError.
-    getattr(lpe, "_round_robin_cursor_by_alias", {}).clear()
+    """Reset all process-local alias-routing state via the extracted state manager."""
+    state.alias_routing_state.reset_for_tests()
+    snapshot_select.set_active_routing_snapshot(None)
 
 
 @pytest.fixture(autouse=True)
 def _reset_alias_routing_ambient_state() -> Any:
     """Neutralize shared cooldown / affinity / snapshot / gate / round-robin state."""
-    previous_snapshot = lpe.get_active_routing_snapshot()
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
     _reset_alias_routing_ambient_state_now()
     yield
     _reset_alias_routing_ambient_state_now()
-    lpe.set_active_routing_snapshot(previous_snapshot)
+    snapshot_select.set_active_routing_snapshot(previous_snapshot)
 
 
 _SINGLE_CANDIDATE_YAML = """
@@ -124,20 +121,20 @@ async def _run_read_lane_once(
     async def _perform_candidate_request(**_kwargs: Any) -> Response:
         raise raise_exc
 
-    max_attempts = len(lpe._get_codex_auto_agent_candidates_for_alias("read"))
+    max_attempts = len(snapshot_select._get_codex_auto_agent_candidates_for_alias("read"))
     return await lpe._handle_auto_agent_alias_route(
         alias_family="codex_auto_agent",
         alias_model="read",
         request=request,
         prepared_request_body=body,
         max_candidate_attempts=max_attempts,
-        select_candidate_fn=lpe._select_codex_auto_agent_candidate,
-        add_alias_metadata_fn=lpe._add_codex_auto_agent_alias_metadata,
+        select_candidate_fn=selection._select_codex_auto_agent_candidate,
+        add_alias_metadata_fn=attempt_records._add_codex_auto_agent_alias_metadata,
         perform_candidate_request_fn=_perform_candidate_request,
-        get_active_cooldown_state_fn=lpe._get_codex_auto_agent_active_cooldown_state,
-        set_session_affinity_fn=lpe._set_codex_auto_agent_session_affinity,
-        apply_cooldown_fn=lpe._set_codex_auto_agent_candidate_cooldowns,
-        raise_redispatch_required_fn=lpe._raise_codex_auto_agent_redispatch_required,
+        get_active_cooldown_state_fn=cooldown_state._get_codex_auto_agent_active_cooldown_state,
+        set_session_affinity_fn=cooldown_state._set_codex_auto_agent_session_affinity,
+        apply_cooldown_fn=cooldown_apply._set_codex_auto_agent_candidate_cooldowns,
+        raise_redispatch_required_fn=selection._raise_codex_auto_agent_redispatch_required,
         attempts_metadata_key="codex_auto_agent_attempts",
         skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
         no_candidate_detail="No read-lane candidates were available.",
@@ -153,8 +150,8 @@ def _live_cooldown_key() -> str:
         "route_family": "codex_openrouter_completion_adapter",
         "last_resort": False,
     }
-    lane_key = lpe._CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    snapshot = lpe.get_active_routing_snapshot()
+    lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
+    snapshot = snapshot_select.get_active_routing_snapshot()
     epoch_tag: str | None = None
     if snapshot is not None:
         alias = snapshot.aliases.get("read")
@@ -168,7 +165,7 @@ def _live_cooldown_key() -> str:
             for compiled in alias.candidates
         ):
             epoch_tag = snapshot.config_hash
-    return lpe._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
+    return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
 
 
 def test_live_cooldown_key_requires_exact_read_alias_ownership() -> None:
@@ -192,7 +189,7 @@ aliases:
         priority: 100
 """
     )
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     assert not _live_cooldown_key().startswith("h")
 
@@ -203,7 +200,7 @@ async def test_live_read_lane_structured_429_cools_with_gate_duration() -> None:
     with the gate's retry-after-derived duration -- proving the gate is
     authoritative and evidence is recorded before the cooldown is applied."""
     snapshot = compiler.compile_yaml(_SINGLE_CANDIDATE_YAML)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     with pytest.raises(Exception):
         await _run_read_lane_once(
@@ -212,7 +209,7 @@ async def test_live_read_lane_structured_429_cools_with_gate_duration() -> None:
         )
 
     live_key = _live_cooldown_key()
-    applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
+    applied_remaining = state.alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     # The gate resolved a 12s retry-after-derived duration; the APPLIED cooldown
     # -- looked up by the live provider:model:lane key the selector produced --
     # must reflect that gate duration.
@@ -225,7 +222,7 @@ async def test_live_read_lane_single_marker_failure_does_not_cool() -> None:
     must NOT cool the candidate -- the N-of-M gate needs multiple marker events
     within its window before a key advances toward cooling."""
     snapshot = compiler.compile_yaml(_SINGLE_CANDIDATE_YAML)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     with pytest.raises(Exception):
         await _run_read_lane_once(
@@ -234,10 +231,10 @@ async def test_live_read_lane_single_marker_failure_does_not_cool() -> None:
         )
 
     live_key = _live_cooldown_key()
-    applied_remaining = lpe._alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
+    applied_remaining = state.alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == 0.0
     # And the gate itself must agree the key is not cooled after one marker event.
-    assert lpe._read_pilot_cooldown_gate.is_cooled(cooldown_key=live_key) is False
+    assert state.alias_routing_state.read_pilot_gate.is_cooled(cooldown_key=live_key) is False
 
 
 _ROUND_ROBIN_YAML = """
@@ -269,14 +266,14 @@ def test_live_round_robin_rotates_across_equal_priority_candidates() -> None:
     the live selector performs on its ``first_available`` return. This test drives
     that read+commit pair per selection to prove deterministic rotation."""
     snapshot = compiler.compile_yaml(_ROUND_ROBIN_YAML)
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     leaders: list[str] = []
     for _ in range(4):
-        token = lpe._derive_round_robin_commit_token("read", client_product_label=None)
-        leader = lpe._select_read_pilot_snapshot_candidates()[0]
+        token = snapshot_select._derive_round_robin_commit_token("read", client_product_label=None)
+        leader = snapshot_select._select_read_pilot_snapshot_candidates()[0]
         leaders.append(leader["model"])
-        lpe._commit_round_robin_selection(token, selected_candidate=leader)
+        snapshot_select._commit_round_robin_selection(token, selected_candidate=leader)
     # Deterministic rotation: consecutive leaders must alternate and both
     # candidates must lead within any two consecutive selections.
     assert leaders[0] != leaders[1]

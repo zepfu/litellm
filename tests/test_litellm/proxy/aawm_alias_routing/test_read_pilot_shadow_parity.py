@@ -33,12 +33,15 @@ import os
 
 import pytest
 
-from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AAWM_LOW_CANDIDATES,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    alias_routing_state,
 )
 
 _READ_YAML_PATH = os.path.join(
@@ -66,13 +69,13 @@ def _reset_alias_routing_ambient_state():
     ``clear_codex_auto_agent_alias_state`` autouse fixture, scoped to just the
     state this shadow-parity test could otherwise flap on.
     """
-    previous_snapshot = lpe.get_active_routing_snapshot()
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.codex.session_affinity_by_key.clear()
     yield
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe.set_active_routing_snapshot(previous_snapshot)
+    alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.codex.session_affinity_by_key.clear()
+    snapshot_select.set_active_routing_snapshot(previous_snapshot)
 
 
 def _compile_read_yaml():
@@ -92,12 +95,12 @@ def test_shadow_parity_read_vs_low(monkeypatch: pytest.MonkeyPatch) -> None:
     """Snapshot-driven ``read`` selection (promo window closed) reproduces
     ``CODEX_AAWM_LOW_CANDIDATES`` ordering/eligibility exactly."""
     snapshot = _compile_read_yaml()
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     # Force the auto-agent alias resolver's fallback table to resolve "read"
     # from the snapshot regardless of the untouched hard-coded alias-name
     # mapping (Wave 4's helper is keyed on the literal alias name "read").
-    selected = lpe._select_read_pilot_snapshot_candidates(
+    selected = snapshot_select._select_read_pilot_snapshot_candidates(
         client_product_label=None,
         now_utc=_REFERENCE_NOW_UTC,
     )
@@ -121,10 +124,10 @@ def test_shadow_parity_promo_window_open_outranks_everything() -> None:
     promo candidate legitimately outranks the CODEX_AAWM_LOW_CANDIDATES-parity
     set (this is intentional product behavior, not a parity break)."""
     snapshot = _compile_read_yaml()
-    lpe.set_active_routing_snapshot(snapshot)
+    snapshot_select.set_active_routing_snapshot(snapshot)
 
     now_within_promo_window = dt.datetime(2026, 7, 15, tzinfo=dt.timezone.utc)
-    selected = lpe._select_read_pilot_snapshot_candidates(
+    selected = snapshot_select._select_read_pilot_snapshot_candidates(
         client_product_label=None,
         now_utc=now_within_promo_window,
     )

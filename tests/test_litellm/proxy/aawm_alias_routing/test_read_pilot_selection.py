@@ -1,25 +1,13 @@
 """RED-phase tests for Wave 4: selector integration for the ``read`` pilot only.
 
-These tests target the new selection surface Wave 4 must add to
-``llm_passthrough_endpoints.py`` (candidate resolution for ``read`` from the
-compiled snapshot; priority/tie/TUI/schedule selection semantics) while
-asserting every other alias keeps resolving from the untouched hard-coded
-``policy.py`` tables, and that NO new routing-decision recording path is
-added (per operator: routing decisions are not persisted beyond existing
-``session_history`` as-routed fields).
+These tests target the selection surface Wave 4 added for candidate resolution
+from the compiled snapshot; priority/tie/TUI/schedule selection semantics;
+unchanged hard-coded ``policy.py`` tables for every other alias; and no new
+routing-decision recording path beyond existing ``session_history`` as-routed
+fields.
 
-Assumed new surface (engineer's contract to satisfy, per Wave 4 Source Spec):
-  - ``lpe.get_active_routing_snapshot()`` / ``lpe.set_active_routing_snapshot(snapshot)``
-    — process-local snapshot holder accessor/setter (wired to config_snapshot.py).
-  - ``lpe._get_codex_auto_agent_candidates_for_alias("read", ...)`` resolves from
-    the active snapshot instead of ``CODEX_AAWM_LOW_CANDIDATES``.
-  - ``lpe._order_snapshot_candidates_by_priority(candidates)`` — pure ordering.
-  - ``lpe._select_proportional_snapshot_candidate(candidates, weights, rng)`` — pure tie-break.
-  - ``lpe._is_tui_attached_candidate_eligible(candidate, client_product_label)`` — pure TUI gate.
-  - ``lpe._is_snapshot_candidate_in_schedule_window(candidate, now_utc)`` — pure schedule gate.
-
-Modules under test do not exist yet (``config_snapshot``, ``config_compiler``),
-so import failure at collection time is the correct red-phase signal.
+The extracted selection surface is owned by
+``aawm_alias_routing.snapshot_select``.
 """
 
 from __future__ import annotations
@@ -29,8 +17,9 @@ import inspect
 import pytest
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (  # type: ignore[import-not-found]
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
+    snapshot_select,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AAWM_LOW_CANDIDATES,
@@ -59,15 +48,15 @@ aliases:
 @pytest.fixture()
 def snapshot_fixture():
     snapshot = compiler.compile_yaml(_SNAPSHOT_YAML)
-    previous = lpe.get_active_routing_snapshot()
-    lpe.set_active_routing_snapshot(snapshot)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
     yield snapshot
-    lpe.set_active_routing_snapshot(previous)
+    snapshot_select.set_active_routing_snapshot(previous)
 
 
 def test_read_alias_uses_snapshot(snapshot_fixture) -> None:
     """``read`` resolves candidates from the compiled snapshot, not CODEX_AAWM_LOW_CANDIDATES."""
-    candidates = lpe._get_codex_auto_agent_candidates_for_alias("read")
+    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias("read")
     models = [c["model"] for c in candidates]
     assert "openrouter/snapshot-only-model" in models
     low_models = [c["model"] for c in CODEX_AAWM_LOW_CANDIDATES]
@@ -78,15 +67,15 @@ def test_other_aliases_unchanged(snapshot_fixture) -> None:
     """aawm-read, aawm-low, aawm-sota still resolve from the hard-coded tables."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import policy
 
-    assert lpe._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_READ_ALIAS) == policy.CODEX_AUTO_AGENT_CANDIDATES
-    assert lpe._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_LOW_ALIAS) == CODEX_AAWM_LOW_CANDIDATES
-    assert lpe._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_SOTA_ALIAS) == policy.CODEX_AAWM_SOTA_CANDIDATES
+    assert snapshot_select._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_READ_ALIAS) == policy.CODEX_AUTO_AGENT_CANDIDATES
+    assert snapshot_select._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_LOW_ALIAS) == CODEX_AAWM_LOW_CANDIDATES
+    assert snapshot_select._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_SOTA_ALIAS) == policy.CODEX_AAWM_SOTA_CANDIDATES
 
 
 def test_priority_descending_selection(snapshot_fixture) -> None:
     """Higher priority first; priority:0 only when all others are cooled/ineligible."""
     read_alias = snapshot_fixture.aliases["read"]
-    ordered = lpe._order_snapshot_candidates_by_priority(read_alias.candidates)
+    ordered = snapshot_select._order_snapshot_candidates_by_priority(read_alias.candidates)
     assert ordered[0].model == "openrouter/snapshot-only-model"
     assert ordered[-1].priority == 0
     assert ordered[-1].model == "gpt-5.4-mini"
@@ -121,7 +110,7 @@ aliases:
     counts: dict[str, int] = {"a": 0, "b": 0}
     n_trials = 4000
     for _ in range(n_trials):
-        selected = lpe._select_proportional_snapshot_candidate(candidates, weights, rng)
+        selected = snapshot_select._select_proportional_snapshot_candidate(candidates, weights, rng)
         counts[selected.model] += 1
 
     ratio_a = counts["a"] / n_trials
@@ -149,7 +138,7 @@ aliases:
 """
     snapshot = compiler.compile_yaml(raw)
     candidates = snapshot.aliases["read"].candidates
-    eligible = [c for c in candidates if lpe._is_tui_attached_candidate_eligible(c, client_product_label=None)]
+    eligible = [c for c in candidates if snapshot_select._is_tui_attached_candidate_eligible(c, client_product_label=None)]
     eligible_models = [c.model for c in eligible]
     assert "claude-only-model" not in eligible_models
     assert "gpt-5.4-mini" in eligible_models
@@ -170,8 +159,8 @@ aliases:
 """
     snapshot = compiler.compile_yaml(raw)
     candidate = snapshot.aliases["read"].candidates[0]
-    assert lpe._is_tui_attached_candidate_eligible(candidate, client_product_label="Claude/1.2")
-    assert not lpe._is_tui_attached_candidate_eligible(candidate, client_product_label="Codex/1.0")
+    assert snapshot_select._is_tui_attached_candidate_eligible(candidate, client_product_label="Claude/1.2")
+    assert not snapshot_select._is_tui_attached_candidate_eligible(candidate, client_product_label="Codex/1.0")
 
 
 def test_schedule_window_close_stops_new_affinity() -> None:
@@ -201,8 +190,8 @@ aliases:
     now_within_window = dt.datetime(2026, 7, 5, tzinfo=dt.timezone.utc)
     now_after_window = dt.datetime(2026, 7, 20, tzinfo=dt.timezone.utc)
 
-    assert lpe._is_snapshot_candidate_in_schedule_window(promo_candidate, now_utc=now_within_window)
-    assert not lpe._is_snapshot_candidate_in_schedule_window(promo_candidate, now_utc=now_after_window)
+    assert snapshot_select._is_snapshot_candidate_in_schedule_window(promo_candidate, now_utc=now_within_window)
+    assert not snapshot_select._is_snapshot_candidate_in_schedule_window(promo_candidate, now_utc=now_after_window)
 
     # An existing affinity-pinned session must continue on the out-of-window model —
     # the schedule gate only prevents NEW affinity, it does not evict existing state.
@@ -228,6 +217,7 @@ aliases:
 
 def test_no_new_routing_decision_recording(snapshot_fixture) -> None:
     """Selecting a read candidate adds no new session_history write path / hash persistence."""
+    # This contract intentionally inspects the facade module itself.
     source = inspect.getsource(lpe)
     # No config-hash/version persistence path introduced by the pilot.
     assert "config_hash" not in _extract_session_history_write_regions(source)
