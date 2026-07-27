@@ -1805,8 +1805,7 @@ class TestWave6ERequestPolicyOwnership:
         assert len(seen) == 76
         assert not duplicates
 
-    # Same-object facades still on god module: these must NOT be FunctionDefs.
-    WAVE6E_SAME_OBJECT_SYMBOLS: set[str] = WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS
+    WAVE6E_SAME_OBJECT_SYMBOLS: set[str] = set()
 
     WAVE6E_CODEX_TOOL_POLICY_MODULE_ONLY_SYMBOLS: set[str] = {
         "_get_openai_tool_name",
@@ -1828,7 +1827,7 @@ class TestWave6ERequestPolicyOwnership:
     )
 
     def test_same_object_facades_not_function_defs(self):
-        """11 same-object facades must not be FunctionDefs in the god module."""
+        """No Wave 6E same-object facades remain on the god module."""
         func_defs = _top_level_function_defs(_parse_god_module())
         violations = self.WAVE6E_SAME_OBJECT_SYMBOLS & func_defs
         assert not violations, (
@@ -1848,7 +1847,13 @@ class TestWave6ERequestPolicyOwnership:
         """All 76 symbols remain callable on their owning public surface."""
         claude_symbols = WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS
         codex_module_symbols = self.WAVE6E_CODEX_TOOL_POLICY_MODULE_ONLY_SYMBOLS
-        god_symbols = ALL_WAVE6E_FUNCTIONS - claude_symbols - codex_module_symbols
+        anthropic_symbols = WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS
+        god_symbols = (
+            ALL_WAVE6E_FUNCTIONS
+            - claude_symbols
+            - codex_module_symbols
+            - anthropic_symbols
+        )
         for symbol in god_symbols:
             facade = getattr(lpe, symbol, None)
             assert facade is not None, f"{symbol} not on god module"
@@ -1860,6 +1865,18 @@ class TestWave6ERequestPolicyOwnership:
             module_fn = getattr(mod, symbol, None)
             assert module_fn is not None, (
                 f"{symbol} not on claude_prompt_replacement module"
+            )
+            assert callable(module_fn), f"{symbol} not callable on module"
+            assert not hasattr(lpe, symbol), (
+                f"{symbol} should be absent from god module"
+            )
+        anthropic_mod = importlib.import_module(
+            WAVE6E_MODULE_IMPORT_PATHS["anthropic_body_prep"]
+        )
+        for symbol in anthropic_symbols:
+            module_fn = getattr(anthropic_mod, symbol, None)
+            assert module_fn is not None, (
+                f"{symbol} not on anthropic_body_prep module"
             )
             assert callable(module_fn), f"{symbol} not callable on module"
             assert not hasattr(lpe, symbol), (
@@ -1894,14 +1911,16 @@ class TestWave6ERequestPolicyOwnership:
                 f"claude_prompt_replacement.{symbol}: still present on god module"
             )
 
-    def test_anthropic_body_prep_same_object_identity(self):
-        """anthropic_body_prep facades are same-object assignments."""
+    def test_anthropic_body_prep_absent_from_god_module(self):
+        """Anthropic body-prep functions are callable only on their owner module."""
         mod = importlib.import_module(WAVE6E_MODULE_IMPORT_PATHS["anthropic_body_prep"])
         for symbol in WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS:
-            facade = getattr(lpe, symbol)
             module_fn = getattr(mod, symbol)
-            assert facade is module_fn, (
-                f"anthropic_body_prep.{symbol}: facade identity mismatch"
+            assert callable(module_fn), (
+                f"anthropic_body_prep.{symbol}: not callable on module"
+            )
+            assert not hasattr(lpe, symbol), (
+                f"anthropic_body_prep.{symbol}: still present on god module"
             )
 
     def test_codex_tool_policy_pure_functions_absent_from_god_module(self):

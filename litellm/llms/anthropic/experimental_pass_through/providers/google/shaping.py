@@ -182,10 +182,27 @@ for _implementation_module, _owned_names in _EXPORTS_BY_MODULE:
 
 def bind_runtime(namespace: Mapping[str, object]) -> None:
     provider_namespace = dict(namespace)
+    anthropic_body_prep = namespace.get("_aawm_anthropic_body_prep")
+    if anthropic_body_prep is None:
+        raise RuntimeError(
+            "Google provider runtime requires _aawm_anthropic_body_prep"
+        )
     provider_namespace.update(
         {
             name: getattr(_FACADE_MODULE, name)
             for name in _OWNED_FUNCTION_NAMES
+        }
+    )
+    provider_namespace.update(
+        {
+            "_repair_anthropic_tool_use_ids_for_passthrough": getattr(
+                anthropic_body_prep,
+                "_repair_anthropic_tool_use_ids_for_passthrough",
+            ),
+            "_validate_anthropic_tool_blocks_for_passthrough": getattr(
+                anthropic_body_prep,
+                "_validate_anthropic_tool_blocks_for_passthrough",
+            ),
         }
     )
     for implementation_module in _IMPLEMENTATION_MODULES:

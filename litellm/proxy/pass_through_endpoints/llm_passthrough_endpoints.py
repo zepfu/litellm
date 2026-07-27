@@ -4866,7 +4866,9 @@ _aawm_responses_finalize.configure_responses_finalize_runtime(
 _ANTHROPIC_OPENAI_PROVIDER_RUNTIME = _anthropic_openai_provider.Runtime(
     resolve_auth_context=lambda request: (_resolve_anthropic_openai_responses_adapter_auth_context(request)),
     compact_context=lambda body, **kwargs: (
-        _compact_openai_adapter_claude_context_in_anthropic_request_body(body, **kwargs)
+        _aawm_anthropic_body_prep._compact_openai_adapter_claude_context_in_anthropic_request_body(
+            body, **kwargs
+        )
     ),
     log_debug=lambda message, *args: verbose_proxy_logger.debug(message, *args),
     build_request_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
@@ -4938,7 +4940,9 @@ _ANTHROPIC_NVIDIA_PROVIDER_RUNTIME = _anthropic_nvidia_provider.Runtime(
 
 _ANTHROPIC_OPENROUTER_PROVIDER_RUNTIME = _anthropic_openrouter_provider.Runtime(
     compact_context=lambda body, **kwargs: (
-        _compact_openai_adapter_claude_context_in_anthropic_request_body(body, **kwargs)
+        _aawm_anthropic_body_prep._compact_openai_adapter_claude_context_in_anthropic_request_body(
+            body, **kwargs
+        )
     ),
     log_debug=lambda message, *args: verbose_proxy_logger.debug(message, *args),
     build_responses_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
@@ -7495,7 +7499,9 @@ async def anthropic_proxy_route(  # noqa: PLR0915
             expanded_count,
             hooks,
             billing_header_fields,
-        ) = await _prepare_anthropic_request_body_for_passthrough(request, request_body)
+        ) = await _aawm_anthropic_body_prep._prepare_anthropic_request_body_for_passthrough(
+            request, request_body
+        )
         if prepared_request_body is not request_body:
             _safe_set_request_parsed_body(request, prepared_request_body)
             verbose_proxy_logger.debug(
@@ -10057,22 +10063,6 @@ def _rewrite_grok_native_unsupported_input_items_in_place(request_body):
     return _aawm_codex_tool_policy.rewrite_grok_native_unsupported_input_items_in_place(
         request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
     )
-
-# ---------------------------------------------------------------------------
-# Wave 6E anthropic-body-prep same-object facades
-# ---------------------------------------------------------------------------
-_get_openai_adapter_claude_context_char_cap = _aawm_anthropic_body_prep._get_openai_adapter_claude_context_char_cap
-_detect_openai_adapter_claude_context_markers = _aawm_anthropic_body_prep._detect_openai_adapter_claude_context_markers
-_select_openai_adapter_context_summary_lines = _aawm_anthropic_body_prep._select_openai_adapter_context_summary_lines
-_build_openai_adapter_compacted_claude_context_block = _aawm_anthropic_body_prep._build_openai_adapter_compacted_claude_context_block
-_compact_openai_adapter_claude_context_text = _aawm_anthropic_body_prep._compact_openai_adapter_claude_context_text
-_compact_openai_adapter_claude_context_value = _aawm_anthropic_body_prep._compact_openai_adapter_claude_context_value
-_add_openai_adapter_claude_context_compaction_logging_metadata = _aawm_anthropic_body_prep._add_openai_adapter_claude_context_compaction_logging_metadata
-_compact_openai_adapter_claude_context_in_anthropic_request_body = _aawm_anthropic_body_prep._compact_openai_adapter_claude_context_in_anthropic_request_body
-_validate_anthropic_tool_blocks_for_passthrough = _aawm_anthropic_body_prep._validate_anthropic_tool_blocks_for_passthrough
-_repair_anthropic_tool_use_ids_for_passthrough = _aawm_anthropic_body_prep._repair_anthropic_tool_use_ids_for_passthrough
-_prepare_anthropic_request_body_for_passthrough = _aawm_anthropic_body_prep._prepare_anthropic_request_body_for_passthrough
-
 
 # ---------------------------------------------------------------------------
 # Wave 6E anthropic-body-prep runtime configuration

@@ -34,6 +34,10 @@ from litellm.proxy.aawm_route_logging import (
     flush_aawm_route_rollups,
 )
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep import (
+    _compact_openai_adapter_claude_context_in_anthropic_request_body,
+    _prepare_anthropic_request_body_for_passthrough,
+)
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     _add_anthropic_auto_agent_alias_metadata,
@@ -67,7 +71,6 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _collect_responses_response_from_stream,
     _raise_codex_auto_agent_failed_responses_payload,
     _compact_google_adapter_persisted_output_in_anthropic_request_body,
-    _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _classify_codex_auto_agent_retryable_exhaustion,
     _codex_auto_agent_request_has_continuation_state,
     _classify_auto_agent_alias_terminal_activity_status,
@@ -200,7 +203,6 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
     _log_grok_forward_header_compare,
-    _prepare_anthropic_request_body_for_passthrough,
     _prepare_anthropic_context_1m_native_passthrough,
     _prepare_grok_request_body_for_passthrough,
     _prepare_request_body_for_passthrough_observability,
@@ -11603,7 +11605,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_codex_auth_headers",
@@ -11699,7 +11701,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
@@ -11779,7 +11781,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
@@ -12177,7 +12179,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
@@ -12230,7 +12232,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_valid_local_google_oauth_access_token",
@@ -12286,7 +12288,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
@@ -12375,7 +12377,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
@@ -12465,7 +12467,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
@@ -12562,7 +12564,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
@@ -12669,7 +12671,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
@@ -12778,7 +12780,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
@@ -12889,7 +12891,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_openrouter_api_key",
@@ -12967,7 +12969,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
@@ -13062,7 +13064,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
@@ -13131,7 +13133,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
@@ -13207,7 +13209,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_anthropic_adapter_nvidia_api_key",
@@ -13281,7 +13283,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
@@ -13411,7 +13413,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
@@ -13485,7 +13487,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
@@ -13568,7 +13570,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_codex_auth_headers",
@@ -13679,7 +13681,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_codex_auth_headers",
@@ -13747,7 +13749,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_codex_auth_headers",
@@ -13836,7 +13838,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
@@ -14161,7 +14163,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
@@ -14215,7 +14217,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
@@ -14269,7 +14271,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
@@ -14359,7 +14361,7 @@ class TestClaudePersistedOutputExpansion:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
             new=AsyncMock(return_value=request_body),
         ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
             new=AsyncMock(return_value=(request_body, 0, set(), {})),
         ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.is_streaming_request_fn",
@@ -22342,7 +22344,7 @@ async def test_anthropic_proxy_route_uses_auto_alias_only_on_anthropic_messages(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(return_value=body),
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+        "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
         new=AsyncMock(return_value=(body, 0, set(), {})),
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_auto_agent_alias_route",
@@ -22376,7 +22378,7 @@ async def test_anthropic_proxy_route_aawm_read_alias_applies_read_guidance(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(return_value=body),
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+        "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
         new=AsyncMock(return_value=(body, 0, set(), {})),
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_auto_agent_alias_route",
@@ -22436,7 +22438,7 @@ async def test_anthropic_proxy_route_routes_all_oa_xai_models_to_responses_adapt
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(return_value=body),
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+        "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
         new=AsyncMock(return_value=(body, 0, set(), {})),
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_completion_adapter_route",
@@ -22476,7 +22478,7 @@ async def test_anthropic_proxy_route_routes_opencode_zen_model_to_responses_adap
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(return_value=body),
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+        "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
         new=AsyncMock(return_value=(body, 0, set(), {})),
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_opencode_zen_responses_adapter_route",
@@ -22515,7 +22517,7 @@ async def test_anthropic_proxy_route_routes_grok_native_models_to_responses_adap
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(return_value=body),
     ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_anthropic_request_body_for_passthrough",
+        "litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep._prepare_anthropic_request_body_for_passthrough",
         new=AsyncMock(return_value=(body, 0, set(), {})),
     ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route",
