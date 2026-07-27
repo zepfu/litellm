@@ -1805,11 +1805,11 @@ class TestWave6ERequestPolicyOwnership:
         assert len(seen) == 76
         assert not duplicates
 
-    # Same-object facades: these must NOT be FunctionDefs in the god module.
-    # 14 claude_prompt_replacement + 11 anthropic_body_prep + 9 pure codex.
+    # Same-object facades still on god module: these must NOT be FunctionDefs.
+    # 11 anthropic_body_prep + 9 pure codex.
+    # (14 claude_prompt_replacement symbols were removed from the god module.)
     WAVE6E_SAME_OBJECT_SYMBOLS: set[str] = (
-        WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS
-        | WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS
+        WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS
         | {
             "_get_openai_tool_name",
             "_get_openai_tool_type",
@@ -1830,7 +1830,7 @@ class TestWave6ERequestPolicyOwnership:
     )
 
     def test_same_object_facades_not_function_defs(self):
-        """34 same-object facades must not be FunctionDefs in the god module."""
+        """20 same-object facades must not be FunctionDefs in the god module."""
         func_defs = _top_level_function_defs(_parse_god_module())
         violations = self.WAVE6E_SAME_OBJECT_SYMBOLS & func_defs
         assert not violations, (
@@ -1847,20 +1847,38 @@ class TestWave6ERequestPolicyOwnership:
         )
 
     def test_all_wave6e_symbols_accessible(self):
-        """All 76 Wave 6E symbols are callable on the god module."""
-        for symbol in ALL_WAVE6E_FUNCTIONS:
+        """62 symbols callable on god module; 14 claude_prompt_replacement
+        symbols callable on their module and absent from the god module."""
+        claude_symbols = WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS
+        god_symbols = ALL_WAVE6E_FUNCTIONS - claude_symbols
+        for symbol in god_symbols:
             facade = getattr(lpe, symbol, None)
             assert facade is not None, f"{symbol} not on god module"
             assert callable(facade), f"{symbol} not callable"
+        mod = importlib.import_module(
+            WAVE6E_MODULE_IMPORT_PATHS["claude_prompt_replacement"]
+        )
+        for symbol in claude_symbols:
+            module_fn = getattr(mod, symbol, None)
+            assert module_fn is not None, (
+                f"{symbol} not on claude_prompt_replacement module"
+            )
+            assert callable(module_fn), f"{symbol} not callable on module"
+            assert not hasattr(lpe, symbol), (
+                f"{symbol} should be absent from god module"
+            )
 
-    def test_claude_prompt_replacement_same_object_identity(self):
-        """claude_prompt_replacement facades are same-object assignments."""
+    def test_claude_prompt_replacement_absent_from_god_module(self):
+        """14 claude_prompt_replacement symbols are absent from god module
+        and callable on aawm_request_policy.claude_prompt_replacement."""
         mod = importlib.import_module(WAVE6E_MODULE_IMPORT_PATHS["claude_prompt_replacement"])
         for symbol in WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS:
-            facade = getattr(lpe, symbol)
             module_fn = getattr(mod, symbol)
-            assert facade is module_fn, (
-                f"claude_prompt_replacement.{symbol}: facade identity mismatch"
+            assert callable(module_fn), (
+                f"claude_prompt_replacement.{symbol}: not callable on module"
+            )
+            assert not hasattr(lpe, symbol), (
+                f"claude_prompt_replacement.{symbol}: still present on god module"
             )
 
     def test_anthropic_body_prep_same_object_identity(self):

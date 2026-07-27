@@ -332,7 +332,6 @@ from .aawm_request_policy import alias_guidance as _aawm_alias_guidance
 from .aawm_request_policy import observability_metadata as _aawm_observability_metadata
 from .aawm_request_policy import persisted_output as _aawm_persisted_output
 from .aawm_request_policy import codex_tool_policy as _aawm_codex_tool_policy
-from .aawm_request_policy import claude_prompt_replacement as _aawm_claude_prompt_replacement
 from .aawm_request_policy import anthropic_body_prep as _aawm_anthropic_body_prep
 from litellm.llms.anthropic.experimental_pass_through.providers.google import env_policy as _google_env_policy
 from litellm.llms.anthropic.experimental_pass_through.providers.google import context_window as _google_context_window
@@ -10067,26 +10066,6 @@ def _rewrite_grok_native_unsupported_input_items_in_place(request_body):
     return _aawm_codex_tool_policy.rewrite_grok_native_unsupported_input_items_in_place(
         request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
     )
-
-
-# ---------------------------------------------------------------------------
-# Wave 6E claude-prompt-replacement same-object facades
-# ---------------------------------------------------------------------------
-_parse_claude_code_version = _aawm_claude_prompt_replacement._parse_claude_code_version
-_resolve_claude_auto_memory_template_path = _aawm_claude_prompt_replacement._resolve_claude_auto_memory_template_path
-_load_claude_context_replacement_template = _aawm_claude_prompt_replacement._load_claude_context_replacement_template
-_load_claude_prompt_patch_manifest = _aawm_claude_prompt_replacement._load_claude_prompt_patch_manifest
-_extract_markdown_section = _aawm_claude_prompt_replacement._extract_markdown_section
-_render_claude_auto_memory_replacement = _aawm_claude_prompt_replacement._render_claude_auto_memory_replacement
-_replace_claude_auto_memory_section_in_text = _aawm_claude_prompt_replacement._replace_claude_auto_memory_section_in_text
-_replace_claude_system_prompt_override_in_value = _aawm_claude_prompt_replacement._replace_claude_system_prompt_override_in_value
-_add_claude_system_prompt_override_logging_metadata = _aawm_claude_prompt_replacement._add_claude_system_prompt_override_logging_metadata
-_replace_claude_system_prompt_in_anthropic_request_body = _aawm_claude_prompt_replacement._replace_claude_system_prompt_in_anthropic_request_body
-_apply_claude_prompt_patches_in_text = _aawm_claude_prompt_replacement._apply_claude_prompt_patches_in_text
-_replace_claude_prompt_patches_in_value = _aawm_claude_prompt_replacement._replace_claude_prompt_patches_in_value
-_add_claude_prompt_patch_logging_metadata = _aawm_claude_prompt_replacement._add_claude_prompt_patch_logging_metadata
-_apply_claude_prompt_patches_to_anthropic_request_body = _aawm_claude_prompt_replacement._apply_claude_prompt_patches_to_anthropic_request_body
-
 
 # ---------------------------------------------------------------------------
 # Wave 6E anthropic-body-prep same-object facades
