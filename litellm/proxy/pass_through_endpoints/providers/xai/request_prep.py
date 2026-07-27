@@ -166,12 +166,20 @@ def build_default_xai_request_prep_runtime(
     sanitize_xai_responses_request_body_in_place: Optional[
         Callable[[Payload], tuple[list[str], list[dict[str, Any]]]]
     ] = None,
+    get_grok_native_oauth_access_token: Optional[
+        Callable[[], Awaitable[str]]
+    ] = None,
 ) -> XAIRequestPrepRuntime:
     """Build production defaults while keeping every host callback explicit."""
 
     if sanitize_xai_responses_request_body_in_place is None:
         sanitize_xai_responses_request_body_in_place = (
             _host_sanitize_xai_responses_request_body_in_place
+        )
+
+    if get_grok_native_oauth_access_token is None:
+        get_grok_native_oauth_access_token = (
+            _get_grok_native_oauth_access_token
         )
 
     return XAIRequestPrepRuntime(
@@ -181,7 +189,7 @@ def build_default_xai_request_prep_runtime(
         resolve_oa_xai_upstream_model=_resolve_oa_xai_upstream_model,
         prepare_oa_xai_request=_prepare_oa_xai_request,
         build_grok_native_oauth_metadata=_build_grok_native_oauth_metadata,
-        get_grok_native_oauth_access_token=_get_grok_native_oauth_access_token,
+        get_grok_native_oauth_access_token=get_grok_native_oauth_access_token,
         get_secret_str=_get_secret_str,
         uuid4=_uuid4,
         _get_model_metadata_entry=get_model_metadata_entry,

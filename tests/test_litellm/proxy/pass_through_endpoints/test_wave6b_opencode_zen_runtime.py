@@ -407,3 +407,107 @@ def test_build_codex_streaming_response_preserves_transport_fields() -> None:
     assert normalized.status_code == 202
     assert normalized.headers["x-provider"] == "opencode"
     assert normalized.media_type == "text/event-stream"
+
+
+
+@pytest.mark.asyncio
+async def test_installed_host_facade_patch_reaches_candidate_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A patch on the host facade must reach _build_opencode_zen_headers.
+
+    After Wave 6B extraction the responses/header path resolves the candidate
+    loader through the runtime's live-host callback. Simulate the god-module
+    ``install(globals())`` facade, then patch the host-bound candidate-key
+    function *after* install (as the alias-failover test does on the god
+    module), and prove the installed ``_build_opencode_zen_headers`` facade
+    observes the patch.
+    """
+    calls: list[dict[str, Any]] = []
+
+    async def _patched_candidate_key(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return "patched-candidate-key"
+
+    # Minimal host globals; install() stores live-lookup lambdas that are only
+    # resolved when the runtime functions are actually invoked.
+    host_globals: dict[str, Any] = {
+        "BaseOpenAIPassThroughHandler": SimpleNamespace(
+            _assemble_headers=lambda *, api_key, request: {
+                "authorization": f"Bearer {api_key}",
+                "api-key": api_key,
+            },
+        ),
+    }
+    zen_runtime.install(host_globals)
+
+    try:
+        # The facade published into the host namespace is the same object as
+        # the runtime module function.
+        assert (
+            host_globals["_build_opencode_zen_headers"]
+            is zen_runtime._build_opencode_zen_headers
+        )
+
+        # Patch *after* install, exactly like the failing alias-failover test
+        # patches the god-module attribute at test time.
+        host_globals["_load_opencode_zen_api_key_for_candidate"] = (
+            _patched_candidate_key
+        )
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/responses",
+                "headers": [],
+                "query_string": b"",
+                "server": ("testserver", 80),
+                "scheme": "http",
+            }
+        )
+
+        headers = await host_globals["_build_opencode_zen_headers"](
+            request,
+            use_alias_candidate_probe=True,
+        )
+
+        assert headers == {
+            "authorization": "Bearer patched-candidate-key",
+            "api-key": "patched-candidate-key",
+        }
+        assert calls == [{"use_alias_candidate_probe": True}]
+    finally:
+        # install() reconfigured the module singleton with a live-host runtime
+        # bound to the throwaway facade dict; restore the autouse fixture's
+        # standalone runtime so later tests are unaffected.
+        zen_runtime.configure_runtime(
+            zen_runtime.Runtime(
+                get_secret_str=lambda name: os.getenv(name),
+                assemble_headers=_assemble_headers,
+                normalize_endpoint_for_target=_normalize_endpoint_for_target,
+                join_url_paths=_join_url_paths,
+                extract_exception_status_code=lambda exc: getattr(
+                    exc, "status_code", None
+                ),
+                extract_exception_detail=lambda exc: getattr(exc, "detail", None),
+                merge_metadata=_merge_metadata,
+                add_route_family_logging_metadata=lambda body, family: {
+                    **body,
+                    "route_family": family,
+                },
+                build_langfuse_span_descriptor=lambda **kwargs: kwargs,
+                normalization_runtime_factory=_normalization_runtime,
+                is_openai_responses_endpoint=lambda endpoint: (
+                    httpx.URL(endpoint).path in {"/responses", "/v1/responses"}
+                ),
+                has_anthropic_responses_adapter_endpoint=lambda endpoint: (
+                    httpx.URL(endpoint).path in {"/messages", "/v1/messages"}
+                ),
+                get_anthropic_adapter_model_candidates=lambda body: [
+                    body["model"]
+                ]
+                if isinstance(body.get("model"), str)
+                else [],
+            )
+        )

@@ -20,7 +20,6 @@ from datetime import datetime, timedelta, timezone
 from inspect import isawaitable  # noqa: F401 - Wave 6A facade host binding
 from pathlib import Path
 from functools import lru_cache
-from importlib.resources import files
 from types import SimpleNamespace
 from typing import (
     Any,
@@ -83,6 +82,7 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 )
 from litellm.llms.xai.oauth import (
     is_oa_xai_model,
+    get_grok_native_oauth_access_token,  # noqa: F401  # compatibility host-global
     normalize_grok_native_oauth_model,
     resolve_oa_xai_upstream_model,
 )
@@ -308,7 +308,7 @@ from .aawm_alias_routing import adapter_config as _aawm_adapter_config
 from .aawm_alias_routing import adapter_driver as _aawm_adapter_driver
 from .aawm_alias_routing import classification as _aawm_alias_classification
 from .aawm_alias_routing import memory as _aawm_alias_memory
-from .aawm_alias_routing import provider_shaping as _aawm_provider_shaping
+from .aawm_alias_routing import provider_shaping as _aawm_provider_shaping  # noqa: F401 - runtime globals() binding
 from .aawm_alias_routing import responses_finalize as _aawm_responses_finalize
 # Compatibility host global for transplanted Google env-policy functions/tests.
 from .aawm_alias_routing import retry as _aawm_alias_retry  # noqa: F401
@@ -327,6 +327,9 @@ from . import aawm_adapter_runtime as _aawm_adapter_runtime
 from .aawm_request_policy import alias_guidance as _aawm_alias_guidance
 from .aawm_request_policy import observability_metadata as _aawm_observability_metadata
 from .aawm_request_policy import persisted_output as _aawm_persisted_output
+from .aawm_request_policy import codex_tool_policy as _aawm_codex_tool_policy
+from .aawm_request_policy import claude_prompt_replacement as _aawm_claude_prompt_replacement
+from .aawm_request_policy import anthropic_body_prep as _aawm_anthropic_body_prep
 from litellm.llms.anthropic.experimental_pass_through.providers.google import env_policy as _google_env_policy
 from litellm.llms.anthropic.experimental_pass_through.providers.google import context_window as _google_context_window
 from litellm.llms.anthropic.experimental_pass_through.providers.google import error_signals as _google_error_signals
@@ -2832,17 +2835,6 @@ _get_google_adapter_followup_subagent_context_text_part_char_cap = _google_env_p
 
 
 _get_google_adapter_followup_allowed_tool_names = _google_env_policy._get_google_adapter_followup_allowed_tool_names
-
-
-def _get_openai_adapter_claude_context_char_cap() -> int:
-    raw_value = _clean_codex_auth_value(os.getenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP"))
-    if raw_value is None:
-        return 1200
-    try:
-        parsed = int(raw_value)
-    except Exception:
-        return 1200
-    return max(256, parsed)
 
 
 def _request_block_has_google_function_response(request_block: dict[str, Any]) -> bool:
@@ -6501,260 +6493,6 @@ _get_google_adapter_followup_persisted_output_char_cap = _google_env_policy._get
 _get_google_adapter_followup_auxiliary_context_char_cap = _google_env_policy._get_google_adapter_followup_auxiliary_context_char_cap
 
 
-def _detect_openai_adapter_claude_context_markers(text: str) -> set[str]:
-    markers: set[str] = set()
-    for marker_text, marker_name in _OPENAI_ADAPTER_CONTEXT_MARKERS:
-        if marker_text in text:
-            markers.add(marker_name)
-    return markers
-
-
-def _select_openai_adapter_context_summary_lines(text: str) -> list[str]:
-    selected: list[str] = []
-    seen: set[str] = set()
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        include_line = (
-            line.startswith("SubagentStart hook additional context:")
-            or line.startswith("SubAgentStart hook additional context:")
-            or line.startswith("#")
-            or line.startswith("Contents of ")
-            or line.startswith("You are '")
-            or line.startswith("Codebase and user instructions")
-            or line.startswith("IMPORTANT:")
-        )
-        if not include_line:
-            continue
-        if line in seen:
-            continue
-        selected.append(line)
-        seen.add(line)
-        if len(selected) >= 10:
-            break
-    if selected:
-        return selected
-    return [line.strip() for line in text.splitlines() if line.strip()][:4]
-
-
-def _build_openai_adapter_compacted_claude_context_block(
-    *,
-    original_block: str,
-    markers: set[str],
-    cap: int,
-) -> str:
-    marker_text = ", ".join(sorted(markers)) or "unknown"
-    heading = (
-        "[OpenAI adapter compacted Claude Code context block "
-        f"from {len(original_block)} chars. Markers: {marker_text}. "
-        "The current child task, tool schemas, and latest user instructions remain authoritative.]"
-    )
-    summary_budget = max(0, cap - len(heading) - 64)
-    summary_text = "\n".join(_select_openai_adapter_context_summary_lines(original_block)).strip()
-    if len(summary_text) > summary_budget:
-        summary_text = summary_text[:summary_budget].rstrip()
-    if summary_text:
-        body = f"{heading}\n{summary_text}"
-    else:
-        body = heading
-    return f"<system-reminder>\n{body}\n</system-reminder>\n"
-
-
-def _compact_openai_adapter_claude_context_text(
-    text: str,
-    *,
-    cap: Optional[int] = None,
-) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
-    effective_cap = cap or _get_openai_adapter_claude_context_char_cap()
-    updated_text = text
-    compacted_count = 0
-    combined_markers: set[str] = set()
-    metadata_items: list[dict[str, Any]] = []
-
-    spans = _aawm_provider_shaping.iter_delimited_spans(
-        text,
-        "<system-reminder>",
-        "</system-reminder>",
-    )
-    for span in reversed(spans):
-        reminder_block = text[span.start : span.end]
-        markers = _detect_openai_adapter_claude_context_markers(reminder_block)
-        if not markers or len(reminder_block) <= effective_cap:
-            continue
-
-        compacted_block = _build_openai_adapter_compacted_claude_context_block(
-            original_block=reminder_block,
-            markers=markers,
-            cap=effective_cap,
-        )
-        updated_text = updated_text[: span.start] + compacted_block + updated_text[span.end :]
-        compacted_count += 1
-        combined_markers.update(markers)
-        metadata_items.append(
-            {
-                "markers": sorted(markers),
-                "original_chars": len(reminder_block),
-                "kept_chars": len(compacted_block),
-                "mode": "system_reminder_context_cap",
-            }
-        )
-
-    metadata_items.reverse()
-    return updated_text, compacted_count, combined_markers, metadata_items
-
-
-def _compact_openai_adapter_claude_context_value(
-    value: Any,
-    *,
-    cap: Optional[int] = None,
-) -> Tuple[Any, int, set[str], list[dict[str, Any]]]:
-    if isinstance(value, str):
-        return _compact_openai_adapter_claude_context_text(value, cap=cap)
-
-    if isinstance(value, dict):
-        updated_dict: dict[str, Any] = {}
-        compacted_count = 0
-        markers: set[str] = set()
-        metadata_items: list[dict[str, Any]] = []
-        changed = False
-        for key, child in value.items():
-            (
-                updated_child,
-                child_count,
-                child_markers,
-                child_metadata,
-            ) = _compact_openai_adapter_claude_context_value(child, cap=cap)
-            updated_dict[key] = updated_child
-            compacted_count += child_count
-            markers.update(child_markers)
-            metadata_items.extend(child_metadata)
-            changed = changed or updated_child != child
-        if changed:
-            return updated_dict, compacted_count, markers, metadata_items
-        return value, compacted_count, markers, metadata_items
-
-    if isinstance(value, list):
-        updated_list: list[Any] = []
-        compacted_count = 0
-        list_markers: set[str] = set()
-        list_metadata_items: list[dict[str, Any]] = []
-        changed = False
-        for child in value:
-            (
-                updated_child,
-                child_count,
-                child_markers,
-                child_metadata,
-            ) = _compact_openai_adapter_claude_context_value(child, cap=cap)
-            updated_list.append(updated_child)
-            compacted_count += child_count
-            list_markers.update(child_markers)
-            list_metadata_items.extend(child_metadata)
-            changed = changed or updated_child != child
-        if changed:
-            return updated_list, compacted_count, list_markers, list_metadata_items
-        return value, compacted_count, list_markers, list_metadata_items
-
-    return value, 0, set(), []
-
-
-def _add_openai_adapter_claude_context_compaction_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    compacted_count: int,
-    markers: set[str],
-    metadata_items: list[dict[str, Any]],
-    span_started_at: datetime,
-    tag_prefix: str = "openai-adapter",
-    metadata_prefix: str = "openai_adapter",
-    span_name: str = "openai_adapter.claude_context_compaction",
-) -> dict[str, Any]:
-    original_chars = sum(
-        item.get("original_chars", 0) for item in metadata_items if isinstance(item.get("original_chars"), int)
-    )
-    compacted_chars = sum(
-        item.get("kept_chars", 0) for item in metadata_items if isinstance(item.get("kept_chars"), int)
-    )
-    sorted_markers = sorted(markers)
-    tags = [
-        f"{tag_prefix}-claude-context-compacted",
-        *[f"{tag_prefix}-claude-context:{marker}" for marker in sorted_markers],
-    ]
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags,
-        extra_fields={
-            f"{metadata_prefix}_claude_context_compacted": True,
-            f"{metadata_prefix}_claude_context_compacted_count": compacted_count,
-            f"{metadata_prefix}_claude_context_markers": sorted_markers,
-            f"{metadata_prefix}_claude_context_original_chars": original_chars,
-            f"{metadata_prefix}_claude_context_compacted_chars": compacted_chars,
-            f"{metadata_prefix}_claude_context_saved_chars": max(0, original_chars - compacted_chars),
-            f"{metadata_prefix}_claude_context_compaction_events": metadata_items,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name=span_name,
-                    metadata={
-                        "compacted_count": compacted_count,
-                        "markers": sorted_markers,
-                        "original_chars": original_chars,
-                        "compacted_chars": compacted_chars,
-                        "saved_chars": max(0, original_chars - compacted_chars),
-                    },
-                    start_time=span_started_at,
-                    end_time=datetime.now(timezone.utc),
-                )
-            ],
-        },
-    )
-
-
-def _compact_openai_adapter_claude_context_in_anthropic_request_body(
-    request_body: dict[str, Any],
-    *,
-    tag_prefix: str = "openai-adapter",
-    metadata_prefix: str = "openai_adapter",
-    span_name: str = "openai_adapter.claude_context_compaction",
-) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
-    span_started_at = datetime.now(timezone.utc)
-    updated_body = dict(request_body)
-    compacted_count = 0
-    markers: set[str] = set()
-    metadata_items: list[dict[str, Any]] = []
-    changed = False
-
-    for top_level_key in ("system", "messages"):
-        if top_level_key not in request_body:
-            continue
-        (
-            updated_value,
-            value_count,
-            value_markers,
-            value_metadata,
-        ) = _compact_openai_adapter_claude_context_value(request_body[top_level_key])
-        if value_count > 0:
-            updated_body[top_level_key] = updated_value
-            compacted_count += value_count
-            markers.update(value_markers)
-            metadata_items.extend(value_metadata)
-            changed = True
-
-    if not changed:
-        return request_body, 0, set(), []
-
-    updated_body = _add_openai_adapter_claude_context_compaction_logging_metadata(
-        updated_body,
-        compacted_count=compacted_count,
-        markers=markers,
-        metadata_items=metadata_items,
-        span_started_at=span_started_at,
-        tag_prefix=tag_prefix,
-        metadata_prefix=metadata_prefix,
-        span_name=span_name,
-    )
-    return updated_body, compacted_count, markers, metadata_items
-
 def _is_anthropic_web_search_tool(value: dict[str, Any]) -> bool:
     tool_type = value.get("type")
     tool_name = value.get("name")
@@ -6822,2193 +6560,10 @@ def _sanitize_anthropic_web_search_empty_domain_lists(
     return updated_body, sanitized_count
 
 
-def _patch_codex_spawn_agent_description_text(description: str) -> tuple[str, int]:
-    updated_description = description
-    replacement_count = 0
-    for pattern in _CODEX_SPAWN_AGENT_RESTRICTIVE_DESCRIPTION_PATTERNS:
-        updated_description, count = pattern.subn(
-            _CODEX_SPAWN_AGENT_FANOUT_POLICY,
-            updated_description,
-            count=1,
-        )
-        replacement_count += count
-    return updated_description, replacement_count
-
-
-def _get_codex_core_tool_guidance(tool_name: Optional[str]) -> Optional[str]:
-    normalized_tool_name = _normalize_low_cardinality_tag_value(tool_name)
-    if not normalized_tool_name:
-        return None
-    return _CODEX_CORE_TOOL_GUIDANCE_BY_NAME.get(normalized_tool_name)
-
-
-def _append_codex_core_tool_guidance_to_description(
-    description: Any,
-    *,
-    guidance: str,
-) -> tuple[str, bool]:
-    existing_description = description if isinstance(description, str) else ""
-    if guidance in existing_description:
-        return existing_description, False
-    if not existing_description.strip():
-        return guidance, True
-    return f"{existing_description.rstrip()}\n\n{guidance}", True
-
-
-def _patch_codex_spawn_agent_payload_parameters(
-    parameters: Any,
-) -> tuple[Any, list[str], list[str]]:
-    if parameters is None:
-        updated_parameters: dict[str, Any] = {
-            "type": "object",
-            "properties": {},
-        }
-    elif isinstance(parameters, dict):
-        updated_parameters = copy.deepcopy(parameters)
-        if "type" not in updated_parameters:
-            updated_parameters["type"] = "object"
-    else:
-        return parameters, [], []
-
-    properties = updated_parameters.get("properties")
-    if not isinstance(properties, dict):
-        properties = {}
-    else:
-        properties = dict(properties)
-
-    removed_fields: list[str] = []
-    if "fork_context" in properties:
-        properties.pop("fork_context")
-        removed_fields.append("fork_context")
-
-    added_fields: list[str] = []
-    for field_name in _CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER:
-        if field_name in properties:
-            continue
-        properties[field_name] = copy.deepcopy(_CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS[field_name])
-        added_fields.append(field_name)
-
-    required = updated_parameters.get("required")
-    if isinstance(required, list) and "fork_context" in required:
-        updated_parameters["required"] = [field_name for field_name in required if field_name != "fork_context"]
-
-    if not added_fields and not removed_fields:
-        return parameters, [], []
-
-    updated_parameters["properties"] = properties
-    return updated_parameters, added_fields, removed_fields
-
-
-def _get_openai_tool_name(tool: dict[str, Any]) -> Optional[str]:
-    name = tool.get("name")
-    if isinstance(name, str) and name.strip():
-        return name.strip()
-    function = tool.get("function")
-    if isinstance(function, dict):
-        function_name = function.get("name")
-        if isinstance(function_name, str) and function_name.strip():
-            return function_name.strip()
-    return None
-
-
-def _get_openai_tool_type(tool: dict[str, Any]) -> Optional[str]:
-    tool_type = tool.get("type")
-    if isinstance(tool_type, str) and tool_type.strip():
-        return tool_type.strip()
-    return None
-
-
-@lru_cache(maxsize=1)
-def _load_bundled_model_cost_map_for_codex_policy() -> dict[str, Any]:
-    try:
-        content = (
-            files("litellm")
-            .joinpath("bundled_model_prices_and_context_window_fallback.json")
-            .read_text(encoding="utf-8")
-        )
-        loaded = json.loads(content)
-        if isinstance(loaded, dict):
-            return loaded
-    except Exception:
-        return {}
-    return {}
-
-
-def _get_codex_tool_policy_model_cost_candidates(model: Any) -> list[str]:
-    if not isinstance(model, str) or not model.strip():
-        return []
-
-    model_name = model.strip()
-    split_model_name = model_name.split("/", 1)[1] if "/" in model_name else model_name
-    candidates = [
-        model_name,
-        model_name.lower(),
-        split_model_name,
-        split_model_name.lower(),
-        f"chatgpt/{split_model_name}",
-        f"chatgpt/{split_model_name.lower()}",
-        f"openai/{split_model_name}",
-        f"openai/{split_model_name.lower()}",
-    ]
-    grok_native_model = normalize_grok_native_oauth_model(model_name)
-    if grok_native_model is not None:
-        candidates.extend(
-            [
-                f"xai/{grok_native_model}",
-                f"xai/{grok_native_model.lower()}",
-            ]
-        )
-    if is_oa_xai_model(model_name):
-        try:
-            xai_oauth_upstream_model = resolve_oa_xai_upstream_model(model_name)
-            candidates.extend(
-                [
-                    xai_oauth_upstream_model,
-                    xai_oauth_upstream_model.lower(),
-                ]
-            )
-        except Exception:
-            pass
-
-    unique_candidates: list[str] = []
-    for candidate in candidates:
-        if candidate not in unique_candidates:
-            unique_candidates.append(candidate)
-    return unique_candidates
-
-
-def _get_unsupported_hosted_tool_types_for_model(model: Any) -> set[str]:
-    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
-    if not candidate_model_cost_keys:
-        return set()
-
-    model_cost_sources = [
-        litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_policy(),
-    ]
-    for model_cost in model_cost_sources:
-        for key in candidate_model_cost_keys:
-            model_info = model_cost.get(key)
-            if not isinstance(model_info, dict):
-                continue
-
-            unsupported_tools = model_info.get(_CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD)
-            if not isinstance(unsupported_tools, list):
-                continue
-
-            return {
-                normalized for value in unsupported_tools if (normalized := _normalize_low_cardinality_tag_value(value))
-            }
-
-    return set()
-
-
-def _get_unsupported_request_param_names_for_model(model: Any) -> set[str]:
-    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
-    if not candidate_model_cost_keys:
-        return set()
-
-    model_cost_sources = [
-        litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_policy(),
-    ]
-    for model_cost in model_cost_sources:
-        for key in candidate_model_cost_keys:
-            model_info = model_cost.get(key)
-            if not isinstance(model_info, dict):
-                continue
-
-            unsupported_params = model_info.get(_CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD)
-            if not isinstance(unsupported_params, list):
-                continue
-
-            return {
-                normalized
-                for value in unsupported_params
-                if (normalized := _normalize_low_cardinality_tag_value(value))
-            }
-
-    return set()
-
-
-def _get_unsupported_input_item_types_for_model(model: Any) -> set[str]:
-    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
-    if not candidate_model_cost_keys:
-        return set()
-
-    model_cost_sources = [
-        litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_policy(),
-    ]
-    for model_cost in model_cost_sources:
-        for key in candidate_model_cost_keys:
-            model_info = model_cost.get(key)
-            if not isinstance(model_info, dict):
-                continue
-
-            unsupported_input_item_types = model_info.get(_CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD)
-            if not isinstance(unsupported_input_item_types, list):
-                continue
-
-            return {
-                normalized
-                for value in unsupported_input_item_types
-                if (normalized := _normalize_low_cardinality_tag_value(value))
-            }
-
-    return set()
-
-
-def _get_rewrite_input_item_types_for_model(model: Any) -> set[str]:
-    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
-    if not candidate_model_cost_keys:
-        return set()
-
-    model_cost_sources = [
-        litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_policy(),
-    ]
-    for model_cost in model_cost_sources:
-        for key in candidate_model_cost_keys:
-            model_info = model_cost.get(key)
-            if not isinstance(model_info, dict):
-                continue
-
-            rewrite_input_item_types = model_info.get(_CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD)
-            if not isinstance(rewrite_input_item_types, list):
-                continue
-
-            return {
-                normalized
-                for value in rewrite_input_item_types
-                if (normalized := _normalize_low_cardinality_tag_value(value))
-            }
-
-    return set()
-
-
-def _get_custom_tool_function_adapter_names_for_model(model: Any) -> set[str]:
-    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
-    if not candidate_model_cost_keys:
-        return set()
-
-    model_cost_sources = [
-        litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_policy(),
-    ]
-    for model_cost in model_cost_sources:
-        for key in candidate_model_cost_keys:
-            model_info = model_cost.get(key)
-            if not isinstance(model_info, dict):
-                continue
-
-            adapter_names = model_info.get(_CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD)
-            if not isinstance(adapter_names, list):
-                continue
-
-            return {
-                normalized for value in adapter_names if (normalized := _normalize_low_cardinality_tag_value(value))
-            }
-
-    return set()
-
-
-def _get_namespace_tool_function_adapter_names_for_model(
-    model: Any,
-) -> dict[str, set[str]]:
-    candidate_model_cost_keys = _get_codex_tool_policy_model_cost_candidates(model)
-    if not candidate_model_cost_keys:
-        return {}
-
-    model_cost_sources = [
-        litellm.model_cost,
-        _load_bundled_model_cost_map_for_codex_policy(),
-    ]
-    for model_cost in model_cost_sources:
-        for key in candidate_model_cost_keys:
-            model_info = model_cost.get(key)
-            if not isinstance(model_info, dict):
-                continue
-
-            configured_adapters = model_info.get(_CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD)
-            if not isinstance(configured_adapters, dict):
-                continue
-
-            normalized_adapters: dict[str, set[str]] = {}
-            for namespace, tool_names in configured_adapters.items():
-                normalized_namespace = _normalize_low_cardinality_tag_value(namespace)
-                if normalized_namespace is None or not isinstance(tool_names, list):
-                    continue
-                normalized_names = {
-                    normalized for value in tool_names if (normalized := _normalize_low_cardinality_tag_value(value))
-                }
-                if normalized_names:
-                    normalized_adapters[normalized_namespace] = normalized_names
-            return normalized_adapters
-
-    return {}
-
-
-def _adapted_custom_tool_function_schema(
-    tool: dict[str, Any],
-    *,
-    tool_name: str,
-) -> dict[str, Any]:
-    adapted_tool: dict[str, Any] = {
-        "type": "function",
-        "name": tool_name,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "input": {
-                    "type": "string",
-                    "description": (
-                        "Raw input for the client-hosted custom tool. For "
-                        "apply_patch this must be the complete patch text."
-                    ),
-                }
-            },
-            "required": ["input"],
-            "additionalProperties": False,
-        },
-    }
-    description = tool.get("description")
-    if isinstance(description, str) and description.strip():
-        adapted_tool["description"] = description
-    return adapted_tool
-
-
-def _adapt_codex_custom_tool_definitions(
-    tools: Any,
-    *,
-    adapter_names: set[str],
-) -> tuple[Optional[list[Any]], list[dict[str, Any]]]:
-    if not isinstance(tools, list):
-        return None, []
-
-    updated_tools: list[Any] = []
-    adapted_tools: list[dict[str, Any]] = []
-    for index, tool in enumerate(tools):
-        if not isinstance(tool, dict):
-            updated_tools.append(tool)
-            continue
-        tool_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
-        tool_name = _normalize_low_cardinality_tag_value(_get_openai_tool_name(tool))
-        if tool_type != "custom" or tool_name not in adapter_names:
-            updated_tools.append(tool)
-            continue
-        updated_tools.append(
-            _adapted_custom_tool_function_schema(
-                tool,
-                tool_name=tool_name,
-            )
-        )
-        adapted_tools.append(
-            {
-                "name": tool_name,
-                "tool_index": index,
-            }
-        )
-    return updated_tools, adapted_tools
-
-
-def _adapted_custom_tool_call_ids(
-    input_items: Any,
-    *,
-    adapter_names: set[str],
-) -> set[str]:
-    if not isinstance(input_items, list):
-        return set()
-
-    adapted_call_ids: set[str] = set()
-    for item in input_items:
-        if not isinstance(item, dict) or item.get("type") != "custom_tool_call":
-            continue
-        item_name = _normalize_low_cardinality_tag_value(item.get("name"))
-        call_id = item.get("call_id")
-        if item_name in adapter_names and isinstance(call_id, str) and call_id.strip():
-            adapted_call_ids.add(call_id.strip())
-    return adapted_call_ids
-
-
-def _adapt_codex_custom_tool_input_items(
-    input_items: Any,
-    *,
-    adapter_names: set[str],
-) -> tuple[Optional[list[Any]], list[dict[str, Any]]]:
-    adapted_call_ids = _adapted_custom_tool_call_ids(
-        input_items,
-        adapter_names=adapter_names,
-    )
-    if not isinstance(input_items, list) or not adapted_call_ids:
-        return None, []
-
-    updated_input_items: list[Any] = []
-    adapted_input_items: list[dict[str, Any]] = []
-    for index, item in enumerate(input_items):
-        if not isinstance(item, dict):
-            updated_input_items.append(item)
-            continue
-
-        item_type = item.get("type")
-        call_id = item.get("call_id")
-        normalized_call_id = call_id.strip() if isinstance(call_id, str) and call_id.strip() else None
-        if item_type == "custom_tool_call":
-            item_name = _normalize_low_cardinality_tag_value(item.get("name"))
-            raw_input = item.get("input")
-            if item_name in adapter_names and normalized_call_id in adapted_call_ids and isinstance(raw_input, str):
-                adapted_item = dict(item)
-                adapted_item["type"] = "function_call"
-                adapted_item["arguments"] = json.dumps(
-                    {"input": raw_input},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                adapted_item.pop("input", None)
-                updated_input_items.append(adapted_item)
-                adapted_input_items.append(
-                    {
-                        "type": item_type,
-                        "name": item_name,
-                        "input_index": index,
-                    }
-                )
-                continue
-        elif item_type == "custom_tool_call_output" and normalized_call_id in adapted_call_ids:
-            adapted_item = dict(item)
-            adapted_item["type"] = "function_call_output"
-            updated_input_items.append(adapted_item)
-            adapted_input_items.append(
-                {
-                    "type": item_type,
-                    "input_index": index,
-                }
-            )
-            continue
-
-        updated_input_items.append(item)
-    return updated_input_items, adapted_input_items
-
-
-def _adapt_codex_custom_tool_choice(
-    tool_choice: Any,
-    *,
-    adapter_names: set[str],
-) -> tuple[Any, bool]:
-    if not isinstance(tool_choice, dict):
-        return tool_choice, False
-    tool_choice_type = _normalize_low_cardinality_tag_value(tool_choice.get("type"))
-    tool_choice_name = _normalize_low_cardinality_tag_value(tool_choice.get("name"))
-    if tool_choice_type != "custom" or tool_choice_name not in adapter_names:
-        return tool_choice, False
-    return (
-        {
-            **tool_choice,
-            "type": "function",
-            "name": tool_choice_name,
-        },
-        True,
-    )
-
-
-def _add_codex_custom_tool_function_adapter_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    adapted_tools: list[dict[str, Any]],
-    adapted_input_items: list[dict[str, Any]],
-    adapted_tool_choice: bool,
-) -> dict[str, Any]:
-    adapted_names = _dedupe_sorted_str_list(
-        [str(item["name"]) for item in adapted_tools if isinstance(item.get("name"), str)]
-    )
-    updated_body = _merge_litellm_metadata(
-        request_body,
-        tags_to_add=[
-            "codex-custom-tool-function-adapted",
-            *(f"codex-custom-tool-function:{name}" for name in adapted_names),
-        ],
-        extra_fields={
-            "codex_custom_tool_function_adapter_count": len(adapted_tools),
-            "codex_custom_tool_function_adapter_names": adapted_names,
-            "codex_custom_tool_function_adapter_tools": adapted_tools,
-            "codex_custom_tool_function_adapter_input_item_count": len(adapted_input_items),
-            "codex_custom_tool_function_adapter_input_items": adapted_input_items,
-            "codex_custom_tool_function_adapter_tool_choice": adapted_tool_choice,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="codex.custom_tool_function_adapted",
-                    metadata={
-                        "tool_count": len(adapted_tools),
-                        "tool_names": adapted_names,
-                        "input_item_count": len(adapted_input_items),
-                        "tool_choice_adapted": adapted_tool_choice,
-                    },
-                )
-            ],
-        },
-    )
-    return updated_body
-
-
-def _adapt_codex_custom_tools_to_functions_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    adapter_names = _get_custom_tool_function_adapter_names_for_model(request_body.get("model"))
-    if not adapter_names:
-        return request_body, []
-
-    updated_tools, adapted_tools = _adapt_codex_custom_tool_definitions(
-        request_body.get("tools"),
-        adapter_names=adapter_names,
-    )
-    updated_input_items, adapted_input_items = _adapt_codex_custom_tool_input_items(
-        request_body.get("input"),
-        adapter_names=adapter_names,
-    )
-    updated_tool_choice, adapted_tool_choice = _adapt_codex_custom_tool_choice(
-        request_body.get("tool_choice"),
-        adapter_names=adapter_names,
-    )
-    if not adapted_tools and not adapted_input_items and not adapted_tool_choice:
-        return request_body, []
-
-    updated_body = dict(request_body)
-    if updated_tools is not None and adapted_tools:
-        updated_body["tools"] = updated_tools
-    if updated_input_items is not None and adapted_input_items:
-        updated_body["input"] = updated_input_items
-    if adapted_tool_choice:
-        updated_body["tool_choice"] = updated_tool_choice
-    updated_body = _add_codex_custom_tool_function_adapter_logging_metadata(
-        updated_body,
-        adapted_tools=adapted_tools,
-        adapted_input_items=adapted_input_items,
-        adapted_tool_choice=adapted_tool_choice,
-    )
-    return updated_body, adapted_tools
-
-
-def _adapt_codex_namespace_tool_definitions(
-    tools: Any,
-    *,
-    adapter_names: dict[str, set[str]],
-) -> tuple[
-    Optional[list[Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-]:
-    if not isinstance(tools, list):
-        return None, [], []
-
-    occupied_names = {
-        normalized_name
-        for tool in tools
-        if isinstance(tool, dict)
-        and _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool)) != "namespace"
-        and (normalized_name := _normalize_low_cardinality_tag_value(_get_openai_tool_name(tool)))
-    }
-    updated_tools: list[Any] = []
-    adapted_tools: list[dict[str, Any]] = []
-    skipped_tools: list[dict[str, Any]] = []
-    changed = False
-
-    for tool_index, tool in enumerate(tools):
-        if not isinstance(tool, dict):
-            updated_tools.append(tool)
-            continue
-
-        tool_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
-        namespace = _normalize_low_cardinality_tag_value(_get_openai_tool_name(tool))
-        allowed_names = adapter_names.get(namespace or "")
-        if tool_type != "namespace" or allowed_names is None:
-            updated_tools.append(tool)
-            continue
-
-        changed = True
-        namespace_tools = tool.get("tools")
-        if not isinstance(namespace_tools, list):
-            skipped_tools.append(
-                {
-                    "namespace": namespace,
-                    "tool_index": tool_index,
-                    "reason": "tools_not_list",
-                }
-            )
-            continue
-
-        for child_index, child in enumerate(namespace_tools):
-            skip_detail: dict[str, Any] = {
-                "namespace": namespace,
-                "tool_index": tool_index,
-                "child_index": child_index,
-            }
-            if not isinstance(child, dict):
-                skipped_tools.append({**skip_detail, "reason": "child_not_object"})
-                continue
-
-            child_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(child))
-            child_name = _normalize_low_cardinality_tag_value(_get_openai_tool_name(child))
-            if child_type != "function":
-                skipped_tools.append(
-                    {
-                        **skip_detail,
-                        "name": child_name,
-                        "reason": "child_not_function",
-                    }
-                )
-                continue
-            if child_name not in allowed_names:
-                skipped_tools.append(
-                    {
-                        **skip_detail,
-                        "name": child_name,
-                        "reason": "child_not_configured",
-                    }
-                )
-                continue
-            if not isinstance(child.get("parameters"), dict):
-                skipped_tools.append(
-                    {
-                        **skip_detail,
-                        "name": child_name,
-                        "reason": "parameters_not_object",
-                    }
-                )
-                continue
-            if child_name in occupied_names:
-                skipped_tools.append(
-                    {
-                        **skip_detail,
-                        "name": child_name,
-                        "reason": "name_collision",
-                    }
-                )
-                continue
-
-            adapted_tool: dict[str, Any] = {
-                "type": "function",
-                "name": child_name,
-                "parameters": copy.deepcopy(child["parameters"]),
-            }
-            description = child.get("description")
-            if isinstance(description, str) and description.strip():
-                adapted_tool["description"] = description
-            strict = child.get("strict")
-            if isinstance(strict, bool):
-                adapted_tool["strict"] = strict
-
-            updated_tools.append(adapted_tool)
-            occupied_names.add(child_name)
-            adapted_tools.append(
-                {
-                    "namespace": namespace,
-                    "name": child_name,
-                    "tool_index": tool_index,
-                    "child_index": child_index,
-                }
-            )
-
-    return (updated_tools if changed else None), adapted_tools, skipped_tools
-
-
-def _adapt_codex_namespace_input_items(
-    input_items: Any,
-    *,
-    adapter_names: dict[str, set[str]],
-) -> tuple[Optional[list[Any]], list[dict[str, Any]]]:
-    if not isinstance(input_items, list):
-        return None, []
-
-    updated_items: list[Any] = []
-    adapted_items: list[dict[str, Any]] = []
-    changed = False
-    for input_index, item in enumerate(input_items):
-        if not isinstance(item, dict):
-            updated_items.append(item)
-            continue
-
-        namespace = _normalize_low_cardinality_tag_value(item.get("namespace"))
-        item_name = _normalize_low_cardinality_tag_value(item.get("name"))
-        if (
-            namespace is None
-            or item_name not in adapter_names.get(namespace, set())
-            or item.get("type") not in {"function_call", "custom_tool_call"}
-        ):
-            updated_items.append(item)
-            continue
-
-        adapted_item = dict(item)
-        original_type = adapted_item.get("type")
-        adapted_item.pop("namespace", None)
-        if original_type == "custom_tool_call":
-            raw_input = adapted_item.get("input")
-            if not isinstance(raw_input, str):
-                updated_items.append(item)
-                continue
-            adapted_item["type"] = "function_call"
-            adapted_item["arguments"] = raw_input
-            adapted_item.pop("input", None)
-
-        updated_items.append(adapted_item)
-        adapted_items.append(
-            {
-                "namespace": namespace,
-                "name": item_name,
-                "input_index": input_index,
-                "source_type": original_type,
-            }
-        )
-        changed = True
-
-    return (updated_items if changed else None), adapted_items
-
-
-def _adapt_codex_namespace_tool_choice(
-    tool_choice: Any,
-    *,
-    adapter_names: dict[str, set[str]],
-) -> tuple[Any, Optional[dict[str, str]]]:
-    if not isinstance(tool_choice, dict):
-        return tool_choice, None
-
-    namespace = _normalize_low_cardinality_tag_value(tool_choice.get("namespace"))
-    tool_name = _normalize_low_cardinality_tag_value(tool_choice.get("name"))
-    if namespace is None or tool_name not in adapter_names.get(namespace, set()):
-        return tool_choice, None
-
-    tool_choice_type = _normalize_low_cardinality_tag_value(tool_choice.get("type"))
-    if tool_choice_type not in {"custom", "function"}:
-        return tool_choice, None
-
-    updated_choice = {
-        "type": "function",
-        "function": {"name": tool_name},
-    }
-    return updated_choice, {"namespace": namespace, "name": tool_name}
-
-
-def _add_codex_namespace_tool_function_adapter_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    adapted_tools: list[dict[str, Any]],
-    adapted_input_items: list[dict[str, Any]],
-    adapted_tool_choice: Optional[dict[str, str]],
-    skipped_tools: list[dict[str, Any]],
-) -> dict[str, Any]:
-    adapted_namespaces = _dedupe_sorted_str_list(
-        [str(item["namespace"]) for item in adapted_tools if isinstance(item.get("namespace"), str)]
-    )
-    adapted_names = _dedupe_sorted_str_list(
-        [str(item["name"]) for item in adapted_tools if isinstance(item.get("name"), str)]
-    )
-    tags_to_add = ["codex-namespace-tool-function-adapted"]
-    tags_to_add.extend(f"codex-namespace-tool-function:{namespace}" for namespace in adapted_namespaces)
-    if skipped_tools:
-        tags_to_add.append("codex-namespace-tool-function-skipped")
-
-    span_metadata: dict[str, Any] = {
-        "tool_count": len(adapted_tools),
-        "namespaces": adapted_namespaces,
-        "tool_names": adapted_names,
-        "input_item_count": len(adapted_input_items),
-        "tool_choice_adapted": adapted_tool_choice is not None,
-        "skipped_count": len(skipped_tools),
-    }
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "codex_namespace_tool_function_adapter_count": len(adapted_tools),
-            "codex_namespace_tool_function_adapter_namespaces": adapted_namespaces,
-            "codex_namespace_tool_function_adapter_names": adapted_names,
-            "codex_namespace_tool_function_adapter_tools": adapted_tools,
-            "codex_namespace_tool_function_adapter_input_item_count": len(adapted_input_items),
-            "codex_namespace_tool_function_adapter_input_items": adapted_input_items,
-            "codex_namespace_tool_function_adapter_tool_choice": adapted_tool_choice,
-            "codex_namespace_tool_function_adapter_skipped_count": len(skipped_tools),
-            "codex_namespace_tool_function_adapter_skipped_tools": skipped_tools,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="codex.namespace_tool_function_adapted",
-                    metadata=span_metadata,
-                )
-            ],
-        },
-    )
-
-
-def _adapt_codex_namespace_tools_to_functions_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    adapter_names = _get_namespace_tool_function_adapter_names_for_model(request_body.get("model"))
-    if not adapter_names:
-        return request_body, []
-
-    updated_tools, adapted_tools, skipped_tools = _adapt_codex_namespace_tool_definitions(
-        request_body.get("tools"),
-        adapter_names=adapter_names,
-    )
-    active_adapter_names = adapter_names
-    if isinstance(request_body.get("tools"), list):
-        active_adapter_names = {}
-        for adapted_tool in adapted_tools:
-            namespace = adapted_tool.get("namespace")
-            tool_name = adapted_tool.get("name")
-            if isinstance(namespace, str) and isinstance(tool_name, str):
-                active_adapter_names.setdefault(namespace, set()).add(tool_name)
-    updated_input, adapted_input_items = _adapt_codex_namespace_input_items(
-        request_body.get("input"),
-        adapter_names=active_adapter_names,
-    )
-    updated_tool_choice, adapted_tool_choice = _adapt_codex_namespace_tool_choice(
-        request_body.get("tool_choice"),
-        adapter_names=active_adapter_names,
-    )
-    if updated_tools is None and updated_input is None and adapted_tool_choice is None and not skipped_tools:
-        return request_body, []
-
-    updated_body = dict(request_body)
-    if updated_tools is not None:
-        updated_body["tools"] = updated_tools
-    if updated_input is not None:
-        updated_body["input"] = updated_input
-    if adapted_tool_choice is not None:
-        updated_body["tool_choice"] = updated_tool_choice
-    updated_body = _add_codex_namespace_tool_function_adapter_logging_metadata(
-        updated_body,
-        adapted_tools=adapted_tools,
-        adapted_input_items=adapted_input_items,
-        adapted_tool_choice=adapted_tool_choice,
-        skipped_tools=skipped_tools,
-    )
-    return updated_body, adapted_tools
-
-
-def _openai_tool_choice_references_tool_type(
-    tool_choice: Any,
-    tool_types: set[str],
-) -> bool:
-    if not tool_types:
-        return False
-
-    candidates: list[Any] = []
-    if isinstance(tool_choice, str):
-        candidates.append(tool_choice)
-    elif isinstance(tool_choice, dict):
-        candidates.extend([tool_choice.get("type"), tool_choice.get("name")])
-        function = tool_choice.get("function")
-        if isinstance(function, dict):
-            candidates.append(function.get("name"))
-
-    for candidate in candidates:
-        normalized = _normalize_low_cardinality_tag_value(candidate)
-        if normalized in tool_types:
-            return True
-    return False
-
-
-def _add_codex_unsupported_hosted_tool_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    removed_tools: list[dict[str, Any]],
-    removed_tool_choice: Optional[Any],
-) -> dict[str, Any]:
-    removed_tool_types = _dedupe_sorted_str_list(
-        [tool["type"] for tool in removed_tools if isinstance(tool.get("type"), str) and tool["type"]]
-    )
-    span_metadata: dict[str, Any] = {
-        "removed_count": len(removed_tools),
-        "removed_tool_types": removed_tool_types,
-    }
-    if removed_tool_choice is not None:
-        span_metadata["removed_tool_choice"] = removed_tool_choice
-
-    tags_to_add = ["codex-unsupported-hosted-tool-removed"]
-    tags_to_add.extend(f"codex-unsupported-hosted-tool:{tool_type}" for tool_type in removed_tool_types)
-    if removed_tool_choice is not None:
-        tags_to_add.append("codex-unsupported-hosted-tool-choice-removed")
-
-    extra_fields: dict[str, Any] = {
-        "codex_unsupported_hosted_tool_removed_count": len(removed_tools),
-        "codex_unsupported_hosted_tool_types_removed": removed_tool_types,
-        "codex_unsupported_hosted_tools_removed": removed_tools,
-        "langfuse_spans": [
-            _build_langfuse_span_descriptor(
-                name="codex.unsupported_hosted_tool_removed",
-                metadata=span_metadata,
-            )
-        ],
-    }
-    if removed_tool_choice is not None:
-        extra_fields["codex_unsupported_hosted_tool_choice_removed"] = removed_tool_choice
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
-    )
-
-
-def _request_has_openai_tool_definitions(request_body: dict[str, Any]) -> bool:
-    tools = request_body.get("tools")
-    if not isinstance(tools, list):
-        return False
-
-    for tool in tools:
-        if isinstance(tool, dict) and _get_openai_tool_type(tool):
-            return True
-    return False
-
-
-def _add_tool_choice_without_tools_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    removed_tool_choice: Any,
-) -> dict[str, Any]:
-    span_metadata: dict[str, Any] = {
-        "removed_tool_choice": removed_tool_choice,
-        "reason": "missing_tools",
-    }
-    extracted_tool_choice = _extract_openai_passthrough_tool_choice(removed_tool_choice)
-    if extracted_tool_choice:
-        span_metadata["tool_choice"] = extracted_tool_choice
-
-    tags_to_add = ["xai-tool-choice-without-tools-removed"]
-    if extracted_tool_choice:
-        tags_to_add.append(f"xai-tool-choice-without-tools:{extracted_tool_choice}")
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "xai_tool_choice_without_tools_removed": removed_tool_choice,
-            "xai_tool_choice_without_tools_removed_reason": "missing_tools",
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="xai.tool_choice_without_tools_removed",
-                    metadata=span_metadata,
-                )
-            ],
-        },
-    )
-
-
-def _drop_tool_choice_without_tools_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], Optional[Any]]:
-    if "tool_choice" not in request_body:
-        return request_body, None
-
-    if _request_has_openai_tool_definitions(request_body):
-        return request_body, None
-
-    updated_body = dict(request_body)
-    removed_tool_choice = updated_body.pop("tool_choice", None)
-    updated_body = _add_tool_choice_without_tools_logging_metadata(
-        updated_body,
-        removed_tool_choice=removed_tool_choice,
-    )
-    return updated_body, removed_tool_choice
-
-
-def _add_codex_unsupported_request_param_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    removed_params: list[str],
-) -> dict[str, Any]:
-    normalized_params = _dedupe_sorted_str_list(
-        [normalized for param in removed_params if (normalized := _normalize_low_cardinality_tag_value(param))]
-    )
-    span_metadata: dict[str, Any] = {
-        "removed_count": len(removed_params),
-        "removed_params": normalized_params,
-    }
-    tags_to_add = ["codex-unsupported-request-param-removed"]
-    tags_to_add.extend(f"codex-unsupported-request-param:{param}" for param in normalized_params)
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "codex_unsupported_request_param_removed_count": len(removed_params),
-            "codex_unsupported_request_params_removed": normalized_params,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="codex.unsupported_request_param_removed",
-                    metadata=span_metadata,
-                )
-            ],
-        },
-    )
-
-
-def _drop_unsupported_codex_request_params_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[str]]:
-    unsupported_params = _get_unsupported_request_param_names_for_model(request_body.get("model"))
-    if not unsupported_params:
-        return request_body, []
-
-    def _drop_from_value(
-        value: Any,
-        *,
-        path: tuple[str, ...] = (),
-        _depth: int = 0,
-    ) -> tuple[Any, list[str], bool]:
-        # RR-054 #25: bound recursive walk of untrusted request bodies.
-        if _depth > _AAWM_REQUEST_BODY_WALK_MAX_DEPTH:
-            return value, [], False
-        if isinstance(value, dict):
-            updated_dict: dict[str, Any] = {}
-            removed: list[str] = []
-            changed = False
-            for key, child_value in value.items():
-                normalized_key = _normalize_low_cardinality_tag_value(key)
-                normalized_path = ".".join([*path, normalized_key]) if normalized_key is not None else None
-                if normalized_key in unsupported_params or (normalized_path in unsupported_params):
-                    removed.append(
-                        normalized_path
-                        if normalized_key not in unsupported_params and normalized_path in unsupported_params
-                        else key
-                    )
-                    changed = True
-                    continue
-                updated_child, child_removed, child_changed = _drop_from_value(
-                    child_value,
-                    path=((*path, normalized_key) if normalized_key is not None else path),
-                    _depth=_depth + 1,
-                )
-                updated_dict[key] = updated_child
-                removed.extend(child_removed)
-                changed = changed or child_changed
-            return (updated_dict if changed else value), removed, changed
-
-        if isinstance(value, list):
-            updated_list: list[Any] = []
-            list_removed: list[str] = []
-            changed = False
-            for item in value:
-                updated_item, item_removed, item_changed = _drop_from_value(
-                    item,
-                    path=path,
-                    _depth=_depth + 1,
-                )
-                updated_list.append(updated_item)
-                list_removed.extend(item_removed)
-                changed = changed or item_changed
-            return (updated_list if changed else value), list_removed, changed
-
-        return value, [], False
-
-    updated_value, removed_params, changed = _drop_from_value(request_body)
-    if not removed_params:
-        return request_body, []
-
-    updated_body = updated_value if changed and isinstance(updated_value, dict) else dict(request_body)
-
-    updated_body = _add_codex_unsupported_request_param_logging_metadata(
-        updated_body,
-        removed_params=removed_params,
-    )
-    return updated_body, removed_params
-
-
-def _add_codex_unsupported_input_item_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    removed_items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    removed_item_types = _dedupe_sorted_str_list(
-        [item["type"] for item in removed_items if isinstance(item.get("type"), str) and item["type"]]
-    )
-    span_metadata: dict[str, Any] = {
-        "removed_count": len(removed_items),
-        "removed_item_types": removed_item_types,
-    }
-
-    tags_to_add = ["codex-unsupported-input-item-removed"]
-    tags_to_add.extend(f"codex-unsupported-input-item:{item_type}" for item_type in removed_item_types)
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "codex_unsupported_input_item_removed_count": len(removed_items),
-            "codex_unsupported_input_item_types_removed": removed_item_types,
-            "codex_unsupported_input_items_removed": removed_items,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="codex.unsupported_input_item_removed",
-                    metadata=span_metadata,
-                )
-            ],
-        },
-    )
-
-
-def _drop_unsupported_codex_input_items_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if _normalize_kimi_code_chat_completions_adapter_model_name(request_body.get("model")) is not None:
-        request_body = _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(request_body)
-
-    unsupported_input_item_types = _get_unsupported_input_item_types_for_model(request_body.get("model"))
-    if not unsupported_input_item_types:
-        return request_body, []
-
-    input_items = request_body.get("input")
-    if not isinstance(input_items, list):
-        return request_body, []
-
-    updated_input_items: list[Any] = []
-    removed_items: list[dict[str, Any]] = []
-    for index, item in enumerate(input_items):
-        if not isinstance(item, dict):
-            updated_input_items.append(item)
-            continue
-
-        item_type = _normalize_low_cardinality_tag_value(item.get("type"))
-        if item_type in unsupported_input_item_types:
-            removed_item: dict[str, Any] = {
-                "type": item_type,
-                "index": index,
-            }
-            if item_type == "reasoning" and isinstance(item.get("encrypted_content"), str):
-                removed_item["encrypted_content"] = True
-            removed_items.append(removed_item)
-            continue
-
-        updated_input_items.append(item)
-
-    if not removed_items:
-        return request_body, []
-
-    updated_body = dict(request_body)
-    updated_body["input"] = updated_input_items
-    updated_body = _add_codex_unsupported_input_item_logging_metadata(
-        updated_body,
-        removed_items=removed_items,
-    )
-    return updated_body, removed_items
-
-
-def _stringify_grok_native_input_item_value(value: Any) -> str:
-    return _anthropic_grok_normalization.stringify_input_item_value(value)
-
-
-def _format_grok_native_function_call_input_message(
-    item: dict[str, Any],
-    *,
-    include_correlation_ref: bool = True,
-) -> str:
-    return _anthropic_grok_normalization.format_function_call_input_message(
-        item,
-        include_correlation_ref=include_correlation_ref,
-    )
-
-
-def _format_grok_native_function_call_output_input_message(
-    item: dict[str, Any],
-    *,
-    include_correlation_ref: bool = True,
-) -> str:
-    return _anthropic_grok_normalization.format_function_call_output_input_message(
-        item,
-        include_correlation_ref=include_correlation_ref,
-    )
-
-
-def _rewrite_grok_native_input_item_for_model_input(
-    item: dict[str, Any],
-    *,
-    item_type: str,
-    include_correlation_ref: bool = True,
-) -> Optional[dict[str, Any]]:
-    return _anthropic_grok_normalization.rewrite_input_item_for_model_input(
-        item,
-        item_type=item_type,
-        include_correlation_ref=include_correlation_ref,
-    )
-
-
-def _is_anthropic_grok_native_responses_adapter_body(
-    request_body: dict[str, Any],
-) -> bool:
-    return _anthropic_grok_normalization.is_anthropic_responses_adapter_body(request_body)
-
-
-def _add_grok_native_input_item_rewrite_logging_metadata(
-    request_body: dict[str, Any],
-    *,
-    rewritten_items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return _anthropic_grok_normalization.add_input_item_rewrite_logging_metadata(
-        _get_anthropic_grok_normalization_runtime(),
-        request_body,
-        rewritten_items=rewritten_items,
-    )
-
-
 _rewrite_grok_native_unsupported_input_items_from_request_body = _wave6b_xai_request_prep._rewrite_grok_native_unsupported_input_items_from_request_body
 
 
 _rewrite_grok_native_unsupported_input_items_in_place = _wave6b_xai_request_prep._rewrite_grok_native_unsupported_input_items_in_place
-
-
-def _drop_unsupported_codex_hosted_tools_from_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    unsupported_tool_types = _get_unsupported_hosted_tool_types_for_model(request_body.get("model"))
-    if not unsupported_tool_types:
-        return request_body, []
-
-    tools = request_body.get("tools")
-    if not isinstance(tools, list):
-        return request_body, []
-
-    updated_tools: list[Any] = []
-    removed_tools: list[dict[str, Any]] = []
-    for index, tool in enumerate(tools):
-        if not isinstance(tool, dict):
-            updated_tools.append(tool)
-            continue
-
-        tool_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))
-        if tool_type in unsupported_tool_types:
-            removed_tool: dict[str, Any] = {
-                "type": tool_type,
-                "index": index,
-            }
-            tool_name = _get_openai_tool_name(tool)
-            if tool_name:
-                removed_tool["name"] = tool_name
-            removed_tools.append(removed_tool)
-            continue
-
-        updated_tools.append(tool)
-
-    if not removed_tools:
-        return request_body, []
-
-    updated_body = dict(request_body)
-    updated_body["tools"] = updated_tools
-
-    removed_tool_types = {tool["type"] for tool in removed_tools if isinstance(tool.get("type"), str) and tool["type"]}
-    removed_tool_choice = None
-    if _openai_tool_choice_references_tool_type(
-        updated_body.get("tool_choice"),
-        removed_tool_types,
-    ):
-        removed_tool_choice = updated_body.pop("tool_choice", None)
-
-    updated_body = _add_codex_unsupported_hosted_tool_logging_metadata(
-        updated_body,
-        removed_tools=removed_tools,
-        removed_tool_choice=removed_tool_choice,
-    )
-    return updated_body, removed_tools
-
-
-def _patch_codex_spawn_agent_tool_description(
-    tool: dict[str, Any],
-    *,
-    tool_index: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if _get_openai_tool_name(tool) != _CODEX_SPAWN_AGENT_TOOL_NAME:
-        return tool, []
-
-    updated_tool = tool
-    patch_events: list[dict[str, Any]] = []
-    description_targets: list[tuple[dict[str, Any], str, str]] = [
-        (tool, "description", f"tools.{tool_index}.description")
-    ]
-    function = tool.get("function")
-    if isinstance(function, dict):
-        description_targets.append(
-            (
-                function,
-                "description",
-                f"tools.{tool_index}.function.description",
-            )
-        )
-
-    for container, key, path in description_targets:
-        description = container.get(key)
-        if not isinstance(description, str):
-            continue
-
-        (
-            updated_description,
-            replacement_count,
-        ) = _patch_codex_spawn_agent_description_text(description)
-        if replacement_count == 0 or updated_description == description:
-            continue
-
-        if updated_tool is tool:
-            updated_tool = dict(tool)
-
-        if container is tool:
-            updated_tool[key] = updated_description
-        else:
-            updated_function = dict(container)
-            updated_function[key] = updated_description
-            updated_tool["function"] = updated_function
-
-        patch_events.append(
-            {
-                "id": _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID,
-                "status": "applied",
-                "tool_name": _CODEX_SPAWN_AGENT_TOOL_NAME,
-                "path": path,
-                "occurrences": replacement_count,
-            }
-        )
-
-    parameter_targets: list[tuple[str, str]] = []
-    function = updated_tool.get("function")
-    if isinstance(function, dict):
-        parameter_targets.append(("function", f"tools.{tool_index}.function.parameters"))
-    if "parameters" in updated_tool or not parameter_targets:
-        parameter_targets.append(("tool", f"tools.{tool_index}.parameters"))
-
-    for target_kind, path in parameter_targets:
-        if target_kind == "function":
-            current_function = updated_tool.get("function")
-            if not isinstance(current_function, dict):
-                continue
-            parameters = current_function.get("parameters")
-        else:
-            parameters = updated_tool.get("parameters")
-
-        (
-            updated_parameters,
-            added_fields,
-            removed_fields,
-        ) = _patch_codex_spawn_agent_payload_parameters(parameters)
-        if (not added_fields and not removed_fields) or updated_parameters is parameters:
-            continue
-
-        if updated_tool is tool:
-            updated_tool = dict(tool)
-
-        if target_kind == "function":
-            current_function = updated_tool.get("function")
-            if not isinstance(current_function, dict):
-                continue
-            updated_function = dict(current_function)
-            updated_function["parameters"] = updated_parameters
-            updated_tool["function"] = updated_function
-        else:
-            updated_tool["parameters"] = updated_parameters
-
-        patch_events.append(
-            {
-                "id": _CODEX_SPAWN_AGENT_PAYLOAD_SCHEMA_PATCH_ID,
-                "status": "applied",
-                "tool_name": _CODEX_SPAWN_AGENT_TOOL_NAME,
-                "path": path,
-                "fields_added": added_fields,
-                "fields_removed": removed_fields,
-                "occurrences": 0,
-            }
-        )
-
-    return updated_tool, patch_events
-
-
-def _patch_codex_multi_agent_tool_search_description(
-    tool: dict[str, Any],
-    *,
-    tool_index: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if _normalize_low_cardinality_tag_value(tool.get("type")) != (_CODEX_MULTI_AGENT_TOOL_SEARCH_TYPE):
-        return tool, []
-
-    description = tool.get("description")
-    if not isinstance(description, str):
-        return tool, []
-    if _CODEX_SPAWN_AGENT_FANOUT_POLICY in description:
-        return tool, []
-    if "Multi-agent tools" not in description and "Spawn and manage sub-agents" not in description:
-        return tool, []
-
-    updated_tool = dict(tool)
-    updated_tool["description"] = f"{description.rstrip()}\n\n{_CODEX_SPAWN_AGENT_FANOUT_POLICY}"
-    return updated_tool, [
-        {
-            "id": _CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID,
-            "status": "applied",
-            "tool_name": _CODEX_MULTI_AGENT_TOOL_SEARCH_TYPE,
-            "path": f"tools.{tool_index}.description",
-            "occurrences": 0,
-            "guidance_chars": len(_CODEX_SPAWN_AGENT_FANOUT_POLICY),
-        }
-    ]
-
-
-def _patch_codex_core_tool_description(
-    tool: dict[str, Any],
-    *,
-    tool_index: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    tool_name = _get_openai_tool_name(tool)
-    guidance = _get_codex_core_tool_guidance(tool_name)
-    if guidance is None:
-        return tool, []
-
-    updated_tool = tool
-    patch_events: list[dict[str, Any]] = []
-    description_targets: list[tuple[dict[str, Any], str, str]] = []
-    function = tool.get("function")
-    if isinstance(function, dict):
-        description_targets.append(
-            (
-                function,
-                "description",
-                f"tools.{tool_index}.function.description",
-            )
-        )
-    if "description" in tool or not description_targets:
-        description_targets.append((tool, "description", f"tools.{tool_index}.description"))
-
-    for container, key, path in description_targets:
-        updated_description, changed = _append_codex_core_tool_guidance_to_description(
-            container.get(key),
-            guidance=guidance,
-        )
-        if not changed:
-            continue
-
-        if updated_tool is tool:
-            updated_tool = dict(tool)
-
-        if container is tool:
-            updated_tool[key] = updated_description
-        else:
-            updated_function = dict(container)
-            updated_function[key] = updated_description
-            updated_tool["function"] = updated_function
-
-        normalized_tool_name = _normalize_low_cardinality_tag_value(tool_name) or "unknown"
-        patch_events.append(
-            {
-                "id": f"{_CODEX_CORE_TOOL_GUIDANCE_PATCH_PREFIX}-{normalized_tool_name}",
-                "status": "applied",
-                "tool_name": tool_name,
-                "path": path,
-                "occurrences": 0,
-                "guidance_chars": len(guidance),
-            }
-        )
-
-    return updated_tool, patch_events
-
-
-def _add_codex_tool_description_patch_logging_metadata(
-    request_body: dict[str, Any],
-    patch_events: list[dict[str, Any]],
-) -> dict[str, Any]:
-    patch_ids = _dedupe_sorted_str_list(
-        [event["id"] for event in patch_events if isinstance(event.get("id"), str) and event["id"]]
-    )
-    replacement_count = sum(event["occurrences"] for event in patch_events if isinstance(event.get("occurrences"), int))
-    span_metadata: dict[str, Any] = {
-        "patch_count": len(patch_events),
-        "replacement_count": replacement_count,
-    }
-    if patch_ids:
-        span_metadata["patch_ids"] = patch_ids
-
-    tags_to_add = ["codex-tool-description-patch"]
-    tags_to_add.extend(f"codex-tool-description-patch:{patch_id}" for patch_id in patch_ids)
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "codex_tool_description_patch_count": len(patch_events),
-            "codex_tool_description_patch_replacement_count": replacement_count,
-            "codex_tool_description_patch_ids": patch_ids,
-            "codex_tool_description_patch_events": patch_events,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="codex.tool_description_patch",
-                    metadata=span_metadata,
-                )
-            ],
-        },
-    )
-
-
-def _apply_codex_tool_description_patches_to_request_body(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    tools = request_body.get("tools")
-    if not isinstance(tools, list):
-        return request_body, []
-
-    updated_tools: list[Any] = []
-    patch_events: list[dict[str, Any]] = []
-    changed = False
-    for index, tool in enumerate(tools):
-        if not isinstance(tool, dict):
-            updated_tools.append(tool)
-            continue
-        updated_tool, tool_patch_events = _patch_codex_spawn_agent_tool_description(
-            tool,
-            tool_index=index,
-        )
-        (
-            updated_tool,
-            tool_search_patch_events,
-        ) = _patch_codex_multi_agent_tool_search_description(
-            updated_tool,
-            tool_index=index,
-        )
-        updated_tool, core_tool_patch_events = _patch_codex_core_tool_description(
-            updated_tool,
-            tool_index=index,
-        )
-        updated_tools.append(updated_tool)
-        patch_events.extend(tool_patch_events)
-        patch_events.extend(tool_search_patch_events)
-        patch_events.extend(core_tool_patch_events)
-        if updated_tool is not tool:
-            changed = True
-
-    if not changed or not patch_events:
-        return request_body, []
-
-    updated_body = dict(request_body)
-    updated_body["tools"] = updated_tools
-    updated_body = _add_codex_tool_description_patch_logging_metadata(
-        updated_body,
-        patch_events,
-    )
-    return updated_body, patch_events
-
-
-
-def _parse_claude_code_version(
-    cc_version: Optional[str],
-) -> Optional[tuple[int, int, int]]:
-    if not cc_version:
-        return None
-
-    match = _CLAUDE_CC_VERSION_PATTERN.match(cc_version.strip())
-    if match is None:
-        return None
-
-    return (
-        int(match.group("major")),
-        int(match.group("minor")),
-        int(match.group("patch")),
-    )
-
-
-def _resolve_claude_auto_memory_template_path(
-    cc_version: Optional[str],
-) -> Optional[Path]:
-    parsed_version = _parse_claude_code_version(cc_version)
-    if parsed_version is None:
-        return None
-
-    major, minor, patch = parsed_version
-    min_major, min_minor, min_patch = _CLAUDE_AUTO_MEMORY_MIN_COMPAT_VERSION
-
-    if (major, minor) != (min_major, min_minor):
-        return None
-    if patch < min_patch:
-        return None
-
-    return _CLAUDE_AUTO_MEMORY_TEMPLATE_PATH
-
-
-def _load_claude_context_replacement_template(template_path: Path) -> str:
-    cached_template = _claude_context_replacement_template_cache.get(template_path)
-    if cached_template is not None:
-        return cached_template
-
-    template_text = template_path.read_text(encoding="utf-8").strip()
-    if not template_text:
-        raise ValueError(f"Claude context replacement template is empty: {template_path}")
-
-    cached_template = template_text + "\n"
-    _claude_context_replacement_template_cache[template_path] = cached_template
-    return cached_template
-
-
-def _load_claude_prompt_patch_manifest(template_path: Path) -> dict[str, Any]:
-    cached_manifest = _claude_prompt_patch_manifest_cache.get(template_path)
-    if cached_manifest is not None:
-        return cached_manifest
-
-    manifest = json.loads(template_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Invalid Claude prompt patch manifest: {template_path}")
-
-    patches = manifest.get("patches")
-    if not isinstance(patches, list) or not patches:
-        raise ValueError(f"Claude prompt patch manifest has no patches: {template_path}")
-
-    normalized_patches: list[dict[str, str]] = []
-    for patch_descriptor in patches:
-        if not isinstance(patch_descriptor, dict):
-            raise ValueError(f"Invalid Claude prompt patch descriptor in {template_path}")
-        patch_id = patch_descriptor.get("id")
-        before_text = patch_descriptor.get("before")
-        after_text = patch_descriptor.get("after")
-        if not isinstance(patch_id, str) or not patch_id:
-            raise ValueError(f"Claude prompt patch manifest is missing patch id in {template_path}")
-        if not isinstance(before_text, str) or not before_text:
-            raise ValueError(f"Claude prompt patch manifest is missing before text for {patch_id}")
-        if not isinstance(after_text, str) or not after_text:
-            raise ValueError(f"Claude prompt patch manifest is missing after text for {patch_id}")
-        normalized_patches.append(
-            {
-                "id": patch_id,
-                "before": before_text,
-                "after": after_text,
-            }
-        )
-
-    normalized_manifest = {
-        "source": manifest.get("source"),
-        "patches": normalized_patches,
-    }
-    _claude_prompt_patch_manifest_cache[template_path] = normalized_manifest
-    return normalized_manifest
-
-
-def _extract_markdown_section(markdown_text: str, heading: str) -> str:
-    section_pattern = re.compile(rf"(?ms)^## {re.escape(heading)}\n.*?(?=^## |\Z)")
-    match = section_pattern.search(markdown_text)
-    if match is None:
-        raise ValueError(f"Missing Claude auto-memory section: {heading}")
-    return match.group(0).rstrip()
-
-
-def _render_claude_auto_memory_replacement(auto_memory_section: str, cc_version: str) -> tuple[str, Path]:
-    template_path = _resolve_claude_auto_memory_template_path(cc_version)
-    if template_path is None:
-        raise ValueError(f"Unsupported Claude Code version for auto-memory override: {cc_version}")
-
-    template_text = _load_claude_context_replacement_template(template_path)
-    rendered_text = template_text
-    if "{{TYPES_XML_BLOCK}}" in rendered_text:
-        types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(auto_memory_section)
-        if types_match is None:
-            raise ValueError("Missing Claude auto-memory <types> block")
-        rendered_text = rendered_text.replace("{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip())
-
-    section_placeholders = {
-        "{{WHAT_NOT_TO_SAVE_SECTION}}": "What NOT to save in memory",
-        "{{BEFORE_RECOMMENDING_SECTION}}": "Before recommending from memory",
-        "{{MEMORY_AND_PERSISTENCE_SECTION}}": "Memory and other forms of persistence",
-    }
-    for placeholder, heading in section_placeholders.items():
-        if placeholder in rendered_text:
-            rendered_text = rendered_text.replace(placeholder, _extract_markdown_section(auto_memory_section, heading))
-
-    unresolved_placeholders = _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN.findall(rendered_text)
-    if unresolved_placeholders:
-        raise ValueError(
-            "Unresolved Claude context replacement placeholders: " + ", ".join(sorted(unresolved_placeholders))
-        )
-
-    return rendered_text.rstrip() + "\n", template_path
-
-
-def _replace_claude_auto_memory_section_in_text(text: str, cc_version: str) -> tuple[str, Optional[dict[str, Any]]]:
-    if "# auto memory" not in text:
-        return text, None
-
-    section_match = _CLAUDE_AUTO_MEMORY_SECTION_PATTERN.search(text)
-    if section_match is None:
-        return text, None
-
-    replacement_text, template_path = _render_claude_auto_memory_replacement(
-        section_match.group(0),
-        cc_version,
-    )
-    replacement_event: dict[str, Any] = {
-        "id": "auto-memory",
-        "status": "resolved",
-        "cc_version": cc_version,
-        "template_path": str(template_path.relative_to(Path(__file__).resolve().parents[3])),
-        "output_chars": len(replacement_text),
-    }
-    return (
-        text[: section_match.start()] + replacement_text + text[section_match.end() :],
-        replacement_event,
-    )
-
-
-def _replace_claude_system_prompt_override_in_value(value: Any, cc_version: str) -> tuple[Any, list[dict[str, Any]]]:
-    if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
-            if "# auto memory" not in value["text"]:
-                return value, []
-            try:
-                updated_text, event = _replace_claude_auto_memory_section_in_text(value["text"], cc_version)
-            except Exception as exc:
-                return value, [
-                    {
-                        "id": "auto-memory",
-                        "status": "failed",
-                        "cc_version": cc_version,
-                        "error": exc.__class__.__name__,
-                    }
-                ]
-
-            if event is None:
-                return value, []
-            updated_value = dict(value)
-            updated_value["text"] = updated_text
-            return updated_value, [event]
-
-        updated_dict: dict[str, Any] = {}
-        combined_events: list[dict[str, Any]] = []
-        changed = False
-        for key, child in value.items():
-            (
-                updated_child,
-                child_events,
-            ) = _replace_claude_system_prompt_override_in_value(
-                child,
-                cc_version,
-            )
-            updated_dict[key] = updated_child
-            combined_events.extend(child_events)
-            if updated_child is not child:
-                changed = True
-        return (updated_dict if changed else value), combined_events
-
-    if isinstance(value, list):
-        updated_list = []
-        list_combined_events: list[dict[str, Any]] = []
-        changed = False
-        for child in value:
-            (
-                updated_child,
-                child_events,
-            ) = _replace_claude_system_prompt_override_in_value(
-                child,
-                cc_version,
-            )
-            updated_list.append(updated_child)
-            list_combined_events.extend(child_events)
-            if updated_child is not child:
-                changed = True
-        return (updated_list if changed else value), list_combined_events
-
-    return value, []
-
-
-def _add_claude_system_prompt_override_logging_metadata(
-    request_body: dict[str, Any], override_events: list[dict[str, Any]]
-) -> dict[str, Any]:
-    override_ids = sorted(
-        {event["id"] for event in override_events if isinstance(event.get("id"), str) and event["id"]}
-    )
-    failure_ids = sorted(
-        {
-            event["id"]
-            for event in override_events
-            if event.get("status") == "failed" and isinstance(event.get("id"), str) and event["id"]
-        }
-    )
-    statuses = [
-        event["status"] for event in override_events if isinstance(event.get("status"), str) and event["status"]
-    ]
-    cc_versions = sorted(
-        {
-            event["cc_version"]
-            for event in override_events
-            if isinstance(event.get("cc_version"), str) and event["cc_version"]
-        }
-    )
-    template_paths = sorted(
-        {
-            event["template_path"]
-            for event in override_events
-            if isinstance(event.get("template_path"), str) and event["template_path"]
-        }
-    )
-
-    tags_to_add = ["claude-system-prompt-override"]
-    tags_to_add.extend(f"claude-system-prompt-override:{override_id}" for override_id in override_ids)
-    if failure_ids:
-        tags_to_add.append("claude-system-prompt-override-failed")
-
-    span_metadata: dict[str, Any] = {
-        "override_count": len(override_events),
-        "failure_count": len(failure_ids),
-    }
-    if override_ids:
-        span_metadata["override_ids"] = override_ids
-    if cc_versions:
-        span_metadata["cc_versions"] = cc_versions
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "claude_system_prompt_override_count": len(override_events),
-            "claude_system_prompt_override_ids": override_ids,
-            "claude_system_prompt_override_failure_ids": failure_ids,
-            "claude_system_prompt_override_statuses": statuses,
-            "claude_system_prompt_override_cc_versions": cc_versions,
-            "claude_system_prompt_override_template_paths": template_paths,
-            "claude_system_prompt_override_events": override_events,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="claude.system_prompt_override",
-                    metadata=span_metadata,
-                )
-            ],
-        },
-    )
-
-
-def _replace_claude_system_prompt_in_anthropic_request_body(
-    request_body: dict[str, Any], billing_header_fields: dict[str, str]
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    cc_version = billing_header_fields.get("cc_version")
-    if not isinstance(cc_version, str) or not cc_version:
-        return request_body, []
-    template_path = _resolve_claude_auto_memory_template_path(cc_version)
-    if template_path is None or "system" not in request_body:
-        return request_body, []
-
-    span_started_at = datetime.now(timezone.utc)
-    updated_body = dict(request_body)
-    updated_system, override_events = _replace_claude_system_prompt_override_in_value(
-        request_body["system"],
-        cc_version,
-    )
-    if not override_events:
-        return request_body, []
-
-    updated_body["system"] = updated_system
-    updated_body = _add_claude_system_prompt_override_logging_metadata(
-        updated_body,
-        override_events,
-    )
-
-    litellm_metadata = updated_body.get("litellm_metadata")
-    if isinstance(litellm_metadata, dict):
-        langfuse_spans = litellm_metadata.get("langfuse_spans")
-        if isinstance(langfuse_spans, list):
-            for span_descriptor in langfuse_spans:
-                if isinstance(span_descriptor, dict) and span_descriptor.get("name") == "claude.system_prompt_override":
-                    span_descriptor["start_time"] = _format_langfuse_span_timestamp(span_started_at)
-                    span_descriptor["end_time"] = _format_langfuse_span_timestamp(datetime.now(timezone.utc))
-    return updated_body, override_events
-
-
-def _apply_claude_prompt_patches_in_text(text: str, cc_version: str) -> tuple[str, list[dict[str, Any]]]:
-    manifest_path = _CLAUDE_PROMPT_PATCH_MANIFEST_PATH
-    manifest = _load_claude_prompt_patch_manifest(manifest_path)
-    updated_text = text
-    patch_events: list[dict[str, Any]] = []
-    relative_manifest_path = str(manifest_path.relative_to(Path(__file__).resolve().parents[3]))
-
-    for patch_descriptor in manifest["patches"]:
-        before_text = patch_descriptor["before"]
-        if before_text not in updated_text:
-            continue
-
-        after_text = patch_descriptor["after"]
-        occurrences = updated_text.count(before_text)
-        updated_text = updated_text.replace(before_text, after_text)
-        patch_events.append(
-            {
-                "id": patch_descriptor["id"],
-                "status": "resolved",
-                "cc_version": cc_version,
-                "manifest_path": relative_manifest_path,
-                "occurrences": occurrences,
-            }
-        )
-
-    return updated_text, patch_events
-
-
-def _replace_claude_prompt_patches_in_value(value: Any, cc_version: str) -> tuple[Any, list[dict[str, Any]]]:
-    if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
-            try:
-                updated_text, patch_events = _apply_claude_prompt_patches_in_text(value["text"], cc_version)
-            except Exception as exc:
-                return value, [
-                    {
-                        "id": "manifest-load",
-                        "status": "failed",
-                        "cc_version": cc_version,
-                        "error": exc.__class__.__name__,
-                    }
-                ]
-            if not patch_events:
-                return value, []
-            updated_value = dict(value)
-            updated_value["text"] = updated_text
-            return updated_value, patch_events
-
-        updated_dict: dict[str, Any] = {}
-        combined_events: list[dict[str, Any]] = []
-        changed = False
-        for key, child in value.items():
-            updated_child, child_events = _replace_claude_prompt_patches_in_value(
-                child,
-                cc_version,
-            )
-            updated_dict[key] = updated_child
-            combined_events.extend(child_events)
-            if updated_child is not child:
-                changed = True
-        return (updated_dict if changed else value), combined_events
-
-    if isinstance(value, list):
-        updated_list = []
-        list_combined_events: list[dict[str, Any]] = []
-        changed = False
-        for child in value:
-            updated_child, child_events = _replace_claude_prompt_patches_in_value(
-                child,
-                cc_version,
-            )
-            updated_list.append(updated_child)
-            list_combined_events.extend(child_events)
-            if updated_child is not child:
-                changed = True
-        return (updated_list if changed else value), list_combined_events
-
-    return value, []
-
-
-def _add_claude_prompt_patch_logging_metadata(
-    request_body: dict[str, Any], patch_events: list[dict[str, Any]]
-) -> dict[str, Any]:
-    patch_ids = sorted({event["id"] for event in patch_events if isinstance(event.get("id"), str) and event["id"]})
-    failure_ids = sorted(
-        {
-            event["id"]
-            for event in patch_events
-            if event.get("status") == "failed" and isinstance(event.get("id"), str) and event["id"]
-        }
-    )
-    statuses = [event["status"] for event in patch_events if isinstance(event.get("status"), str) and event["status"]]
-    cc_versions = sorted(
-        {
-            event["cc_version"]
-            for event in patch_events
-            if isinstance(event.get("cc_version"), str) and event["cc_version"]
-        }
-    )
-    manifest_paths = sorted(
-        {
-            event["manifest_path"]
-            for event in patch_events
-            if isinstance(event.get("manifest_path"), str) and event["manifest_path"]
-        }
-    )
-    total_occurrences = sum(event["occurrences"] for event in patch_events if isinstance(event.get("occurrences"), int))
-
-    tags_to_add = ["claude-prompt-patch"]
-    tags_to_add.extend(f"claude-prompt-patch:{patch_id}" for patch_id in patch_ids)
-    if failure_ids:
-        tags_to_add.append("claude-prompt-patch-failed")
-
-    span_metadata: dict[str, Any] = {
-        "patch_count": len(patch_events),
-        "replacement_count": total_occurrences,
-        "failure_count": len(failure_ids),
-    }
-    if patch_ids:
-        span_metadata["patch_ids"] = patch_ids
-    if cc_versions:
-        span_metadata["cc_versions"] = cc_versions
-
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "claude_prompt_patch_count": len(patch_events),
-            "claude_prompt_patch_replacement_count": total_occurrences,
-            "claude_prompt_patch_ids": patch_ids,
-            "claude_prompt_patch_failure_ids": failure_ids,
-            "claude_prompt_patch_statuses": statuses,
-            "claude_prompt_patch_cc_versions": cc_versions,
-            "claude_prompt_patch_manifest_paths": manifest_paths,
-            "claude_prompt_patch_events": patch_events,
-            "langfuse_spans": [
-                _build_langfuse_span_descriptor(
-                    name="claude.prompt_patch",
-                    metadata=span_metadata,
-                )
-            ],
-        },
-    )
-
-
-def _apply_claude_prompt_patches_to_anthropic_request_body(
-    request_body: dict[str, Any], billing_header_fields: dict[str, str]
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    cc_version = billing_header_fields.get("cc_version")
-    if not cc_version:
-        return request_body, []
-
-    span_started_at = datetime.now(timezone.utc)
-    updated_body, patch_events = _replace_claude_prompt_patches_in_value(
-        request_body,
-        cc_version,
-    )
-    if not patch_events:
-        return request_body, []
-
-    if not isinstance(updated_body, dict):
-        return request_body, []
-
-    updated_body = _add_claude_prompt_patch_logging_metadata(
-        updated_body,
-        patch_events,
-    )
-
-    litellm_metadata = updated_body.get("litellm_metadata")
-    if isinstance(litellm_metadata, dict):
-        langfuse_spans = litellm_metadata.get("langfuse_spans")
-        if isinstance(langfuse_spans, list):
-            for span_descriptor in langfuse_spans:
-                if isinstance(span_descriptor, dict) and span_descriptor.get("name") == "claude.prompt_patch":
-                    span_descriptor["start_time"] = _format_langfuse_span_timestamp(span_started_at)
-                    span_descriptor["end_time"] = _format_langfuse_span_timestamp(datetime.now(timezone.utc))
-    return updated_body, patch_events
-
-
-def _validate_anthropic_tool_blocks_for_passthrough(
-    request_body: dict[str, Any],
-) -> None:
-    messages = request_body.get("messages")
-    if not isinstance(messages, list):
-        return
-
-    for message_index, message in enumerate(messages):
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for content_index, block in enumerate(content):
-            if not isinstance(block, dict):
-                continue
-            block_type = block.get("type")
-            if block_type == "tool_use":
-                tool_use_id = block.get("id")
-                if not isinstance(tool_use_id, str) or not tool_use_id.strip():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Invalid Anthropic tool_use block at "
-                            f"messages.{message_index}.content.{content_index}: "
-                            "missing required non-empty string tool_use.id"
-                        ),
-                    )
-                continue
-            if block_type != "tool_result" and not (
-                isinstance(block_type, str) and block_type.endswith("_tool_result")
-            ):
-                continue
-            tool_use_id = block.get("tool_use_id")
-            if not isinstance(tool_use_id, str) or not tool_use_id.strip():
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Invalid Anthropic tool_result block at "
-                        f"messages.{message_index}.content.{content_index}: "
-                        "missing required non-empty string "
-                        f"tool_result.tool_use_id for block type {block_type!r}"
-                    ),
-                )
-
-
-def _repair_anthropic_tool_use_ids_for_passthrough(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], int]:
-    messages = request_body.get("messages")
-    if not isinstance(messages, list):
-        return request_body, 0
-
-    from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
-        LiteLLMAnthropicMessagesAdapter,
-    )
-
-    (
-        repaired_messages,
-        repaired_count,
-    ) = LiteLLMAnthropicMessagesAdapter.repair_missing_anthropic_tool_use_ids(messages)
-    if repaired_count == 0:
-        return request_body, 0
-
-    updated_body = dict(request_body)
-    updated_body["messages"] = repaired_messages
-    return (
-        _merge_litellm_metadata(
-            updated_body,
-            tags_to_add=["anthropic-tool-use-id-repaired"],
-            extra_fields={"anthropic_tool_use_id_repaired_count": repaired_count},
-        ),
-        repaired_count,
-    )
-
-
-async def _prepare_anthropic_request_body_for_passthrough(
-    request: Request, request_body: dict[str, Any]
-) -> Tuple[dict[str, Any], int, set[str], dict[str, str]]:
-    (
-        updated_body,
-        expanded_count,
-        hooks,
-        _source_metadata_items,
-    ) = _expand_claude_persisted_output_in_anthropic_request_body(request_body)
-    billing_header_fields = _extract_anthropic_billing_header_fields_from_request_body(updated_body)
-    (
-        updated_body,
-        _claude_system_prompt_override_events,
-        _claude_prompt_patch_events,
-    ) = await _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
-        updated_body,
-        billing_header_fields,
-    )
-    (
-        updated_body,
-        _aawm_injection_events,
-    ) = await _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body(updated_body)
-    updated_body = _aawm_add_claude_post_rewrite_context_file_logging_metadata(updated_body)
-    (
-        updated_body,
-        _web_search_domain_filter_sanitized_count,
-    ) = _sanitize_anthropic_web_search_empty_domain_lists(updated_body)
-    updated_body = _add_claude_child_agent_observability_metadata(
-        updated_body,
-        explicit_tenant_id=_get_aawm_tenant_header(request),
-    )
-    if billing_header_fields:
-        updated_body = _add_anthropic_billing_header_logging_metadata(
-            updated_body,
-            billing_header_fields,
-        )
-    updated_body = _add_route_family_logging_metadata(updated_body, "anthropic_messages")
-    updated_body = _add_claude_request_breakout_logging_metadata(updated_body)
-    updated_body = _prepare_request_body_for_passthrough_observability(
-        request=request,
-        request_body=updated_body,
-    )
-    (
-        updated_body,
-        _repaired_tool_use_id_count,
-    ) = _repair_anthropic_tool_use_ids_for_passthrough(updated_body)
-    _validate_anthropic_tool_blocks_for_passthrough(updated_body)
-    return updated_body, expanded_count, hooks, billing_header_fields
 
 
 def _should_preserve_openai_client_auth(request: Request, endpoint: str) -> bool:
@@ -14462,6 +12017,7 @@ _wave6b_xai_request_prep.configure_xai_request_prep_runtime(
         get_case_insensitive_header=lambda hdrs, name: _get_case_insensitive_header(hdrs, name),
         get_rewrite_input_item_types_for_model=lambda m: _get_rewrite_input_item_types_for_model(m),
         get_grok_passthrough_target_base=lambda: _get_grok_passthrough_target_base(),
+        get_grok_native_oauth_access_token=lambda: get_grok_native_oauth_access_token(),
     )
 )
 
@@ -14625,6 +12181,325 @@ _aawm_alias_guidance.configure_alias_guidance_runtime(
         merge_litellm_metadata=_merge_litellm_metadata,
         build_langfuse_span_descriptor=_build_langfuse_span_descriptor,
     ),
+)
+
+
+
+# ---------------------------------------------------------------------------
+# Wave 6E codex-tool-policy same-object facades
+# ---------------------------------------------------------------------------
+
+# Build the shared CodexToolPolicyCallbacks with live host-global lookups.
+_CODEX_TOOL_POLICY_CALLBACKS = _aawm_codex_tool_policy.CodexToolPolicyCallbacks(
+    normalize_tag_value=_normalize_low_cardinality_tag_value,
+    dedupe_sorted=_dedupe_sorted_str_list,
+    merge_metadata=_merge_litellm_metadata,
+    build_span=_build_langfuse_span_descriptor,
+    get_model_cost_map=lambda: litellm.model_cost,
+    normalize_grok_native_oauth_model=normalize_grok_native_oauth_model,
+    is_oa_xai_model=is_oa_xai_model,
+    resolve_oa_xai_upstream_model=resolve_oa_xai_upstream_model,
+    normalize_kimi_model_name=_normalize_kimi_code_chat_completions_adapter_model_name,
+    normalize_kimi_custom_tool_outputs=lambda b: _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(b),
+    grok_normalization=_anthropic_grok_normalization,
+    grok_normalization_runtime=_get_anthropic_grok_normalization_runtime(),
+    request_body_walk_max_depth=_AAWM_REQUEST_BODY_WALK_MAX_DEPTH,
+)
+
+# -- Pure functions (same-object identity) --
+_get_openai_tool_name = _aawm_codex_tool_policy.get_openai_tool_name
+_get_openai_tool_type = _aawm_codex_tool_policy.get_openai_tool_type
+_patch_codex_spawn_agent_description_text = _aawm_codex_tool_policy.patch_codex_spawn_agent_description_text
+_patch_codex_spawn_agent_payload_parameters = _aawm_codex_tool_policy.patch_codex_spawn_agent_payload_parameters
+_load_bundled_model_cost_map_for_codex_policy = _aawm_codex_tool_policy.load_bundled_model_cost_map_for_codex_policy
+_adapted_custom_tool_function_schema = _aawm_codex_tool_policy.adapted_custom_tool_function_schema
+_request_has_openai_tool_definitions = _aawm_codex_tool_policy.request_has_openai_tool_definitions
+_apply_spawn_agent_parameter_patches = _aawm_codex_tool_policy._apply_spawn_agent_parameter_patches
+_lookup_model_info_field = _aawm_codex_tool_policy._lookup_model_info_field
+
+# -- Functions binding normalize_tag_value --
+
+def _patch_codex_spawn_agent_tool_description(tool, *, tool_index):
+    return _aawm_codex_tool_policy.patch_codex_spawn_agent_tool_description(
+        tool, tool_index=tool_index, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _get_codex_core_tool_guidance(tool_name):
+    return _aawm_codex_tool_policy.get_codex_core_tool_guidance(
+        tool_name, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _append_codex_core_tool_guidance_to_description(description, *, guidance):
+    return _aawm_codex_tool_policy.append_codex_core_tool_guidance_to_description(
+        description, guidance=guidance,
+    )
+
+def _patch_codex_multi_agent_tool_search_description(tool, *, tool_index):
+    return _aawm_codex_tool_policy.patch_codex_multi_agent_tool_search_description(
+        tool, tool_index=tool_index, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _patch_codex_core_tool_description(tool, *, tool_index):
+    return _aawm_codex_tool_policy.patch_codex_core_tool_description(
+        tool, tool_index=tool_index, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _adapt_codex_custom_tool_definitions(tools, *, adapter_names):
+    return _aawm_codex_tool_policy.adapt_codex_custom_tool_definitions(
+        tools, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _adapted_custom_tool_call_ids(input_items, *, adapter_names):
+    return _aawm_codex_tool_policy.adapted_custom_tool_call_ids(
+        input_items, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _adapt_codex_custom_tool_input_items(input_items, *, adapter_names):
+    return _aawm_codex_tool_policy.adapt_codex_custom_tool_input_items(
+        input_items, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _adapt_codex_custom_tool_choice(tool_choice, *, adapter_names):
+    return _aawm_codex_tool_policy.adapt_codex_custom_tool_choice(
+        tool_choice, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _adapt_codex_namespace_tool_definitions(tools, *, adapter_names):
+    return _aawm_codex_tool_policy.adapt_codex_namespace_tool_definitions(
+        tools, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _adapt_codex_namespace_input_items(input_items, *, adapter_names):
+    return _aawm_codex_tool_policy.adapt_codex_namespace_input_items(
+        input_items, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _adapt_codex_namespace_tool_choice(tool_choice, *, adapter_names):
+    return _aawm_codex_tool_policy.adapt_codex_namespace_tool_choice(
+        tool_choice, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+def _openai_tool_choice_references_tool_type(tool_choice, tool_types):
+    return _aawm_codex_tool_policy.openai_tool_choice_references_tool_type(
+        tool_choice, tool_types, normalize_tag_value=_normalize_low_cardinality_tag_value,
+    )
+
+# -- Functions binding CodexToolPolicyCallbacks --
+def _get_codex_tool_policy_model_cost_candidates(model):
+    return _aawm_codex_tool_policy.get_codex_tool_policy_model_cost_candidates(
+        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _get_unsupported_hosted_tool_types_for_model(model):
+    return _aawm_codex_tool_policy.get_unsupported_hosted_tool_types_for_model(
+        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _get_unsupported_request_param_names_for_model(model):
+    return _aawm_codex_tool_policy.get_unsupported_request_param_names_for_model(
+        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _get_unsupported_input_item_types_for_model(model):
+    return _aawm_codex_tool_policy.get_unsupported_input_item_types_for_model(
+        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _get_rewrite_input_item_types_for_model(model):
+    return _aawm_codex_tool_policy.get_rewrite_input_item_types_for_model(
+        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _get_custom_tool_function_adapter_names_for_model(model):
+    return _aawm_codex_tool_policy.get_custom_tool_function_adapter_names_for_model(
+        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _get_namespace_tool_function_adapter_names_for_model(model):
+    return _aawm_codex_tool_policy.get_namespace_tool_function_adapter_names_for_model(
+        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _add_codex_custom_tool_function_adapter_logging_metadata(
+    request_body, *, adapted_tools, adapted_input_items, adapted_tool_choice,
+):
+    return _aawm_codex_tool_policy.add_codex_custom_tool_function_adapter_logging_metadata(
+        request_body,
+        adapted_tools=adapted_tools,
+        adapted_input_items=adapted_input_items,
+        adapted_tool_choice=adapted_tool_choice,
+        callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _adapt_codex_custom_tools_to_functions_from_request_body(request_body):
+    return _aawm_codex_tool_policy.adapt_codex_custom_tools_to_functions_from_request_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _add_codex_namespace_tool_function_adapter_logging_metadata(
+    request_body, *, adapted_tools, adapted_input_items, adapted_tool_choice, skipped_tools,
+):
+    return _aawm_codex_tool_policy.add_codex_namespace_tool_function_adapter_logging_metadata(
+        request_body,
+        adapted_tools=adapted_tools,
+        adapted_input_items=adapted_input_items,
+        adapted_tool_choice=adapted_tool_choice,
+        skipped_tools=skipped_tools,
+        callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _adapt_codex_namespace_tools_to_functions_from_request_body(request_body):
+    return _aawm_codex_tool_policy.adapt_codex_namespace_tools_to_functions_from_request_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _add_codex_unsupported_hosted_tool_logging_metadata(
+    request_body, *, removed_tools, removed_tool_choice,
+):
+    return _aawm_codex_tool_policy.add_codex_unsupported_hosted_tool_logging_metadata(
+        request_body,
+        removed_tools=removed_tools,
+        removed_tool_choice=removed_tool_choice,
+        callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _add_tool_choice_without_tools_logging_metadata(request_body, *, removed_tool_choice):
+    return _aawm_codex_tool_policy.add_tool_choice_without_tools_logging_metadata(
+        request_body, removed_tool_choice=removed_tool_choice, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _drop_tool_choice_without_tools_from_request_body(request_body):
+    return _aawm_codex_tool_policy.drop_tool_choice_without_tools_from_request_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _add_codex_unsupported_request_param_logging_metadata(request_body, *, removed_params):
+    return _aawm_codex_tool_policy.add_codex_unsupported_request_param_logging_metadata(
+        request_body, removed_params=removed_params, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _drop_unsupported_codex_request_params_from_request_body(request_body):
+    return _aawm_codex_tool_policy.drop_unsupported_codex_request_params_from_request_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _add_codex_unsupported_input_item_logging_metadata(request_body, *, removed_items):
+    return _aawm_codex_tool_policy.add_codex_unsupported_input_item_logging_metadata(
+        request_body, removed_items=removed_items, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _drop_unsupported_codex_input_items_from_request_body(request_body):
+    return _aawm_codex_tool_policy.drop_unsupported_codex_input_items_from_request_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _drop_unsupported_codex_hosted_tools_from_request_body(request_body):
+    return _aawm_codex_tool_policy.drop_unsupported_codex_hosted_tools_from_request_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _add_codex_tool_description_patch_logging_metadata(request_body, patch_events):
+    return _aawm_codex_tool_policy.add_codex_tool_description_patch_logging_metadata(
+        request_body, patch_events, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _apply_codex_tool_description_patches_to_request_body(request_body):
+    return _aawm_codex_tool_policy.apply_codex_tool_description_patches_to_request_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _stringify_grok_native_input_item_value(value):
+    return _aawm_codex_tool_policy.stringify_grok_native_input_item_value(
+        value, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _format_grok_native_function_call_input_message(item, *, include_correlation_ref=False):
+    return _aawm_codex_tool_policy.format_grok_native_function_call_input_message(
+        item, include_correlation_ref=include_correlation_ref, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _format_grok_native_function_call_output_input_message(item, *, include_correlation_ref=False):
+    return _aawm_codex_tool_policy.format_grok_native_function_call_output_input_message(
+        item, include_correlation_ref=include_correlation_ref, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _rewrite_grok_native_input_item_for_model_input(item, *, item_type, include_correlation_ref=False):
+    return _aawm_codex_tool_policy.rewrite_grok_native_input_item_for_model_input(
+        item, item_type=item_type, include_correlation_ref=include_correlation_ref,
+        callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _is_anthropic_grok_native_responses_adapter_body(request_body):
+    return _aawm_codex_tool_policy.is_anthropic_grok_native_responses_adapter_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _add_grok_native_input_item_rewrite_logging_metadata(request_body, *, rewritten_items):
+    return _aawm_codex_tool_policy.add_grok_native_input_item_rewrite_logging_metadata(
+        request_body, rewritten_items=rewritten_items, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _rewrite_grok_native_unsupported_input_items_from_request_body(request_body):
+    return _aawm_codex_tool_policy.rewrite_grok_native_unsupported_input_items_from_request_body(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+def _rewrite_grok_native_unsupported_input_items_in_place(request_body):
+    return _aawm_codex_tool_policy.rewrite_grok_native_unsupported_input_items_in_place(
+        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave 6E claude-prompt-replacement same-object facades
+# ---------------------------------------------------------------------------
+_parse_claude_code_version = _aawm_claude_prompt_replacement._parse_claude_code_version
+_resolve_claude_auto_memory_template_path = _aawm_claude_prompt_replacement._resolve_claude_auto_memory_template_path
+_load_claude_context_replacement_template = _aawm_claude_prompt_replacement._load_claude_context_replacement_template
+_load_claude_prompt_patch_manifest = _aawm_claude_prompt_replacement._load_claude_prompt_patch_manifest
+_extract_markdown_section = _aawm_claude_prompt_replacement._extract_markdown_section
+_render_claude_auto_memory_replacement = _aawm_claude_prompt_replacement._render_claude_auto_memory_replacement
+_replace_claude_auto_memory_section_in_text = _aawm_claude_prompt_replacement._replace_claude_auto_memory_section_in_text
+_replace_claude_system_prompt_override_in_value = _aawm_claude_prompt_replacement._replace_claude_system_prompt_override_in_value
+_add_claude_system_prompt_override_logging_metadata = _aawm_claude_prompt_replacement._add_claude_system_prompt_override_logging_metadata
+_replace_claude_system_prompt_in_anthropic_request_body = _aawm_claude_prompt_replacement._replace_claude_system_prompt_in_anthropic_request_body
+_apply_claude_prompt_patches_in_text = _aawm_claude_prompt_replacement._apply_claude_prompt_patches_in_text
+_replace_claude_prompt_patches_in_value = _aawm_claude_prompt_replacement._replace_claude_prompt_patches_in_value
+_add_claude_prompt_patch_logging_metadata = _aawm_claude_prompt_replacement._add_claude_prompt_patch_logging_metadata
+_apply_claude_prompt_patches_to_anthropic_request_body = _aawm_claude_prompt_replacement._apply_claude_prompt_patches_to_anthropic_request_body
+
+
+# ---------------------------------------------------------------------------
+# Wave 6E anthropic-body-prep same-object facades
+# ---------------------------------------------------------------------------
+_get_openai_adapter_claude_context_char_cap = _aawm_anthropic_body_prep._get_openai_adapter_claude_context_char_cap
+_detect_openai_adapter_claude_context_markers = _aawm_anthropic_body_prep._detect_openai_adapter_claude_context_markers
+_select_openai_adapter_context_summary_lines = _aawm_anthropic_body_prep._select_openai_adapter_context_summary_lines
+_build_openai_adapter_compacted_claude_context_block = _aawm_anthropic_body_prep._build_openai_adapter_compacted_claude_context_block
+_compact_openai_adapter_claude_context_text = _aawm_anthropic_body_prep._compact_openai_adapter_claude_context_text
+_compact_openai_adapter_claude_context_value = _aawm_anthropic_body_prep._compact_openai_adapter_claude_context_value
+_add_openai_adapter_claude_context_compaction_logging_metadata = _aawm_anthropic_body_prep._add_openai_adapter_claude_context_compaction_logging_metadata
+_compact_openai_adapter_claude_context_in_anthropic_request_body = _aawm_anthropic_body_prep._compact_openai_adapter_claude_context_in_anthropic_request_body
+_validate_anthropic_tool_blocks_for_passthrough = _aawm_anthropic_body_prep._validate_anthropic_tool_blocks_for_passthrough
+_repair_anthropic_tool_use_ids_for_passthrough = _aawm_anthropic_body_prep._repair_anthropic_tool_use_ids_for_passthrough
+_prepare_anthropic_request_body_for_passthrough = _aawm_anthropic_body_prep._prepare_anthropic_request_body_for_passthrough
+
+
+# ---------------------------------------------------------------------------
+# Wave 6E anthropic-body-prep runtime configuration
+# ---------------------------------------------------------------------------
+_aawm_anthropic_body_prep.configure_anthropic_body_prep_runtime(
+    expand_persisted_output=_expand_claude_persisted_output_in_anthropic_request_body,
+    extract_billing_header_fields=_extract_anthropic_billing_header_fields_from_request_body,
+    apply_control_plane_rewrites=_aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body,
+    expand_dynamic_directives=_aawm_expand_aawm_dynamic_directives_in_anthropic_request_body,
+    add_post_rewrite_context_file_metadata=_aawm_add_claude_post_rewrite_context_file_logging_metadata,
+    sanitize_web_search_domain_lists=_sanitize_anthropic_web_search_empty_domain_lists,
+    add_billing_header_logging_metadata=_add_anthropic_billing_header_logging_metadata,
+    add_route_family_logging_metadata=_add_route_family_logging_metadata,
+    add_request_breakout_logging_metadata=_add_claude_request_breakout_logging_metadata,
+    prepare_observability=_prepare_request_body_for_passthrough_observability,
+    get_tenant_header=_get_aawm_tenant_header,
 )
 
 

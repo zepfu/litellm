@@ -46,29 +46,29 @@ PROXY_DELEGATES = {
         "_anthropic_grok_normalization.sanitize_function_call_arguments_in_place"
     ),
     "_stringify_grok_native_input_item_value": (
-        "_anthropic_grok_normalization.stringify_input_item_value"
+        "_aawm_codex_tool_policy.stringify_grok_native_input_item_value"
     ),
     "_format_grok_native_function_call_input_message": (
-        "_anthropic_grok_normalization.format_function_call_input_message"
+        "_aawm_codex_tool_policy.format_grok_native_function_call_input_message"
     ),
     "_format_grok_native_function_call_output_input_message": (
-        "_anthropic_grok_normalization.format_function_call_output_input_message"
+        "_aawm_codex_tool_policy.format_grok_native_function_call_output_input_message"
     ),
     "_rewrite_grok_native_input_item_for_model_input": (
-        "_anthropic_grok_normalization.rewrite_input_item_for_model_input"
+        "_aawm_codex_tool_policy.rewrite_grok_native_input_item_for_model_input"
     ),
     "_is_anthropic_grok_native_responses_adapter_body": (
-        "_anthropic_grok_normalization.is_anthropic_responses_adapter_body"
+        "_aawm_codex_tool_policy.is_anthropic_grok_native_responses_adapter_body"
     ),
     "_add_grok_native_input_item_rewrite_logging_metadata": (
-        "_anthropic_grok_normalization.add_input_item_rewrite_logging_metadata"
+        "_aawm_codex_tool_policy.add_grok_native_input_item_rewrite_logging_metadata"
     ),
     "_rewrite_grok_native_unsupported_input_items_from_request_body": (
-        "_anthropic_grok_normalization."
-        "rewrite_unsupported_input_items_from_request_body"
+        "_aawm_codex_tool_policy."
+        "rewrite_grok_native_unsupported_input_items_from_request_body"
     ),
     "_rewrite_grok_native_unsupported_input_items_in_place": (
-        "_anthropic_grok_normalization.rewrite_unsupported_input_items_in_place"
+        "_aawm_codex_tool_policy.rewrite_grok_native_unsupported_input_items_in_place"
     ),
 }
 

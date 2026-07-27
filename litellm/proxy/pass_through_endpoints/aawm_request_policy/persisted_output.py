@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FunctionType
-from typing import Any, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 from litellm.llms.anthropic.experimental_pass_through.providers.google import (
     env_policy as _google_env_policy,
@@ -56,6 +56,10 @@ _persisted_output_logging_callback: Optional[
     Callable[..., dict[str, Any]]
 ] = None
 
+if TYPE_CHECKING:
+
+    def _format_langfuse_span_timestamp(value: datetime) -> str: ...
+
 _RUNTIME_DEPENDENCY_NAMES = (
     "_anthropic_google_shaping",
     "_CLAUDE_PERSISTED_OUTPUT_PATTERN",
@@ -67,6 +71,7 @@ _RUNTIME_DEPENDENCY_NAMES = (
     "_get_google_adapter_followup_auxiliary_context_char_cap",
     "_get_google_adapter_followup_persisted_output_char_cap",
     "_get_google_adapter_persisted_output_char_cap",
+    "_format_langfuse_span_timestamp",
     "_persisted_output_logging_callback",
 )
 
@@ -397,7 +402,24 @@ def _expand_claude_persisted_output_in_anthropic_request_body(
                 expanded_count,
                 hooks,
                 source_metadata_items,
-                span_started_at,
             )
+            litellm_metadata = updated_body.get("litellm_metadata")
+            if isinstance(litellm_metadata, dict):
+                langfuse_spans = litellm_metadata.get("langfuse_spans")
+                if isinstance(langfuse_spans, list):
+                    for span_descriptor in langfuse_spans:
+                        if (
+                            isinstance(span_descriptor, dict)
+                            and span_descriptor.get("name")
+                            == "claude.persisted_output_expand"
+                        ):
+                            span_descriptor["start_time"] = (
+                                _format_langfuse_span_timestamp(span_started_at)
+                            )
+                            span_descriptor["end_time"] = (
+                                _format_langfuse_span_timestamp(
+                                    datetime.now(timezone.utc)
+                                )
+                            )
         return updated_body, expanded_count, hooks, source_metadata_items
     return request_body, 0, set(), []

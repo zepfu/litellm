@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,6 +33,29 @@ EXPECTED_SYMBOLS = (
     "_expand_claude_persisted_output_in_anthropic_request_body",
     "_estimate_google_content_text_chars",
 )
+
+
+def _load_direct_owner_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "_wave6d_direct_owner_persisted_output",
+        TARGET_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load direct-owner module from {TARGET_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _isolate_direct_owner_module() -> Iterator[None]:
+    global po
+    canonical_module = po
+    po = _load_direct_owner_module()
+    try:
+        yield
+    finally:
+        po = canonical_module
 
 
 def _persisted_output_marker(path: Path, hook: str = "SubagentStart") -> str:
@@ -446,10 +472,9 @@ def test_body_expansion_calls_logging_callback_with_correct_args(
         expanded_count: int,
         hooks: set[str],
         source_metadata_items: list[dict[str, Any]],
-        span_started_at: Any,
     ) -> dict[str, Any]:
         call_log.append(
-            (body, expanded_count, hooks, source_metadata_items, span_started_at)
+            (body, expanded_count, hooks, source_metadata_items)
         )
         body["litellm_metadata"] = {"injected": True}
         return body
@@ -483,11 +508,10 @@ def test_body_expansion_calls_logging_callback_with_correct_args(
     assert len(sources) == 1
     assert updated["litellm_metadata"] == {"injected": True}
     assert len(call_log) == 1
-    _, cb_count, cb_hooks, cb_sources, cb_span_start = call_log[0]
+    _, cb_count, cb_hooks, cb_sources = call_log[0]
     assert cb_count == 1
     assert cb_hooks == {"subagentstart"}
     assert len(cb_sources) == 1
-    assert cb_span_start is not None
 
 
 def test_body_expansion_noop_when_nothing_expanded(
@@ -541,33 +565,69 @@ def test_body_expansion_skips_callback_when_not_configured(
     assert "litellm_metadata" not in updated
 
 
-def test_body_expansion_callback_receives_span_started_at_before_end(
+def test_body_expansion_callback_four_arg_signature_and_timing_regression(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from datetime import datetime, timezone
+    """Regression: preserve the callback signature and span timing sequence.
 
-    root, output_path = _create_persisted_file(tmp_path, text="timing")
+    The configured observability callback
+    (_add_claude_persisted_output_logging_metadata) accepts four positional
+    arguments. Timing is attached to its span descriptor after it returns.
+    """
+    root, output_path = _create_persisted_file(tmp_path, text="regression")
     monkeypatch.setenv("LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT", "1")
     monkeypatch.setenv("LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT", str(root))
 
-    captured_start: list[Any] = []
+    call_args: list[Any] = []
+    events: list[str] = []
+    span_started_at = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+    span_ended_at = datetime(2026, 7, 27, 12, 0, 1, tzinfo=timezone.utc)
+    timestamps = iter((span_started_at, span_ended_at))
 
-    def capture_timing(
+    class SequencedDateTime:
+        @classmethod
+        def now(cls, tz: Any) -> datetime:
+            value = next(timestamps)
+            assert tz is timezone.utc
+            events.append(
+                "now:start" if value is span_started_at else "now:end"
+            )
+            return value
+
+    def format_timestamp(value: datetime) -> str:
+        events.append(
+            "format:start" if value is span_started_at else "format:end"
+        )
+        return value.isoformat().replace("+00:00", "Z")
+
+    def strict_four_arg_callback(
         body: dict[str, Any],
-        _c: int,
-        _h: set[str],
-        _s: list[dict[str, Any]],
-        span_started_at: Any,
+        expanded_count: int,
+        hooks: set[str],
+        source_metadata_items: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        captured_start.append(span_started_at)
+        events.append("callback")
+        call_args.append((body, expanded_count, hooks, source_metadata_items))
+        body["litellm_metadata"] = {
+            "langfuse_spans": [
+                {"name": "other"},
+                {"name": "claude.persisted_output_expand"},
+            ]
+        }
         return body
 
+    monkeypatch.setattr(po, "datetime", SequencedDateTime)
     monkeypatch.setattr(
-        po, "_persisted_output_logging_callback", capture_timing
+        po,
+        "_format_langfuse_span_timestamp",
+        format_timestamp,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        po, "_persisted_output_logging_callback", strict_four_arg_callback
     )
 
-    before = datetime.now(timezone.utc)
     body: dict[str, Any] = {
         "messages": [
             {
@@ -578,11 +638,32 @@ def test_body_expansion_callback_receives_span_started_at_before_end(
             }
         ]
     }
-    po._expand_claude_persisted_output_in_anthropic_request_body(body)
-    after = datetime.now(timezone.utc)
+    updated, count, hooks, sources = (
+        po._expand_claude_persisted_output_in_anthropic_request_body(body)
+    )
 
-    assert len(captured_start) == 1
-    assert before <= captured_start[0] <= after
+    assert count == 1
+    assert hooks == {"subagentstart"}
+    assert len(sources) == 1
+    assert len(call_args) == 1
+    _, cb_count, cb_hooks, cb_sources = call_args[0]
+    assert cb_count == 1
+    assert cb_hooks == {"subagentstart"}
+    assert len(cb_sources) == 1
+    spans = updated["litellm_metadata"]["langfuse_spans"]
+    assert spans[0] == {"name": "other"}
+    assert spans[1] == {
+        "name": "claude.persisted_output_expand",
+        "start_time": "2026-07-27T12:00:00Z",
+        "end_time": "2026-07-27T12:00:01Z",
+    }
+    assert events == [
+        "now:start",
+        "callback",
+        "format:start",
+        "now:end",
+        "format:end",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +723,6 @@ def test_body_expansion_callback_order_expand_then_log(
         _c: int,
         _h: set[str],
         _s: list[dict[str, Any]],
-        _t: Any,
     ) -> dict[str, Any]:
         order.append("log")
         return body

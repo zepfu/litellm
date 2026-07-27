@@ -461,3 +461,175 @@ def test_wave6d_observability_get_nested_str_value_facade() -> None:
     assert lpe._get_nested_str_value(nested, ("x", "y", "z")) == "deep"
     assert cp._get_nested_str_value(nested, ("x", "y", "z")) == "deep"
     assert lpe._get_nested_str_value(nested, ("x", "missing")) is None
+
+
+# ---------------------------------------------------------------------------
+# Wave 6E: request-policy facade call-through tests
+# ---------------------------------------------------------------------------
+
+from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+    anthropic_body_prep,
+    claude_prompt_replacement,
+    codex_tool_policy,
+)
+
+
+def test_wave6e_codex_tool_policy_pure_facade_call_through() -> None:
+    """Pure codex_tool_policy functions are same-object on lpe."""
+    assert lpe._get_openai_tool_name is codex_tool_policy.get_openai_tool_name
+    assert lpe._get_openai_tool_type is codex_tool_policy.get_openai_tool_type
+    assert lpe._get_openai_tool_name({"name": "bash"}) == "bash"
+    assert lpe._get_openai_tool_type({"type": "function"}) == "function"
+
+
+def test_wave6e_codex_spawn_agent_description_facade() -> None:
+    """patch_codex_spawn_agent_description_text facade is same-object."""
+    assert lpe._patch_codex_spawn_agent_description_text is (
+        codex_tool_policy.patch_codex_spawn_agent_description_text
+    )
+    result, count = lpe._patch_codex_spawn_agent_description_text("no match")
+    assert result == "no match"
+    assert count == 0
+
+
+def test_wave6e_codex_callbacks_bound_facade_call_through() -> None:
+    """Callback-bound facade delegates to codex_tool_policy with live callbacks."""
+    result = lpe._get_unsupported_hosted_tool_types_for_model("gpt-4o")
+    assert isinstance(result, (list, set))
+
+
+def test_wave6e_codex_drop_tool_choice_facade_call_through() -> None:
+    """drop_tool_choice_without_tools_from_request_body facade call-through."""
+    body: dict[str, Any] = {"tool_choice": "auto", "model": "gpt-4o"}
+    result = lpe._drop_tool_choice_without_tools_from_request_body(body)
+    # Returns (updated_body, removed_tool_choice) tuple
+    assert isinstance(result, tuple)
+    assert isinstance(result[0], dict)
+
+
+def test_wave6e_codex_grok_native_facade_call_through() -> None:
+    """Grok-native facades are callable through lpe."""
+    body: dict[str, Any] = {"model": "claude-3", "messages": []}
+    result = lpe._is_anthropic_grok_native_responses_adapter_body(body)
+    assert isinstance(result, bool)
+
+
+def test_wave6e_claude_prompt_replacement_facade_identity() -> None:
+    """All 14 claude_prompt_replacement facades are same-object."""
+    for symbol in (
+        "_parse_claude_code_version",
+        "_resolve_claude_auto_memory_template_path",
+        "_load_claude_context_replacement_template",
+        "_load_claude_prompt_patch_manifest",
+        "_extract_markdown_section",
+        "_render_claude_auto_memory_replacement",
+        "_replace_claude_auto_memory_section_in_text",
+        "_replace_claude_system_prompt_override_in_value",
+        "_add_claude_system_prompt_override_logging_metadata",
+        "_replace_claude_system_prompt_in_anthropic_request_body",
+        "_apply_claude_prompt_patches_in_text",
+        "_replace_claude_prompt_patches_in_value",
+        "_add_claude_prompt_patch_logging_metadata",
+        "_apply_claude_prompt_patches_to_anthropic_request_body",
+    ):
+        assert getattr(lpe, symbol) is getattr(claude_prompt_replacement, symbol), (
+            f"{symbol}: facade identity mismatch"
+        )
+
+
+def test_wave6e_claude_parse_version_facade_call_through() -> None:
+    """_parse_claude_code_version facade call-through."""
+    assert lpe._parse_claude_code_version("2.1.110") == (2, 1, 110)
+    assert lpe._parse_claude_code_version(None) is None
+
+
+def test_wave6e_claude_extract_markdown_section_facade() -> None:
+    """_extract_markdown_section facade call-through."""
+    md = "## auto memory\nsome memory content\n## Environment\nenv stuff"
+    result = lpe._extract_markdown_section(md, "auto memory")
+    assert "some memory content" in result
+
+
+def test_wave6e_anthropic_body_prep_facade_identity() -> None:
+    """All 11 anthropic_body_prep facades are same-object."""
+    for symbol in (
+        "_get_openai_adapter_claude_context_char_cap",
+        "_detect_openai_adapter_claude_context_markers",
+        "_select_openai_adapter_context_summary_lines",
+        "_build_openai_adapter_compacted_claude_context_block",
+        "_compact_openai_adapter_claude_context_text",
+        "_compact_openai_adapter_claude_context_value",
+        "_add_openai_adapter_claude_context_compaction_logging_metadata",
+        "_compact_openai_adapter_claude_context_in_anthropic_request_body",
+        "_validate_anthropic_tool_blocks_for_passthrough",
+        "_repair_anthropic_tool_use_ids_for_passthrough",
+        "_prepare_anthropic_request_body_for_passthrough",
+    ):
+        assert getattr(lpe, symbol) is getattr(anthropic_body_prep, symbol), (
+            f"{symbol}: facade identity mismatch"
+        )
+
+
+def test_wave6e_body_prep_detect_markers_facade_call_through() -> None:
+    """_detect_openai_adapter_claude_context_markers facade call-through."""
+    markers = lpe._detect_openai_adapter_claude_context_markers("see CLAUDE.md for details")
+    assert "claude-md" in markers
+
+
+def test_wave6e_body_prep_validate_tool_blocks_facade_call_through() -> None:
+    """_validate_anthropic_tool_blocks_for_passthrough facade call-through."""
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        ]
+    }
+    lpe._validate_anthropic_tool_blocks_for_passthrough(body)
+
+
+def test_wave6e_body_prep_char_cap_facade_call_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_get_openai_adapter_claude_context_char_cap facade reads env."""
+    monkeypatch.delenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP", raising=False)
+    assert lpe._get_openai_adapter_claude_context_char_cap() == 1200
+    monkeypatch.setenv("AAWM_OPENAI_ADAPTER_CLAUDE_CONTEXT_CHAR_CAP", "500")
+    assert lpe._get_openai_adapter_claude_context_char_cap() == 500
+
+
+# ---------------------------------------------------------------------------
+# Wave 6B XAI OAuth compatibility-binding regression
+# ---------------------------------------------------------------------------
+
+
+def test_wave6b_xai_oauth_god_module_patch_reaches_production_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patching lpe.get_grok_native_oauth_access_token must intercept the
+    actual runtime call after the Wave 6B extraction.
+
+    The configured production runtime holds a late-binding lambda that looks
+    up ``get_grok_native_oauth_access_token`` in the god-module globals at call
+    time, so a monkeypatch of the compatibility facade reaches
+    ``_prepare_grok_native_oauth_passthrough_request`` through the live
+    runtime rather than the frozen module-scope import.
+    """
+    from litellm.proxy.pass_through_endpoints.providers.xai import (
+        request_prep as xai_request_prep,
+    )
+
+    runtime = xai_request_prep._require_runtime()
+
+    calls: list[str] = []
+
+    async def fake_token() -> str:
+        calls.append("token")
+        return "patched-oauth-token"
+
+    monkeypatch.setattr(
+        lpe, "get_grok_native_oauth_access_token", fake_token
+    )
+
+    result = asyncio.run(runtime.get_grok_native_oauth_access_token())
+
+    assert result == "patched-oauth-token"
+    assert calls == ["token"]

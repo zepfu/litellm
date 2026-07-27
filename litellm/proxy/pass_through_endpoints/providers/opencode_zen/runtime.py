@@ -52,6 +52,7 @@ class Runtime:
     get_anthropic_adapter_model_candidates: Callable[[Payload], list[str]]
     load_local_api_key: Optional[Callable[[], Awaitable[str]]] = None
     raise_candidate_unavailable: Optional[Callable[[Exception], Any]] = None
+    load_candidate_api_key: Optional[Callable[..., Awaitable[str]]] = None
 
 
 _runtime: Optional[Runtime] = None
@@ -186,6 +187,9 @@ def install(host_globals: dict[str, Any]) -> None:
             raise_candidate_unavailable=lambda exc: _host(
                 "_raise_opencode_zen_auto_agent_candidate_unavailable"
             )(exc),
+            load_candidate_api_key=lambda **kwargs: _host(
+                "_load_opencode_zen_api_key_for_candidate"
+            )(**kwargs),
         )
     )
     for name in _HOST_FUNCTION_NAMES:
@@ -311,10 +315,17 @@ async def _build_opencode_zen_headers(
     *,
     use_alias_candidate_probe: bool = False,
 ) -> dict[str, str]:
-    api_key = await _load_opencode_zen_api_key_for_candidate(
-        use_alias_candidate_probe=use_alias_candidate_probe,
-    )
-    return _require_runtime().assemble_headers(
+    runtime = _require_runtime()
+    load_candidate = runtime.load_candidate_api_key
+    if load_candidate is not None:
+        api_key = await load_candidate(
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    else:
+        api_key = await _load_opencode_zen_api_key_for_candidate(
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    return runtime.assemble_headers(
         api_key=api_key,
         request=request,
     )

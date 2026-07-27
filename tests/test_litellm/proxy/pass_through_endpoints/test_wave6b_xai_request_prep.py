@@ -41,8 +41,6 @@ MOVED_SYMBOLS = (
     "_build_grok_native_oauth_headers",
     "_add_grok_native_oauth_metadata",
     "_prepare_grok_native_oauth_passthrough_request",
-    "_rewrite_grok_native_unsupported_input_items_from_request_body",
-    "_rewrite_grok_native_unsupported_input_items_in_place",
 )
 
 EXPECTED_SEAM_DISPOSITION = {

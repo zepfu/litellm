@@ -466,3 +466,51 @@ def test_same_object_fallback_does_not_recurse() -> None:
 
     # Clean up
     del runtime.host_globals["_google_adapter_hidden_retry_metadata"]
+
+
+@pytest.mark.asyncio
+async def test_post_configuration_host_logger_patch_intercepts_terminal_retry_log() -> None:
+    """A host logger patched AFTER configure_google_retry_runtime must
+ intercept _emit_google_adapter_terminal_retry_log calls (late-binding)."""
+
+    calls = 0
+    custom_body: dict[str, Any] = {}
+    terminal_error = _UpstreamError("unavailable", status_code=503)
+
+    async def pass_through_request(**_kwargs: Any) -> Response:
+        nonlocal calls
+        calls += 1
+        raise terminal_error
+
+    _configure_runtime(
+        pass_through_request=pass_through_request,
+        transient_max_attempts=1,
+    )
+
+    # Simulate the production host_globals carrying a logger object.
+    runtime = retry_runtime._require_runtime()
+    assert isinstance(runtime.host_globals, dict)
+
+    class _FakeLogger:
+        def __init__(self) -> None:
+            self.error_calls: list[tuple[Any, ...]] = []
+
+        def error(self, *args: Any, **kwargs: Any) -> None:
+            self.error_calls.append((args, kwargs))
+
+    fake_logger = _FakeLogger()
+    runtime.host_globals["verbose_proxy_logger"] = fake_logger
+
+    try:
+        with pytest.raises(_UpstreamError):
+            await retry_runtime._perform_google_adapter_pass_through_request(
+                custom_body=custom_body,
+            )
+
+        # The late-bound host logger must have been called exactly once.
+        assert len(fake_logger.error_calls) == 1
+        call_args, call_kwargs = fake_logger.error_calls[0]
+        assert "exhausted hidden retries" in call_args[0]
+        assert call_kwargs["exc_info"] is True
+    finally:
+        del runtime.host_globals["verbose_proxy_logger"]

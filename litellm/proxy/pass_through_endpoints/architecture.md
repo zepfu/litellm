@@ -610,6 +610,70 @@ module scope. `persisted_output.py` imports from `providers/google/env_policy`,
 for patterns and caps. `alias_guidance.py` imports from `lane_keys` (policy
 constants) and `aawm_alias_routing/policy` (alias names).
 
+#### Wave 6E request-policy ownership
+
+Wave 6E extracts the remaining request-policy concerns from
+`llm_passthrough_endpoints.py` into three modules under
+`aawm_request_policy/`:
+
+- `codex_tool_policy.py` -- Codex spawn-agent / core-tool description patches,
+  model-capability policy lookups, custom-tool-to-function and namespace-tool
+  adaptation, unsupported hosted-tool / request-param / input-item drops,
+  tool-choice cleanup, and Grok-native input-item policy. 51 owned symbols.
+- `claude_prompt_replacement.py` -- Claude auto-memory section replacement and
+  prompt-patch manifest application, plus their logging-metadata helpers.
+  14 owned symbols.
+- `anthropic_body_prep.py` -- OpenAI-adapter Claude-context compaction,
+  Anthropic tool-block validation / tool-use-id repair, and the final
+  `_prepare_anthropic_request_body_for_passthrough` orchestration.
+  11 owned symbols.
+
+Total: 76 functions. No symbol is owned by more than one Wave 6E module, and
+no Wave 6E symbol overlaps a Wave 4, 6A, or 6D inventory symbol.
+
+**Facade model.** Two facade styles coexist on the god module:
+
+- *Same-object facades* (34): the 14 `claude_prompt_replacement` symbols, the
+  11 `anthropic_body_prep` symbols, and 9 pure `codex_tool_policy` helpers with
+  no external dependency are bound by direct assignment
+  (`_name = _aawm_<module>._name`). These are `is`-identical to the module
+  definitions and are NOT `FunctionDef`s in the god module.
+- *Thin callback wrappers* (42): the dependency-injecting `codex_tool_policy`
+  functions are exposed as small god-module `FunctionDef`s that bind the shared
+  `_CODEX_TOOL_POLICY_CALLBACKS` (or `_normalize_low_cardinality_tag_value`)
+  and delegate. These remain `FunctionDef`s by design; they are compatibility
+  wrappers, not owned logic.
+
+`_extract_openai_passthrough_tool_choice` stays Wave 6D
+`observability_metadata`-owned; Wave 6E does not shadow it.
+
+**Callback seams and configuration order.** Wave 6E is configured after all of
+Wave 6D. `codex_tool_policy` builds `_CODEX_TOOL_POLICY_CALLBACKS` from the
+already-configured observability callbacks (`_normalize_low_cardinality_tag_value`,
+`_dedupe_sorted_str_list`, `_merge_litellm_metadata`,
+`_build_langfuse_span_descriptor`) plus live host-global model/xai/grok
+resolvers. `anthropic_body_prep.configure_anthropic_body_prep_runtime(...)` is
+then called with the live host callbacks for the non-owned orchestration steps
+(persisted-output expansion, billing headers, control-plane rewrites, dynamic
+directives, post-rewrite context metadata, web-search sanitization,
+observability, tenant header). The owned preparation order inside
+`_prepare_anthropic_request_body_for_passthrough` is: persisted-output
+expansion; billing headers; control-plane rewrites; dynamic directives;
+post-rewrite context metadata; web-search sanitization; child-agent
+observability; billing/route/request-breakout/passthrough metadata; tool-use-id
+repair; tool-block validation.
+
+**Import boundary.** No Wave 6E module imports `llm_passthrough_endpoints` at
+module scope. `claude_prompt_replacement.py` and `anthropic_body_prep.py` import
+shared metadata primitives directly from `observability_metadata`.
+`anthropic_body_prep.py` additionally imports auth/shaping helpers from
+`aawm_alias_routing`. `codex_tool_policy.py` takes every external dependency
+through `CodexToolPolicyCallbacks` and imports no provider or god module.
+
+Wave 6E does not claim Wave 6F ownership: provider calls, candidate calls,
+dispatch gates, route-pair delegates, the OpenCode wrapper, native Anthropic
+routes, and the aawm.2/aawm.5 patches remain in the god module / Wave 6F scope.
+
 ### Runtime invariants
 
 - Durable Redis keys use

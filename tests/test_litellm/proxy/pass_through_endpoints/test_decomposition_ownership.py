@@ -1422,7 +1422,6 @@ WAVE6D_OBSERVABILITY_METADATA_SYMBOLS: set[str] = {
     "_build_passthrough_tool_definition_metadata",
     "_add_passthrough_tool_definition_metadata",
     "_prepare_request_body_for_passthrough_observability",
-    "_extract_openai_passthrough_tool_choice",
     "_extract_claude_request_breakout_fields",
     "_add_claude_request_breakout_logging_metadata",
     "_extract_gemini_request_breakout_fields",
@@ -1435,6 +1434,7 @@ WAVE6D_OBSERVABILITY_METADATA_SYMBOLS: set[str] = {
     "_add_anthropic_billing_header_logging_metadata",
     "_add_claude_persisted_output_logging_metadata",
     "_add_route_family_logging_metadata",
+    "_extract_openai_passthrough_tool_choice",
 }
 
 WAVE6D_ALIAS_GUIDANCE_SYMBOLS: set[str] = {
@@ -1655,3 +1655,343 @@ class TestWave6DRequestPolicyOwnership:
         overlap = ALL_WAVE6D_FUNCTIONS & prior
         # _estimate_google_content_text_chars was removed from env_policy
         assert not overlap, f"Wave 6D overlaps prior waves: {sorted(overlap)}"
+
+
+# ===========================================================================
+# SECTION 10: Wave 6E request-policy ownership and facade identity
+# ===========================================================================
+
+WAVE6E_MODULE_ORDER: tuple[str, ...] = (
+    "codex_tool_policy",
+    "claude_prompt_replacement",
+    "anthropic_body_prep",
+)
+WAVE6E_MODULE_IMPORT_PATHS: dict[str, str] = {
+    name: (
+        "litellm.proxy.pass_through_endpoints.aawm_request_policy."
+        f"{name}"
+    )
+    for name in WAVE6E_MODULE_ORDER
+}
+WAVE6E_EXPECTED_COUNTS: dict[str, int] = {
+    "codex_tool_policy": 51,
+    "claude_prompt_replacement": 14,
+    "anthropic_body_prep": 11,
+}
+
+WAVE6E_CODEX_TOOL_POLICY_SYMBOLS: set[str] = {
+    "_patch_codex_spawn_agent_description_text",
+    "_get_codex_core_tool_guidance",
+    "_append_codex_core_tool_guidance_to_description",
+    "_patch_codex_spawn_agent_payload_parameters",
+    "_get_openai_tool_name",
+    "_get_openai_tool_type",
+    "_load_bundled_model_cost_map_for_codex_policy",
+    "_get_codex_tool_policy_model_cost_candidates",
+    "_get_unsupported_hosted_tool_types_for_model",
+    "_get_unsupported_request_param_names_for_model",
+    "_get_unsupported_input_item_types_for_model",
+    "_get_rewrite_input_item_types_for_model",
+    "_get_custom_tool_function_adapter_names_for_model",
+    "_get_namespace_tool_function_adapter_names_for_model",
+    "_adapted_custom_tool_function_schema",
+    "_adapt_codex_custom_tool_definitions",
+    "_adapted_custom_tool_call_ids",
+    "_adapt_codex_custom_tool_input_items",
+    "_adapt_codex_custom_tool_choice",
+    "_add_codex_custom_tool_function_adapter_logging_metadata",
+    "_adapt_codex_custom_tools_to_functions_from_request_body",
+    "_adapt_codex_namespace_tool_definitions",
+    "_adapt_codex_namespace_input_items",
+    "_adapt_codex_namespace_tool_choice",
+    "_add_codex_namespace_tool_function_adapter_logging_metadata",
+    "_adapt_codex_namespace_tools_to_functions_from_request_body",
+    "_openai_tool_choice_references_tool_type",
+    "_add_codex_unsupported_hosted_tool_logging_metadata",
+    "_request_has_openai_tool_definitions",
+    "_add_tool_choice_without_tools_logging_metadata",
+    "_drop_tool_choice_without_tools_from_request_body",
+    "_add_codex_unsupported_request_param_logging_metadata",
+    "_drop_unsupported_codex_request_params_from_request_body",
+    "_add_codex_unsupported_input_item_logging_metadata",
+    "_drop_unsupported_codex_input_items_from_request_body",
+    "_stringify_grok_native_input_item_value",
+    "_format_grok_native_function_call_input_message",
+    "_format_grok_native_function_call_output_input_message",
+    "_rewrite_grok_native_input_item_for_model_input",
+    "_is_anthropic_grok_native_responses_adapter_body",
+    "_add_grok_native_input_item_rewrite_logging_metadata",
+    "_drop_unsupported_codex_hosted_tools_from_request_body",
+    "_patch_codex_spawn_agent_tool_description",
+    "_patch_codex_multi_agent_tool_search_description",
+    "_patch_codex_core_tool_description",
+    "_add_codex_tool_description_patch_logging_metadata",
+    "_apply_codex_tool_description_patches_to_request_body",
+    "_rewrite_grok_native_unsupported_input_items_from_request_body",
+    "_rewrite_grok_native_unsupported_input_items_in_place",
+    "_apply_spawn_agent_parameter_patches",
+    "_lookup_model_info_field",
+}
+
+WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS: set[str] = {
+    "_parse_claude_code_version",
+    "_resolve_claude_auto_memory_template_path",
+    "_load_claude_context_replacement_template",
+    "_load_claude_prompt_patch_manifest",
+    "_extract_markdown_section",
+    "_render_claude_auto_memory_replacement",
+    "_replace_claude_auto_memory_section_in_text",
+    "_replace_claude_system_prompt_override_in_value",
+    "_add_claude_system_prompt_override_logging_metadata",
+    "_replace_claude_system_prompt_in_anthropic_request_body",
+    "_apply_claude_prompt_patches_in_text",
+    "_replace_claude_prompt_patches_in_value",
+    "_add_claude_prompt_patch_logging_metadata",
+    "_apply_claude_prompt_patches_to_anthropic_request_body",
+}
+
+WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS: set[str] = {
+    "_get_openai_adapter_claude_context_char_cap",
+    "_detect_openai_adapter_claude_context_markers",
+    "_select_openai_adapter_context_summary_lines",
+    "_build_openai_adapter_compacted_claude_context_block",
+    "_compact_openai_adapter_claude_context_text",
+    "_compact_openai_adapter_claude_context_value",
+    "_add_openai_adapter_claude_context_compaction_logging_metadata",
+    "_compact_openai_adapter_claude_context_in_anthropic_request_body",
+    "_validate_anthropic_tool_blocks_for_passthrough",
+    "_repair_anthropic_tool_use_ids_for_passthrough",
+    "_prepare_anthropic_request_body_for_passthrough",
+}
+
+WAVE6E_SYMBOL_INVENTORY: dict[str, set[str]] = {
+    "codex_tool_policy": WAVE6E_CODEX_TOOL_POLICY_SYMBOLS,
+    "claude_prompt_replacement": WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS,
+    "anthropic_body_prep": WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS,
+}
+
+ALL_WAVE6E_FUNCTIONS: set[str] = set()
+for _syms in WAVE6E_SYMBOL_INVENTORY.values():
+    ALL_WAVE6E_FUNCTIONS |= _syms
+
+
+class TestWave6ERequestPolicyOwnership:
+    """Wave 6E structural ownership: 76 functions across 3 modules."""
+
+    @staticmethod
+    def _modules() -> dict[str, object]:
+        return {
+            name: importlib.import_module(import_path)
+            for name, import_path in WAVE6E_MODULE_IMPORT_PATHS.items()
+        }
+
+    def test_exact_77_symbol_union_without_duplicate_ownership(self):
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+
+        for module_name in WAVE6E_MODULE_ORDER:
+            symbols = WAVE6E_SYMBOL_INVENTORY[module_name]
+            assert len(symbols) == WAVE6E_EXPECTED_COUNTS[module_name], (
+                f"{module_name}: expected {WAVE6E_EXPECTED_COUNTS[module_name]}, "
+                f"got {len(symbols)}"
+            )
+            for symbol in symbols:
+                if symbol in seen:
+                    duplicates.append(
+                        f"{symbol}: {seen[symbol]} and {module_name}"
+                    )
+                seen[symbol] = module_name
+
+        assert len(seen) == 76
+        assert not duplicates
+
+    # Same-object facades: these must NOT be FunctionDefs in the god module.
+    # 14 claude_prompt_replacement + 11 anthropic_body_prep + 9 pure codex.
+    WAVE6E_SAME_OBJECT_SYMBOLS: set[str] = (
+        WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS
+        | WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS
+        | {
+            "_get_openai_tool_name",
+            "_get_openai_tool_type",
+            "_patch_codex_spawn_agent_description_text",
+            "_patch_codex_spawn_agent_payload_parameters",
+            "_load_bundled_model_cost_map_for_codex_policy",
+            "_adapted_custom_tool_function_schema",
+            "_request_has_openai_tool_definitions",
+            "_apply_spawn_agent_parameter_patches",
+            "_lookup_model_info_field",
+        }
+    )
+
+    # Thin callback wrappers: these ARE intentional FunctionDefs in the god
+    # module (they bind CodexToolPolicyCallbacks or normalize_tag_value).
+    WAVE6E_WRAPPER_SYMBOLS: set[str] = (
+        WAVE6E_CODEX_TOOL_POLICY_SYMBOLS - WAVE6E_SAME_OBJECT_SYMBOLS
+    )
+
+    def test_same_object_facades_not_function_defs(self):
+        """34 same-object facades must not be FunctionDefs in the god module."""
+        func_defs = _top_level_function_defs(_parse_god_module())
+        violations = self.WAVE6E_SAME_OBJECT_SYMBOLS & func_defs
+        assert not violations, (
+            f"Wave 6E same-object facades defined as FunctionDefs: "
+            f"{sorted(violations)}"
+        )
+
+    def test_wrapper_facades_are_function_defs(self):
+        """42 codex callback wrappers are intentional FunctionDefs."""
+        func_defs = _top_level_function_defs(_parse_god_module())
+        missing = self.WAVE6E_WRAPPER_SYMBOLS - func_defs
+        assert not missing, (
+            f"Wave 6E wrapper facades missing as FunctionDefs: {sorted(missing)}"
+        )
+
+    def test_all_wave6e_symbols_accessible(self):
+        """All 76 Wave 6E symbols are callable on the god module."""
+        for symbol in ALL_WAVE6E_FUNCTIONS:
+            facade = getattr(lpe, symbol, None)
+            assert facade is not None, f"{symbol} not on god module"
+            assert callable(facade), f"{symbol} not callable"
+
+    def test_claude_prompt_replacement_same_object_identity(self):
+        """claude_prompt_replacement facades are same-object assignments."""
+        mod = importlib.import_module(WAVE6E_MODULE_IMPORT_PATHS["claude_prompt_replacement"])
+        for symbol in WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS:
+            facade = getattr(lpe, symbol)
+            module_fn = getattr(mod, symbol)
+            assert facade is module_fn, (
+                f"claude_prompt_replacement.{symbol}: facade identity mismatch"
+            )
+
+    def test_anthropic_body_prep_same_object_identity(self):
+        """anthropic_body_prep facades are same-object assignments."""
+        mod = importlib.import_module(WAVE6E_MODULE_IMPORT_PATHS["anthropic_body_prep"])
+        for symbol in WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS:
+            facade = getattr(lpe, symbol)
+            module_fn = getattr(mod, symbol)
+            assert facade is module_fn, (
+                f"anthropic_body_prep.{symbol}: facade identity mismatch"
+            )
+
+    def test_codex_tool_policy_pure_function_identity(self):
+        """codex_tool_policy pure functions (no callbacks) are same-object."""
+        mod = importlib.import_module(WAVE6E_MODULE_IMPORT_PATHS["codex_tool_policy"])
+        pure_symbols = {
+            "_get_openai_tool_name",
+            "_get_openai_tool_type",
+            "_patch_codex_spawn_agent_description_text",
+            "_patch_codex_spawn_agent_payload_parameters",
+            "_load_bundled_model_cost_map_for_codex_policy",
+            "_adapted_custom_tool_function_schema",
+            "_request_has_openai_tool_definitions",
+            "_apply_spawn_agent_parameter_patches",
+            "_lookup_model_info_field",
+        }
+        for symbol in pure_symbols:
+            facade = getattr(lpe, symbol)
+            # Map god-module name to module name (strip leading _)
+            module_name = symbol.lstrip("_")
+            module_fn = getattr(mod, module_name, None) or getattr(mod, symbol, None)
+            assert module_fn is not None, f"{module_name} not on codex_tool_policy"
+            assert facade is module_fn, (
+                f"codex_tool_policy.{symbol}: facade identity mismatch"
+            )
+
+    def test_no_wave6e_module_imports_god_module_at_scope(self):
+        for module_name, import_path in WAVE6E_MODULE_IMPORT_PATHS.items():
+            mod = importlib.import_module(import_path)
+            mod_path = Path(mod.__file__).resolve()
+            tree = ast.parse(mod_path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    assert all(
+                        "llm_passthrough_endpoints" not in alias.name
+                        for alias in node.names
+                    ), f"{module_name} imports god module"
+                elif isinstance(node, ast.ImportFrom):
+                    assert (
+                        node.module is None
+                        or "llm_passthrough_endpoints" not in node.module
+                    ), f"{module_name} imports from god module"
+
+    def test_callback_and_install_ordering(self):
+        """God module configures Wave 6D first, then Wave 6E body prep."""
+        tree = _parse_god_module()
+        configure_lines: dict[str, int] = {}
+
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+            ):
+                if (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_aawm_observability_metadata"
+                    and node.func.attr == "configure_observability_metadata_runtime"
+                ):
+                    configure_lines["observability"] = node.lineno
+                elif (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_aawm_persisted_output"
+                    and node.func.attr == "install"
+                ):
+                    configure_lines["persisted_output"] = node.lineno
+                elif (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_aawm_alias_guidance"
+                    and node.func.attr == "configure_alias_guidance_runtime"
+                ):
+                    configure_lines["alias_guidance"] = node.lineno
+                elif (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_aawm_anthropic_body_prep"
+                    and node.func.attr == "configure_anthropic_body_prep_runtime"
+                ):
+                    configure_lines["anthropic_body_prep"] = node.lineno
+
+        assert "observability" in configure_lines
+        assert "persisted_output" in configure_lines
+        assert "alias_guidance" in configure_lines
+        assert "anthropic_body_prep" in configure_lines
+        # Wave 6D before Wave 6E
+        assert configure_lines["observability"] < configure_lines["anthropic_body_prep"]
+        assert configure_lines["persisted_output"] < configure_lines["anthropic_body_prep"]
+        assert configure_lines["alias_guidance"] < configure_lines["anthropic_body_prep"]
+
+    def test_no_cross_wave6e_duplicates(self):
+        """Each Wave 6E symbol appears in exactly one module."""
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+        for module_key, symbols in WAVE6E_SYMBOL_INVENTORY.items():
+            for sym in symbols:
+                if sym in seen:
+                    duplicates.append(f"{sym} in both {seen[sym]} and {module_key}")
+                else:
+                    seen[sym] = module_key
+        assert not duplicates
+
+    def test_no_overlap_with_prior_wave_inventories(self):
+        """Wave 6E symbols do not overlap with Wave 4, 6A, or 6D inventories."""
+        prior = ALL_MOVED_FUNCTIONS | ALL_RESTORED_CONSTANTS | ALL_WAVE6D_FUNCTIONS
+        overlap = ALL_WAVE6E_FUNCTIONS & prior
+        assert not overlap, f"Wave 6E overlaps prior waves: {sorted(overlap)}"
+
+    def test_codex_tool_policy_callbacks_bound(self):
+        """_CODEX_TOOL_POLICY_CALLBACKS is constructed in the god module."""
+        assert hasattr(lpe, "_CODEX_TOOL_POLICY_CALLBACKS")
+        from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+            CodexToolPolicyCallbacks,
+        )
+        assert isinstance(lpe._CODEX_TOOL_POLICY_CALLBACKS, CodexToolPolicyCallbacks)
+
+    def test_anthropic_body_prep_callbacks_configured(self):
+        """configure_anthropic_body_prep_runtime has been called with live callbacks."""
+        from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+            anthropic_body_prep as abp,
+        )
+        # After configuration, the module-level callback slots are not None
+        assert abp._expand_persisted_output is not None
+        assert abp._extract_billing_header_fields is not None
+        assert abp._apply_control_plane_rewrites is not None
+        assert abp._prepare_observability is not None
+        assert abp._get_tenant_header is not None

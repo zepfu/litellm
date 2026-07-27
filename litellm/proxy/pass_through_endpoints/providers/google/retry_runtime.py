@@ -92,6 +92,22 @@ def _runtime_function(
     return fallback
 
 
+def _resolve_host_log_error() -> Callable[..., None]:
+    """Resolve the current host ``verbose_proxy_logger.error`` at call time.
+
+    Falls back to the configuration-time ``runtime.log_error`` when the host
+    globals do not carry a usable logger.  This ensures that post-configuration
+    patches (e.g. ``unittest.mock.patch`` of ``verbose_proxy_logger.error``)
+    are intercepted without importing the god module.
+    """
+
+    runtime = _require_runtime()
+    logger = runtime.host_globals.get("verbose_proxy_logger")
+    if logger is not None and callable(getattr(logger, "error", None)):
+        return logger.error  # type: ignore[attr-defined]
+    return runtime.log_error
+
+
 def _get_google_adapter_semaphore(
     model: Optional[str] = None,
     *,
@@ -233,12 +249,32 @@ def _log_google_adapter_terminal_transient_failure(
     status_code: Optional[int],
     failure_classification: Optional[str],
 ) -> None:
+    _runtime_function(
+        "_emit_google_adapter_terminal_retry_log",
+        _emit_google_adapter_terminal_retry_log,
+    )(
+        passthrough_kwargs,
+        exc=exc,
+        status_code=status_code,
+        failure_classification=failure_classification,
+    )
+
+
+def _emit_google_adapter_terminal_retry_log(
+    passthrough_kwargs: dict[str, Any],
+    *,
+    exc: Any,
+    status_code: Optional[int],
+    failure_classification: Optional[str],
+) -> None:
+    """Emit the terminal retry-exhaustion error log via live host logger."""
+
     runtime = _require_runtime()
     metadata = _runtime_function(
         "_google_adapter_hidden_retry_metadata",
         _google_adapter_hidden_retry_metadata,
     )(passthrough_kwargs)
-    runtime.log_error(
+    _resolve_host_log_error()(
         (
             "Google adapter exhausted hidden retries for transient upstream "
             "failure status=%s error=%s final_outcome=%s retry_count=%s"
