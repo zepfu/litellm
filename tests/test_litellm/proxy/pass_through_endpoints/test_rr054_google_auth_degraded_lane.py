@@ -20,6 +20,15 @@ import pytest
 from fastapi import HTTPException, Request
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    lane_keys,
+    openrouter_quota,
+    policy,
+    selection,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    alias_routing_state,
+)
 
 
 def _minimal_request(path: str = "/v1/responses") -> Request:
@@ -53,7 +62,7 @@ def _stale_antigravity_oauth_http_exception() -> HTTPException:
 
 def _antigravity_candidate_template() -> dict[str, Any]:
     return {
-        "provider": lpe._CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
+        "provider": policy.CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
         "model": "gemini-3-flash",
         "route_family": "codex_antigravity_code_assist_adapter",
         "last_resort": False,
@@ -62,14 +71,14 @@ def _antigravity_candidate_template() -> dict[str, Any]:
 
 def _reset_google_lane_negative_cache() -> None:
     """Best-effort reset of the google-lane negative cache across ownership seams."""
-    lpe._alias_routing_state.google_lane_negative_until_monotonic = 0.0
-    lpe._codex_auto_agent_google_lane_key_by_key.clear()
-    lpe._codex_auto_agent_google_lane_key_until_monotonic_by_key.clear()
+    alias_routing_state.google_lane_negative_until_monotonic = 0.0
+    alias_routing_state.google_lane_key_by_key.clear()
+    alias_routing_state.google_lane_key_until_monotonic_by_key.clear()
 
 
 def _reset_antigravity_lane_cache() -> None:
-    lpe._codex_auto_agent_antigravity_lane_key_by_key.clear()
-    lpe._codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.clear()
+    alias_routing_state.antigravity_lane_key_by_key.clear()
+    alias_routing_state.antigravity_lane_key_until_monotonic_by_key.clear()
     if hasattr(lpe, "_codex_auto_agent_antigravity_auth_degraded_log_until_monotonic"):
         lpe._codex_auto_agent_antigravity_auth_degraded_log_until_monotonic = 0.0
 
@@ -130,7 +139,7 @@ async def test_rr054_google_lane_negative_cache_suppresses_second_resolve_call()
     )
     # Negative-cache TTL should still be active after the first failure.
     assert (
-        lpe._alias_routing_state.google_lane_negative_until_monotonic
+        alias_routing_state.google_lane_negative_until_monotonic
         > time.monotonic()
     )
 
@@ -211,7 +220,7 @@ async def test_rr054_antigravity_auth_degraded_lane_state_forces_cooldown_fields
     assert state["failure_phase"] == "auth"
     assert state["attempted_provider_call"] is False
     assert state["forced_cooldown_seconds"] == pytest.approx(
-        lpe._CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
+        selection._CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
     )
     assert state["forced_cooldown_seconds"] == pytest.approx(5 * 60.0)
 
@@ -224,13 +233,13 @@ async def test_rr054_antigravity_auth_degraded_candidate_state_is_unavailable() 
     candidate = _antigravity_candidate_template()
     auth_degraded_lane_state = {
         "lane_key": lpe._CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY,
-        "forced_cooldown_seconds": lpe._CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS,
+        "forced_cooldown_seconds": selection._CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS,
         "skip_reason": "auth_degraded",
         "cooldown_state_source": "auth_degraded",
         "failure_phase": "auth",
         "attempted_provider_call": False,
     }
-    expected_cooldown_key = lpe._codex_auto_agent_candidate_key(
+    expected_cooldown_key = lane_keys._codex_auto_agent_candidate_key(
         candidate,
         lpe._CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY,
     )
@@ -257,7 +266,7 @@ async def test_rr054_antigravity_auth_degraded_candidate_state_is_unavailable() 
 
     with patch.object(
         lpe,
-        "_get_codex_auto_agent_active_cooldown_state",
+        "_get_codex_active_cooldown_state",
         new=AsyncMock(return_value=(0.0, "local_fallback")),
     ), patch.object(
         lpe,
@@ -276,7 +285,7 @@ async def test_rr054_antigravity_auth_degraded_candidate_state_is_unavailable() 
         "_apply_codex_auto_agent_forced_candidate_cooldown",
         new=AsyncMock(),
     ) as forced_cd:
-        state = await lpe._build_codex_auto_agent_candidate_state(
+        state = await selection._build_codex_auto_agent_candidate_state(
             request,
             candidate_template=candidate,
             antigravity_lane_state=auth_degraded_lane_state,
@@ -289,14 +298,14 @@ async def test_rr054_antigravity_auth_degraded_candidate_state_is_unavailable() 
     assert state["failure_phase"] == "auth"
     assert state["attempted_provider_call"] is False
     assert state["cooldown_seconds"] == pytest.approx(
-        lpe._CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
+        selection._CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
     )
-    assert lpe._is_auto_agent_candidate_state_available(state) is False
+    assert selection._is_auto_agent_candidate_state_available(state) is False
     forced_cd.assert_awaited_once()
     forced_kwargs = forced_cd.await_args.kwargs
     assert forced_kwargs["cooldown_key"] == expected_cooldown_key
     assert forced_kwargs["cooldown_seconds"] == pytest.approx(
-        lpe._CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
+        selection._CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
     )
 
 

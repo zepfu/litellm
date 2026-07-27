@@ -12,7 +12,18 @@ from starlette.responses import Response
 from litellm.proxy.pass_through_endpoints import (
     llm_passthrough_endpoints as lpe,
 )
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing import policy
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    cooldown_apply,
+    cooldown_state,
+    attempt_records,
+    durable,
+    error_signals,
+    policy,
+    selection,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    alias_routing_state,
+)
 
 
 class _FakeDurableAliasCache:
@@ -85,19 +96,19 @@ def _anthropic_body(alias: str, *, continuation: bool = False) -> dict[str, Any]
 
 @pytest.fixture(autouse=True)
 def _reset_moonshot_alias_state() -> None:
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+    alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.codex.session_affinity_by_key.clear()
+    alias_routing_state.anthropic.session_affinity_by_key.clear()
     yield
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+    alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.codex.session_affinity_by_key.clear()
+    alias_routing_state.anthropic.session_affinity_by_key.clear()
 
 
 def test_should_keep_the_complete_moonshot_alias_order_and_only_one_cross_ingress_alias() -> None:
@@ -162,13 +173,13 @@ def test_should_keep_the_complete_moonshot_alias_order_and_only_one_cross_ingres
 @pytest.mark.asyncio
 async def test_should_select_k3_high_after_forced_spark_cooldown_for_both_code_ingresses() -> None:
     spark_key = "openai:gpt-5.3-codex-spark:__default__"
-    await lpe._set_codex_auto_agent_cooldown(spark_key, 60.0)
+    await cooldown_state._set_codex_auto_agent_cooldown(spark_key, 60.0)
 
-    codex_selection = await lpe._select_codex_auto_agent_candidate(
+    codex_selection = await selection._select_codex_auto_agent_candidate(
         request=_request("/v1/responses"),
         request_body=_codex_body("aawm-code"),
     )
-    anthropic_selection = await lpe._select_anthropic_auto_agent_candidate(
+    anthropic_selection = await selection._select_anthropic_auto_agent_candidate(
         request=_request("/v1/messages"),
         request_body=_anthropic_body("aawm-code-anthropic"),
     )
@@ -182,29 +193,29 @@ async def test_should_select_k3_high_after_forced_spark_cooldown_for_both_code_i
 @pytest.mark.asyncio
 async def test_should_preserve_sota_moonshot_continuation_affinity_per_ingress() -> None:
     codex_request = _request("/v1/responses")
-    codex_initial = await lpe._select_codex_auto_agent_candidate(
+    codex_initial = await selection._select_codex_auto_agent_candidate(
         request=codex_request,
         request_body=_codex_body("aawm-sota-moonshot"),
     )
-    await lpe._set_codex_auto_agent_session_affinity(
+    await cooldown_state._set_codex_auto_agent_session_affinity(
         codex_initial["session_key"],
         codex_initial["candidate"],
     )
-    codex_continuation = await lpe._select_codex_auto_agent_candidate(
+    codex_continuation = await selection._select_codex_auto_agent_candidate(
         request=codex_request,
         request_body=_codex_body("aawm-sota-moonshot", continuation=True),
     )
 
     anthropic_request = _request("/v1/messages")
-    anthropic_initial = await lpe._select_anthropic_auto_agent_candidate(
+    anthropic_initial = await selection._select_anthropic_auto_agent_candidate(
         request=anthropic_request,
         request_body=_anthropic_body("aawm-sota-moonshot"),
     )
-    await lpe._set_anthropic_auto_agent_session_affinity(
+    await cooldown_state._set_anthropic_auto_agent_session_affinity(
         anthropic_initial["session_key"],
         anthropic_initial["candidate"],
     )
-    anthropic_continuation = await lpe._select_anthropic_auto_agent_candidate(
+    anthropic_continuation = await selection._select_anthropic_auto_agent_candidate(
         request=anthropic_request,
         request_body=_anthropic_body("aawm-sota-moonshot", continuation=True),
     )
@@ -217,7 +228,7 @@ async def test_should_preserve_sota_moonshot_continuation_affinity_per_ingress()
 
 @pytest.mark.asyncio
 async def test_should_not_retry_bounded_kimi_invalid_request_for_continuation() -> None:
-    await lpe._set_codex_auto_agent_cooldown(
+    await cooldown_state._set_codex_auto_agent_cooldown(
         "openai:gpt-5.3-codex-spark:__default__",
         60.0,
     )
@@ -271,11 +282,15 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
     exact_reset_seconds = 17.0
 
     with patch.object(
+        durable,
+        "get_aawm_alias_routing_dual_cache",
+        return_value=cache,
+    ), patch.object(
         lpe,
         "_get_aawm_alias_routing_dual_cache",
         return_value=cache,
     ):
-        scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
+        scope = await cooldown_apply._set_codex_auto_agent_candidate_cooldowns(
             request=_request("/v1/responses"),
             candidate=kimi_candidate,
             lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
@@ -286,12 +301,12 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
         )
         assert scope == "managed_account"
 
-        managed_key = lpe._get_kimi_code_managed_account_cooldown_key()
-        assert await lpe._get_codex_auto_agent_active_cooldown_seconds(managed_key) > 0
-        lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-        lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
+        managed_key = error_signals._get_kimi_code_managed_account_cooldown_key()
+        assert await cooldown_state._get_codex_auto_agent_active_cooldown_seconds(managed_key) > 0
+        alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+        alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
 
-        highspeed_state = await lpe._build_codex_auto_agent_candidate_state(
+        highspeed_state = await selection._build_codex_auto_agent_candidate_state(
             _request("/v1/responses"),
             candidate_template={
                 "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
@@ -300,7 +315,7 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
                 "last_resort": False,
             },
         )
-        standard_state = await lpe._build_anthropic_auto_agent_candidate_state(
+        standard_state = await selection._build_anthropic_auto_agent_candidate_state(
             _request("/v1/messages"),
             candidate_template={
                 "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
@@ -315,17 +330,17 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
         assert highspeed_state["cooldown_scope"] == "managed_account"
         assert standard_state["cooldown_scope"] == "managed_account"
 
-        await lpe._set_codex_auto_agent_cooldown(
+        await cooldown_state._set_codex_auto_agent_cooldown(
             "openai:gpt-5.3-codex-spark:__default__",
             exact_reset_seconds,
         )
-        selection = await lpe._select_codex_auto_agent_candidate(
+        selection_result = await selection._select_codex_auto_agent_candidate(
             request=_request("/v1/responses"),
             request_body=_codex_body("aawm-code"),
         )
 
-    assert selection["candidate"]["model"] == "xai/grok-4.5"
-    skipped_kimi = next(item for item in selection["skipped"] if item["model"] == "kimi_code/k3-high")
+    assert selection_result["candidate"]["model"] == "xai/grok-4.5"
+    skipped_kimi = next(item for item in selection_result["skipped"] if item["model"] == "kimi_code/k3-high")
     assert skipped_kimi["cooldown_scope"] == "managed_account"
     assert skipped_kimi["cooldown_seconds"] <= exact_reset_seconds
     assert skipped_kimi["cooldown_seconds"] > exact_reset_seconds - 2.0
@@ -345,7 +360,7 @@ async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malform
         "trace_id": "kimi-trace_019",
         "reset_reason": "unsupported_effort",
     }
-    scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
+    scope = await cooldown_apply._set_codex_auto_agent_candidate_cooldowns(
         request=_request("/v1/responses"),
         candidate=candidate,
         lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
@@ -356,9 +371,9 @@ async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malform
     )
 
     assert scope == "candidate"
-    assert await lpe._get_codex_auto_agent_active_cooldown_seconds(candidate_key) > 0
+    assert await cooldown_state._get_codex_auto_agent_active_cooldown_seconds(candidate_key) > 0
     assert (
-        await lpe._get_codex_auto_agent_active_cooldown_seconds(lpe._get_kimi_code_managed_account_cooldown_key()) == 0
+        await cooldown_state._get_codex_auto_agent_active_cooldown_seconds(error_signals._get_kimi_code_managed_account_cooldown_key()) == 0
     )
 
     malformed_metadata = {
@@ -370,7 +385,7 @@ async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malform
         "trace_id": "kimi-trace_020",
         "reset_reason": "malformed_provider_response",
     }
-    malformed_scope = await lpe._set_codex_auto_agent_candidate_cooldowns(
+    malformed_scope = await cooldown_apply._set_codex_auto_agent_candidate_cooldowns(
         request=_request("/v1/responses"),
         candidate={
             "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
@@ -387,7 +402,7 @@ async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malform
 
     assert malformed_scope == "none"
     assert (
-        await lpe._get_codex_auto_agent_active_cooldown_seconds(
+        await cooldown_state._get_codex_auto_agent_active_cooldown_seconds(
             "kimi_code:kimi_code/kimi-for-coding:kimi_code_managed_account"
         )
         == 0
@@ -410,11 +425,11 @@ def test_should_record_allowlisted_kimi_selection_telemetry_without_secrets() ->
     setattr(exc, "kimi_code_probe_failure_metadata", metadata)
     attempt: dict[str, Any] = {}
 
-    safe_metadata = lpe._get_safe_kimi_code_probe_failure_metadata(
+    safe_metadata = error_signals._get_safe_kimi_code_probe_failure_metadata(
         exc,
         candidate=candidate,
     )
-    lpe._update_codex_auto_agent_retryable_attempt_record(
+    attempt_records._update_codex_auto_agent_retryable_attempt_record(
         attempt_record=attempt,
         exc=exc,
         error_class="kimi_code_managed_account",

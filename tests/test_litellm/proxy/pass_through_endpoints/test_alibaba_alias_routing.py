@@ -5,10 +5,14 @@ from typing import Any
 import pytest
 from starlette.requests import Request
 
-from litellm.proxy.pass_through_endpoints import (
-    llm_passthrough_endpoints as lpe,
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    cooldown_state,
+    policy,
+    selection,
 )
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing import policy
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    alias_routing_state,
+)
 
 
 def _request(path: str) -> Request:
@@ -63,19 +67,19 @@ def _anthropic_body(alias: str, *, continuation: bool = False) -> dict[str, Any]
 
 @pytest.fixture(autouse=True)
 def _reset_alibaba_alias_state() -> None:
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+    alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.codex.session_affinity_by_key.clear()
+    alias_routing_state.anthropic.session_affinity_by_key.clear()
     yield
-    lpe._codex_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._anthropic_auto_agent_cooldown_negative_until_monotonic_by_key.clear()
-    lpe._codex_auto_agent_session_affinity_by_key.clear()
-    lpe._anthropic_auto_agent_session_affinity_by_key.clear()
+    alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
+    alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
+    alias_routing_state.codex.session_affinity_by_key.clear()
+    alias_routing_state.anthropic.session_affinity_by_key.clear()
 
 
 def test_should_register_all_alibaba_aliases_for_both_ingresses() -> None:
@@ -121,29 +125,29 @@ def test_should_place_qwen_flash_immediately_before_kimi_and_terminal_fallback()
 @pytest.mark.asyncio
 async def test_should_preserve_alibaba_continuation_affinity_per_ingress() -> None:
     codex_request = _request("/v1/responses")
-    codex_initial = await lpe._select_codex_auto_agent_candidate(
+    codex_initial = await selection._select_codex_auto_agent_candidate(
         request=codex_request,
         request_body=_codex_body("aawm-sota-alibaba"),
     )
-    await lpe._set_codex_auto_agent_session_affinity(
+    await cooldown_state._set_codex_auto_agent_session_affinity(
         codex_initial["session_key"],
         codex_initial["candidate"],
     )
-    codex_continuation = await lpe._select_codex_auto_agent_candidate(
+    codex_continuation = await selection._select_codex_auto_agent_candidate(
         request=codex_request,
         request_body=_codex_body("aawm-sota-alibaba", continuation=True),
     )
 
     anthropic_request = _request("/v1/messages")
-    anthropic_initial = await lpe._select_anthropic_auto_agent_candidate(
+    anthropic_initial = await selection._select_anthropic_auto_agent_candidate(
         request=anthropic_request,
         request_body=_anthropic_body("aawm-sota-alibaba"),
     )
-    await lpe._set_anthropic_auto_agent_session_affinity(
+    await cooldown_state._set_anthropic_auto_agent_session_affinity(
         anthropic_initial["session_key"],
         anthropic_initial["candidate"],
     )
-    anthropic_continuation = await lpe._select_anthropic_auto_agent_candidate(
+    anthropic_continuation = await selection._select_anthropic_auto_agent_candidate(
         request=anthropic_request,
         request_body=_anthropic_body("aawm-sota-alibaba", continuation=True),
     )
@@ -156,15 +160,15 @@ async def test_should_preserve_alibaba_continuation_affinity_per_ingress() -> No
 
 @pytest.mark.asyncio
 async def test_should_share_one_alibaba_credential_lane_across_models_and_ingresses() -> None:
-    codex_state = await lpe._build_codex_auto_agent_candidate_state(
+    codex_state = await selection._build_codex_auto_agent_candidate_state(
         _request("/v1/responses"),
         candidate_template=policy.CODEX_AAWM_SOTA_ALIBABA_CANDIDATES[0],
     )
-    codex_fallback_state = await lpe._build_codex_auto_agent_candidate_state(
+    codex_fallback_state = await selection._build_codex_auto_agent_candidate_state(
         _request("/v1/responses"),
         candidate_template=policy.CODEX_AAWM_SOTA_ALIBABA_CANDIDATES[1],
     )
-    anthropic_state = await lpe._build_anthropic_auto_agent_candidate_state(
+    anthropic_state = await selection._build_anthropic_auto_agent_candidate_state(
         _request("/v1/messages"),
         candidate_template=policy.ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES[0],
     )

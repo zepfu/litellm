@@ -6,7 +6,7 @@ import pytest
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
     normalization,
 )
-from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+from litellm.proxy.pass_through_endpoints.providers.xai.request_prep import (
     _coerce_grok_native_function_call_arguments_value,
     _get_anthropic_grok_normalization_runtime,
     _rewrite_grok_native_unsupported_input_items_from_request_body,
