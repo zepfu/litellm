@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 from pathlib import Path
 
 import pytest
@@ -13,12 +14,14 @@ from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
 
 
 OWNER_PATH = Path(composer_repair.__file__).resolve()
-PROXY_PATH = (
+REQUEST_BUILD_PATH = (
     OWNER_PATH.parents[5]
     / "proxy"
     / "pass_through_endpoints"
-    / "llm_passthrough_endpoints.py"
+    / "aawm_adapter_runtime"
+    / "request_build.py"
 )
+FACADE_MODULE = "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints"
 
 OWNER_FUNCTIONS = {
     "literal_tool_block_strip_start",
@@ -179,9 +182,9 @@ def test_rr054_grok_composer_god_file_names_are_exact_thin_delegates(
     function_name: str,
     expected_call: str,
 ) -> None:
-    proxy_tree = _parse(PROXY_PATH)
+    request_build_tree = _parse(REQUEST_BUILD_PATH)
 
-    function = _function(proxy_tree, function_name)
+    function = _function(request_build_tree, function_name)
     calls = _calls(function)
     assert expected_call in calls, (
         f"{function_name} must delegate to {expected_call}; "
@@ -191,4 +194,24 @@ def test_rr054_grok_composer_god_file_names_are_exact_thin_delegates(
     assert len(statements) == 1, (
         f"{function_name} retains Grok Composer logic "
         f"({len(statements)} statements)"
+    )
+
+    # Runtime facade identity: the symbol must be accessible through
+    # llm_passthrough_endpoints and be the exact same object as the one
+    # defined in request_build (installed via install(host_globals)).
+    facade = importlib.import_module(FACADE_MODULE)
+    request_build_mod = importlib.import_module(
+        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.request_build"
+    )
+    facade_obj = getattr(facade, function_name, None)
+    assert facade_obj is not None, (
+        f"{function_name} not accessible on llm_passthrough_endpoints facade"
+    )
+    source_obj = getattr(request_build_mod, function_name, None)
+    assert source_obj is not None, (
+        f"{function_name} not accessible on request_build module"
+    )
+    assert facade_obj is source_obj, (
+        f"{function_name}: facade object is not the same object as "
+        f"request_build source (facade={facade_obj!r}, source={source_obj!r})"
     )

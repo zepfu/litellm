@@ -15,6 +15,14 @@ from typing import Optional
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+CODEX_CANDIDATE_CALLS_PATH = (
+    REPO_ROOT
+    / "litellm"
+    / "proxy"
+    / "pass_through_endpoints"
+    / "aawm_adapter_runtime"
+    / "codex_candidate_calls.py"
+)
 GOD_PATH = (
     REPO_ROOT
     / "litellm"
@@ -342,13 +350,21 @@ def test_rr054_opencode_god_compatibility_functions_are_thin_delegates() -> None
 
 
 def test_rr054_codex_opencode_route_delegates_request_normalization() -> None:
-    god_tree = _parse(GOD_PATH)
-    route = _function_node(god_tree, "_handle_codex_opencode_zen_adapter_route")
+    # Wave 6F: the route handler was extracted to aawm_adapter_runtime.
+    # Inspect the authoritative extracted owner via AST, then verify the
+    # facade still exposes the same object.
+    extracted_tree = _parse(CODEX_CANDIDATE_CALLS_PATH)
+    route = _function_node(
+        extracted_tree, "_handle_codex_opencode_zen_adapter_route"
+    )
 
     assert isinstance(route, ast.AsyncFunctionDef)
     assert (
         "_anthropic_opencode_zen_normalization.normalize_codex_request"
         in _called_names(route)
+    ), (
+        "_handle_codex_opencode_zen_adapter_route must delegate to "
+        "_anthropic_opencode_zen_normalization.normalize_codex_request"
     )
     forbidden_route_calls = {
         (
@@ -363,4 +379,22 @@ def test_rr054_codex_opencode_route_delegates_request_normalization() -> None:
     assert not residual_calls, (
         "Codex OpenCode Zen route still performs request normalization directly: "
         f"{sorted(residual_calls)}"
+    )
+
+    # Facade accessibility: the god module must still expose the route
+    # handler via install(), and it must be the same object.
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    assert hasattr(lpe, "_handle_codex_opencode_zen_adapter_route"), (
+        "_handle_codex_opencode_zen_adapter_route must be available on the "
+        "llm_passthrough_endpoints facade via install()"
+    )
+    assert (
+        getattr(lpe, "_handle_codex_opencode_zen_adapter_route")
+        is codex_candidate_calls._handle_codex_opencode_zen_adapter_route
+    ), (
+        "_handle_codex_opencode_zen_adapter_route on the facade must be the "
+        "same object as the extracted codex_candidate_calls owner"
     )
