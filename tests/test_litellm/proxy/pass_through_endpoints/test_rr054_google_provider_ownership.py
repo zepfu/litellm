@@ -52,6 +52,16 @@ GOOGLE_SHAPING_IMPLEMENTATION_PATHS = tuple(
 GOOGLE_PROCESS_CACHE_PATH = PROVIDERS_DIR / "google" / "process_cache.py"
 ANTIGRAVITY_ADAPTER_PATH = PROVIDERS_DIR / "antigravity" / "adapter.py"
 
+GOOGLE_CODEX_CODE_ASSIST_PATH = (
+    REPO_ROOT
+    / "litellm"
+    / "proxy"
+    / "pass_through_endpoints"
+    / "providers"
+    / "google"
+    / "codex_code_assist.py"
+)
+
 GOOGLE_REPRESENTATIVE_SHAPING_SEAMS = {
     "_apply_google_adapter_request_shape_policy",
     "_build_google_code_assist_request_from_completion_kwargs",
@@ -187,6 +197,65 @@ def _imported_submodule_alias(
     return None
 
 
+def _parse_owned_function_names(module_path: Path) -> frozenset[str]:
+    """Derive the owned-function inventory from the canonical module AST.
+
+    Reads the ``_OWNED_FUNCTION_NAMES`` tuple literal so the contract is
+    pinned to what the module actually publishes, not a broad wildcard.
+    """
+    tree = _tree(module_path)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "_OWNED_FUNCTION_NAMES":
+                assert isinstance(node.value, ast.Tuple), (
+                    f"_OWNED_FUNCTION_NAMES in {module_path} must be a tuple literal"
+                )
+                names: list[str] = []
+                for elt in node.value.elts:
+                    assert isinstance(elt, ast.Constant) and isinstance(elt.value, str), (
+                        f"_OWNED_FUNCTION_NAMES entries must be string literals in {module_path}"
+                    )
+                    names.append(elt.value)
+                assert len(names) == 45, (
+                    f"expected 45 owned functions in {module_path}, got {len(names)}"
+                )
+                return frozenset(names)
+    raise AssertionError(f"_OWNED_FUNCTION_NAMES not found in {module_path}")
+
+
+def _validate_install_globals_call(
+    god_tree: ast.Module,
+    *,
+    expected_alias: str,
+) -> None:
+    """Prove exactly one ``<expected_alias>.install(globals())`` call exists."""
+    matching: list[ast.Call] = []
+    for node in ast.walk(god_tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "install" or not isinstance(node.func.value, ast.Name):
+            continue
+        if node.func.value.id == expected_alias:
+            matching.append(node)
+    assert len(matching) == 1, (
+        f"expected exactly one {expected_alias}.install() call, found {len(matching)}"
+    )
+    call = matching[0]
+    assert len(call.args) == 1 and not call.keywords, (
+        f"{expected_alias}.install() must receive exactly one positional argument"
+    )
+    arg = call.args[0]
+    assert (
+        isinstance(arg, ast.Call)
+        and isinstance(arg.func, ast.Name)
+        and arg.func.id == "globals"
+        and not arg.args
+        and not arg.keywords
+    ), f"{expected_alias}.install() must receive globals()"
+
+
 def _provider_shaping_seams(
     god_tree: ast.Module,
     *,
@@ -218,6 +287,25 @@ def _provider_shaping_seams(
             and value.value.id in _WAVE6B_MODULE_ALIASES
         ):
             discovered.add(name)
+    # Wave 6C: discover Google code-assist seams published via canonical
+    # ``_google_codex_code_assist.install(globals())``.  The owned inventory
+    # is derived from the module's ``_OWNED_FUNCTION_NAMES`` tuple, not a
+    # wildcard, and the install call is validated for alias + globals().
+    if provider_marker == "google":
+        _codex_alias = _imported_submodule_alias(
+            god_tree,
+            package_suffix="pass_through_endpoints.providers.google",
+            submodule="codex_code_assist",
+        )
+        if _codex_alias is not None:
+            _validate_install_globals_call(god_tree, expected_alias=_codex_alias)
+            for name in _parse_owned_function_names(GOOGLE_CODEX_CODE_ASSIST_PATH):
+                if (
+                    provider_marker in name
+                    and name.startswith(SHAPING_VERB_PREFIXES)
+                    and name not in GOOGLE_PROCESS_CACHE_SEAMS
+                ):
+                    discovered.add(name)
     assert representative_seams.issubset(discovered), (
         f"shaping discovery lost required {provider_marker} seams: "
         f"{sorted(representative_seams - discovered)}"
@@ -267,6 +355,7 @@ def _assert_thin_god_delegates(
     god_tree: ast.Module,
     function_names: set[str],
     module_alias: str,
+    install_published_names: frozenset[str] = frozenset(),
 ) -> None:
     god_assignments = _top_level_assignments(god_tree)
     # Only the antigravity Wave 6B runtime may publish antigravity seams.
@@ -309,6 +398,10 @@ def _assert_thin_god_delegates(
                     f"{name} must delegate to {module_alias}.{name} or a "
                     f"Wave 6B extracted module alias"
                 )
+        elif name in install_published_names:
+            # Wave 6C: runtime-published same-object facade via canonical
+            # install(globals()); already validated by discovery helpers.
+            continue
         else:
             # Wave 6B pattern: same-object assignment from extracted provider module
             assert name in god_assignments, (
@@ -340,6 +433,7 @@ def test_rr054_google_and_antigravity_provider_packages_are_real() -> None:
         GOOGLE_SHAPING_PATH,
         *GOOGLE_SHAPING_IMPLEMENTATION_PATHS,
         GOOGLE_PROCESS_CACHE_PATH,
+        GOOGLE_CODEX_CODE_ASSIST_PATH,
         PROVIDERS_DIR / "antigravity" / "__init__.py",
         ANTIGRAVITY_ADAPTER_PATH,
     )
@@ -358,7 +452,7 @@ def test_rr054_google_and_antigravity_provider_packages_are_real() -> None:
         representative_seams=ANTIGRAVITY_REPRESENTATIVE_SHAPING_SEAMS,
     )
     _assert_substantive_owners(
-        GOOGLE_SHAPING_IMPLEMENTATION_PATHS,
+        (*GOOGLE_SHAPING_IMPLEMENTATION_PATHS, GOOGLE_CODEX_CODE_ASSIST_PATH),
         google_shaping_seams,
     )
     _assert_substantive_owners(
@@ -404,10 +498,12 @@ def test_rr054_google_and_antigravity_god_functions_are_thin_delegates() -> None
         representative_seams=ANTIGRAVITY_REPRESENTATIVE_SHAPING_SEAMS,
     )
 
+    _codex_owned = _parse_owned_function_names(GOOGLE_CODEX_CODE_ASSIST_PATH)
     _assert_thin_god_delegates(
         god_tree=god_tree,
         function_names=google_shaping_seams,
         module_alias=google_shaping_alias,
+        install_published_names=_codex_owned,
     )
     _assert_thin_god_delegates(
         god_tree=god_tree,

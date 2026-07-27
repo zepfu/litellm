@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import Request
+from fastapi.responses import StreamingResponse
 
+from litellm.llms.anthropic.experimental_pass_through.providers.google import (
+    process_cache,
+)
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     payload_validation,
@@ -15,6 +21,9 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     sse,
     stream_collect,
     tool_call_restore,
+)
+from litellm.proxy.pass_through_endpoints.providers.google import (
+    codex_code_assist as gca,
 )
 
 
@@ -160,3 +169,162 @@ def test_payload_validation_facade_uses_live_malformed_text_detector(
         lpe._is_codex_auto_agent_malformed_tool_call_text_output
     )
     assert calls == ["live marker"]
+
+
+# ---------------------------------------------------------------------------
+# Wave 6C: same-object facade identity + late host-global dependency resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def wave6c_lpe_runtime() -> Iterator[None]:
+    """Bind moved Google Code Assist callers to the live facade namespace."""
+    previous_runtime = gca._RUNTIME
+    process_cache._codex_google_code_assist_tool_call_name_cache.clear()
+    process_cache._codex_google_code_assist_tool_call_arguments_cache.clear()
+    gca.configure(host_globals=lpe.__dict__)
+    yield
+    process_cache._codex_google_code_assist_tool_call_name_cache.clear()
+    process_cache._codex_google_code_assist_tool_call_arguments_cache.clear()
+    gca._RUNTIME = previous_runtime
+
+
+def test_wave6c_cache_remember_lookup_late_host_max_size(
+    wave6c_lpe_runtime: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert lpe._remember_codex_google_code_assist_tool_call_name is (
+        gca._remember_codex_google_code_assist_tool_call_name
+    )
+    assert lpe._lookup_codex_google_code_assist_tool_call_name is (
+        gca._lookup_codex_google_code_assist_tool_call_name
+    )
+
+    monkeypatch.setattr(
+        lpe,
+        "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE",
+        2,
+    )
+    gca._remember_codex_google_code_assist_tool_call_name("k1", "Alpha")
+    gca._remember_codex_google_code_assist_tool_call_name("k2", "Beta")
+    gca._remember_codex_google_code_assist_tool_call_name("k3", "Gamma")
+
+    assert gca._lookup_codex_google_code_assist_tool_call_name("k1") is None
+    assert gca._lookup_codex_google_code_assist_tool_call_name("k2") == "Beta"
+    assert gca._lookup_codex_google_code_assist_tool_call_name("k3") == "Gamma"
+
+
+def test_wave6c_request_preparation_uses_late_host_token_loader(
+    wave6c_lpe_runtime: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert lpe._prepare_codex_google_code_assist_adapter_request is (
+        gca._prepare_codex_google_code_assist_adapter_request
+    )
+
+    class ExpectedTokenLoad(Exception):
+        pass
+
+    calls: list[str] = []
+
+    async def late_token_loader() -> str:
+        calls.append("loader")
+        raise ExpectedTokenLoad("late lpe token loader")
+
+    monkeypatch.setattr(
+        lpe,
+        "_load_valid_local_google_oauth_access_token",
+        late_token_loader,
+    )
+
+    with pytest.raises(ExpectedTokenLoad, match="late lpe token loader"):
+        asyncio.run(
+            gca._prepare_codex_google_code_assist_adapter_request(
+                request=Request({"type": "http", "headers": []}),
+                prepared_request_body={},
+                adapter_model="gemini-2.5-pro",
+            )
+        )
+
+    assert calls == ["loader"]
+
+
+def test_wave6c_stream_tool_restore_late_host_remember(
+    wave6c_lpe_runtime: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert lpe._restore_google_adapter_tool_call_names is (
+        gca._restore_google_adapter_tool_call_names
+    )
+
+    remembered: list[tuple[str, str, str | None]] = []
+
+    def late_remember(
+        tool_call_id: str,
+        name: str,
+        arguments: str | None,
+        *,
+        scope_key: str | None = None,
+    ) -> None:
+        remembered.append((tool_call_id, name, scope_key))
+
+    monkeypatch.setattr(
+        lpe,
+        "_remember_codex_google_code_assist_tool_call_name",
+        late_remember,
+    )
+
+    fn = SimpleNamespace(name="adapted_1", arguments='{"p":1}')
+    tool_call = SimpleNamespace(id="call_77", function=fn)
+    message = SimpleNamespace(tool_calls=[tool_call])
+    choice = SimpleNamespace(message=message)
+    response_obj = SimpleNamespace(choices=[choice])
+
+    result = gca._restore_google_adapter_tool_call_names(
+        response_obj,
+        {"adapted_1": "OriginalTool"},
+        scope_key="scope-6c",
+    )
+
+    assert result is response_obj
+    assert fn.name == "OriginalTool"
+    assert remembered == [("call_77", "OriginalTool", "scope-6c")]
+
+
+def test_wave6c_response_collection_uses_late_host_model_normalizer(
+    wave6c_lpe_runtime: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert lpe._collect_google_code_assist_response_from_stream is (
+        gca._collect_google_code_assist_response_from_stream
+    )
+
+    class ExpectedNormalize(Exception):
+        pass
+
+    calls: list[str] = []
+
+    def late_normalize(model: str) -> str:
+        calls.append(model)
+        raise ExpectedNormalize("late lpe model normalizer")
+
+    async def body_iter() -> AsyncIterator[bytes]:
+        yield b'{"candidates":[]}'
+
+    monkeypatch.setattr(
+        lpe,
+        "_normalize_google_completion_adapter_model_name",
+        late_normalize,
+    )
+
+    with pytest.raises(ExpectedNormalize, match="late lpe model normalizer"):
+        asyncio.run(
+            gca._collect_google_code_assist_response_from_stream(
+                response=StreamingResponse(body_iter()),
+                adapter_model="gemini-raw-6c",
+                tool_name_mapping={},
+                logging_obj=None,
+            )
+        )
+
+    assert calls == ["gemini-raw-6c"]

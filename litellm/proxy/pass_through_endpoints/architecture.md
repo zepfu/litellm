@@ -233,6 +233,8 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Google environment policy and configuration | `providers/google/env_policy.py` |
 | Google context window management | `providers/google/context_window.py` |
 | Google error signal extraction | `providers/google/error_signals.py` |
+| Google adapter retry, cooldown, transient failure handling, hidden retry metadata, and transient status constant | `providers/google/retry_runtime.py` |
+| Google Code Assist request building, tool replay, tool-call caches, schema sanitization, response translation, and stream shaping | `providers/google/codex_code_assist.py` |
 | Grok side channel endpoint classification | `providers/grok/side_channel.py` |
 | OpenRouter retry and transport algorithms | `providers/openrouter/retry_transport.py` |
 | Cross-provider text/JSON shaping primitives | `aawm_alias_routing/provider_shaping.py` |
@@ -496,6 +498,52 @@ detail extraction callbacks) and raises a structured `ProxyException` with
 code `aawm_codex_auto_agent_candidate_unavailable`, error type
 `rate_limit_error`, and status 429. Provider modules import these raisers
 directly; the god module re-exports them for backward compatibility.
+
+#### Wave 6C Google retry and Code Assist extraction
+
+Wave 6C extracts Google adapter retry/cooldown runtime and Google Code Assist
+request/stream functions from `llm_passthrough_endpoints.py` into two focused
+modules under `litellm/proxy/pass_through_endpoints/providers/google/`. The
+package `__init__.py` exports both modules.
+
+| Concern | Module | Symbols |
+|---------|--------|---------|
+| Google adapter retry sequencing, cooldown waits, rate-limit/transient failure handling, hidden retry metadata, terminal failure logging, and pass-through request execution | `providers/google/retry_runtime.py` | 11 functions + `_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES` |
+| Google Code Assist request building, tool-call replay/repair, tool-call name/argument caches, schema sanitization, response translation, stream collection, and streaming response assembly | `providers/google/codex_code_assist.py` | 45 functions + 3 constants (`_GOOGLE_CODE_ASSIST_SCHEMA_SANITIZE_MAX_DEPTH`, `_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_TTL_SECONDS`, `_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE`) |
+
+**Process-cache ownership.** `retry_runtime.py` delegates semaphore acquisition
+to `process_cache._get_google_adapter_semaphore` and does not own semaphore or
+cache state. `codex_code_assist.py` receives canonical tool-call cache mappings
+from `process_cache` through its `Runtime` dataclass; it does not create a
+second cache owner. The god module retains canonical process-cache aliases
+(project cache/lock, prime quota/lock, token cache, semaphores, user-prompt turn
+state) and a direct `_get_google_adapter_semaphore` delegate that calls
+`process_cache` with the assembled runtime.
+
+**Configuration order.** The god module calls
+`configure_google_retry_runtime(Runtime(...))` before
+`codex_code_assist.install(globals())`. This ordering is contractual: the retry
+runtime must be fully wired before Code Assist facades resolve host-global
+collaborators at call time.
+
+**Facade and monkeypatch contract.** All 11 retry functions are exposed as
+same-object aliases on the god module (direct assignment from
+`_google_retry_runtime.<name>`). All 45 Code Assist functions are published into
+the god module globals dictionary by `install(globals())`. Installed functions
+resolve host dependencies through live `host_globals[name]` lookups at call
+time, so existing monkeypatches on the god module remain reachable without
+rebinding. Neither module imports `llm_passthrough_endpoints` at module scope.
+
+**God-module retention.** `llm_passthrough_endpoints.py` retains FastAPI route
+bodies, six route/delegate boundaries for Google traffic, canonical
+process-cache aliases, the direct semaphore delegate, compatibility re-export
+surfaces, and runtime assembly (constructing `Runtime` dataclasses and calling
+`configure_google_retry_runtime` / `codex_code_assist.install`).
+
+**Scope boundary.** Live Google route bodies remain unchanged by Wave 6C. This
+wave does not claim ownership of Wave 6D-6F concerns (additional provider
+extractions, further route-body decomposition, or cross-provider runtime
+consolidation).
 
 ### Runtime invariants
 

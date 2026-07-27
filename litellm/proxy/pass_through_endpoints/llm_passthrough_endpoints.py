@@ -310,7 +310,8 @@ from .aawm_alias_routing import classification as _aawm_alias_classification
 from .aawm_alias_routing import memory as _aawm_alias_memory
 from .aawm_alias_routing import provider_shaping as _aawm_provider_shaping
 from .aawm_alias_routing import responses_finalize as _aawm_responses_finalize
-from .aawm_alias_routing import retry as _aawm_alias_retry
+# Compatibility host global for transplanted Google env-policy functions/tests.
+from .aawm_alias_routing import retry as _aawm_alias_retry  # noqa: F401
 from .aawm_alias_routing import streaming as _aawm_alias_streaming
 from .aawm_alias_routing import google_oauth as _aawm_google_oauth
 from .aawm_alias_routing import antigravity_oauth as _aawm_antigravity_oauth
@@ -335,6 +336,8 @@ from litellm.proxy.pass_through_endpoints.providers.openrouter import runtime as
 from litellm.proxy.pass_through_endpoints.providers.nvidia import runtime as _wave6b_nvidia_runtime
 from litellm.proxy.pass_through_endpoints.providers.opencode_zen import runtime as _wave6b_opencode_zen_runtime
 from litellm.proxy.pass_through_endpoints.providers.xai import request_prep as _wave6b_xai_request_prep
+from litellm.proxy.pass_through_endpoints.providers.google import retry_runtime as _google_retry_runtime
+from litellm.proxy.pass_through_endpoints.providers.google import codex_code_assist as _google_codex_code_assist
 
 from .aawm_alias_routing import interfaces as _aawm_alias_interfaces
 from .aawm_alias_routing.state import alias_routing_state as _alias_routing_state
@@ -353,8 +356,8 @@ _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES = 8 * 1024 * 1024
 _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS = 5.0
 _CODEX_AUTO_AGENT_GOOGLE_LANE_NEGATIVE_TTL_SECONDS = 15.0
 _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY = "google:auth_degraded"
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_TTL_SECONDS = 6 * 60 * 60
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE = 2048
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_TTL_SECONDS = _google_codex_code_assist._CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_TTL_SECONDS
+_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE = _google_codex_code_assist._CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE
 _codex_google_code_assist_tool_call_name_cache = (
     _anthropic_google_process_cache._codex_google_code_assist_tool_call_name_cache
 )
@@ -949,7 +952,6 @@ _PASSTHROUGH_REPOSITORY_TRANSCRIPT_ARTIFACT_RE = re.compile(
 _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset({"/messages", "/v1/messages"})
 
 _CODEX_GOOGLE_CODE_ASSIST_DEFAULT_MAX_TOKENS = 8192
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE = 2048
 
 _ANTHROPIC_ADAPTER_OPENAI_FORWARD_HEADER_ALLOWLIST = (
     "authorization",
@@ -3071,9 +3073,6 @@ _get_google_adapter_capacity_backoff_seconds = _google_env_policy._get_google_ad
 _get_google_adapter_hidden_retry_budget_seconds = _google_env_policy._get_google_adapter_hidden_retry_budget_seconds
 
 
-_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES = frozenset(PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES)
-
-
 _get_google_adapter_transient_retry_max_attempts = _google_env_policy._get_google_adapter_transient_retry_max_attempts
 
 
@@ -3089,397 +3088,122 @@ def _is_google_adapter_transient_retryable_failure(
     )
 
 
-def _google_adapter_hidden_retry_kwargs_from_passthrough_kwargs(
-    passthrough_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    custom_body = passthrough_kwargs.get("custom_body")
-    if not isinstance(custom_body, dict):
-        return {}
-    metadata = custom_body.get("litellm_metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-        custom_body["litellm_metadata"] = metadata
-    return {"litellm_params": {"metadata": metadata}}
-
-
-def _record_google_adapter_hidden_retry_metadata(
-    passthrough_kwargs: dict[str, Any],
-    *,
-    attempt_number: int,
-    max_attempts: int,
-    status_code: Optional[int],
-    failure_class: str,
-    wait_seconds: float,
-    final_outcome: Optional[str] = None,
-    failure_classification: Optional[str] = None,
-) -> None:
-    kwargs = _google_adapter_hidden_retry_kwargs_from_passthrough_kwargs(passthrough_kwargs)
-    if not kwargs:
-        return
-    _record_passthrough_hidden_retry_metadata(
-        kwargs,
-        attempt_number=attempt_number,
-        max_attempts=max_attempts,
-        status_code=status_code,
-        failure_class=failure_class,
-        wait_seconds=wait_seconds,
-        final_outcome=final_outcome,
-        failure_classification=failure_classification,
-    )
-
-
-def _record_google_adapter_terminal_transient_failure_metadata(
-    passthrough_kwargs: dict[str, Any],
-    *,
-    exc: Any,
-    attempt: int,
-    max_attempts: int,
-    status_code: Optional[int],
-    error_reason: Optional[str],
-    failure_class: str,
-    failure_classification: Optional[str],
-) -> None:
-    _record_google_adapter_error_for_logging(
-        passthrough_kwargs,
-        exc=exc,
-        status_code=status_code,
-        error_reason=error_reason,
-        attempt=attempt,
-        wait_seconds=0.0,
-    )
-    _record_google_adapter_hidden_retry_metadata(
-        passthrough_kwargs,
-        attempt_number=attempt,
-        max_attempts=max_attempts,
-        status_code=status_code,
-        failure_class=failure_class,
-        wait_seconds=0.0,
-        final_outcome=("failed_after_retry" if attempt > 1 else "failed_without_retry"),
-        failure_classification=failure_classification,
-    )
-
-
-def _google_adapter_hidden_retry_metadata(
-    passthrough_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    custom_body = passthrough_kwargs.get("custom_body")
-    if not isinstance(custom_body, dict):
-        return {}
-    metadata = custom_body.get("litellm_metadata")
-    return metadata if isinstance(metadata, dict) else {}
-
-
-def _record_google_adapter_success_after_transient_retry(
-    passthrough_kwargs: dict[str, Any],
-    *,
-    attempt: int,
-    max_attempts: int,
-) -> None:
-    metadata = _google_adapter_hidden_retry_metadata(passthrough_kwargs)
-    if not metadata.get("aawm_passthrough_hidden_retry_count"):
-        return
-    if metadata.get("aawm_passthrough_hidden_retry_final_outcome"):
-        return
-    _record_google_adapter_hidden_retry_metadata(
-        passthrough_kwargs,
-        attempt_number=attempt,
-        max_attempts=max_attempts,
-        status_code=None,
-        failure_class="success",
-        wait_seconds=0.0,
-        final_outcome="success_after_retry",
-    )
-
-
 _build_google_adapter_terminal_error_log_context = _google_error_signals._build_google_adapter_terminal_error_log_context
 
 
-def _log_google_adapter_terminal_transient_failure(
-    passthrough_kwargs: dict[str, Any],
-    *,
-    exc: Any,
-    status_code: Optional[int],
-    failure_classification: Optional[str],
-) -> None:
-    metadata = _google_adapter_hidden_retry_metadata(passthrough_kwargs)
-    verbose_proxy_logger.error(
-        (
-            "Google adapter exhausted hidden retries for transient upstream "
-            "failure status=%s error=%s final_outcome=%s retry_count=%s"
+_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES = (
+    _google_retry_runtime._GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES
+)
+
+_google_adapter_hidden_retry_kwargs_from_passthrough_kwargs = (
+    _google_retry_runtime._google_adapter_hidden_retry_kwargs_from_passthrough_kwargs
+)
+
+_record_google_adapter_hidden_retry_metadata = (
+    _google_retry_runtime._record_google_adapter_hidden_retry_metadata
+)
+
+_record_google_adapter_terminal_transient_failure_metadata = (
+    _google_retry_runtime._record_google_adapter_terminal_transient_failure_metadata
+)
+
+_google_adapter_hidden_retry_metadata = (
+    _google_retry_runtime._google_adapter_hidden_retry_metadata
+)
+
+_record_google_adapter_success_after_transient_retry = (
+    _google_retry_runtime._record_google_adapter_success_after_transient_retry
+)
+
+_log_google_adapter_terminal_transient_failure = (
+    _google_retry_runtime._log_google_adapter_terminal_transient_failure
+)
+
+_wait_for_google_adapter_cooldown_if_needed = (
+    _google_retry_runtime._wait_for_google_adapter_cooldown_if_needed
+)
+
+_set_google_adapter_cooldown = _google_retry_runtime._set_google_adapter_cooldown
+
+_handle_google_adapter_rate_limit_failure = (
+    _google_retry_runtime._handle_google_adapter_rate_limit_failure
+)
+
+_handle_google_adapter_transient_failure = (
+    _google_retry_runtime._handle_google_adapter_transient_failure
+)
+
+_perform_google_adapter_pass_through_request = (
+    _google_retry_runtime._perform_google_adapter_pass_through_request
+)
+
+_google_retry_runtime.configure_google_retry_runtime(
+    _google_retry_runtime.Runtime(
+        process_cache_runtime=_get_anthropic_google_process_cache_runtime(),
+        rate_limit=_alias_routing_state.google_rate_limit,
+        get_rate_limit_key_from_kwargs=lambda kwargs: (
+            _get_google_adapter_rate_limit_key_from_kwargs(kwargs)
         ),
-        status_code,
-        str(exc),
-        metadata.get("aawm_passthrough_hidden_retry_final_outcome"),
-        metadata.get("aawm_passthrough_hidden_retry_count"),
-        extra=_build_google_adapter_terminal_error_log_context(
-            passthrough_kwargs,
-            status_code=status_code,
-            failure_classification=failure_classification,
+        get_max_retries=lambda: _get_google_adapter_max_retries(),
+        coerce_non_negative_int=lambda value, default: (
+            _coerce_non_negative_int(value, default)
         ),
-        exc_info=True,
-    )
-
-
-async def _wait_for_google_adapter_cooldown_if_needed(rate_limit_key: str) -> None:
-    await _aawm_alias_retry.wait_for_monotonic_cooldown_map(
-        _alias_routing_state.google_rate_limit,
-        rate_limit_key,
-        log_label="Google adapter",
-        sleep=asyncio.sleep,
-    )
-
-
-async def _set_google_adapter_cooldown(rate_limit_key: str, wait_seconds: float) -> None:
-    # Google keeps token-keyed cache bound via _bound_google_adapter_token_cache.
-    async with _google_adapter_rate_limit_lock:
-        _alias_routing_state.google_rate_limit.extend(
-            rate_limit_key,
-            wait_seconds,
-            max_size=None,
-        )
-        _bound_google_adapter_token_cache(_google_adapter_rate_limit_until_monotonic_by_key)
-
-
-async def _handle_google_adapter_rate_limit_failure(
-    passthrough_kwargs: dict[str, Any],
-    *,
-    exc: Any,
-    status_code: Optional[int],
-    error_reason: Optional[str],
-    attempt: int,
-    retry_limit: int,
-    wait_seconds: float,
-    rate_limit_key: str,
-    accumulated_hidden_wait_seconds: float,
-    hidden_retry_budget_seconds: float,
-    is_capacity_retry: bool,
-) -> float:
-    _record_google_adapter_error_for_logging(
-        passthrough_kwargs,
-        exc=exc,
-        status_code=status_code,
-        error_reason=error_reason,
-        attempt=attempt,
-        wait_seconds=wait_seconds,
-    )
-    projected_hidden_wait_seconds = accumulated_hidden_wait_seconds + wait_seconds
-    within_hidden_budget = (
-        hidden_retry_budget_seconds > 0 and projected_hidden_wait_seconds <= hidden_retry_budget_seconds
-    )
-    if attempt >= retry_limit and not within_hidden_budget:
-        verbose_proxy_logger.warning(
-            "Google adapter upstream attempt %s failed with %s (%s, reason=%s) and will not be retried",
-            attempt,
-            status_code,
-            exc.__class__.__name__,
-            error_reason,
-        )
-        raise exc
-    if attempt >= retry_limit and within_hidden_budget:
-        verbose_proxy_logger.warning(
-            "Google adapter keeping 429 hidden from client for %s; hidden retry wait %.1fs/%.1fs (reason=%s)",
-            rate_limit_key,
-            projected_hidden_wait_seconds,
-            hidden_retry_budget_seconds,
-            error_reason,
-        )
-    if is_capacity_retry:
-        verbose_proxy_logger.warning(
-            "Google adapter upstream attempt %s hit 429 (%s, reason=%s); exponential backoff %.1fs",
-            attempt,
-            exc.__class__.__name__,
-            error_reason,
-            wait_seconds,
-        )
-    else:
-        verbose_proxy_logger.warning(
-            "Google adapter upstream attempt %s hit 429 (%s, reason=%s); parsed reset %.1fs",
-            attempt,
-            exc.__class__.__name__,
-            error_reason,
-            wait_seconds,
-        )
-    await _set_google_adapter_cooldown(rate_limit_key, wait_seconds + 1.0)
-    return projected_hidden_wait_seconds
-
-
-async def _handle_google_adapter_transient_failure(
-    passthrough_kwargs: dict[str, Any],
-    *,
-    exc: Any,
-    status_code: Optional[int],
-    error_reason: Optional[str],
-    attempt: int,
-    transient_retry_max_attempts: int,
-    failure_class: str,
-    failure_classification: Optional[str],
-) -> None:
-    transient_wait_seconds = _get_google_adapter_transient_backoff_seconds(attempt)
-    if attempt >= transient_retry_max_attempts:
-        _record_google_adapter_terminal_transient_failure_metadata(
-            passthrough_kwargs,
-            exc=exc,
-            attempt=attempt,
-            max_attempts=transient_retry_max_attempts,
-            status_code=status_code,
-            error_reason=error_reason,
-            failure_class=failure_class,
-            failure_classification=failure_classification,
-        )
-        verbose_proxy_logger.warning(
-            "Google adapter upstream attempt %s failed with transient %s (%s, reason=%s) and will not be retried",
-            attempt,
-            status_code,
-            exc.__class__.__name__,
-            error_reason,
-        )
-        _log_google_adapter_terminal_transient_failure(
-            passthrough_kwargs,
-            exc=exc,
-            status_code=status_code,
-            failure_classification=failure_classification,
-        )
-        raise exc
-    verbose_proxy_logger.warning(
-        "Google adapter upstream attempt %s hit transient %s (%s, reason=%s); hidden retry wait %.1fs",
-        attempt,
-        status_code,
-        exc.__class__.__name__,
-        error_reason,
-        transient_wait_seconds,
-    )
-    _record_google_adapter_hidden_retry_metadata(
-        passthrough_kwargs,
-        attempt_number=attempt,
-        max_attempts=transient_retry_max_attempts,
-        status_code=status_code,
-        failure_class=failure_class,
-        wait_seconds=transient_wait_seconds,
-        failure_classification=failure_classification,
-    )
-    await asyncio.sleep(transient_wait_seconds)
-
-
-async def _perform_google_adapter_pass_through_request(**kwargs: Any) -> Response:
-    passthrough_kwargs = dict(kwargs)
-    max_retries = _coerce_non_negative_int(
-        passthrough_kwargs.pop("google_adapter_max_retries", None),
-        _get_google_adapter_max_retries(),
-    )
-    total_attempts = max_retries + 1
-    capacity_total_attempts = (
-        _coerce_non_negative_int(
-            passthrough_kwargs.pop("google_adapter_model_capacity_max_retries", None),
-            _get_google_adapter_model_capacity_max_retries(),
-        )
-        + 1
-    )
-    hidden_retry_budget_seconds = _coerce_non_negative_float(
-        passthrough_kwargs.pop("google_adapter_hidden_retry_budget_seconds", None),
-        _get_google_adapter_hidden_retry_budget_seconds(),
-    )
-    accumulated_hidden_wait_seconds = 0.0
-    rate_limit_key = _get_google_adapter_rate_limit_key_from_kwargs(kwargs)
-    transient_retry_max_attempts = _get_google_adapter_transient_retry_max_attempts()
-    passthrough_kwargs.pop("google_access_token", None)
-    passthrough_kwargs.pop("google_adapter_rate_limit_key", None)
-
-    async def _before_attempt(attempt: int) -> None:
-        verbose_proxy_logger.debug(
-            "Google adapter upstream attempt %s/%s",
-            attempt,
-            max(total_attempts, capacity_total_attempts, transient_retry_max_attempts),
-        )
-        await _wait_for_google_adapter_cooldown_if_needed(rate_limit_key)
-
-    async def _operation() -> Response:
-        passthrough_kwargs["retryable_upstream_status_codes"] = sorted(
-            {429, *_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES}
-        )
-        passthrough_kwargs["caller_managed_hidden_retry"] = True
-        return await pass_through_request(**passthrough_kwargs)
-
-    async def _on_success(_response: Response, attempt: int) -> None:
-        _record_google_adapter_success_after_transient_retry(
-            passthrough_kwargs,
-            attempt=attempt,
-            max_attempts=transient_retry_max_attempts,
-        )
-
-    async def _on_failure(exc: Exception, attempt: int) -> bool:
-        nonlocal accumulated_hidden_wait_seconds
-        status_code = _extract_google_adapter_exception_status_code(exc)
-        error_reason = _extract_google_adapter_error_reason(exc)
-        is_capacity_retry = error_reason == "MODEL_CAPACITY_EXHAUSTED"
-        is_rate_limit_retry = status_code == 429 or error_reason in {
-            "MODEL_CAPACITY_EXHAUSTED",
-            "RATE_LIMIT_EXCEEDED",
-        }
-        is_transient_retry = _is_google_adapter_transient_retryable_failure(
-            exc,
-            status_code=status_code,
-            error_reason=error_reason,
-        )
-        failure_class = exc.__class__.__name__
-        failure_classification: Optional[str] = None
-        if is_transient_retry:
-            (
-                classified_status_code,
-                failure_class,
-                failure_classification,
-            ) = _classify_passthrough_hidden_retry_failure(exc)
-            if classified_status_code is not None and status_code is None:
-                status_code = classified_status_code
-        retry_limit = capacity_total_attempts if is_capacity_retry else total_attempts
-        if is_capacity_retry:
-            wait_seconds = _get_google_adapter_capacity_backoff_seconds(attempt)
-        else:
-            wait_seconds = _parse_google_rate_limit_reset_seconds(exc)
-        if is_rate_limit_retry:
-            accumulated_hidden_wait_seconds = await _handle_google_adapter_rate_limit_failure(
-                passthrough_kwargs,
-                exc=exc,
-                status_code=status_code,
-                error_reason=error_reason,
-                attempt=attempt,
-                retry_limit=retry_limit,
-                wait_seconds=wait_seconds,
-                rate_limit_key=rate_limit_key,
-                accumulated_hidden_wait_seconds=accumulated_hidden_wait_seconds,
-                hidden_retry_budget_seconds=hidden_retry_budget_seconds,
-                is_capacity_retry=is_capacity_retry,
+        coerce_non_negative_float=lambda value, default: (
+            _coerce_non_negative_float(value, default)
+        ),
+        get_model_capacity_max_retries=lambda: (
+            _get_google_adapter_model_capacity_max_retries()
+        ),
+        get_capacity_backoff_seconds=lambda attempt: (
+            _get_google_adapter_capacity_backoff_seconds(attempt)
+        ),
+        get_hidden_retry_budget_seconds=lambda: (
+            _get_google_adapter_hidden_retry_budget_seconds()
+        ),
+        get_transient_retry_max_attempts=lambda: (
+            _get_google_adapter_transient_retry_max_attempts()
+        ),
+        get_transient_backoff_seconds=lambda attempt: (
+            _get_google_adapter_transient_backoff_seconds(attempt)
+        ),
+        extract_exception_status_code=lambda exc: (
+            _extract_google_adapter_exception_status_code(exc)
+        ),
+        extract_error_reason=lambda exc: (
+            _extract_google_adapter_error_reason(exc)
+        ),
+        parse_rate_limit_reset_seconds=lambda exc: (
+            _parse_google_rate_limit_reset_seconds(exc)
+        ),
+        is_transient_retryable_failure=lambda exc, **kwargs: (
+            _is_google_adapter_transient_retryable_failure(exc, **kwargs)
+        ),
+        classify_hidden_retry_failure=lambda exc: (
+            _classify_passthrough_hidden_retry_failure(exc)
+        ),
+        record_error_for_logging=lambda passthrough_kwargs, **kwargs: (
+            _record_google_adapter_error_for_logging(passthrough_kwargs, **kwargs)
+        ),
+        record_hidden_retry_metadata=lambda kwargs, **kw: (
+            _record_passthrough_hidden_retry_metadata(kwargs, **kw)
+        ),
+        build_terminal_error_log_context=lambda passthrough_kwargs, **kwargs: (
+            _build_google_adapter_terminal_error_log_context(
+                passthrough_kwargs, **kwargs
             )
-            return True
-        if is_transient_retry:
-            await _handle_google_adapter_transient_failure(
-                passthrough_kwargs,
-                exc=exc,
-                status_code=status_code,
-                error_reason=error_reason,
-                attempt=attempt,
-                transient_retry_max_attempts=transient_retry_max_attempts,
-                failure_class=failure_class,
-                failure_classification=failure_classification,
-            )
-            return True
-        verbose_proxy_logger.warning(
-            "Google adapter upstream attempt %s failed with %s (%s, reason=%s) and will not be retried",
-            attempt,
-            status_code,
-            exc.__class__.__name__,
-            error_reason,
-        )
-        return False
-
-    return await _aawm_alias_retry.run_adapter_retry_policy(
-        _operation,
-        policy=_aawm_alias_retry.AdapterRetryPolicy(
-            before_attempt=_before_attempt,
-            on_failure=_on_failure,
-            on_success=_on_success,
         ),
+        pass_through_request=lambda **kwargs: pass_through_request(**kwargs),
+        bound_token_cache=lambda cache: _bound_google_adapter_token_cache(cache),
+        sleep=lambda seconds: asyncio.sleep(seconds),
+        log_debug=verbose_proxy_logger.debug,
+        log_warning=verbose_proxy_logger.warning,
+        log_error=verbose_proxy_logger.error,
+        host_globals=globals(),
     )
+)
 
+# Wave 6C Phase 2: Google Code Assist extraction install
+_google_codex_code_assist.install(globals())
 
 _ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME = _anthropic_openrouter_retry_transport.Runtime(
     rate_limit=_alias_routing_state.openrouter_rate_limit,
@@ -3767,111 +3491,11 @@ def _sanitize_google_schema_array_items(schema_node: Any, *, _depth: int = 0, _s
     return _anthropic_google_shaping._sanitize_google_schema_array_items(schema_node, _depth=_depth, _seen=_seen)
 
 
-def _merge_google_code_assist_schema_annotations(source: dict[str, Any], target: dict[str, Any]) -> None:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._merge_google_code_assist_schema_annotations(source, target)
 
 
-def _simplify_google_code_assist_union_schema(  # noqa: PLR0915
-    schema_node: dict[str, Any],
-) -> int:
-    fix_count = 0
-    for union_key in ("anyOf", "oneOf", "allOf"):
-        variants = schema_node.get(union_key)
-        if not isinstance(variants, list):
-            continue
-        dict_variants = [variant for variant in variants if isinstance(variant, dict)]
-        if not dict_variants:
-            schema_node.pop(union_key, None)
-            fix_count += 1
-            continue
-
-        nullable = any(variant.get("type") == "null" for variant in dict_variants)
-        non_null_variants = [variant for variant in dict_variants if variant.get("type") != "null"]
-        if len(non_null_variants) == 1:
-            replacement = copy.deepcopy(non_null_variants[0])
-            _merge_google_code_assist_schema_annotations(schema_node, replacement)
-            if nullable:
-                replacement["nullable"] = True
-            schema_node.clear()
-            schema_node.update(replacement)
-            fix_count += 1
-            continue
-
-        string_variant = next(
-            (variant for variant in non_null_variants if variant.get("type") == "string"),
-            None,
-        )
-        if string_variant is not None:
-            replacement = {
-                key: copy.deepcopy(value)
-                for key, value in string_variant.items()
-                if key in {"type", "description", "title", "enum", "default"}
-            }
-            replacement.setdefault("type", "string")
-            _merge_google_code_assist_schema_annotations(schema_node, replacement)
-            if nullable:
-                replacement["nullable"] = True
-            schema_node.clear()
-            schema_node.update(replacement)
-            fix_count += 1
-            continue
-
-        object_variants = [
-            variant
-            for variant in non_null_variants
-            if variant.get("type") == "object" and isinstance(variant.get("properties"), dict)
-        ]
-        if object_variants:
-            merged_properties: dict[str, Any] = {}
-            for variant in object_variants:
-                merged_properties.update(copy.deepcopy(variant.get("properties") or {}))
-            replacement = {
-                "type": "object",
-                "properties": merged_properties,
-            }
-            _merge_google_code_assist_schema_annotations(schema_node, replacement)
-            if nullable:
-                replacement["nullable"] = True
-            schema_node.clear()
-            schema_node.update(replacement)
-            fix_count += 1
-            continue
-
-        typed_variant = next(
-            (variant for variant in non_null_variants if isinstance(variant.get("type"), str)),
-            None,
-        )
-        if typed_variant is not None:
-            replacement = copy.deepcopy(typed_variant)
-            _merge_google_code_assist_schema_annotations(schema_node, replacement)
-            if nullable:
-                replacement["nullable"] = True
-            schema_node.clear()
-            schema_node.update(replacement)
-            fix_count += 1
-            continue
-
-        schema_node.pop(union_key, None)
-        schema_node.setdefault("type", "object")
-        schema_node.setdefault("properties", {})
-        fix_count += 1
-    return fix_count
+_GOOGLE_CODE_ASSIST_SCHEMA_SANITIZE_MAX_DEPTH = _google_codex_code_assist._GOOGLE_CODE_ASSIST_SCHEMA_SANITIZE_MAX_DEPTH
 
 
-_GOOGLE_CODE_ASSIST_SCHEMA_SANITIZE_MAX_DEPTH = 64
-
-
-def _sanitize_google_code_assist_union_schemas(
-    schema_node: Any, *, _depth: int = 0, _seen: Optional[set[int]] = None
-) -> int:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._sanitize_google_code_assist_union_schemas(schema_node, _depth=_depth, _seen=_seen)
-
-
-def _sanitize_google_code_assist_tool_schema(schema_node: Any) -> int:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._sanitize_google_code_assist_tool_schema(schema_node)
 
 
 _extract_completion_message_text = _google_context_window._extract_completion_message_text
@@ -3969,15 +3593,6 @@ def _normalize_codex_openai_chat_kwargs_for_google_code_assist(
     return _anthropic_google_shaping._normalize_codex_openai_chat_kwargs_for_google_code_assist(completion_kwargs)
 
 
-def _is_anthropic_tool_use_content_block(block: Any) -> bool:
-    return isinstance(block, dict) and block.get("type") == "tool_use"
-
-
-def _is_anthropic_tool_result_content_block(block: Any) -> bool:
-    if not isinstance(block, dict):
-        return False
-    block_type = block.get("type")
-    return block_type == "tool_result" or (isinstance(block_type, str) and block_type.endswith("_tool_result"))
 
 
 def _has_codex_google_code_assist_anthropic_tool_replay_blocks(messages: list[Any]) -> bool:
@@ -3985,58 +3600,6 @@ def _has_codex_google_code_assist_anthropic_tool_replay_blocks(messages: list[An
     return _anthropic_google_shaping._has_codex_google_code_assist_anthropic_tool_replay_blocks(messages)
 
 
-def _codex_google_code_assist_tool_result_content_to_openai_content(
-    content: Any,
-) -> Any:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                text_parts.append(item)
-                continue
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str):
-                    text_parts.append(text)
-        if text_parts:
-            return "".join(text_parts)
-    try:
-        return json.dumps(content, ensure_ascii=False, default=str)
-    except Exception:
-        return str(content)
-
-
-def _codex_google_code_assist_anthropic_tool_use_to_openai_tool_call(
-    *,
-    block: dict[str, Any],
-    message_index: int,
-    content_index: int,
-) -> dict[str, Any]:
-    tool_use_id = block.get("id")
-    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid Anthropic tool_use block at "
-                f"messages.{message_index}.content.{content_index}: "
-                "missing required non-empty string tool_use.id"
-            ),
-        )
-    tool_input = block.get("input")
-    if not isinstance(tool_input, dict):
-        tool_input = {}
-    return {
-        "id": tool_use_id.strip(),
-        "type": "function",
-        "function": {
-            "name": str(block.get("name") or ""),
-            "arguments": json.dumps(tool_input, ensure_ascii=False),
-        },
-    }
 
 
 def _normalize_codex_google_code_assist_anthropic_assistant_message(
@@ -4048,31 +3611,6 @@ def _normalize_codex_google_code_assist_anthropic_assistant_message(
     )
 
 
-def _codex_google_code_assist_anthropic_tool_result_to_openai_tool_message(
-    *,
-    block: dict[str, Any],
-    message_index: int,
-    content_index: int,
-) -> dict[str, Any]:
-    tool_use_id = block.get("tool_use_id")
-    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid Anthropic tool_result block at "
-                f"messages.{message_index}.content.{content_index}: "
-                "missing required non-empty string tool_result.tool_use_id"
-            ),
-        )
-    tool_message = {
-        "role": "tool",
-        "tool_call_id": tool_use_id.strip(),
-        "content": _codex_google_code_assist_tool_result_content_to_openai_content(block.get("content")),
-    }
-    cache_control = block.get("cache_control")
-    if cache_control is not None:
-        tool_message["cache_control"] = cache_control
-    return tool_message
 
 
 def _normalize_codex_google_code_assist_anthropic_user_message(
@@ -4095,11 +3633,6 @@ def _build_codex_google_code_assist_anthropic_replay_changes(
     )
 
 
-def _normalize_codex_google_code_assist_anthropic_tool_replay(
-    completion_kwargs: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_anthropic_tool_replay(completion_kwargs)
 
 
 def _deterministic_codex_google_code_assist_tool_call_id(
@@ -4145,11 +3678,6 @@ def _repair_codex_google_code_assist_tool_call_id(
     )
 
 
-def _repair_codex_google_code_assist_openai_tool_call_ids(
-    completion_kwargs: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._repair_codex_google_code_assist_openai_tool_call_ids(completion_kwargs)
 
 
 def _normalize_codex_google_code_assist_reasoning_effort(
@@ -4166,182 +3694,6 @@ def _normalize_google_code_assist_thinking_max_tokens(
     return _anthropic_google_shaping._normalize_google_code_assist_thinking_max_tokens(completion_kwargs)
 
 
-def _codex_google_code_assist_tool_call_cache_key(
-    tool_call_id: str,
-    *,
-    scope_key: Optional[str] = None,
-) -> str:
-    cleaned_scope = _clean_codex_auth_value(scope_key)
-    if cleaned_scope:
-        return f"{cleaned_scope}:{tool_call_id}"
-    return tool_call_id
-
-
-def _resolve_codex_google_code_assist_tool_call_scope_key(
-    *,
-    request: Optional[Request] = None,
-    request_body: Optional[Payload] = None,
-    explicit_scope_key: Optional[str] = None,
-) -> Optional[str]:
-    explicit = _clean_codex_auth_value(explicit_scope_key)
-    if explicit is not None:
-        return explicit
-    body = request_body if isinstance(request_body, dict) else {}
-    for source in (
-        body.get("litellm_metadata"),
-        body.get("metadata"),
-        body,
-    ):
-        if not isinstance(source, dict):
-            continue
-        for key in (
-            "session_id",
-            "session-id",
-            "conversation_id",
-            "thread_id",
-            "litellm_call_id",
-        ):
-            value = _clean_codex_auth_value(source.get(key))
-            if value is not None:
-                return value
-    if request is not None:
-        headers = _safe_get_request_headers(request)
-        if isinstance(headers, dict):
-            for key in (
-                "session_id",
-                "session-id",
-                "x-session-id",
-                "x-litellm-session-id",
-                "x-request-id",
-            ):
-                value = _clean_codex_auth_value(headers.get(key))
-                if value is not None:
-                    return value
-    return None
-
-
-def _prune_codex_google_code_assist_tool_call_caches(
-    now: Optional[float] = None,
-) -> None:
-    current = time.monotonic() if now is None else now
-    expired_keys = [
-        key
-        for key, entry in _codex_google_code_assist_tool_call_name_cache.items()
-        if not isinstance(entry, tuple) or len(entry) < 2 or float(entry[1]) <= current
-    ]
-    for key in expired_keys:
-        _codex_google_code_assist_tool_call_name_cache.pop(key, None)
-        _codex_google_code_assist_tool_call_arguments_cache.pop(key, None)
-    # FIFO eviction on insertion order once TTL prune is insufficient (#13).
-    # Keep at most MAX_SIZE entries (strict > so a full cache can still insert one).
-    while len(_codex_google_code_assist_tool_call_name_cache) > _CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE:
-        try:
-            oldest_key = next(iter(_codex_google_code_assist_tool_call_name_cache))
-        except StopIteration:
-            break
-        _codex_google_code_assist_tool_call_name_cache.pop(oldest_key, None)
-        _codex_google_code_assist_tool_call_arguments_cache.pop(oldest_key, None)
-
-
-def _remember_codex_google_code_assist_tool_call_name(
-    tool_call_id: Any,
-    function_name: Any,
-    function_arguments: Any = None,
-    *,
-    scope_key: Optional[str] = None,
-) -> None:
-    if not isinstance(tool_call_id, str) or not tool_call_id:
-        return
-    cache_key = _codex_google_code_assist_tool_call_cache_key(tool_call_id, scope_key=scope_key)
-    now = time.monotonic()
-    _prune_codex_google_code_assist_tool_call_caches(now)
-    expires_at = now + float(_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_TTL_SECONDS)
-    if not isinstance(function_name, str) or not function_name:
-        cached = _codex_google_code_assist_tool_call_name_cache.get(cache_key)
-        if cached is None and "__thought__" in tool_call_id:
-            base_key = _codex_google_code_assist_tool_call_cache_key(
-                tool_call_id.split("__thought__", 1)[0], scope_key=scope_key
-            )
-            cached = _codex_google_code_assist_tool_call_name_cache.get(base_key)
-        function_name = cached[0] if isinstance(cached, tuple) and cached else None
-        if not isinstance(function_name, str) or not function_name:
-            return
-    # Re-insert for FIFO recency so eviction drops the oldest insertion, not a hot key.
-    _codex_google_code_assist_tool_call_name_cache.pop(cache_key, None)
-    _codex_google_code_assist_tool_call_name_cache[cache_key] = (
-        function_name,
-        expires_at,
-    )
-    _prune_codex_google_code_assist_tool_call_caches(now)
-    normalized_arguments = _normalize_codex_google_code_assist_tool_call_arguments(function_arguments)
-    if normalized_arguments is None:
-        return
-    existing_entry = _codex_google_code_assist_tool_call_arguments_cache.get(cache_key)
-    existing_arguments = existing_entry[0] if isinstance(existing_entry, tuple) and existing_entry else ""
-    if not existing_arguments:
-        merged = normalized_arguments
-    elif normalized_arguments.startswith(existing_arguments):
-        merged = normalized_arguments
-    elif not existing_arguments.endswith(normalized_arguments):
-        merged = f"{existing_arguments}{normalized_arguments}"
-    else:
-        merged = existing_arguments
-    _codex_google_code_assist_tool_call_arguments_cache.pop(cache_key, None)
-    _codex_google_code_assist_tool_call_arguments_cache[cache_key] = (
-        merged,
-        expires_at,
-    )
-
-
-def _normalize_codex_google_code_assist_tool_call_arguments(function_arguments: Any) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_tool_call_arguments(function_arguments)
-
-
-def _lookup_codex_google_code_assist_tool_call_name(
-    tool_call_id: Any,
-    *,
-    scope_key: Optional[str] = None,
-) -> Optional[str]:
-    if not isinstance(tool_call_id, str) or not tool_call_id:
-        return None
-    now = time.monotonic()
-    _prune_codex_google_code_assist_tool_call_caches(now)
-    cache_key = _codex_google_code_assist_tool_call_cache_key(tool_call_id, scope_key=scope_key)
-    cached = _codex_google_code_assist_tool_call_name_cache.get(cache_key)
-    if isinstance(cached, tuple) and cached and float(cached[1]) > now:
-        return cached[0]
-    if "__thought__" in tool_call_id:
-        base_key = _codex_google_code_assist_tool_call_cache_key(
-            tool_call_id.split("__thought__", 1)[0], scope_key=scope_key
-        )
-        cached = _codex_google_code_assist_tool_call_name_cache.get(base_key)
-        if isinstance(cached, tuple) and cached and float(cached[1]) > now:
-            return cached[0]
-    return None
-
-
-def _lookup_codex_google_code_assist_tool_call_arguments(
-    tool_call_id: Any,
-    *,
-    scope_key: Optional[str] = None,
-) -> Optional[str]:
-    if not isinstance(tool_call_id, str) or not tool_call_id:
-        return None
-    now = time.monotonic()
-    _prune_codex_google_code_assist_tool_call_caches(now)
-    cache_key = _codex_google_code_assist_tool_call_cache_key(tool_call_id, scope_key=scope_key)
-    cached = _codex_google_code_assist_tool_call_arguments_cache.get(cache_key)
-    if isinstance(cached, tuple) and cached and float(cached[1]) > now:
-        return cached[0]
-    if "__thought__" in tool_call_id:
-        base_key = _codex_google_code_assist_tool_call_cache_key(
-            tool_call_id.split("__thought__", 1)[0], scope_key=scope_key
-        )
-        cached = _codex_google_code_assist_tool_call_arguments_cache.get(base_key)
-        if isinstance(cached, tuple) and cached and float(cached[1]) > now:
-            return cached[0]
-    return None
 
 
 def _infer_single_codex_google_code_assist_function_tool_name(tools: Any) -> Optional[str]:
@@ -4379,27 +3731,6 @@ def _previous_codex_google_code_assist_tool_call(
     )
 
 
-def _codex_google_code_assist_tool_call_function_name(
-    tool_call: Optional[dict[str, Any]],
-) -> Optional[str]:
-    if not isinstance(tool_call, dict):
-        return None
-    function = tool_call.get("function")
-    if not isinstance(function, dict):
-        return None
-    name = function.get("name")
-    return name if isinstance(name, str) and name else None
-
-
-def _codex_google_code_assist_tool_call_function_arguments(
-    tool_call: Optional[dict[str, Any]],
-) -> Optional[str]:
-    if not isinstance(tool_call, dict):
-        return None
-    function = tool_call.get("function")
-    if not isinstance(function, dict):
-        return None
-    return _normalize_codex_google_code_assist_tool_call_arguments(function.get("arguments"))
 
 
 def _build_codex_google_code_assist_synthetic_tool_call(
@@ -4432,25 +3763,6 @@ def _build_codex_google_code_assist_tool_pair_repair_changes(
     )
 
 
-def _codex_google_code_assist_tool_result_message_content(
-    message: dict[str, Any],
-) -> str:
-    return str(_codex_google_code_assist_tool_result_content_to_openai_content(message.get("content")) or "").strip()
-
-
-def _codex_google_code_assist_orphan_tool_result_context_text(
-    *,
-    tool_call_id: str,
-    content: str,
-) -> str:
-    normalized_content = content.strip()
-    if not normalized_content:
-        return "Previous tool result context (unmapped tool call " f"{tool_call_id}): no output was recorded."
-    return "Previous tool result context (unmapped tool call " f"{tool_call_id}):\n{normalized_content}"
-
-
-def _codex_google_code_assist_display_tool_call_id(tool_call_id: str) -> str:
-    return tool_call_id.split("__thought__", 1)[0]
 
 
 def _append_codex_google_code_assist_orphan_tool_result_context(
@@ -4471,63 +3783,6 @@ def _sanitize_codex_google_code_assist_orphan_tool_results(
     )
 
 
-def _ensure_codex_google_code_assist_tool_results_have_calls(
-    completion_kwargs: dict[str, Any], *, scope_key: Optional[str] = None
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._ensure_codex_google_code_assist_tool_results_have_calls(
-        completion_kwargs, scope_key=scope_key
-    )
-
-
-async def _build_google_code_assist_request_from_completion_kwargs(
-    *,
-    completion_kwargs: dict[str, Any],
-    adapter_model: str,
-    project: str,
-    request: Request,
-    completion_kwargs_are_openai_chat: bool = False,
-    scope_key: Optional[str] = None,
-) -> tuple[dict[str, Any], dict[str, str], list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._build_google_code_assist_request_from_completion_kwargs(
-        completion_kwargs=completion_kwargs,
-        adapter_model=adapter_model,
-        project=project,
-        request=request,
-        completion_kwargs_are_openai_chat=completion_kwargs_are_openai_chat,
-        scope_key=scope_key,
-    )
-
-
-def _drop_codex_google_code_assist_non_function_tools(request_body: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._drop_codex_google_code_assist_non_function_tools(request_body)
-
-
-def _build_codex_google_code_assist_completion_kwargs(
-    prepared_request_body: dict[str, Any], *, adapter_model: str
-) -> tuple[dict[str, Any], Any, ResponsesAPIOptionalRequestParams]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_google_code_assist_completion_kwargs(
-        prepared_request_body, adapter_model=adapter_model
-    )
-
-
-async def _prepare_codex_google_code_assist_adapter_request(
-    *,
-    request: Request,
-    prepared_request_body: dict[str, Any],
-    adapter_model: str,
-    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
-) -> SimpleNamespace:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._prepare_codex_google_code_assist_adapter_request(
-        request=request,
-        prepared_request_body=prepared_request_body,
-        adapter_model=adapter_model,
-        adapter_provider=adapter_provider,
-    )
 
 
 _get_google_code_assist_native_tool_aliases = _google_env_policy._get_google_code_assist_native_tool_aliases
@@ -4622,80 +3877,16 @@ def _build_google_adapter_preserved_task_state_message(
 _apply_google_adapter_completion_message_window = _google_context_window._apply_google_adapter_completion_message_window
 
 
-def _normalize_google_code_assist_httpx_payload(value: Any) -> Any:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_google_code_assist_httpx_payload(value)
 
 
 _google_code_assist_duplicate_tool_results_from_completion_messages = _google_context_window._google_code_assist_duplicate_tool_results_from_completion_messages
 
 
-def _annotate_google_code_assist_duplicate_tool_response_parts(
-    contents: list[Any], duplicate_tool_results: list[tuple[str, str]], *, annotate_function_response_id: bool = False
-) -> int:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._annotate_google_code_assist_duplicate_tool_response_parts(
-        contents, duplicate_tool_results, annotate_function_response_id=annotate_function_response_id
-    )
-
-
-def _annotate_google_code_assist_duplicate_tool_responses(
-    google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]]
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._annotate_google_code_assist_duplicate_tool_responses(
-        google_request_dict, completion_messages
-    )
 
 
 _google_code_assist_tool_results_from_completion_messages = _google_context_window._google_code_assist_tool_results_from_completion_messages
 
 
-def _annotate_google_code_assist_claude_tool_response_ids(
-    google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]], *, google_model: str
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._annotate_google_code_assist_claude_tool_response_ids(
-        google_request_dict, completion_messages, google_model=google_model
-    )
-
-
-def _google_code_assist_function_response_id(
-    function_response: dict[str, Any],
-) -> Optional[str]:
-    response_payload = function_response.get("response")
-    response_tool_use_id = response_payload.get("tool_use_id") if isinstance(response_payload, dict) else None
-    for candidate in (function_response.get("id"), response_tool_use_id):
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return None
-
-
-def _google_code_assist_function_call_args_for_id(
-    tool_call_id: str,
-    *,
-    scope_key: Optional[str] = None,
-) -> dict[str, Any]:
-    cached_arguments = _lookup_codex_google_code_assist_tool_call_arguments(
-        tool_call_id,
-        scope_key=scope_key,
-    )
-    if not isinstance(cached_arguments, str) or not cached_arguments.strip():
-        return {}
-    try:
-        parsed_arguments = json.loads(cached_arguments)
-    except Exception:
-        return {}
-    return parsed_arguments if isinstance(parsed_arguments, dict) else {}
-
-
-def _insert_google_code_assist_missing_claude_function_call_pairs(
-    google_request_dict: dict[str, Any], *, google_model: str, scope_key: Optional[str] = None
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._insert_google_code_assist_missing_claude_function_call_pairs(
-        google_request_dict, google_model=google_model, scope_key=scope_key
-    )
 
 
 def _extract_google_code_assist_text_metrics(content_block: Any) -> tuple[int, int]:
@@ -4732,97 +3923,6 @@ def _summarize_google_code_assist_request_shape(payload: Any) -> dict[str, Any]:
     return _anthropic_google_shaping._summarize_google_code_assist_request_shape(payload)
 
 
-def _unwrap_google_code_assist_response_payload(payload: Any) -> Optional[dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._unwrap_google_code_assist_response_payload(payload)
-
-
-async def _translate_google_code_assist_response_to_anthropic(
-    *,
-    response: Response,
-    adapter_model: str,
-    tool_name_mapping: dict[str, str],
-    completion_messages: list[dict[str, Any]],
-    gemini_optional_params: dict[str, Any],
-    litellm_params: dict[str, Any],
-    logging_obj: Any,
-) -> Response:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._translate_google_code_assist_response_to_anthropic(
-        response=response,
-        adapter_model=adapter_model,
-        tool_name_mapping=tool_name_mapping,
-        completion_messages=completion_messages,
-        gemini_optional_params=gemini_optional_params,
-        litellm_params=litellm_params,
-        logging_obj=logging_obj,
-    )
-
-
-def _iterate_google_code_assist_unwrapped_stream(
-    body_iterator: Any, *, adapter_model: Optional[str] = None, rate_limit_key: Optional[str] = None
-) -> Any:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._iterate_google_code_assist_unwrapped_stream(
-        body_iterator, adapter_model=adapter_model, rate_limit_key=rate_limit_key
-    )
-
-
-def _build_anthropic_streaming_response_from_google_code_assist_stream(
-    *,
-    response: StreamingResponse,
-    adapter_model: str,
-    tool_name_mapping: dict[str, str],
-    gemini_optional_params: dict[str, Any],
-    rate_limit_key: Optional[str] = None,
-) -> StreamingResponse:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_anthropic_streaming_response_from_google_code_assist_stream(
-        response=response,
-        adapter_model=adapter_model,
-        tool_name_mapping=tool_name_mapping,
-        gemini_optional_params=gemini_optional_params,
-        rate_limit_key=rate_limit_key,
-    )
-
-
-def _restore_google_adapter_tool_call_names(
-    response_obj: Any, tool_name_mapping: dict[str, str], *, scope_key: Optional[str] = None
-) -> Any:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._restore_google_adapter_tool_call_names(
-        response_obj, tool_name_mapping, scope_key=scope_key
-    )
-
-
-async def _restore_google_adapter_tool_call_names_stream(
-    completion_stream: Any, tool_name_mapping: dict[str, str], *, scope_key: Optional[str] = None
-) -> Any:
-    _anthropic_google_shaping.bind_runtime(globals())
-    async for _provider_item in _anthropic_google_shaping._restore_google_adapter_tool_call_names_stream(
-        completion_stream, tool_name_mapping, scope_key=scope_key
-    ):
-        yield _provider_item
-
-
-async def _collect_google_code_assist_model_response_from_stream(
-    *, response: StreamingResponse, adapter_model: str, logging_obj: Any
-) -> Any:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._collect_google_code_assist_model_response_from_stream(
-        response=response, adapter_model=adapter_model, logging_obj=logging_obj
-    )
-
-
-async def _collect_google_code_assist_response_from_stream(
-    *, response: StreamingResponse, adapter_model: str, tool_name_mapping: dict[str, str], logging_obj: Any
-) -> Response:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._collect_google_code_assist_response_from_stream(
-        response=response, adapter_model=adapter_model, tool_name_mapping=tool_name_mapping, logging_obj=logging_obj
-    )
-
-
 
 
 def _build_responses_response_from_adapter_response(response_obj: Any) -> Response:
@@ -4834,13 +3934,6 @@ def _build_responses_response_from_adapter_response(response_obj: Any) -> Respon
 
 
 
-def _build_codex_streaming_response_from_google_code_assist_stream(
-    *, response: StreamingResponse, adapter_request: SimpleNamespace
-) -> StreamingResponse:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_streaming_response_from_google_code_assist_stream(
-        response=response, adapter_request=adapter_request
-    )
 
 
 def _wrap_streaming_response_with_release_callback(
@@ -5963,9 +5056,6 @@ def _build_anthropic_response_from_completion_adapter_response(
 
 
 
-def _sanitize_google_code_assist_request_schemas(wrapped_request_body: Any) -> int:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._sanitize_google_code_assist_request_schemas(wrapped_request_body)
 
 
 def _log_google_completion_adapter_debug(
