@@ -31,6 +31,9 @@ from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints import (
     aawm_alias_routing_policy as policy_compat,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+    anthropic_adapter_calls as _wave6f_anthropic_calls,
+)
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 
 # ---------------------------------------------------------------------------
@@ -42,6 +45,7 @@ PASS_THROUGH_DIR = PACKAGE_DIR.parent
 GOD_PATH = Path(lpe.__file__).resolve()
 COMPAT_POLICY_PATH = Path(policy_compat.__file__).resolve()
 ARCHITECTURE_PATH = PASS_THROUGH_DIR / "architecture.md"
+WAVE6F_ANTHROPIC_CALLS_PATH = Path(_wave6f_anthropic_calls.__file__).resolve()
 PROVIDER_DIR = (
     GOD_PATH.parents[2]
     / "llms"
@@ -244,9 +248,6 @@ ALLOWED_GOD_THIN_WRAPPERS: dict[str, str] = {
     "_hydrate_aawm_alias_routing_affinity_memory": (
         "_aawm_alias_memory.hydrate_affinity_memory"
     ),
-    "_finalize_anthropic_responses_adapter_upstream_response": (
-        "_aawm_responses_finalize.finalize_anthropic_responses_adapter_upstream_response"
-    ),
 }
 
 # Nine Anthropic adapter route handlers that must delegate to package drivers.
@@ -299,6 +300,25 @@ DURABLE_GOD_BINDINGS = {
     ),
     "_get_aawm_alias_routing_state_namespace": (
         "get_aawm_alias_routing_state_namespace"
+    ),
+}
+
+# Wave 6F exact-removal contract: these four former god-module FunctionDefs
+# now live exclusively in aawm_adapter_runtime/anthropic_adapter_calls.py and
+# are installed back onto the god module via install_wave6f(globals()).
+WAVE6F_EXTRACTED_FUNCTIONS: dict[str, str] = {
+    "_build_anthropic_responses_adapter_request_body": (
+        "_anthropic_provider_common.build_responses_request_body"
+    ),
+    "_prepare_anthropic_completion_adapter_request_body": (
+        "_anthropic_provider_common.prepare_completion_request_body"
+    ),
+    "_apply_anthropic_responses_adapter_policies_from_config": (
+        "_anthropic_provider_common.apply_responses_policies"
+    ),
+    "_finalize_anthropic_responses_adapter_upstream_response": (
+        "_aawm_responses_finalize."
+        "finalize_anthropic_responses_adapter_upstream_response"
     ),
 }
 
@@ -1000,22 +1020,38 @@ def test_rr054_provider_common_owns_shared_shaping_orchestration() -> None:
         "apply_responses_policies",
     } <= common_defs
 
-    god_tree = _parse(GOD_PATH)
-    expected_delegates = {
-        "_build_anthropic_responses_adapter_request_body": (
-            "_anthropic_provider_common.build_responses_request_body"
-        ),
-        "_prepare_anthropic_completion_adapter_request_body": (
-            "_anthropic_provider_common.prepare_completion_request_body"
-        ),
-        "_apply_anthropic_responses_adapter_policies_from_config": (
-            "_anthropic_provider_common.apply_responses_policies"
-        ),
+    # Wave 6F: the three shaping wrappers are no longer god-module FunctionDefs.
+    # They are defined in anthropic_adapter_calls.py and delegate to common.
+    god_fn_cls = _top_level_function_class_names(_parse(GOD_PATH))
+    calls_tree = _parse(WAVE6F_ANTHROPIC_CALLS_PATH)
+    shaping_names = {
+        "_build_anthropic_responses_adapter_request_body",
+        "_prepare_anthropic_completion_adapter_request_body",
+        "_apply_anthropic_responses_adapter_policies_from_config",
     }
-    for wrapper, expected_call in expected_delegates.items():
-        fn = _function_node(god_tree, wrapper)
-        assert fn is not None, wrapper
-        assert expected_call in _call_attr_names(fn)
+    for name in sorted(shaping_names):
+        # Exact removal: not a FunctionDef on the god-file.
+        assert name not in god_fn_cls, (
+            f"{name} must not be a god-module FunctionDef after Wave 6F"
+        )
+        # Defined in the extracted owner module.
+        fn = _function_node(calls_tree, name)
+        assert fn is not None, (
+            f"{name} must be defined in anthropic_adapter_calls.py"
+        )
+        # Delegates to provider common.
+        expected_call = WAVE6F_EXTRACTED_FUNCTIONS[name]
+        assert expected_call in _call_attr_names(fn), (
+            f"{name} must delegate to {expected_call}"
+        )
+        # Runtime accessibility on the god module via install_wave6f.
+        assert hasattr(lpe, name), (
+            f"{name} must be accessible on the god module at runtime"
+        )
+        extracted_obj = getattr(_wave6f_anthropic_calls, name)
+        assert getattr(lpe, name) is extracted_obj, (
+            f"lpe.{name} must be identical to the extracted module object"
+        )
 
 
 def test_rr054_god_file_provider_prepare_wrappers_are_thin_delegates() -> None:
@@ -1059,6 +1095,7 @@ def test_rr054_provider_algorithms_are_not_duplicated_in_god_file() -> None:
 def test_rr054_responses_finalize_control_flow_owned_by_package() -> None:
     package_source = _read(PACKAGE_DIR / "responses_finalize.py")
     god_source = _read(GOD_PATH)
+    calls_source = _read(WAVE6F_ANTHROPIC_CALLS_PATH)
 
     # Package owns the real finalization control flow.
     for marker in (
@@ -1069,28 +1106,33 @@ def test_rr054_responses_finalize_control_flow_owned_by_package() -> None:
     ):
         assert marker in package_source, f"package finalize missing {marker!r}"
 
-    # God-file must not contain the package control-flow body markers as its
-    # own implementation outside the configure/wrapper path. The thin wrapper
-    # and runtime callback wiring are required by architecture.
+    # God-file retains configure wiring but not the finalize FunctionDef.
     assert "configure_responses_finalize_runtime" in god_source
+
+    # Wave 6F exact removal: not a god-module FunctionDef.
+    god_fn_cls = _top_level_function_class_names(_parse(GOD_PATH))
     assert (
-        "_aawm_responses_finalize.finalize_anthropic_responses_adapter_upstream_response"
-        in god_source
+        "_finalize_anthropic_responses_adapter_upstream_response" not in god_fn_cls
+    ), (
+        "_finalize_anthropic_responses_adapter_upstream_response must not be a "
+        "god-module FunctionDef after Wave 6F extraction"
     )
 
-    # Ensure god wrapper does not embed validate/collect/build itself.
+    # Extracted owner defines it and delegates to the package finalize entrypoint.
+    calls_tree = _parse(WAVE6F_ANTHROPIC_CALLS_PATH)
     fn = _function_node(
-        _parse(GOD_PATH),
-        "_finalize_anthropic_responses_adapter_upstream_response",
+        calls_tree, "_finalize_anthropic_responses_adapter_upstream_response"
     )
-    assert fn is not None
+    assert fn is not None, (
+        "_finalize_anthropic_responses_adapter_upstream_response must be "
+        "defined in anthropic_adapter_calls.py"
+    )
     calls = _call_attr_names(fn)
     assert (
-        "_aawm_responses_finalize.finalize_anthropic_responses_adapter_upstream_response"
-        in calls
-    )
-    # Local re-implementation would typically call validate/collect helpers
-    # directly without going through the package finalize entrypoint only.
+        "_aawm_responses_finalize."
+        "finalize_anthropic_responses_adapter_upstream_response" in calls
+    ), f"extracted finalize must delegate to package; calls={sorted(calls)}"
+    # Thin delegate: body should be a single return-await.
     assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
     body_stmts = [
         s
@@ -1101,8 +1143,23 @@ def test_rr054_responses_finalize_control_flow_owned_by_package() -> None:
             and isinstance(s.value.value, str)
         )
     ]
-    assert len(body_stmts) <= 4, (
-        "god finalize wrapper is not thin; possible duplicated finalization logic"
+    assert len(body_stmts) <= 2, (
+        "extracted finalize wrapper is not thin; possible duplicated logic"
+    )
+
+    # Runtime accessibility on the god module via install_wave6f.
+    assert hasattr(lpe, "_finalize_anthropic_responses_adapter_upstream_response")
+    assert getattr(
+        lpe, "_finalize_anthropic_responses_adapter_upstream_response"
+    ) is getattr(
+        _wave6f_anthropic_calls,
+        "_finalize_anthropic_responses_adapter_upstream_response",
+    )
+
+    # The extracted module references the package finalize entrypoint.
+    assert (
+        "_aawm_responses_finalize."
+        "finalize_anthropic_responses_adapter_upstream_response" in calls_source
     )
 
 

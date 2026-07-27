@@ -6,7 +6,17 @@ from functools import lru_cache
 from types import FunctionType, ModuleType
 from typing import Any
 
-from . import payload_validation, request_build, sse, stream_collect, tool_call_restore
+from . import (
+    anthropic_adapter_calls,
+    anthropic_dispatch,
+    codex_candidate_calls,
+    codex_dispatch,
+    payload_validation,
+    request_build,
+    sse,
+    stream_collect,
+    tool_call_restore,
+)
 
 __all__ = [
     "install",
@@ -15,6 +25,11 @@ __all__ = [
     "tool_call_restore",
     "stream_collect",
     "payload_validation",
+    "anthropic_adapter_calls",
+    "codex_candidate_calls",
+    "codex_dispatch",
+    "anthropic_dispatch",
+    "install_wave6f",
 ]
 
 
@@ -65,3 +80,20 @@ def install(host_globals: dict[str, Any]) -> None:
     tool_call_restore.install(host_globals)
     stream_collect.install(host_globals)
     payload_validation.install(host_globals)
+
+
+def install_wave6f(host_globals: dict[str, Any]) -> None:
+    """Install Wave 6F facades after the Wave 6D/6E host bindings exist."""
+    canonical_route_metadata = host_globals.get(
+        "_add_route_family_logging_metadata"
+    )
+    anthropic_adapter_calls.install(host_globals)
+    if canonical_route_metadata is not None:
+        anthropic_adapter_calls._add_route_family_logging_metadata = (
+            canonical_route_metadata
+        )
+        host_globals["_add_route_family_logging_metadata"] = (
+            canonical_route_metadata
+        )
+    codex_candidate_calls.install(host_globals)
+    codex_dispatch.install(host_globals)

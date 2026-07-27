@@ -674,6 +674,51 @@ Wave 6E does not claim Wave 6F ownership: provider calls, candidate calls,
 dispatch gates, route-pair delegates, the OpenCode wrapper, native Anthropic
 routes, and the aawm.2/aawm.5 patches remain in the god module / Wave 6F scope.
 
+#### Wave 6F adapter-call and dispatch ownership
+
+Wave 6F extracts adapter execution and dispatch orchestration into four modules
+under `aawm_adapter_runtime/`:
+
+| Concern | Module | Callable surface |
+|---------|--------|------------------|
+| Shared Anthropic adapter request policies, execution, streaming, response finalization, and route logging support | `anthropic_adapter_calls.py` | 46 |
+| Codex auto-agent candidate execution plus Kimi, Alibaba, OpenCode, and OpenRouter candidate calls | `codex_candidate_calls.py` | 14 |
+| Codex Responses adapter recognition and optional dispatch | `codex_dispatch.py` | 1 |
+| Anthropic-shaped adapter recognition and optional dispatch through an explicit runtime | `anthropic_dispatch.py` | 1 |
+
+The authored surface is 62 callables. Exactly 55 former god-module
+`FunctionDef`s move to the first two modules: 41 Anthropic adapter-call
+definitions and 14 Codex candidate-call definitions. Five Anthropic-call names
+were already compatibility assignments rather than definitions.
+`_add_route_family_logging_metadata` remains canonically owned by Wave 6D
+`observability_metadata.py`; Wave 6F installation restores that same object on
+both the god module and `anthropic_adapter_calls.py`.
+
+`aawm_adapter_runtime.install_wave6f()` runs only after the Wave 6D and Wave 6E
+runtime callbacks are configured. It installs Anthropic adapter calls first,
+then Codex candidate calls, then Codex dispatch. Candidate calls therefore
+exist on the live host namespace before the Codex dispatch gate is published.
+`anthropic_dispatch.py` is not installed through host-global rebinding; the god
+module constructs `AnthropicDispatchRuntime` with late-binding resolver and
+handler callbacks.
+
+The Codex gate replaces only the inline recognition cascade after existing
+request preparation. A returned `Response` ends dispatch; `None` preserves the
+prepared body and falls through to the normal OpenAI pass-through path. The
+Anthropic gate runs after body preparation and the auto-agent alias route but
+before native Anthropic handling. Its resolver priority is xAI OAuth, Grok
+native OAuth, OpenAI Responses, Antigravity, OpenCode, Kimi, Alibaba, Google,
+NVIDIA, OpenRouter completion, then OpenRouter Responses. `None` falls through
+to native Anthropic normalization, context-1m handling, and passthrough.
+
+The 12 concrete Anthropic prepare/handle route-family pairs remain visible
+god-module delegates, including the asymmetric Google pair
+`_prepare_anthropic_google_completion_adapter_request` /
+`_handle_anthropic_google_completion_adapter_route`. The combined OpenCode
+wrapper, native Anthropic routes, route decorators and registrations, candidate
+loop/cooldown ownership, and the aawm.2 OAuth and aawm.5 audit patches remain in
+their prior owners.
+
 ### Runtime invariants
 
 - Durable Redis keys use

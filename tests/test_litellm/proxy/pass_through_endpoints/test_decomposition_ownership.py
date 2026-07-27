@@ -1995,3 +1995,401 @@ class TestWave6ERequestPolicyOwnership:
         assert abp._apply_control_plane_rewrites is not None
         assert abp._prepare_observability is not None
         assert abp._get_tenant_header is not None
+
+
+# ===========================================================================
+# SECTION 11: Wave 6F adapter-call and dispatch ownership
+# ===========================================================================
+
+WAVE6F_MODULE_ORDER: tuple[str, ...] = (
+    "anthropic_adapter_calls",
+    "codex_candidate_calls",
+    "codex_dispatch",
+    "anthropic_dispatch",
+)
+WAVE6F_MODULE_IMPORT_PATHS: dict[str, str] = {
+    name: (
+        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime."
+        f"{name}"
+    )
+    for name in WAVE6F_MODULE_ORDER
+}
+WAVE6F_EXPECTED_COUNTS: dict[str, int] = {
+    "anthropic_adapter_calls": 46,
+    "codex_candidate_calls": 14,
+    "codex_dispatch": 1,
+    "anthropic_dispatch": 1,
+}
+
+WAVE6F_ANTHROPIC_ADAPTER_CALL_SYMBOLS: set[str] = {
+    "_decode_http_response_body",
+    "_build_adapted_route_rollup_kwargs",
+    "_emit_adapted_route_access_log",
+    "_record_adapted_completed_route_rollup_turn",
+    "_record_adapted_completed_route_rollup_after_stream",
+    "_add_codex_native_tool_alias_adapter_metadata",
+    "_normalize_openai_function_tool_parameters",
+    "_sanitize_openai_object_schema_properties",
+    "_normalize_openai_function_tool_schemas",
+    "_get_openai_adapter_function_tool_names",
+    "_apply_responses_adapter_parallel_instruction_policy",
+    "_apply_openai_adapter_parallel_instruction_policy",
+    "_apply_openrouter_adapter_parallel_instruction_policy",
+    "_get_latest_adapter_user_prompt_text",
+    "_prompt_explicitly_requests_bash_tool",
+    "_maybe_force_explicit_bash_tool_choice_for_responses_adapter",
+    "_apply_forced_bash_tool_choice_for_responses_adapter",
+    "_maybe_force_explicit_bash_tool_choice_for_completion_adapter",
+    "_responses_request_contains_mcp_tools",
+    "_coerce_mapping_to_namespace",
+    "_drop_anthropic_grok_native_prior_function_call_replay",
+    "_build_anthropic_response_from_responses_response",
+    "_build_completion_adapter_metadata",
+    "_copy_translated_anthropic_adapter_response_headers",
+    "_get_anthropic_adapter_access_log_target_label",
+    "_annotate_request_scope_for_adapted_access_log",
+    "_serialize_anthropic_adapter_response",
+    "_build_anthropic_response_from_completion_adapter_response",
+    "_get_anthropic_adapter_openai_target_base",
+    "_get_anthropic_adapter_openrouter_api_key",
+    "_get_anthropic_adapter_nvidia_api_key",
+    "_get_anthropic_adapter_nvidia_target_base",
+    "_get_anthropic_adapter_openrouter_target_base",
+    "_resolve_anthropic_openai_responses_adapter_auth_context",
+    "_build_anthropic_responses_adapter_request_body",
+    "_prepare_anthropic_completion_adapter_request_body",
+    "_apply_anthropic_responses_adapter_common_request_policies",
+    "_apply_anthropic_responses_adapter_policies_from_config",
+    "_finalize_anthropic_responses_adapter_upstream_response",
+    "_finalize_anthropic_responses_adapter_from_config",
+    "_perform_anthropic_responses_adapter_pass_through",
+    "_perform_normalized_anthropic_completion_adapter_stream",
+    "_is_anthropic_messages_response",
+    "_finalize_anthropic_completion_adapter_response",
+    "_perform_anthropic_completion_adapter_messages_call",
+    "_add_route_family_logging_metadata",
+}
+
+WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS: set[str] = {
+    "_perform_codex_auto_agent_alias_candidate_request",
+    "_perform_codex_auto_agent_native_openai_request",
+    "_perform_codex_auto_agent_grok_native_responses_request",
+    "_perform_codex_auto_agent_oa_xai_responses_request",
+    "_validate_codex_auto_agent_openrouter_responses_stream",
+    "_perform_codex_auto_agent_openrouter_responses_request",
+    "_perform_codex_auto_agent_openrouter_completion_request",
+    "_prepare_codex_kimi_chat_completions_adapter_route",
+    "_perform_codex_kimi_chat_completions_adapter_call",
+    "_handle_codex_kimi_chat_completions_adapter_route",
+    "_prepare_codex_alibaba_token_plan_adapter_route",
+    "_perform_codex_alibaba_token_plan_adapter_call",
+    "_handle_codex_alibaba_token_plan_adapter_route",
+    "_handle_codex_opencode_zen_adapter_route",
+}
+
+WAVE6F_DISPATCH_SYMBOLS: set[str] = {
+    "try_dispatch_codex_request",
+    "try_dispatch_anthropic_adapter",
+}
+
+WAVE6F_SYMBOL_INVENTORY: dict[str, set[str]] = {
+    "anthropic_adapter_calls": WAVE6F_ANTHROPIC_ADAPTER_CALL_SYMBOLS,
+    "codex_candidate_calls": WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS,
+    "codex_dispatch": {"try_dispatch_codex_request"},
+    "anthropic_dispatch": {"try_dispatch_anthropic_adapter"},
+}
+
+WAVE6F_ANTHROPIC_ALREADY_FACADE_SYMBOLS: set[str] = {
+    "_get_anthropic_adapter_openrouter_api_key",
+    "_get_anthropic_adapter_nvidia_api_key",
+    "_get_anthropic_adapter_nvidia_target_base",
+    "_get_anthropic_adapter_openrouter_target_base",
+    "_add_route_family_logging_metadata",
+}
+
+WAVE6F_REMOVED_GOD_FUNCTIONS: set[str] = (
+    WAVE6F_ANTHROPIC_ADAPTER_CALL_SYMBOLS
+    - WAVE6F_ANTHROPIC_ALREADY_FACADE_SYMBOLS
+) | WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS
+
+ALL_WAVE6F_FACADES: set[str] = set().union(
+    *WAVE6F_SYMBOL_INVENTORY.values()
+)
+
+WAVE6F_ANTHROPIC_ROUTE_PAIRS: tuple[tuple[str, str], ...] = (
+    (
+        "_prepare_anthropic_google_completion_adapter_request",
+        "_handle_anthropic_google_completion_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_openai_responses_adapter_route",
+        "_handle_anthropic_openai_responses_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_xai_oauth_responses_adapter_route",
+        "_handle_anthropic_xai_oauth_responses_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_grok_native_oauth_responses_adapter_route",
+        "_handle_anthropic_grok_native_oauth_responses_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_xai_oauth_completion_adapter_route",
+        "_handle_anthropic_xai_oauth_completion_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_nvidia_completion_adapter_route",
+        "_handle_anthropic_nvidia_completion_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_openrouter_completion_adapter_route",
+        "_handle_anthropic_openrouter_completion_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_openrouter_responses_adapter_route",
+        "_handle_anthropic_openrouter_responses_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_opencode_zen_responses_adapter_route",
+        "_handle_anthropic_opencode_zen_responses_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_opencode_zen_completion_adapter_route",
+        "_handle_anthropic_opencode_zen_completion_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_kimi_chat_completions_adapter_route",
+        "_handle_anthropic_kimi_chat_completions_adapter_route",
+    ),
+    (
+        "_prepare_anthropic_alibaba_token_plan_adapter_route",
+        "_handle_anthropic_alibaba_token_plan_adapter_route",
+    ),
+)
+
+
+class TestWave6FAdapterRuntimeOwnership:
+    """Wave 6F structural ownership and compatibility-facade contract."""
+
+    @staticmethod
+    def _modules() -> dict[str, object]:
+        return {
+            name: importlib.import_module(import_path)
+            for name, import_path in WAVE6F_MODULE_IMPORT_PATHS.items()
+        }
+
+    def test_exact_62_callable_inventory_without_duplicate_ownership(self):
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+        for module_name in WAVE6F_MODULE_ORDER:
+            symbols = WAVE6F_SYMBOL_INVENTORY[module_name]
+            assert len(symbols) == WAVE6F_EXPECTED_COUNTS[module_name]
+            for symbol in symbols:
+                if symbol in seen:
+                    duplicates.append(
+                        f"{symbol}: {seen[symbol]} and {module_name}"
+                    )
+                seen[symbol] = module_name
+
+        assert len(seen) == 62
+        assert not duplicates
+
+    def test_authored_module_inventories_match_shared_inventory(self):
+        modules = self._modules()
+        assert set(
+            getattr(
+                modules["anthropic_adapter_calls"],
+                "_EXTRACTED_FUNCTION_NAMES",
+            )
+        ) == WAVE6F_ANTHROPIC_ADAPTER_CALL_SYMBOLS
+        assert set(
+            getattr(
+                modules["codex_candidate_calls"],
+                "_HOST_FUNCTION_NAMES",
+            )
+        ) == WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS
+        assert callable(
+            getattr(modules["codex_dispatch"], "try_dispatch_codex_request")
+        )
+        assert callable(
+            getattr(
+                modules["anthropic_dispatch"],
+                "try_dispatch_anthropic_adapter",
+            )
+        )
+
+    def test_exact_55_owned_function_defs_removed_from_god_module(self):
+        assert len(WAVE6F_REMOVED_GOD_FUNCTIONS) == 55
+        func_defs = _top_level_function_defs(_parse_god_module())
+        violations = WAVE6F_REMOVED_GOD_FUNCTIONS & func_defs
+        assert not violations, (
+            "Wave 6F-owned functions remain defined in god module: "
+            f"{sorted(violations)}"
+        )
+
+    def test_dispatch_gate_definition_disposition(self):
+        func_defs = _top_level_function_defs(_parse_god_module())
+        assert "try_dispatch_codex_request" not in func_defs
+        assert "try_dispatch_anthropic_adapter" in func_defs
+
+    def test_all_62_facades_are_accessible(self):
+        for symbol in ALL_WAVE6F_FACADES:
+            assert callable(getattr(lpe, symbol, None)), symbol
+
+    def test_same_object_facade_identity(self):
+        modules = self._modules()
+        for symbol in WAVE6F_ANTHROPIC_ADAPTER_CALL_SYMBOLS:
+            assert getattr(lpe, symbol) is getattr(
+                modules["anthropic_adapter_calls"],
+                symbol,
+            )
+        for symbol in WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS:
+            assert getattr(lpe, symbol) is getattr(
+                modules["codex_candidate_calls"],
+                symbol,
+            )
+        assert lpe.try_dispatch_codex_request is getattr(
+            modules["codex_dispatch"],
+            "try_dispatch_codex_request",
+        )
+        assert lpe.try_dispatch_anthropic_adapter is not getattr(
+            modules["anthropic_dispatch"],
+            "try_dispatch_anthropic_adapter",
+        )
+
+    def test_wave6d_route_metadata_identity_is_preserved(self):
+        modules = self._modules()
+        observability = importlib.import_module(
+            "litellm.proxy.pass_through_endpoints.aawm_request_policy."
+            "observability_metadata"
+        )
+        assert lpe._add_route_family_logging_metadata is (
+            observability._add_route_family_logging_metadata
+        )
+        assert getattr(
+            modules["anthropic_adapter_calls"],
+            "_add_route_family_logging_metadata",
+        ) is observability._add_route_family_logging_metadata
+
+    def test_package_exports_and_install_order(self):
+        package = importlib.import_module(
+            "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime"
+        )
+        modules = self._modules()
+        for module_name, module in modules.items():
+            assert getattr(package, module_name) is module
+
+        package_tree = ast.parse(
+            Path(package.__file__).read_text(encoding="utf-8")
+        )
+        install = next(
+            node
+            for node in package_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "install_wave6f"
+        )
+        install_order = [
+            statement.value.func.value.id
+            for statement in install.body
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+            and statement.value.func.attr == "install"
+            and isinstance(statement.value.func.value, ast.Name)
+        ]
+        assert install_order == [
+            "anthropic_adapter_calls",
+            "codex_candidate_calls",
+            "codex_dispatch",
+        ]
+        assert "anthropic_dispatch" not in install_order
+
+    def test_wave6f_install_follows_wave6e_configuration(self):
+        tree = _parse_god_module()
+        body_prep_line = 0
+        install_line = 0
+        runtime_line = 0
+        wrapper_line = 0
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+            ):
+                if (
+                    node.func.value.id == "_aawm_anthropic_body_prep"
+                    and node.func.attr
+                    == "configure_anthropic_body_prep_runtime"
+                ):
+                    body_prep_line = node.lineno
+                elif (
+                    node.func.value.id == "_aawm_adapter_runtime"
+                    and node.func.attr == "install_wave6f"
+                ):
+                    install_line = node.lineno
+            elif (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "_ANTHROPIC_DISPATCH_RUNTIME"
+                    for target in node.targets
+                )
+            ):
+                runtime_line = node.lineno
+            elif (
+                isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "try_dispatch_anthropic_adapter"
+            ):
+                wrapper_line = node.lineno
+
+        assert 0 < body_prep_line < install_line < runtime_line < wrapper_line
+
+    def test_no_wave6f_module_imports_god_module_at_scope(self):
+        for module_name, module in self._modules().items():
+            tree = ast.parse(
+                Path(module.__file__).read_text(encoding="utf-8")
+            )
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    assert all(
+                        "llm_passthrough_endpoints" not in alias.name
+                        for alias in node.names
+                    ), f"{module_name} imports god module"
+                elif isinstance(node, ast.ImportFrom):
+                    assert (
+                        node.module is None
+                        or "llm_passthrough_endpoints" not in node.module
+                    ), f"{module_name} imports from god module"
+
+    def test_prior_wave_overlap_is_only_canonical_route_metadata(self):
+        prior = (
+            ALL_MOVED_FUNCTIONS
+            | ALL_RESTORED_CONSTANTS
+            | ALL_WAVE6D_FUNCTIONS
+            | ALL_WAVE6E_FUNCTIONS
+        )
+        assert ALL_WAVE6F_FACADES & prior == {
+            "_add_route_family_logging_metadata"
+        }
+
+    def test_all_12_anthropic_route_pairs_and_opencode_wrapper_remain(self):
+        func_defs = _top_level_function_defs(_parse_god_module())
+        assert len(WAVE6F_ANTHROPIC_ROUTE_PAIRS) == 12
+        for prepare, handle in WAVE6F_ANTHROPIC_ROUTE_PAIRS:
+            assert prepare in func_defs
+            assert handle in func_defs
+        assert "_handle_anthropic_opencode_zen_adapter_route" in func_defs
+
+    def test_native_anthropic_route_and_decorator_remain(self):
+        tree = _parse_god_module()
+        func_defs = _top_level_function_defs(tree)
+        assert "_perform_anthropic_native_passthrough_request" in func_defs
+        assert "_prepare_anthropic_oauth_native_passthrough_headers" in func_defs
+        assert "_prepare_anthropic_context_1m_native_passthrough" in func_defs
+        route = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "anthropic_proxy_route"
+        )
+        assert route.decorator_list

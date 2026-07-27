@@ -23,6 +23,7 @@ from starlette.responses import StreamingResponse
 
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import adapter_config
+from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
 
 # ---------------------------------------------------------------------------
 # Canonical nine adapters (RR-054 #9)
@@ -56,6 +57,14 @@ PROBE_RETRYABLE = list(lpe._AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_aawm_route_rollups():
+    """Prevent pending AAWM route rollups from flushing after pytest capture closes."""
+    clear_aawm_route_rollups()
+    yield
+    clear_aawm_route_rollups()
 
 
 def _minimal_request(path: str = "/v1/messages") -> Request:

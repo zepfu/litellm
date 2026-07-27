@@ -12,7 +12,12 @@
       "address": "decorated_function:anthropic_proxy_route",
       "qualified_name": "anthropic_proxy_route",
       "source_kind": "decorated_function",
-      "sha256": "eff26b6046637af91efd7ecd37a14e31da305e60a366aa86a76760e57c2f99ba"
+      "split_policy": "prefix_suffix_guard",
+      "prefix_sha256": "bf1d9e580797adda21bf162f5a4d06032e16335d3bbae629ce83520d5982dbaa",
+      "suffix_sha256": "e461ed7187e79e258c6b06531964b74d108083a8ec914150887dec32891e1bd9",
+      "prefix_end_anchor": "_handle_anthropic_auto_agent_alias_route",
+      "suffix_start_anchor": "_normalize_anthropic_native_passthrough_model_alias",
+      "allowed_zone_description": "Wave 6F dispatch-gate extraction: individual adapter resolve/handle blocks replaced by try_dispatch_anthropic_adapter"
     },
     {
       "address": "decorated_function:assemblyai_proxy_route",
