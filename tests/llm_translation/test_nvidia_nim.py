@@ -375,7 +375,9 @@ class TestNvidiaNimEmbeddingConfigIsolation:
         assert b.get_config() == {"input_type": "query", "truncate": "NONE"}
 
     def test_default_after_configured_has_no_stale_values(self):
-        _configured = NvidiaNimEmbeddingConfig(encoding_format="float", user="u1", input_type="passage", truncate="END")
+        _configured = NvidiaNimEmbeddingConfig(
+            encoding_format="float", user="u1", input_type="passage", truncate="END"
+        )
         default = NvidiaNimEmbeddingConfig()
         assert default.get_config() == {}
 
