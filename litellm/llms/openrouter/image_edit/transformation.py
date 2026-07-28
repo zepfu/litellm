@@ -47,11 +47,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 import httpx
 from httpx._types import RequestFiles
 
-import litellm
 from litellm.images.utils import ImageEditRequestUtils
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.base_llm.image_edit.transformation import BaseImageEditConfig
-from litellm.llms.openrouter.common_utils import OpenRouterException
+from litellm.llms.openrouter.common_utils import (
+    OpenRouterException,
+    get_openrouter_auth_headers,
+)
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.images.main import ImageEditOptionalRequestParams
 from litellm.types.router import GenericLiteLLMParams
@@ -117,15 +119,20 @@ class OpenRouterImageEditConfig(BaseImageEditConfig):
         model: str,
         api_key: Optional[str] = None,
     ) -> dict:
-        api_key = api_key or litellm.api_key or get_secret_str("OPENROUTER_API_KEY")
-        if not api_key:
-            raise ValueError("OPENROUTER_API_KEY is not set")
-        headers.update(
-            {
-                "Authorization": f"Bearer {api_key}",
-            }
+        validated_headers = dict(headers)
+        auth_headers = get_openrouter_auth_headers(
+            api_key=api_key,
+            extra_headers=validated_headers,
         )
-        return headers
+        # Remove any pre-existing authorization key (any casing) before
+        # applying the resolved header so we never end up with duplicates.
+        keys_to_remove = [
+            k for k in validated_headers if k.lower() == "authorization"
+        ]
+        for k in keys_to_remove:
+            del validated_headers[k]
+        validated_headers.update(auth_headers)
+        return validated_headers
 
     def use_multipart_form_data(self) -> bool:
         """OpenRouter uses JSON requests, not multipart/form-data."""

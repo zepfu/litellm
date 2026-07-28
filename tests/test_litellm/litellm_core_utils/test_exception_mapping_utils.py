@@ -379,3 +379,64 @@ class TestExtractAndRaiseLitellmException:
         )
         
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter config-error passthrough (D1-539/D1-540)
+# ---------------------------------------------------------------------------
+
+
+class TestOpenRouterConfigErrorPassthrough:
+    def test_openrouter_config_error_reraised_verbatim(self):
+        from litellm.llms.openrouter.common_utils import OpenRouterConfigError
+
+        original = OpenRouterConfigError("OpenRouter: multiple Authorization headers detected")
+        with pytest.raises(OpenRouterConfigError) as exc_info:
+            exception_type(
+                model="openrouter/google/gemini-2.5-flash",
+                original_exception=original,
+                custom_llm_provider="openrouter",
+            )
+        # Exact same instance is re-raised, not wrapped.
+        assert exc_info.value is original
+
+    def test_openrouter_config_error_is_value_error_compatible(self):
+        from litellm.llms.openrouter.common_utils import OpenRouterConfigError
+
+        original = OpenRouterConfigError("boom")
+        with pytest.raises(ValueError):
+            exception_type(
+                model="openrouter/google/gemini-2.5-flash",
+                original_exception=original,
+                custom_llm_provider="openrouter",
+            )
+
+    def test_non_openrouter_value_error_unchanged(self):
+        """A plain ValueError for a non-OpenRouter provider must not be
+        intercepted by the OpenRouter config-error branch."""
+        original = ValueError("generic failure")
+        with pytest.raises(Exception) as exc_info:
+            exception_type(
+                model="gpt-4",
+                original_exception=original,
+                custom_llm_provider="openai",
+            )
+        assert isinstance(exc_info.value, litellm.APIConnectionError)
+        assert exc_info.value is not original
+
+    def test_remote_openrouter_401_still_maps_to_auth_error(self):
+        """A remote OpenRouter 401 (has status_code) must still map to
+        AuthenticationError, not be swallowed by the config-error branch."""
+        from litellm.llms.openrouter.common_utils import OpenRouterException
+
+        remote = OpenRouterException(
+            message="Unauthorized",
+            status_code=401,
+            headers={},
+        )
+        with pytest.raises(litellm.AuthenticationError):
+            exception_type(
+                model="openrouter/google/gemini-2.5-flash",
+                original_exception=remote,
+                custom_llm_provider="openrouter",
+            )

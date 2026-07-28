@@ -31,12 +31,10 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import httpx
 
-import litellm
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.base_llm.image_generation.transformation import (
     BaseImageGenerationConfig,
 )
-from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import (
     OpenAIImageGenerationOptionalParams,
     AllMessageValues,
@@ -47,7 +45,10 @@ from litellm.types.utils import (
     ImageUsage,
     ImageUsageInputTokensDetails,
 )
-from litellm.llms.openrouter.common_utils import OpenRouterException
+from litellm.llms.openrouter.common_utils import (
+    OpenRouterException,
+    get_openrouter_auth_headers,
+)
 
 
 if TYPE_CHECKING:
@@ -272,13 +273,20 @@ class OpenRouterImageGenerationConfig(BaseImageGenerationConfig):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
     ) -> dict:
-        api_key = api_key or litellm.api_key or get_secret_str("OPENROUTER_API_KEY")
-        headers.update(
-            {
-                "Authorization": f"Bearer {api_key}",
-            }
+        validated_headers = dict(headers)
+        auth_headers = get_openrouter_auth_headers(
+            api_key=api_key,
+            extra_headers=validated_headers,
         )
-        return headers
+        # Remove any pre-existing authorization key (any casing) before
+        # applying the resolved header so we never end up with duplicates.
+        keys_to_remove = [
+            k for k in validated_headers if k.lower() == "authorization"
+        ]
+        for k in keys_to_remove:
+            del validated_headers[k]
+        validated_headers.update(auth_headers)
+        return validated_headers
 
     def transform_image_generation_request(
         self,

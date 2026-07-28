@@ -3340,14 +3340,6 @@ def completion(  # type: ignore # noqa: PLR0915
                 or "https://openrouter.ai/api/v1"
             )
 
-            api_key = (
-                api_key
-                or litellm.api_key
-                or litellm.openrouter_key
-                or get_secret_str("OPENROUTER_API_KEY")
-                or get_secret_str("OR_API_KEY")
-                or get_secret_str("AAWM_OPENROUTER_API_KEY")
-            )
 
             openrouter_site_url = get_secret("OR_SITE_URL") or "https://litellm.ai"
             openrouter_app_name = get_secret("OR_APP_NAME") or "liteLLM"
@@ -5128,14 +5120,6 @@ def embedding(  # noqa: PLR0915
                 or "https://openrouter.ai/api/v1"
             )
 
-            api_key = (
-                api_key
-                or litellm.api_key
-                or litellm.openrouter_key
-                or get_secret_str("OPENROUTER_API_KEY")
-                or get_secret_str("OR_API_KEY")
-                or get_secret_str("AAWM_OPENROUTER_API_KEY")
-            )
 
             openrouter_site_url = get_secret("OR_SITE_URL") or "https://litellm.ai"
             openrouter_app_name = get_secret("OR_APP_NAME") or "liteLLM"

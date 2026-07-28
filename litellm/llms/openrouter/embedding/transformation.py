@@ -15,7 +15,10 @@ from litellm.types.llms.openai import AllEmbeddingInputValues
 from litellm.types.utils import EmbeddingResponse
 from litellm.utils import convert_to_model_response_object
 
-from ..common_utils import OpenRouterException
+from ..common_utils import (
+    OpenRouterException,
+    get_openrouter_auth_headers,
+)
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as _LiteLLMLoggingObj
@@ -43,16 +46,15 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
         api_base: Optional[str] = None,
     ) -> dict:
         """
-        Validate environment and set up headers for OpenRouter API.
+        Validate environment and set up headers for OpenRouter Embedding API.
 
-        OpenRouter requires:
-        - Authorization header with Bearer token
-        - HTTP-Referer header (site URL)
-        - X-Title header (app name)
+        Auth resolution is delegated to the shared
+        ``get_openrouter_auth_headers`` helper, which enforces strict
+        precedence and raises ``OpenRouterConfigError`` on malformed or
+        missing credentials before any HTTP dispatch.
         """
         from litellm import get_secret
 
-        # Get OpenRouter-specific headers
         openrouter_site_url = get_secret("OR_SITE_URL") or "https://litellm.ai"
         openrouter_app_name = get_secret("OR_APP_NAME") or "liteLLM"
 
@@ -62,12 +64,23 @@ class OpenrouterEmbeddingConfig(BaseEmbeddingConfig):
             "Content-Type": "application/json",
         }
 
-        # Add Authorization header if api_key is provided
-        if api_key:
-            openrouter_headers["Authorization"] = f"Bearer {api_key}"
-
-        # Merge with existing headers (user's extra_headers take priority)
+        # Merge base + caller headers (caller wins for non-auth keys).
         merged_headers = {**openrouter_headers, **headers}
+
+        # Resolve auth via the shared helper. It raises OpenRouterConfigError
+        # for a malformed caller Authorization header or when no key source is
+        # available, so failures surface here before HTTP dispatch.
+        auth_headers = get_openrouter_auth_headers(
+            api_key=api_key, extra_headers=headers
+        )
+
+        # Drop any pre-existing authorization header (any casing) and apply the
+        # definitively resolved auth header, preserving caller casing when the
+        # caller supplied a valid Authorization header.
+        merged_headers = {
+            k: v for k, v in merged_headers.items() if k.lower() != "authorization"
+        }
+        merged_headers.update(auth_headers)
 
         return merged_headers
 

@@ -19,7 +19,10 @@ from litellm.types.utils import ModelResponse, ModelResponseStream
 from litellm.utils import get_model_info, supports_native_cache_control
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
-from ..common_utils import OpenRouterException
+from ..common_utils import (
+    OpenRouterException,
+    get_openrouter_auth_headers,
+)
 
 
 # Vendor-family tokens used only when cost-map metadata is missing for a model.
@@ -37,6 +40,48 @@ _OPENROUTER_CACHE_CONTROL_VENDOR_FAMILIES: Tuple[str, ...] = (
 
 
 class OpenrouterConfig(OpenAIGPTConfig):
+    def validate_environment(
+        self,
+        headers: dict,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+    ) -> dict:
+        """Resolve OpenRouter auth headers with strict caller-precedence.
+
+        Delegates to the shared ``get_openrouter_auth_headers`` helper which:
+        - preserves a valid caller-supplied Authorization header (case-insensitive
+          lookup, original casing retained) instead of overwriting with a resolved key;
+        - raises ``OpenRouterConfigError`` for malformed caller auth (no fallback);
+        - resolves keys from the shared precedence chain when no caller auth is present;
+        - raises ``OpenRouterConfigError`` when no credential source is available.
+
+        Content-Type behavior matches the inherited OpenAI implementation.
+        """
+        validated_headers = dict(headers)
+        auth_headers = get_openrouter_auth_headers(
+            api_key=api_key, extra_headers=validated_headers
+        )
+        # Remove all case-insensitive Authorization keys before applying the
+        # single resolved header so we never end up with duplicates.
+        keys_to_remove = [
+            k for k in validated_headers if k.lower() == "authorization"
+        ]
+        for k in keys_to_remove:
+            del validated_headers[k]
+        validated_headers.update(auth_headers)
+
+        if (
+            "content-type" not in validated_headers
+            and "Content-Type" not in validated_headers
+        ):
+            validated_headers["Content-Type"] = "application/json"
+
+        return validated_headers
+
     def get_supported_openai_params(self, model: str) -> list:
         """
         Allow reasoning parameters for models flagged as reasoning-capable.
