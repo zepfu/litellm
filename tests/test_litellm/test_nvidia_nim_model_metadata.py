@@ -2,6 +2,7 @@ import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Dict, Optional
+from unittest.mock import patch
 
 import pytest
 from typing_extensions import assert_type
@@ -254,3 +255,169 @@ def test_should_expose_typed_nvidia_metadata() -> None:
     )
     assert_type(metadata["rerank"], NvidiaNimRerankMetadata)
     assert metadata["supports_max_completion_tokens"] is True
+
+
+# ---------------------------------------------------------------------------
+# D1-556: Typed NVIDIA catalog authority hardening
+# ---------------------------------------------------------------------------
+
+# The exact five NVIDIA NIM rerank catalog keys and their typed metadata.
+EXPECTED_NVIDIA_RERANK_CATALOG: Dict[str, NvidiaNimRerankMetadata] = {
+    "nvidia_nim/nv-rerank-qa-mistral-4b:1": NvidiaNimRerankMetadata(
+        endpoint_path="/v1/retrieval/nvidia/reranking",
+        body_model="nv-rerank-qa-mistral-4b:1",
+    ),
+    "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2": NvidiaNimRerankMetadata(
+        endpoint_path="/v1/retrieval/nvidia/llama-3_2-nv-rerankqa-1b-v2/reranking",
+        body_model="nvidia/llama-3.2-nv-rerankqa-1b-v2",
+    ),
+    "nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3": NvidiaNimRerankMetadata(
+        endpoint_path="/v1/retrieval/nvidia/reranking",
+        body_model="nvidia/nv-rerankqa-mistral-4b-v3",
+    ),
+    "nvidia_nim/nvidia/rerank-qa-mistral-4b": NvidiaNimRerankMetadata(
+        endpoint_path="/v1/retrieval/nvidia/reranking",
+        body_model="nv-rerank-qa-mistral-4b:1",
+    ),
+    "nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2": NvidiaNimRerankMetadata(
+        endpoint_path="/v1/ranking",
+        body_model="nvidia/llama-3.2-nv-rerankqa-1b-v2",
+    ),
+}
+
+
+def test_should_have_exactly_five_nvidia_rerank_catalog_keys() -> None:
+    """Assert the exact set of NVIDIA rerank keys in both catalogs."""
+    for catalog_path in CATALOG_PATHS:
+        catalog = _load_catalog(catalog_path)
+        nvidia_rerank_entries = _nvidia_catalog_entries(catalog, mode="rerank")
+        assert set(nvidia_rerank_entries.keys()) == set(
+            EXPECTED_NVIDIA_RERANK_CATALOG.keys()
+        ), (
+            f"Catalog {catalog_path.name}: expected exactly "
+            f"{sorted(EXPECTED_NVIDIA_RERANK_CATALOG.keys())}, "
+            f"got {sorted(nvidia_rerank_entries.keys())}"
+        )
+
+
+@pytest.mark.usefixtures("local_nvidia_catalog")
+def test_should_resolve_exact_typed_shape_for_each_rerank_key() -> None:
+    """Each known rerank key resolves to exact endpoint_path/body_model."""
+    for catalog_model, expected_rerank in EXPECTED_NVIDIA_RERANK_CATALOG.items():
+        metadata = get_nvidia_nim_model_metadata(catalog_model)
+        assert metadata.get("rerank") == expected_rerank, (
+            f"Model {catalog_model}: expected {expected_rerank}, "
+            f"got {metadata.get('rerank')}"
+        )
+        # Verify typed shape explicitly
+        rerank = metadata["rerank"]
+        assert_type(rerank, NvidiaNimRerankMetadata)
+        assert isinstance(rerank["endpoint_path"], str)
+        assert isinstance(rerank["body_model"], str)
+
+
+@pytest.mark.usefixtures("local_nvidia_catalog")
+def test_should_return_empty_for_genuine_unknown_model() -> None:
+    """Unknown models produce empty metadata (ValueError swallowed)."""
+    result = get_nvidia_nim_model_metadata("vendor/definitely-not-in-catalog")
+    assert result == {}
+    assert isinstance(result, dict)
+
+
+@pytest.mark.usefixtures("local_nvidia_catalog")
+def test_should_raise_typeerror_for_malformed_provider_specific_entry() -> None:
+    """Non-Mapping provider_specific_entry raises TypeError."""
+    catalog_model = next(iter(EXPECTED_NVIDIA_RERANK_CATALOG))
+    fake_model_info: Dict[str, Any] = {
+        "key": catalog_model,
+        "litellm_provider": "nvidia_nim",
+        "mode": "rerank",
+        "provider_specific_entry": "not-a-mapping",
+    }
+    with patch("litellm.utils.get_model_info", return_value=fake_model_info):
+        with pytest.raises(TypeError, match="Malformed provider_specific_entry"):
+            get_nvidia_nim_model_metadata(catalog_model)
+
+
+@pytest.mark.usefixtures("local_nvidia_catalog")
+def test_should_raise_typeerror_for_malformed_rerank_subentry() -> None:
+    """Non-Mapping rerank sub-entry raises TypeError."""
+    catalog_model = next(iter(EXPECTED_NVIDIA_RERANK_CATALOG))
+    fake_model_info: Dict[str, Any] = {
+        "key": catalog_model,
+        "litellm_provider": "nvidia_nim",
+        "mode": "rerank",
+        "provider_specific_entry": {"rerank": 42},
+    }
+    with patch("litellm.utils.get_model_info", return_value=fake_model_info):
+        with pytest.raises(TypeError, match="Malformed.*rerank"):
+            get_nvidia_nim_model_metadata(catalog_model)
+
+
+@pytest.mark.parametrize(
+    "rerank_metadata",
+    (
+        {"endpoint_path": 123, "body_model": None},
+        {"endpoint_path": "", "body_model": "nvidia/example-reranker"},
+        {"endpoint_path": " \t", "body_model": "nvidia/example-reranker"},
+        {"endpoint_path": "/v1/ranking", "body_model": ""},
+        {"endpoint_path": "/v1/ranking", "body_model": " \n"},
+    ),
+)
+@pytest.mark.usefixtures("local_nvidia_catalog")
+def test_should_raise_typeerror_for_invalid_rerank_fields(
+    rerank_metadata: Dict[str, Any],
+) -> None:
+    """Rerank endpoint_path/body_model must be non-empty strings."""
+    catalog_model = next(iter(EXPECTED_NVIDIA_RERANK_CATALOG))
+    fake_model_info: Dict[str, Any] = {
+        "key": catalog_model,
+        "litellm_provider": "nvidia_nim",
+        "mode": "rerank",
+        "provider_specific_entry": {"rerank": rerank_metadata},
+    }
+    with patch("litellm.utils.get_model_info", return_value=fake_model_info):
+        with pytest.raises(
+            TypeError,
+            match="endpoint_path and body_model must be non-empty strings",
+        ):
+            get_nvidia_nim_model_metadata(catalog_model)
+
+
+@pytest.mark.usefixtures("local_nvidia_catalog")
+def test_should_propagate_unexpected_resolver_errors() -> None:
+    """Non-ValueError exceptions from get_model_info propagate."""
+    catalog_model = next(iter(EXPECTED_NVIDIA_RERANK_CATALOG))
+    with patch(
+        "litellm.utils.get_model_info",
+        side_effect=RuntimeError("unexpected resolver failure"),
+    ):
+        with pytest.raises(RuntimeError, match="unexpected resolver failure"):
+            get_nvidia_nim_model_metadata(catalog_model)
+
+
+@pytest.mark.usefixtures("local_nvidia_catalog")
+def test_should_not_swallow_errors_wrapped_by_real_model_info_resolver() -> None:
+    """A confirmed catalog model must propagate failures wrapped by get_model_info."""
+    catalog_model = next(iter(EXPECTED_NVIDIA_RERANK_CATALOG))
+    with patch(
+        "litellm.utils._get_model_info_from_model_cost",
+        side_effect=RuntimeError("simulated catalog storage failure"),
+    ):
+        with pytest.raises(Exception, match="isn't mapped yet") as exc_info:
+            get_nvidia_nim_model_metadata(catalog_model)
+
+    assert isinstance(exc_info.value.__context__, RuntimeError)
+    assert str(exc_info.value.__context__) == "simulated catalog storage failure"
+
+
+@pytest.mark.usefixtures("local_nvidia_catalog")
+def test_should_propagate_keyerror_from_resolver() -> None:
+    """KeyError (not ValueError) from resolver propagates as-is."""
+    catalog_model = next(iter(EXPECTED_NVIDIA_RERANK_CATALOG))
+    with patch(
+        "litellm.utils.get_model_info",
+        side_effect=KeyError("missing_internal_key"),
+    ):
+        with pytest.raises(KeyError, match="missing_internal_key"):
+            get_nvidia_nim_model_metadata(catalog_model)

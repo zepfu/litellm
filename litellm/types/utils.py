@@ -285,16 +285,50 @@ class ModelInfo(ModelInfoBase, total=False):
 
 
 def get_nvidia_nim_model_metadata(model: str) -> NvidiaNimModelMetadata:
-    """Return normalized NVIDIA NIM metadata through ``get_model_info``."""
-    from litellm.utils import get_model_info
+    """Return normalized NVIDIA NIM metadata through ``get_model_info``.
 
-    try:
-        model_info = get_model_info(
-            model=model,
+    Raises:
+        TypeError: If ``provider_specific_entry`` or its ``rerank`` sub-entry
+            is present but malformed (wrong container type or missing/invalid
+            ``endpoint_path``/``body_model`` strings).
+        Exception: Any unexpected catalog or resolver error propagates.
+    """
+    import litellm
+    from litellm.utils import (
+        _check_provider_match,
+        _get_model_cost_key,
+        _get_potential_model_names,
+        get_model_info,
+    )
+
+    potential_model_names = _get_potential_model_names(
+        model=model,
+        custom_llm_provider="nvidia_nim",
+    )
+    candidate_keys = (
+        potential_model_names["combined_model_name"],
+        model,
+        potential_model_names["combined_stripped_model_name"],
+        potential_model_names["stripped_model_name"],
+        potential_model_names["split_model"],
+    )
+    for candidate in candidate_keys:
+        matched_key = _get_model_cost_key(candidate)
+        if matched_key is None:
+            continue
+        model_entry = litellm.model_cost[matched_key]
+        if _check_provider_match(
+            model_info=model_entry,
             custom_llm_provider="nvidia_nim",
-        )
-    except Exception:
+        ):
+            break
+    else:
         return NvidiaNimModelMetadata()
+
+    model_info = get_model_info(
+        model=model,
+        custom_llm_provider="nvidia_nim",
+    )
 
     if model_info.get("litellm_provider") != "nvidia_nim":
         return NvidiaNimModelMetadata()
@@ -303,6 +337,13 @@ def get_nvidia_nim_model_metadata(model: str) -> NvidiaNimModelMetadata:
     supports_max_completion_tokens = model_info.get("supports_max_completion_tokens")
 
     provider_specific_entry = model_info.get("provider_specific_entry")
+    if provider_specific_entry is not None and not isinstance(
+        provider_specific_entry, Mapping
+    ):
+        raise TypeError(
+            f"Malformed provider_specific_entry for model {model!r}: "
+            f"expected Mapping or None, got {type(provider_specific_entry).__name__}"
+        )
     if isinstance(provider_specific_entry, Mapping):
         if supports_max_completion_tokens is None:
             supports_max_completion_tokens = provider_specific_entry.get(
@@ -310,14 +351,28 @@ def get_nvidia_nim_model_metadata(model: str) -> NvidiaNimModelMetadata:
             )
 
         rerank_metadata = provider_specific_entry.get("rerank")
+        if rerank_metadata is not None and not isinstance(rerank_metadata, Mapping):
+            raise TypeError(
+                f"Malformed provider_specific_entry['rerank'] for model {model!r}: "
+                f"expected Mapping or None, got {type(rerank_metadata).__name__}"
+            )
         if isinstance(rerank_metadata, Mapping):
             endpoint_path = rerank_metadata.get("endpoint_path")
             body_model = rerank_metadata.get("body_model")
-            if isinstance(endpoint_path, str) and isinstance(body_model, str):
-                normalized["rerank"] = NvidiaNimRerankMetadata(
-                    endpoint_path=endpoint_path,
-                    body_model=body_model,
+            if (
+                not isinstance(endpoint_path, str)
+                or not endpoint_path.strip()
+                or not isinstance(body_model, str)
+                or not body_model.strip()
+            ):
+                raise TypeError(
+                    f"Malformed rerank metadata for model {model!r}: "
+                    "endpoint_path and body_model must be non-empty strings"
                 )
+            normalized["rerank"] = NvidiaNimRerankMetadata(
+                endpoint_path=endpoint_path,
+                body_model=body_model,
+            )
 
     if isinstance(supports_max_completion_tokens, bool):
         normalized["supports_max_completion_tokens"] = supports_max_completion_tokens
