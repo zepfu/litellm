@@ -1,5 +1,6 @@
 import json
 import os
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,8 @@ from litellm.integrations.aawm_agent_identity import (
     _finalize_rate_limit_observation,
 )
 from litellm.llms.xai import oauth
+from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
+from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
 from litellm.proxy.route_llm_request import route_request
 from litellm.responses.utils import ResponsesAPIRequestUtils
 
@@ -482,6 +485,237 @@ async def test_grok_native_oauth_near_expiry_uses_sidecar_wording_not_refresh(
 
 
 @pytest.mark.asyncio
+async def test_prepare_oa_xai_request_keeps_caller_metadata_separate():
+    harness = OaXaiHarness()
+    public_model = "oa_xai/grok-4.3"
+    caller_metadata = {
+        "session_id": harness.session_id,
+        "auth_mode": "caller-auth-mode",
+        "route_family": "caller-route-family",
+        "xai_oauth_public_model": "caller-public-model",
+        "tags": ["caller-tag"],
+    }
+    internal_tags = [
+        "existing-litellm-tag",
+        "existing-litellm-tag",
+        "route:xai_oauth_api",
+    ]
+    preexisting_litellm_metadata = {
+        "existing_internal_entry": "preserved",
+        "session_id": "existing-internal-session",
+        "auth_mode": "stale-auth",
+        "credential_family": "stale-credential",
+        "passthrough_route_family": "stale-passthrough",
+        "route_family": "stale-route",
+        "xai_oauth_managed": False,
+        "xai_oauth_public_model": "stale-public-model",
+        "xai_oauth_upstream_model": "stale-upstream-model",
+        "xai_quota_family": "stale-quota",
+        "shared_quota_family": "stale-shared-quota",
+        "grok_subscription_quota_shared": False,
+        "model_group": "stale-model-group",
+        "tags": internal_tags,
+    }
+    caller_metadata_before = deepcopy(caller_metadata)
+    preexisting_litellm_metadata_before = deepcopy(preexisting_litellm_metadata)
+    internal_tags_before = deepcopy(internal_tags)
+    data = {
+        "model": public_model,
+        "messages": [{"role": "user", "content": "Reply with ack."}],
+        "metadata": caller_metadata,
+        "litellm_metadata": preexisting_litellm_metadata,
+    }
+    data_before = deepcopy(data)
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="managed-oauth-token"),
+    ):
+        assert await oauth.prepare_oa_xai_request(data) is True
+
+    assert data["metadata"] == data_before["metadata"]
+    assert caller_metadata == caller_metadata_before
+    assert preexisting_litellm_metadata == preexisting_litellm_metadata_before
+    assert internal_tags == internal_tags_before
+    assert data["messages"] == data_before["messages"]
+    assert data["model"] == harness.public_to_upstream[public_model]
+    assert data["api_key"] == "managed-oauth-token"
+    assert data["api_base"] == harness.api_base
+    assert data["custom_llm_provider"] == "xai"
+    assert set(data) == set(data_before) | {
+        "api_base",
+        "api_key",
+        "custom_llm_provider",
+    }
+
+    litellm_metadata = data["litellm_metadata"]
+    assert litellm_metadata["existing_internal_entry"] == "preserved"
+    assert litellm_metadata["session_id"] == "existing-internal-session"
+    assert litellm_metadata["auth_mode"] == "oauth"
+    assert litellm_metadata["credential_family"] == "xai_oauth"
+    assert litellm_metadata["passthrough_route_family"] == "xai_oauth_api"
+    assert litellm_metadata["route_family"] == "xai_oauth_api"
+    assert litellm_metadata["xai_oauth_managed"] is True
+    assert litellm_metadata["xai_oauth_public_model"] == public_model
+    assert (
+        litellm_metadata["xai_oauth_upstream_model"]
+        == harness.public_to_upstream[public_model]
+    )
+    assert litellm_metadata["xai_quota_family"] == "xai_grok_subscription"
+    assert litellm_metadata["shared_quota_family"] == "xai_grok_subscription"
+    assert litellm_metadata["grok_subscription_quota_shared"] is True
+    assert litellm_metadata["model_group"] == public_model
+    assert litellm_metadata["tags"] == [
+        "existing-litellm-tag",
+        "route:xai_oauth_api",
+        "auth:xai_oauth",
+        "provider:xai",
+        "quota:xai_grok_subscription",
+    ]
+    assert data["metadata"]["auth_mode"] == "caller-auth-mode"
+    assert data["metadata"]["route_family"] == "caller-route-family"
+    assert data["metadata"]["xai_oauth_public_model"] == "caller-public-model"
+    assert "route:xai_oauth_api" not in data["metadata"]["tags"]
+
+
+@pytest.mark.asyncio
+async def test_oa_xai_observability_uses_internal_metadata_authority():  # noqa: PLR0915
+    from litellm.integrations.langfuse.langfuse import LangFuseLogger
+    from litellm.integrations.langfuse.langfuse_otel import LangfuseOtelLogger
+
+    harness = OaXaiHarness()
+    public_model = "oa_xai/grok-4.3"
+    caller_tags = ["caller-tag", "shared-tag", "caller-tag"]
+    internal_tags = ["internal-tag", "shared-tag", "internal-tag"]
+    caller_tags_before = deepcopy(caller_tags)
+    internal_tags_before = deepcopy(internal_tags)
+    preexisting_litellm_metadata = {
+        "existing_internal_entry": "preserved",
+        "custom_field": "internal-value",
+        "auth_mode": "stale-auth",
+        "credential_family": "stale-credential",
+        "passthrough_route_family": "stale-passthrough",
+        "route_family": "stale-route",
+        "xai_oauth_managed": False,
+        "xai_oauth_public_model": "stale-public-model",
+        "xai_oauth_upstream_model": "stale-upstream-model",
+        "xai_quota_family": "stale-quota",
+        "shared_quota_family": "stale-shared-quota",
+        "grok_subscription_quota_shared": False,
+        "model_group": "stale-model-group",
+        "tags": internal_tags,
+    }
+    preexisting_litellm_metadata_before = deepcopy(preexisting_litellm_metadata)
+    data = {
+        "model": public_model,
+        "messages": [{"role": "user", "content": "Reply with ack."}],
+        "metadata": {
+            "session_id": harness.session_id,
+            "auth_mode": "caller-auth",
+            "route_family": "caller-route",
+            "model_group": "caller-model-group",
+            "custom_field": "caller-value",
+            "tags": caller_tags,
+        },
+        "litellm_metadata": preexisting_litellm_metadata,
+    }
+
+    with patch(
+        "litellm.llms.xai.oauth.get_xai_oauth_access_token",
+        new=AsyncMock(return_value="managed-oauth-token"),
+    ):
+        assert await oauth.prepare_oa_xai_request(data) is True
+
+    assert preexisting_litellm_metadata == preexisting_litellm_metadata_before
+    caller_metadata_before_logging = deepcopy(data["metadata"])
+    internal_metadata_before_logging = deepcopy(data["litellm_metadata"])
+    canonical_params = get_litellm_params(
+        metadata=data["metadata"],
+        litellm_metadata=data["litellm_metadata"],
+        custom_llm_provider="xai",
+        proxy_server_request={
+            "headers": {},
+            "body": {"model": public_model},
+        },
+    )
+
+    expected_tags = [
+        "caller-tag",
+        "shared-tag",
+        "internal-tag",
+        "route:xai_oauth_api",
+        "auth:xai_oauth",
+        "provider:xai",
+        "quota:xai_grok_subscription",
+    ]
+    canonical_metadata = canonical_params["metadata"]
+    assert canonical_metadata["auth_mode"] == "oauth"
+    assert canonical_metadata["credential_family"] == "xai_oauth"
+    assert canonical_metadata["xai_oauth_managed"] is True
+    assert canonical_metadata["route_family"] == "xai_oauth_api"
+    assert canonical_metadata["model_group"] == public_model
+    assert canonical_metadata["custom_field"] == "caller-value"
+    assert canonical_metadata["tags"] == expected_tags
+    assert data["metadata"] == caller_metadata_before_logging
+    assert data["litellm_metadata"] == internal_metadata_before_logging
+    assert caller_tags == caller_tags_before
+    assert internal_tags == internal_tags_before
+
+    standard_metadata = StandardLoggingPayloadSetup.merge_litellm_metadata(
+        canonical_params
+    )
+    standard_tags = StandardLoggingPayloadSetup._get_request_tags(
+        litellm_params=canonical_params,
+        proxy_server_request=canonical_params["proxy_server_request"],
+    )
+    assert standard_metadata["auth_mode"] == "oauth"
+    assert standard_metadata["route_family"] == "xai_oauth_api"
+    assert standard_metadata["model_group"] == public_model
+    assert standard_tags == expected_tags
+
+    standard_logging_object = {
+        "metadata": standard_metadata,
+        "request_tags": standard_tags,
+        "model": data["model"],
+        "model_group": public_model,
+        "call_type": "acompletion",
+    }
+    observability_kwargs = {
+        "model": data["model"],
+        "custom_llm_provider": "xai",
+        "call_type": "acompletion",
+        "litellm_call_id": "call-oa-xai-canonical-metadata",
+        "litellm_params": canonical_params,
+        "standard_logging_object": standard_logging_object,
+    }
+    session_record = _build_session_history_record(
+        kwargs=observability_kwargs,
+        result=harness.response_body(),
+        start_time="2026-07-28T12:00:00Z",
+        end_time="2026-07-28T12:00:01Z",
+    )
+    assert session_record is not None
+    assert session_record["metadata"]["auth_mode"] == "oauth"
+    assert session_record["metadata"]["route_family"] == "xai_oauth_api"
+    assert session_record["metadata"]["request_tags"] == expected_tags
+
+    langfuse_metadata = LangfuseOtelLogger._extract_langfuse_metadata(
+        observability_kwargs
+    )
+    langfuse_tags = LangFuseLogger._get_langfuse_tags(
+        standard_logging_object=standard_logging_object,
+        metadata=langfuse_metadata,
+    )
+    assert langfuse_metadata["auth_mode"] == "oauth"
+    assert langfuse_metadata["route_family"] == "xai_oauth_api"
+    assert langfuse_metadata["model_group"] == public_model
+    assert langfuse_tags == expected_tags
+    assert session_record["metadata"]["request_tags"] == langfuse_tags
+    assert caller_tags == caller_tags_before
+    assert internal_tags == internal_tags_before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "public_model,upstream_model", OaXaiHarness.public_to_upstream.items()
 )
@@ -498,15 +732,18 @@ async def test_oa_xai_harness_routes_litellm_client_to_upstream_oauth(
     assert call_kwargs["api_base"] == harness.api_base
     assert call_kwargs["custom_llm_provider"] == "xai"
     metadata = call_kwargs["metadata"]
-    assert metadata["session_id"] == harness.session_id
-    assert metadata["auth_mode"] == "oauth"
-    assert metadata["credential_family"] == "xai_oauth"
-    assert metadata["passthrough_route_family"] == "xai_oauth_api"
-    assert metadata["xai_oauth_public_model"] == public_model
-    assert metadata["xai_oauth_upstream_model"] == upstream_model
-    assert metadata["shared_quota_family"] == "xai_grok_subscription"
-    assert "existing-tag" in metadata["tags"]
-    assert "route:xai_oauth_api" in metadata["tags"]
+    assert metadata == {
+        "session_id": harness.session_id,
+        "tags": ["existing-tag"],
+    }
+    litellm_metadata = call_kwargs["litellm_metadata"]
+    assert litellm_metadata["auth_mode"] == "oauth"
+    assert litellm_metadata["credential_family"] == "xai_oauth"
+    assert litellm_metadata["passthrough_route_family"] == "xai_oauth_api"
+    assert litellm_metadata["xai_oauth_public_model"] == public_model
+    assert litellm_metadata["xai_oauth_upstream_model"] == upstream_model
+    assert litellm_metadata["shared_quota_family"] == "xai_grok_subscription"
+    assert "route:xai_oauth_api" in litellm_metadata["tags"]
     assert "authorization" not in harness.request_data(public_model)
     assert "api_key" not in harness.request_data(public_model)
     assert "api_base" not in harness.request_data(public_model)
@@ -573,17 +810,17 @@ async def test_oa_xai_harness_decodes_previous_response_id_before_responses_egre
     ]
     assert call_kwargs["previous_response_id"] == original_response_id
     assert call_kwargs["previous_response_id"] != encoded_response_id
-    assert call_kwargs["metadata"]["session_id"] == harness.session_id
-    assert call_kwargs["metadata"]["xai_responses_previous_response_id_decoded"] is True
+    assert call_kwargs["metadata"] == {
+        "session_id": harness.session_id,
+        "tags": ["existing-tag"],
+    }
+    assert (
+        "xai_responses_previous_response_id_decoded"
+        not in call_kwargs["metadata"]
+    )
     assert call_kwargs["litellm_metadata"][
         "xai_responses_previous_response_id_decoded"
     ] is True
-    assert "existing-tag" in call_kwargs["metadata"]["tags"]
-    assert "xai-responses-previous-response-id-decoded" in call_kwargs["metadata"][
-        "tags"
-    ]
-    assert original_response_id not in call_kwargs["metadata"]["tags"]
-    assert encoded_response_id not in call_kwargs["metadata"]["tags"]
     assert "existing-litellm-tag" in call_kwargs["litellm_metadata"]["tags"]
     assert "xai-responses-previous-response-id-decoded" in call_kwargs[
         "litellm_metadata"

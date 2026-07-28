@@ -60,7 +60,10 @@ from litellm.integrations.deepeval.deepeval import DeepEvalLogger
 from litellm.integrations.mlflow import MlflowLogger
 from litellm.integrations.sqs import SQSLogger
 from litellm.litellm_core_utils.core_helpers import reconstruct_model_name
-from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
+from litellm.litellm_core_utils.get_litellm_params import (
+    get_litellm_params,
+    merge_metadata_for_logging,
+)
 from litellm.litellm_core_utils.llm_cost_calc.tool_call_cost_tracking import (
     StandardBuiltInToolCostTracking,
 )
@@ -689,15 +692,10 @@ class Logging(LiteLLMLoggingBaseClass):
             kwargs["litellm_metadata"], dict
         ):
             base_litellm_params["litellm_metadata"] = kwargs["litellm_metadata"]
-            if "metadata" not in base_litellm_params:
-                base_litellm_params["metadata"] = kwargs["litellm_metadata"].copy()
-            else:
-                # Merge litellm_metadata into metadata without overwriting existing
-                # keys so API key fields are visible to callbacks even when
-                # Anthropic's native metadata is present (/v1/messages).
-                for key, value in kwargs["litellm_metadata"].items():
-                    if key not in base_litellm_params["metadata"]:
-                        base_litellm_params["metadata"][key] = value
+            base_litellm_params["metadata"] = merge_metadata_for_logging(
+                base_litellm_params.get("metadata"),
+                kwargs["litellm_metadata"],
+            )
 
         if litellm_params:
             base_litellm_params.update(litellm_params)
@@ -709,15 +707,10 @@ class Logging(LiteLLMLoggingBaseClass):
         if "litellm_metadata" in kwargs and isinstance(
             kwargs["litellm_metadata"], dict
         ):
-            if not base_litellm_params.get("metadata"):
-                base_litellm_params["metadata"] = dict(kwargs["litellm_metadata"])
-            else:
-                base_litellm_params["metadata"] = dict(
-                    base_litellm_params["metadata"]
-                )
-                for key, value in kwargs["litellm_metadata"].items():
-                    if key not in base_litellm_params["metadata"]:
-                        base_litellm_params["metadata"][key] = value
+            base_litellm_params["metadata"] = merge_metadata_for_logging(
+                base_litellm_params.get("metadata"),
+                kwargs["litellm_metadata"],
+            )
 
         self.update_environment_variables(
             litellm_params=base_litellm_params,
@@ -4799,30 +4792,16 @@ class StandardLoggingPayloadSetup:
             litellm_params: Dictionary containing metadata and litellm_metadata
 
         Returns:
-            dict: Merged metadata with user API key fields taking precedence
+            dict: Canonical metadata. Caller fields normally take precedence;
+                xAI OAuth-managed internal fields remain authoritative.
         """
-        merged_metadata: dict = {}
-
-        # Start with metadata (user API key fields) - but skip non-serializable objects
-        if litellm_params.get("metadata") and isinstance(
-            litellm_params.get("metadata"), dict
-        ):
-            for key, value in litellm_params["metadata"].items():
-                # Skip non-serializable objects like UserAPIKeyAuth
-                if key == "user_api_key_auth":
-                    continue
-                merged_metadata[key] = value
-
-        # Then merge litellm_metadata (model-related fields) - this will NOT overwrite existing keys
-        if litellm_params.get("litellm_metadata") and isinstance(
-            litellm_params.get("litellm_metadata"), dict
-        ):
-            for key, value in litellm_params["litellm_metadata"].items():
-                if (
-                    key not in merged_metadata
-                ):  # Don't overwrite existing keys from metadata
-                    merged_metadata[key] = value
-
+        merged_metadata = merge_metadata_for_logging(
+            litellm_params.get("metadata"),
+            litellm_params.get("litellm_metadata"),
+        )
+        if not isinstance(merged_metadata, dict):
+            return {}
+        merged_metadata.pop("user_api_key_auth", None)
         return merged_metadata
 
     @staticmethod

@@ -261,10 +261,17 @@ async def test_route_request_routes_oa_xai_with_managed_oauth(
 ):
     import litellm
 
+    caller_metadata = {
+        "session_id": "session-oa-xai",
+        "auth_mode": "caller-auth",
+        "route_family": "caller-route",
+        "model_group": "caller-model-group",
+        "tags": ["caller-tag"],
+    }
     data = {
         "model": public_model,
         "messages": [{"role": "user", "content": "hello"}],
-        "metadata": {"session_id": "session-oa-xai"},
+        "metadata": caller_metadata,
     }
     llm_router = MagicMock()
     llm_router.model_names = []
@@ -291,11 +298,23 @@ async def test_route_request_routes_oa_xai_with_managed_oauth(
     assert call_kwargs["api_key"] == "managed-oauth-token"
     assert call_kwargs["api_base"] == "https://api.x.ai/v1"
     assert call_kwargs["custom_llm_provider"] == "xai"
-    metadata = call_kwargs["metadata"]
-    assert metadata["auth_mode"] == "oauth"
-    assert metadata["credential_family"] == "xai_oauth"
-    assert metadata["passthrough_route_family"] == "xai_oauth_api"
-    assert metadata["xai_oauth_public_model"] == public_model
-    assert metadata["xai_oauth_upstream_model"] == upstream_model
-    assert metadata["shared_quota_family"] == "xai_grok_subscription"
-    assert "route:xai_oauth_api" in metadata["tags"]
+    assert call_kwargs["metadata"] == caller_metadata
+    assert data["metadata"] == caller_metadata
+
+    litellm_metadata = call_kwargs["litellm_metadata"]
+    assert litellm_metadata is not call_kwargs["metadata"]
+    assert litellm_metadata["auth_mode"] == "oauth"
+    assert litellm_metadata["credential_family"] == "xai_oauth"
+    assert litellm_metadata["passthrough_route_family"] == "xai_oauth_api"
+    assert litellm_metadata["route_family"] == "xai_oauth_api"
+    assert litellm_metadata["xai_oauth_managed"] is True
+    assert litellm_metadata["xai_oauth_public_model"] == public_model
+    assert litellm_metadata["xai_oauth_upstream_model"] == upstream_model
+    assert litellm_metadata["model_group"] == public_model
+    assert litellm_metadata["shared_quota_family"] == "xai_grok_subscription"
+    assert litellm_metadata["tags"] == [
+        "route:xai_oauth_api",
+        "auth:xai_oauth",
+        "provider:xai",
+        "quota:xai_grok_subscription",
+    ]

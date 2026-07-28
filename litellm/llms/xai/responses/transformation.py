@@ -25,6 +25,7 @@ class XAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
     Inherits from OpenAIResponsesAPIConfig since XAI's Responses API is largely
     compatible with OpenAI's, with a few differences:
     - Does not support the 'instructions' parameter
+    - Treats top-level 'metadata' as unsupported and compatibility-only
     - Requires code_interpreter tools to have 'container' field removed
     - Recommends store=false when sending images
 
@@ -39,13 +40,19 @@ class XAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
         """
         Get supported parameters for XAI Responses API.
 
-        XAI supports most OpenAI Responses API params except 'instructions'.
+        XAI supports most OpenAI Responses API params except 'instructions' and
+        compatibility-only 'metadata'.
         """
         supported_params = super().get_supported_openai_params(model)
 
         # Remove 'instructions' as it's not supported by XAI
         if "instructions" in supported_params:
             supported_params.remove("instructions")
+
+        # metadata is compatibility-only and unsupported by xAI Responses.
+        # Remove it so strict mode rejects it while permissive mode can drop it.
+        if "metadata" in supported_params:
+            supported_params.remove("metadata")
 
         return supported_params
 
@@ -158,10 +165,17 @@ class XAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
             params.pop("instructions")
 
         if "metadata" in params:
-            verbose_logger.debug(
-                "XAI Responses API does not support 'metadata' parameter. Dropping it."
-            )
-            params.pop("metadata")
+            if drop_params:
+                verbose_logger.warning(
+                    "XAI Responses API does not support parameter 'metadata'; "
+                    "dropping it because drop_params=True."
+                )
+                params.pop("metadata")
+            else:
+                verbose_logger.warning(
+                    "XAI Responses API does not support parameter 'metadata'; "
+                    "retaining it because drop_params=False."
+                )
 
         # Transform tools
         if "tools" in params and params["tools"]:

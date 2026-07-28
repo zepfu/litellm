@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 
 # Pre-define optional kwargs keys as frozenset for O(1) lookups
 # These are extracted from kwargs only if present, avoiding unnecessary .get() calls
@@ -34,6 +34,88 @@ _OPTIONAL_KWARGS_KEYS = frozenset(
         "rpm",
     }
 )
+
+_XAI_OAUTH_AUTHORITATIVE_METADATA_KEYS = frozenset(
+    {
+        "auth_mode",
+        "credential_family",
+        "passthrough_route_family",
+        "route_family",
+        "xai_oauth_managed",
+        "xai_oauth_public_model",
+        "xai_oauth_upstream_model",
+        "xai_quota_family",
+        "shared_quota_family",
+        "grok_subscription_quota_shared",
+        "model_group",
+        "xai_responses_previous_response_id_decoded",
+        "codex_unsupported_input_item_removed_count",
+        "codex_unsupported_input_item_types_removed",
+        "codex_unsupported_input_items_removed",
+    }
+)
+
+
+def _stable_union_metadata_tags(*tag_lists: Any) -> list[str]:
+    tags: list[str] = []
+    for tag_list in tag_lists:
+        if not isinstance(tag_list, list):
+            continue
+        for tag in tag_list:
+            if isinstance(tag, str) and tag and tag not in tags:
+                tags.append(tag)
+    return tags
+
+
+def _is_authoritative_xai_oauth_metadata(metadata: dict) -> bool:
+    public_model = metadata.get("xai_oauth_public_model")
+    upstream_model = metadata.get("xai_oauth_upstream_model")
+    if not isinstance(public_model, str) or not public_model.startswith("oa_xai/"):
+        return False
+    if upstream_model != f"xai/{public_model[len('oa_xai/') :]}":
+        return False
+
+    return (
+        metadata.get("xai_oauth_managed") is True
+        and metadata.get("auth_mode") == "oauth"
+        and metadata.get("credential_family") == "xai_oauth"
+        and metadata.get("passthrough_route_family") == "xai_oauth_api"
+        and metadata.get("route_family") == "xai_oauth_api"
+        and metadata.get("xai_quota_family") == "xai_grok_subscription"
+        and metadata.get("shared_quota_family") == "xai_grok_subscription"
+        and metadata.get("grok_subscription_quota_shared") is True
+        and metadata.get("model_group") == public_model
+    )
+
+
+def merge_metadata_for_logging(
+    metadata: Optional[dict],
+    litellm_metadata: Optional[dict],
+) -> Optional[dict]:
+    """Merge metadata without mutation, with gated internal-field authority."""
+    caller_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    internal_metadata = (
+        dict(litellm_metadata) if isinstance(litellm_metadata, dict) else {}
+    )
+    if metadata is None and not internal_metadata:
+        return None
+
+    merged_metadata = dict(internal_metadata)
+    merged_metadata.update(caller_metadata)
+
+    if _is_authoritative_xai_oauth_metadata(internal_metadata):
+        for key in _XAI_OAUTH_AUTHORITATIVE_METADATA_KEYS:
+            if key in internal_metadata:
+                merged_metadata[key] = internal_metadata[key]
+        if isinstance(caller_metadata.get("tags"), list) or isinstance(
+            internal_metadata.get("tags"), list
+        ):
+            merged_metadata["tags"] = _stable_union_metadata_tags(
+                caller_metadata.get("tags"),
+                internal_metadata.get("tags"),
+            )
+
+    return merged_metadata
 
 
 def _get_base_model_from_litellm_call_metadata(
@@ -106,15 +188,7 @@ def get_litellm_params(
     # Merge litellm_metadata into metadata so callbacks (e.g. Langfuse)
     # that read from litellm_params["metadata"] see API key fields even when
     # the request uses "litellm_metadata" (e.g. /v1/messages from Claude Code).
-    _merged_metadata = metadata
-    if litellm_metadata and isinstance(litellm_metadata, dict):
-        if _merged_metadata is None:
-            _merged_metadata = dict(litellm_metadata)
-        else:
-            _merged_metadata = dict(_merged_metadata)  # don't mutate caller's dict
-            for key, value in litellm_metadata.items():
-                if key not in _merged_metadata:
-                    _merged_metadata[key] = value
+    _merged_metadata = merge_metadata_for_logging(metadata, litellm_metadata)
 
     # Build base dict with explicit parameters (always included)
     litellm_params = {

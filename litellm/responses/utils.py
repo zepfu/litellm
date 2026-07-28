@@ -50,6 +50,7 @@ class ResponsesAPIRequestUtils:
             if k not in supported_params:
                 unsupported_params[k] = non_default_params[k]
         if unsupported_params:
+            unsupported_param_names = sorted(unsupported_params.keys())
             if litellm.drop_params is True or (
                 drop_params is not None and drop_params is True
             ):
@@ -57,7 +58,7 @@ class ResponsesAPIRequestUtils:
             else:
                 raise litellm.UnsupportedParamsError(
                     status_code=500,
-                    message=f"{custom_llm_provider} does not support parameters: {unsupported_params}, for model={model}. To drop these, set `litellm.drop_params=True` or for proxy:\n\n`litellm_settings:\n drop_params: true`\n",
+                    message=f"{custom_llm_provider} does not support parameters: {unsupported_param_names}, for model={model}. To drop these, set `litellm.drop_params=True` or for proxy:\n\n`litellm_settings:\n drop_params: true`\n",
                 )
 
     @staticmethod

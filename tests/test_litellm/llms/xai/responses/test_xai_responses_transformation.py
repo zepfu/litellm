@@ -6,6 +6,7 @@ transformations for the Responses API.
 
 Source: litellm/llms/xai/responses/transformation.py
 """
+from copy import deepcopy
 import os
 import sys
 
@@ -83,11 +84,63 @@ class TestXAIResponsesAPITransformation:
         """Test that get_supported_openai_params excludes instructions"""
         config = XAIResponsesAPIConfig()
         supported = config.get_supported_openai_params("grok-4-fast")
-        
+
         assert "instructions" not in supported, "instructions should not be supported"
+        assert "metadata" not in supported, "metadata should not be supported"
         assert "tools" in supported, "tools should be supported"
         assert "temperature" in supported, "temperature should be supported"
         assert "model" in supported, "model should be supported"
+
+    def test_metadata_is_preserved_when_not_dropped(self, caplog):
+        """Test that metadata is preserved in direct mapping when drop_params=False"""
+        config = XAIResponsesAPIConfig()
+        secret_like_value = "secret-like-metadata-value-preserve"
+        params = ResponsesAPIOptionalRequestParams(
+            metadata={"trace_id": secret_like_value},
+            temperature=0.2,
+        )
+        params_before = deepcopy(params)
+
+        with caplog.at_level("WARNING", logger="LiteLLM"):
+            result = config.map_openai_params(
+                response_api_optional_params=params,
+                model="grok-4-fast",
+                drop_params=False,
+            )
+
+        assert "metadata" in result
+        assert result["metadata"] == {"trace_id": secret_like_value}
+        assert result["temperature"] == 0.2
+        assert params == params_before
+        diagnostics = "\n".join(record.getMessage() for record in caplog.records)
+        assert "metadata" in diagnostics
+        assert secret_like_value not in diagnostics
+        assert any(record.levelname == "WARNING" for record in caplog.records)
+
+    def test_metadata_is_dropped_when_drop_params_true(self, caplog):
+        """Test that metadata is dropped in direct mapping when drop_params=True"""
+        config = XAIResponsesAPIConfig()
+        secret_like_value = "secret-like-metadata-value-drop"
+        params = ResponsesAPIOptionalRequestParams(
+            metadata={"trace_id": secret_like_value},
+            temperature=0.2,
+        )
+        params_before = deepcopy(params)
+
+        with caplog.at_level("WARNING", logger="LiteLLM"):
+            result = config.map_openai_params(
+                response_api_optional_params=params,
+                model="grok-4-fast",
+                drop_params=True,
+            )
+
+        assert "metadata" not in result
+        assert result["temperature"] == 0.2
+        assert params == params_before
+        diagnostics = "\n".join(record.getMessage() for record in caplog.records)
+        assert "metadata" in diagnostics
+        assert secret_like_value not in diagnostics
+        assert any(record.levelname == "WARNING" for record in caplog.records)
 
     def test_xai_responses_endpoint_url(self):
         """Test that get_complete_url returns correct XAI endpoint"""
@@ -316,4 +369,3 @@ class TestXAIResponsesAPITransformation:
         # Verify function tool is unchanged
         assert result["tools"][3]["type"] == "function"
         assert result["tools"][3]["name"] == "get_weather"
-

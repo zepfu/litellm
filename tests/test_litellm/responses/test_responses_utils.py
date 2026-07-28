@@ -1,4 +1,5 @@
 import base64
+from copy import deepcopy
 import json
 import os
 import sys
@@ -14,6 +15,7 @@ sys.path.insert(
 import litellm
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+from litellm.llms.xai.responses.transformation import XAIResponsesAPIConfig
 from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequestUtils
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
 from litellm.types.utils import Usage
@@ -68,6 +70,59 @@ class TestResponsesAPIRequestUtils:
 
         assert "unsupported_param" in str(excinfo.value)
         assert model in str(excinfo.value)
+
+    def test_get_optional_params_responses_api_xai_metadata_rejected_in_strict_mode(self):
+        """Test xAI rejects metadata in strict mode without leaking secret values"""
+        model = "grok-4-fast"
+        config = XAIResponsesAPIConfig()
+        secret_like_metadata = {"trace_id": "secret-token-9c0a"}
+        original_drop_params = litellm.drop_params
+        optional_params = ResponsesAPIOptionalRequestParams(
+            metadata=secret_like_metadata,
+            temperature=0.5,
+        )
+        optional_params_before = deepcopy(optional_params)
+
+        try:
+            litellm.drop_params = False
+            with pytest.raises(litellm.UnsupportedParamsError) as excinfo:
+                ResponsesAPIRequestUtils.get_optional_params_responses_api(
+                    model=model,
+                    responses_api_provider_config=config,
+                    response_api_optional_params=optional_params,
+                )
+        finally:
+            litellm.drop_params = original_drop_params
+
+        message = str(excinfo.value)
+        assert "metadata" in message
+        assert model in message
+        assert "secret-token-9c0a" not in message
+        assert optional_params == optional_params_before
+
+    def test_get_optional_params_responses_api_xai_metadata_dropped_when_drop_params_enabled(
+        self,
+    ):
+        """Test that metadata is dropped in permissive mode and supported fields remain"""
+        original = {"metadata": {"trace_id": "secret-token-abc123"}, "temperature": 0.5}
+        params = ResponsesAPIOptionalRequestParams(**original)
+        before = deepcopy(params)
+        original_drop_params = litellm.drop_params
+
+        try:
+            litellm.drop_params = True
+            config = XAIResponsesAPIConfig()
+            result = ResponsesAPIRequestUtils.get_optional_params_responses_api(
+                model="grok-4-fast",
+                responses_api_provider_config=config,
+                response_api_optional_params=params,
+            )
+
+            assert "metadata" not in result
+            assert result["temperature"] == 0.5
+            assert params == before
+        finally:
+            litellm.drop_params = original_drop_params
 
     def test_get_requested_response_api_optional_param(self):
         """Test filtering parameters to only include those in ResponsesAPIOptionalRequestParams"""

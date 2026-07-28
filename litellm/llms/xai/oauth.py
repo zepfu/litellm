@@ -171,38 +171,33 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)
     removed_input_items = _drop_xai_unsupported_reasoning_input_items_in_place(data)
 
-    metadata = data.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-        data["metadata"] = metadata
-    _merge_metadata(metadata, build_oa_xai_metadata(public_model, upstream_model))
+    existing_litellm_metadata = data.get("litellm_metadata")
+    litellm_metadata = (
+        dict(existing_litellm_metadata)
+        if isinstance(existing_litellm_metadata, dict)
+        else {}
+    )
+    data["litellm_metadata"] = litellm_metadata
+
+    _merge_metadata(
+        litellm_metadata,
+        build_oa_xai_metadata(public_model, upstream_model),
+        authoritative=True,
+    )
     if decoded_previous_response_id:
-        _merge_metadata(metadata, _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA)
+        _merge_metadata(
+            litellm_metadata,
+            _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA,
+            authoritative=True,
+        )
     if removed_input_items:
         _merge_metadata(
-            metadata,
+            litellm_metadata,
             _build_xai_unsupported_reasoning_input_removed_metadata(
                 removed_input_items
             ),
+            authoritative=True,
         )
-
-    litellm_metadata = data.get("litellm_metadata")
-    if isinstance(litellm_metadata, dict):
-        _merge_metadata(
-            litellm_metadata, build_oa_xai_metadata(public_model, upstream_model)
-        )
-        if decoded_previous_response_id:
-            _merge_metadata(
-                litellm_metadata,
-                _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA,
-            )
-        if removed_input_items:
-            _merge_metadata(
-                litellm_metadata,
-                _build_xai_unsupported_reasoning_input_removed_metadata(
-                    removed_input_items
-                ),
-            )
 
     return True
 
@@ -264,19 +259,29 @@ def _build_xai_unsupported_reasoning_input_removed_metadata(
     }
 
 
-def _merge_metadata(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:
+def _merge_metadata(
+    target: Dict[str, Any],
+    incoming: Dict[str, Any],
+    *,
+    authoritative: bool = False,
+) -> None:
     incoming_tags = incoming.get("tags")
     existing_tags = target.get("tags")
-    merged_tags = list(existing_tags) if isinstance(existing_tags, list) else []
-    if isinstance(incoming_tags, list):
-        for tag in incoming_tags:
+    merged_tags: list[str] = []
+    for tag_list in (existing_tags, incoming_tags):
+        if not isinstance(tag_list, list):
+            continue
+        for tag in tag_list:
             if isinstance(tag, str) and tag not in merged_tags:
                 merged_tags.append(tag)
 
     for key, value in incoming.items():
         if key == "tags":
             continue
-        target.setdefault(key, value)
+        if authoritative:
+            target[key] = value
+        else:
+            target.setdefault(key, value)
     if merged_tags:
         target["tags"] = merged_tags
 

@@ -237,6 +237,59 @@ class TestUpdateFromKwargs:
         }
         assert logging_obj.litellm_params["litellm_metadata"] == lm_meta
 
+    def test_xai_authoritative_merge_survives_caller_metadata_replace(
+        self, logging_obj
+    ):
+        metadata = {
+            "route_family": "caller-route",
+            "auth_mode": "caller-auth",
+            "custom_field": "caller-value",
+            "tags": ["caller-tag", "shared-tag", "caller-tag"],
+        }
+        litellm_metadata = {
+            "route_family": "xai_oauth_api",
+            "auth_mode": "oauth",
+            "credential_family": "xai_oauth",
+            "passthrough_route_family": "xai_oauth_api",
+            "xai_oauth_managed": True,
+            "xai_oauth_public_model": "oa_xai/grok-4.3",
+            "xai_oauth_upstream_model": "xai/grok-4.3",
+            "xai_quota_family": "xai_grok_subscription",
+            "shared_quota_family": "xai_grok_subscription",
+            "grok_subscription_quota_shared": True,
+            "model_group": "oa_xai/grok-4.3",
+            "custom_field": "internal-value",
+            "tags": ["internal-tag", "shared-tag", "internal-tag"],
+        }
+        metadata_before = json.loads(json.dumps(metadata))
+        litellm_metadata_before = json.loads(json.dumps(litellm_metadata))
+
+        logging_obj.update_from_kwargs(
+            kwargs={
+                "metadata": metadata,
+                "litellm_metadata": litellm_metadata,
+            },
+            litellm_params={
+                "metadata": {
+                    **metadata,
+                    "route_family": "replacement-caller-route",
+                }
+            },
+        )
+
+        canonical = logging_obj.litellm_params["metadata"]
+        assert canonical["route_family"] == "xai_oauth_api"
+        assert canonical["auth_mode"] == "oauth"
+        assert canonical["xai_oauth_managed"] is True
+        assert canonical["custom_field"] == "caller-value"
+        assert canonical["tags"] == [
+            "caller-tag",
+            "shared-tag",
+            "internal-tag",
+        ]
+        assert metadata == metadata_before
+        assert litellm_metadata == litellm_metadata_before
+
     def test_merge_survives_caller_litellm_params_metadata_replace(self, logging_obj):
         """
         After base_litellm_params.update(litellm_params) replaces metadata,

@@ -4,6 +4,8 @@ Tests for get_litellm_params and related helpers.
 Ensures backward compatibility after sparse kwargs extraction optimization.
 """
 
+from copy import deepcopy
+
 import pytest
 
 from litellm.litellm_core_utils.get_litellm_params import (
@@ -179,3 +181,131 @@ class TestGetLitellmParamsMetadataMerge:
             litellm_metadata={"user_api_key_hash": "h"},
         )
         assert original == {"user_api_key": "sk-real"}
+
+    def test_generic_soft_merge_preserves_caller_wins_and_inputs(self):
+        metadata = {
+            "route_family": "caller-route",
+            "custom_field": "caller-value",
+            "tags": ["caller-tag", "shared-tag"],
+        }
+        litellm_metadata = {
+            "route_family": "internal-route",
+            "custom_field": "internal-value",
+            "tags": ["internal-tag", "shared-tag"],
+        }
+        metadata_before = deepcopy(metadata)
+        litellm_metadata_before = deepcopy(litellm_metadata)
+
+        result = get_litellm_params(
+            metadata=metadata,
+            litellm_metadata=litellm_metadata,
+        )
+
+        assert result["metadata"]["route_family"] == "caller-route"
+        assert result["metadata"]["custom_field"] == "caller-value"
+        assert result["metadata"]["tags"] == ["caller-tag", "shared-tag"]
+        assert metadata == metadata_before
+        assert litellm_metadata == litellm_metadata_before
+
+    def test_xai_internal_fields_win_and_tags_are_stable_unioned(self):
+        metadata = {
+            "auth_mode": "caller-auth",
+            "credential_family": "caller-credential",
+            "passthrough_route_family": "caller-passthrough",
+            "route_family": "caller-route",
+            "xai_oauth_managed": False,
+            "xai_oauth_public_model": "caller-public",
+            "xai_oauth_upstream_model": "caller-upstream",
+            "xai_quota_family": "caller-quota",
+            "shared_quota_family": "caller-shared-quota",
+            "grok_subscription_quota_shared": False,
+            "model_group": "caller-model-group",
+            "xai_responses_previous_response_id_decoded": False,
+            "codex_unsupported_input_item_removed_count": 99,
+            "codex_unsupported_input_item_types_removed": ["caller-reasoning"],
+            "codex_unsupported_input_items_removed": [{"caller": True}],
+            "custom_field": "caller-value",
+            "tags": ["caller-tag", "shared-tag", "caller-tag"],
+        }
+        litellm_metadata = {
+            "auth_mode": "oauth",
+            "credential_family": "xai_oauth",
+            "passthrough_route_family": "xai_oauth_api",
+            "route_family": "xai_oauth_api",
+            "xai_oauth_managed": True,
+            "xai_oauth_public_model": "oa_xai/grok-4.3",
+            "xai_oauth_upstream_model": "xai/grok-4.3",
+            "xai_quota_family": "xai_grok_subscription",
+            "shared_quota_family": "xai_grok_subscription",
+            "grok_subscription_quota_shared": True,
+            "model_group": "oa_xai/grok-4.3",
+            "xai_responses_previous_response_id_decoded": True,
+            "codex_unsupported_input_item_removed_count": 1,
+            "codex_unsupported_input_item_types_removed": ["reasoning"],
+            "codex_unsupported_input_items_removed": [
+                {"type": "reasoning", "index": 0}
+            ],
+            "custom_field": "internal-value",
+            "tags": ["internal-tag", "shared-tag", "internal-tag"],
+        }
+        metadata_before = deepcopy(metadata)
+        litellm_metadata_before = deepcopy(litellm_metadata)
+
+        result = get_litellm_params(
+            metadata=metadata,
+            litellm_metadata=litellm_metadata,
+        )
+
+        canonical = result["metadata"]
+        for key in (
+            "auth_mode",
+            "credential_family",
+            "passthrough_route_family",
+            "route_family",
+            "xai_oauth_managed",
+            "xai_oauth_public_model",
+            "xai_oauth_upstream_model",
+            "xai_quota_family",
+            "shared_quota_family",
+            "grok_subscription_quota_shared",
+            "model_group",
+            "xai_responses_previous_response_id_decoded",
+            "codex_unsupported_input_item_removed_count",
+            "codex_unsupported_input_item_types_removed",
+            "codex_unsupported_input_items_removed",
+        ):
+            assert canonical[key] == litellm_metadata[key]
+        assert canonical["custom_field"] == "caller-value"
+        assert canonical["tags"] == [
+            "caller-tag",
+            "shared-tag",
+            "internal-tag",
+        ]
+        assert metadata == metadata_before
+        assert litellm_metadata == litellm_metadata_before
+
+    def test_xai_marker_alone_does_not_enable_internal_authority(self):
+        metadata = {
+            "auth_mode": "caller-auth",
+            "route_family": "caller-route",
+            "tags": ["caller-tag", "caller-tag"],
+        }
+        litellm_metadata = {
+            "xai_oauth_managed": True,
+            "auth_mode": "oauth",
+            "route_family": "xai_oauth_api",
+            "tags": ["internal-tag"],
+        }
+        metadata_before = deepcopy(metadata)
+        litellm_metadata_before = deepcopy(litellm_metadata)
+
+        result = get_litellm_params(
+            metadata=metadata,
+            litellm_metadata=litellm_metadata,
+        )
+
+        assert result["metadata"]["auth_mode"] == "caller-auth"
+        assert result["metadata"]["route_family"] == "caller-route"
+        assert result["metadata"]["tags"] == ["caller-tag", "caller-tag"]
+        assert metadata == metadata_before
+        assert litellm_metadata == litellm_metadata_before

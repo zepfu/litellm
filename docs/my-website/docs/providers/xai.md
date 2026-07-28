@@ -138,6 +138,19 @@ for chunk in response:
     print(chunk)
 ```
 
+## Responses API Metadata
+
+xAI documents top-level `metadata` on the Responses API as unsupported and
+compatibility-only. LiteLLM strict mode rejects this parameter. To
+permissively adapt the request, set `litellm.drop_params=True`; LiteLLM then
+drops the unsupported field before sending the request.
+
+When LiteLLM reports this adaptation, diagnostics identify the parameter
+without including caller-provided metadata values. LiteLLM's internal
+observability, routing, authentication, and session metadata remain in the
+separate `litellm_metadata` structure and are never merged into caller
+top-level `metadata`.
+
 ## Sample Usage - Vision
 
 ```python showLineNumbers title="LiteLLM python sdk usage - Vision"
