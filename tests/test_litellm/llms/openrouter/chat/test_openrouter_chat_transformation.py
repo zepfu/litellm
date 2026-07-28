@@ -15,6 +15,7 @@ from litellm.llms.openrouter.chat.transformation import (
     OpenrouterConfig,
     OpenRouterException,
 )
+from litellm.llms.openrouter.common_utils import OpenRouterConfigError
 from litellm.utils import get_model_info
 
 
@@ -673,3 +674,87 @@ def test_openrouter_unmapped_non_family_model_strips_cache_control():
         headers={},
     )
     assert transformed_request["messages"][0].get("cache_control") is None
+
+
+class TestOpenRouterValidateEnvironment:
+    def test_uses_shared_auth_resolver_and_preserves_content_type(self, monkeypatch):
+        captured = {}
+
+        def mock_get_openrouter_auth_headers(api_key=None, extra_headers=None):
+            captured["api_key"] = api_key
+            captured["extra_headers"] = dict(extra_headers or {})
+            return {"Authorization": "Bearer resolved-key"}
+
+        monkeypatch.setattr(
+            "litellm.llms.openrouter.chat.transformation.get_openrouter_auth_headers",
+            mock_get_openrouter_auth_headers,
+        )
+        headers = {"Content-Type": "application/vnd.custom+json"}
+
+        result = OpenrouterConfig().validate_environment(
+            headers=headers,
+            model="openrouter/anthropic/claude-sonnet-4",
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params={},
+            litellm_params={},
+            api_key="explicit-key",
+        )
+
+        assert captured == {
+            "api_key": "explicit-key",
+            "extra_headers": headers,
+        }
+        assert result["Authorization"] == "Bearer resolved-key"
+        assert result["Content-Type"] == "application/vnd.custom+json"
+
+    def test_preserves_valid_caller_authorization(self):
+        headers = {
+            "authorization": "Bearer caller-key",
+            "X-Custom": "caller-value",
+        }
+        original_headers = dict(headers)
+
+        result = OpenrouterConfig().validate_environment(
+            headers=headers,
+            model="openrouter/anthropic/claude-sonnet-4",
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params={},
+            litellm_params={},
+            api_key="resolved-key",
+        )
+
+        assert result["authorization"] == "Bearer caller-key"
+        assert "Authorization" not in result
+        assert result["Content-Type"] == "application/json"
+        assert headers == original_headers
+        assert result is not headers
+
+    def test_rejects_malformed_caller_authorization(self):
+        with pytest.raises(OpenRouterConfigError, match="not a valid Bearer"):
+            OpenrouterConfig().validate_environment(
+                headers={"Authorization": "Basic credentials"},
+                model="openrouter/anthropic/claude-sonnet-4",
+                messages=[{"role": "user", "content": "hi"}],
+                optional_params={},
+                litellm_params={},
+                api_key="fallback-key",
+            )
+
+    def test_rejects_missing_credentials(self, monkeypatch):
+        monkeypatch.setattr(litellm, "api_key", None)
+        monkeypatch.setattr(litellm, "openrouter_key", None)
+        for env_name in (
+            "OPENROUTER_API_KEY",
+            "OR_API_KEY",
+            "AAWM_OPENROUTER_API_KEY",
+        ):
+            monkeypatch.delenv(env_name, raising=False)
+
+        with pytest.raises(OpenRouterConfigError, match="no valid credential found"):
+            OpenrouterConfig().validate_environment(
+                headers={},
+                model="openrouter/anthropic/claude-sonnet-4",
+                messages=[{"role": "user", "content": "hi"}],
+                optional_params={},
+                litellm_params={},
+            )

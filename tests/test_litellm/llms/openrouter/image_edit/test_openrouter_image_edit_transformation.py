@@ -5,19 +5,20 @@ import sys
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 
 sys.path.insert(
     0, os.path.abspath("../../../../..")
 )  # Adds the parent directory to the system path
 
-from litellm.llms.openrouter.common_utils import OpenRouterException
+from litellm.llms.openrouter.common_utils import (
+    OpenRouterConfigError,
+    OpenRouterException,
+)
 from litellm.llms.openrouter.image_edit.transformation import (
     OpenRouterImageEditConfig,
 )
 from litellm.types.router import GenericLiteLLMParams
-from litellm.types.utils import ImageResponse
 
 
 class TestOpenRouterImageEditTransformation:
@@ -168,8 +169,7 @@ class TestOpenRouterImageEditTransformation:
 
     # Validate environment tests
 
-    @patch("litellm.llms.openrouter.image_edit.transformation.get_secret_str")
-    def test_validate_environment_with_api_key(self, mock_get_secret):
+    def test_validate_environment_with_api_key(self):
         """Test that validate_environment sets authorization header with provided key."""
         headers = {}
         result = self.config.validate_environment(
@@ -179,34 +179,32 @@ class TestOpenRouterImageEditTransformation:
         )
 
         assert result["Authorization"] == "Bearer test_api_key"
-        mock_get_secret.assert_not_called()
 
-    @patch("litellm.llms.openrouter.image_edit.transformation.get_secret_str")
-    def test_validate_environment_with_secret_key(self, mock_get_secret):
-        """Test that validate_environment falls back to secret key."""
-        mock_get_secret.return_value = "secret_api_key"
-        headers = {}
-        result = self.config.validate_environment(
-            headers=headers,
-            model=self.model,
-            api_key=None,
-        )
-
-        assert result["Authorization"] == "Bearer secret_api_key"
-
-    @patch("litellm.llms.openrouter.image_edit.transformation.litellm")
-    @patch("litellm.llms.openrouter.image_edit.transformation.get_secret_str")
-    def test_validate_environment_missing_api_key_raises(self, mock_get_secret, mock_litellm):
-        """Test that validate_environment raises ValueError when no API key is available."""
-        mock_get_secret.return_value = None
-        mock_litellm.api_key = None
-
-        with pytest.raises(ValueError, match="OPENROUTER_API_KEY is not set"):
+    def test_validate_environment_rejects_malformed_caller_auth(self):
+        """Test that malformed caller auth does not fall back to the API key."""
+        with pytest.raises(OpenRouterConfigError):
             self.config.validate_environment(
-                headers={},
+                headers={"Authorization": "Basic invalid"},
                 model=self.model,
-                api_key=None,
+                api_key="test_api_key",
             )
+
+    def test_validate_environment_missing_api_key_raises(self, monkeypatch):
+        """Test that validation fails locally when no credential is available."""
+        for key in (
+            "OPENROUTER_API_KEY",
+            "OR_API_KEY",
+            "AAWM_OPENROUTER_API_KEY",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        with patch("litellm.api_key", None), patch("litellm.openrouter_key", None):
+            with pytest.raises(OpenRouterConfigError):
+                self.config.validate_environment(
+                    headers={},
+                    model=self.model,
+                    api_key=None,
+                )
 
     # Request transformation tests
 

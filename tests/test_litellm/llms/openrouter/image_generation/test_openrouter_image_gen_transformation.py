@@ -3,7 +3,6 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 
 sys.path.insert(
@@ -13,7 +12,10 @@ sys.path.insert(
 from litellm.llms.openrouter.image_generation.transformation import (
     OpenRouterImageGenerationConfig,
 )
-from litellm.llms.openrouter.common_utils import OpenRouterException
+from litellm.llms.openrouter.common_utils import (
+    OpenRouterConfigError,
+    OpenRouterException,
+)
 from litellm.types.utils import ImageResponse
 
 
@@ -220,41 +222,50 @@ class TestOpenRouterImageGenerationTransformation:
         
         assert result == custom_base
 
-    @patch("litellm.llms.openrouter.image_generation.transformation.get_secret_str")
-    def test_validate_environment_with_api_key(self, mock_get_secret):
+    def test_validate_environment_with_api_key(self):
         """Test that validate_environment correctly sets authorization header."""
-        headers = {}
-        api_key = "test_api_key"
-        
         result = self.config.validate_environment(
-            headers=headers,
+            headers={},
             model=self.model,
             messages=[],
             optional_params={},
             litellm_params={},
-            api_key=api_key
+            api_key="test_api_key",
         )
-        
-        assert result["Authorization"] == f"Bearer {api_key}"
-        mock_get_secret.assert_not_called()
 
-    @patch("litellm.llms.openrouter.image_generation.transformation.get_secret_str")
-    def test_validate_environment_with_secret_key(self, mock_get_secret):
-        """Test that validate_environment uses secret API key when api_key is None."""
-        mock_get_secret.return_value = "secret_api_key"
-        headers = {}
-        
-        result = self.config.validate_environment(
-            headers=headers,
-            model=self.model,
-            messages=[],
-            optional_params={},
-            litellm_params={},
-            api_key=None
-        )
-        
-        assert result["Authorization"] == "Bearer secret_api_key"
-        mock_get_secret.assert_called_once_with("OPENROUTER_API_KEY")
+        assert result["Authorization"] == "Bearer test_api_key"
+
+    def test_validate_environment_rejects_malformed_caller_auth(self):
+        """Test that malformed caller auth does not fall back to the API key."""
+        with pytest.raises(OpenRouterConfigError):
+            self.config.validate_environment(
+                headers={"Authorization": "Basic invalid"},
+                model=self.model,
+                messages=[],
+                optional_params={},
+                litellm_params={},
+                api_key="test_api_key",
+            )
+
+    def test_validate_environment_missing_api_key_raises(self, monkeypatch):
+        """Test that validation fails locally when no credential is available."""
+        for key in (
+            "OPENROUTER_API_KEY",
+            "OR_API_KEY",
+            "AAWM_OPENROUTER_API_KEY",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        with patch("litellm.api_key", None), patch("litellm.openrouter_key", None):
+            with pytest.raises(OpenRouterConfigError):
+                self.config.validate_environment(
+                    headers={},
+                    model=self.model,
+                    messages=[],
+                    optional_params={},
+                    litellm_params={},
+                    api_key=None,
+                )
 
     def test_transform_image_generation_request_basic(self):
         """Test that transform_image_generation_request creates correct request body."""
@@ -571,3 +582,28 @@ class TestOpenRouterImageGenerationTransformation:
         assert isinstance(error, OpenRouterException)
         assert "Test error" in str(error)
         assert error.status_code == 400
+
+
+def test_image_generation_and_edit_preserve_caller_auth_casing():
+    """Test parity across the two image validator signatures."""
+    from litellm.llms.openrouter.image_edit.transformation import (
+        OpenRouterImageEditConfig,
+    )
+
+    generation_headers = OpenRouterImageGenerationConfig().validate_environment(
+        headers={"authorization": "Bearer caller-token"},
+        model="google/gemini-2.5-flash-image",
+        messages=[],
+        optional_params={},
+        litellm_params={},
+        api_key="fallback-key",
+    )
+    edit_headers = OpenRouterImageEditConfig().validate_environment(
+        headers={"authorization": "Bearer caller-token"},
+        model="google/gemini-2.5-flash-image",
+        api_key="fallback-key",
+    )
+
+    assert generation_headers == edit_headers == {
+        "authorization": "Bearer caller-token"
+    }

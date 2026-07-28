@@ -5151,13 +5151,20 @@ class BaseLLMHTTPHandler:
         else:
             sync_httpx_client = client
 
+        headers_for_validation = (
+            image_edit_optional_request_params.get("extra_headers", {}) or {}
+        )
+        if custom_llm_provider == "openrouter":
+            headers_for_validation = dict(headers_for_validation)
+            if extra_headers:
+                headers_for_validation.update(extra_headers)
+
         headers = image_edit_provider_config.validate_environment(
             api_key=litellm_params.api_key,
-            headers=image_edit_optional_request_params.get("extra_headers", {}) or {},
+            headers=headers_for_validation,
             model=model,
         )
-
-        if extra_headers:
+        if custom_llm_provider != "openrouter" and extra_headers:
             headers.update(extra_headers)
 
         api_base = image_edit_provider_config.get_complete_url(
@@ -5247,13 +5254,20 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        headers_for_validation = (
+            image_edit_optional_request_params.get("extra_headers", {}) or {}
+        )
+        if custom_llm_provider == "openrouter":
+            headers_for_validation = dict(headers_for_validation)
+            if extra_headers:
+                headers_for_validation.update(extra_headers)
+
         headers = image_edit_provider_config.validate_environment(
             api_key=litellm_params.api_key,
-            headers=image_edit_optional_request_params.get("extra_headers", {}) or {},
+            headers=headers_for_validation,
             model=model,
         )
-
-        if extra_headers:
+        if custom_llm_provider != "openrouter" and extra_headers:
             headers.update(extra_headers)
 
         api_base = image_edit_provider_config.get_complete_url(
@@ -5362,17 +5376,23 @@ class BaseLLMHTTPHandler:
         else:
             sync_httpx_client = client
 
+        headers_for_validation = (
+            image_generation_optional_request_params.get("extra_headers", {}) or {}
+        )
+        if custom_llm_provider == "openrouter":
+            headers_for_validation = dict(headers_for_validation)
+            if extra_headers:
+                headers_for_validation.update(extra_headers)
+
         headers = image_generation_provider_config.validate_environment(
             api_key=api_key,
-            headers=image_generation_optional_request_params.get("extra_headers", {})
-            or {},
+            headers=headers_for_validation,
             model=model,
             messages=[],
             optional_params=image_generation_optional_request_params,
             litellm_params=dict(litellm_params),
         )
-
-        if extra_headers:
+        if custom_llm_provider != "openrouter" and extra_headers:
             headers.update(extra_headers)
 
         api_base = image_generation_provider_config.get_complete_url(
@@ -5472,17 +5492,23 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        headers_for_validation = (
+            image_generation_optional_request_params.get("extra_headers", {}) or {}
+        )
+        if custom_llm_provider == "openrouter":
+            headers_for_validation = dict(headers_for_validation)
+            if extra_headers:
+                headers_for_validation.update(extra_headers)
+
         headers = image_generation_provider_config.validate_environment(
             api_key=api_key,
-            headers=image_generation_optional_request_params.get("extra_headers", {})
-            or {},
+            headers=headers_for_validation,
             model=model,
             messages=[],
             optional_params=image_generation_optional_request_params,
             litellm_params=dict(litellm_params),
         )
-
-        if extra_headers:
+        if custom_llm_provider != "openrouter" and extra_headers:
             headers.update(extra_headers)
 
         api_base = image_generation_provider_config.get_complete_url(

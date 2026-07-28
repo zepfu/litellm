@@ -1,6 +1,12 @@
 """
 Unit tests for OpenRouter embedding transformation logic.
 """
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import litellm
+from litellm.llms.openrouter.common_utils import OpenRouterConfigError
 from litellm.llms.openrouter.embedding.transformation import (
     OpenrouterEmbeddingConfig,
 )
@@ -49,7 +55,6 @@ def test_openrouter_embedding_validate_environment():
     """Test environment validation and header setup."""
     config = OpenrouterEmbeddingConfig()
 
-    # Test with API key
     headers = config.validate_environment(
         headers={"Custom-Header": "value"},
         model="test-model",
@@ -71,21 +76,55 @@ def test_openrouter_embedding_validate_environment():
     # Should preserve custom headers
     assert headers["Custom-Header"] == "value"
 
-    # Test without API key
-    headers_no_key = config.validate_environment(
-        headers={},
+
+def test_openrouter_embedding_preserves_valid_caller_authorization():
+    """Test embedding adapter integration with caller-provided auth."""
+    config = OpenrouterEmbeddingConfig()
+
+    headers = config.validate_environment(
+        headers={
+            "authorization": "Bearer caller-key",
+            "Custom-Header": "value",
+        },
         model="test-model",
         messages=[],
         optional_params={},
         litellm_params={},
-        api_key=None,
+        api_key="explicit-key",
     )
 
-    # Should still include OpenRouter headers but not Authorization
-    assert "HTTP-Referer" in headers_no_key
-    assert "X-Title" in headers_no_key
-    assert "Content-Type" in headers_no_key
-    assert "Authorization" not in headers_no_key
+    assert headers["authorization"] == "Bearer caller-key"
+    assert "Authorization" not in headers
+    assert headers["Custom-Header"] == "value"
+
+
+def test_openrouter_embedding_missing_auth_prevents_http_dispatch(monkeypatch):
+    """Test missing auth fails before the embedding HTTP request."""
+    for env_name in (
+        "OPENROUTER_API_KEY",
+        "OR_API_KEY",
+        "AAWM_OPENROUTER_API_KEY",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(litellm, "api_key", None, raising=False)
+    monkeypatch.setattr(litellm, "openrouter_key", None, raising=False)
+
+    client = MagicMock()
+    with patch(
+        "litellm.secret_managers.main.get_secret_str",
+        return_value=None,
+    ), patch(
+        "litellm.llms.custom_httpx.llm_http_handler._get_httpx_client",
+        return_value=client,
+    ):
+        with pytest.raises(OpenRouterConfigError):
+            litellm.embedding(
+                model="openrouter/text-embedding-3-small",
+                input=["hello"],
+                client=client,
+            )
+
+    client.post.assert_not_called()
 
 
 def test_openrouter_embedding_get_complete_url():

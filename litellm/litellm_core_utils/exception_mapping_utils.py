@@ -2312,6 +2312,16 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                         request=httpx.Request(method="POST", url="https://openai.com/"),
                     )
             if custom_llm_provider == "openrouter":
+                # Re-raise provider config errors verbatim (e.g. malformed or
+                # duplicate Authorization headers) before status-code mapping.
+                # Lazy import avoids litellm initialization cycles.
+                from litellm.llms.openrouter.common_utils import (
+                    OpenRouterConfigError,
+                )
+
+                if isinstance(original_exception, OpenRouterConfigError):
+                    exception_mapping_worked = True
+                    raise original_exception
                 if hasattr(original_exception, "status_code"):
                     exception_mapping_worked = True
                     if original_exception.status_code == 400:

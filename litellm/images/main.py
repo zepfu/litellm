@@ -427,6 +427,7 @@ def image_generation(  # noqa: PLR0915
                 litellm_params=litellm_params_dict,
                 logging_obj=litellm_logging_obj,
                 timeout=timeout,
+                extra_headers=headers,
                 client=client,
             )
         elif custom_llm_provider == "black_forest_labs":
