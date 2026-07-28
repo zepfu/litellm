@@ -258,6 +258,55 @@ headers. The request includes the OIDC bearer token plus `x-userid`,
 snapshot as a sanitized `rate_limit_observations` row using the same stored field
 shape and dedupe guard as the LiteLLM callback path.
 
+### Native Grok client-version consumers
+
+The billing poll resolves its Grok client version for every outbound request
+attempt. An explicitly supplied `--grok-billing-client-version` is an
+operator-only override. Otherwise, request-time precedence is:
+
+1. `AAWM_GROK_BILLING_CLIENT_VERSION`
+2. `LITELLM_XAI_GROK_CLIENT_VERSION`
+3. `GROK_CLIENT_VERSION`
+4. the shared native Grok client-version cache
+
+There is no fixed-version fallback. A present override is authoritative, so an
+empty or invalid value fails that request instead of falling through to a
+lower-precedence source. The native Grok OIDC request path uses
+`LITELLM_XAI_GROK_CLIENT_VERSION` as its explicit emergency override, then the
+legacy `GROK_CLIENT_VERSION`, then the same shared cache. Normal operation
+leaves the overrides unset.
+
+The cache is part of the native Grok OIDC contract used by Grok requests and
+billing. It is separate from managed xAI OAuth for `oa_xai/*`; managed OAuth
+does not read the native version cache, and neither credential family may be
+used as a substitute for the other.
+
+For billing, the resolved version creates the actual outbound `user-agent` and
+`x-grok-client-version` headers. Request events and persisted evidence are
+derived from that same header object, rather than reconstructing an expected
+header set after the request. Version provenance is limited to sanitized fields
+such as `client_version_source`, `client_version_cache_source`, and
+`client_version_cache_path_class`; it does not expose the configured host path
+or cache contents.
+
+### Native Grok client-version cache maintenance
+
+Consumers read `AAWM_GROK_CLIENT_VERSION_CACHE_PATH`, which defaults to
+`/run/aawm/grok/native-client-version.json`. The maximum accepted record age is
+configured by `AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS` and defaults to
+`172800` seconds. Missing, malformed, invalid, future-dated, or stale cache
+records fail closed. The cache is re-read for every request attempt, so its
+writer must publish a complete file by atomic replacement; the next request
+observes the replacement without a LiteLLM or sidecar restart.
+
+Local development and Thoth mount the host cache directory selected by
+`AAWM_GROK_CLIENT_VERSION_CACHE_DIR` (default
+`/home/zepfu/.cache/aawm/grok`) read-only at `/run/aawm/grok`. Mount the parent
+directory, not the JSON file, so atomic inode replacement remains visible to
+the containers. Cache discovery or refresh belongs in host maintenance outside
+request serving. Do not add a host command, CLI invocation, package lookup, or
+subprocess to the request path.
+
 Grok billing has two distinct payload shapes and must not be conflated:
 
 - `GET /v1/billing?format=credits` (credit-format): weekly Grok Build credit
@@ -468,9 +517,20 @@ Relevant environment variables:
   poll attempts.
 - `AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS`: billing endpoint timeout.
 - `AAWM_GROK_BILLING_URL`: billing endpoint URL.
-- `AAWM_GROK_BILLING_CLIENT_VERSION`: Grok CLI client version header.
-  Defaults to `AAWM_GROK_BILLING_CLIENT_VERSION`,
-  `LITELLM_XAI_GROK_CLIENT_VERSION`, `GROK_CLIENT_VERSION`, then `0.2.55`.
+- `AAWM_GROK_BILLING_CLIENT_VERSION`: explicit billing-only client-version
+  override. It has no default and should remain unset outside emergency or
+  diagnostic use.
+- `LITELLM_XAI_GROK_CLIENT_VERSION`: explicit native Grok emergency override
+  and second-precedence billing override. It has no default.
+- `GROK_CLIENT_VERSION`: legacy native Grok and billing override. It has no
+  default.
+- `AAWM_GROK_CLIENT_VERSION_CACHE_DIR`: host directory mounted read-only at
+  `/run/aawm/grok` for local development and Thoth. Defaults to
+  `/home/zepfu/.cache/aawm/grok`.
+- `AAWM_GROK_CLIENT_VERSION_CACHE_PATH`: in-container cache path. Defaults to
+  `/run/aawm/grok/native-client-version.json`.
+- `AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS`: maximum cache record age.
+  Defaults to `172800`.
 - `AAWM_GROK_BILLING_CLIENT_IDENTIFIER`: Grok CLI client identifier header.
 - `AAWM_GROK_BILLING_XAI_TOKEN_AUTH`: `x-xai-token-auth` header value.
 - `AAWM_GROK_BILLING_MODEL`: model label stored with the billing snapshot.
@@ -498,32 +558,37 @@ for that scheduled run.
 Each due attempt emits a separate `grok_billing_poll` JSON line with sanitized
 status fields such as `attempted`, `persisted`, `skipped`, `auth_file`,
 `resolved_auth_file`, `auth_file_source`, `billing_url`, `client_version`,
-`model`, `status_code`, `attempt_count`, `retry_count`, `poll_max_attempts`,
-`observation_count`, `inserted_count`, `error_class`, and `error_message`. For
-D1-304 debugging, the event also includes compact request/transport diagnostics
-such as `http_client`, `request_method`, `billing_host`, `billing_path`,
-`billing_query_keys`, `billing_query_present`, `header_names`,
-`include_model_override`, `model_override_configured`, `client_identifier`,
+`user_agent`, `client_version_source`, `client_version_cache_source`,
+`client_version_cache_path_class`, `model`, `status_code`, `attempt_count`,
+`retry_count`, `poll_max_attempts`, `observation_count`, `inserted_count`,
+`error_class`, and `error_message`. For D1-304 debugging, the event also
+includes compact request/transport diagnostics such as `http_client`,
+`request_method`, `billing_host`, `billing_path`, `billing_query_keys`,
+`billing_query_present`, `header_names`, `include_model_override`,
+`model_override_configured`, `client_identifier`,
 `x_xai_token_auth_configured`, and `request_contract_fingerprint`.
 
 The fingerprint is derived from the non-secret request contract only: HTTP
-method, billing host/path, query key names, configured client version and
-identifier, whether `x-xai-token-auth` is configured, model-override flags, and
-header names. It must not include authorization tokens, account identity values,
-raw auth payloads, resolved IP addresses, or the configured
-`x-xai-token-auth` value. The event must not emit dedicated identity fields or
-raw auth headers. It must not contain access tokens, refresh tokens, id tokens,
-client secrets, account identity values (`user_id`, `team_id`, `email`, or the
-derived `x-userid`, `x-grok-user-id`, `x-teamid`, and `x-email` headers), or the
-full billing credential payload. Billing poll failures are logged and do not
-raise out of the sidecar loop.
+method, billing host/path, query key names, the actual client version and
+user-agent, client identifier, whether `x-xai-token-auth` is configured,
+model-override flags, and header names. It must not include authorization
+tokens, account identity values, raw auth payloads, resolved IP addresses, the
+configured cache path, cache contents, or the configured `x-xai-token-auth`
+value. The event must not emit dedicated identity fields or raw auth headers.
+It must not contain access tokens, refresh tokens, id tokens, client secrets,
+account identity values (`user_id`, `team_id`, `email`, or the derived
+`x-userid`, `x-grok-user-id`, `x-teamid`, and `x-email` headers), or the full
+billing credential payload. Billing poll failures are logged and do not raise
+out of the sidecar loop.
 
 Successful sidecar billing polls copy the same safe request-contract evidence
 into `rate_limit_observations.evidence` with
 `request_contract_source=grok_billing_sidecar_poll`. This lets later DB-only
 investigations distinguish snapshots inserted by the scheduled sidecar from
 snapshots extracted from Grok passthrough/manual traffic without storing auth
-tokens or account identity values.
+tokens or account identity values. The evidence records the client version,
+user-agent, and sanitized version source from the headers used by the successful
+request.
 
 Successful native Grok billing passthrough calls also record comparable
 request-contract metadata in Langfuse/session-history metadata and copy the
