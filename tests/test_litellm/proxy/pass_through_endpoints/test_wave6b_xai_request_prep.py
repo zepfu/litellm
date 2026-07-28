@@ -1200,7 +1200,9 @@ async def test_sanitize_seam_should_resolve_through_runtime_not_module_local() -
 
 
 @pytest.mark.asyncio
-async def test_grok_prepare_sanitize_seam_should_resolve_through_runtime() -> None:
+async def test_grok_prepare_sanitize_seam_should_resolve_through_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Regression: _prepare_grok_native_oauth_passthrough_request must also
     route the xAI sanitize stage through the runtime seam."""
     calls: list[int] = []
@@ -1209,6 +1211,11 @@ async def test_grok_prepare_sanitize_seam_should_resolve_through_runtime() -> No
         calls.append(id(body))
         return [], []
 
+    monkeypatch.setattr(
+        request_prep,
+        '_get_grok_native_oauth_client_version',
+        lambda: '0.1.211',
+    )
     _configure(
         _sanitize_xai_responses_request_body_in_place=tracking_sanitize,
     )
@@ -1220,3 +1227,254 @@ async def test_grok_prepare_sanitize_seam_should_resolve_through_runtime() -> No
 
     assert result[0] is True
     assert len(calls) == 1, "sanitize must be called exactly once via runtime"
+
+
+# ---------------------------------------------------------------------------
+# Native Grok client-version contract integration (XAI-002 body 3)
+# ---------------------------------------------------------------------------
+
+
+def _write_grok_version_cache(
+    tmp_path: Path,
+    *,
+    version: str = "0.1.211",
+    observed_epoch: Optional[float] = None,
+) -> Path:
+    import json as _json
+    import time as _time
+    from datetime import datetime as _dt, timezone as _tz
+
+    epoch = (
+        observed_epoch
+        if observed_epoch is not None
+        else _time.time() - 60
+    )
+    observed_at = _dt.fromtimestamp(epoch, tz=_tz.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    payload = {
+        "schema_version": 1,
+        "client": "grok-cli",
+        "version": version,
+        "build": "a1b2c3d4",
+        "channel": "stable",
+        "source": "installed-grok-cli",
+        "observed_at": observed_at,
+    }
+    path = tmp_path / "native-client-version.json"
+    path.write_text(_json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_grok_client_version_invalid_explicit_override_rejected() -> None:
+    _configure(
+        get_secret_str=lambda name: "1.2.3-beta"
+        if name == "LITELLM_XAI_GROK_CLIENT_VERSION"
+        else None
+    )
+
+    with pytest.raises(Exception, match="version"):
+        request_prep._get_grok_native_oauth_client_version()
+
+
+def test_grok_client_version_empty_explicit_override_rejected() -> None:
+    calls: list[str] = []
+
+    def secrets(name: str) -> Optional[str]:
+        calls.append(name)
+        return "" if name == "LITELLM_XAI_GROK_CLIENT_VERSION" else "1.2.3"
+
+    _configure(get_secret_str=secrets)
+
+    with pytest.raises(Exception, match="version"):
+        request_prep._get_grok_native_oauth_client_version()
+
+    assert calls == ["LITELLM_XAI_GROK_CLIENT_VERSION"]
+
+
+def test_grok_client_version_invalid_legacy_override_rejected() -> None:
+    def secrets(name: str) -> Optional[str]:
+        if name == "LITELLM_XAI_GROK_CLIENT_VERSION":
+            return None
+        if name == "GROK_CLIENT_VERSION":
+            return "not-a-version"
+        return None
+
+    _configure(get_secret_str=secrets)
+
+    with pytest.raises(Exception, match="version"):
+        request_prep._get_grok_native_oauth_client_version()
+
+
+def test_grok_client_version_empty_legacy_override_rejected() -> None:
+    def secrets(name: str) -> Optional[str]:
+        if name == "LITELLM_XAI_GROK_CLIENT_VERSION":
+            return None
+        if name == "GROK_CLIENT_VERSION":
+            return ""
+        return None
+
+    _configure(get_secret_str=secrets)
+
+    with pytest.raises(Exception, match="version"):
+        request_prep._get_grok_native_oauth_client_version()
+
+
+@pytest.mark.parametrize(
+    "invalid_version",
+    ["1", " 1.2", "1.2 ", "+1.2", "1_0.2", "١.٢", "１.２"],
+)
+def test_grok_client_version_override_requires_strict_ascii_dotted_version(
+    invalid_version: str,
+) -> None:
+    _configure(
+        get_secret_str=lambda name: invalid_version
+        if name == "LITELLM_XAI_GROK_CLIENT_VERSION"
+        else None
+    )
+
+    with pytest.raises(Exception, match="version"):
+        request_prep._get_grok_native_oauth_client_version()
+
+
+def test_grok_client_version_falls_back_to_valid_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_grok_version_cache(tmp_path, version="0.9.9")
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH", str(path)
+    )
+    _configure(get_secret_str=lambda _: None)
+
+    assert (
+        request_prep._get_grok_native_oauth_client_version() == "0.9.9"
+    )
+
+
+def test_grok_client_version_fails_closed_without_any_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH",
+        str(tmp_path / "missing.json"),
+    )
+    _configure(get_secret_str=lambda _: None)
+
+    with pytest.raises(Exception, match="no valid Grok native"):
+        request_prep._get_grok_native_oauth_client_version()
+
+
+def test_grok_client_version_atomic_replacement_observed_next_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os as _os
+
+    path = _write_grok_version_cache(tmp_path, version="1.0.0")
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH", str(path)
+    )
+    _configure(get_secret_str=lambda _: None)
+
+    assert (
+        request_prep._get_grok_native_oauth_client_version() == "1.0.0"
+    )
+
+    # Atomic inode replacement; no process restart.
+    new_path = _write_grok_version_cache(tmp_path, version="2.0.0")
+    tmp_swap = tmp_path / "swap.json"
+    tmp_swap.write_text(new_path.read_text(encoding="utf-8"), encoding="utf-8")
+    _os.replace(str(tmp_swap), str(path))
+
+    assert (
+        request_prep._get_grok_native_oauth_client_version() == "2.0.0"
+    )
+
+
+def test_grok_headers_exact_user_agent_and_version_header(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_grok_version_cache(tmp_path, version="3.4.5")
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH", str(path)
+    )
+    _configure(get_secret_str=lambda _: None)
+
+    headers = request_prep._build_grok_native_oauth_headers(
+        access_token="access",
+        model="grok-4",
+        request=_request({"x-request-id": "req-1"}),
+        request_body={},
+    )
+
+    assert headers["user-agent"] == "grok/3.4.5"
+    assert headers["x-grok-client-version"] == "3.4.5"
+
+
+def test_grok_headers_explicit_user_agent_override_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_grok_version_cache(tmp_path, version="3.4.5")
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH", str(path)
+    )
+    values = {"LITELLM_XAI_GROK_USER_AGENT": "custom-agent"}
+    _configure(get_secret_str=values.get)
+
+    headers = request_prep._build_grok_native_oauth_headers(
+        access_token="access",
+        model="grok-4",
+        request=_request(),
+        request_body={},
+    )
+
+    assert headers["user-agent"] == "custom-agent"
+    assert headers["x-grok-client-version"] == "3.4.5"
+
+
+@pytest.mark.asyncio
+async def test_managed_oa_xai_path_does_not_load_native_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard: managed oa_xai/* preparation must never read the native
+    Grok version cache."""
+    from litellm.secret_managers import (
+        grok_native_version_contract as _contract,
+    )
+
+    def _explode(**_kwargs: Any) -> Any:
+        raise AssertionError(
+            "native cache must not be read for managed oa_xai paths"
+        )
+
+    monkeypatch.setattr(
+        _contract, "resolve_grok_native_version", _explode
+    )
+    monkeypatch.setattr(
+        _contract, "try_resolve_grok_native_version", _explode
+    )
+
+    async def prepare(body: Payload) -> bool:
+        body.update({"api_base": "base", "api_key": "key"})
+        return True
+
+    _configure(
+        is_oa_xai_model=lambda model: isinstance(model, str)
+        and model.startswith("oa-xai/"),
+        prepare_oa_xai_request=prepare,
+    )
+
+    prepared, api_base, api_key = (
+        await request_prep._prepare_oa_xai_passthrough_request(
+            {"model": "oa-xai/grok"}
+        )
+    )
+
+    assert prepared is True
+    assert api_base == "base"
+    assert api_key == "key"

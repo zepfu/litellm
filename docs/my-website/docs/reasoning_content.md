@@ -14,7 +14,7 @@ Supported Providers:
 - Anthropic API (`anthropic/`)
 - Bedrock (Anthropic + Deepseek + GPT-OSS) (`bedrock/`)
 - Vertex AI (Anthropic) (`vertexai/`)
-- OpenRouter (`openrouter/`)
+- OpenRouter (`openrouter/`); reasoning support is model-specific and metadata-backed. See the [OpenRouter model metadata snapshot](./providers/openrouter-model-metadata).
 - XAI (`xai/`)
 - Google AI Studio (`google/`)
 - Vertex AI (`vertex_ai/`)

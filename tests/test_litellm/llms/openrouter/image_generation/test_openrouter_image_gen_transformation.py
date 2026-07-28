@@ -1,8 +1,10 @@
 import json
 import os
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import litellm
 import pytest
 
 sys.path.insert(
@@ -607,3 +609,57 @@ def test_image_generation_and_edit_preserve_caller_auth_casing():
     assert generation_headers == edit_headers == {
         "authorization": "Bearer caller-token"
     }
+
+
+class TestOpenRouterImageGenUnknownModel:
+    """Uncataloged/unknown model behavior for image generation."""
+
+    metadata_key = "openrouter/google/gemini-2.5-flash-image"
+    unknown_model = "google/gemini-2.5-flash-image"
+
+    @pytest.fixture(autouse=True)
+    def ensure_model_is_uncataloged(self, monkeypatch):
+        metadata_path = (
+            Path(__file__).resolve().parents[5]
+            / "model_prices_and_context_window.json"
+        )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert self.metadata_key not in metadata
+        monkeypatch.delitem(litellm.model_cost, self.metadata_key, raising=False)
+
+    def setup_method(self):
+        self.config = OpenRouterImageGenerationConfig()
+
+    def test_unknown_model_request_accepted(self):
+        """transform_image_generation_request accepts arbitrary model IDs."""
+        result = self.config.transform_image_generation_request(
+            model=self.unknown_model,
+            prompt="Generate something",
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+        assert result["model"] == self.unknown_model
+        assert result["messages"] == [{"role": "user", "content": "Generate something"}]
+
+    def test_unknown_model_drop_params_false_passthrough(self):
+        """Unsupported params pass through when drop_params=False for unknown models."""
+        result = self.config.map_openai_params(
+            non_default_params={"size": "1024x1024", "custom_flag": "keep-me"},
+            optional_params={},
+            model=self.unknown_model,
+            drop_params=False,
+        )
+        assert result["image_config"]["aspect_ratio"] == "1:1"
+        assert result["custom_flag"] == "keep-me"
+
+    def test_unknown_model_drop_params_true_removal(self):
+        """Unsupported params are removed when drop_params=True for unknown models."""
+        result = self.config.map_openai_params(
+            non_default_params={"size": "1024x1024", "custom_flag": "drop-me"},
+            optional_params={},
+            model=self.unknown_model,
+            drop_params=True,
+        )
+        assert result["image_config"]["aspect_ratio"] == "1:1"
+        assert "custom_flag" not in result

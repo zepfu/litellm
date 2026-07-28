@@ -203,7 +203,7 @@ import os
 os.environ["OPENROUTER_API_KEY"] = "openrouter_api_key"
 
 response = completion(
-  model="openrouter/google/palm-2-chat-bison",
+  model="openrouter/google/gemini-2.5-flash",
   messages = [{ "content": "Hello, how are you?","role": "user"}],
 )
 ```
@@ -438,7 +438,7 @@ import os
 os.environ["OPENROUTER_API_KEY"] = "openrouter_api_key"
 
 response = completion(
-  model="openrouter/google/palm-2-chat-bison",
+  model="openrouter/google/gemini-2.5-flash",
   messages = [{ "content": "Hello, how are you?","role": "user"}],
   stream=True,
 )

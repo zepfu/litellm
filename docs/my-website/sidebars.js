@@ -906,6 +906,7 @@ const sidebars = {
         "providers/oci",
         "providers/ollama",
         "providers/openrouter",
+        "providers/openrouter-model-metadata",
         "providers/sarvam",
         "providers/ovhcloud",
         {

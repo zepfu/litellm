@@ -3,8 +3,10 @@ import json
 import os
 import sys
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import litellm
 import pytest
 
 sys.path.insert(
@@ -536,3 +538,53 @@ class TestOpenRouterImageEditTransformation:
         """Test that unsupported image type raises ValueError."""
         with pytest.raises(ValueError, match="Unsupported image type"):
             self.config._read_image_bytes("not_an_image")  # type: ignore
+
+
+class TestOpenRouterImageEditUnknownModel:
+    """Uncataloged/unknown model behavior for image edit."""
+
+    metadata_key = "openrouter/google/gemini-2.5-flash-image"
+    unknown_model = "google/gemini-2.5-flash-image"
+
+    @pytest.fixture(autouse=True)
+    def ensure_model_is_uncataloged(self, monkeypatch):
+        metadata_path = (
+            Path(__file__).resolve().parents[5]
+            / "model_prices_and_context_window.json"
+        )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert self.metadata_key not in metadata
+        monkeypatch.delitem(litellm.model_cost, self.metadata_key, raising=False)
+
+    def setup_method(self):
+        self.config = OpenRouterImageEditConfig()
+        self.sample_image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+
+    def test_unknown_model_request_accepted(self):
+        """transform_image_edit_request accepts arbitrary model IDs."""
+        data, files = self.config.transform_image_edit_request(
+            model=self.unknown_model,
+            prompt="Edit this",
+            image=self.sample_image_bytes,
+            image_edit_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert data["model"] == self.unknown_model
+        assert data["messages"][0]["content"][1]["text"] == "Edit this"
+
+    def test_unknown_model_emits_only_recognized_params_even_drop_false(self):
+        """map_openai_params emits only recognized params (size/quality/n)
+        even when drop_params=False; unrecognized params are never forwarded."""
+        result = self.config.map_openai_params(
+            image_edit_optional_params={
+                "size": "1024x1024",
+                "n": 2,
+                "arbitrary_unsupported": "should-not-appear",
+            },
+            model=self.unknown_model,
+            drop_params=False,
+        )
+        assert result["image_config"]["aspect_ratio"] == "1:1"
+        assert result["n"] == 2
+        assert "arbitrary_unsupported" not in result

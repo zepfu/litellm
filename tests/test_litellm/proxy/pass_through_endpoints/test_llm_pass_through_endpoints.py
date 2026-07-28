@@ -12999,6 +12999,14 @@ def _assert_grok_composer_rewrite_metadata(metadata: dict[str, Any]) -> None:
     assert "grok-native-input-item-rewritten" in metadata["tags"]
 
 
+@pytest.fixture
+def explicit_grok_native_client_version(monkeypatch):
+    monkeypatch.setenv(
+        "LITELLM_XAI_GROK_CLIENT_VERSION",
+        "0.2.112",
+    )
+
+
 def _assert_openai_grok_native_oidc_call_args(
     call_args: dict[str, Any],
     *,
@@ -13148,7 +13156,10 @@ async def test_prepare_grok_native_oauth_passthrough_request_sanitizes_function_
         ],
     }
 
-    with patch(
+    with patch.dict(
+        os.environ,
+        {"LITELLM_XAI_GROK_CLIENT_VERSION": "0.1.211"},
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
         new=AsyncMock(return_value="grok-oidc-token"),
     ):
@@ -13202,7 +13213,10 @@ async def test_prepare_grok_4_5_continuation_rewrites_model_input_tool_items():
         ],
     }
 
-    with patch(
+    with patch.dict(
+        os.environ,
+        {"LITELLM_XAI_GROK_CLIENT_VERSION": "0.1.211"},
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
         new=AsyncMock(return_value="grok-oidc-token"),
     ):
@@ -16371,6 +16385,7 @@ async def test_anthropic_grok_native_alias_probe_sidecar_refresh_required_is_can
     assert exc_info.value.detail["error"]["code"] == ("aawm_codex_auto_agent_candidate_unavailable")
 
 
+@pytest.mark.usefixtures("explicit_grok_native_client_version")
 @pytest.mark.asyncio
 async def test_anthropic_grok_native_alias_probe_reasoning_effort_400_is_candidate_unavailable(
     monkeypatch,
@@ -16418,6 +16433,7 @@ async def test_anthropic_grok_native_alias_probe_reasoning_effort_400_is_candida
     assert "reasoningEffort" in exc_info.value.message
 
 
+@pytest.mark.usefixtures("explicit_grok_native_client_version")
 @pytest.mark.asyncio
 async def test_anthropic_grok_native_alias_probe_compaction_blob_400_is_candidate_unavailable(
     monkeypatch,
@@ -16848,6 +16864,7 @@ async def test_anthropic_xai_oauth_responses_adapter_streams_with_tools(
     mock_stream_builder.assert_called_once()
 
 
+@pytest.mark.usefixtures("explicit_grok_native_client_version")
 @pytest.mark.asyncio
 async def test_anthropic_grok_native_oauth_responses_adapter_uses_grok_headers(
     monkeypatch,
@@ -16964,6 +16981,7 @@ async def test_build_anthropic_response_from_responses_response_rejects_malforme
     assert exc_info.value.detail["error"]["code"] == ("aawm_auto_agent_malformed_tool_call_text")
 
 
+@pytest.mark.usefixtures("explicit_grok_native_client_version")
 @pytest.mark.asyncio
 async def test_anthropic_grok_native_oauth_responses_adapter_rejects_malformed_composer_call_upstream_payload(
     monkeypatch,
@@ -17031,6 +17049,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rejects_malformed_c
     assert record["route_family"] == "anthropic_grok_native_responses_adapter"
 
 
+@pytest.mark.usefixtures("explicit_grok_native_client_version")
 @pytest.mark.asyncio
 async def test_anthropic_grok_native_oauth_responses_adapter_drops_prior_tool_call_replay(
     monkeypatch,
@@ -17153,6 +17172,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_drops_prior_tool_ca
     assert metadata["passthrough_route_family"] == ("anthropic_grok_native_responses_adapter")
 
 
+@pytest.mark.usefixtures("explicit_grok_native_client_version")
 @pytest.mark.asyncio
 async def test_anthropic_grok_native_alias_probe_marks_transient_statuses_alias_managed(
     monkeypatch,
@@ -27339,6 +27359,7 @@ class TestOpenAIPassthroughRoute:
         assert prepared_body["litellm_metadata"]["trace_id"] == "trace-123"
         assert prepared_body["litellm_metadata"]["xai_oauth_public_model"] == ("oa_xai/grok-4.3")
 
+    @pytest.mark.usefixtures("explicit_grok_native_client_version")
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "model",
@@ -27453,6 +27474,7 @@ class TestOpenAIPassthroughRoute:
         metadata = prepared_body["litellm_metadata"]
         _assert_openai_grok_native_oidc_metadata(metadata, model=model)
 
+    @pytest.mark.usefixtures("explicit_grok_native_client_version")
     @pytest.mark.asyncio
     @pytest.mark.parametrize("model", ["grok-build", "grok-composer-2.5-fast"])
     async def test_openai_passthrough_grok_native_drops_tool_choice_without_tools(

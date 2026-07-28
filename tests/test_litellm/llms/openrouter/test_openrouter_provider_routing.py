@@ -11,8 +11,10 @@ so the correct model ID is sent to the OpenRouter API.
 See: https://github.com/BerriAI/litellm/issues/16353
 """
 
+import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -105,3 +107,44 @@ class TestOpenRouterNativeModelRouting:
         result_model, provider, _, _ = litellm.get_llm_provider(model=input_model)
         assert provider == "openrouter"
         assert result_model == expected_model
+
+
+class TestOpenRouterUncatalogedModelRouting:
+    """Explicit provider/prefix preserves arbitrary uncataloged model IDs."""
+
+    metadata_key = "openrouter/google/gemini-2.5-flash-image"
+    unknown_model = "google/gemini-2.5-flash-image"
+
+    @pytest.fixture(autouse=True)
+    def ensure_model_is_uncataloged(self, monkeypatch):
+        metadata_path = (
+            Path(__file__).resolve().parents[4]
+            / "model_prices_and_context_window.json"
+        )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert self.metadata_key not in metadata
+        monkeypatch.delitem(litellm.model_cost, self.metadata_key, raising=False)
+
+    def test_uncataloged_model_prefix_strips_once(self):
+        """Provider prefix resolution works for models absent from the catalog."""
+        result_model, provider, _, _ = litellm.get_llm_provider(
+            model=self.metadata_key
+        )
+        assert provider == "openrouter"
+        assert result_model == self.unknown_model
+
+    def test_uncataloged_native_model_prefix_strips_once(self):
+        """The provider prefix is stripped only once for native model IDs."""
+        result_model, provider, _, _ = litellm.get_llm_provider(
+            model="openrouter/openrouter/uncataloged-native-xyz"
+        )
+        assert provider == "openrouter"
+        assert result_model == "openrouter/uncataloged-native-xyz"
+
+    def test_explicit_provider_preserves_uncataloged_id(self):
+        """custom_llm_provider='openrouter' passes arbitrary IDs through unchanged."""
+        result_model, provider, _, _ = litellm.get_llm_provider(
+            model=self.unknown_model, custom_llm_provider="openrouter"
+        )
+        assert provider == "openrouter"
+        assert result_model == self.unknown_model

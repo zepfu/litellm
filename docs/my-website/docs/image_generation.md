@@ -240,7 +240,7 @@ See Recraft usage with LiteLLM [here](./providers/recraft.md#image-generation)
 
 ## OpenRouter Image Generation Models
 
-Use this for image generation models available through OpenRouter (e.g., Google Gemini image generation models)
+Use this for image generation models available through OpenRouter (e.g., Google Gemini image generation models). The adapter maps `size` to `image_config.aspect_ratio` and `quality` to `image_config.image_size`; the selected upstream model must support the mapped values. Compatibility with `2K` and `4K` is model-specific. Gemini 2.5 Flash Image is fixed at `1K`, so this example uses `standard` (`1K`).
 
 #### Usage
 
@@ -254,7 +254,7 @@ response = image_generation(
     model="openrouter/google/gemini-2.5-flash-image",
     prompt="A beautiful sunset over a calm ocean",
     size="1024x1024",
-    quality="high",
+    quality="standard",
 )
 print(response)
 ```
@@ -324,4 +324,4 @@ print(f"response: {response}")
 | Recraft | [Recraft Image Generation →](./providers/recraft#image-generation) |
 | OpenRouter | [OpenRouter Image Generation →](./providers/openrouter#image-generation) |
 | Xinference | [Xinference Image Generation →](./providers/xinference#image-generation) |
-| Nscale | [Nscale Image Generation →](./providers/nscale#image-generation) | 
+| Nscale | [Nscale Image Generation →](./providers/nscale#image-generation) |

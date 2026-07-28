@@ -1,5 +1,10 @@
 # OpenRouter
-LiteLLM supports all the text / chat / vision / embedding models from [OpenRouter](https://openrouter.ai/docs)
+LiteLLM can route requests to OpenRouter models through the `openrouter/` prefix.
+The [OpenRouter model metadata snapshot](./openrouter-model-metadata) is the
+canonical reference for model-specific capability declarations in LiteLLM's
+metadata.
+Passthrough routing and metadata-backed capability coverage are separate:
+uncataloged model IDs can still be sent explicitly to OpenRouter.
 
 <a target="_blank" href="https://colab.research.google.com/github/BerriAI/litellm/blob/main/cookbook/LiteLLM_OpenRouter.ipynb">
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
@@ -16,7 +21,7 @@ os.environ["OR_SITE_URL"] = "" # [OPTIONAL]
 os.environ["OR_APP_NAME"] = "" # [OPTIONAL]
 
 response = completion(
-            model="openrouter/google/palm-2-chat-bison",
+            model="openrouter/google/gemini-2.5-flash",
             messages=messages,
         )
 ```
@@ -38,7 +43,7 @@ os.environ["OPENROUTER_API_KEY"] = OPENROUTER_API_KEY
 os.environ["OPENROUTER_API_BASE"] = OPENROUTER_BASE_URL
 
 response = completion(
-    model="openrouter/google/palm-2-chat-bison",
+    model="openrouter/google/gemini-2.5-flash",
     messages=messages,
     base_url=OPENROUTER_BASE_URL  # Explicitly pass base_url for clarity
 )
@@ -47,20 +52,32 @@ response = completion(
 This approach provides better flexibility for managing configurations across different environments (dev, staging, production) and makes it easier to switch between self-hosted and cloud endpoints.
 
 ## OpenRouter Completion Models
-🚨 LiteLLM supports ALL OpenRouter models, send `model=openrouter/<your-openrouter-model>` to send it to open router. See all openrouter models [here](https://openrouter.ai/models)
+Send `model=openrouter/<your-openrouter-model>` to route a request to
+OpenRouter. See OpenRouter's current catalog [here](https://openrouter.ai/models).
+For model-specific capability declarations, use the
+[OpenRouter model metadata snapshot](./openrouter-model-metadata).
 
-| Model Name                | Function Call                                       |
-|---------------------------|-----------------------------------------------------|
-| openrouter/openai/gpt-3.5-turbo | `completion('openrouter/openai/gpt-3.5-turbo', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/openai/gpt-3.5-turbo-16k | `completion('openrouter/openai/gpt-3.5-turbo-16k', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/openai/gpt-4    | `completion('openrouter/openai/gpt-4', messages)`       | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/openai/gpt-4-32k | `completion('openrouter/openai/gpt-4-32k', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/anthropic/claude-2 | `completion('openrouter/anthropic/claude-2', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/anthropic/claude-instant-v1 | `completion('openrouter/anthropic/claude-instant-v1', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/google/palm-2-chat-bison | `completion('openrouter/google/palm-2-chat-bison', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/google/palm-2-codechat-bison | `completion('openrouter/google/palm-2-codechat-bison', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/meta-llama/llama-2-13b-chat | `completion('openrouter/meta-llama/llama-2-13b-chat', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
-| openrouter/meta-llama/llama-2-70b-chat | `completion('openrouter/meta-llama/llama-2-70b-chat', messages)` | `os.environ['OR_SITE_URL']`,`os.environ['OR_APP_NAME']`,`os.environ['OPENROUTER_API_KEY']` |
+```python
+response = completion(
+    model="openrouter/<provider>/<model-id>",
+    messages=messages,
+)
+```
+
+### Uncataloged Chat Models
+
+Explicit `openrouter/<model-id>` routing remains available when a model is not
+present in LiteLLM's metadata. Metadata-dependent parameter advertisement does
+not become universal for these models:
+
+- `reasoning_effort` and `thinking` are advertised only when metadata declares
+  `supports_reasoning: true`.
+- For `cache_control`, an explicit metadata value of
+  `supports_native_cache_control: false` disables forwarding and an explicit
+  `true` enables it.
+- When that cache-control flag is absent, recognized vendor families may use
+  LiteLLM's existing fallback. Unknown models outside those families have
+  `cache_control` stripped.
 
 ## Passing OpenRouter Params - transforms, models, route
 Pass `transforms`, `models`, `route`as arguments to `litellm.completion()`
@@ -72,7 +89,7 @@ from litellm import completion
 os.environ["OPENROUTER_API_KEY"] = ""
 
 response = completion(
-            model="openrouter/google/palm-2-chat-bison",
+            model="openrouter/google/gemini-2.5-flash",
             messages=messages,
             transforms = [""],
             route= ""
@@ -80,6 +97,11 @@ response = completion(
 ```
 
 ## Embedding
+
+OpenRouter embedding requests use the fixed advertised embedding parameter set.
+Use a mapped embedding model such as the example below; an uncataloged model ID
+may still be passed through to OpenRouter, but it does not add additional
+LiteLLM parameters.
 
 ```python
 from litellm import embedding
@@ -96,7 +118,11 @@ print(response)
 
 ## Image Generation
 
-OpenRouter supports image generation through select models like Google Gemini image generation models. LiteLLM transforms standard image generation requests to OpenRouter's chat completion format.
+LiteLLM's OpenRouter image-generation adapter converts the standard image
+request into OpenRouter's chat-completions request shape. It maps the parameters
+documented below and preserves the explicitly routed model ID. Actual image
+generation availability and accepted values depend on the selected upstream
+OpenRouter model; consult OpenRouter's current model catalog and model details.
 
 ### Supported Parameters
 
@@ -111,6 +137,10 @@ OpenRouter supports image generation through select models like Google Gemini im
   - `low` or `standard` → `1K`
   - `medium` → `2K`
   - `high` or `hd` → `4K`
+
+The adapter performs these mappings for any explicitly routed model. The
+selected upstream model must support the resulting `image_size`; `4K` support
+is model-specific.
 
 - `n`: Number of images to generate
 
@@ -138,12 +168,12 @@ import os
 
 os.environ["OPENROUTER_API_KEY"] = "your-api-key"
 
-# Generate high-quality landscape image
+# Generate a 1K landscape image
 response = image_generation(
     model="openrouter/google/gemini-2.5-flash-image",
     prompt="A serene mountain landscape with a lake",
     size="1536x1024",  # Landscape format
-    quality="high",     # High quality (4K)
+    quality="standard", # Maps to image_size 1K
 )
 
 # Access the generated image
@@ -171,11 +201,15 @@ response = image_generation(
     prompt="A futuristic cityscape at night",
     image_config={
         "aspect_ratio": "16:9",  # OpenRouter native format
-        "image_size": "4K"       # OpenRouter native format
+        "image_size": "1K"       # OpenRouter native format
     }
 )
 print(response)
 ```
+
+When `drop_params=False`, image generation may also pass unknown parameters
+through to OpenRouter. Whether OpenRouter accepts them remains
+model-specific.
 
 ### Response Format
 
@@ -213,15 +247,21 @@ print(f"Request cost: ${response._hidden_params['additional_headers']['llm_provi
 
 ## Image Edit
 
-OpenRouter supports image editing through select models like Google Gemini image models. LiteLLM routes image edit requests to OpenRouter's chat completions endpoint with the source image sent as a base64 data URL and `modalities: ["image", "text"]`.
+LiteLLM's OpenRouter image-edit adapter converts the request to OpenRouter's
+chat-completions format. It sends the source image as a base64 data URL, adds
+the edit prompt as text, and requests `modalities: ["image", "text"]`. The
+adapter maps only the recognized parameters documented below. Actual image-edit
+availability and accepted values depend on the selected upstream OpenRouter
+model; consult OpenRouter's current model catalog and model details.
 
-### Supported Models
+### Model Availability
 
-| Model | Description |
-|-------|-------------|
-| `openrouter/google/gemini-2.5-flash-image` | Gemini 2.5 Flash with image editing |
+See currently available image models and their supported operations on
+[OpenRouter's model list](https://openrouter.ai/models?modality=image).
 
-See all available image models on [OpenRouter's model list](https://openrouter.ai/models?modality=image).
+Image edit emits only recognized parameters. An explicitly routed uncataloged
+model ID may still reach OpenRouter, but support is determined by OpenRouter and
+the selected upstream model.
 
 ### Supported Parameters
 
@@ -232,7 +272,10 @@ See all available image models on [OpenRouter's model list](https://openrouter.a
 | `n` | `n` | Number of images |
 
 :::note
-`quality=high` (4K) is only supported by `google/gemini-3-pro-image-preview` and `google/gemini-3.1-flash-image-preview`. The `google/gemini-2.5-flash-image` model supports up to `medium` (2K).
+The adapter maps `quality=high` or `quality=hd` to `image_size=4K`, but the
+selected upstream model must support 4K output. Compatibility with `2K` and
+`4K` is model-specific. `google/gemini-2.5-flash-image` is fixed at `1K`, so
+the examples on this page use `quality=standard` (`image_size=1K`).
 :::
 
 ### Usage
@@ -267,7 +310,7 @@ response = image_edit(
     image=open("photo.png", "rb"),
     prompt="Add northern lights to the sky",
     size="1536x1024",   # Maps to aspect_ratio 3:2
-    quality="high",      # Maps to image_size 4K
+    quality="standard",  # Maps to image_size 1K
 )
 
 # Access the edited image
