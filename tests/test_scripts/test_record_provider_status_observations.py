@@ -382,6 +382,7 @@ def _grok_billing_poll_config(**overrides):
         grok_billing_poll_http_timeout_seconds=30.0,
         grok_billing_url="https://cli-chat-proxy.grok.com/v1/billing?format=credits",
         grok_billing_client_version="0.2.55",
+        grok_billing_client_version_source="config",
         grok_billing_client_identifier="grok-cli",
         grok_billing_xai_token_auth="xai-grok-cli",
         grok_billing_model="grok-build",
@@ -393,6 +394,64 @@ def _grok_billing_poll_config(**overrides):
     if overrides:
         config = replace(config, **overrides)
     return config
+
+
+def _clear_grok_billing_version_env(monkeypatch) -> None:
+    for env_name in (
+        *loop.GROK_BILLING_CLIENT_VERSION_ENV_VARS,
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH",
+        "AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+
+def _write_grok_billing_version_cache(
+    path: Path,
+    *,
+    version: str,
+    observed_at=None,
+) -> None:
+    observed_at = observed_at or datetime.now(timezone.utc)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "client": "grok-cli",
+                "version": version,
+                "build": "a1b2c3d4",
+                "channel": "stable",
+                "source": "installed-grok-cli",
+                "observed_at": observed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _grok_billing_request_headers(config):
+    return loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+        identity_headers=_grok_billing_auth_context()["identity_headers"],
+    )
+
+
+def _grok_billing_fetch_result(
+    config,
+    *,
+    payload=None,
+    status_code: int = 200,
+    attempt_count: int = 1,
+    retry_count: int = 0,
+):
+    request_headers = _grok_billing_request_headers(config)
+    return {
+        "status_code": status_code,
+        "payload": payload or _grok_billing_payload(),
+        "attempt_count": attempt_count,
+        "retry_count": retry_count,
+        "request_headers": request_headers,
+    }
 
 
 def _alibaba_quota_poll_config(**overrides):
@@ -678,31 +737,283 @@ def test_resolve_grok_sidecar_auth_file_uses_grok_home_and_default(tmp_path, mon
 
 
 def test_resolve_grok_billing_client_version_prefers_grok_client_version(monkeypatch) -> None:
-    for env_name in (
-        "AAWM_GROK_BILLING_CLIENT_VERSION",
-        "LITELLM_XAI_GROK_CLIENT_VERSION",
-        "GROK_CLIENT_VERSION",
-    ):
-        monkeypatch.delenv(env_name, raising=False)
-
+    _clear_grok_billing_version_env(monkeypatch)
     monkeypatch.setenv("GROK_CLIENT_VERSION", "0.2.70")
+    config = _grok_billing_poll_config(
+        grok_billing_client_version=None,
+        grok_billing_client_version_source=None,
+    )
 
-    assert loop._resolve_grok_billing_client_version() == "0.2.70"
+    resolution = loop._resolve_grok_billing_client_version(config)
+
+    assert resolution.version == "0.2.70"
+    assert resolution.source == "GROK_CLIENT_VERSION"
 
 
-def test_loop_config_defaults_use_grok_client_version_fallback(monkeypatch) -> None:
-    for env_name in (
-        "AAWM_GROK_BILLING_CLIENT_VERSION",
-        "LITELLM_XAI_GROK_CLIENT_VERSION",
-        "GROK_CLIENT_VERSION",
-    ):
-        monkeypatch.delenv(env_name, raising=False)
-
+def test_loop_config_does_not_freeze_grok_client_version_env(monkeypatch) -> None:
+    _clear_grok_billing_version_env(monkeypatch)
     monkeypatch.setenv("GROK_CLIENT_VERSION", "0.2.70")
 
     config = loop.parse_config([])
+    monkeypatch.setenv("GROK_CLIENT_VERSION", "0.2.71")
+    headers = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
 
-    assert config.grok_billing_client_version == "0.2.70"
+    assert config.grok_billing_client_version is None
+    assert config.grok_billing_client_version_source is None
+    assert headers["x-grok-client-version"] == "0.2.71"
+    assert headers.version_resolution.source == "GROK_CLIENT_VERSION"
+
+
+def test_grok_billing_client_version_env_precedence_is_per_request(
+    monkeypatch,
+) -> None:
+    _clear_grok_billing_version_env(monkeypatch)
+    config = _grok_billing_poll_config(
+        grok_billing_client_version=None,
+        grok_billing_client_version_source=None,
+    )
+    monkeypatch.setenv("AAWM_GROK_BILLING_CLIENT_VERSION", "1.2.3")
+    monkeypatch.setenv("LITELLM_XAI_GROK_CLIENT_VERSION", "2.3.4")
+    monkeypatch.setenv("GROK_CLIENT_VERSION", "3.4.5")
+
+    first = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+    monkeypatch.delenv("AAWM_GROK_BILLING_CLIENT_VERSION")
+    second = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+    monkeypatch.delenv("LITELLM_XAI_GROK_CLIENT_VERSION")
+    third = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+
+    assert first["x-grok-client-version"] == "1.2.3"
+    assert (
+        first.version_resolution.source
+        == "AAWM_GROK_BILLING_CLIENT_VERSION"
+    )
+    assert second["x-grok-client-version"] == "2.3.4"
+    assert (
+        second.version_resolution.source
+        == "LITELLM_XAI_GROK_CLIENT_VERSION"
+    )
+    assert third["x-grok-client-version"] == "3.4.5"
+    assert third.version_resolution.source == "GROK_CLIENT_VERSION"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("AAWM_GROK_BILLING_CLIENT_VERSION", ""),
+        ("LITELLM_XAI_GROK_CLIENT_VERSION", ""),
+        ("GROK_CLIENT_VERSION", ""),
+        ("AAWM_GROK_BILLING_CLIENT_VERSION", "v1.2.3"),
+        ("LITELLM_XAI_GROK_CLIENT_VERSION", "1.2.beta"),
+        ("GROK_CLIENT_VERSION", "1"),
+    ],
+)
+def test_grok_billing_client_version_present_empty_or_invalid_fails_closed(
+    monkeypatch,
+    env_name,
+    value,
+) -> None:
+    _clear_grok_billing_version_env(monkeypatch)
+    monkeypatch.setenv(env_name, value)
+    if env_name != "GROK_CLIENT_VERSION":
+        monkeypatch.setenv("GROK_CLIENT_VERSION", "9.9.9")
+    config = _grok_billing_poll_config(
+        grok_billing_client_version=None,
+        grok_billing_client_version_source=None,
+    )
+
+    with pytest.raises(loop.GrokBillingClientVersionError) as exc_info:
+        loop._build_grok_billing_request_headers(
+            config,
+            access_token="access-token-secret",
+        )
+
+    assert exc_info.value.source_metadata == {
+        "client_version_source": env_name
+    }
+    assert env_name in str(exc_info.value)
+    if value:
+        assert value not in str(exc_info.value)
+
+
+def test_grok_billing_client_version_falls_back_to_valid_cache(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _clear_grok_billing_version_env(monkeypatch)
+    cache_path = tmp_path / "native-client-version.json"
+    _write_grok_billing_version_cache(cache_path, version="4.5.6")
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH",
+        str(cache_path),
+    )
+    config = _grok_billing_poll_config(
+        grok_billing_client_version=None,
+        grok_billing_client_version_source=None,
+    )
+
+    headers = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+
+    assert headers["x-grok-client-version"] == "4.5.6"
+    assert headers["user-agent"] == "grok/4.5.6"
+    assert headers.version_resolution.sanitized_metadata() == {
+        "client_version_source": "cache",
+        "client_version_cache_source": "installed-grok-cli",
+        "client_version_cache_path_class": "configured",
+    }
+
+
+@pytest.mark.parametrize(
+    ("cache_state", "error_fragment"),
+    [
+        ("missing", "missing"),
+        ("invalid", "valid JSON"),
+        ("stale", "stale"),
+        ("future", "future"),
+    ],
+)
+def test_grok_billing_attempt_reports_sanitized_cache_failure(
+    tmp_path,
+    monkeypatch,
+    cache_state,
+    error_fragment,
+) -> None:
+    _clear_grok_billing_version_env(monkeypatch)
+    cache_path = tmp_path / "secret-cache-location.json"
+    now = datetime.now(timezone.utc)
+    if cache_state == "invalid":
+        cache_path.write_text("secret-cache-contents", encoding="utf-8")
+    elif cache_state == "stale":
+        _write_grok_billing_version_cache(
+            cache_path,
+            version="5.6.7",
+            observed_at=now - timedelta(minutes=5),
+        )
+    elif cache_state == "future":
+        _write_grok_billing_version_cache(
+            cache_path,
+            version="5.6.7",
+            observed_at=now + timedelta(minutes=5),
+        )
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH",
+        str(cache_path),
+    )
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS",
+        "60",
+    )
+    monkeypatch.setattr(
+        loop,
+        "_load_grok_billing_auth_context",
+        lambda _path: _grok_billing_auth_context(),
+    )
+    monkeypatch.setattr(
+        loop.urllib_request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "billing HTTP request must not run without a valid version"
+        ),
+    )
+    config = _grok_billing_poll_config(
+        apply=False,
+        grok_billing_client_version=None,
+        grok_billing_client_version_source=None,
+    )
+
+    event = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )[0]
+    encoded_event = json.dumps(event)
+
+    assert event["error_class"] == "GrokBillingClientVersionError"
+    assert error_fragment in event["error_message"]
+    assert event["client_version_source"] == "cache"
+    assert event["client_version_cache_path_class"] == "configured"
+    assert str(cache_path) not in encoded_event
+    assert "secret-cache-contents" not in encoded_event
+    assert "access-token-secret" not in encoded_event
+
+
+def test_grok_billing_client_version_observes_atomic_inode_replacement(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _clear_grok_billing_version_env(monkeypatch)
+    cache_path = tmp_path / "native-client-version.json"
+    replacement_path = tmp_path / "replacement.json"
+    _write_grok_billing_version_cache(cache_path, version="6.7.8")
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH",
+        str(cache_path),
+    )
+    config = _grok_billing_poll_config(
+        grok_billing_client_version=None,
+        grok_billing_client_version_source=None,
+    )
+
+    first = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+    _write_grok_billing_version_cache(replacement_path, version="7.8.9")
+    os.replace(replacement_path, cache_path)
+    second = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+
+    assert first["x-grok-client-version"] == "6.7.8"
+    assert second["x-grok-client-version"] == "7.8.9"
+
+
+def test_grok_billing_cli_version_is_explicit_config_only(monkeypatch) -> None:
+    _clear_grok_billing_version_env(monkeypatch)
+    config = loop.parse_config(
+        ["--grok-billing-client-version", "8.9.10"]
+    )
+    empty_config = loop.parse_config(
+        ["--grok-billing-client-version", ""]
+    )
+
+    assert config.grok_billing_client_version == "8.9.10"
+    assert config.grok_billing_client_version_source == "cli"
+    with pytest.raises(loop.GrokBillingClientVersionError) as exc_info:
+        loop._build_grok_billing_request_headers(
+            empty_config,
+            access_token="access-token-secret",
+        )
+    assert exc_info.value.source_metadata == {
+        "client_version_source": "cli"
+    }
+
+
+def test_grok_billing_has_no_hardcoded_client_version_fallback() -> None:
+    script_text = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/run_provider_status_observations_loop.py"
+    ).read_text(encoding="utf-8")
+    help_text = loop._build_parser().format_help()
+
+    assert "DEFAULT_GROK_BILLING_CLIENT_VERSION" not in script_text
+    assert "0.2.55" not in script_text
+    assert "0.2.55" not in help_text
 
 
 def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
@@ -769,7 +1080,8 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         config.grok_billing_url
         == "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
     )
-    assert config.grok_billing_client_version == "0.2.55"
+    assert config.grok_billing_client_version is None
+    assert config.grok_billing_client_version_source is None
     assert config.grok_billing_client_identifier == "grok-cli"
     assert config.grok_billing_xai_token_auth == "xai-grok-cli"
     assert config.grok_billing_model == "grok-build"
@@ -909,10 +1221,6 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     )
     assert (
         "AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS=${AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS:-0.5}"
-        in compose_text
-    )
-    assert (
-        "AAWM_GROK_BILLING_CLIENT_VERSION=${AAWM_GROK_BILLING_CLIENT_VERSION:-0.2.55}"
         in compose_text
     )
     assert (
@@ -2337,7 +2645,17 @@ def test_loop_config_reads_grok_billing_poll_env_defaults(monkeypatch) -> None:
         config.grok_billing_url
         == "https://cli-chat-proxy.grok.com/v1/billing?format=credits&lane=dev"
     )
-    assert config.grok_billing_client_version == "0.2.60"
+    assert config.grok_billing_client_version is None
+    assert config.grok_billing_client_version_source is None
+    headers = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+    assert headers["x-grok-client-version"] == "0.2.60"
+    assert (
+        headers.version_resolution.source
+        == "AAWM_GROK_BILLING_CLIENT_VERSION"
+    )
     assert config.grok_billing_client_identifier == "grok-cli-dev"
     assert config.grok_billing_xai_token_auth == "xai-grok-cli-dev"
     assert config.grok_billing_model == "grok-composer-2.5-fast"
@@ -2371,7 +2689,7 @@ def test_run_due_sidecar_tasks_throttles_grok_billing_poll(monkeypatch) -> None:
         "_fetch_grok_billing_payload",
         lambda *_args, **_kwargs: (
             calls.__setitem__("fetch", calls["fetch"] + 1)
-            or {"status_code": 200, "payload": _grok_billing_payload()}
+            or _grok_billing_fetch_result(config)
         ),
     )
     monkeypatch.setattr(
@@ -2430,7 +2748,7 @@ def test_grok_billing_request_contract_summary_includes_safe_diagnostics() -> No
 
     summary = loop._grok_billing_request_contract_summary(
         config,
-        identity_headers=_grok_billing_auth_context()["identity_headers"],
+        request_headers=_grok_billing_request_headers(config),
     )
 
     assert summary["http_client"] == "urllib"
@@ -2443,6 +2761,8 @@ def test_grok_billing_request_contract_summary_includes_safe_diagnostics() -> No
     assert summary["model_override_configured"] is True
     assert summary["client_identifier"] == "grok-cli"
     assert summary["client_version"] == "0.2.55"
+    assert summary["user_agent"] == "grok/0.2.55"
+    assert summary["client_version_source"] == "config"
     assert summary["x_xai_token_auth_configured"] is True
     assert summary["resolved_auth_file"] == "/home/zepfu/.grok/auth.json"
     assert summary["auth_file_source"] == "default"
@@ -2461,17 +2781,7 @@ def test_run_due_sidecar_tasks_grok_billing_event_includes_safe_diagnostics(
     monkeypatch.setattr(
         loop,
         "_fetch_grok_billing_payload",
-        lambda *_args, **_kwargs: {
-            "status_code": 200,
-            "payload": _grok_billing_payload(),
-            "attempt_count": 1,
-            "retry_count": 0,
-        },
-    )
-    monkeypatch.setattr(
-        loop,
-        "_load_grok_billing_auth_context",
-        lambda _path: _grok_billing_auth_context(),
+        lambda *_args, **_kwargs: _grok_billing_fetch_result(config),
     )
     monkeypatch.setattr(
         loop,
@@ -2511,22 +2821,14 @@ def test_run_due_sidecar_tasks_persists_grok_billing_snapshot(monkeypatch) -> No
     monkeypatch.setattr(
         loop,
         "_fetch_grok_billing_payload",
-        lambda *_args, **_kwargs: {
-            "status_code": 200,
-            "payload": _grok_billing_payload(),
-        },
-    )
-    monkeypatch.setattr(
-        loop,
-        "_load_grok_billing_auth_context",
-        lambda _path: _grok_billing_auth_context(),
+        lambda *_args, **_kwargs: _grok_billing_fetch_result(config),
     )
 
-    def fake_persist(cfg, *, observed_at, response_body, identity_headers=None):
+    def fake_persist(cfg, *, observed_at, response_body, request_headers=None):
         captured["config"] = cfg
         captured["observed_at"] = observed_at
         captured["response_body"] = response_body
-        captured["identity_headers"] = identity_headers
+        captured["request_headers"] = request_headers
         return 1, 1
 
     monkeypatch.setattr(loop, "_persist_grok_billing_observations", fake_persist)
@@ -2539,15 +2841,94 @@ def test_run_due_sidecar_tasks_persists_grok_billing_snapshot(monkeypatch) -> No
 
     assert captured["config"] is config
     assert captured["response_body"] == _grok_billing_payload()
-    assert captured["identity_headers"] == _grok_billing_auth_context()[
-        "identity_headers"
-    ]
+    assert captured["request_headers"]["x-userid"] == "user_123"
+    assert captured["request_headers"]["x-grok-client-version"] == "0.2.55"
     assert events[0]["event"] == "grok_billing_poll"
     assert events[0]["persisted"] is True
     assert events[0]["observation_count"] == 1
     assert events[0]["inserted_count"] == 1
     assert events[0]["status_code"] == 200
     assert "access-token" not in json.dumps(events)
+
+
+def test_grok_billing_reuses_request_headers_for_event_and_persistence(
+    monkeypatch,
+) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_client_version="9.10.11",
+    )
+    captured = {}
+
+    class CapturedRequest:
+        def __init__(self, url, *, headers, method):
+            captured["request_headers"] = headers
+            self.url = url
+            self.method = method
+
+        def get_method(self):
+            return self.method
+
+    def fake_urlopen(request, timeout):
+        assert request is not None
+        assert timeout == 30.0
+        return type(
+            "Resp",
+            (),
+            {
+                "status": 200,
+                "getcode": lambda self: 200,
+                "read": lambda self: json.dumps(
+                    _grok_billing_payload()
+                ).encode(),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: None,
+            },
+        )()
+
+    def fake_persist(
+        cfg,
+        *,
+        observed_at,
+        response_body,
+        request_headers,
+    ):
+        assert request_headers is captured["request_headers"]
+        payload = loop._build_grok_billing_rate_limit_payload(
+            cfg,
+            observed_at=observed_at,
+            response_body=response_body,
+            request_headers=request_headers,
+        )
+        captured["persisted_payload"] = payload
+        return 1, 1
+
+    monkeypatch.setattr(
+        loop,
+        "_load_grok_billing_auth_context",
+        lambda _path: _grok_billing_auth_context(),
+    )
+    monkeypatch.setattr(loop.urllib_request, "Request", CapturedRequest)
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        loop,
+        "_persist_grok_billing_observations",
+        fake_persist,
+    )
+
+    event = loop.run_due_sidecar_tasks(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )[0]
+    evidence = json.loads(captured["persisted_payload"][17])
+
+    assert event["client_version"] == "9.10.11"
+    assert event["user_agent"] == "grok/9.10.11"
+    assert event["client_version_source"] == "config"
+    assert captured["persisted_payload"][2] == "9.10.11"
+    assert evidence["request_contract_client_version"] == "9.10.11"
+    assert evidence["request_contract_user_agent"] == "grok/9.10.11"
+    assert evidence["request_contract_client_version_source"] == "config"
 
 
 def test_run_due_sidecar_tasks_redacts_grok_billing_poll_failure(monkeypatch) -> None:
@@ -2610,6 +2991,10 @@ def test_run_due_sidecar_tasks_grok_billing_event_does_not_emit_identity_fields(
         "auth_file_source",
         "billing_url",
         "client_version",
+        "user_agent",
+        "client_version_source",
+        "client_version_cache_source",
+        "client_version_cache_path_class",
         "model",
         "observation_count",
         "inserted_count",
@@ -2646,13 +3031,12 @@ def test_run_due_sidecar_tasks_grok_billing_event_does_not_emit_identity_fields(
 def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
     config = _grok_billing_poll_config(grok_billing_model="grok-composer-2.5-fast")
     observed_at = datetime(2026, 6, 16, 20, 4, tzinfo=timezone.utc)
-    identity_headers = _grok_billing_auth_context()["identity_headers"]
 
     payload = loop._build_grok_billing_rate_limit_payload(
         config,
         observed_at=observed_at,
         response_body=_grok_billing_payload(),
-        identity_headers=identity_headers,
+        request_headers=_grok_billing_request_headers(config),
     )
 
     assert payload[0] == observed_at
@@ -2692,6 +3076,9 @@ def test_grok_billing_sidecar_payload_maps_percentage_snapshot() -> None:
     assert "x-userid" in evidence["request_contract_header_names"]
     assert "authorization" in evidence["request_contract_header_names"]
     assert evidence["request_contract_x_xai_token_auth_configured"] is True
+    assert evidence["request_contract_client_version"] == "0.2.55"
+    assert evidence["request_contract_user_agent"] == "grok/0.2.55"
+    assert evidence["request_contract_client_version_source"] == "config"
     evidence_json = json.dumps(evidence)
     assert "user_123" not in evidence_json
     assert "team_123" not in evidence_json
@@ -2713,6 +3100,7 @@ def test_grok_billing_sidecar_payload_maps_weekly_fresh_period_snapshot() -> Non
         config,
         observed_at=observed_at,
         response_body=response_body,
+        request_headers=_grok_billing_request_headers(config),
     )
 
     assert payload[6] == "xai_grok_build_weekly_credits:credits"
@@ -2743,6 +3131,7 @@ def test_grok_billing_sidecar_payload_maps_monthly_counter_snapshot() -> None:
         config,
         observed_at=observed_at,
         response_body=response_body,
+        request_headers=_grok_billing_request_headers(config),
     )
 
     assert payload[6] == "xai_grok_build_monthly_requests:requests"
@@ -2763,6 +3152,7 @@ def test_grok_billing_sidecar_payload_keeps_legacy_credit_snapshot_monthly() -> 
         config,
         observed_at=observed_at,
         response_body=_grok_billing_legacy_monthly_credit_payload(),
+        request_headers=_grok_billing_request_headers(config),
     )
 
     assert payload[6] == "xai_grok_build_monthly_credits:credits"
@@ -2786,6 +3176,7 @@ def test_grok_billing_sidecar_payload_raises_without_usage_or_period() -> None:
             config,
             observed_at=observed_at,
             response_body={"config": {}},
+            request_headers=_grok_billing_request_headers(config),
         )
 
 
@@ -2804,19 +3195,15 @@ def test_run_due_sidecar_tasks_persists_grok_billing_period_only_snapshot(
     monkeypatch.setattr(
         loop,
         "_fetch_grok_billing_payload",
-        lambda *_args, **_kwargs: {
-            "status_code": 200,
-            "payload": period_only_payload,
-        },
-    )
-    monkeypatch.setattr(
-        loop,
-        "_load_grok_billing_auth_context",
-        lambda _path: _grok_billing_auth_context(),
+        lambda *_args, **_kwargs: _grok_billing_fetch_result(
+            config,
+            payload=period_only_payload,
+        ),
     )
 
-    def fake_persist(cfg, *, observed_at, response_body, identity_headers=None):
+    def fake_persist(cfg, *, observed_at, response_body, request_headers=None):
         captured["response_body"] = response_body
+        captured["request_headers"] = request_headers
         return 1, 1
 
     monkeypatch.setattr(loop, "_persist_grok_billing_observations", fake_persist)
@@ -2828,6 +3215,7 @@ def test_run_due_sidecar_tasks_persists_grok_billing_period_only_snapshot(
     )
 
     assert captured["response_body"] == period_only_payload
+    assert captured["request_headers"]["x-grok-client-version"] == "0.2.55"
     assert events[0]["event"] == "grok_billing_poll"
     assert events[0]["persisted"] is True
     assert events[0]["observation_count"] == 1
@@ -2847,6 +3235,7 @@ def test_persist_grok_billing_observations_uses_sidecar_db_path(monkeypatch) -> 
         config,
         observed_at=observed_at,
         response_body=_grok_billing_payload(),
+        request_headers=_grok_billing_request_headers(config),
     )
 
     assert observation_count == 1
@@ -2870,6 +3259,51 @@ def test_persist_grok_billing_observations_uses_sidecar_db_path(monkeypatch) -> 
     evidence = json.loads(insert_payload[17])
     assert evidence["request_contract_source"] == "grok_billing_sidecar_poll"
     assert len(evidence["request_contract_fingerprint"]) == 64
+
+
+def test_grok_billing_persistence_records_sanitized_cache_source(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _clear_grok_billing_version_env(monkeypatch)
+    cache_path = tmp_path / "native-client-version.json"
+    _write_grok_billing_version_cache(cache_path, version="10.11.12")
+    monkeypatch.setenv(
+        "AAWM_GROK_CLIENT_VERSION_CACHE_PATH",
+        str(cache_path),
+    )
+    config = _grok_billing_poll_config(
+        grok_billing_client_version=None,
+        grok_billing_client_version_source=None,
+    )
+    request_headers = loop._build_grok_billing_request_headers(
+        config,
+        access_token="access-token-secret",
+    )
+
+    payload = loop._build_grok_billing_rate_limit_payload(
+        config,
+        observed_at=datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc),
+        response_body=_grok_billing_payload(),
+        request_headers=request_headers,
+    )
+    evidence = json.loads(payload[17])
+    encoded_evidence = json.dumps(evidence)
+
+    assert payload[2] == "10.11.12"
+    assert evidence["request_contract_client_version"] == "10.11.12"
+    assert evidence["request_contract_user_agent"] == "grok/10.11.12"
+    assert evidence["request_contract_client_version_source"] == "cache"
+    assert (
+        evidence["request_contract_client_version_cache_source"]
+        == "installed-grok-cli"
+    )
+    assert (
+        evidence["request_contract_client_version_cache_path_class"]
+        == "configured"
+    )
+    assert str(cache_path) not in encoded_evidence
+    assert "access-token-secret" not in encoded_evidence
 
 
 def test_fetch_grok_billing_payload_retries_cancelled_timeout_then_succeeds(
@@ -3167,6 +3601,59 @@ def test_fetch_grok_billing_payload_includes_identity_headers(monkeypatch) -> No
     assert captured["headers"]["X-grok-user-id"] == "user_123"
     assert captured["headers"]["X-teamid"] == "team_123"
     assert captured["headers"]["X-email"] == "user@example.com"
+
+
+def test_fetch_grok_billing_payload_does_not_use_managed_xai_oauth(
+    monkeypatch,
+) -> None:
+    native_auth_file = "/native-grok/auth.json"
+    managed_auth_file = "/managed-xai/auth.json"
+    config = _grok_billing_poll_config(
+        grok_oidc_auth_file=native_auth_file,
+        xai_oauth_auth_file=managed_auth_file,
+    )
+    loaded_auth_files = []
+
+    def fake_load_grok_auth(auth_file):
+        loaded_auth_files.append(auth_file)
+        return _grok_billing_auth_context()
+
+    def managed_auth_read_must_not_run(*_args, **_kwargs):
+        raise AssertionError("managed oa_xai OAuth must not serve native billing")
+
+    def fake_urlopen(_request, timeout):
+        assert timeout == 30.0
+        return type(
+            "Resp",
+            (),
+            {
+                "status": 200,
+                "getcode": lambda self: 200,
+                "read": lambda self: json.dumps(
+                    _grok_billing_payload()
+                ).encode(),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: None,
+            },
+        )()
+
+    monkeypatch.setattr(
+        loop,
+        "_load_grok_billing_auth_context",
+        fake_load_grok_auth,
+    )
+    monkeypatch.setattr(
+        loop.xai_oauth_refresh,
+        "_read_credential_payload",
+        managed_auth_read_must_not_run,
+    )
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+
+    fetched = loop._fetch_grok_billing_payload(config)
+
+    assert fetched["status_code"] == 200
+    assert loaded_auth_files == [native_auth_file]
+    assert managed_auth_file not in loaded_auth_files
 
 
 def test_fetch_grok_billing_payload_does_not_retry_auth_failure(monkeypatch) -> None:
