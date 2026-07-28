@@ -529,11 +529,45 @@ async def _prepare_oa_xai_passthrough_request(
 
 
 def _get_grok_native_oauth_client_version() -> str:
+    """Resolve the Grok native client version with strict validation.
+
+    Precedence:
+    1. ``LITELLM_XAI_GROK_CLIENT_VERSION`` (emergency override)
+    2. ``GROK_CLIENT_VERSION`` (legacy override)
+    3. Validated cache record via the shared contract module
+    4. Fail closed -- no hard-coded fallback
+    """
+    from litellm.secret_managers.grok_native_version_contract import (
+        GrokNativeVersionError,
+        _validate_version_string,
+        try_resolve_grok_native_version,
+    )
+
     runtime = _require_runtime()
-    return (
-        runtime.get_secret_str("LITELLM_XAI_GROK_CLIENT_VERSION")
-        or runtime.get_secret_str("GROK_CLIENT_VERSION")
-        or "0.1.210"
+
+    # 1. Explicit override (emergency path, still validated).
+    explicit = runtime.get_secret_str("LITELLM_XAI_GROK_CLIENT_VERSION")
+    if explicit:
+        _validate_version_string(explicit)
+        return explicit
+
+    # 2. Legacy override.
+    legacy = runtime.get_secret_str("GROK_CLIENT_VERSION")
+    if legacy:
+        _validate_version_string(legacy)
+        return legacy
+
+    # 3. Validated cache record (re-read every call, no caching).
+    result = try_resolve_grok_native_version()
+    if result is not None:
+        record, _metadata = result
+        return record.version
+
+    # 4. Fail closed.
+    raise GrokNativeVersionError(
+        "no valid Grok native client version: set "
+        "LITELLM_XAI_GROK_CLIENT_VERSION or GROK_CLIENT_VERSION, "
+        "or provide a valid cache file at the configured path"
     )
 
 
