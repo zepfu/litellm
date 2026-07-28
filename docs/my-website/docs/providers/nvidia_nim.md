@@ -102,6 +102,25 @@ request body. Current NVIDIA catalog entries conservatively do not set
 `supports_max_completion_tokens` to `true`; native-alias behavior should not
 be inferred for an unlisted model.
 
+### Chat parameter compliance
+
+NVIDIA NIM chat parameter handling is strict by default. Ordinary OpenAI
+parameters that are not supported by the selected NVIDIA model raise
+`UnsupportedParamsError` before a provider request is made. The error reports
+parameter names only and never includes parameter values.
+
+Set request-level `drop_params=True` or global
+`litellm.drop_params = True` to remove unsupported parameters instead. Dropped
+fields are never included in the NVIDIA request body. Explicit
+`allowed_openai_params` entries retain their existing pass-through behavior.
+
+Rejected and dropped fields use the same bounded, value-free
+`provider_parameter_adaptations` metadata contract described above. Strict
+mode records `rejected` / `unsupported_param`; drop mode records
+`dropped` / `unsupported_param`. Canonical request and logging metadata are
+updated before strict errors are raised, and concurrent sync or async requests
+keep independent adaptation records.
+
 
 ## Usage - embedding
 

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 from datetime import datetime
@@ -608,19 +609,30 @@ class TestUnrelatedMappingPreserved:
             "seed": 42,
         }
 
-    def test_unsupported_param_dropped(self) -> None:
+    def test_unsupported_param_rejected_names_only(self) -> None:
         config = NvidiaNimConfig()
-        result = config.map_openai_params(
-            non_default_params={
-                "temperature": 0.5,
-                "cache_control": {"type": "ephemeral"},
-            },
-            optional_params={},
-            model="meta/llama3-8b-instruct",
-            drop_params=False,
-        )
-        assert result == {"temperature": 0.5}
-        assert "cache_control" not in result
+        collector = AdaptationCollector()
+        with pytest.raises(UnsupportedParamsError) as exc_info:
+            config.map_openai_params(
+                non_default_params={
+                    "temperature": 0.5,
+                    "cache_control": {"type": "ephemeral-secret"},
+                },
+                optional_params={},
+                model="meta/llama3-8b-instruct",
+                drop_params=False,
+                adaptation_collector=collector,
+            )
+
+        assert "cache_control" in str(exc_info.value.message)
+        assert "ephemeral-secret" not in str(exc_info.value.message)
+        assert collector.to_metadata()["provider_parameter_adaptations"] == [
+            {
+                "name": "cache_control",
+                "action": "rejected",
+                "reason": "unsupported_param",
+            }
+        ]
 
     def test_tools_and_response_format_preserved(self) -> None:
         config = NvidiaNimConfig()
@@ -718,10 +730,7 @@ def test_nvidia_nim_reasoning_effort_supported_from_model_metadata(
 
     supported_params = config.get_supported_openai_params("vendor/reasoning-model")
     optional_params = config.map_openai_params(
-        non_default_params={
-            "reasoning_effort": "high",
-            "cache_control": {"type": "ephemeral"},
-        },
+        non_default_params={"reasoning_effort": "high"},
         optional_params={},
         model="vendor/reasoning-model",
         drop_params=False,
@@ -729,22 +738,76 @@ def test_nvidia_nim_reasoning_effort_supported_from_model_metadata(
 
     assert "reasoning_effort" in supported_params
     assert optional_params["reasoning_effort"] == "high"
-    assert "cache_control" not in optional_params
 
 
-def test_nvidia_nim_reasoning_effort_stripped_without_model_metadata() -> None:
+def test_nvidia_nim_reasoning_effort_rejected_without_model_metadata() -> None:
     config = NvidiaNimConfig()
+    collector = AdaptationCollector()
 
     supported_params = config.get_supported_openai_params("vendor/plain-model")
-    optional_params = config.map_openai_params(
-        non_default_params={"reasoning_effort": "high"},
-        optional_params={},
-        model="vendor/plain-model",
-        drop_params=False,
-    )
+    with pytest.raises(UnsupportedParamsError) as exc_info:
+        config.map_openai_params(
+            non_default_params={"reasoning_effort": "high"},
+            optional_params={},
+            model="vendor/plain-model",
+            drop_params=False,
+            adaptation_collector=collector,
+        )
 
     assert "reasoning_effort" not in supported_params
-    assert "reasoning_effort" not in optional_params
+    assert "reasoning_effort" in str(exc_info.value.message)
+    assert "high" not in str(exc_info.value.message)
+    assert collector.to_metadata()["provider_parameter_adaptations"] == [
+        {
+            "name": "reasoning_effort",
+            "action": "rejected",
+            "reason": "unsupported_param",
+        }
+    ]
+
+
+def test_nvidia_nim_ordinary_unsupported_param_dropped_names_only() -> None:
+    collector = AdaptationCollector()
+    result = NvidiaNimConfig().map_openai_params(
+        non_default_params={"logit_bias": {"secret-token": 100}},
+        optional_params={"logit_bias": {"stale-secret": 1}},
+        model="vendor/plain-model",
+        drop_params=True,
+        adaptation_collector=collector,
+    )
+
+    assert "logit_bias" not in result
+    metadata = collector.to_metadata()
+    assert metadata["provider_parameter_adaptations"] == [
+        {
+            "name": "logit_bias",
+            "action": "dropped",
+            "reason": "unsupported_param",
+        }
+    ]
+    assert "secret-token" not in json.dumps(metadata)
+    assert "stale-secret" not in json.dumps(metadata)
+
+
+def test_nvidia_nim_unsupported_param_adaptations_remain_bounded() -> None:
+    collector = AdaptationCollector()
+    params = {f"unsupported_{index}": f"secret-{index}" for index in range(100)}
+
+    result = NvidiaNimConfig().map_openai_params(
+        non_default_params=params,
+        optional_params={},
+        model="vendor/plain-model",
+        drop_params=True,
+        adaptation_collector=collector,
+    )
+
+    metadata = collector.to_metadata()
+    records = metadata["provider_parameter_adaptations"]
+    truncated = metadata["provider_parameter_adaptations_truncated_count"]
+    assert result == {}
+    assert len(records) < len(params)
+    assert len(records) + truncated == len(params)
+    assert all(set(record) == {"name", "action", "reason"} for record in records)
 
 
 def test_nvidia_anthropic_adapter_models_have_nonzero_cost_map_coverage() -> None:
@@ -799,6 +862,8 @@ class TestProductionCallerPath:
         max_completion_tokens=None,
         drop_params=None,
         metadata=None,
+        allowed_openai_params=None,
+        logit_bias=None,
     ):
         """Invoke get_optional_params for nvidia_nim chat with contextvar set."""
         from litellm.utils import (
@@ -825,6 +890,8 @@ class TestProductionCallerPath:
                 max_tokens=max_tokens,
                 max_completion_tokens=max_completion_tokens,
                 drop_params=drop_params,
+                allowed_openai_params=allowed_openai_params,
+                logit_bias=logit_bias,
             )
         finally:
             _reset_provider_parameter_adaptation_request_context(token)
@@ -980,6 +1047,57 @@ class TestProductionCallerPath:
         assert result["max_tokens"] == 10
         assert "max_completion_tokens" not in result
         assert len(meta["provider_parameter_adaptations"]) == 1
+
+    def test_ordinary_unsupported_strict_persists_rejection(self) -> None:
+        metadata = {}
+        with pytest.raises(UnsupportedParamsError) as exc_info:
+            self._call(
+                metadata=metadata,
+                logit_bias={"private-token": 99},
+            )
+
+        assert "logit_bias" in str(exc_info.value.message)
+        assert "private-token" not in str(exc_info.value.message)
+        assert metadata["provider_parameter_adaptations"] == [
+            {
+                "name": "logit_bias",
+                "action": "rejected",
+                "reason": "unsupported_param",
+            }
+        ]
+        assert metadata["provider_parameter_adaptations_truncated_count"] == 0
+        assert "private-token" not in json.dumps(metadata)
+
+    @pytest.mark.parametrize("drop_source", ("request", "global"))
+    def test_ordinary_unsupported_drop_persists_and_removes(
+        self, drop_source: str, monkeypatch
+    ) -> None:
+        if drop_source == "global":
+            monkeypatch.setattr(litellm, "drop_params", True)
+        result, metadata = self._call(
+            drop_params=True if drop_source == "request" else None,
+            logit_bias={"private-token": 99},
+        )
+
+        assert "logit_bias" not in result
+        assert metadata["provider_parameter_adaptations"] == [
+            {
+                "name": "logit_bias",
+                "action": "dropped",
+                "reason": "unsupported_param",
+            }
+        ]
+        assert metadata["provider_parameter_adaptations_truncated_count"] == 0
+        assert "private-token" not in json.dumps(metadata)
+
+    def test_allowed_openai_params_preserves_explicit_passthrough(self) -> None:
+        result, metadata = self._call(
+            allowed_openai_params=["logit_bias"],
+            logit_bias={"allowed": 1},
+        )
+
+        assert result["logit_bias"] == {"allowed": 1}
+        assert "provider_parameter_adaptations" not in metadata
 
 
 class TestStrictConflictWrapperPersistence:
@@ -1146,3 +1264,305 @@ class TestStrictConflictWrapperPersistence:
             exc=exc_info.value,
             request_id="async",
         )
+
+
+class TestUnsupportedParamWrapperCompliance:
+    """Verify ordinary unsupported fields through real completion wrappers."""
+
+    MODEL = "nvidia_nim/meta/llama3-8b-instruct"
+    MESSAGES = [{"role": "user", "content": "ordinary-wrapper-message"}]
+    UNSUPPORTED_VALUE = {"private-token": 97531}
+    PROVIDER_SECRET = "ordinary-provider-secret"
+    EXPECTED_REJECTED = [
+        {
+            "name": "logit_bias",
+            "action": "rejected",
+            "reason": "unsupported_param",
+        }
+    ]
+    EXPECTED_DROPPED = [
+        {
+            "name": "logit_bias",
+            "action": "dropped",
+            "reason": "unsupported_param",
+        }
+    ]
+
+    @classmethod
+    def _logging_obj(cls, metadata: dict, call_type: str, request_id: str) -> Logging:
+        logging_obj = Logging(
+            model=cls.MODEL,
+            messages=cls.MESSAGES,
+            stream=False,
+            call_type=call_type,
+            start_time=datetime.now(),
+            litellm_call_id=f"d1-556-ordinary-{request_id}",
+            function_id="",
+            kwargs={"metadata": metadata},
+        )
+        logging_obj.success_handler = MagicMock()  # type: ignore[method-assign]
+        logging_obj.failure_handler = MagicMock()  # type: ignore[method-assign]
+        logging_obj.async_failure_handler = AsyncMock()  # type: ignore[method-assign]
+        logging_obj.handle_sync_success_callbacks_for_async_calls = MagicMock()  # type: ignore[method-assign]
+        return logging_obj
+
+    @classmethod
+    def _metadata(cls, request_id: str) -> dict:
+        return {
+            "source": "caller",
+            "request_id": request_id,
+            "provider_parameter_adaptations": [
+                {
+                    "name": "caller-spoof",
+                    "action": "dropped",
+                    "reason": "unsupported_param",
+                }
+            ],
+            "provider_parameter_adaptations_truncated_count": 999,
+        }
+
+    @classmethod
+    def _provider_response(cls, request_id: str):
+        response = MagicMock()
+        response.model_dump.return_value = {
+            "id": f"chatcmpl-{request_id}",
+            "object": "chat.completion",
+            "created": 1,
+            "model": cls.MODEL,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+        return {}, response
+
+    @classmethod
+    def _assert_canonical_metadata(
+        cls,
+        *,
+        metadata: dict,
+        logging_obj: Logging,
+        request_id: str,
+        expected_records: list,
+    ) -> None:
+        logging_metadata = logging_obj.model_call_details["litellm_params"]["metadata"]
+        for target in (metadata, logging_metadata):
+            assert target["source"] == "caller"
+            assert target["request_id"] == request_id
+            assert target["provider_parameter_adaptations"] == expected_records
+            assert target["provider_parameter_adaptations_truncated_count"] == 0
+
+        adaptation_text = json.dumps(expected_records)
+        assert "private-token" not in adaptation_text
+        assert "97531" not in adaptation_text
+        assert "caller-spoof" not in adaptation_text
+
+    def test_completion_strict_ordinary_unsupported_persists_rejection(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(litellm, "num_retries", 0)
+        metadata = self._metadata("sync-strict")
+        logging_obj = self._logging_obj(
+            metadata, CallTypes.completion.value, "sync-strict"
+        )
+        provider_request = MagicMock()
+
+        with (
+            patch.object(
+                OpenAIChatCompletion,
+                "make_sync_openai_chat_completion_request",
+                new=provider_request,
+            ),
+            pytest.raises(UnsupportedParamsError) as exc_info,
+        ):
+            litellm.completion(
+                model=self.MODEL,
+                messages=self.MESSAGES,
+                metadata=metadata,
+                litellm_logging_obj=logging_obj,
+                client=MagicMock(),
+                api_key=self.PROVIDER_SECRET,
+                num_retries=0,
+                logit_bias=self.UNSUPPORTED_VALUE,
+            )
+
+        provider_request.assert_not_called()
+        error_text = str(exc_info.value.message)
+        assert "logit_bias" in error_text
+        assert "private-token" not in error_text
+        assert "97531" not in error_text
+        self._assert_canonical_metadata(
+            metadata=metadata,
+            logging_obj=logging_obj,
+            request_id="sync-strict",
+            expected_records=self.EXPECTED_REJECTED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_acompletion_strict_ordinary_unsupported_persists_rejection(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(litellm, "num_retries", 0)
+        metadata = self._metadata("async-strict")
+        logging_obj = self._logging_obj(
+            metadata, CallTypes.acompletion.value, "async-strict"
+        )
+        provider_request = AsyncMock()
+        executor_loop = MagicMock()
+
+        async def run_in_executor(_executor, func):
+            return func()
+
+        executor_loop.run_in_executor.side_effect = run_in_executor
+        with (
+            patch.object(
+                OpenAIChatCompletion,
+                "make_openai_chat_completion_request",
+                new=provider_request,
+            ),
+            patch(
+                "litellm.utils._client_async_logging_helper",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("litellm.main.asyncio.get_event_loop", return_value=executor_loop),
+            pytest.raises(UnsupportedParamsError) as exc_info,
+        ):
+            await litellm.acompletion(
+                model=self.MODEL,
+                messages=self.MESSAGES,
+                metadata=metadata,
+                litellm_logging_obj=logging_obj,
+                client=MagicMock(),
+                api_key=self.PROVIDER_SECRET,
+                num_retries=0,
+                logit_bias=self.UNSUPPORTED_VALUE,
+            )
+
+        provider_request.assert_not_awaited()
+        error_text = str(exc_info.value.message)
+        assert "logit_bias" in error_text
+        assert "private-token" not in error_text
+        assert "97531" not in error_text
+        self._assert_canonical_metadata(
+            metadata=metadata,
+            logging_obj=logging_obj,
+            request_id="async-strict",
+            expected_records=self.EXPECTED_REJECTED,
+        )
+
+    def test_completion_drop_removes_ordinary_unsupported_from_payload(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(litellm, "num_retries", 0)
+        metadata = self._metadata("sync-drop")
+        logging_obj = self._logging_obj(
+            metadata, CallTypes.completion.value, "sync-drop"
+        )
+        provider_request = MagicMock(return_value=self._provider_response("sync-drop"))
+
+        with patch.object(
+            OpenAIChatCompletion,
+            "make_sync_openai_chat_completion_request",
+            new=provider_request,
+        ):
+            litellm.completion(
+                model=self.MODEL,
+                messages=self.MESSAGES,
+                metadata=metadata,
+                litellm_logging_obj=logging_obj,
+                client=MagicMock(),
+                api_key=self.PROVIDER_SECRET,
+                num_retries=0,
+                drop_params=True,
+                logit_bias=self.UNSUPPORTED_VALUE,
+            )
+
+        payload = provider_request.call_args.kwargs["data"]
+        assert "logit_bias" not in payload
+        assert "private-token" not in json.dumps(payload)
+        assert "97531" not in json.dumps(payload)
+        self._assert_canonical_metadata(
+            metadata=metadata,
+            logging_obj=logging_obj,
+            request_id="sync-drop",
+            expected_records=self.EXPECTED_DROPPED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_acompletion_concurrent_drop_contexts_are_isolated(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(litellm, "num_retries", 0)
+        requests = {}
+
+        async def provider_request(**kwargs):
+            request_id = kwargs["logging_obj"].model_call_details["litellm_params"][
+                "metadata"
+            ]["request_id"]
+            requests[request_id] = kwargs["data"]
+            return self._provider_response(request_id)
+
+        executor_loop = MagicMock()
+
+        async def run_in_executor(_executor, func):
+            return func()
+
+        executor_loop.run_in_executor.side_effect = run_in_executor
+
+        async def make_call(request_id: str, secret_value: str):
+            metadata = self._metadata(request_id)
+            logging_obj = self._logging_obj(
+                metadata, CallTypes.acompletion.value, request_id
+            )
+            await litellm.acompletion(
+                model=self.MODEL,
+                messages=self.MESSAGES,
+                metadata=metadata,
+                litellm_logging_obj=logging_obj,
+                client=MagicMock(),
+                api_key=self.PROVIDER_SECRET,
+                num_retries=0,
+                drop_params=True,
+                logit_bias={secret_value: 1},
+            )
+            return metadata, logging_obj
+
+        with (
+            patch.object(
+                OpenAIChatCompletion,
+                "make_openai_chat_completion_request",
+                new=AsyncMock(side_effect=provider_request),
+            ),
+            patch(
+                "litellm.utils._client_async_logging_helper",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("litellm.main.asyncio.get_event_loop", return_value=executor_loop),
+        ):
+            first, second = await asyncio.gather(
+                make_call("async-first", "first-private-token"),
+                make_call("async-second", "second-private-token"),
+            )
+
+        for request_id, (metadata, logging_obj) in (
+            ("async-first", first),
+            ("async-second", second),
+        ):
+            self._assert_canonical_metadata(
+                metadata=metadata,
+                logging_obj=logging_obj,
+                request_id=request_id,
+                expected_records=self.EXPECTED_DROPPED,
+            )
+            payload_text = json.dumps(requests[request_id])
+            assert "logit_bias" not in requests[request_id]
+            assert "first-private-token" not in payload_text
+            assert "second-private-token" not in payload_text

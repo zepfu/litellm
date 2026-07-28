@@ -7,7 +7,7 @@ This file only contains param mapping logic
 
 API calling is done using the OpenAI SDK with an api_base
 """
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from litellm.exceptions import UnsupportedParamsError
 from litellm.litellm_core_utils.param_adaptation import AdaptationCollector
@@ -302,8 +302,10 @@ class NvidiaNimConfig(OpenAIGPTConfig):
         model: str,
         drop_params: bool,
         adaptation_collector: Optional[AdaptationCollector] = None,
+        allowed_openai_params: Optional[List[str]] = None,
     ) -> dict:
         supported_openai_params = self.get_supported_openai_params(model=model)
+        supported_openai_params.extend(allowed_openai_params or [])
 
         # Resolve token-limit fields with deterministic policy first.
         optional_params = self._resolve_token_limit_params(
@@ -314,10 +316,37 @@ class NvidiaNimConfig(OpenAIGPTConfig):
             adaptation_collector=adaptation_collector,
         )
 
-        # Map remaining non-token params through the supported list.
+        # Map supported non-token params and explicitly handle unsupported ones.
+        unsupported_param_names = []
         for param, value in non_default_params.items():
             if param in _TOKEN_LIMIT_FIELDS:
                 continue  # already resolved above
+            if param in {"user", "stream_options", "max_retries"} or (
+                param == "n" and value == 1
+            ):
+                continue
             if param in supported_openai_params:
                 optional_params[param] = value
+            else:
+                optional_params.pop(param, None)
+                unsupported_param_names.append(param)
+
+        if unsupported_param_names:
+            action = "dropped" if drop_params else "rejected"
+            if adaptation_collector is not None:
+                for param_name in unsupported_param_names:
+                    adaptation_collector.add(
+                        name=param_name,
+                        action=action,
+                        reason="unsupported_param",
+                    )
+            if not drop_params:
+                raise UnsupportedParamsError(
+                    message=(
+                        "nvidia_nim does not support parameters: "
+                        f"{unsupported_param_names}, for model={model}."
+                    ),
+                    llm_provider="nvidia_nim",
+                    model=model,
+                )
         return optional_params

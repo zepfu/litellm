@@ -4215,6 +4215,9 @@ def get_optional_params(  # noqa: PLR0915
         non_default_params=non_default_params,
         custom_llm_provider=custom_llm_provider,
     )
+    adaptation_collector: Optional[AdaptationCollector] = None
+    if custom_llm_provider == "nvidia_nim":
+        adaptation_collector = AdaptationCollector()
 
     def _check_valid_arg(supported_params: List[str]):
         """
@@ -4248,6 +4251,16 @@ def get_optional_params(  # noqa: PLR0915
                     unsupported_params[k] = non_default_params[k]
 
         if unsupported_params:
+            effective_drop_params = litellm.drop_params is True or drop_params is True
+            if adaptation_collector is not None:
+                action = "dropped" if effective_drop_params else "rejected"
+                for param_name in unsupported_params:
+                    adaptation_collector.add(
+                        name=param_name,
+                        action=action,
+                        reason="unsupported_param",
+                    )
+                _persist_provider_parameter_adaptations(adaptation_collector)
             if litellm.drop_params is True or (
                 drop_params is not None and drop_params is True
             ):
@@ -4694,7 +4707,7 @@ def get_optional_params(  # noqa: PLR0915
         )
     elif custom_llm_provider == "nvidia_nim":
         effective_drop_params = litellm.drop_params is True or drop_params is True
-        adaptation_collector = AdaptationCollector()
+        assert adaptation_collector is not None
         try:
             optional_params = litellm.NvidiaNimConfig().map_openai_params(
                 model=model,
@@ -4702,6 +4715,7 @@ def get_optional_params(  # noqa: PLR0915
                 optional_params=optional_params,
                 drop_params=effective_drop_params,
                 adaptation_collector=adaptation_collector,
+                allowed_openai_params=allowed_openai_params,
             )
         except UnsupportedParamsError:
             _persist_provider_parameter_adaptations(adaptation_collector)
