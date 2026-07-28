@@ -110,6 +110,9 @@ services:
       # Sanitized Kimi native descriptor for canonical endpoint resolution (MS-030/MS-031).
       # Read-only; does not contain OAuth credentials or the full Kimi home.
       - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:/app/kimi-descriptor:ro
+      # Grok native client-version cache (xai-002). Read-only directory mount;
+      # the sidecar or host CLI writes the JSON, LiteLLM only reads.
+      - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
       # Qwen CLI settings are the canonical Token Plan credential owner.
       # LiteLLM reads the existing file in place and never copies the key.
       - /home/zepfu/.qwen/settings.json:/home/zepfu/.qwen/settings.json:ro
@@ -184,6 +187,8 @@ services:
       - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/kimi-native-contract.json}
       - LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}
+      - AAWM_GROK_CLIENT_VERSION_CACHE_PATH=${AAWM_GROK_CLIENT_VERSION_CACHE_PATH:-/run/aawm/grok/native-client-version.json}
+      - AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS=${AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS:-172800}
       - LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE=${LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE:-/home/zepfu/.qwen/settings.json}
       - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
@@ -251,6 +256,9 @@ services:
       - /home/zepfu/.kimi-code/oauth:/home/zepfu/.kimi-code/oauth
       # Sanitized Kimi native descriptor for canonical endpoint resolution (MS-030/MS-031).
       - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:/app/kimi-descriptor:ro
+      # Grok native client-version cache (xai-002). Read-only directory mount;
+      # the billing poller reads the version written by the host CLI.
+      - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
       # Alibaba Token Plan sidecar session file source for quota polling.
       - /home/zepfu/.alibaba:/home/zepfu/.alibaba:ro
     environment:
@@ -356,12 +364,13 @@ services:
       - AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS=${AAWM_GROK_BILLING_POLL_MAX_ATTEMPTS:-3}
       - AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS=${AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS:-0.5}
       - AAWM_GROK_BILLING_URL=${AAWM_GROK_BILLING_URL:-https://cli-chat-proxy.grok.com/v1/billing?format=credits}
-      - AAWM_GROK_BILLING_CLIENT_VERSION=${AAWM_GROK_BILLING_CLIENT_VERSION:-0.2.55}
       - AAWM_GROK_BILLING_CLIENT_IDENTIFIER=${AAWM_GROK_BILLING_CLIENT_IDENTIFIER:-grok-cli}
       - AAWM_GROK_BILLING_XAI_TOKEN_AUTH=${AAWM_GROK_BILLING_XAI_TOKEN_AUTH:-xai-grok-cli}
       - AAWM_GROK_BILLING_MODEL=${AAWM_GROK_BILLING_MODEL:-grok-build}
       - AAWM_GROK_BILLING_HTTP_METHOD=${AAWM_GROK_BILLING_HTTP_METHOD:-GET}
       - AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE=${AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE:-1}
+      - AAWM_GROK_CLIENT_VERSION_CACHE_PATH=${AAWM_GROK_CLIENT_VERSION_CACHE_PATH:-/run/aawm/grok/native-client-version.json}
+      - AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS=${AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS:-172800}
       - AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED=${AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED:-1}
       - AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS=${AAWM_OBSERVABILITY_ANOMALY_SCAN_INTERVAL_SECONDS:-3600}
       - AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS=${AAWM_OBSERVABILITY_ANOMALY_SCAN_LOOKBACK_HOURS:-4}

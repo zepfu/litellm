@@ -14,7 +14,9 @@ ENV PYTHONUNBUFFERED=1 \
     AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS=1000 \
     AAWM_PROVIDER_STATUS_DB_STATEMENT_TIMEOUT_MS=5000 \
     LITELLM_KIMI_NATIVE_CONTRACT_PATH=/app/kimi-descriptor/kimi-native-contract.json \
-    LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false
+    LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false \
+    AAWM_GROK_CLIENT_VERSION_CACHE_PATH=/run/aawm/grok/native-client-version.json \
+    AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS=172800
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -38,6 +40,8 @@ COPY litellm/secret_managers/credential_file_metadata.py /app/litellm/secret_man
 COPY litellm/secret_managers/credential_file_write.py /app/litellm/secret_managers/credential_file_write.py
 # Canonical Kimi endpoint/contract resolver (pure-stdlib, MS-030/MS-031).
 COPY litellm/secret_managers/kimi_native_contract.py /app/litellm/secret_managers/kimi_native_contract.py
+# Grok native client-version cache contract (pure-stdlib, xai-002).
+COPY litellm/secret_managers/grok_native_version_contract.py /app/litellm/secret_managers/grok_native_version_contract.py
 RUN touch \
     /app/scripts/__init__.py \
     /app/litellm/__init__.py \
@@ -47,5 +51,9 @@ RUN touch \
 # /app/kimi-descriptor.  The image itself ships only the contract module and
 # the descriptor path gate; it never bundles OAuth credentials or the Kimi home.
 RUN mkdir -p /app/kimi-descriptor
+
+# Grok native client-version cache directory; compose mounts the host cache
+# read-only here.  The image ships only the directory and the contract module.
+RUN mkdir -p /run/aawm/grok
 
 ENTRYPOINT ["python", "/app/scripts/run_provider_status_observations_loop.py"]

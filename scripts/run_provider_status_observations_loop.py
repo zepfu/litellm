@@ -65,6 +65,7 @@ from litellm.secret_managers.kimi_native_contract import (
     resolve_contract as _kimi_resolve_contract,
     resolve_endpoint_url as _kimi_resolve_endpoint_url,
 )
+from litellm.secret_managers import grok_native_version_contract
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -257,13 +258,17 @@ DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
-DEFAULT_GROK_BILLING_CLIENT_VERSION = "0.2.55"
 DEFAULT_GROK_BILLING_CLIENT_IDENTIFIER = "grok-cli"
 DEFAULT_GROK_BILLING_XAI_TOKEN_AUTH = "xai-grok-cli"
 DEFAULT_GROK_BILLING_MODEL = "grok-build"
 DEFAULT_GROK_BILLING_HTTP_METHOD = "GET"
 DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS = 3
 DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS = 0.5
+GROK_BILLING_CLIENT_VERSION_ENV_VARS = (
+    "AAWM_GROK_BILLING_CLIENT_VERSION",
+    "LITELLM_XAI_GROK_CLIENT_VERSION",
+    "GROK_CLIENT_VERSION",
+)
 USAGE_PERIOD_TYPE_WEEKLY = "USAGE_PERIOD_TYPE_WEEKLY"
 GROK_BILLING_WEEKLY_CREDITS_QUOTA_KEY = "xai_grok_build_weekly_credits:credits"
 GROK_BILLING_MONTHLY_REQUESTS_QUOTA_KEY = "xai_grok_build_monthly_requests:requests"
@@ -358,6 +363,50 @@ PROVIDER_FAILURE_SECRET_RE = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class GrokBillingClientVersionResolution:
+    """Validated version and sanitized provenance for one request attempt."""
+
+    version: str
+    source: str
+    cache_source: Optional[str] = None
+    cache_path_class: Optional[str] = None
+
+    def sanitized_metadata(self) -> Dict[str, str]:
+        metadata = {"client_version_source": self.source}
+        if self.cache_source is not None:
+            metadata["client_version_cache_source"] = self.cache_source
+        if self.cache_path_class is not None:
+            metadata["client_version_cache_path_class"] = self.cache_path_class
+        return metadata
+
+
+class GrokBillingRequestHeaders(dict[str, str]):
+    """Actual outbound headers plus non-secret version provenance."""
+
+    def __init__(
+        self,
+        headers: Mapping[str, str],
+        *,
+        version_resolution: GrokBillingClientVersionResolution,
+    ) -> None:
+        super().__init__(headers)
+        self.version_resolution = version_resolution
+
+
+class GrokBillingClientVersionError(ValueError):
+    """Sanitized client-version resolution failure for one billing attempt."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_metadata: Mapping[str, str],
+    ) -> None:
+        super().__init__(message)
+        self.source_metadata = dict(source_metadata)
+
+
 class GrokBillingPollError(ValueError):
     """Sanitized billing poll failure with retry metadata for sidecar events."""
 
@@ -368,11 +417,13 @@ class GrokBillingPollError(ValueError):
         status_code: Optional[int],
         attempt_count: int,
         retry_count: int,
+        request_headers: Optional[GrokBillingRequestHeaders] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.attempt_count = max(1, attempt_count)
         self.retry_count = max(0, retry_count)
+        self.request_headers = request_headers
 
 
 class CodexResetCreditPollError(ValueError):
@@ -1231,7 +1282,8 @@ class ProviderStatusLoopConfig:
         DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS
     )
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
-    grok_billing_client_version: str = DEFAULT_GROK_BILLING_CLIENT_VERSION
+    grok_billing_client_version: Optional[str] = None
+    grok_billing_client_version_source: Optional[str] = None
     grok_billing_client_identifier: str = DEFAULT_GROK_BILLING_CLIENT_IDENTIFIER
     grok_billing_xai_token_auth: str = DEFAULT_GROK_BILLING_XAI_TOKEN_AUTH
     grok_billing_model: str = DEFAULT_GROK_BILLING_MODEL
@@ -1411,12 +1463,75 @@ def _resolve_kimi_oauth_sidecar_auth_file(
     return DEFAULT_KIMI_OAUTH_AUTH_FILE, "default"
 
 
-def _resolve_grok_billing_client_version() -> str:
-    return (
-        _first_non_empty_env("AAWM_GROK_BILLING_CLIENT_VERSION")
-        or _first_non_empty_env("LITELLM_XAI_GROK_CLIENT_VERSION")
-        or _first_non_empty_env("GROK_CLIENT_VERSION")
-        or DEFAULT_GROK_BILLING_CLIENT_VERSION
+def _grok_billing_cache_path_class() -> str:
+    if grok_native_version_contract.GROK_VERSION_CACHE_PATH_ENV in os.environ:
+        return "configured"
+    return "default"
+
+
+def _validate_grok_billing_client_version(
+    value: str,
+    *,
+    source: str,
+    source_metadata: Mapping[str, str],
+) -> GrokBillingClientVersionResolution:
+    try:
+        grok_native_version_contract._validate_version_string(value)
+    except grok_native_version_contract.GrokNativeVersionError as exc:
+        raise GrokBillingClientVersionError(
+            f"Grok billing client version from {source} is invalid: {exc}",
+            source_metadata=source_metadata,
+        ) from exc
+    return GrokBillingClientVersionResolution(
+        version=value,
+        source=source_metadata["client_version_source"],
+    )
+
+
+def _resolve_grok_billing_client_version(
+    config: ProviderStatusLoopConfig,
+) -> GrokBillingClientVersionResolution:
+    explicit_value = config.grok_billing_client_version
+    if explicit_value is not None:
+        explicit_source = (
+            "cli"
+            if config.grok_billing_client_version_source == "cli"
+            else "config"
+        )
+        return _validate_grok_billing_client_version(
+            explicit_value,
+            source=explicit_source,
+            source_metadata={"client_version_source": explicit_source},
+        )
+
+    for env_name in GROK_BILLING_CLIENT_VERSION_ENV_VARS:
+        if env_name not in os.environ:
+            continue
+        return _validate_grok_billing_client_version(
+            os.environ[env_name],
+            source=env_name,
+            source_metadata={"client_version_source": env_name},
+        )
+
+    cache_path_class = _grok_billing_cache_path_class()
+    cache_source_metadata = {
+        "client_version_source": "cache",
+        "client_version_cache_path_class": cache_path_class,
+    }
+    try:
+        record, metadata = (
+            grok_native_version_contract.resolve_grok_native_version()
+        )
+    except grok_native_version_contract.GrokNativeVersionError as exc:
+        raise GrokBillingClientVersionError(
+            f"Grok billing client version cache resolution failed: {exc}",
+            source_metadata=cache_source_metadata,
+        ) from exc
+    return GrokBillingClientVersionResolution(
+        version=record.version,
+        source="cache",
+        cache_source=metadata.source,
+        cache_path_class=cache_path_class,
     )
 
 
@@ -2075,11 +2190,13 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     )
     parser.add_argument(
         "--grok-billing-client-version",
-        default=_resolve_grok_billing_client_version(),
+        default=None,
         help=(
-            "Grok CLI client version header for billing polls. Defaults to "
-            "AAWM_GROK_BILLING_CLIENT_VERSION, LITELLM_XAI_GROK_CLIENT_VERSION, "
-            "GROK_CLIENT_VERSION, or 0.2.55."
+            "Explicit Grok CLI client-version override for billing polls. "
+            "Without this option, each request resolves "
+            "AAWM_GROK_BILLING_CLIENT_VERSION, "
+            "LITELLM_XAI_GROK_CLIENT_VERSION, GROK_CLIENT_VERSION, then the "
+            "validated native-version cache."
         ),
     )
     parser.add_argument(
@@ -2437,8 +2554,6 @@ def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--grok-billing-poll-http-timeout-seconds must be greater than 0")
     if not str(args.grok_billing_url).strip():
         raise SystemExit("--grok-billing-url must not be empty")
-    if not str(args.grok_billing_client_version).strip():
-        raise SystemExit("--grok-billing-client-version must not be empty")
     if not str(args.grok_billing_client_identifier).strip():
         raise SystemExit("--grok-billing-client-identifier must not be empty")
     if not str(args.grok_billing_xai_token_auth).strip():
@@ -2583,6 +2698,9 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_poll_http_timeout_seconds=args.grok_billing_poll_http_timeout_seconds,
         grok_billing_url=args.grok_billing_url,
         grok_billing_client_version=args.grok_billing_client_version,
+        grok_billing_client_version_source=(
+            "cli" if args.grok_billing_client_version is not None else None
+        ),
         grok_billing_client_identifier=args.grok_billing_client_identifier,
         grok_billing_xai_token_auth=args.grok_billing_xai_token_auth,
         grok_billing_model=args.grok_billing_model,
@@ -5855,15 +5973,16 @@ def _build_grok_billing_request_headers(
     *,
     access_token: str,
     identity_headers: Optional[Mapping[str, str]] = None,
-) -> Dict[str, str]:
+) -> GrokBillingRequestHeaders:
+    version_resolution = _resolve_grok_billing_client_version(config)
     request_id = str(uuid.uuid4())
     headers = {
         "accept": "application/json",
         "authorization": f"Bearer {access_token}",
         "content-type": "application/json",
-        "user-agent": f"grok/{config.grok_billing_client_version}",
+        "user-agent": f"grok/{version_resolution.version}",
         "x-grok-client-identifier": config.grok_billing_client_identifier,
-        "x-grok-client-version": config.grok_billing_client_version,
+        "x-grok-client-version": version_resolution.version,
         "x-grok-req-id": request_id,
         "x-request-id": request_id,
         "x-xai-token-auth": config.grok_billing_xai_token_auth,
@@ -5876,13 +5995,14 @@ def _build_grok_billing_request_headers(
             value = identity_headers.get(header_name)
             if isinstance(value, str) and value.strip():
                 headers[header_name] = value.strip()
-    return headers
+    return GrokBillingRequestHeaders(
+        headers,
+        version_resolution=version_resolution,
+    )
 
 
-def _grok_billing_request_contract_summary(
+def _grok_billing_request_target_summary(
     config: ProviderStatusLoopConfig,
-    *,
-    identity_headers: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     parsed_url = urlsplit(config.grok_billing_url)
     query_keys = sorted(
@@ -5895,28 +6015,44 @@ def _grok_billing_request_contract_summary(
             if key
         }
     )
-    identity_header_names = [
-        header_name
-        for header_name, _credential_field in GROK_BILLING_IDENTITY_HEADER_FIELDS
-        if isinstance((identity_headers or {}).get(header_name), str)
-        and str((identity_headers or {}).get(header_name)).strip()
-    ]
-    request_headers = _build_grok_billing_request_headers(
-        config,
-        access_token="<redacted>",
-        identity_headers={
-            header_name: "<redacted>" for header_name in identity_header_names
-        }
-        if identity_header_names
-        else None,
-    )
-    header_names = sorted(request_headers.keys())
-    fingerprint_payload = {
+    return {
+        "http_client": "urllib",
+        "request_method": config.grok_billing_http_method,
         "billing_host": parsed_url.hostname,
         "billing_path": parsed_url.path or "/",
         "billing_query_keys": query_keys,
+        "billing_query_present": bool(parsed_url.query),
+        "include_model_override": config.grok_billing_include_model_override,
+        "model_override_configured": bool(
+            config.grok_billing_include_model_override
+            and str(config.grok_billing_model).strip()
+        ),
         "client_identifier": config.grok_billing_client_identifier,
-        "client_version": config.grok_billing_client_version,
+        "x_xai_token_auth_configured": bool(config.grok_billing_xai_token_auth),
+        "resolved_auth_file": config.grok_oidc_auth_file,
+        "auth_file_source": config.grok_oidc_auth_file_source,
+        "poll_max_attempts": max(1, config.grok_billing_poll_max_attempts),
+    }
+
+
+def _grok_billing_request_contract_summary(
+    config: ProviderStatusLoopConfig,
+    *,
+    request_headers: GrokBillingRequestHeaders,
+) -> Dict[str, Any]:
+    target_summary = _grok_billing_request_target_summary(config)
+    header_names = sorted(request_headers.keys())
+    client_version = request_headers["x-grok-client-version"]
+    user_agent = request_headers["user-agent"]
+    version_source_metadata = (
+        request_headers.version_resolution.sanitized_metadata()
+    )
+    fingerprint_payload = {
+        "billing_host": target_summary["billing_host"],
+        "billing_path": target_summary["billing_path"],
+        "billing_query_keys": target_summary["billing_query_keys"],
+        "client_identifier": config.grok_billing_client_identifier,
+        "client_version": client_version,
         "header_names": header_names,
         "http_client": "urllib",
         "include_model_override": config.grok_billing_include_model_override,
@@ -5925,6 +6061,7 @@ def _grok_billing_request_contract_summary(
             config.grok_billing_include_model_override
             and str(config.grok_billing_model).strip()
         ),
+        "user_agent": user_agent,
         "x_xai_token_auth_configured": bool(config.grok_billing_xai_token_auth),
     }
     fingerprint = hashlib.sha256(
@@ -5933,24 +6070,11 @@ def _grok_billing_request_contract_summary(
         )
     ).hexdigest()
     return {
-        "http_client": "urllib",
-        "request_method": config.grok_billing_http_method,
-        "billing_host": parsed_url.hostname,
-        "billing_path": parsed_url.path or "/",
-        "billing_query_keys": query_keys,
-        "billing_query_present": bool(parsed_url.query),
+        **target_summary,
         "header_names": header_names,
-        "include_model_override": config.grok_billing_include_model_override,
-        "model_override_configured": bool(
-            config.grok_billing_include_model_override
-            and str(config.grok_billing_model).strip()
-        ),
-        "client_identifier": config.grok_billing_client_identifier,
-        "client_version": config.grok_billing_client_version,
-        "x_xai_token_auth_configured": bool(config.grok_billing_xai_token_auth),
-        "resolved_auth_file": config.grok_oidc_auth_file,
-        "auth_file_source": config.grok_oidc_auth_file_source,
-        "poll_max_attempts": max(1, config.grok_billing_poll_max_attempts),
+        "client_version": client_version,
+        "user_agent": user_agent,
+        **version_source_metadata,
         "request_contract_fingerprint": fingerprint,
     }
 
@@ -6055,15 +6179,17 @@ def _fetch_grok_billing_payload(
 
     while attempt_count < max_attempts:
         attempt_count += 1
+        request_headers: Optional[GrokBillingRequestHeaders] = None
         try:
             auth_context = _load_grok_billing_auth_context(config.grok_oidc_auth_file)
+            request_headers = _build_grok_billing_request_headers(
+                config,
+                access_token=auth_context["access_token"],
+                identity_headers=auth_context["identity_headers"],
+            )
             request = urllib_request.Request(
                 config.grok_billing_url,
-                headers=_build_grok_billing_request_headers(
-                    config,
-                    access_token=auth_context["access_token"],
-                    identity_headers=auth_context["identity_headers"],
-                ),
+                headers=request_headers,
                 method=config.grok_billing_http_method,
             )
             with urllib_request.urlopen(
@@ -6097,6 +6223,7 @@ def _fetch_grok_billing_payload(
                 status_code=last_status_code,
                 attempt_count=attempt_count,
                 retry_count=retry_count,
+                request_headers=request_headers,
             ) from exc
         except urllib_error.URLError as exc:
             last_status_code = None
@@ -6118,6 +6245,7 @@ def _fetch_grok_billing_payload(
                 status_code=last_status_code,
                 attempt_count=attempt_count,
                 retry_count=retry_count,
+                request_headers=request_headers,
             ) from exc
 
         try:
@@ -6128,6 +6256,7 @@ def _fetch_grok_billing_payload(
                 status_code=int(status_code),
                 attempt_count=attempt_count,
                 retry_count=retry_count,
+                request_headers=request_headers,
             ) from exc
         if not isinstance(payload, dict):
             raise GrokBillingPollError(
@@ -6135,12 +6264,18 @@ def _fetch_grok_billing_payload(
                 status_code=int(status_code),
                 attempt_count=attempt_count,
                 retry_count=retry_count,
+                request_headers=request_headers,
+            )
+        if request_headers is None:
+            raise RuntimeError(
+                "Grok billing request headers were not built for a successful attempt."
             )
         return {
             "status_code": int(status_code),
             "payload": payload,
             "attempt_count": attempt_count,
             "retry_count": retry_count,
+            "request_headers": request_headers,
         }
 
     raise GrokBillingPollError(
@@ -6434,11 +6569,11 @@ def _grok_billing_snapshot_parts(
 def _grok_billing_sidecar_request_contract_evidence(
     config: ProviderStatusLoopConfig,
     *,
-    identity_headers: Optional[Mapping[str, str]] = None,
+    request_headers: GrokBillingRequestHeaders,
 ) -> Dict[str, Any]:
     summary = _grok_billing_request_contract_summary(
         config,
-        identity_headers=identity_headers,
+        request_headers=request_headers,
     )
     evidence: Dict[str, Any] = {
         "request_contract_fingerprint": summary["request_contract_fingerprint"],
@@ -6453,6 +6588,16 @@ def _grok_billing_sidecar_request_contract_evidence(
         ("header_names", "request_contract_header_names"),
         ("client_identifier", "request_contract_client_identifier"),
         ("client_version", "request_contract_client_version"),
+        ("user_agent", "request_contract_user_agent"),
+        ("client_version_source", "request_contract_client_version_source"),
+        (
+            "client_version_cache_source",
+            "request_contract_client_version_cache_source",
+        ),
+        (
+            "client_version_cache_path_class",
+            "request_contract_client_version_cache_path_class",
+        ),
     ):
         value = summary.get(summary_key)
         if value is not None and value != "" and value != []:
@@ -6466,9 +6611,6 @@ def _grok_billing_sidecar_request_contract_evidence(
         value = summary.get(summary_key)
         if value is not None:
             evidence[evidence_key] = value
-    user_agent = f"grok/{config.grok_billing_client_version}"
-    if user_agent:
-        evidence["request_contract_user_agent"] = user_agent
     return evidence
 
 
@@ -6477,14 +6619,14 @@ def _build_grok_billing_rate_limit_payload(
     *,
     observed_at: datetime,
     response_body: Dict[str, Any],
-    identity_headers: Optional[Mapping[str, str]] = None,
+    request_headers: GrokBillingRequestHeaders,
 ) -> tuple[Any, ...]:
     billing_config = _grok_billing_config(response_body)
     snapshot = _grok_billing_snapshot_parts(
         billing_config,
         base_evidence=_grok_billing_sidecar_request_contract_evidence(
             config,
-            identity_headers=identity_headers,
+            request_headers=request_headers,
         ),
     )
     if snapshot is None:
@@ -6503,7 +6645,7 @@ def _build_grok_billing_rate_limit_payload(
     return (
         observed_at,
         "grok-build",
-        config.grok_billing_client_version,
+        request_headers["x-grok-client-version"],
         None,
         "xai",
         config.grok_billing_model,
@@ -6531,13 +6673,13 @@ def _persist_grok_billing_observations(
     *,
     observed_at: datetime,
     response_body: Dict[str, Any],
-    identity_headers: Optional[Mapping[str, str]] = None,
+    request_headers: GrokBillingRequestHeaders,
 ) -> tuple[int, int]:
     payload = _build_grok_billing_rate_limit_payload(
         config,
         observed_at=observed_at,
         response_body=response_body,
-        identity_headers=identity_headers,
+        request_headers=request_headers,
     )
     dsn = _resolve_dsn(config)
     try:
@@ -7064,13 +7206,13 @@ def _build_grok_billing_observations_for_dry_run(
     *,
     observed_at: datetime,
     response_body: Dict[str, Any],
-    identity_headers: Optional[Mapping[str, str]] = None,
+    request_headers: GrokBillingRequestHeaders,
 ) -> int:
     _build_grok_billing_rate_limit_payload(
         config,
         observed_at=observed_at,
         response_body=response_body,
-        identity_headers=identity_headers,
+        request_headers=request_headers,
     )
     return 1
 
@@ -7757,7 +7899,11 @@ def _run_grok_billing_poll_task(
         "resolved_auth_file": config.grok_oidc_auth_file,
         "auth_file_source": config.grok_oidc_auth_file_source,
         "billing_url": config.grok_billing_url,
-        "client_version": config.grok_billing_client_version,
+        "client_version": None,
+        "user_agent": None,
+        "client_version_source": None,
+        "client_version_cache_source": None,
+        "client_version_cache_path_class": None,
         "model": config.grok_billing_model,
         "observation_count": 0,
         "inserted_count": 0,
@@ -7767,17 +7913,21 @@ def _run_grok_billing_poll_task(
         "poll_max_attempts": max(1, config.grok_billing_poll_max_attempts),
         "error_class": None,
         "error_message": None,
+        **_grok_billing_request_target_summary(config),
     }
-    summary.update(_grok_billing_request_contract_summary(config))
     try:
-        auth_context = _load_grok_billing_auth_context(config.grok_oidc_auth_file)
+        fetched = _fetch_grok_billing_payload(config)
+        request_headers = fetched.get("request_headers")
+        if not isinstance(request_headers, GrokBillingRequestHeaders):
+            raise TypeError(
+                "Grok billing fetch did not return the request headers used."
+            )
         summary.update(
             _grok_billing_request_contract_summary(
                 config,
-                identity_headers=auth_context.get("identity_headers"),
+                request_headers=request_headers,
             )
         )
-        fetched = _fetch_grok_billing_payload(config)
         summary["status_code"] = fetched["status_code"]
         summary["attempt_count"] = fetched.get("attempt_count", 1)
         summary["retry_count"] = fetched.get("retry_count", 0)
@@ -7786,7 +7936,7 @@ def _run_grok_billing_poll_task(
                 config,
                 observed_at=observed_at,
                 response_body=fetched["payload"],
-                identity_headers=auth_context.get("identity_headers"),
+                request_headers=request_headers,
             )
             summary["observation_count"] = observation_count
             summary["inserted_count"] = inserted_count
@@ -7796,10 +7946,22 @@ def _run_grok_billing_poll_task(
                 config,
                 observed_at=observed_at,
                 response_body=fetched["payload"],
-                identity_headers=auth_context.get("identity_headers"),
+                request_headers=request_headers,
             )
             summary["persisted"] = False
     except Exception as exc:
+        if isinstance(exc, GrokBillingClientVersionError):
+            summary.update(exc.source_metadata)
+        elif (
+            isinstance(exc, GrokBillingPollError)
+            and exc.request_headers is not None
+        ):
+            summary.update(
+                _grok_billing_request_contract_summary(
+                    config,
+                    request_headers=exc.request_headers,
+                )
+            )
         summary["error_class"] = exc.__class__.__name__
         summary["error_message"] = _redacted_failure_message(str(exc))
         if isinstance(exc, GrokBillingPollError):
