@@ -236,8 +236,20 @@ class NvidiaNimConfig(OpenAIGPTConfig):
             if native_val == alias_val:
                 # Equal aliases: deduplicate to provider-native field.
                 resolved[native_field] = native_val
+                if adaptation_collector is not None:
+                    adaptation_collector.add(
+                        name=alias_field,
+                        action="renamed",
+                        reason="provider_rename",
+                    )
             elif not drop_params:
                 # Differing aliases, strict/default: names-only error.
+                if adaptation_collector is not None:
+                    adaptation_collector.add(
+                        name=alias_field,
+                        action="rejected",
+                        reason="unsupported_param",
+                    )
                 raise UnsupportedParamsError(
                     message=(
                         "Conflicting token limit parameters: "
@@ -263,6 +275,12 @@ class NvidiaNimConfig(OpenAIGPTConfig):
             else:
                 # Conservative: historical compat mapping.
                 resolved[native_field] = non_default_params[alias_field]
+                if adaptation_collector is not None:
+                    adaptation_collector.add(
+                        name=alias_field,
+                        action="renamed",
+                        reason="provider_rename",
+                    )
         else:
             resolved[native_field] = non_default_params[native_field]
 

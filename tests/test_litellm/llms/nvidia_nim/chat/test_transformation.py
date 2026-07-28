@@ -1,14 +1,19 @@
 import json
 import threading
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import litellm
 
 from litellm.exceptions import UnsupportedParamsError
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.param_adaptation import AdaptationCollector
 from litellm.llms.nvidia_nim.chat.transformation import NvidiaNimConfig
+from litellm.llms.openai.openai import OpenAIChatCompletion
+from litellm.types.utils import CallTypes
 
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -76,17 +81,27 @@ class TestTokenPolicyConservative:
     def test_only_max_completion_tokens_mapped_to_max_tokens(self) -> None:
         """Historical NVIDIA compat: alias maps to provider-native field."""
         config = NvidiaNimConfig()
+        collector = AdaptationCollector()
         result = config.map_openai_params(
             non_default_params={"max_completion_tokens": 2048},
             optional_params={},
             model="vendor/unknown-model",
             drop_params=False,
+            adaptation_collector=collector,
         )
         assert result == {"max_tokens": 2048}
         assert "max_completion_tokens" not in result
+        assert collector.to_metadata()["provider_parameter_adaptations"] == [
+            {
+                "name": "max_completion_tokens",
+                "action": "renamed",
+                "reason": "provider_rename",
+            }
+        ]
 
     def test_equal_aliases_deduplicate_to_max_tokens(self) -> None:
         config = NvidiaNimConfig()
+        collector = AdaptationCollector()
         result = config.map_openai_params(
             non_default_params={
                 "max_tokens": 512,
@@ -95,11 +110,20 @@ class TestTokenPolicyConservative:
             optional_params={},
             model="vendor/unknown-model",
             drop_params=False,
+            adaptation_collector=collector,
         )
         assert result == {"max_tokens": 512}
+        assert collector.to_metadata()["provider_parameter_adaptations"] == [
+            {
+                "name": "max_completion_tokens",
+                "action": "renamed",
+                "reason": "provider_rename",
+            }
+        ]
 
     def test_conflicting_aliases_strict_raises_names_only(self) -> None:
         config = NvidiaNimConfig()
+        collector = AdaptationCollector()
         with pytest.raises(UnsupportedParamsError) as exc_info:
             config.map_openai_params(
                 non_default_params={
@@ -109,6 +133,7 @@ class TestTokenPolicyConservative:
                 optional_params={},
                 model="vendor/unknown-model",
                 drop_params=False,
+                adaptation_collector=collector,
             )
         msg = str(exc_info.value.message)
         assert "max_tokens" in msg
@@ -116,6 +141,13 @@ class TestTokenPolicyConservative:
         # Names-only: no parameter values leaked.
         assert "100" not in msg
         assert "200" not in msg
+        assert collector.to_metadata()["provider_parameter_adaptations"] == [
+            {
+                "name": "max_completion_tokens",
+                "action": "rejected",
+                "reason": "unsupported_param",
+            }
+        ]
 
     def test_conflicting_aliases_drop_retains_native_and_records(self) -> None:
         config = NvidiaNimConfig()
@@ -193,6 +225,7 @@ class TestTokenPolicyNativeMCT:
 
     def test_equal_aliases_deduplicate_to_native_field(self) -> None:
         config = self._config()
+        collector = AdaptationCollector()
         result = config.map_openai_params(
             non_default_params={
                 "max_tokens": 512,
@@ -201,12 +234,21 @@ class TestTokenPolicyNativeMCT:
             optional_params={},
             model="vendor/mct-model",
             drop_params=False,
+            adaptation_collector=collector,
         )
         # Equal aliases always deduplicate to provider-native field.
         assert result == {"max_tokens": 512}
+        assert collector.to_metadata()["provider_parameter_adaptations"] == [
+            {
+                "name": "max_completion_tokens",
+                "action": "renamed",
+                "reason": "provider_rename",
+            }
+        ]
 
     def test_conflicting_aliases_strict_raises(self) -> None:
         config = self._config()
+        collector = AdaptationCollector()
         with pytest.raises(UnsupportedParamsError) as exc_info:
             config.map_openai_params(
                 non_default_params={
@@ -216,12 +258,20 @@ class TestTokenPolicyNativeMCT:
                 optional_params={},
                 model="vendor/mct-model",
                 drop_params=False,
+                adaptation_collector=collector,
             )
         msg = str(exc_info.value.message)
         assert "max_tokens" in msg
         assert "max_completion_tokens" in msg
         assert "100" not in msg
         assert "200" not in msg
+        assert collector.to_metadata()["provider_parameter_adaptations"] == [
+            {
+                "name": "max_completion_tokens",
+                "action": "rejected",
+                "reason": "unsupported_param",
+            }
+        ]
 
     def test_conflicting_aliases_drop_retains_native_records(self) -> None:
         config = self._config()
@@ -723,3 +773,376 @@ def test_nvidia_minimax_cost_map_uses_openrouter_fallback_pricing_basis() -> Non
         assert entry["pricing_source"] == "https://openrouter.ai/minimax/minimax-m2.5"
         assert entry["input_cost_per_token"] == 1.5e-07
         assert entry["output_cost_per_token"] == 1.15e-06
+
+
+# ---------------------------------------------------------------------------
+# Production caller path: get_optional_params (utils.py)
+# ---------------------------------------------------------------------------
+
+
+class TestProductionCallerPath:
+    """Exercise the real get_optional_params caller for nvidia_nim chat.
+
+    These tests verify that the production code path in utils.py:
+    - creates and passes an AdaptationCollector
+    - uses effective global drop_params (litellm.drop_params OR request drop_params)
+    - persists bounded value-free adaptation metadata via the contextvar
+    - never leaks adaptation metadata into the provider payload (optional_params)
+    """
+
+    def _call(
+        self,
+        *,
+        model="meta/llama3-8b-instruct",
+        call_type=CallTypes.completion.value,
+        max_tokens=None,
+        max_completion_tokens=None,
+        drop_params=None,
+        metadata=None,
+    ):
+        """Invoke get_optional_params for nvidia_nim chat with contextvar set."""
+        from litellm.utils import (
+            _reset_provider_parameter_adaptation_request_context,
+            _set_provider_parameter_adaptation_request_context,
+            get_optional_params,
+        )
+
+        meta = metadata if metadata is not None else {}
+        request_kwargs = {
+            "custom_llm_provider": "nvidia_nim",
+            "metadata": meta,
+        }
+        token = _set_provider_parameter_adaptation_request_context(
+            call_type=call_type,
+            model=model,
+            kwargs=request_kwargs,
+            logging_obj=None,
+        )
+        try:
+            result = get_optional_params(
+                model=model,
+                custom_llm_provider="nvidia_nim",
+                max_tokens=max_tokens,
+                max_completion_tokens=max_completion_tokens,
+                drop_params=drop_params,
+            )
+        finally:
+            _reset_provider_parameter_adaptation_request_context(token)
+        return result, meta
+
+    @pytest.mark.parametrize(
+        "call_type",
+        (CallTypes.completion.value, CallTypes.acompletion.value),
+    )
+    def test_rename_max_completion_tokens_to_max_tokens(self, call_type: str) -> None:
+        """Conservative rename persists one record for both chat call types."""
+        result, meta = self._call(
+            call_type=call_type,
+            max_completion_tokens=1024,
+        )
+        assert result["max_tokens"] == 1024
+        assert "max_completion_tokens" not in result
+        assert "provider_parameter_adaptations" not in result
+        assert "provider_parameter_adaptations_truncated_count" not in result
+        assert meta["provider_parameter_adaptations"] == [
+            {
+                "name": "max_completion_tokens",
+                "action": "renamed",
+                "reason": "provider_rename",
+            }
+        ]
+        assert meta["provider_parameter_adaptations_truncated_count"] == 0
+
+    @pytest.mark.parametrize(
+        "call_type",
+        (CallTypes.completion.value, CallTypes.acompletion.value),
+    )
+    def test_equal_value_dedup(self, call_type: str) -> None:
+        """Equal aliases deduplicate and persist one record for both call types."""
+        result, meta = self._call(
+            call_type=call_type,
+            max_tokens=512,
+            max_completion_tokens=512,
+        )
+        assert result["max_tokens"] == 512
+        assert "max_completion_tokens" not in result
+        assert "provider_parameter_adaptations" not in result
+        assert "provider_parameter_adaptations_truncated_count" not in result
+        assert meta["provider_parameter_adaptations"] == [
+            {
+                "name": "max_completion_tokens",
+                "action": "renamed",
+                "reason": "provider_rename",
+            }
+        ]
+        assert meta["provider_parameter_adaptations_truncated_count"] == 0
+
+    def test_native_alias_only_has_no_adaptation(self, monkeypatch) -> None:
+        """Native metadata keeps max_completion_tokens without a rename record."""
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "nvidia_nim/vendor/synth-true",
+            _synthetic_mct_entry(supported=True),
+        )
+        result, meta = self._call(
+            model="vendor/synth-true",
+            max_completion_tokens=7777,
+        )
+        assert result["max_completion_tokens"] == 7777
+        assert "max_tokens" not in result
+        assert "provider_parameter_adaptations" not in meta
+
+    def test_strict_differing_conflict_raises(self) -> None:
+        """Differing aliases with drop_params=False raises names-only error."""
+        from litellm.exceptions import UnsupportedParamsError
+
+        with pytest.raises(UnsupportedParamsError) as exc_info:
+            self._call(max_tokens=100, max_completion_tokens=200, drop_params=False)
+        msg = str(exc_info.value.message)
+        assert "max_tokens" in msg
+        assert "max_completion_tokens" in msg
+        assert "100" not in msg
+        assert "200" not in msg
+
+    def test_request_level_permissive_conflict(self) -> None:
+        """Request-level drop_params=True resolves conflict and persists record."""
+        result, meta = self._call(
+            max_tokens=100, max_completion_tokens=200, drop_params=True
+        )
+        assert result["max_tokens"] == 100
+        assert "max_completion_tokens" not in result
+        records = meta["provider_parameter_adaptations"]
+        assert len(records) == 1
+        assert records[0] == {
+            "name": "max_completion_tokens",
+            "action": "dropped",
+            "reason": "unsupported_param",
+        }
+        assert meta["provider_parameter_adaptations_truncated_count"] == 0
+
+    def test_global_permissive_conflict(self, monkeypatch) -> None:
+        """Global litellm.drop_params=True resolves conflict without request flag."""
+        monkeypatch.setattr(litellm, "drop_params", True)
+        result, meta = self._call(max_tokens=300, max_completion_tokens=400)
+        assert result["max_tokens"] == 300
+        assert "max_completion_tokens" not in result
+        records = meta["provider_parameter_adaptations"]
+        assert len(records) == 1
+        assert records[0]["name"] == "max_completion_tokens"
+        assert records[0]["action"] == "dropped"
+
+    def test_metadata_never_in_provider_payload(self) -> None:
+        """Adaptation metadata keys must not appear in optional_params."""
+        result, _ = self._call(
+            max_tokens=100, max_completion_tokens=200, drop_params=True
+        )
+        assert "provider_parameter_adaptations" not in result
+        assert "provider_parameter_adaptations_truncated_count" not in result
+
+    def test_metadata_is_value_free(self) -> None:
+        """Persisted records contain names/actions/reasons only, no values."""
+        _, meta = self._call(
+            max_tokens=100, max_completion_tokens=200, drop_params=True
+        )
+        records = meta["provider_parameter_adaptations"]
+        for rec in records:
+            assert set(rec.keys()) == {"name", "action", "reason"}
+            # No numeric values anywhere in the record.
+            for v in rec.values():
+                assert isinstance(v, str)
+
+    def test_no_contextvar_no_crash(self) -> None:
+        """Without contextvar set, caller still works (no persistence target)."""
+        from litellm.utils import get_optional_params
+
+        result = get_optional_params(
+            model="meta/llama3-8b-instruct",
+            custom_llm_provider="nvidia_nim",
+            max_completion_tokens=256,
+        )
+        assert result["max_tokens"] == 256
+        assert "max_completion_tokens" not in result
+
+    def test_global_drop_params_false_request_true(self, monkeypatch) -> None:
+        """Request-level drop_params=True overrides global False."""
+        monkeypatch.setattr(litellm, "drop_params", False)
+        result, meta = self._call(
+            max_tokens=10, max_completion_tokens=20, drop_params=True
+        )
+        assert result["max_tokens"] == 10
+        assert "max_completion_tokens" not in result
+        assert len(meta["provider_parameter_adaptations"]) == 1
+
+    def test_global_drop_params_true_request_none(self, monkeypatch) -> None:
+        """Global True with no request-level flag still activates permissive."""
+        monkeypatch.setattr(litellm, "drop_params", True)
+        result, meta = self._call(max_tokens=10, max_completion_tokens=20)
+        assert result["max_tokens"] == 10
+        assert "max_completion_tokens" not in result
+        assert len(meta["provider_parameter_adaptations"]) == 1
+
+
+class TestStrictConflictWrapperPersistence:
+    """Verify strict rejection metadata through real completion wrappers."""
+
+    MODEL = "nvidia_nim/meta/llama3-8b-instruct"
+    MESSAGES = [{"role": "user", "content": "wrapper-secret-message"}]
+    MAX_TOKENS = 135791
+    MAX_COMPLETION_TOKENS = 246802
+    PROVIDER_SECRET = "wrapper-provider-secret"
+    EXPECTED_RECORDS = [
+        {
+            "name": "max_completion_tokens",
+            "action": "rejected",
+            "reason": "unsupported_param",
+        }
+    ]
+
+    @classmethod
+    def _logging_obj(cls, metadata: dict, call_type: str) -> Logging:
+        logging_obj = Logging(
+            model=cls.MODEL,
+            messages=cls.MESSAGES,
+            stream=False,
+            call_type=call_type,
+            start_time=datetime.now(),
+            litellm_call_id=f"d1-556-{call_type}",
+            function_id="",
+            kwargs={"metadata": metadata},
+        )
+        logging_obj.success_handler = MagicMock()  # type: ignore[method-assign]
+        logging_obj.failure_handler = MagicMock()  # type: ignore[method-assign]
+        logging_obj.async_failure_handler = AsyncMock()  # type: ignore[method-assign]
+        logging_obj.handle_sync_success_callbacks_for_async_calls = MagicMock()  # type: ignore[method-assign]
+        return logging_obj
+
+    @classmethod
+    def _metadata(cls, request_id: str) -> dict:
+        return {
+            "source": "caller",
+            "request_id": request_id,
+            "provider_parameter_adaptations": [
+                {
+                    "name": "caller-spoof",
+                    "action": "dropped",
+                    "reason": "unsupported_param",
+                }
+            ],
+            "provider_parameter_adaptations_truncated_count": 999,
+        }
+
+    @classmethod
+    def _assert_rejection(
+        cls,
+        *,
+        metadata: dict,
+        logging_obj: Logging,
+        exc: UnsupportedParamsError,
+        request_id: str,
+    ) -> None:
+        logging_metadata = logging_obj.model_call_details["litellm_params"]["metadata"]
+        for target in (metadata, logging_metadata):
+            assert target["source"] == "caller"
+            assert target["request_id"] == request_id
+            assert target["provider_parameter_adaptations"] == cls.EXPECTED_RECORDS
+            assert target["provider_parameter_adaptations_truncated_count"] == 0
+
+        error_text = str(exc.message)
+        adaptation_text = json.dumps(cls.EXPECTED_RECORDS)
+        for forbidden in (
+            str(cls.MAX_TOKENS),
+            str(cls.MAX_COMPLETION_TOKENS),
+            cls.PROVIDER_SECRET,
+            cls.MESSAGES[0]["content"],
+            "caller-spoof",
+        ):
+            assert forbidden not in error_text
+            assert forbidden not in adaptation_text
+
+        assert "max_tokens" in error_text
+        assert "max_completion_tokens" in error_text
+
+    def test_completion_strict_conflict_persists_rejection(self, monkeypatch) -> None:
+        monkeypatch.setattr(litellm, "num_retries", 0)
+        metadata = self._metadata("sync")
+        logging_obj = self._logging_obj(metadata, CallTypes.completion.value)
+        provider_request = MagicMock()
+
+        with (
+            patch.object(
+                OpenAIChatCompletion,
+                "make_sync_openai_chat_completion_request",
+                new=provider_request,
+            ),
+            pytest.raises(UnsupportedParamsError) as exc_info,
+        ):
+            litellm.completion(
+                model=self.MODEL,
+                messages=self.MESSAGES,
+                metadata=metadata,
+                litellm_logging_obj=logging_obj,
+                client=MagicMock(),
+                api_key=self.PROVIDER_SECRET,
+                num_retries=0,
+                max_tokens=self.MAX_TOKENS,
+                max_completion_tokens=self.MAX_COMPLETION_TOKENS,
+            )
+
+        provider_request.assert_not_called()
+        self._assert_rejection(
+            metadata=metadata,
+            logging_obj=logging_obj,
+            exc=exc_info.value,
+            request_id="sync",
+        )
+
+    @pytest.mark.asyncio
+    async def test_acompletion_strict_conflict_persists_rejection(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(litellm, "num_retries", 0)
+        metadata = self._metadata("async")
+        logging_obj = self._logging_obj(metadata, CallTypes.acompletion.value)
+        provider_request = AsyncMock()
+        executor_loop = MagicMock()
+
+        async def run_in_executor(_executor, func):
+            return func()
+
+        executor_loop.run_in_executor.side_effect = run_in_executor
+
+        with (
+            patch.object(
+                OpenAIChatCompletion,
+                "make_openai_chat_completion_request",
+                new=provider_request,
+            ),
+            patch(
+                "litellm.utils._client_async_logging_helper",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "litellm.main.asyncio.get_event_loop",
+                return_value=executor_loop,
+            ),
+            pytest.raises(UnsupportedParamsError) as exc_info,
+        ):
+            await litellm.acompletion(
+                model=self.MODEL,
+                messages=self.MESSAGES,
+                metadata=metadata,
+                litellm_logging_obj=logging_obj,
+                client=MagicMock(),
+                api_key=self.PROVIDER_SECRET,
+                num_retries=0,
+                max_tokens=self.MAX_TOKENS,
+                max_completion_tokens=self.MAX_COMPLETION_TOKENS,
+            )
+
+        provider_request.assert_not_awaited()
+        self._assert_rejection(
+            metadata=metadata,
+            logging_obj=logging_obj,
+            exc=exc_info.value,
+            request_id="async",
+        )

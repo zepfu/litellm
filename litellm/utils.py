@@ -2176,7 +2176,12 @@ def _is_provider_parameter_adaptation_request(
     model: Optional[str],
     kwargs: Dict[str, Any],
 ) -> bool:
-    if call_type not in (CallTypes.embedding.value, CallTypes.aembedding.value):
+    if call_type not in (
+        CallTypes.embedding.value,
+        CallTypes.aembedding.value,
+        CallTypes.completion.value,
+        CallTypes.acompletion.value,
+    ):
         return False
     return kwargs.get("custom_llm_provider") == "nvidia_nim" or (
         isinstance(model, str) and model.startswith("nvidia_nim/")
@@ -4688,16 +4693,20 @@ def get_optional_params(  # noqa: PLR0915
             ),
         )
     elif custom_llm_provider == "nvidia_nim":
-        optional_params = litellm.NvidiaNimConfig().map_openai_params(
-            model=model,
-            non_default_params=non_default_params,
-            optional_params=optional_params,
-            drop_params=(
-                drop_params
-                if drop_params is not None and isinstance(drop_params, bool)
-                else False
-            ),
-        )
+        effective_drop_params = litellm.drop_params is True or drop_params is True
+        adaptation_collector = AdaptationCollector()
+        try:
+            optional_params = litellm.NvidiaNimConfig().map_openai_params(
+                model=model,
+                non_default_params=non_default_params,
+                optional_params=optional_params,
+                drop_params=effective_drop_params,
+                adaptation_collector=adaptation_collector,
+            )
+        except UnsupportedParamsError:
+            _persist_provider_parameter_adaptations(adaptation_collector)
+            raise
+        _persist_provider_parameter_adaptations(adaptation_collector)
     elif custom_llm_provider == "cerebras":
         optional_params = litellm.CerebrasConfig().map_openai_params(
             non_default_params=non_default_params,
