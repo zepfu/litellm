@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+from pathlib import Path
 
 import httpx
 import litellm
@@ -758,3 +760,85 @@ class TestOpenRouterValidateEnvironment:
                 optional_params={},
                 litellm_params={},
             )
+
+
+class TestOpenRouterUnknownModelBehavior:
+    """Uncataloged/unknown model behavior for chat transformations."""
+
+    unknown_model = "openrouter/google/gemini-2.5-flash-image"
+
+    @pytest.fixture(autouse=True)
+    def ensure_model_is_uncataloged(self, monkeypatch):
+        metadata_path = (
+            Path(__file__).resolve().parents[5]
+            / "model_prices_and_context_window.json"
+        )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert self.unknown_model not in metadata
+        monkeypatch.delitem(litellm.model_cost, self.unknown_model, raising=False)
+        get_model_info.cache_clear()
+
+    def test_unknown_model_transforms_models_route_passthrough(self):
+        """transforms/models/route are OpenRouter-level params that pass through
+        regardless of whether the model is cataloged."""
+        config = OpenrouterConfig()
+        non_default_params = {
+            "transforms": ["middleware:anthropic/cache"],
+            "models": ["openrouter/auto"],
+            "route": "lowest-latency",
+            "temperature": 0.7,
+        }
+        result = config.map_openai_params(
+            non_default_params=non_default_params,
+            optional_params={},
+            model=self.unknown_model,
+            drop_params=False,
+        )
+
+        assert result["extra_body"]["transforms"] == ["middleware:anthropic/cache"]
+        assert result["extra_body"]["models"] == ["openrouter/auto"]
+        assert result["extra_body"]["route"] == "lowest-latency"
+        # Standard param still mapped
+        assert result["temperature"] == 0.7
+
+    def test_unknown_model_reasoning_effort_metadata_gated(self):
+        """reasoning_effort is only available when cost-map metadata declares
+        reasoning support; unknown models do not gain it."""
+        config = OpenrouterConfig()
+        supported = config.get_supported_openai_params(
+            model=self.unknown_model
+        )
+        assert "reasoning_effort" not in supported
+        assert "thinking" not in supported
+
+    def test_unknown_model_cache_control_vendor_family_fallback(self):
+        """Uncataloged models in known vendor families keep cache_control;
+        those outside known families strip it."""
+        config = OpenrouterConfig()
+        messages = [
+            {
+                "role": "user",
+                "content": "Hello",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+        # Upstream-only model in a known cache-control family (gemini) keeps it
+        kept = config.transform_request(
+            model=self.unknown_model,
+            messages=[dict(m) for m in messages],
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+        assert kept["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+        # Unknown model outside known families strips it
+        stripped = config.transform_request(
+            model="openrouter/acme/uncataloged-model",
+            messages=[dict(m) for m in messages],
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+        assert stripped["messages"][0].get("cache_control") is None

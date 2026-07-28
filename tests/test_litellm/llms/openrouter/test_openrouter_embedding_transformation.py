@@ -1,6 +1,8 @@
 """
 Unit tests for OpenRouter embedding transformation logic.
 """
+import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -169,3 +171,63 @@ def test_openrouter_embedding_map_params():
     assert result["timeout"] == 30
     # Unsupported params should not be included
     assert "unsupported" not in result
+
+
+class TestOpenRouterEmbeddingUnknownModel:
+    """Uncataloged/unknown model behavior for embedding transformations."""
+
+    metadata_key = "openrouter/google/gemini-2.5-flash-image"
+    unknown_model = "google/gemini-2.5-flash-image"
+
+    @pytest.fixture(autouse=True)
+    def ensure_model_is_uncataloged(self, monkeypatch):
+        metadata_path = (
+            Path(__file__).resolve().parents[4]
+            / "model_prices_and_context_window.json"
+        )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        assert self.metadata_key not in metadata
+        monkeypatch.delitem(litellm.model_cost, self.metadata_key, raising=False)
+
+    def test_unknown_model_routing_preserved(self):
+        """transform_embedding_request preserves arbitrary model IDs after
+        stripping only the openrouter/ provider prefix."""
+        config = OpenrouterEmbeddingConfig()
+
+        result = config.transform_embedding_request(
+            model=self.metadata_key,
+            input="test",
+            optional_params={},
+            headers={},
+        )
+        assert result["model"] == self.unknown_model
+        assert result["input"] == ["test"]
+
+        # Without prefix, model passes through unchanged
+        result2 = config.transform_embedding_request(
+            model=self.unknown_model,
+            input=["a", "b"],
+            optional_params={},
+            headers={},
+        )
+        assert result2["model"] == self.unknown_model
+
+    def test_unknown_model_supported_params_fixed(self):
+        """Supported params are a fixed list regardless of model; unsupported
+        arbitrary params are always omitted."""
+        config = OpenrouterEmbeddingConfig()
+
+        # Supported params pass through for any model
+        result = config.map_openai_params(
+            non_default_params={
+                "dimensions": 256,
+                "encoding_format": "float",
+                "arbitrary_unsupported": "value",
+            },
+            optional_params={},
+            model=self.unknown_model,
+            drop_params=False,
+        )
+        assert result["dimensions"] == 256
+        assert result["encoding_format"] == "float"
+        assert "arbitrary_unsupported" not in result

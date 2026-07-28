@@ -305,6 +305,11 @@ print(response)
 
 <TabItem value="openrouter" label="OpenRouter">
 
+The OpenRouter adapter maps `size` to `image_config.aspect_ratio` and `quality`
+to `image_config.image_size`. The selected upstream model must support the
+mapped values. Compatibility with `2K` and `4K` is model-specific. Gemini 2.5
+Flash Image is fixed at `1K`, so the example below uses `standard` (`1K`).
+
 #### Basic Image Edit
 ```python showLineNumbers title="OpenRouter Image Edit"
 import os
@@ -336,7 +341,7 @@ response = image_edit(
     ],
     prompt="Blend the reference style into the scene",
     size="1536x1024",   # mapped to aspect_ratio 3:2
-    quality="high",      # mapped to image_size 4K
+    quality="standard",  # mapped to image_size 1K
 )
 
 print(response)
