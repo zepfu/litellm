@@ -76,6 +76,32 @@ for chunk in response:
     print(chunk)
 ```
 
+### Chat token-limit adaptation
+
+NVIDIA NIM chat requests use model metadata to resolve the OpenAI token-limit
+aliases `max_tokens` and `max_completion_tokens`:
+
+- Missing or `false` `supports_max_completion_tokens` metadata uses the
+  conservative provider-native `max_tokens` field. An
+  `max_completion_tokens` request is adapted to `max_tokens`.
+- Typed `true` metadata preserves the native `max_completion_tokens` alias
+  where the model supports it.
+- If both aliases are supplied with equal values, LiteLLM deduplicates them
+  deterministically to the provider-native `max_tokens` field.
+- If both aliases differ, strict mode rejects the request. Request-level
+  `drop_params=True` or global `litellm.drop_params = True` enables drop mode:
+  the differing alias is dropped and the provider-native `max_tokens` value is
+  used.
+
+Every token-limit rename or drop is recorded as bounded, flat,
+value-free provider metadata under `provider_parameter_adaptations`, with
+overflow reported by
+`provider_parameter_adaptations_truncated_count`. These records contain no
+request values or secrets and are never included in the NVIDIA provider
+request body. Current NVIDIA catalog entries conservatively do not set
+`supports_max_completion_tokens` to `true`; native-alias behavior should not
+be inferred for an unlisted model.
+
 
 ## Usage - embedding
 
