@@ -1277,6 +1277,21 @@ def test_grok_client_version_invalid_explicit_override_rejected() -> None:
         request_prep._get_grok_native_oauth_client_version()
 
 
+def test_grok_client_version_empty_explicit_override_rejected() -> None:
+    calls: list[str] = []
+
+    def secrets(name: str) -> Optional[str]:
+        calls.append(name)
+        return "" if name == "LITELLM_XAI_GROK_CLIENT_VERSION" else "1.2.3"
+
+    _configure(get_secret_str=secrets)
+
+    with pytest.raises(Exception, match="version"):
+        request_prep._get_grok_native_oauth_client_version()
+
+    assert calls == ["LITELLM_XAI_GROK_CLIENT_VERSION"]
+
+
 def test_grok_client_version_invalid_legacy_override_rejected() -> None:
     def secrets(name: str) -> Optional[str]:
         if name == "LITELLM_XAI_GROK_CLIENT_VERSION":
@@ -1286,6 +1301,37 @@ def test_grok_client_version_invalid_legacy_override_rejected() -> None:
         return None
 
     _configure(get_secret_str=secrets)
+
+    with pytest.raises(Exception, match="version"):
+        request_prep._get_grok_native_oauth_client_version()
+
+
+def test_grok_client_version_empty_legacy_override_rejected() -> None:
+    def secrets(name: str) -> Optional[str]:
+        if name == "LITELLM_XAI_GROK_CLIENT_VERSION":
+            return None
+        if name == "GROK_CLIENT_VERSION":
+            return ""
+        return None
+
+    _configure(get_secret_str=secrets)
+
+    with pytest.raises(Exception, match="version"):
+        request_prep._get_grok_native_oauth_client_version()
+
+
+@pytest.mark.parametrize(
+    "invalid_version",
+    ["1", " 1.2", "1.2 ", "+1.2", "1_0.2", "١.٢", "１.２"],
+)
+def test_grok_client_version_override_requires_strict_ascii_dotted_version(
+    invalid_version: str,
+) -> None:
+    _configure(
+        get_secret_str=lambda name: invalid_version
+        if name == "LITELLM_XAI_GROK_CLIENT_VERSION"
+        else None
+    )
 
     with pytest.raises(Exception, match="version"):
         request_prep._get_grok_native_oauth_client_version()

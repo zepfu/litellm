@@ -13148,7 +13148,10 @@ async def test_prepare_grok_native_oauth_passthrough_request_sanitizes_function_
         ],
     }
 
-    with patch(
+    with patch.dict(
+        os.environ,
+        {"LITELLM_XAI_GROK_CLIENT_VERSION": "0.1.211"},
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
         new=AsyncMock(return_value="grok-oidc-token"),
     ):
@@ -13202,7 +13205,10 @@ async def test_prepare_grok_4_5_continuation_rewrites_model_input_tool_items():
         ],
     }
 
-    with patch(
+    with patch.dict(
+        os.environ,
+        {"LITELLM_XAI_GROK_CLIENT_VERSION": "0.1.211"},
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token",
         new=AsyncMock(return_value="grok-oidc-token"),
     ):

@@ -2,7 +2,7 @@
 
 Pure-stdlib module (no LiteLLM imports) that validates a JSON cache
 file written by the installed Grok CLI.  The file is re-read on every
- call so atomic replacement is restart-free.
+call so atomic replacement is restart-free.
 
 Cache file schema (schema_version 1)::
 
@@ -24,12 +24,14 @@ Environment configuration
 
 ``AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS``
     Override the default maximum record age in seconds
-    (default ``172800`` = 48 hours).  Must be a positive integer.
+    (default ``172800`` = 48 hours). Must be a canonical positive
+    ASCII decimal.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import os
 import re
@@ -53,7 +55,6 @@ GROK_VERSION_DEFAULT_CACHE_PATH = "/run/aawm/grok/native-client-version.json"
 GROK_VERSION_DEFAULT_MAX_AGE_SECONDS = 172_800  # 48 hours
 GROK_VERSION_SCHEMA_VERSION = 1
 GROK_VERSION_MAX_BYTES = 65_536  # 64 KiB
-GROK_VERSION_FUTURE_SKEW_SECONDS = 300  # 5 min
 
 _REQUIRED_FIELDS = frozenset(
     {
@@ -69,22 +70,24 @@ _REQUIRED_FIELDS = frozenset(
 _EXPECTED_CLIENT = "grok-cli"
 _EXPECTED_SOURCE = "installed-grok-cli"
 
-# Strict dotted-numeric version: segments of digits separated by dots.
-_VERSION_RE = re.compile(r"\A\d+(\.\d+)*\Z")
+# Strict dotted-numeric version with at least two ASCII-numeric segments.
+_VERSION_RE = re.compile(r"\A[0-9]+(?:\.[0-9]+)+\Z")
+_POSITIVE_ASCII_DECIMAL_RE = re.compile(r"\A[1-9][0-9]*\Z")
 # Strict lowercase hex build hash.
 _BUILD_RE = re.compile(r"\A[0-9a-f]+\Z")
 # Safe channel token: alphanumeric, hyphens, underscores, dots.
 _CHANNEL_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 # RFC 3339 UTC timestamp ending in Z.
 _RFC3339_Z_RE = re.compile(
-    r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\Z"
+    r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z\Z"
 )
 
 
 class GrokNativeVersionError(Exception):
     """Raised when the version cache is missing, stale, or malformed.
 
-    Messages never contain file contents or secrets.
+    Messages never contain file contents, configured paths, or secrets.
     """
 
 
@@ -120,38 +123,45 @@ class GrokNativeVersionMetadata:
 
 
 def _resolve_cache_path(explicit_path: Optional[str] = None) -> str:
-    if explicit_path:
-        return explicit_path
-    return os.environ.get(
-        GROK_VERSION_CACHE_PATH_ENV,
-        GROK_VERSION_DEFAULT_CACHE_PATH,
+    path = (
+        explicit_path
+        if explicit_path is not None
+        else os.environ.get(
+            GROK_VERSION_CACHE_PATH_ENV,
+            GROK_VERSION_DEFAULT_CACHE_PATH,
+        )
     )
+    if not isinstance(path, str) or not os.path.isabs(path):
+        raise GrokNativeVersionError(
+            "invalid version cache path: must be absolute"
+        )
+    return path
 
 
 def _resolve_max_age() -> int:
     raw = os.environ.get(GROK_VERSION_CACHE_MAX_AGE_ENV)
     if raw is None:
         return GROK_VERSION_DEFAULT_MAX_AGE_SECONDS
+    if _POSITIVE_ASCII_DECIMAL_RE.fullmatch(raw) is None:
+        raise GrokNativeVersionError(
+            f"invalid {GROK_VERSION_CACHE_MAX_AGE_ENV}: "
+            "must be a canonical positive ASCII decimal"
+        )
     try:
-        value = int(raw)
-    except (ValueError, TypeError):
+        return int(raw)
+    except (ValueError, OverflowError):
         raise GrokNativeVersionError(
             f"invalid {GROK_VERSION_CACHE_MAX_AGE_ENV}: "
-            "must be a positive integer"
+            "must be a canonical positive ASCII decimal"
         )
-    if value <= 0:
-        raise GrokNativeVersionError(
-            f"invalid {GROK_VERSION_CACHE_MAX_AGE_ENV}: "
-            "must be a positive integer"
-        )
-    return value
 
 
 def _validate_version_string(version: str) -> None:
     """Validate a strict dotted-numeric version string."""
     if not isinstance(version, str) or not _VERSION_RE.match(version):
         raise GrokNativeVersionError(
-            "invalid version: must be a strict dotted numeric string"
+            "invalid version: must contain at least two ASCII-numeric "
+            "segments separated by dots"
         )
 
 
@@ -163,13 +173,102 @@ def _parse_observed_at(value: str) -> float:
         )
     try:
         # Python 3.7+ fromisoformat does not handle Z suffix.
-        normalized = value.replace("Z", "+00:00")
+        normalized = f"{value[:-1]}+00:00"
         dt = datetime.fromisoformat(normalized)
         return dt.timestamp()
     except (ValueError, OverflowError):
         raise GrokNativeVersionError(
             "invalid observed_at: unparseable timestamp"
         )
+
+
+def _open_cache_file(path: str) -> int:
+    """Open the configured path once without following a final symlink."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise GrokNativeVersionError(
+            "secure version cache open is unsupported on this platform"
+        )
+
+    flags = os.O_RDONLY | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if cloexec is not None:
+        flags |= cloexec
+
+    try:
+        return os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            message = "version cache file is missing"
+        elif exc.errno in (errno.ELOOP, errno.EMLINK):
+            message = "version cache file is a symlink or unsafe path"
+        else:
+            message = "version cache file is unreadable"
+        raise GrokNativeVersionError(message) from None
+    except (TypeError, ValueError, UnicodeError):
+        raise GrokNativeVersionError(
+            "version cache file is unreadable"
+        ) from None
+
+
+def _read_cache_bytes(file_descriptor: int) -> bytes:
+    """Read at most one byte beyond the allowed size from the open fd."""
+    chunks: list[bytes] = []
+    bytes_read = 0
+    while bytes_read <= GROK_VERSION_MAX_BYTES:
+        try:
+            chunk = os.read(
+                file_descriptor,
+                min(8192, GROK_VERSION_MAX_BYTES + 1 - bytes_read),
+            )
+        except OSError:
+            raise GrokNativeVersionError(
+                "version cache file could not be read"
+            ) from None
+        if not chunk:
+            break
+        chunks.append(chunk)
+        bytes_read += len(chunk)
+
+    if bytes_read > GROK_VERSION_MAX_BYTES:
+        raise GrokNativeVersionError(
+            f"version cache file exceeds {GROK_VERSION_MAX_BYTES} bytes"
+        )
+    return b"".join(chunks)
+
+
+def _read_cache_text(path: str) -> str:
+    """Securely open, validate, and decode the configured cache file."""
+    file_descriptor = _open_cache_file(path)
+    try:
+        try:
+            file_status = os.fstat(file_descriptor)
+        except OSError:
+            raise GrokNativeVersionError(
+                "version cache file metadata is unreadable"
+            ) from None
+
+        if not stat.S_ISREG(file_status.st_mode):
+            raise GrokNativeVersionError(
+                "version cache path is not a regular file"
+            )
+        if file_status.st_size > GROK_VERSION_MAX_BYTES:
+            raise GrokNativeVersionError(
+                f"version cache file exceeds {GROK_VERSION_MAX_BYTES} bytes"
+            )
+        raw_bytes = _read_cache_bytes(file_descriptor)
+    finally:
+        try:
+            os.close(file_descriptor)
+        except OSError:
+            pass
+
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise GrokNativeVersionError(
+            "version cache file is not valid UTF-8"
+        ) from None
 
 
 
@@ -247,43 +346,7 @@ def resolve_grok_native_version(
     max_age = _resolve_max_age()
     current_time = now if now is not None else time.time()
 
-    # --- File-level checks ---
-    if not os.path.exists(path):
-        raise GrokNativeVersionError(
-            f"version cache file missing: {path}"
-        )
-
-    # Reject symlinks (security: prevent symlink attacks).
-    if os.path.islink(path):
-        raise GrokNativeVersionError(
-            f"version cache file is a symlink: {path}"
-        )
-
-    try:
-        st = os.stat(path)
-    except OSError:
-        raise GrokNativeVersionError(
-            f"version cache file unreadable: {path}"
-        )
-
-    if not stat.S_ISREG(st.st_mode):
-        raise GrokNativeVersionError(
-            f"version cache path is not a regular file: {path}"
-        )
-
-    if st.st_size > GROK_VERSION_MAX_BYTES:
-        raise GrokNativeVersionError(
-            f"version cache file exceeds {GROK_VERSION_MAX_BYTES} bytes"
-        )
-
-    # --- Read and parse ---
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            raw = fh.read()
-    except OSError:
-        raise GrokNativeVersionError(
-            f"version cache file unreadable: {path}"
-        )
+    raw = _read_cache_text(path)
 
     try:
         data = json.loads(raw)
@@ -319,9 +382,9 @@ def resolve_grok_native_version(
 
     # --- Time validation ---
     age = current_time - observed_epoch
-    if age < -GROK_VERSION_FUTURE_SKEW_SECONDS:
+    if observed_epoch > current_time:
         raise GrokNativeVersionError(
-            "version cache observed_at is too far in the future"
+            "version cache observed_at is in the future"
         )
 
     if age > max_age:

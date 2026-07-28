@@ -547,13 +547,13 @@ def _get_grok_native_oauth_client_version() -> str:
 
     # 1. Explicit override (emergency path, still validated).
     explicit = runtime.get_secret_str("LITELLM_XAI_GROK_CLIENT_VERSION")
-    if explicit:
+    if explicit is not None:
         _validate_version_string(explicit)
         return explicit
 
     # 2. Legacy override.
     legacy = runtime.get_secret_str("GROK_CLIENT_VERSION")
-    if legacy:
+    if legacy is not None:
         _validate_version_string(legacy)
         return legacy
 

@@ -8,12 +8,15 @@ from pathlib import Path
 
 import pytest
 
+from litellm.secret_managers import (
+    grok_native_version_contract as version_contract,
+)
 from litellm.secret_managers.grok_native_version_contract import (
     GROK_VERSION_CACHE_MAX_AGE_ENV,
     GROK_VERSION_CACHE_PATH_ENV,
     GROK_VERSION_DEFAULT_CACHE_PATH,
     GROK_VERSION_DEFAULT_MAX_AGE_SECONDS,
-    GROK_VERSION_FUTURE_SKEW_SECONDS,
+    GROK_VERSION_MAX_BYTES,
     GROK_VERSION_SCHEMA_VERSION,
     GrokNativeVersionError,
     GrokNativeVersionMetadata,
@@ -94,16 +97,6 @@ class TestValidResolution:
         )
         assert record.version == "1.2.3.4"
 
-    def test_single_segment_version_accepted(self, tmp_path: Path):
-        now = time.time()
-        payload = _make_payload(version="42", now=now)
-        path = _write(tmp_path, payload)
-        record, _ = resolve_grok_native_version(
-            cache_path=str(path), now=now
-        )
-        assert record.version == "42"
-
-
 # ---------------------------------------------------------------------------
 # Missing / symlink / non-regular / unreadable
 # ---------------------------------------------------------------------------
@@ -142,6 +135,79 @@ class TestFileLevelRejection:
         with pytest.raises(GrokNativeVersionError, match="unreadable"):
             resolve_grok_native_version(cache_path=str(path), now=now)
 
+    def test_open_descriptor_is_used_after_path_is_replaced_by_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        now = time.time()
+        path = _write(
+            tmp_path,
+            _make_payload(version="1.2.3", now=now),
+        )
+        replacement_target = _write(
+            tmp_path,
+            _make_payload(version="9.9.9", now=now),
+            name="replacement-target.json",
+        )
+        real_open = os.open
+        replaced = False
+
+        def open_then_replace(configured_path: str, flags: int) -> int:
+            nonlocal replaced
+            file_descriptor = real_open(configured_path, flags)
+            if not replaced:
+                replacement_link = tmp_path / "replacement-link"
+                os.symlink(replacement_target, replacement_link)
+                os.replace(replacement_link, path)
+                replaced = True
+            return file_descriptor
+
+        monkeypatch.setattr(version_contract.os, "open", open_then_replace)
+
+        record, _ = resolve_grok_native_version(
+            cache_path=str(path),
+            now=now,
+        )
+        assert record.version == "1.2.3"
+
+        with pytest.raises(GrokNativeVersionError, match="symlink"):
+            resolve_grok_native_version(cache_path=str(path), now=now)
+
+    def test_missing_o_nofollow_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        path = _write(tmp_path, _make_payload())
+        monkeypatch.delattr(version_contract.os, "O_NOFOLLOW")
+
+        with pytest.raises(GrokNativeVersionError, match="unsupported"):
+            resolve_grok_native_version(cache_path=str(path))
+
+    def test_bounded_read_rejects_growth_after_fstat(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        path = tmp_path / "cache.json"
+        path.write_bytes(b"x" * (GROK_VERSION_MAX_BYTES + 1))
+        real_fstat = os.fstat
+
+        def underreport_size(file_descriptor: int) -> os.stat_result:
+            values = list(real_fstat(file_descriptor))
+            values[6] = 0
+            return os.stat_result(values)
+
+        monkeypatch.setattr(
+            version_contract.os,
+            "fstat",
+            underreport_size,
+        )
+
+        with pytest.raises(GrokNativeVersionError, match="exceeds"):
+            resolve_grok_native_version(cache_path=str(path))
+
 
 # ---------------------------------------------------------------------------
 # Malformed JSON / structure
@@ -149,6 +215,40 @@ class TestFileLevelRejection:
 
 
 class TestMalformedRejection:
+    def test_invalid_utf8_rejected_without_leaking_contents_or_path(
+        self,
+        tmp_path: Path,
+    ):
+        secret = "secret-cache-target"
+        path = tmp_path / secret
+        path.write_bytes(b"\xffsuper-secret-file-content")
+
+        with pytest.raises(GrokNativeVersionError, match="UTF-8") as exc_info:
+            resolve_grok_native_version(cache_path=str(path))
+
+        error = str(exc_info.value)
+        assert secret not in error
+        assert "super-secret-file-content" not in error
+
+    def test_read_error_is_sanitized(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        path = _write(tmp_path, _make_payload())
+
+        def fail_read(_file_descriptor: int, _size: int) -> bytes:
+            raise OSError("sensitive-kernel-detail")
+
+        monkeypatch.setattr(version_contract.os, "read", fail_read)
+
+        with pytest.raises(GrokNativeVersionError, match="could not be read") as exc_info:
+            resolve_grok_native_version(cache_path=str(path))
+
+        error = str(exc_info.value)
+        assert str(path) not in error
+        assert "sensitive-kernel-detail" not in error
+
     def test_invalid_json_rejected(self, tmp_path: Path):
         path = tmp_path / "bad.json"
         path.write_text("{not json", encoding="utf-8")
@@ -230,7 +330,23 @@ class TestFieldValidation:
 
     @pytest.mark.parametrize(
         "bad_version",
-        ["", "abc", "1.2.3-beta", "1..2", ".1.2", "1.2.", "v1.2.3", "1 2"],
+        [
+            "",
+            "42",
+            "abc",
+            "1.2.3-beta",
+            "1..2",
+            ".1.2",
+            "1.2.",
+            "v1.2.3",
+            "1 2",
+            " 1.2",
+            "1.2 ",
+            "+1.2",
+            "1_0.2",
+            "١.٢",
+            "１.２",
+        ],
     )
     def test_invalid_version_rejected(
         self, tmp_path: Path, bad_version: str
@@ -300,19 +416,18 @@ class TestTimeValidation:
         with pytest.raises(GrokNativeVersionError, match="stale"):
             resolve_grok_native_version(cache_path=str(path), now=now)
 
-    def test_future_beyond_skew_rejected(self, tmp_path: Path):
-        now = time.time()
-        future = now + GROK_VERSION_FUTURE_SKEW_SECONDS + 60
+    def test_any_future_record_rejected(self, tmp_path: Path):
+        now = 1_800_000_000.0
+        future = now + 1
         payload = _make_payload(observed_at=_utc_z(future), now=now)
         path = _write(tmp_path, payload)
 
         with pytest.raises(GrokNativeVersionError, match="future"):
             resolve_grok_native_version(cache_path=str(path), now=now)
 
-    def test_future_within_skew_accepted(self, tmp_path: Path):
-        now = time.time()
-        slight_future = now + GROK_VERSION_FUTURE_SKEW_SECONDS - 10
-        payload = _make_payload(observed_at=_utc_z(slight_future), now=now)
+    def test_record_observed_exactly_now_is_accepted(self, tmp_path: Path):
+        now = 1_800_000_000.0
+        payload = _make_payload(observed_at=_utc_z(now), now=now)
         path = _write(tmp_path, payload)
 
         record, _ = resolve_grok_native_version(
@@ -337,7 +452,23 @@ class TestTimeValidation:
         with pytest.raises(GrokNativeVersionError, match="stale"):
             resolve_grok_native_version(cache_path=str(path), now=now)
 
-    @pytest.mark.parametrize("bad_val", ["0", "-1", "abc", ""])
+    @pytest.mark.parametrize(
+        "bad_val",
+        [
+            "",
+            "0",
+            "00",
+            "01",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "1_0",
+            "١",
+            "１",
+            "abc",
+        ],
+    )
     def test_invalid_max_age_env_rejected(
         self, tmp_path: Path, monkeypatch, bad_val: str
     ):
@@ -346,7 +477,7 @@ class TestTimeValidation:
         path = _write(tmp_path, payload)
         monkeypatch.setenv(GROK_VERSION_CACHE_MAX_AGE_ENV, bad_val)
 
-        with pytest.raises(GrokNativeVersionError, match="positive integer"):
+        with pytest.raises(GrokNativeVersionError, match="ASCII decimal"):
             resolve_grok_native_version(cache_path=str(path), now=now)
 
 
@@ -356,6 +487,25 @@ class TestTimeValidation:
 
 
 class TestEnvPathConfig:
+    @pytest.mark.parametrize("configured_path", ["cache.json", "./cache.json", ""])
+    def test_relative_or_empty_explicit_path_rejected(
+        self,
+        configured_path: str,
+    ):
+        with pytest.raises(GrokNativeVersionError, match="absolute"):
+            resolve_grok_native_version(cache_path=configured_path)
+
+    @pytest.mark.parametrize("configured_path", ["cache.json", ""])
+    def test_relative_or_empty_env_path_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        configured_path: str,
+    ):
+        monkeypatch.setenv(GROK_VERSION_CACHE_PATH_ENV, configured_path)
+
+        with pytest.raises(GrokNativeVersionError, match="absolute"):
+            resolve_grok_native_version()
+
     def test_env_path_used(self, tmp_path: Path, monkeypatch):
         now = time.time()
         payload = _make_payload(now=now)
