@@ -25,6 +25,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     error_signals,
     selection,
 )
+from litellm.proxy.pass_through_endpoints.providers.openrouter import (
+    runtime as openrouter_runtime,
+)
 
 GOD_PATH = Path(lpe.__file__).resolve()
 PACKAGE_PATH = GOD_PATH.parent / "aawm_alias_routing"
@@ -65,6 +68,17 @@ FROZEN_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_iter_codex_auto_agent_error_blocks",
         "_extract_codex_auto_agent_error_type_and_code",
         "_get_codex_auto_agent_source_error_summary",
+        "_extract_adapter_exception_detail",
+        "_extract_adapter_error_payloads",
+        "_extract_adapter_exception_status_code",
+        "_extract_openrouter_adapter_raw_message",
+        "_is_openrouter_adapter_provider_raw_error",
+        "_extract_adapter_upstream_headers",
+        "_get_adapter_header_value",
+        "_parse_retry_after_seconds_from_headers",
+        "_parse_rate_limit_reset_wait_seconds_from_headers",
+        "_extract_embedded_json_payload_candidates",
+        "_parse_json_payloads_from_text_candidates",
     ),
     "cooldown_apply": (
         "_resolve_auto_agent_cooldown_publication_plan",
@@ -95,12 +109,21 @@ TARGET_MODULES = {
     "attempt_records": attempt_records,
 }
 
+CANONICAL_HOST_FACADE_OVERRIDES = {
+    "_extract_openrouter_adapter_raw_message": (
+        openrouter_runtime._extract_openrouter_adapter_raw_message
+    ),
+    "_is_openrouter_adapter_provider_raw_error": (
+        openrouter_runtime._is_openrouter_adapter_provider_raw_error
+    ),
+}
+
 # SHA-256 of each baseline function after the narrowly documented AST
 # normalization in _BaselineNormalizer. Function signatures remain included.
 BASELINE_NORMALIZED_SHA256 = {
-    "_codex_auto_agent_error_text": "c935989cd8f7b1fcc20ab901086f4b4974bd7f8adc8a060a8981600a04987426",
+    "_codex_auto_agent_error_text": "5fd757caa5588fed578b0952d18f8be66e1a3a058466455586b7589ece142344",
     "_add_codex_auto_agent_text_error_tokens": "d18afa48ee3320fc4b56ede0b6d657d2d44bd64b022694aae68ecad72500ce23",
-    "_extract_codex_auto_agent_error_tokens": "d217e23bec0c2f4ac82c663d76518418972d26c8815c70d1d34cda69a8e00d57",
+    "_extract_codex_auto_agent_error_tokens": "c990d4fb23c81389bdb491339e37c55f2a38cb75932bd738a2f2bc35ff77f566",
     "_is_codex_auto_agent_durable_cooldown_error_class": "30784d0a5f07f6175a4a8f4232447f54589a696ab08d81b295a9b876add5de6e",
     "_is_codex_auto_agent_spark_candidate": "babb62af91da25fbbc7d39029399752e76d930449237f90f20de83649c31ccf5",
     "_is_codex_auto_agent_grok_4_5_candidate": "6013f5f7029cf137a4fba30e0ec22bffcc6ec4cb85fd8cb7ea7714cf2cc83f68",
@@ -119,18 +142,29 @@ BASELINE_NORMALIZED_SHA256 = {
     "_plan_codex_auto_agent_native_grok_continuation_transient_retry": "e415a0d9db6b8f13994b13240508b50b9da2d4b534933dccd1b0791facf46476",
     "_get_codex_auto_agent_cooldown_scope": "3edbe7a558aaf8e097f73f52ce5d38f2f73e76943b3487f7895c2b3713a47b80",
     "_get_codex_auto_agent_candidate_cooldown_scope": "55e471e6191c2f043f11ae92edf54cecd6af783326c831de44c7c8ac3c5c7acc",
-    "_is_codex_auto_agent_grok_build_usage_balance_exhausted": "0b1fc2f8976fbaa501a96caac6f2cc77f5e81c7b062bb1d0c307a511f457e5a1",
-    "_is_codex_auto_agent_grok_personal_team_spending_limit": "9fafb342595e4a2223ec29b32f110def19c2fdafbf1eff6d4118abee009a879b",
+    "_is_codex_auto_agent_grok_build_usage_balance_exhausted": "e2d8ef75ed78a931d1ee56061fe56f9278b5e5e7297c4ef82f31cff7a757a569",
+    "_is_codex_auto_agent_grok_personal_team_spending_limit": "00d3b86a7c80135ee690988103dbe124653ad81e17d626275859d7e72030744f",
     "_is_codex_auto_agent_grok_account_quota_candidate": "1f655e66bacc29e05bad09e60a320df791aae04a6fb8f0148cced619a5c57a9c",
     "_get_codex_auto_agent_grok_account_quota_lane_cooldown_key": "b7db42909cfec673676444e85f3bd48f23242794476433f0419ab24bc46d694a",
     "_is_codex_auto_agent_grok_account_quota_exhaustion": "59eb9a900b9b4e690e0931e8edc718690bc80ca62015e640a1c1ba62dd8e4065",
-    "_classify_codex_auto_agent_retryable_exhaustion": "97e9cf73ce05b72f3f623aaa6bba09772f6b196b6b26744c60898708d3c92f7f",
+    "_classify_codex_auto_agent_retryable_exhaustion": "d652c7332dbe81ca41838739ff4148294b8f11324255c5cc666819898b5607dc",
     "_is_codex_auto_agent_retryable_exhaustion": "b7765d3e4bfed171e76b25cd908f7a290e0ce47c329ca8d1834774e55e915031",
     "_parse_codex_auto_agent_header_wait_seconds": "d207fcec6808d4163d2c849b783fcf9196ece471a3b595995c2638b6a0204839",
-    "_get_codex_auto_agent_cooldown_seconds": "d5f5186c98d099f30a8f019243a77f7042a7c228a365df1f3bd4a37a3e8f47ae",
-    "_iter_codex_auto_agent_error_blocks": "bd03943a4642f75bf20ab297da67db9be31c9e6086518b4bfab1231d1a312ee0",
+    "_get_codex_auto_agent_cooldown_seconds": "f75184fe1edbdb32127a70a4036523f27883060de461d03364ca03f1b048e987",
+    "_iter_codex_auto_agent_error_blocks": "b583aeb1d182041b2e3a1877317609965b23cc09e8a3630869f161c6043a5f97",
     "_extract_codex_auto_agent_error_type_and_code": "6560a0cf446bdf9ecf060a4a9e47df3ffd7fae326d71dc73d465e4ae854f791f",
     "_get_codex_auto_agent_source_error_summary": "374a4665762d8fced81f8063349aac15053119abcaea2879d2f8a9d194e6aa2e",
+    "_extract_adapter_exception_detail": "45b9f4f5da5f2687bb9a8da2aaa4d60071c856188764ece36bd8c4424092d0f1",
+    "_extract_adapter_error_payloads": "78a09ec62ee6671b4b6c573a0b89b245cbfffe4c3e2359b733685581dc2f981a",
+    "_extract_adapter_exception_status_code": "a5f29723c1df2761cd14c633a5db24cf1c50986f6d0d106360a606224dc87e9f",
+    "_extract_openrouter_adapter_raw_message": "7d205c9e1f4f76cafb5dda0575014fead4af616299007d54181f64da4eea54b3",
+    "_is_openrouter_adapter_provider_raw_error": "68e0510ef85ab0d7810871097a110d4fcd15699ff45722282a8432e9f9f8d583",
+    "_extract_adapter_upstream_headers": "826721de8790a64cffc073ccf5d42ef84040724608292b1dde00fdfd79f8c34c",
+    "_get_adapter_header_value": "36bfd010283a0dafab49732d8af38162e3833d22409e24f4560a7914988b40fb",
+    "_parse_retry_after_seconds_from_headers": "9919e2dc963b11d67fe70be0ae41acaa0a40960b4bcb633f7bbe4fececa38f33",
+    "_parse_rate_limit_reset_wait_seconds_from_headers": "62b010f08927b8da1adbda76b4f7889f0414cbcdabd668556bade220dc9b85ea",
+    "_extract_embedded_json_payload_candidates": "5003f30b814c4737c722f36513a6cf794f035f40d307e41aaa5cf5e04857ece8",
+    "_parse_json_payloads_from_text_candidates": "549719c5b92d44b4fa6de2d4a7fe8e1e3e65d3a779d15241732936250fe197f1",
     "_resolve_auto_agent_cooldown_publication_plan": "193ef7f7c521581d70e99785ef0f2f281438b06d1467fbc620dfa228be6c8544",
     "_persist_codex_cooldown_durable": "87fd93555974db1ad42b17df76ea5cafa6e55f97770a6a1b50cc252066f61cd3",
     "_persist_anthropic_cooldown_durable": "bb6c8840fee8982f1994125976c7c6c4daf98f2216320ef21c6780c01bc04b6c",
@@ -139,9 +173,9 @@ BASELINE_NORMALIZED_SHA256 = {
     "_apply_read_pilot_gated_cooldown": "b6a79d5edff15084fc582ef525c094caa62e0f2fb0246a6c30c252e02847a09e",
     "_apply_anthropic_auto_agent_alias_cooldown": "2968467c04d3d4cce1f51c6243dccc86bf796fee86f35a1bd26ba97cd12dbe3f",
     "_set_codex_auto_agent_candidate_cooldowns": "437b2906f2ce8e86e69cf6073daff236ad52b5180bf0ce315870a965e0fafca2",
-    "_update_codex_auto_agent_retryable_attempt_record": "2bfa9f173d07ad8f1a39c022c53adeb9af5b5722fb9f6d6a9d4c278d6f446897",
+    "_update_codex_auto_agent_retryable_attempt_record": "ecd632224a453568ea22fe24b001aeb437eb2a8e7f87c6eeacd60b99bc867bb4",
     "_record_auto_agent_alias_attempt_started": "7be5154bf3ff55cb6e3a9d515095b7909fac3ee698fbf1f033a744a85ba65953",
-    "_record_read_pilot_cooldown_evidence": "ee40034232b7149eb816ed650b318f132f3809845146911b5b4246bb373d7682",
+    "_record_read_pilot_cooldown_evidence": "5cc58f31d0074d19202949c1e12fae9c4576ab2fc8edfd26174b7f15c877ba8e",
     "_record_auto_agent_alias_attempt_failure": "169d402301c35c1b156236204d14c362c8e842e312fb83ffd48fa9711ee93921",
     "_extract_codex_reasoning_effort": "ab143775e8132aa73f58ff575e97d2a85f1fd319d88816671cc93441a4e03be5",
     "_get_codex_reasoning_effort_ceiling": "f3d94c2bef96dd86af31831869f0195067d9a0f988f540535cf7f63dd4b200a6",
@@ -153,16 +187,12 @@ BASELINE_NORMALIZED_SHA256 = {
 # Baseline has no callback assertions. These exact additions are the permitted
 # fail-fast extraction difference, and their count is locked per function.
 EXPECTED_ASSERT_COUNTS = {
-    "_codex_auto_agent_error_text": 1,
-    "_extract_codex_auto_agent_error_tokens": 2,
     "_is_codex_auto_agent_durable_cooldown_error_class": 1,
-    "_is_codex_auto_agent_grok_build_usage_balance_exhausted": 2,
-    "_is_codex_auto_agent_grok_personal_team_spending_limit": 2,
-    "_classify_codex_auto_agent_retryable_exhaustion": 3,
-    "_parse_codex_auto_agent_header_wait_seconds": 3,
-    "_get_codex_auto_agent_cooldown_seconds": 2,
-    "_iter_codex_auto_agent_error_blocks": 1,
-    "_get_codex_auto_agent_source_error_summary": 3,
+    "_is_codex_auto_agent_grok_build_usage_balance_exhausted": 1,
+    "_is_codex_auto_agent_grok_personal_team_spending_limit": 1,
+    "_classify_codex_auto_agent_retryable_exhaustion": 2,
+    "_get_codex_auto_agent_cooldown_seconds": 1,
+    "_get_codex_auto_agent_source_error_summary": 1,
     "_resolve_auto_agent_cooldown_publication_plan": 4,
     "_persist_codex_cooldown_durable": 1,
     "_persist_anthropic_cooldown_durable": 1,
@@ -171,7 +201,7 @@ EXPECTED_ASSERT_COUNTS = {
     "_apply_read_pilot_gated_cooldown": 1,
     "_apply_anthropic_auto_agent_alias_cooldown": 1,
     "_update_codex_auto_agent_retryable_attempt_record": 6,
-    "_record_auto_agent_alias_attempt_started": 4,
+    "_record_auto_agent_alias_attempt_started": 2,
     "_record_read_pilot_cooldown_evidence": 5,
     "_record_auto_agent_alias_attempt_failure": 4,
     "_get_codex_reasoning_effort_ceiling": 4,
@@ -296,12 +326,12 @@ def _normalized_digest(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
 
 def test_frozen_inventory_and_facade_counts() -> None:
     assert {name: len(symbols) for name, symbols in FROZEN_SYMBOLS.items()} == {
-        "error_signals": 33,
+        "error_signals": 44,
         "cooldown_apply": 8,
         "attempt_records": 9,
     }
-    assert sum(map(len, FROZEN_SYMBOLS.values())) == 50
-    assert len(BASELINE_NORMALIZED_SHA256) == 50
+    assert sum(map(len, FROZEN_SYMBOLS.values())) == 61
+    assert len(BASELINE_NORMALIZED_SHA256) == 61
     assert set(BASELINE_NORMALIZED_SHA256) == {
         symbol
         for symbols in FROZEN_SYMBOLS.values()
@@ -311,14 +341,20 @@ def test_frozen_inventory_and_facade_counts() -> None:
 
 def test_target_modules_are_sole_function_owners() -> None:
     god_functions = _top_level_functions(ast.parse(GOD_PATH.read_text(encoding="utf-8")))
-    god_assignments = _top_level_assignments(ast.parse(GOD_PATH.read_text(encoding="utf-8")))
     for module_name, symbols in FROZEN_SYMBOLS.items():
         module = TARGET_MODULES[module_name]
         target_functions = _top_level_functions(_module_tree(module))
         assert tuple(module._HOST_FUNCTION_NAMES) == symbols
         assert not (set(symbols) & set(god_functions))
-        assert set(symbols) <= set(god_assignments)
         assert set(symbols) <= set(target_functions)
+        for symbol in symbols:
+            host_facade = getattr(lpe, symbol, None)
+            owner_function = getattr(module, symbol)
+            canonical_function = CANONICAL_HOST_FACADE_OVERRIDES.get(
+                symbol, owner_function
+            )
+            assert callable(host_facade)
+            assert host_facade.__code__ is canonical_function.__code__
 
 
 def test_all_50_normalized_bodies_and_signatures_match_baseline() -> None:
@@ -343,7 +379,7 @@ def test_fail_fast_assert_deviations_are_exactly_documented() -> None:
             if count:
                 actual[symbol] = count
     assert actual == EXPECTED_ASSERT_COUNTS
-    assert len(actual) == 25
+    assert len(actual) == 21
 
 
 def test_god_module_facades_are_same_objects_with_owner_globals() -> None:
@@ -351,11 +387,19 @@ def test_god_module_facades_are_same_objects_with_owner_globals() -> None:
     for module_name, symbols in FROZEN_SYMBOLS.items():
         module = TARGET_MODULES[module_name]
         for symbol in symbols:
-            target = getattr(module, symbol)
-            assert getattr(lpe, symbol) is target
-            assert target.__globals__ is vars(module)
+            owner_function = getattr(module, symbol)
+            host_facade = getattr(lpe, symbol)
+            canonical_function = CANONICAL_HOST_FACADE_OVERRIDES.get(
+                symbol, owner_function
+            )
+            assert callable(host_facade)
+            assert host_facade.__code__ is canonical_function.__code__
+            if symbol in CANONICAL_HOST_FACADE_OVERRIDES:
+                assert host_facade is canonical_function
+            elif host_facade is not owner_function:
+                assert host_facade.__globals__ is vars(lpe)
             facade_count += 1
-    assert facade_count == 50
+    assert facade_count == 61
 
 
 def test_installed_host_contract_retains_candidate_loop_dependencies() -> None:

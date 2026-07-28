@@ -91,10 +91,6 @@ Before cutting or promoting a release:
 - Confirm `aawm-litellm` on `:4000` is the prod target being promoted.
 - Confirm `.env` / production env files contain the provider credentials needed
   for the lanes being validated.
-- Confirm Antigravity Code Assist has separate seed and managed OAuth paths in
-  prod: the seed may be mounted read-only into LiteLLM, and the provider-status
-  sidecar must mount the managed auth directory writable so scheduled token
-  refreshes persist at `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE`.
 - Confirm prod error-log mirroring is enabled with a writable mount for this
   repo's `.analysis` directory and
   `LITELLM_AAWM_ERROR_LOG_ENABLED=1`,
@@ -298,18 +294,6 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    `host.docker.internal:<port>` from the container rather than a Docker bridge
    IP such as `172.20.0.1`.
 
-   Antigravity Code Assist OAuth refresh requires two prod credential mounts:
-   a seed token path from the Antigravity CLI login and a writable
-   provider-status-sidecar-owned managed token path. Prefer mounting the seed
-   credential directory read-only into LiteLLM instead of a single token file so
-   host-side reauth and atomic file replacement are visible inside the
-   container. Mount the managed directory read-write into the provider-status
-   sidecar and set `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` / the sidecar's
-   `AAWM_ANTIGRAVITY_AUTH_FILE` to that path. Also set the sidecar's
-   `AAWM_ANTIGRAVITY_SEED_AUTH_FILE` to the read-only canonical CLI token path
-   so AGY CLI fallback can refresh from a staged copy and write only the
-   managed auth file.
-
    Prod error-log mirroring also requires a writable mount from this repo's
    `.analysis` directory to the container path named by
    `LITELLM_AAWM_ERROR_LOG_DIR`, normally `/app/.analysis`.
@@ -425,7 +409,7 @@ coverage.
 ./.venv/bin/python -m dotenv run -- \
   ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
     --target prod \
-    --cases claude_adapter_gemma_31b,claude_adapter_peeromega_fanout \
+    --cases claude_adapter_peeromega_fanout \
     --write-artifact /tmp/litellm-prod-focused.json
 ```
 
@@ -528,15 +512,22 @@ print(json.dumps({"session":session,"model":response.get("model"),"content":resp
 ```
 
 For native passthrough changes, run the opt-in native shard in the existing
-harness. This includes the real Claude, Codex, and Gemini CLIs and should not
-be replaced with skipped or synthetic key checks.
+harness for the retained Claude and Codex CLI paths. Native Gemini harness
+cases were removed; validate retained native Gemini passthrough behavior with
+the focused pytest coverage instead of restoring those cases.
 
 ```bash
 ./.venv/bin/python -m dotenv run -- \
   ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
     --target prod \
-    --cases native_anthropic_passthrough_claude,native_openai_passthrough_chat,native_openai_passthrough_responses,native_openai_passthrough_responses_codex,native_gemini_passthrough_generate_content,native_gemini_passthrough_stream_generate_content \
+    --cases native_anthropic_passthrough_claude,native_openai_passthrough_chat,native_openai_passthrough_responses,native_openai_passthrough_responses_codex \
     --write-artifact /tmp/litellm-prod-native.json
+```
+
+```bash
+./.venv/bin/python -m pytest -p no:rerunfailures \
+  tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py \
+  -q
 ```
 
 For `/anthropic` effort/cache changes, run the opt-in shards that are
@@ -546,8 +537,8 @@ default-excluded to keep the default suite stable:
 ./.venv/bin/python -m dotenv run -- \
   ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
     --target prod \
-    --cases claude_adapter_openai_output_config_effort,claude_adapter_openai_prompt_cache_two_pass,claude_adapter_gemini_output_config_effort,claude_adapter_gemini_output_config_minimal_effort,claude_adapter_gemini_output_config_max_effort,claude_adapter_gemini_output_config_minimal_effort_cache,claude_adapter_gemini_output_config_max_effort_cache \
-    --write-artifact /tmp/litellm-prod-effort-cache-openai-gemini.json
+    --cases claude_adapter_openai_output_config_effort,claude_adapter_openai_prompt_cache_two_pass \
+    --write-artifact /tmp/litellm-prod-effort-cache-openai.json
 
 ./.venv/bin/python -m dotenv run -- \
   ./.venv/bin/python scripts/local-ci/run_anthropic_adapter_acceptance.py \
@@ -630,8 +621,6 @@ unless explicitly requested:
 
 - OpenRouter GPT-OSS edge models:
   `claude_adapter_gpt_oss_20b`, `claude_adapter_gpt_oss_120b`
-- OpenRouter Gemma edge models:
-  `claude_adapter_gemma_31b`, `claude_adapter_gemma_26b_a4b`
 - NVIDIA opt-in checks:
   `claude_adapter_nvidia_deepseek_v32`, `claude_adapter_nvidia_glm47`,
   `claude_adapter_nvidia_minimax_m27`

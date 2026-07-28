@@ -89,7 +89,6 @@ if TYPE_CHECKING:
     def _safe_int(value: Any) -> Optional[int]: ...
 
 _PROVIDER_CACHE_TARGET_FAMILIES = {
-    "antigravity",
     "anthropic",
     "openai",
     "openrouter",
@@ -97,6 +96,14 @@ _PROVIDER_CACHE_TARGET_FAMILIES = {
     "gemini",
     "nvidia",
     "xai",
+}
+
+_RETIRED_PROVIDER_CACHE_NAMES = {
+    "antigravity",
+    "agy",
+    "google-antigravity",
+    "google_code_assist",
+    "google-code-assist",
 }
 
 
@@ -108,6 +115,11 @@ def _normalize_provider_cache_family(
     route_family = (metadata or {}).get("passthrough_route_family")
     if isinstance(route_family, str) and route_family.strip():
         route_family_lower = route_family.lower()
+        if any(
+            marker in route_family_lower
+            for marker in ("antigravity", "code_assist", "code-assist")
+        ):
+            return None
         if "grok" in route_family_lower or "xai" in route_family_lower:
             return "xai"
         if "nvidia" in route_family_lower:
@@ -116,8 +128,6 @@ def _normalize_provider_cache_family(
             return "openrouter"
         if "opencode" in route_family_lower:
             return "opencode_zen"
-        if "antigravity" in route_family_lower:
-            return "antigravity"
         if "gemini" in route_family_lower or "google" in route_family_lower:
             return "gemini"
         if "anthropic" in route_family_lower:
@@ -127,10 +137,10 @@ def _normalize_provider_cache_family(
 
     if isinstance(provider, str) and provider.strip():
         provider_lower = provider.strip().lower()
+        if provider_lower in _RETIRED_PROVIDER_CACHE_NAMES:
+            return None
         if provider_lower == "google":
             return "gemini"
-        if provider_lower in {"antigravity", "agy", "google-antigravity"}:
-            return "antigravity"
         if provider_lower in {"nvidia_nim", "nvidia-nim"}:
             return "nvidia"
         if provider_lower in {"opencode", "opencode-zen", "opencode_zen", "zen"}:
@@ -139,6 +149,8 @@ def _normalize_provider_cache_family(
             return provider_lower
 
     model_lower = str(model or "").strip().lower()
+    if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
+        return None
     if model_lower.startswith("nvidia_nim/") or model_lower.startswith("nvidia/"):
         return "nvidia"
     if model_lower.startswith("xai/") or model_lower.startswith("grok"):
@@ -147,8 +159,6 @@ def _normalize_provider_cache_family(
         return "openrouter"
     if model_lower.startswith(("opencode/", "opencode-zen/", "zen/")):
         return "opencode_zen"
-    if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
-        return "antigravity"
     if "gemini" in model_lower or "gemma" in model_lower or model_lower.startswith("google/"):
         return "gemini"
     if "claude" in model_lower or model_lower.startswith("anthropic/"):

@@ -6,7 +6,6 @@ Does NOT import llm_passthrough_endpoints at module scope.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -51,9 +50,6 @@ def _set_selection_runtime(name: str, value: Any) -> None:
 @pytest.fixture(autouse=True)
 def _configure_selection():
     """Configure selection runtime with fresh stubs before each test."""
-    lock = asyncio.Lock()
-    google_rl_map: dict[str, float] = {}
-
     async def _noop_cooldown(key: str, seconds: float) -> None:
         pass
 
@@ -63,12 +59,6 @@ def _configure_selection():
     async def _zero_adapter(model: Optional[str]) -> float:
         return 0.0
 
-    async def _google_lane() -> str:
-        return "google:default"
-
-    async def _antigravity_state() -> dict[str, Any]:
-        return {"lane_key": "antigravity:default"}
-
     runtime_names = {
         "_get_codex_active_cooldown_state",
         "_get_anthropic_active_cooldown_state",
@@ -77,11 +67,7 @@ def _configure_selection():
         "_set_anthropic_cooldown",
         "_get_codex_session_affinity",
         "_get_anthropic_session_affinity",
-        "_resolve_google_lane_key",
-        "_resolve_antigravity_lane_state",
         "_get_openrouter_adapter_active_cooldown_seconds",
-        "_google_adapter_rate_limit_lock",
-        "_google_adapter_rate_limit_until_monotonic_by_key",
         "_normalize_codex_alias_model",
         "_extract_client_product_label",
         "_resolve_codex_session_key",
@@ -105,11 +91,7 @@ def _configure_selection():
         "_set_anthropic_cooldown": _noop_cooldown,
         "_get_codex_session_affinity": AsyncMock(return_value=None),
         "_get_anthropic_session_affinity": AsyncMock(return_value=None),
-        "_resolve_google_lane_key": _google_lane,
-        "_resolve_antigravity_lane_state": _antigravity_state,
         "_get_openrouter_adapter_active_cooldown_seconds": _zero_adapter,
-        "_google_adapter_rate_limit_lock": lock,
-        "_google_adapter_rate_limit_until_monotonic_by_key": google_rl_map,
         "_normalize_codex_alias_model": lambda m: None,
         "_extract_client_product_label": lambda r, b: None,
         "_resolve_codex_session_key": lambda r, b, **kw: None,
@@ -133,11 +115,7 @@ def _configure_selection():
         set_anthropic_cooldown=_noop_cooldown,
         get_codex_session_affinity=AsyncMock(return_value=None),
         get_anthropic_session_affinity=AsyncMock(return_value=None),
-        resolve_google_lane_key=_google_lane,
-        resolve_antigravity_lane_state=_antigravity_state,
         get_openrouter_adapter_active_cooldown_seconds=_zero_adapter,
-        google_adapter_rate_limit_lock=lock,
-        google_adapter_rate_limit_until_monotonic_by_key=google_rl_map,
         normalize_codex_alias_model=lambda m: None,
         extract_client_product_label=lambda r, b: None,
         resolve_codex_session_key=lambda r, b, **kw: None,
@@ -253,8 +231,8 @@ class TestSkippedShaping:
     def test_skip_reason_propagated(self):
         states = [
             {
-                "candidate": _candidate("google_code_assist", "gemini-2.5-pro"),
-                "lane_key": "google:auth_degraded",
+                "candidate": _candidate("xai", "grok-4"),
+                "lane_key": "xai:auth_degraded",
                 "cooldown_seconds": 300.0,
                 "skip_reason": "auth_degraded",
                 "cooldown_state_source": "auth_degraded",
@@ -739,9 +717,9 @@ class TestCodexRedispatch:
     async def test_durable_affinity_removed_raises_before_alternate_selection(self):
         request = _make_request()
         affinity = {
-            "provider": "antigravity",
+            "provider": "openai",
             "model": "removed-durable-model",
-            "route_family": "codex_antigravity_code_assist_adapter",
+            "route_family": "openai_responses_adapter",
             "last_resort": False,
             "affinity_state_source": "durable_cache",
         }
@@ -783,64 +761,6 @@ class TestCodexRedispatch:
         assert detail["failure_phase"] == "affinity_continuation_removed"
         assert detail["attempted_provider_call"] is False
         alternate_states.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
-# Candidate state construction: Google auth-degraded
-# ---------------------------------------------------------------------------
-
-
-class TestGoogleAuthDegraded:
-    @pytest.mark.asyncio
-    async def test_google_auth_degraded_forced_cooldown(self):
-        request = _make_request()
-
-        async def _google_degraded() -> str:
-            return "google:auth_degraded"
-
-        _set_selection_runtime("_resolve_google_lane_key", _google_degraded)
-
-        state = await selection._build_codex_auto_agent_candidate_state(
-            request,
-            candidate_template=_candidate("google_code_assist", "gemini-2.5-pro"),
-        )
-        assert state["skip_reason"] == "auth_degraded"
-        assert state["cooldown_seconds"] == 300.0
-        assert state["cooldown_state_source"] == "auth_degraded"
-        assert state["failure_phase"] == "auth"
-        assert state["attempted_provider_call"] is False
-
-
-# ---------------------------------------------------------------------------
-# Candidate state construction: Antigravity
-# ---------------------------------------------------------------------------
-
-
-class TestAntigravityLane:
-    @pytest.mark.asyncio
-    async def test_antigravity_forced_cooldown(self):
-        request = _make_request()
-
-        async def _antigravity() -> dict[str, Any]:
-            return {
-                "lane_key": "antigravity:oauth_expired",
-                "forced_cooldown_seconds": 600.0,
-                "skip_reason": "oauth_expired",
-                "cooldown_state_source": "antigravity_oauth",
-                "failure_phase": "auth",
-                "attempted_provider_call": False,
-            }
-
-        _set_selection_runtime("_resolve_antigravity_lane_state", _antigravity)
-
-        state = await selection._build_codex_auto_agent_candidate_state(
-            request,
-            candidate_template=_candidate("antigravity", "gemini-2.5-pro"),
-        )
-        assert state["skip_reason"] == "oauth_expired"
-        assert state["cooldown_seconds"] == 600.0
-        assert state["cooldown_state_source"] == "antigravity_oauth"
-        assert state["lane_key"] == "antigravity:oauth_expired"
 
 
 # ---------------------------------------------------------------------------

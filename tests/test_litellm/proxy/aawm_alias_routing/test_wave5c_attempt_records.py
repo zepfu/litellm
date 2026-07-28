@@ -57,7 +57,7 @@ def _configure_attempt_records():  # noqa: PLR0915
         "_parse_codex_auto_agent_header_wait_seconds",
         "_get_codex_auto_agent_source_error_summary",
         "_build_safe_kimi_code_selection_telemetry",
-        "_extract_google_adapter_exception_status_code",
+        "_extract_exception_status_code",
         "_safe_set_request_parsed_body",
         "_emit_auto_agent_alias_route_event",
         "_build_auto_agent_alias_audit_event",
@@ -109,9 +109,6 @@ def _configure_attempt_records():  # noqa: PLR0915
             {"alias_model": alias_model, "candidate": candidate, "metadata": metadata}
         )
         return {"kimi": "telemetry", "alias_model": alias_model}
-
-    def _extract_status(exc: Any) -> Optional[int]:
-        return getattr(exc, "_status_code", 429)
 
     def _set_parsed_body(request: Request, body: Any) -> None:
         state.parsed_bodies.append(body)
@@ -182,7 +179,7 @@ def _configure_attempt_records():  # noqa: PLR0915
         parse_header_wait_seconds=_parse_wait,
         get_source_error_summary=_source_summary,
         build_kimi_telemetry=_build_kimi_telemetry,
-        extract_status_code=_extract_status,
+        extract_status_code=lambda exc: getattr(exc, '_status_code', None),
         safe_set_parsed_body=_set_parsed_body,
         emit_route_event=_emit_event,
         build_audit_event=_build_audit_event,

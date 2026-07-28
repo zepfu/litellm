@@ -380,11 +380,6 @@ streaming response has been handed to the client, midstream failures remain
 terminal for that stream and are recorded through the streaming error context
 path instead of replaying the request.
 
-Adapted Google Code Assist streams also own cleanup of their nested event
-parser and source body iterator. If a downstream client stops consuming the
-stream early, both iterators are closed before teardown; this releases upstream
-resources without synthesizing a terminal event or replaying the request.
-
 Post-first-byte upstream read timeouts also emit an explicit terminal stream
 event to the client after any bytes already forwarded. The proxy preserves the
 partial stream, appends a route-family-specific terminal failure chunk, and does
@@ -405,8 +400,8 @@ emitted for expected behavior.
 
 Routes with their own retry, cooldown, or alias-candidate progression set
 `caller_managed_hidden_retry=True` so the shared pass-through wrapper does not
-double retry. This includes Google/Antigravity adapter calls, OpenRouter adapter
-calls, Codex/auto-agent candidate probes, Cursor lifecycle calls, and Grok
+double retry. This includes OpenRouter adapter calls, Codex/auto-agent candidate
+probes, Cursor lifecycle calls, and Grok
 session side-channel mutation routes.
 
 Alias candidate probes also pass their caller-managed transient upstream status
@@ -914,15 +909,6 @@ control file. That mode intentionally persists raw upstream request/response
 headers and bodies for short-lived manual investigations and should not be used
 as default telemetry.
 
-Google Code Assist / Antigravity bootstrap preflight calls in
-`litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py` also call
-`capture_passthrough_shape()` directly for `v1internal:loadCodeAssist` and the
-`retrieveUserQuota` / `fetchAdminControls` / `listExperiments` prime path. Those
-direct preflight captures use the same exact-scope gate as other diagnostic
-manifest writes: they stay local-only under
-`/tmp/captures/diagnostic_payloads` by default and persist shape/hash manifest
-data only unless the separate full-payload capture opt-in is enabled.
-
 Native `/rerank` proxy requests use a separate rerank diagnostic manifest
 wrapper rather than the pass-through HTTP response helper. The route family is
 `rerank`, the endpoint template is `/rerank`, and the artifact records only
@@ -936,9 +922,6 @@ Diagnostic manifest coverage by route family:
 - OpenAI, Anthropic, Gemini, Vertex, Cohere, and Cursor pass-through HTTP
   handlers use the shared pass-through capture hooks for nonstreaming,
   streaming, and error-shape manifests.
-- Google Code Assist / Antigravity bootstrap preflight calls use direct
-  `capture_passthrough_shape()` calls because they run before the normal shared
-  pass-through response handler.
 - Native `/rerank` proxy calls use the rerank wrapper described above because
   they flow through `base_process_llm_request(route_type="arerank")`, not the
   pass-through HTTP stack.

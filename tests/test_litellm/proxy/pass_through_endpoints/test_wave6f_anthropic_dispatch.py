@@ -30,11 +30,9 @@ RESOLVER_SEAMS = (
     "resolve_xai_oauth",
     "resolve_grok_native_oauth",
     "resolve_openai_responses",
-    "resolve_antigravity",
     "resolve_opencode_zen",
     "resolve_kimi",
     "resolve_alibaba",
-    "resolve_google",
     "resolve_nvidia",
     "resolve_openrouter_completion",
     "resolve_openrouter_responses",
@@ -87,7 +85,6 @@ def _make_runtime(
     kwargs["handle_xai_oauth_completion"] = recorder.handler("xai_completion")
     kwargs["handle_grok_native_oauth_responses"] = recorder.handler("grok")
     kwargs["handle_openai_responses"] = recorder.handler("openai")
-    kwargs["handle_google_completion"] = recorder.handler("google")
     kwargs["handle_opencode_zen"] = recorder.handler("opencode_zen")
     kwargs["handle_kimi"] = recorder.handler("kimi")
     kwargs["handle_alibaba"] = recorder.handler("alibaba")
@@ -95,7 +92,6 @@ def _make_runtime(
     kwargs["handle_openrouter_completion"] = recorder.handler("openrouter_completion")
     kwargs["handle_openrouter_responses"] = recorder.handler("openrouter_responses")
     kwargs["is_oa_xai_responses_model"] = lambda model: is_responses
-    kwargs["antigravity_adapter_provider"] = "antigravity"
     return AnthropicDispatchRuntime(**kwargs)
 
 
@@ -134,11 +130,9 @@ async def test_should_return_none_when_no_adapter_matches() -> None:
     [
         ("resolve_grok_native_oauth", "grok"),
         ("resolve_openai_responses", "openai"),
-        ("resolve_antigravity", "google"),
         ("resolve_opencode_zen", "opencode_zen"),
         ("resolve_kimi", "kimi"),
         ("resolve_alibaba", "alibaba"),
-        ("resolve_google", "google"),
         ("resolve_nvidia", "nvidia"),
         ("resolve_openrouter_completion", "openrouter_completion"),
         ("resolve_openrouter_responses", "openrouter_responses"),
@@ -213,15 +207,6 @@ async def test_should_route_xai_to_completion_when_not_responses_model() -> None
     assert recorder.calls == ["resolve:resolve_xai_oauth", "handle:xai_completion"]
 
 
-async def test_should_pass_antigravity_provider_to_google_handler() -> None:
-    recorder = _Recorder()
-    runtime = _make_runtime(recorder, match="resolve_antigravity")
-
-    await try_dispatch_anthropic_adapter(runtime, **_DISPATCH_KWARGS)
-
-    assert recorder.handler_kwargs["google"]["adapter_provider"] == "antigravity"
-
-
 # ---------------------------------------------------------------------------
 # Ordering precedence
 # ---------------------------------------------------------------------------
@@ -237,7 +222,6 @@ async def test_should_respect_priority_order_when_multiple_match() -> None:
     kwargs["handle_xai_oauth_completion"] = recorder.handler("xai_completion")
     kwargs["handle_grok_native_oauth_responses"] = recorder.handler("grok")
     kwargs["handle_openai_responses"] = recorder.handler("openai")
-    kwargs["handle_google_completion"] = recorder.handler("google")
     kwargs["handle_opencode_zen"] = recorder.handler("opencode_zen")
     kwargs["handle_kimi"] = recorder.handler("kimi")
     kwargs["handle_alibaba"] = recorder.handler("alibaba")
@@ -245,7 +229,6 @@ async def test_should_respect_priority_order_when_multiple_match() -> None:
     kwargs["handle_openrouter_completion"] = recorder.handler("openrouter_completion")
     kwargs["handle_openrouter_responses"] = recorder.handler("openrouter_responses")
     kwargs["is_oa_xai_responses_model"] = lambda model: True
-    kwargs["antigravity_adapter_provider"] = "antigravity"
     runtime = AnthropicDispatchRuntime(**kwargs)
 
     result = await try_dispatch_anthropic_adapter(runtime, **_DISPATCH_KWARGS)

@@ -29,13 +29,13 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     audit_events,
     audit_persist,
     durable,
-    google_oauth,
     memory,
     oauth_token_cache,
     policy,
     provider_shaping,
     responses_finalize,
     retry,
+    runtime_memory,
     state,
     streaming,
     task_state,
@@ -54,13 +54,11 @@ COMPAT_POLICY_PATH = Path(policy_compat.__file__).resolve()
 EXPECTED_PACKAGE_MODULES = {
     "adapter_config",
     "adapter_driver",
-    "antigravity_oauth",
     "audit_build",
     "audit_context",
     "audit_events",
     "audit_persist",
     "durable",
-    "google_oauth",
     "memory",
     "oauth_token_cache",
     "policy",
@@ -152,7 +150,6 @@ def test_rr054_package_public_surface_matches_init() -> None:
         "cooldown_apply",
         "cooldown_state",
         "error_signals",
-        "google_oauth",
         "memory",
         "oauth_token_cache",
         "policy",
@@ -176,7 +173,6 @@ def test_rr054_package_public_surface_matches_init() -> None:
     assert package.adapter_config is adapter_config
     assert package.adapter_driver is adapter_driver
     assert package.cooldown_state.__name__.endswith(".cooldown_state")
-    assert package.google_oauth is google_oauth
     assert package.oauth_token_cache is oauth_token_cache
     assert package.provider_shaping is provider_shaping
     assert package.responses_finalize is responses_finalize
@@ -286,20 +282,6 @@ def test_rr054_no_duplicate_state_map_construction_in_god_file() -> None:
         lpe._openrouter_adapter_rate_limit_until_monotonic_by_key
         is alias_routing_state.openrouter_rate_limit.until_monotonic_by_key
     )
-    assert (
-        lpe._google_adapter_rate_limit_until_monotonic_by_key
-        is alias_routing_state.google_rate_limit.until_monotonic_by_key
-    )
-    assert lpe._google_oauth_access_token_cache is alias_routing_state.google_oauth.tokens
-    assert (
-        lpe._antigravity_oauth_access_token_cache
-        is alias_routing_state.antigravity_oauth.tokens
-    )
-    assert lpe._google_oauth_access_token_lock is alias_routing_state.google_oauth.lock
-    assert (
-        lpe._antigravity_oauth_access_token_lock
-        is alias_routing_state.antigravity_oauth.lock
-    )
 
     god_source = _read(GOD_PATH)
     forbidden_constructors = (
@@ -307,8 +289,6 @@ def test_rr054_no_duplicate_state_map_construction_in_god_file() -> None:
         "_anthropic_auto_agent_cooldown_until_monotonic_by_key: dict",
         "_codex_auto_agent_session_affinity_by_key: dict",
         "_anthropic_auto_agent_session_affinity_by_key: dict",
-        "_google_oauth_access_token_cache: dict",
-        "_antigravity_oauth_access_token_cache: dict",
     )
     for snippet in forbidden_constructors:
         assert snippet not in god_source, f"god-file re-owns map via annotation: {snippet}"
@@ -386,13 +366,20 @@ def test_rr054_god_file_reexports_policy_and_durable_helpers() -> None:
     )
 
 
-def test_rr054_god_file_memory_wrappers_delegate_to_package() -> None:
-    """Thin god wrappers may exist; they must call package memory helpers."""
-    god_source = _read(GOD_PATH)
-    assert "def _bound_aawm_alias_routing_memory_map(" in god_source
-    assert "_aawm_alias_memory.bound_memory_map(" in god_source
-    assert "_aawm_alias_memory.hydrate_cooldown_memory(" in god_source
-    assert "_aawm_alias_memory.hydrate_affinity_memory(" in god_source
+def test_rr054_god_file_memory_facades_use_runtime_memory_owner() -> None:
+    """God-module compatibility names are package-owned runtime functions."""
+    assert (
+        lpe._bound_aawm_alias_routing_memory_map
+        is runtime_memory.bound_aawm_alias_routing_memory_map
+    )
+    assert (
+        lpe._hydrate_aawm_alias_routing_cooldown_memory
+        is runtime_memory.hydrate_aawm_alias_routing_cooldown_memory
+    )
+    assert (
+        lpe._hydrate_aawm_alias_routing_affinity_memory
+        is runtime_memory.hydrate_aawm_alias_routing_affinity_memory
+    )
 
     cache: dict[str, int] = {str(i): i for i in range(5)}
     lpe._bound_aawm_alias_routing_memory_map(cache, max_size=3)
@@ -417,8 +404,6 @@ def test_rr054_adapter_config_and_retry_surfaces_are_package_owned() -> None:
         "finalize_anthropic_responses_adapter_upstream_response",
     )
     assert hasattr(streaming, "peek_streaming_response")
-    assert hasattr(oauth_token_cache, "google_oauth_access_token_cache")
-    assert hasattr(oauth_token_cache, "antigravity_oauth_access_token_cache")
 
 
 def test_rr054_state_singleton_is_shared_process_wide() -> None:
@@ -443,28 +428,17 @@ def test_rr054_remaining_duplicate_ownership_inventory() -> None:
     above). They are compatibility wrappers / unextracted adapter process
     caches that future RR-054 increments may still move.
     """
-    god_source = _read(GOD_PATH)
     remaining: dict[str, Any] = {
-        "thin_memory_wrappers_on_god_file": [
-            "_bound_aawm_alias_routing_memory_map",
-            "_hydrate_aawm_alias_routing_cooldown_memory",
-            "_hydrate_aawm_alias_routing_affinity_memory",
-        ],
-        "google_adapter_process_caches_still_on_god_file": [
-            "_google_code_assist_project_cache",
-            "_google_code_assist_prime_until_monotonic_by_key",
-            "_google_adapter_semaphores",
-            "_google_adapter_user_prompt_turn_counters",
-            "_codex_google_code_assist_tool_call_name_cache",
-        ],
+        "runtime_memory_owner": (
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing."
+            "runtime_memory"
+        ),
         "redis_manager_outside_package": "litellm.proxy.aawm_alias_routing_redis",
         "runtime_engines_still_on_god_file": True,
     }
 
-    for name in remaining["thin_memory_wrappers_on_god_file"]:
-        assert f"def {name}(" in god_source
-    for name in remaining["google_adapter_process_caches_still_on_god_file"]:
-        assert name in god_source
+    runtime_memory_mod = importlib.import_module(remaining["runtime_memory_owner"])
+    assert runtime_memory_mod is runtime_memory
 
     redis_mod = importlib.import_module("litellm.proxy.aawm_alias_routing_redis")
     assert redis_mod.__name__ == remaining["redis_manager_outside_package"]

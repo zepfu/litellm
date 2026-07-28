@@ -3,8 +3,8 @@
 OpenRouter-specific error classification belongs to
 ``providers/openrouter/error_shape.py``; cooldown policy and transport
 execution belong to ``providers/openrouter/retry_transport.py``. The
-pass-through route module may retain historical entrypoints only as thin
-delegates using the exact runtime binding declared here.
+proxy OpenRouter runtime owns host dependency installation and publishes the
+historical route entrypoints as same-object compatibility facades.
 """
 
 from __future__ import annotations
@@ -17,12 +17,17 @@ from litellm.llms.anthropic.experimental_pass_through.providers.openrouter impor
     retry_transport,
 )
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    alias_routing_state,
+)
+from litellm.proxy.pass_through_endpoints.providers.openrouter import (
+    runtime as openrouter_runtime,
+)
 
 PROVIDER_PATH = Path(retry_transport.__file__).resolve()
 ERROR_SHAPE_PATH = Path(error_shape.__file__).resolve()
 GOD_PATH = Path(lpe.__file__).resolve()
-GOD_PROVIDER_ALIAS = "_anthropic_openrouter_retry_transport"
-GOD_RUNTIME_NAME = "_ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME"
+GOD_RUNTIME_ALIAS = "_wave6b_openrouter_runtime"
 
 # Historical route-module symbol -> provider-owned implementation.
 OPENROUTER_PROVIDER_DELEGATES = {
@@ -232,7 +237,7 @@ def test_rr054_openrouter_provider_does_not_back_import_route_implementation() -
     )
 
 
-def test_rr054_god_file_imports_exact_openrouter_retry_transport_owner() -> None:
+def test_rr054_god_file_installs_openrouter_runtime_package_owner() -> None:
     god_tree = _parse(GOD_PATH)
     matching_imports = [
         alias
@@ -240,126 +245,63 @@ def test_rr054_god_file_imports_exact_openrouter_retry_transport_owner() -> None
         if isinstance(node, ast.ImportFrom)
         and node.module
         == (
-            "litellm.llms.anthropic.experimental_pass_through.providers"
-            ".openrouter"
+            "litellm.proxy.pass_through_endpoints.providers.openrouter"
         )
         for alias in node.names
-        if alias.name == "retry_transport" and alias.asname == GOD_PROVIDER_ALIAS
+        if alias.name == "runtime" and alias.asname == GOD_RUNTIME_ALIAS
     ]
     assert matching_imports, (
-        "llm_passthrough_endpoints.py must import OpenRouter retry_transport as "
-        f"{GOD_PROVIDER_ALIAS}"
+        "llm_passthrough_endpoints.py must import the proxy OpenRouter runtime "
+        f"package as {GOD_RUNTIME_ALIAS}"
     )
 
-    runtime_bindings = [
-        node
-        for node in god_tree.body
-        if isinstance(node, (ast.Assign, ast.AnnAssign))
-        and any(
-            isinstance(target, ast.Name) and target.id == GOD_RUNTIME_NAME
-            for target in (
-                node.targets if isinstance(node, ast.Assign) else [node.target]
-            )
-        )
-    ]
-    assert len(runtime_bindings) == 1, (
-        "llm_passthrough_endpoints.py must define exactly one injected "
-        f"{GOD_RUNTIME_NAME}"
+    install_calls = _call_nodes(god_tree, f"{GOD_RUNTIME_ALIAS}.install")
+    assert len(install_calls) == 1, (
+        "llm_passthrough_endpoints.py must install the OpenRouter package "
+        "runtime exactly once"
+    )
+    assert install_calls[0].args
+    install_arg = install_calls[0].args[0]
+    assert isinstance(install_arg, ast.Call)
+    assert _dotted_name(install_arg.func) == "globals"
+
+    configured_runtime = openrouter_runtime._runtime
+    assert configured_runtime is not None
+    retry_runtime = configured_runtime.retry_transport_runtime
+    assert isinstance(retry_runtime, retry_transport.Runtime)
+    assert retry_runtime.rate_limit is alias_routing_state.openrouter_rate_limit
+    assert (
+        retry_runtime.failure_circuit_until_monotonic_by_key
+        is alias_routing_state.openrouter_failure_circuit.until_monotonic_by_key
     )
 
+    class HeaderError(Exception):
+        upstream_headers = {"Retry-After": "4", "X-Test": "value"}
 
-def test_rr054_openrouter_route_symbols_are_thin_provider_delegates() -> None:
+    headers = retry_runtime.extract_upstream_headers(HeaderError())
+    assert dict(headers) == {"Retry-After": "4", "X-Test": "value"}
+    assert retry_runtime.parse_retry_after_seconds_from_headers(headers) == 4.0
+    assert retry_runtime.get_header_value(headers, "x-test") == "value"
+
+
+def test_rr054_openrouter_route_symbols_are_installed_package_facades() -> None:
     god_functions = _functions(_parse(GOD_PATH))
-    god_tree = _parse(GOD_PATH)
-    god_assignments = {
-        target.id: node.value
-        for node in god_tree.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
+    installed_names = set(openrouter_runtime._HOST_FUNCTION_NAMES)
 
-    for wrapper_name, provider_name in OPENROUTER_PROVIDER_DELEGATES.items():
-        wrapper = god_functions.get(wrapper_name)
-
-        # Wave 6B: accept either thin delegate function or direct same-object assignment
-        if wrapper is not None:
-            # Legacy thin delegate pattern
-            expected_call = f"{GOD_PROVIDER_ALIAS}.{provider_name}"
-            calls = _calls(wrapper)
-            assert expected_call in calls, (
-                f"{wrapper_name} must delegate to {expected_call}; "
-                f"calls={sorted(calls)}"
-            )
-            delegate_calls = _call_nodes(wrapper, expected_call)
-            assert len(delegate_calls) == 1, (
-                f"{wrapper_name} must call {expected_call} exactly once"
-            )
-            delegate_call = delegate_calls[0]
-            assert delegate_call.args, (
-                f"{wrapper_name} must pass {GOD_RUNTIME_NAME} as the first argument"
-            )
-            first_argument = delegate_call.args[0]
-            assert isinstance(first_argument, ast.Name)
-            assert first_argument.id == GOD_RUNTIME_NAME, (
-                f"{wrapper_name} must use the shared injected runtime "
-                f"{GOD_RUNTIME_NAME}, got {ast.dump(first_argument)}"
-            )
-
-            statements = _meaningful_statements(wrapper)
-            assert len(statements) <= 2, (
-                f"{wrapper_name} retains implementation logic instead of being a "
-                f"thin provider delegate ({len(statements)} top-level statements)"
-            )
-
-            forbidden_control_flow = [
-                node
-                for node in ast.walk(wrapper)
-                if isinstance(
-                    node,
-                    (
-                        ast.For,
-                        ast.AsyncFor,
-                        ast.While,
-                        ast.If,
-                        ast.Try,
-                        ast.With,
-                        ast.AsyncWith,
-                        ast.Match,
-                    ),
-                )
-            ]
-            assert not forbidden_control_flow, (
-                f"{wrapper_name} retains retry/transport control flow outside the "
-                "OpenRouter provider adapter"
-            )
-        else:
-            # Wave 6B canonical pattern: direct same-object assignment to extracted module
-            assert wrapper_name in god_assignments, (
-                f"historical OpenRouter route entrypoint {wrapper_name} must remain "
-                "as a compatibility delegate or same-object facade assignment"
-            )
-            assigned_value = god_assignments[wrapper_name]
-            assert isinstance(assigned_value, ast.Attribute), (
-                f"{wrapper_name} must be assigned from the extracted Wave 6B module"
-            )
-            assert isinstance(assigned_value.value, ast.Name), (
-                f"{wrapper_name} assignment must reference the extracted module"
-            )
-            assert assigned_value.value.id == "_wave6b_openrouter_runtime", (
-                f"{wrapper_name} must be assigned from _wave6b_openrouter_runtime, "
-                f"got {assigned_value.value.id}"
-            )
-            assert assigned_value.attr == wrapper_name, (
-                f"{wrapper_name} must be assigned the same-named function from "
-                f"_wave6b_openrouter_runtime, got {assigned_value.attr}"
-            )
-            # Verify same-object identity at runtime
-            from litellm.proxy.pass_through_endpoints.providers.openrouter import runtime as openrouter_runtime
-            assert getattr(lpe, wrapper_name) is getattr(openrouter_runtime, wrapper_name), (
-                f"{wrapper_name} must be the same object as "
-                f"_wave6b_openrouter_runtime.{wrapper_name}"
-            )
+    for wrapper_name in OPENROUTER_PROVIDER_DELEGATES:
+        assert wrapper_name not in god_functions, (
+            f"{wrapper_name} must be package-owned, not a god-module FunctionDef"
+        )
+        assert wrapper_name in installed_names, (
+            f"OpenRouter install inventory is missing {wrapper_name}"
+        )
+        assert getattr(lpe, wrapper_name) is getattr(
+            openrouter_runtime,
+            wrapper_name,
+        ), (
+            f"{wrapper_name} must be the same object as "
+            f"{GOD_RUNTIME_ALIAS}.{wrapper_name}"
+        )
 
 
 # --- Wave 6B extracted runtime forwarding contract -------------------------
@@ -370,15 +312,7 @@ def test_rr054_openrouter_route_symbols_are_thin_provider_delegates() -> None:
 # configured runtime through ``_retry_runtime()`` rather than constructing or
 # importing a runtime of its own.
 
-WAVE6B_RUNTIME_PATH = (
-    Path(__file__).resolve().parents[4]
-    / "litellm"
-    / "proxy"
-    / "pass_through_endpoints"
-    / "providers"
-    / "openrouter"
-    / "runtime.py"
-)
+WAVE6B_RUNTIME_PATH = Path(openrouter_runtime.__file__).resolve()
 RETRY_TRANSPORT_MODULE_ALIAS = "_anthropic_openrouter_retry_transport"
 
 

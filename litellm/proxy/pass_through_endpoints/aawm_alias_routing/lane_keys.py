@@ -23,8 +23,6 @@ if TYPE_CHECKING:
     # Host-global functions
     def _clean_codex_auth_value(value: Any) -> Optional[str]: ...
     def _safe_get_request_headers(request: Any) -> dict: ...
-    def _get_anthropic_adapter_google_auth_file_path() -> Any: ...
-    def _get_antigravity_auth_file_path() -> Any: ...
 
 from types import FunctionType
 
@@ -35,8 +33,6 @@ _HOST_FUNCTION_NAMES = (
     "_resolve_codex_auto_agent_openai_lane_key",
     "_resolve_codex_auto_agent_openai_cooldown_lane_key",
     "_get_codex_auto_agent_lane_state_cache_ttl_seconds",
-    "_get_codex_auto_agent_google_lane_cache_key",
-    "_get_codex_auto_agent_antigravity_lane_cache_key",
     "_codex_auto_agent_candidate_key",
     "_resolve_codex_auto_agent_xai_lane_key",
     "_resolve_anthropic_auto_agent_native_lane_key",
@@ -229,18 +225,6 @@ def _get_codex_auto_agent_lane_state_cache_ttl_seconds() -> float:
     except Exception:
         return _CODEX_AUTO_AGENT_LANE_STATE_CACHE_TTL_SECONDS
     return max(0.0, parsed)
-
-def _get_codex_auto_agent_google_lane_cache_key() -> str:
-    auth_path = _get_anthropic_adapter_google_auth_file_path()
-    if auth_path is not None:
-        return f"google-auth:{auth_path.expanduser()}"
-    return "google-auth:__default__"
-
-def _get_codex_auto_agent_antigravity_lane_cache_key() -> str:
-    auth_path = _get_antigravity_auth_file_path()
-    if auth_path is not None:
-        return f"antigravity-auth:{auth_path.expanduser()}"
-    return "antigravity-auth:__default__"
 
 def _codex_auto_agent_candidate_key(
     candidate: dict[str, Any],

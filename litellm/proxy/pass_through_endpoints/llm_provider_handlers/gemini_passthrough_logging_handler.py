@@ -90,55 +90,24 @@ class GeminiPassthroughLoggingHandler:
         return parsed_objects[-1]
 
     @staticmethod
-    def _unwrap_code_assist_response_body(response_body: Any) -> Any:
-        if isinstance(response_body, list):
-            for item in reversed(response_body):
-                unwrapped_item = GeminiPassthroughLoggingHandler._unwrap_code_assist_response_body(
-                    item
-                )
-                if isinstance(unwrapped_item, dict):
-                    return unwrapped_item
-            return response_body
-        if isinstance(response_body, dict) and isinstance(response_body.get("response"), dict):
-            return response_body["response"]
-        return response_body
-
-    @staticmethod
-    def _response_for_transform(
-        httpx_response: httpx.Response,
-        response_body: Any,
-    ) -> httpx.Response:
-        unwrapped_response = GeminiPassthroughLoggingHandler._unwrap_code_assist_response_body(
-            response_body
-        )
-        if unwrapped_response is response_body:
-            return httpx_response
-
-        sanitized_headers = dict(httpx_response.headers)
-        for header_name in (
-            "content-encoding",
-            "transfer-encoding",
-            "content-length",
-        ):
-            sanitized_headers.pop(header_name, None)
-
-        return httpx.Response(
-            status_code=httpx_response.status_code,
-            headers=sanitized_headers,
-            content=json.dumps(unwrapped_response).encode("utf-8"),
-            request=getattr(httpx_response, "request", None),
-        )
-
-    @staticmethod
     def _extract_usage_object_from_response_body(
         response_body: Any,
     ) -> Optional[Dict[str, Any]]:
-        unwrapped_response = GeminiPassthroughLoggingHandler._unwrap_code_assist_response_body(
-            response_body
-        )
-        if not isinstance(unwrapped_response, dict):
+        if isinstance(response_body, list):
+            usage_object: Optional[Dict[str, Any]] = None
+            for item in response_body:
+                if not isinstance(item, dict) or "usageMetadata" not in item:
+                    continue
+                usage_metadata = item.get("usageMetadata")
+                usage_object = (
+                    dict(usage_metadata)
+                    if isinstance(usage_metadata, dict) and usage_metadata
+                    else None
+                )
+            return usage_object
+        if not isinstance(response_body, dict):
             return None
-        usage_metadata = unwrapped_response.get("usageMetadata")
+        usage_metadata = response_body.get("usageMetadata")
         if not isinstance(usage_metadata, dict) or not usage_metadata:
             return None
         return dict(usage_metadata)
@@ -250,10 +219,6 @@ class GeminiPassthroughLoggingHandler:
                 url=url_route,
                 request_body=request_body,
             )
-            transformed_httpx_response = GeminiPassthroughLoggingHandler._response_for_transform(
-                httpx_response=httpx_response,
-                response_body=response_body,
-            )
 
             # Use Gemini config for transformation
             instance_of_gemini_llm = litellm.GoogleAIStudioGeminiConfig()
@@ -263,7 +228,7 @@ class GeminiPassthroughLoggingHandler:
                     messages=[
                         {"role": "user", "content": "no-message-pass-through-endpoint"}
                     ],
-                    raw_response=transformed_httpx_response,
+                    raw_response=httpx_response,
                     model_response=litellm.ModelResponse(),
                     logging_obj=logging_obj,
                     optional_params={},
@@ -366,54 +331,6 @@ class GeminiPassthroughLoggingHandler:
         url_route: str,
     ) -> Optional[Union[ModelResponse, TextCompletionResponse]]:
         if "generateContent" in url_route or "streamGenerateContent" in url_route:
-            parsed_json_chunks = []
-            for chunk in all_chunks:
-                parsed_json_chunks.extend(
-                    GeminiPassthroughLoggingHandler._parse_stream_chunk_json_objects(
-                        chunk
-                    )
-                )
-
-            code_assist_chunks = [
-                chunk.get("response")
-                for chunk in parsed_json_chunks
-                if isinstance(chunk, dict) and isinstance(chunk.get("response"), dict)
-            ]
-            if len(code_assist_chunks) > 0:
-                if len(code_assist_chunks) > 1:
-                    complete_streaming_response = (
-                        GeminiPassthroughLoggingHandler._build_complete_response_from_gemini_stream_chunks(
-                            all_chunks=[
-                                json.dumps(chunk) for chunk in code_assist_chunks
-                            ],
-                            litellm_logging_obj=litellm_logging_obj,
-                        )
-                    )
-                    if complete_streaming_response is not None:
-                        if getattr(complete_streaming_response, "model", None) is None:
-                            complete_streaming_response.model = model
-                        return complete_streaming_response
-
-                transformed_httpx_response = httpx.Response(
-                    status_code=200,
-                    content=json.dumps(code_assist_chunks[-1]).encode("utf-8"),
-                )
-                instance_of_gemini_llm = litellm.GoogleAIStudioGeminiConfig()
-                return instance_of_gemini_llm.transform_response(
-                    model=model,
-                    messages=[
-                        {"role": "user", "content": "no-message-pass-through-endpoint"}
-                    ],
-                    raw_response=transformed_httpx_response,
-                    model_response=litellm.ModelResponse(),
-                    logging_obj=litellm_logging_obj,
-                    optional_params={},
-                    litellm_params={},
-                    api_key="",
-                    request_data={},
-                    encoding=litellm.encoding,
-                )
-
             complete_streaming_response = (
                 GeminiPassthroughLoggingHandler._build_complete_response_from_gemini_stream_chunks(
                     all_chunks=all_chunks,
@@ -542,19 +459,4 @@ class GeminiPassthroughLoggingHandler:
         model: str,
         custom_llm_provider: str,
     ) -> tuple[str, str]:
-        if custom_llm_provider == "antigravity" and model.startswith("claude-"):
-            return f"vertex_ai/{model}", "vertex_ai"
-        if custom_llm_provider == "antigravity" and model.startswith("gemini-"):
-            return (
-                GeminiPassthroughLoggingHandler._get_antigravity_gemini_cost_model(
-                    model
-                ),
-                "gemini",
-            )
         return model, "gemini"
-
-    @staticmethod
-    def _get_antigravity_gemini_cost_model(model: str) -> str:
-        if model.endswith("-low"):
-            return model[: -len("-low")]
-        return model

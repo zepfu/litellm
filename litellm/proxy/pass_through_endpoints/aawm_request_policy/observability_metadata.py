@@ -1349,6 +1349,94 @@ def _add_route_family_logging_metadata(
 
 
 # ---------------------------------------------------------------------------
+# Host publication surface
+# ---------------------------------------------------------------------------
+
+_HOST_PUBLISHED_NAMES: tuple[str, ...] = (
+    # Shared primitives
+    "_merge_litellm_metadata",
+    "_format_langfuse_span_timestamp",
+    "_build_langfuse_span_descriptor",
+    "_normalize_low_cardinality_tag_value",
+    "_dedupe_sorted_str_list",
+    "_iter_anthropic_text_fragments",
+    # Claude child-agent
+    "_extract_claude_agent_and_tenant_from_request_body",
+    "_add_claude_child_agent_observability_metadata",
+    # Post-rewrite context files
+    "_detect_claude_post_rewrite_context_files",
+    "_add_claude_post_rewrite_context_file_logging_metadata",
+    # Session / repository
+    "_get_nested_str_value",
+    "_extract_passthrough_session_id",
+    "_normalize_passthrough_repository",
+    "_extract_passthrough_repository_from_text",
+    "_walk_request_value_with_budget",
+    "_extract_passthrough_repository_from_body_text",
+    "_extract_passthrough_repository",
+    "_get_passthrough_trace_environment",
+    "_add_passthrough_trace_context_metadata",
+    # Tool-definition snapshot
+    "_truncate_tool_definition_string",
+    "_redact_tool_definition_string",
+    "_sanitize_tool_definition_value",
+    "_tool_definition_name",
+    "_tool_definition_description",
+    "_tool_definition_parameters",
+    "_build_tool_definition_snapshot_entry",
+    "_tool_definition_snapshot_hash",
+    "_build_passthrough_tool_definition_metadata",
+    "_add_passthrough_tool_definition_metadata",
+    # Prepare request body
+    "_prepare_request_body_for_passthrough_observability",
+    # Breakout extraction / logging
+    "_extract_openai_passthrough_tool_choice",
+    "_extract_claude_request_breakout_fields",
+    "_add_claude_request_breakout_logging_metadata",
+    "_extract_gemini_request_breakout_fields",
+    "_add_gemini_request_breakout_logging_metadata",
+    "_extract_codex_request_breakout_fields",
+    "_add_codex_request_breakout_logging_metadata",
+    # Anthropic billing header
+    "_parse_anthropic_billing_header_text",
+    "_extract_anthropic_billing_header_fields",
+    "_extract_anthropic_billing_header_fields_from_request_body",
+    "_add_anthropic_billing_header_logging_metadata",
+    # Claude persisted-output
+    "_add_claude_persisted_output_logging_metadata",
+    # Route family
+    "_add_route_family_logging_metadata",
+    # Constants
+    "_ANTHROPIC_BILLING_HEADER_PREFIX",
+    "_AAWM_TOOL_DEFINITION_CAPTURE_VERSION",
+    "_AAWM_TOOL_DEFINITION_MAX_TOOLS",
+    "_PASSTHROUGH_SESSION_ID_HEADER_NAMES",
+    "_PASSTHROUGH_REPOSITORY_HEADER_NAMES",
+    "_PASSTHROUGH_REPOSITORY_BODY_KEYS",
+    "_PASSTHROUGH_REPOSITORY_TEXT_PATTERNS",
+    "_PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES",
+    "_PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES",
+)
+
+
+def install(host_globals: dict[str, Any]) -> None:
+    """Publish same-object observability facades into *host_globals*.
+
+    Contract:
+
+    * Copies the exact module-level objects (functions and constants) named
+      in _HOST_PUBLISHED_NAMES into *host_globals*.
+    * Preserves object identity: every published value is the owner
+      module's object, so mutable constants and late runtime configuration
+      via configure_observability_metadata_runtime remain shared.
+    * Does **not** import llm_passthrough_endpoints or any god module.
+    """
+    module_globals = globals()
+    for name in _HOST_PUBLISHED_NAMES:
+        host_globals[name] = module_globals[name]
+
+
+# ---------------------------------------------------------------------------
 # Owned-symbol inventory
 # ---------------------------------------------------------------------------
 

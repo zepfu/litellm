@@ -510,11 +510,6 @@ def _infer_provider_and_route_family(
         or "x-grok-" in normalized
     ):
         return "xai", "grok_cli_chat_proxy", "provider_exception"
-    if (
-        "cloudcode-pa.googleapis.com" in normalized
-        or "google code assist" in normalized
-    ):
-        return "gemini", "google_code_assist_generate_content", "provider_exception"
     if path and path.startswith("/anthropic"):
         return "anthropic", "anthropic_messages", "provider_exception"
     if "anthropic" in normalized or "claude-" in normalized:

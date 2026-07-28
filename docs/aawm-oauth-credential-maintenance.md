@@ -61,7 +61,6 @@ Related deeper context:
 | Managed xAI OAuth (`oa_xai/*`) | `scripts/xai_oauth_refresh.py` (sidecar) | LiteLLM managed xAI OAuth routes | `~/.litellm/xai/oauth-auth.json` |
 | Grok native OIDC | `scripts/grok_oidc_refresh.py` (sidecar) | LiteLLM Grok native routes | Caller-supplied configured path |
 | Kimi Code CLI OAuth (`kimi_code`) | Existing Kimi Code CLI grant; sidecar refresh only when enabled | Configured LiteLLM Kimi Code consumers | `~/.kimi-code/credentials/kimi-code.json` |
-| Antigravity OAuth | `scripts/antigravity_oauth_refresh.py` (manual / non-sidecar) | LiteLLM Antigravity routes | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
 
 LiteLLM is a **read-only consumer** of these files during request handling. It
 selects a still-valid access token (or fails the candidate with a clear
@@ -86,15 +85,12 @@ credential path. Defaults must not hardcode a specific operator home directory.
 | Managed xAI OAuth | `~/.litellm/xai/oauth-auth.json` | `~/.litellm/xai/oauth-auth.json.lock` |
 | Grok OIDC | Caller-supplied configured path | same directory, `.lock` sibling when configured |
 | Kimi Code CLI OAuth | `~/.kimi-code/credentials/kimi-code.json` | `~/.kimi-code/oauth/kimi-code` (native `proper-lockfile` creates the transient `kimi-code.lock` directory) |
-| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` | `~/.gemini/antigravity-cli/antigravity-oauth-token.lock` |
-| Antigravity CLI binary candidates | `~/.local/bin/agy` | n/a |
 
 Override paths with the normal env vars for the family in use (for example
 `AAWM_CODEX_AUTH_FILE` / `LITELLM_CODEX_AUTH_FILE`,
 `AAWM_XAI_OAUTH_AUTH_FILE` / `LITELLM_XAI_OAUTH_AUTH_FILE`,
 `AAWM_KIMI_OAUTH_AUTH_FILE` / `LITELLM_KIMI_OAUTH_AUTH_FILE`,
 `LITELLM_XAI_GROK_AUTH_FILE`,
-`AAWM_ANTIGRAVITY_AUTH_FILE` / `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` and seed
 variants). Compose may bind the expanded host path into containers; the script
 defaults themselves remain `~`-relative so other operators and hosts work
 without patching source.
@@ -135,11 +131,11 @@ where the script supports that (Codex and Grok repair paths).
 Publication preserves existing file ownership and private mode unless optional
 env overrides are set. Each family uses the same shape:
 
-| Purpose | Codex | Managed xAI | Grok OIDC | Kimi Code CLI | Antigravity |
+| Purpose | Codex | Managed xAI | Grok OIDC | Kimi Code CLI |
 | --- | --- | --- | --- | --- | --- |
-| UID | `AAWM_CODEX_AUTH_FILE_UID` | `AAWM_XAI_OAUTH_AUTH_FILE_UID` | `AAWM_GROK_OIDC_AUTH_FILE_UID` | `AAWM_KIMI_OAUTH_AUTH_FILE_UID` | `AAWM_ANTIGRAVITY_AUTH_FILE_UID` |
-| GID | `AAWM_CODEX_AUTH_FILE_GID` | `AAWM_XAI_OAUTH_AUTH_FILE_GID` | `AAWM_GROK_OIDC_AUTH_FILE_GID` | `AAWM_KIMI_OAUTH_AUTH_FILE_GID` | `AAWM_ANTIGRAVITY_AUTH_FILE_GID` |
-| Mode | `AAWM_CODEX_AUTH_FILE_MODE` | `AAWM_XAI_OAUTH_AUTH_FILE_MODE` | `AAWM_GROK_OIDC_AUTH_FILE_MODE` | `AAWM_KIMI_OAUTH_AUTH_FILE_MODE` | `AAWM_ANTIGRAVITY_AUTH_FILE_MODE` |
+| UID | `AAWM_CODEX_AUTH_FILE_UID` | `AAWM_XAI_OAUTH_AUTH_FILE_UID` | `AAWM_GROK_OIDC_AUTH_FILE_UID` | `AAWM_KIMI_OAUTH_AUTH_FILE_UID` |
+| GID | `AAWM_CODEX_AUTH_FILE_GID` | `AAWM_XAI_OAUTH_AUTH_FILE_GID` | `AAWM_GROK_OIDC_AUTH_FILE_GID` | `AAWM_KIMI_OAUTH_AUTH_FILE_GID` |
+| Mode | `AAWM_CODEX_AUTH_FILE_MODE` | `AAWM_XAI_OAUTH_AUTH_FILE_MODE` | `AAWM_GROK_OIDC_AUTH_FILE_MODE` | `AAWM_KIMI_OAUTH_AUTH_FILE_MODE` |
 
 Rules:
 
@@ -231,36 +227,12 @@ Any production-equivalent deployment must preserve the same read-only worker
 and single-writer sidecar contract, but production mutation remains a separate
 operator-authorized rollout.
 
-## Antigravity staged HOME distinction
+## Historical credential records
 
-Antigravity is different from the Codex / xAI / Grok sidecar-owned families:
-
-| Concern | Behavior |
-| --- | --- |
-| Scheduled writer | Provider-status sidecar does **not** own Antigravity OAuth refresh or Antigravity auth telemetry. |
-| Manual / external writer | `scripts/antigravity_oauth_refresh.py` |
-| LiteLLM role | Read-only consumer of managed and/or seed token files |
-| Alias degradation | Stale/missing Antigravity auth is `auth_degraded` candidate skip, not a request-path refresh |
-
-When direct OAuth refresh fails and the script falls back to the `agy` CLI, it
-stages an isolated private HOME tree:
-
-1. Create an unpredictable private temp directory (`tempfile.mkdtemp`, mode
-   `0700`).
-2. Stage seed credentials under
-   `<staged_home>/.gemini/antigravity-cli/antigravity-oauth-token` at mode
-   `0600` using the same private write helpers (no umask window, symlink
-   refusal).
-3. Set `HOME` for the CLI subprocess to that staged home so the CLI never
-   mutates the operator's real home layout during fallback.
-4. Prefer the staged home for `--log-file` output; otherwise use another private
-   `0700` temp parent.
-5. Unconditionally remove the staged tree in `finally` on every exit path
-   (success, timeout, non-zero CLI exit, OSError).
-
-The staged HOME is temporary publish/isolation state only. The durable
-credential that LiteLLM reads remains the configured Antigravity auth/seed path
-after the script publishes or leaves a valid token in place.
+Older deployment notes may mention Antigravity credential files or refresh
+helpers. Those references are retained only to interpret historical records;
+they do not describe a current LiteLLM route, package, credential, or
+maintenance contract.
 
 ## No container restart required
 
@@ -288,8 +260,6 @@ restart event.
 4. Run the family refresh (sidecar cycle or manual script) and inspect the
    summary: `refreshed` / `skipped` / redacted `error_message` only.
 5. Verify LiteLLM continues serving without restart once the file is updated.
-6. For Antigravity, treat CLI fallback staged HOME as ephemeral and confirm
-   cleanup left no `litellm-antigravity-cli-home-*` directories behind.
 
 ## Implementation map
 
@@ -303,5 +273,4 @@ restart event.
 | Managed xAI refresh | `scripts/xai_oauth_refresh.py` |
 | Grok OIDC refresh | `scripts/grok_oidc_refresh.py` |
 | Managed Kimi Code refresh | `scripts/kimi_oauth_refresh.py` |
-| Antigravity refresh | `scripts/antigravity_oauth_refresh.py` |
 | Sidecar loop | `scripts/run_provider_status_observations_loop.py` |

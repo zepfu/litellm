@@ -47,7 +47,7 @@
       "address": "decorated_function:gemini_proxy_route",
       "qualified_name": "gemini_proxy_route",
       "source_kind": "decorated_function",
-      "sha256": "fdb0af562be92f256591bedbb45961a1f47c0257b7192465a5731f75f69bc605"
+      "sha256": "4422b6318c181fb53293762277910cef9730619f6f448f0bdfe684c7562ddb5f"
     },
     {
       "address": "decorated_function:mistral_proxy_route",

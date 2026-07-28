@@ -24,9 +24,6 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 from litellm.types.utils import StandardPassThroughResponseObject
 from litellm.utils import executor as thread_pool_executor
 
-from .google_code_assist_quota import (
-    sanitize_google_code_assist_quota_for_logging,
-)
 from .llm_provider_handlers.anthropic_passthrough_logging_handler import (
     AnthropicPassthroughLoggingHandler,
 )
@@ -635,38 +632,6 @@ class PassThroughEndpointLogging:
         elif self.is_langfuse_route(url_route):
             # Don't log langfuse pass-through requests
             return
-        elif custom_llm_provider in {
-            "gemini",
-            "antigravity",
-        } and not self.is_gemini_route(url_route, custom_llm_provider):
-            # Gemini CLI performs Code Assist control-plane calls before model
-            # generation. Most do not contain model/usage data and should not
-            # create fallback session_history rows. retrieveUserQuota is the
-            # exception: it contains account quota state, so log it as a
-            # rate-limit observation only.
-            if "retrieveUserQuota" not in url_route:
-                return
-            quota_source = (
-                "antigravity_retrieve_user_quota"
-                if custom_llm_provider == "antigravity"
-                else "google_retrieve_user_quota"
-            )
-            sanitized_quota = sanitize_google_code_assist_quota_for_logging(
-                response_body,
-                source=quota_source,
-            )
-            if not sanitized_quota:
-                return
-            litellm_params = kwargs.get("litellm_params")
-            if not isinstance(litellm_params, dict):
-                litellm_params = {}
-                kwargs["litellm_params"] = litellm_params
-            metadata = litellm_params.get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = {}
-                litellm_params["metadata"] = metadata
-            metadata["google_retrieve_user_quota"] = sanitized_quota
-            metadata["aawm_rate_limit_observation_only"] = True
         else:
             self._record_upstream_rate_limit_headers_metadata(
                 kwargs,
@@ -804,10 +769,7 @@ class PassThroughEndpointLogging:
         """Check if the URL route is a Gemini API route."""
         normalized_url_route = url_route.lower()
         for route in self.TRACKED_GEMINI_ROUTES:
-            if route.lower() in normalized_url_route and custom_llm_provider in {
-                "gemini",
-                "antigravity",
-            }:
+            if route.lower() in normalized_url_route and custom_llm_provider == "gemini":
                 return True
         return False
 

@@ -39,9 +39,6 @@ _CHATGPT_CODEX_MODEL_NOT_SUPPORTED_FOR_ACCOUNT_MARKERS = (
     "not supported when using codex with a chatgpt account",
     "model is not supported",
 )
-_GOOGLE_CODE_ASSIST_HOST_SUFFIX = "cloudcode-pa.googleapis.com"
-_GOOGLE_CODE_ASSIST_TOS_REASON = "TOS_VIOLATION"
-_GOOGLE_CODE_ASSIST_PERMISSION_DENIED_STATUS = "PERMISSION_DENIED"
 
 
 def _get_passthrough_request_url_path(request: Request) -> str:
@@ -149,15 +146,3 @@ def _is_anthropic_passthrough_target(
     provider = str(custom_llm_provider or "").strip().lower()
     hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
     return provider == "anthropic" or hostname == "api.anthropic.com"
-
-
-def _is_google_code_assist_passthrough_target(
-    *,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-) -> bool:
-    provider = str(custom_llm_provider or "").strip().lower()
-    hostname = str(getattr(url, "host", "") or "").lower() if url is not None else ""
-    return provider in {"google_code_assist", "antigravity"} or hostname.endswith(
-        _GOOGLE_CODE_ASSIST_HOST_SUFFIX
-    )

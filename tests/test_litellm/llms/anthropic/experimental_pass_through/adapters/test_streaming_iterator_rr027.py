@@ -1,4 +1,4 @@
-"""RR-027: Anthropic stream wrapper SSE emitters + Gemini debug logging level."""
+"""RR-027: Anthropic stream wrapper SSE emitters and residual contracts."""
 
 from __future__ import annotations
 
@@ -57,17 +57,6 @@ def test_encode_anthropic_sse_chunk_frames_dict_and_passes_through_bytes() -> No
     assert si.encode_anthropic_sse_chunk(raw) is raw
 
 
-def test_wrapper_init_caches_gemini_debug_flag_without_per_chunk_getenv() -> None:
-    with patch.object(
-        si, "is_aawm_gemini_route_debug_enabled", return_value=True
-    ) as mock_flag:
-        wrapper = si.AnthropicStreamWrapper(
-            completion_stream=iter(()), model="gemini/foo"
-        )
-    mock_flag.assert_called_once()
-    assert wrapper._gemini_route_debug is True
-
-
 class _OneChunkStream:
     def __init__(self, chunk: ModelResponseStream) -> None:
         self._chunk = chunk
@@ -92,64 +81,54 @@ class _OneChunkStream:
         return self._chunk
 
 
-def _text_chunk() -> ModelResponseStream:
-    return ModelResponseStream(
-        choices=[
-            StreamingChoices(delta=Delta(content="hi"), index=0, finish_reason=None)
-        ]
+def _primed_text_wrapper() -> si.AnthropicStreamWrapper:
+    wrapper = si.AnthropicStreamWrapper(
+        completion_stream=_OneChunkStream(
+            ModelResponseStream(
+                choices=[
+                    StreamingChoices(
+                        delta=Delta(content="hi"),
+                        index=0,
+                        finish_reason=None,
+                    )
+                ]
+            )
+        ),
+        model="gemini/x",
     )
-
-
-def test_gemini_debug_uses_debug_level_not_warning() -> None:
-    stream = _OneChunkStream(_text_chunk())
-    wrapper = si.AnthropicStreamWrapper(completion_stream=stream, model="gemini/x")
-    wrapper._gemini_route_debug = True
-    # skip message_start by priming so the first OpenAI chunk hits the dump path
     wrapper.sent_first_chunk = True
     wrapper.sent_content_block_start = True
     wrapper.current_content_block_type = "text"
+    return wrapper
 
-    with patch.object(si.verbose_logger, "debug") as mock_debug, patch.object(
-        si.verbose_logger, "warning"
-    ) as mock_warning, patch(
+
+def _translated_text_delta() -> dict:
+    return {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "hi"},
+    }
+
+
+def test_sync_stream_preserves_translated_gemini_text_delta() -> None:
+    wrapper = _primed_text_wrapper()
+
+    with patch(
         "litellm.llms.anthropic.experimental_pass_through.adapters.transformation.LiteLLMAnthropicMessagesAdapter.translate_streaming_openai_response_to_anthropic",
-        return_value={
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "hi"},
-        },
+        return_value=_translated_text_delta(),
     ):
-        out = next(wrapper)
-        assert out["type"] == "content_block_delta"
-        mock_debug.assert_called()
-        assert "Anthropic wrapper debug(sync)" in mock_debug.call_args.args[0]
-        mock_warning.assert_not_called()
+        assert next(wrapper) == _translated_text_delta()
 
 
 @pytest.mark.asyncio
-async def test_gemini_debug_async_uses_debug_level() -> None:
-    stream = _OneChunkStream(_text_chunk())
-    wrapper = si.AnthropicStreamWrapper(completion_stream=stream, model="gemini/x")
-    wrapper._gemini_route_debug = True
-    wrapper.sent_first_chunk = True
-    wrapper.sent_content_block_start = True
-    wrapper.current_content_block_type = "text"
+async def test_async_stream_preserves_translated_gemini_text_delta() -> None:
+    wrapper = _primed_text_wrapper()
 
-    with patch.object(si.verbose_logger, "debug") as mock_debug, patch.object(
-        si.verbose_logger, "warning"
-    ) as mock_warning, patch(
+    with patch(
         "litellm.llms.anthropic.experimental_pass_through.adapters.transformation.LiteLLMAnthropicMessagesAdapter.translate_streaming_openai_response_to_anthropic",
-        return_value={
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "hi"},
-        },
+        return_value=_translated_text_delta(),
     ):
-        out = await wrapper.__anext__()
-        assert out["type"] == "content_block_delta"
-        mock_debug.assert_called()
-        assert "Anthropic wrapper debug(async)" in mock_debug.call_args.args[0]
-        mock_warning.assert_not_called()
+        assert await wrapper.__anext__() == _translated_text_delta()
 
 
 def test_anthropic_sse_wrapper_uses_shared_encoder() -> None:
@@ -323,20 +302,23 @@ def test_tool_use_multi_tool_path_skips_empty_partial_json_and_uses_shared_emitt
     assert types.index("content_block_delta") < types.index("content_block_stop")
 
 
-def test_streaming_iterator_source_has_no_per_chunk_gemini_warning_or_getenv() -> None:
+def test_stream_sources_have_no_aawm_gemini_debug_residue() -> None:
     """RR-027 #3 residual proof against source drift."""
     import inspect
 
-    source = inspect.getsource(si.AnthropicStreamWrapper)
-    # flag resolved in __init__ via helper, not os.getenv inside next/anext
-    assert 'os.getenv("AAWM_GEMINI_ROUTE_DEBUG")' not in source
-    assert (
-        "verbose_logger.warning(" not in source
-        or "Anthropic wrapper debug" not in source
+    from litellm.llms.vertex_ai.gemini import (
+        vertex_and_google_ai_studio_gemini as gemini_module,
     )
-    # positive: debug path present
-    assert "verbose_logger.debug(" in source
-    assert "self._gemini_route_debug" in source
+
+    anthropic_source = inspect.getsource(si)
+    assert "AAWM_GEMINI_ROUTE_DEBUG" not in anthropic_source
+    assert "is_aawm_gemini_route_debug_enabled" not in anthropic_source
+    assert "_gemini_route_debug" not in anthropic_source
+    assert "Anthropic wrapper debug" not in anthropic_source
+
+    gemini_source = inspect.getsource(gemini_module.ModelResponseIterator)
+    assert "AAWM_GEMINI_ROUTE_DEBUG" not in gemini_source
+    assert "Gemini iterator debug" not in gemini_source
 
 
 def test_no_inline_content_block_envelope_literals_in_wrapper_methods() -> None:

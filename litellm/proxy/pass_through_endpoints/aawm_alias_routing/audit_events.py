@@ -27,7 +27,12 @@ _get_auto_agent_alias_request_context: Optional[
     Callable[..., Mapping[str, Any]]
 ] = None
 _attach_auto_agent_alias_terminal_context_fields: Optional[Callable[..., Any]] = None
-_format_auto_agent_alias_timestamp: Optional[Callable[[datetime], str]] = None
+# Default to the owner-concrete implementation from audit_build (D1-591).
+from .audit_build import (
+    _format_auto_agent_alias_timestamp as _default_format_timestamp,
+)
+
+_format_auto_agent_alias_timestamp: Callable[[datetime], str] = _default_format_timestamp
 _extract_auto_agent_alias_metadata_value: Optional[Callable[..., Optional[str]]] = None
 _extract_auto_agent_alias_incoming_endpoint: Optional[Callable[..., str]] = None
 _resolve_codex_auto_agent_session_key: Optional[
@@ -41,13 +46,32 @@ _build_auto_agent_alias_audit_events: Optional[Callable[..., list[dict[str, Any]
 _persist_auto_agent_alias_audit_only_events_best_effort: Optional[Callable[..., str]] = None
 
 _host_globals: Optional[dict] = None
+_MISSING = object()
+_runtime_restore_stacks: dict[str, list[tuple[object, object, object]]] = {}
+
+
+def _update_host_runtime_callbacks(
+    callbacks: Mapping[str, object],
+    previous_module_values: Mapping[str, object],
+) -> None:
+    if _host_globals is None:
+        return
+    for name, callback in callbacks.items():
+        _runtime_restore_stacks.setdefault(name, []).append(
+            (
+                callback,
+                previous_module_values[name],
+                _host_globals.get(name, _MISSING),
+            )
+        )
+        _host_globals[name] = callback
 
 
 def configure_audit_events_runtime(
     *,
     get_request_context: Callable[..., Mapping[str, Any]],
     attach_terminal_context_fields: Callable[..., Any],
-    format_timestamp: Callable[[datetime], str],
+    format_timestamp: Optional[Callable[[datetime], str]] = None,
     extract_metadata_value: Callable[..., Optional[str]],
     extract_incoming_endpoint: Callable[..., str],
     resolve_codex_session_key: Callable[..., Optional[str]],
@@ -68,9 +92,22 @@ def configure_audit_events_runtime(
     global _build_auto_agent_alias_audit_events
     global _persist_auto_agent_alias_audit_only_events_best_effort
 
+    previous_module_values = {
+        "_get_auto_agent_alias_request_context": _get_auto_agent_alias_request_context,
+        "_attach_auto_agent_alias_terminal_context_fields": _attach_auto_agent_alias_terminal_context_fields,
+        "_format_auto_agent_alias_timestamp": _format_auto_agent_alias_timestamp,
+        "_extract_auto_agent_alias_metadata_value": _extract_auto_agent_alias_metadata_value,
+        "_extract_auto_agent_alias_incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint,
+        "_resolve_codex_auto_agent_session_key": _resolve_codex_auto_agent_session_key,
+        "_resolve_anthropic_auto_agent_session_key": _resolve_anthropic_auto_agent_session_key,
+        "_emit_auto_agent_alias_route_event": _emit_auto_agent_alias_route_event,
+        "_build_auto_agent_alias_audit_events": _build_auto_agent_alias_audit_events,
+        "_persist_auto_agent_alias_audit_only_events_best_effort": _persist_auto_agent_alias_audit_only_events_best_effort,
+    }
     _get_auto_agent_alias_request_context = get_request_context
     _attach_auto_agent_alias_terminal_context_fields = attach_terminal_context_fields
-    _format_auto_agent_alias_timestamp = format_timestamp
+    if format_timestamp is not None:
+        _format_auto_agent_alias_timestamp = format_timestamp
     _extract_auto_agent_alias_metadata_value = extract_metadata_value
     _extract_auto_agent_alias_incoming_endpoint = extract_incoming_endpoint
     _resolve_codex_auto_agent_session_key = resolve_codex_session_key
@@ -79,37 +116,21 @@ def configure_audit_events_runtime(
     _build_auto_agent_alias_audit_events = build_audit_events
     _persist_auto_agent_alias_audit_only_events_best_effort = persist_audit_only_events
 
-    if _host_globals is not None:
-        _host_globals["_get_auto_agent_alias_request_context"] = (
-            _get_auto_agent_alias_request_context
-        )
-        _host_globals["_attach_auto_agent_alias_terminal_context_fields"] = (
-            _attach_auto_agent_alias_terminal_context_fields
-        )
-        _host_globals["_format_auto_agent_alias_timestamp"] = (
-            _format_auto_agent_alias_timestamp
-        )
-        _host_globals["_extract_auto_agent_alias_metadata_value"] = (
-            _extract_auto_agent_alias_metadata_value
-        )
-        _host_globals["_extract_auto_agent_alias_incoming_endpoint"] = (
-            _extract_auto_agent_alias_incoming_endpoint
-        )
-        _host_globals["_resolve_codex_auto_agent_session_key"] = (
-            _resolve_codex_auto_agent_session_key
-        )
-        _host_globals["_resolve_anthropic_auto_agent_session_key"] = (
-            _resolve_anthropic_auto_agent_session_key
-        )
-        _host_globals["_emit_auto_agent_alias_route_event"] = (
-            _emit_auto_agent_alias_route_event
-        )
-        _host_globals["_build_auto_agent_alias_audit_events"] = (
-            _build_auto_agent_alias_audit_events
-        )
-        _host_globals["_persist_auto_agent_alias_audit_only_events_best_effort"] = (
-            _persist_auto_agent_alias_audit_only_events_best_effort
-        )
+    _update_host_runtime_callbacks(
+        {
+            "_get_auto_agent_alias_request_context": _get_auto_agent_alias_request_context,
+            "_attach_auto_agent_alias_terminal_context_fields": _attach_auto_agent_alias_terminal_context_fields,
+            "_format_auto_agent_alias_timestamp": _format_auto_agent_alias_timestamp,
+            "_extract_auto_agent_alias_metadata_value": _extract_auto_agent_alias_metadata_value,
+            "_extract_auto_agent_alias_incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint,
+            "_resolve_codex_auto_agent_session_key": _resolve_codex_auto_agent_session_key,
+            "_resolve_anthropic_auto_agent_session_key": _resolve_anthropic_auto_agent_session_key,
+            "_emit_auto_agent_alias_route_event": _emit_auto_agent_alias_route_event,
+            "_build_auto_agent_alias_audit_events": _build_auto_agent_alias_audit_events,
+            "_persist_auto_agent_alias_audit_only_events_best_effort": _persist_auto_agent_alias_audit_only_events_best_effort,
+        },
+        previous_module_values,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +182,6 @@ def _emit_auto_agent_alias_no_candidate_event(
 ) -> None:
     assert _get_auto_agent_alias_request_context is not None
     assert _attach_auto_agent_alias_terminal_context_fields is not None
-    assert _format_auto_agent_alias_timestamp is not None
     assert _extract_auto_agent_alias_metadata_value is not None
     assert _extract_auto_agent_alias_incoming_endpoint is not None
     assert _resolve_codex_auto_agent_session_key is not None
@@ -323,6 +343,44 @@ _HOST_FUNCTION_NAMES = (
 )
 
 
+def _host_callback_delegates_to_module(
+    name: str,
+    callback: object,
+    owner_module: object,
+) -> bool:
+    code = getattr(callback, "__code__", None)
+    callback_globals = getattr(callback, "__globals__", None)
+    if code is None or not isinstance(callback_globals, dict):
+        return False
+
+    owner_callback = getattr(owner_module, name, _MISSING)
+    if callback is owner_callback:
+        return False
+    if (
+        callback_globals.get(name) is callback
+        and getattr(callback, "__name__", None) != name
+    ):
+        return True
+
+    referenced_values = [
+        callback_globals.get(global_name, _MISSING)
+        for global_name in code.co_names
+    ]
+    closure_values = []
+    for cell in getattr(callback, "__closure__", None) or ():
+        try:
+            closure_values.append(cell.cell_contents)
+        except ValueError:
+            continue
+
+    if any(value is owner_callback for value in (*referenced_values, *closure_values)):
+        return True
+    references_seam = name in code.co_names or name in code.co_consts
+    return references_seam and any(
+        value is owner_module for value in (*referenced_values, *closure_values)
+    )
+
+
 def install(host_globals: dict) -> None:
     """Rebind moved functions to host_globals for live lookup.
 
@@ -331,8 +389,18 @@ def install(host_globals: dict) -> None:
     rebound object is published to both this module and the host module.
     """
     global _host_globals
-    _host_globals = host_globals
     _mod = globals()
+    owner_module = _sys.modules[__name__]
+    for _name in _SEAM_NAMES:
+        host_callback = host_globals.get(_name, _MISSING)
+        if host_callback is _MISSING or _host_callback_delegates_to_module(
+            _name,
+            host_callback,
+            owner_module,
+        ):
+            continue
+        _mod[_name] = host_callback
+    _host_globals = host_globals
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         _rebound = _FunctionType(
@@ -399,6 +467,15 @@ class _SeamPropagatingModule(_types.ModuleType):
         if seam_names is not None and name in seam_names:
             hg = self.__dict__.get("_host_globals")
             if hg is not None:
+                restore_stacks = self.__dict__.get("_runtime_restore_stacks", {})
+                restore_stack = restore_stacks.get(name)
+                if restore_stack and value is restore_stack[-1][1]:
+                    _, _, prior_host_value = restore_stack.pop()
+                    if prior_host_value is self.__dict__["_MISSING"]:
+                        hg.pop(name, None)
+                    else:
+                        hg[name] = prior_host_value
+                    return
                 hg[name] = value
 
 

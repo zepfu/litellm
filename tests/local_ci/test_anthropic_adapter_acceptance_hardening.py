@@ -76,13 +76,6 @@ D1251_PARALLEL_CASE_AGENTS = {
         {"Read", "Glob", "Grep"},
         "claude-opus-4-8",
     ),
-    "claude_adapter_antigravity_claude_sonnet_4_6_child_sequential_read_tools": (
-        "harness-antigravity-claude-sonnet-4-6-sequential-read-tools",
-        "antigravity",
-        "claude-sonnet-4-6",
-        {"read_file", "glob", "grep_search"},
-        "antigravity/claude-sonnet-4-6",
-    ),
     "claude_adapter_xai_grok_composer_child_parallel_read_tools": (
         "harness-xai-grok-composer-parallel-read-tools",
         "xai",
@@ -144,7 +137,6 @@ D1251_REQUIRED_TRACE_TAGS = {
     "openai": {"route:anthropic_openai_responses_adapter"},
     "openrouter": {"route:anthropic_openrouter_responses_adapter"},
     "anthropic": {"route:anthropic_messages"},
-    "antigravity": {"route:anthropic_antigravity_completion_adapter"},
     "xai": {
         "route:anthropic_grok_native_responses_adapter",
         "route:anthropic_xai_oauth_responses_adapter",
@@ -170,9 +162,7 @@ D1251_DISALLOWED_TRACE_TAGS_BY_CASE = {
         "route:anthropic_grok_native_responses_adapter",
     },
 }
-D1251_SEQUENTIAL_TRANSCRIPT_CASES = {
-    "claude_adapter_antigravity_claude_sonnet_4_6_child_sequential_read_tools",
-}
+D1251_SEQUENTIAL_TRANSCRIPT_CASES: set = set()
 D1251_OPENCODE_COMPLETION_CASES = {
     "claude_adapter_opencode_zen_big_pickle_child_parallel_read_tools",
 }
@@ -181,7 +171,6 @@ D1256_ALIAS_REPLAY_CASE = (
 )
 D1256_ALIAS_REPLAY_AGENT = "harness-aawm-code-anthropic-alias-parallel-read-tools"
 D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
-    ("antigravity", "claude-sonnet-4-6"),
     ("openai", "gpt-5.3-codex-spark"),
     ("xai", "grok-composer-2.5-fast"),
     ("xai", "oa_xai/grok-build"),
@@ -254,7 +243,6 @@ D1322_CODEX_LOW_ALIAS_REPLAY_CASE = (
     "native_openai_passthrough_responses_codex_aawm_low_tool_activity"
 )
 D1322_AAWM_LOW_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
-    ("antigravity", "gemini-3.5-flash-low"),
     ("openrouter", "openrouter/cohere/north-mini-code:free"),
     ("openrouter", "openrouter/owl-alpha"),
     ("opencode_zen", "deepseek-v4-flash"),
@@ -262,7 +250,6 @@ D1322_AAWM_LOW_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
     ("anthropic", "claude-haiku-4-5-20251001"),
 }
 D1322_AAWM_LOW_CODEX_DECLARED_PROVIDER_MODELS = {
-    ("antigravity", "gemini-3.5-flash-low"),
     ("openrouter", "openrouter/cohere/north-mini-code:free"),
     ("openrouter", "openrouter/owl-alpha"),
     ("opencode_zen", "deepseek-v4-flash"),
@@ -3209,15 +3196,45 @@ def test_d1322_low_anthropic_alias_replay_case_uses_aawm_low_anthropic_child_mod
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
     case_config = config["cases"][D1322_LOW_ANTHROPIC_ALIAS_REPLAY_CASE]
 
-    _assert_parallel_read_common_case(
-        config=config,
-        case_name=D1322_LOW_ANTHROPIC_ALIAS_REPLAY_CASE,
-        case_config=case_config,
-        agent_name=D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT,
-        provider="antigravity",
-        model="gemini-3.5-flash-low",
-        durable_tool_names={"read_file", "glob", "grep_search"},
+    command = case_config["command"]
+    prompt = command[2]
+    assert D1322_LOW_ANTHROPIC_ALIAS_REPLAY_CASE in config["default_excluded_cases"]
+    assert (
+        f"Dispatch to the {D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT} agent" in prompt
     )
+    assert "exactly three tool calls" in prompt
+    assert "must not wait for any tool result" in prompt
+    assert "sequential_core_tools_fixture.txt" in prompt
+    assert "sequential-core-tools-grep" in prompt
+    assert command[command.index("--allowedTools") + 1] == "Agent"
+    assert "--tools" not in command
+    assert set(case_config["claude_agents"]) == {
+        D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT
+    }
+    agent_cfg = case_config["claude_agents"][D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT]
+    assert agent_cfg["tools"] == PARALLEL_READ_TOOLS
+    assert (
+        "first assistant message must contain exactly three tool_use blocks"
+        in agent_cfg["prompt"]
+    )
+    assert "Do not wait for any tool result" in agent_cfg["prompt"]
+    trace_key = f"claude-code.{D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT}"
+    assert trace_key in case_config["required_trace_names"]
+    assert (
+        case_config["expected_trace_user_ids_by_name"][trace_key]
+        == "adapter-harness-tenant"
+    )
+    transcript_agent = case_config["transcript_tool_use_validation"][
+        "expected_agents"
+    ][0]
+    assert transcript_agent["agent_type"] == D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT
+    assert transcript_agent["expected_tool_counts"] == {
+        "Read": 1,
+        "Glob": 1,
+        "Grep": 1,
+    }
+    assert transcript_agent["minimum_tools_in_single_assistant_message"] == 3
+    assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 3
 
     agent_config = case_config["claude_agents"][D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT]
     assert agent_config["model"] == "aawm-low-anthropic"
@@ -3234,7 +3251,6 @@ def test_d1322_low_anthropic_alias_replay_case_uses_aawm_low_anthropic_child_mod
         2,
         3,
         4,
-        5,
     ]
     assert set(case_config["required_trace_tags"]) >= {
         "route:anthropic_messages",
@@ -3291,7 +3307,6 @@ def test_d1322_codex_low_alias_replay_case_uses_aawm_low_and_declared_targets():
         2,
         3,
         4,
-        5,
     ]
 
     command = case_config["command"]
@@ -3362,7 +3377,7 @@ def test_d1256_alias_replay_case_uses_aawm_code_anthropic_child_model_and_declar
     assert {
         (row["provider"], row["model"]) for row in declared_candidates
     } == D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS
-    assert [row["candidate_order"] for row in declared_candidates] == [0, 1, 2, 3, 4]
+    assert [row["candidate_order"] for row in declared_candidates] == [0, 1, 2, 3]
     assert "route:anthropic_messages" in case_config["required_trace_tags"]
     assert "passthrough_route_family" in case_config[
         "required_generation_metadata_truthy"

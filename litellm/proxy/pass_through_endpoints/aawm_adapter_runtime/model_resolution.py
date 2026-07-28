@@ -10,11 +10,14 @@ from typing import Any, Optional
 
 from typing import TYPE_CHECKING
 
+from litellm.llms.kimi_code.adapters import adapter as _kimi_code_adapters
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS as _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
+    KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS as _KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,
+)
+
 if TYPE_CHECKING:
     # Host-global modules (bound via install())
-    _anthropic_google_shaping: Any
-    _anthropic_antigravity_provider: Any
-    _kimi_code_adapters: Any
     _alibaba_token_plan_adapters: Any
 
     # Host-global constants
@@ -25,15 +28,12 @@ if TYPE_CHECKING:
     _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS: frozenset
     _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS: frozenset
     _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS: frozenset
-    _KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS: frozenset
     _ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS: frozenset
-    _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict
 
     # Host-global functions
     def _extract_claude_agent_and_tenant_from_request_body(request_body: dict) -> tuple: ...
     def _load_claude_agent_declared_model(agent_name: str) -> Optional[str]: ...
     def _is_openai_responses_endpoint(endpoint: str) -> bool: ...
-    def _get_anthropic_antigravity_runtime() -> Any: ...
     def is_oa_xai_model(model: str) -> bool: ...
     def normalize_grok_native_oauth_model(model: Any) -> Optional[str]: ...
 
@@ -52,18 +52,12 @@ _HOST_FUNCTION_NAMES = (
     "_normalize_opencode_zen_adapter_model_name",
     "_normalize_kimi_code_chat_completions_adapter_model_name",
     "_normalize_alibaba_token_plan_adapter_model_name",
-    "_normalize_anthropic_google_completion_adapter_model_name",
-    "_normalize_antigravity_code_assist_adapter_model_name",
-    "_normalize_codex_google_code_assist_adapter_model_name",
     "_resolve_codex_opencode_zen_adapter_model",
     "_resolve_codex_kimi_chat_completions_adapter_model",
     "_resolve_codex_alibaba_token_plan_adapter_model",
     "_resolve_anthropic_opencode_zen_adapter_model",
     "_resolve_anthropic_kimi_chat_completions_adapter_model",
     "_resolve_anthropic_alibaba_token_plan_adapter_model",
-    "_resolve_anthropic_antigravity_code_assist_adapter_model",
-    "_resolve_codex_google_code_assist_adapter_model",
-    "_resolve_codex_antigravity_code_assist_adapter_model",
     "_normalize_codex_auto_agent_alias_model",
     "_is_codex_auto_agent_alias_model",
     "_resolve_codex_auto_agent_alias_model",
@@ -73,7 +67,6 @@ _HOST_FUNCTION_NAMES = (
     "_resolve_anthropic_openrouter_completion_adapter_model",
     "_resolve_anthropic_nvidia_responses_adapter_model",
     "_resolve_anthropic_openrouter_responses_adapter_model",
-    "_resolve_anthropic_google_completion_adapter_model",
 )
 
 
@@ -124,10 +117,7 @@ def _split_anthropic_adapter_provider_prefix(
 
     prefix, remainder = normalized_model.split("/", 1)
     provider = {
-        "agy": "antigravity",
         "chatgpt": "openai",
-        "gemini": "google",
-        "google-antigravity": "antigravity",
         "nvidia_nim": "nvidia",
         "opencode": _OPENCODE_ZEN_PROVIDER,  # noqa: F821
         "opencode-zen": _OPENCODE_ZEN_PROVIDER,  # noqa: F821
@@ -138,10 +128,8 @@ def _split_anthropic_adapter_provider_prefix(
         if prefix
         in (
             "openai",
-            "google",
             "openrouter",
             "nvidia",
-            "antigravity",
             _OPENCODE_ZEN_PROVIDER,  # noqa: F821
         )
         else None,
@@ -254,21 +242,6 @@ def _normalize_alibaba_token_plan_adapter_model_name(
         allowed_models=_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS,  # noqa: F821
     )
 
-def _normalize_anthropic_google_completion_adapter_model_name(model: Any) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())  # noqa: F821
-    return _anthropic_google_shaping._normalize_anthropic_google_completion_adapter_model_name(model)  # noqa: F821
-
-def _normalize_antigravity_code_assist_adapter_model_name(
-    model: Any,
-) -> Optional[str]:
-    return _anthropic_antigravity_provider._normalize_antigravity_code_assist_adapter_model_name(  # noqa: F821
-        model,
-        runtime=_get_anthropic_antigravity_runtime(),
-    )
-
-def _normalize_codex_google_code_assist_adapter_model_name(model: Any) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())  # noqa: F821
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_adapter_model_name(model)  # noqa: F821
 
 def _resolve_codex_opencode_zen_adapter_model(
     request_body: dict[str, Any],
@@ -330,28 +303,6 @@ def _resolve_anthropic_alibaba_token_plan_adapter_model(
             return normalized_model
     return None
 
-def _resolve_anthropic_antigravity_code_assist_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    _ = endpoint
-    return _normalize_antigravity_code_assist_adapter_model_name(request_body.get("model"))
-
-def _resolve_codex_google_code_assist_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _is_openai_responses_endpoint(endpoint):
-        return None
-    return _normalize_codex_google_code_assist_adapter_model_name(request_body.get("model"))
-
-def _resolve_codex_antigravity_code_assist_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _is_openai_responses_endpoint(endpoint):
-        return None
-    return _normalize_antigravity_code_assist_adapter_model_name(request_body.get("model"))
 
 def _normalize_codex_auto_agent_alias_model(model: Any) -> Optional[str]:
     if not isinstance(model, str):
@@ -444,17 +395,5 @@ def _resolve_anthropic_openrouter_responses_adapter_model(
             return normalized_model
         explicit_provider, _ = _split_anthropic_adapter_provider_prefix(candidate)
         if explicit_provider == "openrouter" and normalized_model is not None:
-            return normalized_model
-    return None
-
-def _resolve_anthropic_google_completion_adapter_model(
-    request_body: dict[str, Any],
-    endpoint: str,
-) -> Optional[str]:
-    if not _has_anthropic_responses_adapter_endpoint(endpoint):
-        return None
-    for candidate in _get_anthropic_adapter_model_candidates(request_body):
-        normalized_model = _normalize_anthropic_google_completion_adapter_model_name(candidate)
-        if normalized_model is not None:
             return normalized_model
     return None

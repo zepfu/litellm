@@ -107,7 +107,7 @@ async def handle_alias_route(  # noqa: PLR0915
         _lpe._plan_codex_auto_agent_native_grok_continuation_transient_retry
     )
     _get_codex_auto_agent_source_error_summary = _lpe._get_codex_auto_agent_source_error_summary
-    _extract_google_adapter_exception_status_code = _lpe._extract_google_adapter_exception_status_code
+    _extract_adapter_exception_status_code = _lpe._extract_adapter_exception_status_code
     verbose_proxy_logger = _lpe.verbose_proxy_logger
     status = _lpe.status
     HTTPException = _lpe.HTTPException
@@ -155,7 +155,7 @@ async def handle_alias_route(  # noqa: PLR0915
             terminal_status_code = status.HTTP_502_BAD_GATEWAY
         source_error = _get_codex_auto_agent_source_error_summary(
             exc,
-            status_code=_extract_google_adapter_exception_status_code(exc),
+            status_code=_extract_adapter_exception_status_code(exc),
         )
         terminal_exc = HTTPException(
             status_code=terminal_status_code,

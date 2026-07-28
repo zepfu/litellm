@@ -91,13 +91,11 @@ def test_provider_failure_classifiers_live_outside_god_module() -> None:
     import litellm.proxy.pass_through_endpoints.provider_failure_classifiers.grok as grok
     import litellm.proxy.pass_through_endpoints.provider_failure_classifiers.anthropic as anth
     import litellm.proxy.pass_through_endpoints.provider_failure_classifiers.chatgpt_codex as codex
-    import litellm.proxy.pass_through_endpoints.provider_failure_classifiers.google_code_assist as gca
 
     assert pfc.__name__.endswith("provider_failure_classifiers")
     assert "provider_failure_classifiers" in grok.__file__
     assert "provider_failure_classifiers" in anth.__file__
     assert "provider_failure_classifiers" in codex.__file__
-    assert "provider_failure_classifiers" in gca.__file__
     # God-module re-exports registry entry points but does not define them.
     src = open(pte.__file__, encoding="utf-8").read()
     assert "def _is_known_grok_billing_passthrough_timeout_cancel_response" not in src
@@ -447,27 +445,6 @@ def test_registry_failure_kinds_match_historical_log_contracts() -> None:
         _get_passthrough_chatgpt_codex_model_not_supported_failure_kind()
     )
     assert "unsupported model for account" in (results[0].log_message or "").lower()
-
-    with patch.object(
-        reg,
-        "PASSTHROUGH_PROVIDER_FAILURE_CLASSIFIERS",
-        (
-            _only(
-                "google_code_assist_tos",
-                "google_code_assist_tos_violation",
-                "Pass through endpoint surfaced Google Code Assist account TOS violation status=%s error=%s",
-            ),
-        ),
-    ):
-        results = reg._run_passthrough_provider_failure_classifiers(
-            request=request,
-            url=httpx.URL("https://cloudcode-pa.googleapis.com/v1:generate"),
-            custom_llm_provider="google_code_assist",
-            status_code=403,
-            exc=Exception("TOS_VIOLATION"),
-        )
-    assert results[0].failure_kind == "google_code_assist_tos_violation"
-    assert "account TOS violation" in (results[0].log_message or "")
 
 
 

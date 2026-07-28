@@ -77,6 +77,14 @@ class NormalizeKimiToolOutputsFn(Protocol):
     def __call__(self, request_body: dict[str, Any]) -> dict[str, Any]: ...
 
 
+class GetCodexToolPolicyCallbacksFn(Protocol):
+    def __call__(self) -> "CodexToolPolicyCallbacks": ...
+
+
+class GetCodexToolPolicyNormalizeTagValueFn(Protocol):
+    def __call__(self) -> NormalizeTagValueFn: ...
+
+
 @dataclass(frozen=True, slots=True)
 class CodexToolPolicyCallbacks:
     """Explicit seams for every external dependency.
@@ -97,6 +105,38 @@ class CodexToolPolicyCallbacks:
     normalize_kimi_custom_tool_outputs: NormalizeKimiToolOutputsFn
     # Grok normalization module and runtime are passed as opaque objects
     # to avoid importing the provider module at module scope.
+    grok_normalization: Any = None
+    grok_normalization_runtime: Any = None
+    request_body_walk_max_depth: int = 64
+
+
+@dataclass(frozen=True, slots=True)
+class CodexToolPolicyRuntimeAccessors:
+    """Late-bound access to host-owned policy callbacks."""
+
+    get_callbacks: GetCodexToolPolicyCallbacksFn
+    get_normalize_tag_value: GetCodexToolPolicyNormalizeTagValueFn
+
+
+@dataclass(frozen=True, slots=True)
+class CodexToolPolicyHostDeps:
+    """Raw host dependencies needed to build CodexToolPolicyCallbacks.
+
+    Pass an instance to :func:`configure_and_install_codex_tool_policy` to
+    replace the god-module's inline callbacks construction and 42 thin-wrapper
+    definitions with a single call.
+    """
+
+    normalize_tag_value: NormalizeTagValueFn
+    dedupe_sorted: DedupeSortedFn
+    merge_metadata: MergeMetadataFn
+    build_span: BuildSpanFn
+    get_model_cost_map: GetModelCostMapFn
+    normalize_grok_native_oauth_model: NormalizeGrokModelFn
+    is_oa_xai_model: IsOaXaiModelFn
+    resolve_oa_xai_upstream_model: ResolveOaXaiModelFn
+    normalize_kimi_model_name: NormalizeKimiModelFn
+    normalize_kimi_custom_tool_outputs: NormalizeKimiToolOutputsFn
     grok_normalization: Any = None
     grok_normalization_runtime: Any = None
     request_body_walk_max_depth: int = 64
@@ -2094,4 +2134,577 @@ def rewrite_grok_native_unsupported_input_items_in_place(
     return callbacks.grok_normalization.rewrite_unsupported_input_items_in_place(
         callbacks.grok_normalization_runtime,
         request_body,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Host facade publication
+# ---------------------------------------------------------------------------
+
+_codex_tool_policy_runtime_accessors: Optional[
+    CodexToolPolicyRuntimeAccessors
+] = None
+
+_HOST_FUNCTION_NAMES = (
+    "_patch_codex_spawn_agent_tool_description",
+    "_get_codex_core_tool_guidance",
+    "_append_codex_core_tool_guidance_to_description",
+    "_patch_codex_multi_agent_tool_search_description",
+    "_patch_codex_core_tool_description",
+    "_adapt_codex_custom_tool_definitions",
+    "_adapted_custom_tool_call_ids",
+    "_adapt_codex_custom_tool_input_items",
+    "_adapt_codex_custom_tool_choice",
+    "_adapt_codex_namespace_tool_definitions",
+    "_adapt_codex_namespace_input_items",
+    "_adapt_codex_namespace_tool_choice",
+    "_openai_tool_choice_references_tool_type",
+    "_get_codex_tool_policy_model_cost_candidates",
+    "_get_unsupported_hosted_tool_types_for_model",
+    "_get_unsupported_request_param_names_for_model",
+    "_get_unsupported_input_item_types_for_model",
+    "_get_rewrite_input_item_types_for_model",
+    "_get_custom_tool_function_adapter_names_for_model",
+    "_get_namespace_tool_function_adapter_names_for_model",
+    "_add_codex_custom_tool_function_adapter_logging_metadata",
+    "_adapt_codex_custom_tools_to_functions_from_request_body",
+    "_add_codex_namespace_tool_function_adapter_logging_metadata",
+    "_adapt_codex_namespace_tools_to_functions_from_request_body",
+    "_add_codex_unsupported_hosted_tool_logging_metadata",
+    "_add_tool_choice_without_tools_logging_metadata",
+    "_drop_tool_choice_without_tools_from_request_body",
+    "_add_codex_unsupported_request_param_logging_metadata",
+    "_drop_unsupported_codex_request_params_from_request_body",
+    "_add_codex_unsupported_input_item_logging_metadata",
+    "_drop_unsupported_codex_input_items_from_request_body",
+    "_drop_unsupported_codex_hosted_tools_from_request_body",
+    "_add_codex_tool_description_patch_logging_metadata",
+    "_apply_codex_tool_description_patches_to_request_body",
+    "_stringify_grok_native_input_item_value",
+    "_format_grok_native_function_call_input_message",
+    "_format_grok_native_function_call_output_input_message",
+    "_rewrite_grok_native_input_item_for_model_input",
+    "_is_anthropic_grok_native_responses_adapter_body",
+    "_add_grok_native_input_item_rewrite_logging_metadata",
+    "_rewrite_grok_native_unsupported_input_items_from_request_body",
+    "_rewrite_grok_native_unsupported_input_items_in_place",
+)
+
+
+def configure_codex_tool_policy_runtime_accessors(
+    accessors: CodexToolPolicyRuntimeAccessors,
+) -> None:
+    """Configure late-bound runtime access for published policy facades."""
+    global _codex_tool_policy_runtime_accessors
+    _codex_tool_policy_runtime_accessors = accessors
+
+
+def get_codex_tool_policy_runtime_callbacks() -> CodexToolPolicyCallbacks:
+    """Resolve the current host callback bundle at call time."""
+    if _codex_tool_policy_runtime_accessors is None:
+        raise RuntimeError("Codex tool-policy runtime accessors are not configured")
+    return _codex_tool_policy_runtime_accessors.get_callbacks()
+
+
+def get_codex_tool_policy_runtime_normalize_tag_value() -> NormalizeTagValueFn:
+    """Resolve the current host normalization callback at call time."""
+    if _codex_tool_policy_runtime_accessors is None:
+        raise RuntimeError("Codex tool-policy runtime accessors are not configured")
+    return _codex_tool_policy_runtime_accessors.get_normalize_tag_value()
+
+
+def is_codex_tool_policy_runtime_configured() -> bool:
+    """Return True when runtime accessors have been installed.
+
+    Consumers outside the god-module integration boundary (e.g. the
+    Responses endpoint) should check this before calling underscore facades.
+    """
+    return _codex_tool_policy_runtime_accessors is not None
+
+
+def _get_required_codex_tool_policy_host_global(
+    host_globals: dict[str, Any], name: str
+) -> Any:
+    try:
+        return host_globals[name]
+    except KeyError:
+        raise RuntimeError(
+            "Codex tool-policy runtime accessors are not configured"
+        ) from None
+
+
+def install_codex_tool_policy_facades(host_globals: dict[str, Any]) -> None:
+    """Publish same-object facades backed by live host-global lookups."""
+    configure_codex_tool_policy_runtime_accessors(
+        CodexToolPolicyRuntimeAccessors(
+            get_callbacks=lambda: _get_required_codex_tool_policy_host_global(
+                host_globals, "_CODEX_TOOL_POLICY_CALLBACKS"
+            ),
+            get_normalize_tag_value=lambda: _get_required_codex_tool_policy_host_global(
+                host_globals, "_normalize_low_cardinality_tag_value"
+            ),
+        )
+    )
+    module_globals = globals()
+    for name in _HOST_FUNCTION_NAMES:
+        host_globals[name] = module_globals[name]
+
+
+def configure_and_install_codex_tool_policy(
+    host_globals: dict[str, Any],
+    deps: CodexToolPolicyHostDeps,
+) -> None:
+    """One-call replacement for the god-module's callbacks + 42 thin wrappers.
+
+    Builds :class:`CodexToolPolicyCallbacks` from *deps*, publishes the
+    callbacks and normalize function into *host_globals*, then delegates to
+    :func:`install_codex_tool_policy_facades` for late-bound facade
+    publication.  The resulting host-global surface is identical to the
+    hand-written wrappers: same names, same signatures, same late-bound
+    monkeypatch behavior.
+
+    Usage in the god module::
+
+        _aawm_codex_tool_policy.configure_and_install_codex_tool_policy(
+            globals(),
+            _aawm_codex_tool_policy.CodexToolPolicyHostDeps(
+                normalize_tag_value=_normalize_low_cardinality_tag_value,
+                dedupe_sorted=_dedupe_sorted_str_list,
+                merge_metadata=_merge_litellm_metadata,
+                build_span=_build_langfuse_span_descriptor,
+                get_model_cost_map=lambda: litellm.model_cost,
+                normalize_grok_native_oauth_model=normalize_grok_native_oauth_model,
+                is_oa_xai_model=is_oa_xai_model,
+                resolve_oa_xai_upstream_model=resolve_oa_xai_upstream_model,
+                normalize_kimi_model_name=_normalize_kimi_code_chat_completions_adapter_model_name,
+                normalize_kimi_custom_tool_outputs=lambda b: _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(b),
+                grok_normalization=_anthropic_grok_normalization,
+                grok_normalization_runtime=_get_anthropic_grok_normalization_runtime(),
+                request_body_walk_max_depth=_AAWM_REQUEST_BODY_WALK_MAX_DEPTH,
+            ),
+        )
+    """
+    callbacks = CodexToolPolicyCallbacks(
+        normalize_tag_value=deps.normalize_tag_value,
+        dedupe_sorted=deps.dedupe_sorted,
+        merge_metadata=deps.merge_metadata,
+        build_span=deps.build_span,
+        get_model_cost_map=deps.get_model_cost_map,
+        normalize_grok_native_oauth_model=deps.normalize_grok_native_oauth_model,
+        is_oa_xai_model=deps.is_oa_xai_model,
+        resolve_oa_xai_upstream_model=deps.resolve_oa_xai_upstream_model,
+        normalize_kimi_model_name=deps.normalize_kimi_model_name,
+        normalize_kimi_custom_tool_outputs=deps.normalize_kimi_custom_tool_outputs,
+        grok_normalization=deps.grok_normalization,
+        grok_normalization_runtime=deps.grok_normalization_runtime,
+        request_body_walk_max_depth=deps.request_body_walk_max_depth,
+    )
+    host_globals["_CODEX_TOOL_POLICY_CALLBACKS"] = callbacks
+    host_globals["_normalize_low_cardinality_tag_value"] = deps.normalize_tag_value
+    install_codex_tool_policy_facades(host_globals)
+
+
+def _patch_codex_spawn_agent_tool_description(
+    tool: dict[str, Any], *, tool_index: int
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return patch_codex_spawn_agent_tool_description(
+        tool,
+        tool_index=tool_index,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _get_codex_core_tool_guidance(tool_name: Optional[str]) -> Optional[str]:
+    return get_codex_core_tool_guidance(
+        tool_name,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _append_codex_core_tool_guidance_to_description(
+    description: Any, *, guidance: str
+) -> tuple[str, bool]:
+    return append_codex_core_tool_guidance_to_description(
+        description,
+        guidance=guidance,
+    )
+
+
+def _patch_codex_multi_agent_tool_search_description(
+    tool: dict[str, Any], *, tool_index: int
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return patch_codex_multi_agent_tool_search_description(
+        tool,
+        tool_index=tool_index,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _patch_codex_core_tool_description(
+    tool: dict[str, Any], *, tool_index: int
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return patch_codex_core_tool_description(
+        tool,
+        tool_index=tool_index,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _adapt_codex_custom_tool_definitions(
+    tools: list[Any], *, adapter_names: set[str]
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    return adapt_codex_custom_tool_definitions(
+        tools,
+        adapter_names=adapter_names,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _adapted_custom_tool_call_ids(
+    input_items: Any, *, adapter_names: set[str]
+) -> set[str]:
+    return adapted_custom_tool_call_ids(
+        input_items,
+        adapter_names=adapter_names,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _adapt_codex_custom_tool_input_items(
+    input_items: Any, *, adapter_names: set[str]
+) -> tuple[Any, list[dict[str, Any]]]:
+    return adapt_codex_custom_tool_input_items(
+        input_items,
+        adapter_names=adapter_names,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _adapt_codex_custom_tool_choice(
+    tool_choice: Any, *, adapter_names: set[str]
+) -> tuple[Any, Optional[dict[str, Any]]]:
+    return adapt_codex_custom_tool_choice(
+        tool_choice,
+        adapter_names=adapter_names,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _adapt_codex_namespace_tool_definitions(
+    tools: list[Any], *, adapter_names: dict[str, set[str]]
+) -> tuple[list[Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    return adapt_codex_namespace_tool_definitions(
+        tools,
+        adapter_names=adapter_names,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _adapt_codex_namespace_input_items(
+    input_items: Any, *, adapter_names: dict[str, set[str]]
+) -> tuple[Any, list[dict[str, Any]]]:
+    return adapt_codex_namespace_input_items(
+        input_items,
+        adapter_names=adapter_names,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _adapt_codex_namespace_tool_choice(
+    tool_choice: Any, *, adapter_names: dict[str, set[str]]
+) -> tuple[Any, Optional[dict[str, Any]]]:
+    return adapt_codex_namespace_tool_choice(
+        tool_choice,
+        adapter_names=adapter_names,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _openai_tool_choice_references_tool_type(
+    tool_choice: Any, tool_types: set[str]
+) -> bool:
+    return openai_tool_choice_references_tool_type(
+        tool_choice,
+        tool_types,
+        normalize_tag_value=get_codex_tool_policy_runtime_normalize_tag_value(),
+    )
+
+
+def _get_codex_tool_policy_model_cost_candidates(model: Any) -> list[str]:
+    return get_codex_tool_policy_model_cost_candidates(
+        model,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _get_unsupported_hosted_tool_types_for_model(model: Any) -> set[str]:
+    return get_unsupported_hosted_tool_types_for_model(
+        model,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _get_unsupported_request_param_names_for_model(model: Any) -> set[str]:
+    return get_unsupported_request_param_names_for_model(
+        model,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _get_unsupported_input_item_types_for_model(model: Any) -> set[str]:
+    return get_unsupported_input_item_types_for_model(
+        model,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _get_rewrite_input_item_types_for_model(model: Any) -> set[str]:
+    return get_rewrite_input_item_types_for_model(
+        model,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _get_custom_tool_function_adapter_names_for_model(model: Any) -> set[str]:
+    return get_custom_tool_function_adapter_names_for_model(
+        model,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _get_namespace_tool_function_adapter_names_for_model(
+    model: Any,
+) -> dict[str, set[str]]:
+    return get_namespace_tool_function_adapter_names_for_model(
+        model,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _add_codex_custom_tool_function_adapter_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    adapted_tools: list[dict[str, Any]],
+    adapted_input_items: list[dict[str, Any]],
+    adapted_tool_choice: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    return add_codex_custom_tool_function_adapter_logging_metadata(
+        request_body,
+        adapted_tools=adapted_tools,
+        adapted_input_items=adapted_input_items,
+        adapted_tool_choice=adapted_tool_choice,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _adapt_codex_custom_tools_to_functions_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return adapt_codex_custom_tools_to_functions_from_request_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _add_codex_namespace_tool_function_adapter_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    adapted_tools: list[dict[str, Any]],
+    adapted_input_items: list[dict[str, Any]],
+    adapted_tool_choice: Optional[dict[str, Any]],
+    skipped_tools: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return add_codex_namespace_tool_function_adapter_logging_metadata(
+        request_body,
+        adapted_tools=adapted_tools,
+        adapted_input_items=adapted_input_items,
+        adapted_tool_choice=adapted_tool_choice,
+        skipped_tools=skipped_tools,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _adapt_codex_namespace_tools_to_functions_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return adapt_codex_namespace_tools_to_functions_from_request_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _add_codex_unsupported_hosted_tool_logging_metadata(
+    request_body: dict[str, Any],
+    *,
+    removed_tools: list[dict[str, Any]],
+    removed_tool_choice: Optional[Any],
+) -> dict[str, Any]:
+    return add_codex_unsupported_hosted_tool_logging_metadata(
+        request_body,
+        removed_tools=removed_tools,
+        removed_tool_choice=removed_tool_choice,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _add_tool_choice_without_tools_logging_metadata(
+    request_body: dict[str, Any], *, removed_tool_choice: Any
+) -> dict[str, Any]:
+    return add_tool_choice_without_tools_logging_metadata(
+        request_body,
+        removed_tool_choice=removed_tool_choice,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _drop_tool_choice_without_tools_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], Optional[Any]]:
+    return drop_tool_choice_without_tools_from_request_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _add_codex_unsupported_request_param_logging_metadata(
+    request_body: dict[str, Any], *, removed_params: list[str]
+) -> dict[str, Any]:
+    return add_codex_unsupported_request_param_logging_metadata(
+        request_body,
+        removed_params=removed_params,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _drop_unsupported_codex_request_params_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    return drop_unsupported_codex_request_params_from_request_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _add_codex_unsupported_input_item_logging_metadata(
+    request_body: dict[str, Any], *, removed_items: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return add_codex_unsupported_input_item_logging_metadata(
+        request_body,
+        removed_items=removed_items,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _drop_unsupported_codex_input_items_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return drop_unsupported_codex_input_items_from_request_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _drop_unsupported_codex_hosted_tools_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return drop_unsupported_codex_hosted_tools_from_request_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _add_codex_tool_description_patch_logging_metadata(
+    request_body: dict[str, Any], patch_events: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return add_codex_tool_description_patch_logging_metadata(
+        request_body,
+        patch_events,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _apply_codex_tool_description_patches_to_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return apply_codex_tool_description_patches_to_request_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _stringify_grok_native_input_item_value(value: Any) -> str:
+    return stringify_grok_native_input_item_value(
+        value,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _format_grok_native_function_call_input_message(
+    item: dict[str, Any], *, include_correlation_ref: bool = False
+) -> str:
+    return format_grok_native_function_call_input_message(
+        item,
+        include_correlation_ref=include_correlation_ref,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _format_grok_native_function_call_output_input_message(
+    item: dict[str, Any], *, include_correlation_ref: bool = False
+) -> str:
+    return format_grok_native_function_call_output_input_message(
+        item,
+        include_correlation_ref=include_correlation_ref,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _rewrite_grok_native_input_item_for_model_input(
+    item: dict[str, Any],
+    *,
+    item_type: str,
+    include_correlation_ref: bool = False,
+) -> Optional[dict[str, Any]]:
+    return rewrite_grok_native_input_item_for_model_input(
+        item,
+        item_type=item_type,
+        include_correlation_ref=include_correlation_ref,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _is_anthropic_grok_native_responses_adapter_body(
+    request_body: dict[str, Any],
+) -> bool:
+    return is_anthropic_grok_native_responses_adapter_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _add_grok_native_input_item_rewrite_logging_metadata(
+    request_body: dict[str, Any], *, rewritten_items: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return add_grok_native_input_item_rewrite_logging_metadata(
+        request_body,
+        rewritten_items=rewritten_items,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _rewrite_grok_native_unsupported_input_items_from_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return rewrite_grok_native_unsupported_input_items_from_request_body(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
+    )
+
+
+def _rewrite_grok_native_unsupported_input_items_in_place(
+    request_body: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return rewrite_grok_native_unsupported_input_items_in_place(
+        request_body,
+        callbacks=get_codex_tool_policy_runtime_callbacks(),
     )

@@ -1133,10 +1133,8 @@ shared credential, and accepted authenticated `/models` capability evidence.
 
 For retryable provider errors, the handler records a
 `candidate_retryable_failure` event, cools down that candidate, and selects the
-next configured usable candidate. Alias selection also honors process-local
-adapter cooldown evidence for OpenRouter and Google Code Assist candidates so
-recent adapter-level exhaustion suppresses those candidates before the next
-dispatch. Declared OpenRouter free daily candidates are additionally checked
+next configured usable candidate. Declared OpenRouter free daily candidates are
+additionally checked
 from `rate_limit_observations` through a short-timeout, short-TTL cache. When
 the latest `openrouter_free_daily_requests:requests` observation reports
 `remaining_pct <= 0` and a future `expected_reset_at`, those free daily
@@ -1249,12 +1247,6 @@ fields must not be treated as canonical provider token or cost truth for
 normal upstream usage and cost calculation path.
 
 ## AAWM Alias Candidate Orders (D1-363)
-
-`aawm-low`, `aawm-low-anthropic`, `aawm-code`, and `aawm-code-anthropic` do
-not prepend or select Antigravity-backed candidates during normal alias
-selection. These aliases follow their declared non-Antigravity failover order
-below. Direct explicit Antigravity routes remain available separately and are
-documented in the Antigravity OAuth Credentials section.
 
 `aawm-sota-openai` mirrors `aawm-sota` and uses this order:
 
@@ -1480,42 +1472,12 @@ last successful validation time, and redacted failure class/message. Rows must
 never include access tokens, refresh tokens, raw auth-file contents, or the raw
 auth-file path.
 
-## Antigravity OAuth Credentials
+## Historical OAuth records
 
-Antigravity Code Assist routes use OAuth token files on the host. In prod,
-LiteLLM should be configured with `LITELLM_ANTIGRAVITY_MANAGED_AUTH_FILE` for
-the refreshed token copy and `LITELLM_ANTIGRAVITY_SEED_AUTH_FILE` for the
-read-only Antigravity CLI login seed, normally
-`~/.gemini/antigravity-cli/antigravity-oauth-token` (expanded with
-`Path.expanduser()`). LiteLLM is a read-only consumer of those files. During
-request handling it loads the first valid candidate token and never attempts a
-direct OAuth refresh or invokes `agy`. If all candidate tokens are expired or
-invalid, LiteLLM fails the Antigravity candidate with a clear refresh-required
-message.
-
-For AAWM auto-agent aliases, stale or missing Antigravity token data is treated
-as provider-auth degradation during candidate selection. The selector records the
-Antigravity candidate under the `antigravity:auth_degraded` lane, marks it
-skipped with `reason=auth_degraded`, applies a short candidate cooldown, and
-continues to the next declared candidate. This expected degraded state logs a
-bounded warning without traceback; unexpected Antigravity lane-resolution
-exceptions still emit traceback-bearing error logs for intake.
-
-The provider-status sidecar does not schedule Antigravity OAuth refresh, persist
-Antigravity auth telemetry, or probe Google/Gemini front-door endpoints.
-Antigravity token maintenance remains outside provider-status ownership (for
-example `scripts/antigravity_oauth_refresh.py` for manual or non-sidecar use).
-That script defaults to `~`-relative auth/lock/CLI paths, stages CLI fallback
-credentials and `--log-file` output under an unpredictable private `0700`
-`tempfile.mkdtemp` directory with unconditional cleanup, writes credential temps
-at mode `0600` (no umask window), reuses shared credential lock/metadata helpers
-(`credential_file_lock` plus `credential_file_metadata` with optional
-`AAWM_ANTIGRAVITY_AUTH_FILE_UID` / `AAWM_ANTIGRAVITY_AUTH_FILE_GID` /
-`AAWM_ANTIGRAVITY_AUTH_FILE_MODE` overrides, group/other bits clamped to `0600`),
-and logs only non-secret client-pair diagnostic ids when scanning CLI binary
-candidates.
-Historical `provider_auth_observations` rows for Antigravity may still exist in
-the database.
+Historical session-history and provider-auth records may mention Antigravity
+Code Assist tokens or bootstrap artifacts. They are retained only for old-data
+interpretation and do not define a current route, package, credential, or
+maintenance contract.
 
 ## Codex OAuth Credentials
 
@@ -1679,7 +1641,7 @@ the group. For example, native Anthropic traffic under `/anthropic/v1/messages`
 omits `api.anthropic.com/v1/messages`, and Codex passthrough traffic under
 `/openai_passthrough/responses` omits
 `chatgpt.com/backend-api/codex/responses`; mixed-provider routes such as Grok
-or Google adapters remain explicit on their own sublines. If LiteLLM cannot
+or OpenRouter adapters remain explicit on their own sublines. If LiteLLM cannot
 infer an endpoint default, it suppresses the destination only when every subline
 in the bucket shares the same outgoing target. `Turns` counts completed
 requests only. Alias-route candidate events that degrade, cool down, fail, or
@@ -1953,10 +1915,10 @@ headers, request bodies, response bodies, stream chunks, prompts, tool
 arguments, OAuth tokens, API keys, cookies, concrete session ids, and local file
 content must not be copied into `session_history.metadata`.
 
-Google Code Assist / Antigravity bootstrap preflight calls in
-`litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py` already use
-that same direct diagnostic capture path for `v1internal:loadCodeAssist` and the
-prime preflight endpoints. Those artifacts are exact-scope gated, local-only,
+Historical Google Code Assist / Antigravity bootstrap preflight artifacts may
+remain in session-history records. They are historical records only and do not
+describe a current route or credential contract. Session-history artifacts are
+exact-scope gated, local-only,
 and shape/hash-only unless the separate full-payload capture opt-in is enabled.
 They must not be treated as `session_history` rows or copied into
 `session_history.metadata`.

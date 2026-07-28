@@ -160,10 +160,6 @@ class TestDispatchBehavior:
         host: dict[str, Any] = {"__builtins__": __builtins__}
         # Stub all host-global dependencies
         host["_dispatch_auto_agent_alias_candidate_request"] = AsyncMock()
-        host["_handle_codex_google_code_assist_adapter_route"] = AsyncMock()
-        host["_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER"] = "antigravity"
-        host["_CODEX_AUTO_AGENT_GOOGLE_PROVIDER"] = "google"
-        host["_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER"] = "antigravity"
         host["_CODEX_AUTO_AGENT_OPENCODE_PROVIDER"] = "opencode"
         host["_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER"] = "kimi_code"
         host["_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER"] = "alibaba_token_plan"
@@ -184,7 +180,7 @@ class TestDispatchBehavior:
             request=MagicMock(),
             fastapi_response=MagicMock(),
             user_api_key_dict=MagicMock(),
-            candidate={"model": "test-model", "provider": "google"},
+            candidate={"model": "test-model", "provider": "openrouter"},
             candidate_body={"model": "test-model"},
             target_url="https://api.openai.com/v1/responses",
             api_key="sk-test",

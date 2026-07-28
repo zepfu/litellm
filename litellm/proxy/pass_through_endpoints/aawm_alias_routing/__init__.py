@@ -2,13 +2,13 @@
 
 Layers:
 - ``policy``: static candidate tables, allowlists, cooldown defaults
-- ``state``: process-local cooldown/affinity/lane/oauth maps + locks
+- ``state``: process-local cooldown/affinity/probe maps + locks
+- ``oauth_token_cache``: provider-neutral OAuth token memoization primitive
 - ``memory`` / ``retry``: shared map bounding and cooldown wait primitives
 - ``error_signals``: failure extraction, classification, cooldown scope, retry planning
 - ``cooldown_apply``: immutable publication plans and cooldown application
 - ``attempt_records``: attempt mutation, evidence, reasoning normalization, metadata
 - ``adapter_config``: config descriptors for Anthropic adapter routes
-- ``oauth_token_cache`` / ``google_oauth``: Google OAuth token cache + I/O
 - ``task_state``: structured/configurable task-state preservation contract
 - ``durable``: durable key, max-expiry, read/write, and DualCache selection
 
@@ -30,7 +30,6 @@ from . import (
     cooldown_apply,
     cooldown_state,
     error_signals,
-    google_oauth,
     memory,
     oauth_token_cache,
     policy,
@@ -57,7 +56,6 @@ __all__ = [
     "cooldown_apply",
     "cooldown_state",
     "error_signals",
-    "google_oauth",
     "memory",
     "oauth_token_cache",
     "policy",

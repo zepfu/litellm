@@ -57,45 +57,6 @@ def _quota_period_from_window_minutes(window_minutes: Optional[int]) -> Optional
     return f"{window_minutes}_minutes"
 
 
-def _normalize_quota_period(value: Any) -> Optional[str]:
-    normalized = _clean_non_empty_string(value)
-    if normalized is None:
-        return None
-    normalized = normalized.strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "1h": "hourly",
-        "hour": "hourly",
-        "hourly": "hourly",
-        "5h": "five_hour",
-        "five_h": "five_hour",
-        "five_hour": "five_hour",
-        "five_hours": "five_hour",
-        "daily": "daily",
-        "day": "daily",
-        "1d": "daily",
-        "7d": "seven_day",
-        "seven_day": "seven_day",
-        "seven_days": "seven_day",
-        "weekly": "weekly",
-        "week": "weekly",
-        "monthly": "monthly",
-        "month": "monthly",
-    }
-    return aliases.get(normalized, normalized)
-
-
-def _window_minutes_from_quota_period(quota_period: Optional[str]) -> Optional[int]:
-    if quota_period == "hourly":
-        return 60
-    if quota_period == "five_hour":
-        return 300
-    if quota_period == "daily":
-        return 1440
-    if quota_period in {"seven_day", "weekly"}:
-        return 10080
-    return None
-
-
 def _parse_reset_hint_seconds(*values: Any) -> Optional[int]:
     for value in values:
         parsed = _safe_int(value)
@@ -427,15 +388,26 @@ def _infer_rate_limit_client_family(
         if value is not None
     ).lower()
     credential_family = str(metadata.get("credential_family") or "").lower()
-    if (
-        provider == "antigravity"
-        or source_lower.startswith("antigravity_")
-        or "antigravity" in route_family
-        or metadata.get("aawm_stream_logging_custom_llm_provider") == "antigravity"
-        or str(metadata.get("custom_llm_provider") or "").lower() == "antigravity"
-        or model_lower.startswith(("antigravity/", "agy/", "google-antigravity/"))
+    retired_context = " ".join(
+        (
+            str(provider or ""),
+            source_lower,
+            route_family,
+            str(metadata.get("aawm_stream_logging_custom_llm_provider") or ""),
+            str(metadata.get("custom_llm_provider") or ""),
+            model_lower,
+        )
+    ).lower()
+    if any(
+        marker in retired_context
+        for marker in (
+            "antigravity",
+            "google_code_assist",
+            "google-code-assist",
+            "google_retrieve_user_quota",
+        )
     ):
-        return "antigravity_code_assist"
+        return None
     if (
         "opencode" in source_lower
         or credential_family == "opencode"
@@ -452,12 +424,6 @@ def _infer_rate_limit_client_family(
         or "xai_oauth" in route_family
     ):
         return "xai_oauth"
-    if (
-        "google_code_assist" in source_lower
-        or "google_retrieve_user_quota" in source_lower
-        or "code_assist" in route_family
-    ):
-        return "google_code_assist"
     if "codex" in source_lower or "codex" in route_family or "codex" in model_lower:
         return "codex"
     if "gemini" in source_lower or "gemini" in route_family or "gemini" in model_lower:
@@ -807,9 +773,6 @@ def _rate_limit_candidate_roots(kwargs: Dict[str, Any], result: Any) -> List[Any
         "anthropic_response_headers",
         "anthropic_rate_limit_headers",
         "xai_oauth_response_headers",
-        "google_retrieve_user_quota",
-        "google_generate_content_error",
-        "google_user_quota",
         "gemini_model_status",
         "google_model_status",
     ):
@@ -822,8 +785,6 @@ _HOST_FUNCTION_NAMES = (
     "_parse_provider_timestamp",
     "_infer_window_start_at",
     "_quota_period_from_window_minutes",
-    "_normalize_quota_period",
-    "_window_minutes_from_quota_period",
     "_parse_reset_hint_seconds",
     "_resolve_rate_limit_reset_at",
     "_json_safe_rate_limit_value",

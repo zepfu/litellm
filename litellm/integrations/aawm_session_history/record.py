@@ -587,10 +587,17 @@ def _build_session_history_record_from_langfuse_trace_observation(  # noqa: PLR0
     )
     if (
         api_base_provider is not None
-        and provider != "antigravity"
         and (provider in {None, "openai"} or api_base_provider != "openai")
     ):
         provider = api_base_provider
+    provider_normalization_metadata = dict(metadata)
+    if api_base is not None:
+        provider_normalization_metadata.setdefault("api_base", api_base)
+    provider = _normalize_session_history_provider(
+        provider,
+        resolved_model,
+        provider_normalization_metadata,
+    )
     provider, resolved_model = _apply_local_embedding_route_metadata(
         metadata=metadata,
         resolved_provider=provider,
@@ -983,10 +990,17 @@ def _build_session_history_record(  # noqa: PLR0915
     )
     if (
         api_base_provider is not None
-        and resolved_provider != "antigravity"
         and (resolved_provider in {None, "openai"} or api_base_provider != "openai")
     ):
         resolved_provider = api_base_provider
+    provider_normalization_metadata = dict(metadata)
+    if api_base is not None:
+        provider_normalization_metadata.setdefault("api_base", api_base)
+    resolved_provider = _normalize_session_history_provider(
+        resolved_provider,
+        resolved_model,
+        provider_normalization_metadata,
+    )
     provider_for_cache = resolved_provider
     model_group = _normalize_session_history_model_group(
         model_group,
@@ -1911,6 +1925,26 @@ def _install_record_functions() -> None:
     # verbose_logger is imported on this module; ensure host can see the same
     # object if not already present (tests often patch host.verbose_logger).
     host_globals.setdefault("verbose_logger", verbose_logger)
+    # Provider-normalization helpers are rebound to this host namespace and
+    # therefore need their module-owned constant dependencies here as well.
+    from litellm.integrations.aawm_agent_identity import (
+        provider_cache,
+        provider_normalize,
+    )
+
+    for constant_name in (
+        "_RETIRED_GOOGLE_AGENT_PROVIDER_NAMES",
+        "_RETIRED_GOOGLE_AGENT_MARKERS",
+        "_RETIRED_GOOGLE_AGENT_API_BASE_MARKERS",
+    ):
+        host_globals.setdefault(
+            constant_name,
+            getattr(provider_normalize, constant_name),
+        )
+    host_globals.setdefault(
+        "_RETIRED_PROVIDER_CACHE_NAMES",
+        provider_cache._RETIRED_PROVIDER_CACHE_NAMES,
+    )
 
     mod_globals = sys.modules[__name__].__dict__
     for name in _RECORD_API_NAMES:

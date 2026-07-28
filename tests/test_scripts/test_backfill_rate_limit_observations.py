@@ -170,7 +170,7 @@ def test_should_ignore_assistant_prose_keyword_matches() -> None:
     assert quota_backfill.build_record_from_clickhouse_row(row) is None
 
 
-def test_should_extract_google_quota_from_structured_metadata() -> None:
+def test_should_ignore_retired_google_code_assist_quota_metadata() -> None:
     row = {
         "observation_id": "obs-google",
         "observation_trace_id": "trace-google",
@@ -195,14 +195,7 @@ def test_should_extract_google_quota_from_structured_metadata() -> None:
 
     record = quota_backfill.build_record_from_clickhouse_row(row)
 
-    assert record is not None
-    [observation] = record["rate_limit_observations"]
-    assert observation["provider"] == "gemini"
-    assert observation["client_family"] == "google_code_assist"
-    assert observation["remaining_requests"] == 1490
-    assert observation["used_requests"] == 10
-    assert observation["total_requests"] == 1500
-    assert observation["used_percentage"] == 10 / 1500 * 100
+    assert record is None
 
 
 def test_should_extract_anthropic_quota_from_structured_metadata() -> None:

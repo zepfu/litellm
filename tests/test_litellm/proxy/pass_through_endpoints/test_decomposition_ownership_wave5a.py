@@ -939,22 +939,17 @@ class TestW5AInventoryUniqueness:
 
 
 # ===========================================================================
-# SECTION 7: RR-054 process-cache seam preservation (GREEN now)
+# SECTION 7: RR-054 removed-provider seam closure
 # ===========================================================================
 
 
-class TestW5ARR054SeamPreservation:
-    """Wave 5A must not disturb the RR-054 _get_google_adapter_semaphore
-    process-cache seam restored in Wave 4."""
+class TestW5ARR054RemovedProviderClosure:
+    """The removed Google adapter semaphore must not return as a compatibility seam."""
 
-    def test_google_adapter_semaphore_still_accessible(self):
-        """The semaphore getter must remain on the god module."""
-        assert hasattr(lpe, "_get_google_adapter_semaphore")
-        fn = lpe._get_google_adapter_semaphore
-        assert callable(fn)
+    def test_google_adapter_semaphore_is_absent(self):
+        assert not hasattr(lpe, "_get_google_adapter_semaphore")
 
     def test_google_adapter_semaphore_not_in_w5a_inventory(self):
-        """The semaphore is NOT part of any Wave 5A module."""
         for module_key, symbols in W5A_SYMBOL_INVENTORY.items():
             assert "_get_google_adapter_semaphore" not in symbols, (
                 f"_get_google_adapter_semaphore incorrectly in {module_key}"

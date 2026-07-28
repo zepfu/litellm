@@ -22,7 +22,6 @@ Explicitly excluded:
     - Stream accumulation/finalization
     - Custom/namespace tool restoration
     - Bounded payload replay validation
-    - All Google-specific streaming
     - Provider request preparation
 """
 
@@ -77,8 +76,6 @@ W6B_EXCLUDED_SYMBOLS: set[str] = {
     "_restore_adapted_custom_tool_calls_in_streaming_response",
     "_restore_adapted_namespace_tool_calls_in_streaming_response",
     "_validate_alias_candidate_responses_stream_if_needed",
-    "_build_anthropic_streaming_response_from_google_code_assist_stream",
-    "_prepare_anthropic_google_completion_adapter_request",
 }
 
 
@@ -666,3 +663,26 @@ class TestInstallRebinding:
     def test_production_functions_use_god_module_globals(self):
         for name in W6B_OWNED_SYMBOLS:
             assert getattr(sse_mod, name).__globals__ is vars(lpe)
+
+    def test_install_preserves_only_required_module_globals(self):
+        original_functions = {
+            name: getattr(sse_mod, name) for name in W6B_OWNED_SYMBOLS
+        }
+        sentinel = object()
+        host = {"sentinel": sentinel}
+
+        try:
+            sse_mod.install(host)
+
+            assert host["SimpleNamespace"] is SimpleNamespace
+            assert host["_coerce_namespace_to_mapping"](
+                SimpleNamespace(value=1)
+            ) == {"value": 1}
+            assert host["sentinel"] is sentinel
+            assert set(host) == W6B_OWNED_SYMBOLS | {
+                "SimpleNamespace",
+                "sentinel",
+            }
+        finally:
+            for name, function in original_functions.items():
+                setattr(sse_mod, name, function)

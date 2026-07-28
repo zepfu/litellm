@@ -8,7 +8,11 @@ extraction, and native-Grok retry eligibility/budget.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import patch
 
@@ -22,8 +26,11 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals impor
     _classify_codex_auto_agent_retryable_exhaustion,
     _classify_kimi_code_auto_agent_probe_failure,
     _codex_auto_agent_error_text,
+    _extract_adapter_upstream_headers,
     _extract_codex_auto_agent_error_tokens,
     _extract_codex_auto_agent_error_type_and_code,
+    _extract_embedded_json_payload_candidates,
+    _get_adapter_header_value,
     _get_codex_auto_agent_candidate_cooldown_scope,
     _get_codex_auto_agent_cooldown_scope,
     _get_codex_auto_agent_cooldown_seconds,
@@ -45,6 +52,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals impor
     _is_kimi_code_auto_agent_candidate,
     _iter_codex_auto_agent_error_blocks,
     _parse_codex_auto_agent_header_wait_seconds,
+    _parse_json_payloads_from_text_candidates,
+    _parse_rate_limit_reset_wait_seconds_from_headers,
+    _parse_retry_after_seconds_from_headers,
     _plan_codex_auto_agent_native_grok_continuation_transient_retry,
     configure_error_signals_runtime,
 )
@@ -100,59 +110,6 @@ class _FakeExc(Exception):
             setattr(self, key, value)
 
 
-def _stub_extract_detail(exc: Any) -> Any:
-    return getattr(exc, "detail", None)
-
-
-def _stub_extract_payloads(exc: Any) -> list[Any]:
-    return []
-
-
-def _stub_is_openrouter_raw(exc: Any) -> bool:
-    return False
-
-
-def _stub_status_code(exc: Any) -> Optional[int]:
-    return getattr(exc, "_status_code", None)
-
-
-def _stub_extract_headers(exc: Any) -> dict[str, Any]:
-    return getattr(exc, "_headers", {})
-
-
-def _stub_parse_retry_after(headers: dict[str, Any]) -> Optional[float]:
-    val = headers.get("retry-after")
-    if val is not None:
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            return None
-    return None
-
-
-def _stub_get_header_value(headers: dict[str, Any], name: str) -> Optional[str]:
-    for key, value in headers.items():
-        if isinstance(key, str) and key.lower() == name.lower():
-            return str(value) if value is not None else None
-    return None
-
-
-def _stub_extract_openrouter_raw_message(exc: Any) -> Optional[str]:
-    return getattr(exc, "_openrouter_raw_message", None)
-
-
-def _stub_parse_json_payloads(texts: list[str]) -> list[Any]:
-    import json
-
-    results: list[Any] = []
-    for text in texts:
-        try:
-            results.append(json.loads(text))
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return results
-
-
 def _stub_handled_error_summary(exc: Any, *, status_code: Optional[int] = None) -> str:
     detail = getattr(exc, "detail", None)
     if detail:
@@ -169,18 +126,13 @@ def _stub_grok_spending_limit(**kwargs: Any) -> bool:
 
 
 @pytest.fixture(autouse=True)
-def _configure_seams():
+def _configure_seams(request):
     """Configure error_signals runtime seams for every test."""
+    if request.node.name == "test_imported_host_namespace_liveness":
+        yield
+        return
+
     runtime_names = (
-        "_extract_google_adapter_exception_detail",
-        "_extract_google_adapter_error_payloads",
-        "_is_openrouter_adapter_provider_raw_error",
-        "_extract_google_adapter_exception_status_code",
-        "_extract_adapter_upstream_headers",
-        "_parse_retry_after_seconds_from_headers",
-        "_get_adapter_header_value",
-        "_extract_openrouter_adapter_raw_message",
-        "_parse_json_payloads_from_text_candidates",
         "_get_passthrough_handled_http_error_summary",
         "_is_known_grok_build_usage_balance_exhausted_response",
         "_is_known_grok_personal_team_spending_limit_response",
@@ -206,15 +158,6 @@ def _configure_seams():
         else {}
     )
     configure_error_signals_runtime(
-        extract_google_adapter_exception_detail=_stub_extract_detail,
-        extract_google_adapter_error_payloads=_stub_extract_payloads,
-        is_openrouter_adapter_provider_raw_error=_stub_is_openrouter_raw,
-        extract_google_adapter_exception_status_code=_stub_status_code,
-        extract_adapter_upstream_headers=_stub_extract_headers,
-        parse_retry_after_seconds_from_headers=_stub_parse_retry_after,
-        get_adapter_header_value=_stub_get_header_value,
-        extract_openrouter_adapter_raw_message=_stub_extract_openrouter_raw_message,
-        parse_json_payloads_from_text_candidates=_stub_parse_json_payloads,
         get_passthrough_handled_http_error_summary=_stub_handled_error_summary,
         is_known_grok_build_usage_balance_exhausted_response=_stub_grok_balance_exhausted,
         is_known_grok_personal_team_spending_limit_response=_stub_grok_spending_limit,
@@ -342,17 +285,17 @@ class TestClassification:
 
     def test_classify_rate_limited_by_status_429(self):
         exc = _FakeExc(message="something")
-        exc._status_code = 429
+        exc.status_code = 429
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "rate_limited"
 
     def test_classify_transient_by_status_502(self):
         exc = _FakeExc(message="bad gateway")
-        exc._status_code = 502
+        exc.status_code = 502
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "upstream_transient_internal"
 
     def test_classify_timeout_504(self):
         exc = _FakeExc(message="gateway timeout")
-        exc._status_code = 504
+        exc.status_code = 504
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "upstream_timeout"
 
     def test_classify_usage_limit(self):
@@ -569,7 +512,7 @@ class TestCooldownScope:
         """A structured 429 with capacity tokens still classifies as capacity_exhausted,
         not rate_limited, preserving non-widening behavior."""
         exc = _FakeExc(message="model capacity exhausted")
-        exc._status_code = 429
+        exc.status_code = 429
         result = _classify_codex_auto_agent_retryable_exhaustion(exc)
         # capacity token takes priority over bare 429 status
         assert result == "capacity_exhausted"
@@ -606,20 +549,20 @@ class TestCooldownScope:
 class TestHeaderWaitAndCooldown:
     def test_retry_after_header_respected(self):
         exc = _FakeExc(message="rate limited")
-        exc._headers = {"retry-after": "120"}
+        exc.upstream_headers = {"retry-after": "120"}
         wait = _parse_codex_auto_agent_header_wait_seconds(exc)
         assert wait == 120.0
 
     def test_retry_after_minimum_1s(self):
         exc = _FakeExc(message="rate limited")
-        exc._headers = {"retry-after": "0.5"}
+        exc.upstream_headers = {"retry-after": "0.5"}
         wait = _parse_codex_auto_agent_header_wait_seconds(exc)
         assert wait == 1.0
 
     def test_reset_epoch_header(self):
         future_epoch = time.time() + 300
         exc = _FakeExc(message="rate limited")
-        exc._headers = {"x-codex-primary-reset-at": str(future_epoch)}
+        exc.upstream_headers = {"x-codex-primary-reset-at": str(future_epoch)}
         wait = _parse_codex_auto_agent_header_wait_seconds(exc)
         assert wait is not None
         assert 295 <= wait <= 305
@@ -627,14 +570,14 @@ class TestHeaderWaitAndCooldown:
     def test_millisecond_epoch_header(self):
         future_epoch_ms = (time.time() + 600) * 1000
         exc = _FakeExc(message="rate limited")
-        exc._headers = {"x-ratelimit-reset": str(future_epoch_ms)}
+        exc.upstream_headers = {"x-ratelimit-reset": str(future_epoch_ms)}
         wait = _parse_codex_auto_agent_header_wait_seconds(exc)
         assert wait is not None
         assert 595 <= wait <= 605
 
     def test_no_headers_returns_none(self):
         exc = _FakeExc(message="rate limited")
-        exc._headers = {}
+        exc.upstream_headers = {}
         wait = _parse_codex_auto_agent_header_wait_seconds(exc)
         assert wait is None
 
@@ -646,20 +589,20 @@ class TestHeaderWaitAndCooldown:
 
     def test_cooldown_seconds_transient(self):
         exc = _FakeExc(message="bad gateway")
-        exc._status_code = 502
+        exc.status_code = 502
         seconds = _get_codex_auto_agent_cooldown_seconds(exc)
         assert seconds == 30.0
 
     def test_cooldown_seconds_header_wait_overrides(self):
         exc = _FakeExc(message="rate limited")
-        exc._headers = {"retry-after": "7200"}
+        exc.upstream_headers = {"retry-after": "7200"}
         seconds = _get_codex_auto_agent_cooldown_seconds(exc)
         # header wait (7200) < default (10800), so default wins
         assert seconds == 3 * 60 * 60.0
 
     def test_cooldown_seconds_header_wait_larger(self):
         exc = _FakeExc(message="rate limited")
-        exc._headers = {"retry-after": "14400"}
+        exc.upstream_headers = {"retry-after": "14400"}
         seconds = _get_codex_auto_agent_cooldown_seconds(exc)
         assert seconds == 14400.0
 
@@ -690,22 +633,41 @@ class TestSourceSummaryAndTypeCode:
     def test_source_summary_from_openrouter_raw(self):
         import json
 
-        exc = _FakeExc(message="outer")
-        exc._openrouter_raw_message = json.dumps({"message": "inner provider error"})
+        exc = _FakeExc(
+            message="outer",
+            detail={
+                "error": {
+                    "message": "Error from provider",
+                    "metadata": {
+                        "provider_name": "test",
+                        "raw": json.dumps({"message": "inner provider error"}),
+                    },
+                }
+            },
+        )
         summary = _get_codex_auto_agent_source_error_summary(exc, status_code=502)
         assert "inner provider error" in summary
 
     def test_source_summary_fallback_to_exc(self):
         exc = _FakeExc(message="outer error")
-        exc._openrouter_raw_message = None
         summary = _get_codex_auto_agent_source_error_summary(exc, status_code=500)
         assert "outer error" in summary
 
     def test_source_summary_nested_error_message(self):
         import json
 
-        exc = _FakeExc(message="outer")
-        exc._openrouter_raw_message = json.dumps({"error": {"message": "nested msg"}})
+        exc = _FakeExc(
+            message="outer",
+            detail={
+                "error": {
+                    "message": "Error from provider",
+                    "metadata": {
+                        "provider_name": "test",
+                        "raw": json.dumps({"error": {"message": "nested msg"}}),
+                    },
+                }
+            },
+        )
         summary = _get_codex_auto_agent_source_error_summary(exc, status_code=502)
         assert "nested msg" in summary
 
@@ -935,3 +897,363 @@ class TestNativeGrokRetry:
             route_family="codex_grok_native_responses_adapter",
         )
         assert "backoff_seconds" not in meta
+
+
+# ---------------------------------------------------------------------------
+# Owner-local helper parity (D1-591 six helpers)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractAdapterUpstreamHeaders:
+    def test_upstream_headers_dict_preferred(self):
+        exc = _FakeExc()
+        exc.upstream_headers = {"X-Foo": "bar", "X-Skip": None}
+        result = _extract_adapter_upstream_headers(exc)
+        assert result == {"X-Foo": "bar"}
+        assert "X-Skip" not in result
+
+    def test_falls_back_to_response_headers(self):
+        class _Resp:
+            headers = {"Content-Type": "application/json"}
+        exc = _FakeExc()
+        exc.response = _Resp()
+        result = _extract_adapter_upstream_headers(exc)
+        assert result == {"Content-Type": "application/json"}
+
+    def test_no_headers_returns_empty(self):
+        exc = _FakeExc()
+        assert _extract_adapter_upstream_headers(exc) == {}
+
+    def test_non_dict_upstream_headers_ignored(self):
+        exc = _FakeExc()
+        exc.upstream_headers = "not-a-dict"
+        assert _extract_adapter_upstream_headers(exc) == {}
+
+
+class TestGetAdapterHeaderValue:
+    def test_case_insensitive_lookup(self):
+        headers = {"Retry-After": "120"}
+        assert _get_adapter_header_value(headers, "retry-after") == "120"
+
+    def test_empty_headers_returns_none(self):
+        assert _get_adapter_header_value({}, "X-Foo") is None
+
+    def test_none_value_returns_none(self):
+        assert _get_adapter_header_value({"X-Foo": None}, "X-Foo") is None
+
+    def test_whitespace_only_returns_none(self):
+        assert _get_adapter_header_value({"X-Foo": "   "}, "X-Foo") is None
+
+    def test_strips_whitespace(self):
+        assert _get_adapter_header_value({"X-Foo": "  bar  "}, "X-Foo") == "bar"
+
+    def test_non_str_value_coerced(self):
+        assert _get_adapter_header_value({"X-Foo": 42}, "X-Foo") == "42"
+
+    def test_non_str_key_skipped(self):
+        assert _get_adapter_header_value({123: "val"}, "123") is None
+
+    def test_missing_key_returns_none(self):
+        assert _get_adapter_header_value({"X-Other": "1"}, "X-Foo") is None
+
+
+class TestParseRetryAfterSeconds:
+    def test_valid_integer(self):
+        assert _parse_retry_after_seconds_from_headers({"Retry-After": "60"}) == 60.0
+
+    def test_negative_clamped_to_zero(self):
+        assert _parse_retry_after_seconds_from_headers({"Retry-After": "-5"}) == 0.0
+
+    def test_missing_header_returns_none(self):
+        assert _parse_retry_after_seconds_from_headers({}) is None
+
+    def test_non_numeric_returns_none(self):
+        assert _parse_retry_after_seconds_from_headers({"Retry-After": "not-a-number"}) is None
+
+
+class TestParseRateLimitResetWaitSeconds:
+    def test_epoch_seconds_future(self):
+        future = time.time() + 300
+        result = _parse_rate_limit_reset_wait_seconds_from_headers(
+            {"X-RateLimit-Reset": str(future)}
+        )
+        assert result is not None
+        assert 295 <= result <= 305
+
+    def test_millisecond_epoch(self):
+        future_ms = (time.time() + 600) * 1000
+        result = _parse_rate_limit_reset_wait_seconds_from_headers(
+            {"X-RateLimit-Reset": str(future_ms)}
+        )
+        assert result is not None
+        assert 595 <= result <= 605
+
+    def test_past_epoch_clamped_to_zero(self):
+        past = time.time() - 100
+        result = _parse_rate_limit_reset_wait_seconds_from_headers(
+            {"X-RateLimit-Reset": str(past)}
+        )
+        assert result == 0.0
+
+    def test_missing_header_returns_none(self):
+        assert _parse_rate_limit_reset_wait_seconds_from_headers({}) is None
+
+    def test_non_numeric_returns_none(self):
+        assert _parse_rate_limit_reset_wait_seconds_from_headers(
+            {"X-RateLimit-Reset": "garbage"}
+        ) is None
+
+
+class TestExtractEmbeddedJsonPayloadCandidates:
+    def test_dict_input(self):
+        result = _extract_embedded_json_payload_candidates({"key": "val"})
+        assert len(result) == 1
+        import json as _json
+        assert _json.loads(result[0]) == {"key": "val"}
+
+    def test_bytes_input(self):
+        result = _extract_embedded_json_payload_candidates(b'{"a": 1}')
+        assert '{"a": 1}' in result
+
+    def test_brace_extraction(self):
+        result = _extract_embedded_json_payload_candidates('prefix {"x": 1} suffix')
+        assert '{"x": 1}' in result
+
+    def test_bracket_extraction(self):
+        result = _extract_embedded_json_payload_candidates('prefix [1, 2] suffix')
+        assert '[1, 2]' in result
+
+    def test_none_input(self):
+        result = _extract_embedded_json_payload_candidates(None)
+        assert result == [""]
+
+    def test_bytes_literal_wrapper(self):
+        result = _extract_embedded_json_payload_candidates("detail: b'{\"err\": true}'")
+        assert any('{"err": true}' in c for c in result)
+
+
+class TestParseJsonPayloadsFromTextCandidates:
+    def test_valid_json_parsed(self):
+        result = _parse_json_payloads_from_text_candidates(['{"a": 1}', "[2, 3]"])
+        assert result == [{"a": 1}, [2, 3]]
+
+    def test_invalid_json_skipped(self):
+        result = _parse_json_payloads_from_text_candidates(["not json", '{"ok": true}'])
+        assert result == [{"ok": True}]
+
+    def test_empty_list(self):
+        assert _parse_json_payloads_from_text_candidates([]) == []
+
+
+class TestOwnerHelperLiveness:
+    """Verify production-order configuration and owner helper publication."""
+
+    def test_fresh_process_openrouter_callbacks_do_not_load_eager_runtime(self):
+        script = """
+import sys
+
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import error_signals
+
+host_module = (
+    "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints"
+)
+adapter_module = (
+    "litellm.llms.anthropic.experimental_pass_through.providers."
+    "openrouter.adapter"
+)
+retry_module = (
+    "litellm.llms.anthropic.experimental_pass_through.providers."
+    "openrouter.retry_transport"
+)
+assert host_module not in sys.modules
+assert adapter_module not in sys.modules
+assert retry_module not in sys.modules
+
+exc = Exception("outer")
+exc.detail = {
+    "error": {
+        "message": "Error from provider",
+        "metadata": {
+            "provider_name": "test",
+            "raw": "  ERROR  ",
+        },
+    }
+}
+assert error_signals._extract_openrouter_adapter_raw_message(exc) == "  ERROR  "
+assert error_signals._is_openrouter_adapter_provider_raw_error(exc) is True
+assert host_module not in sys.modules
+assert adapter_module not in sys.modules
+assert retry_module not in sys.modules
+"""
+        env = os.environ.copy()
+        env["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[4],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_install_publishes_owner_helpers(self):
+        previous = error_signals._host_globals_ref
+        host: dict = {}
+        try:
+            error_signals.install(host)
+            for name in (
+                "_extract_adapter_exception_detail",
+                "_extract_adapter_error_payloads",
+                "_extract_adapter_exception_status_code",
+                "_extract_openrouter_adapter_raw_message",
+                "_is_openrouter_adapter_provider_raw_error",
+                "_extract_adapter_upstream_headers",
+                "_get_adapter_header_value",
+                "_parse_retry_after_seconds_from_headers",
+                "_parse_rate_limit_reset_wait_seconds_from_headers",
+                "_extract_embedded_json_payload_candidates",
+                "_parse_json_payloads_from_text_candidates",
+            ):
+                assert name in host, f"{name} not published by install()"
+                assert host[name] is getattr(error_signals, name)
+        finally:
+            error_signals._host_globals_ref = previous
+
+    def test_owner_helper_monkeypatch_republishes(self, monkeypatch):
+        host: dict[str, Any] = {}
+
+        def patched(headers, name):
+            return "patched"
+
+        monkeypatch.setattr(error_signals, "_get_adapter_header_value", patched)
+        error_signals.install(host)
+        assert host["_get_adapter_header_value"] is patched
+
+    def test_openrouter_error_shape_observes_post_configure_helper_monkeypatch(
+        self,
+        monkeypatch,
+    ):
+        payload = {
+            "error": {
+                "message": "Error from provider",
+                "metadata": {
+                    "provider_name": "patched",
+                    "raw": "ERROR",
+                },
+            }
+        }
+        calls: list[tuple[str, object]] = []
+
+        def patched_extract(detail):
+            calls.append(("extract", detail))
+            return ["patched-candidate"]
+
+        def patched_parse(candidates):
+            calls.append(("parse", candidates))
+            return [payload]
+
+        monkeypatch.setattr(
+            error_signals,
+            "_extract_embedded_json_payload_candidates",
+            patched_extract,
+        )
+        monkeypatch.setattr(
+            error_signals,
+            "_parse_json_payloads_from_text_candidates",
+            patched_parse,
+        )
+        monkeypatch.setattr(
+            error_signals,
+            "_extract_adapter_upstream_headers",
+            lambda exc: {"Retry-After": "17"},
+        )
+        monkeypatch.setattr(
+            error_signals,
+            "_parse_retry_after_seconds_from_headers",
+            lambda headers: 17.0,
+        )
+        monkeypatch.setattr(
+            error_signals,
+            "_get_adapter_header_value",
+            lambda headers, name: "late-header",
+        )
+        monkeypatch.setattr(
+            error_signals,
+            "_parse_rate_limit_reset_wait_seconds_from_headers",
+            lambda headers: 23.0,
+        )
+
+        exc = _FakeExc(message="outer")
+        assert error_signals._extract_openrouter_adapter_raw_message(exc) == "ERROR"
+        assert error_signals._is_openrouter_adapter_provider_raw_error(exc) is True
+        runtime = error_signals._OPENROUTER_ERROR_SHAPE_RUNTIME
+        assert runtime.extract_upstream_headers(exc) == {"Retry-After": "17"}
+        assert runtime.parse_retry_after_seconds_from_headers({}) == 17.0
+        assert runtime.get_header_value({}, "X-Test") == "late-header"
+        assert runtime.parse_reset_wait_seconds_from_headers({}) == 23.0
+        assert ("parse", ["patched-candidate"]) in calls
+
+    def test_imported_host_namespace_liveness(self):
+        """Import the real host and invoke every retained error-signals callback."""
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as host,
+        )
+
+        detail = {
+            "error": {
+                "message": "Error from provider",
+                "metadata": {
+                    "provider_name": "test",
+                    "raw": "ERROR",
+                },
+            }
+        }
+        exc = _FakeExc(message="429 provider failure", detail=detail)
+        exc.status_code = 429
+        exc.upstream_headers = {"Retry-After": "10"}
+
+        assert host._extract_adapter_exception_detail(exc) is detail
+        assert detail in host._extract_adapter_error_payloads(exc)
+        assert host._extract_adapter_exception_status_code(exc) == 429
+        assert host._extract_openrouter_adapter_raw_message(exc) == "ERROR"
+        assert host._is_openrouter_adapter_provider_raw_error(exc) is True
+        assert host._extract_adapter_upstream_headers(exc) == {"Retry-After": "10"}
+        assert host._parse_retry_after_seconds_from_headers(
+            {"Retry-After": "10"}
+        ) == 10.0
+        assert host._parse_json_payloads_from_text_candidates(['{"ok": true}']) == [
+            {"ok": True}
+        ]
+        assert (
+            host._extract_adapter_exception_status_code
+            is error_signals._extract_adapter_exception_status_code
+        )
+
+        attempt_status = (
+            host._aawm_attempt_records._extract_exception_status_code(exc)
+        )
+        assert attempt_status == 429
+
+        wave6b_runtime = host._wave6b_common_live_runtime()
+        assert wave6b_runtime.extract_status_code(exc) == 429
+        assert wave6b_runtime.extract_detail(exc) is detail
+
+        summary = error_signals._get_passthrough_handled_http_error_summary(
+            exc,
+            status_code=429,
+        )
+        assert isinstance(summary, str)
+        assert (
+            error_signals._is_codex_auto_agent_grok_build_usage_balance_exhausted(
+                _FakeExc()
+            )
+            is False
+        )
+        assert (
+            error_signals._is_codex_auto_agent_grok_personal_team_spending_limit(
+                _FakeExc()
+            )
+            is False
+        )

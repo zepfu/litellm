@@ -416,10 +416,12 @@ Anthropic unified response headers persist separate weekly buckets:
 - `anthropic_unified_7d_sonnet:7d_sonnet` — retired Sonnet-specific weekly-special
   series kept for historical rows; new Fable traffic must not be labeled as Sonnet.
 
-The `public.rate_limit_intervals` materialized view (rebuilt by
-`scripts/apply_rate_limit_intervals_mview_2026_06_03_antigravity.sql`, or the
-legacy `scripts/apply_rate_limit_intervals_mview_2026_05_23.sql` without
-Antigravity pool rows) explicitly allows quota key
+The `public.rate_limit_intervals` materialized view has historical migrations
+(`scripts/apply_rate_limit_intervals_mview_2026_06_03_antigravity.sql` and the
+older `scripts/apply_rate_limit_intervals_mview_2026_05_23.sql` without
+Antigravity pool rows). Those migration names and historical rows are retained
+as database history; they do not define a current Antigravity route. The view
+explicitly allows quota key
 `xai_grok_build_weekly_credits:credits` and maps it to `quota_type = 'weekly'`
 in the final projection CASE. That mapping is deliberate: weekly Grok Build
 credit intervals must roll up under the same `weekly` bucket as other weekly

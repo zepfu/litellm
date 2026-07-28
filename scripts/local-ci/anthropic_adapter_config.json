@@ -34,7 +34,6 @@
     "claude_adapter_openrouter_deepseek_v4_flash_child_parallel_read_tools",
     "claude_adapter_anthropic_claude_haiku_4_5_20251001_child_parallel_read_tools",
     "claude_adapter_anthropic_claude_opus_4_8_child_parallel_read_tools",
-    "claude_adapter_antigravity_claude_sonnet_4_6_child_sequential_read_tools",
     "claude_adapter_xai_grok_composer_child_parallel_read_tools",
     "claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools",
     "claude_adapter_anthropic_claude_sonnet_4_6_child_parallel_read_tools",
@@ -3265,167 +3264,6 @@
         "passthrough_route_family"
       ]
     },
-    "claude_adapter_antigravity_claude_sonnet_4_6_child_sequential_read_tools": {
-      "verification_alias": "aawm-code-anthropic",
-      "verification_candidate_order": 0,
-      "command": [
-        "claude",
-        "-p",
-        "Dispatch to the harness-antigravity-claude-sonnet-4-6-sequential-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must run exactly three tool calls in order, waiting for each tool result before issuing the next tool: first Read scripts/local-ci/sequential_core_tools_fixture.txt, then Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from ., then Grep pattern exactly `sequential-core-tools-grep` with path exactly `scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. After all three tool results return, stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: ANTHROPIC ANTIGRAVITY CLAUDE SONNET SEQUENTIAL TOOLS PASSED",
-        "--output-format",
-        "json",
-        "--permission-mode",
-        "bypassPermissions",
-        "--allowedTools",
-        "Agent"
-      ],
-      "claude_agents": {
-        "harness-antigravity-claude-sonnet-4-6-sequential-read-tools": {
-          "description": "Acceptance harness child for antigravity sequential read-tool proof.",
-          "model": "antigravity/claude-sonnet-4-6",
-          "effort": "high",
-          "background": true,
-          "permissionMode": "auto",
-          "tools": [
-            "Read",
-            "Glob",
-            "Grep"
-          ],
-          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's sequential tool script. This is not a repository investigation. Run exactly three tool calls in this order, waiting for each tool result before issuing the next tool: Read, then Glob, then Grep. After all three tool results return, return only the caller's exact final line."
-        }
-      },
-      "env": {
-        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
-      },
-      "required_trace_names": [
-        "claude-code.orchestrator",
-        "claude-code.harness-antigravity-claude-sonnet-4-6-sequential-read-tools"
-      ],
-      "expected_user_ids": [
-        "adapter-harness-tenant"
-      ],
-      "expected_trace_user_ids_by_name": {
-        "claude-code.orchestrator": "adapter-harness-tenant",
-        "claude-code.harness-antigravity-claude-sonnet-4-6-sequential-read-tools": "adapter-harness-tenant"
-      },
-      "expected_trace_environment": "default",
-      "require_trace_session_id": true,
-      "match_trace_session_id_from_stdout": true,
-      "require_trace_ids_distinct_from_session_ids": true,
-      "post_run_wait_seconds": 2,
-      "allowed_generation_routes": [
-        "/anthropic/v1/messages"
-      ],
-      "command_json_checks": {
-        "required_equals": {
-          "is_error": false
-        },
-        "required_contains": {
-          "result": "ANTHROPIC ANTIGRAVITY CLAUDE SONNET SEQUENTIAL TOOLS PASSED"
-        }
-      },
-      "session_history_validation": {
-        "db_host": "127.0.0.1",
-        "db_port": 5434,
-        "db_name": "aawm_tristore",
-        "db_user": "aawm",
-        "db_password_env": "AAWM_DB_PASSWORD",
-        "poll_timeout_seconds": 60,
-        "poll_interval_seconds": 1,
-        "expected_rows": [
-          {
-            "provider": "antigravity",
-            "model": "claude-sonnet-4-6",
-            "minimums": {
-              "input_tokens": 1,
-              "output_tokens": 1,
-              "total_tokens": 1
-            }
-          }
-        ]
-      },
-      "tool_activity_validation": {
-        "db_host": "127.0.0.1",
-        "db_port": 5434,
-        "db_name": "aawm_tristore",
-        "db_user": "aawm",
-        "db_password_env": "AAWM_DB_PASSWORD",
-        "poll_timeout_seconds": 60,
-        "poll_interval_seconds": 1,
-        "expected_rows": [
-          {
-            "tool_name": "Agent",
-            "tool_kind": "other",
-            "minimum_count": 1
-          },
-          {
-            "provider": "antigravity",
-            "model": "claude-sonnet-4-6",
-            "tool_name": "read_file",
-            "tool_kind": "read",
-            "minimum_count": 1,
-            "maximum_count": 2,
-            "arguments_required_substring": "sequential_core_tools_fixture.txt"
-          },
-          {
-            "provider": "antigravity",
-            "model": "claude-sonnet-4-6",
-            "tool_name": "glob",
-            "tool_kind": "read",
-            "minimum_count": 1,
-            "maximum_count": 2,
-            "arguments_required_substring": "scripts/local-ci/sequential_core_tools_fixture.txt"
-          },
-          {
-            "provider": "antigravity",
-            "model": "claude-sonnet-4-6",
-            "tool_name": "grep_search",
-            "tool_kind": "read",
-            "minimum_count": 1,
-            "maximum_count": 3,
-            "arguments_required_substring": "sequential-core-tools-grep"
-          }
-        ]
-      },
-      "transcript_tool_use_validation": {
-        "poll_timeout_seconds": 20,
-        "poll_interval_seconds": 1,
-        "expected_agents": [
-          {
-            "agent_type": "harness-antigravity-claude-sonnet-4-6-sequential-read-tools",
-            "expected_tool_counts": {
-              "Read": 1,
-              "Glob": 1,
-              "Grep": 1
-            },
-            "minimum_total_tool_uses": 3,
-            "maximum_total_tool_uses": 3,
-            "maximum_tool_uses_per_assistant_message": 1,
-            "require_tool_result_before_next_tool_use": true,
-            "forbid_tool_result_errors": true
-          }
-        ]
-      },
-      "runtime_postconditions": {
-        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
-        "docker_container_name": "litellm-dev"
-      },
-      "timeout_seconds": 300,
-      "langfuse_poll_timeout_seconds": 90,
-      "required_trace_tags": [
-        "route:anthropic_messages",
-        "route:anthropic_antigravity_completion_adapter",
-        "anthropic-antigravity-completion-adapter",
-        "anthropic-adapter-model:claude-sonnet-4-6",
-        "anthropic-adapter-target:antigravity:/v1internal:streamGenerateContent"
-      ],
-      "required_generation_metadata_truthy": [
-        "anthropic_adapter_model",
-        "anthropic_adapter_original_model",
-        "anthropic_adapter_target_endpoint",
-        "passthrough_route_family"
-      ]
-    },
     "claude_adapter_xai_grok_composer_child_parallel_read_tools": {
       "verification_alias": "aawm-code-anthropic",
       "verification_candidate_order": 2,
@@ -3938,30 +3776,24 @@
       "verification_declared_candidates": [
         {
           "candidate_order": 0,
-          "provider": "antigravity",
-          "model": "claude-sonnet-4-6",
-          "route_family": "anthropic_antigravity_completion_adapter"
-        },
-        {
-          "candidate_order": 1,
           "provider": "openai",
           "model": "gpt-5.3-codex-spark",
           "route_family": "anthropic_openai_responses_adapter"
         },
         {
-          "candidate_order": 2,
+          "candidate_order": 1,
           "provider": "xai",
           "model": "grok-composer-2.5-fast",
           "route_family": "anthropic_grok_native_responses_adapter"
         },
         {
-          "candidate_order": 3,
+          "candidate_order": 2,
           "provider": "xai",
           "model": "oa_xai/grok-build",
           "route_family": "anthropic_xai_oauth_responses_adapter"
         },
         {
-          "candidate_order": 4,
+          "candidate_order": 3,
           "provider": "anthropic",
           "model": "claude-sonnet-4-6",
           "route_family": "anthropic_messages"
@@ -4035,7 +3867,6 @@
           {
             "required_one_of": {
               "provider": [
-                "antigravity",
                 "openai",
                 "xai",
                 "anthropic"
@@ -8461,36 +8292,30 @@
       "verification_declared_candidates": [
         {
           "candidate_order": 0,
-          "provider": "antigravity",
-          "model": "gemini-3.5-flash-low",
-          "route_family": "anthropic_antigravity_completion_adapter"
-        },
-        {
-          "candidate_order": 1,
           "provider": "openrouter",
           "model": "openrouter/cohere/north-mini-code:free",
           "route_family": "anthropic_openrouter_completion_adapter"
         },
         {
-          "candidate_order": 2,
+          "candidate_order": 1,
           "provider": "openrouter",
           "model": "openrouter/owl-alpha",
           "route_family": "anthropic_openrouter_completion_adapter"
         },
         {
-          "candidate_order": 3,
+          "candidate_order": 2,
           "provider": "opencode_zen",
           "model": "deepseek-v4-flash",
           "route_family": "anthropic_opencode_zen_responses_adapter"
         },
         {
-          "candidate_order": 4,
+          "candidate_order": 3,
           "provider": "opencode_zen",
           "model": "big-pickle",
           "route_family": "anthropic_opencode_zen_completion_adapter"
         },
         {
-          "candidate_order": 5,
+          "candidate_order": 4,
           "provider": "anthropic",
           "model": "claude-haiku-4-5-20251001",
           "route_family": "anthropic_messages"
@@ -8564,13 +8389,11 @@
           {
             "required_one_of": {
               "provider": [
-                "antigravity",
                 "openrouter",
                 "opencode_zen",
                 "anthropic"
               ],
               "model": [
-                "gemini-3.5-flash-low",
                 "openrouter/cohere/north-mini-code:free",
                 "openrouter/owl-alpha",
                 "deepseek-v4-flash",
@@ -8610,33 +8433,6 @@
             "tool_name": "Agent",
             "tool_kind": "other",
             "minimum_count": 1
-          },
-          {
-            "provider": "antigravity",
-            "model": "gemini-3.5-flash-low",
-            "tool_name": "read_file",
-            "tool_kind": "read",
-            "minimum_count": 1,
-            "maximum_count": 1,
-            "arguments_required_substring": "sequential_core_tools_fixture.txt"
-          },
-          {
-            "provider": "antigravity",
-            "model": "gemini-3.5-flash-low",
-            "tool_name": "glob",
-            "tool_kind": "read",
-            "minimum_count": 1,
-            "maximum_count": 1,
-            "arguments_required_substring": "scripts/local-ci/sequential_core_tools_fixture.txt"
-          },
-          {
-            "provider": "antigravity",
-            "model": "gemini-3.5-flash-low",
-            "tool_name": "grep_search",
-            "tool_kind": "read",
-            "minimum_count": 1,
-            "maximum_count": 1,
-            "arguments_required_substring": "sequential-core-tools-grep"
           }
         ]
       },
@@ -8690,36 +8486,30 @@
       "verification_declared_candidates": [
         {
           "candidate_order": 0,
-          "provider": "antigravity",
-          "model": "gemini-3.5-flash-low",
-          "route_family": "codex_antigravity_code_assist_adapter"
-        },
-        {
-          "candidate_order": 1,
           "provider": "openrouter",
           "model": "openrouter/cohere/north-mini-code:free",
           "route_family": "codex_openrouter_completion_adapter"
         },
         {
-          "candidate_order": 2,
+          "candidate_order": 1,
           "provider": "openrouter",
           "model": "openrouter/owl-alpha",
           "route_family": "codex_openrouter_completion_adapter"
         },
         {
-          "candidate_order": 3,
+          "candidate_order": 2,
           "provider": "opencode_zen",
           "model": "deepseek-v4-flash",
           "route_family": "codex_opencode_zen_adapter"
         },
         {
-          "candidate_order": 4,
+          "candidate_order": 3,
           "provider": "opencode_zen",
           "model": "big-pickle",
           "route_family": "codex_opencode_zen_adapter"
         },
         {
-          "candidate_order": 5,
+          "candidate_order": 4,
           "provider": "openai",
           "model": "gpt-5.4-mini",
           "route_family": "codex_responses"
@@ -8772,13 +8562,11 @@
           {
             "required_one_of": {
               "provider": [
-                "antigravity",
                 "openrouter",
                 "opencode_zen",
                 "openai"
               ],
               "model": [
-                "gemini-3.5-flash-low",
                 "openrouter/cohere/north-mini-code:free",
                 "openrouter/owl-alpha",
                 "deepseek-v4-flash",
@@ -8820,13 +8608,11 @@
           {
             "required_one_of": {
               "provider": [
-                "antigravity",
                 "openrouter",
                 "opencode_zen",
                 "openai"
               ],
               "model": [
-                "gemini-3.5-flash-low",
                 "openrouter/cohere/north-mini-code:free",
                 "openrouter/owl-alpha",
                 "deepseek-v4-flash",

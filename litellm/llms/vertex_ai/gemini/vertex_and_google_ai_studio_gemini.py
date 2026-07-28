@@ -2,7 +2,6 @@
 ## httpx client for vertex ai calls
 ## Initial implementation - covers gemini + image gen calls
 import json
-import os
 import time
 from copy import deepcopy
 from functools import partial
@@ -3086,27 +3085,6 @@ class ModelResponseIterator:
                 pending_response.choices = pending_terminal_choices
                 self.pending_model_response_chunks.append(pending_response)
                 setattr(model_response, "usage", None)
-
-            if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
-                try:
-                    choice_summaries = []
-                    for choice in model_response.choices:
-                        delta = getattr(choice, "delta", None)
-                        choice_summaries.append({
-                            "finish_reason": getattr(choice, "finish_reason", None),
-                            "content": getattr(delta, "content", None) if delta is not None else None,
-                            "tool_calls": len(getattr(delta, "tool_calls", []) or []) if delta is not None else 0,
-                            "function_call": bool(getattr(delta, "function_call", None)) if delta is not None else False,
-                            "reasoning_content": getattr(delta, "reasoning_content", None) if delta is not None else None,
-                        })
-                    verbose_logger.warning(
-                        "Gemini iterator debug: choices=%s pending=%s usage_present=%s",
-                        choice_summaries,
-                        len(self.pending_model_response_chunks),
-                        getattr(model_response, "usage", None) is not None,
-                    )
-                except Exception:
-                    verbose_logger.exception("Gemini iterator debug logging failed")
 
             model_response._hidden_params["is_finished"] = False
             return model_response

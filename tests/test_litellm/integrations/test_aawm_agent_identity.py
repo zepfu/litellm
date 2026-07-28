@@ -5357,7 +5357,7 @@ def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selec
             "model_group": "aawm-code-anthropic",
             "requested_model_alias": "aawm-code-anthropic",
             "anthropic_auto_agent_alias": "aawm-code-anthropic",
-            "anthropic_auto_agent_selected_provider": "antigravity",
+            "anthropic_auto_agent_selected_provider": "anthropic",
             "anthropic_auto_agent_selected_model": "claude-sonnet-4-6",
         }
     )
@@ -5382,7 +5382,7 @@ def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selec
     )
 
     assert record is not None
-    assert record["provider"] == "antigravity"
+    assert record["provider"] == "anthropic"
     assert record["model"] == "claude-sonnet-4-6"
     assert record["inbound_model_alias"] == "aawm-code-anthropic"
     assert record["model_group"] == "claude-sonnet-4-6"
@@ -7228,7 +7228,7 @@ def test_build_session_history_record_uses_adapter_target_over_anthropic_ingress
         assert record["model"] == "gemini-3-flash-preview"
 
 
-def test_build_session_history_record_uses_codex_google_code_assist_metadata() -> None:
+def test_build_session_history_record_preserves_historical_codex_google_code_assist_metadata() -> None:
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["model"] = "unknown"
     kwargs["custom_llm_provider"] = "gemini"
@@ -7277,7 +7277,7 @@ def test_build_session_history_record_uses_codex_google_code_assist_metadata() -
     )
 
     assert record is not None
-    assert record["provider"] == "gemini"
+    assert record["provider"] is None
     assert record["model"] == "gemini-3.1-pro-preview"
     assert record["metadata"]["passthrough_route_family"] == ("codex_google_code_assist_adapter")
     assert record["metadata"]["codex_adapter_model"] == "gemini-3.1-pro-preview"
@@ -8365,357 +8365,6 @@ def test_build_rate_limit_observations_extracts_xai_oauth_hidden_headers() -> No
     assert by_scope["requests"]["provider_resets_at"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
     assert by_scope["requests"]["evidence"]["reset_source"] == ("xai_grok_subscription_month_boundary")
     assert by_scope["tokens"]["remaining_pct"] == pytest.approx(99.0)
-
-
-def test_build_rate_limit_observations_extracts_google_quota_buckets() -> None:
-    kwargs = _base_kwargs()
-    kwargs["model"] = "gemini/gemini-2.5-flash"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["litellm_call_id"] = "call-google-quota-buckets"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-google-quota-buckets",
-            "passthrough_route_family": "google_code_assist_generate_content",
-            "google_retrieve_user_quota": {
-                "source": "google_retrieve_user_quota",
-                "buckets": {
-                    "items": [
-                        {
-                            "modelId": "gemini-2.5-flash",
-                            "tokenType": "REQUESTS",
-                            "remainingFraction": 0.907,
-                            "resetTime": "2026-05-06T00:25:54Z",
-                        },
-                        {
-                            "modelId": "gemini-2.5-flash-lite",
-                            "tokenType": "REQUESTS",
-                            "remainingFraction": 0.9775,
-                            "resetTime": "2026-05-06T00:26:00Z",
-                        },
-                    ]
-                },
-            },
-        }
-    )
-    end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
-
-    observations = _build_rate_limit_observations(
-        kwargs=kwargs,
-        result={"choices": []},
-        start_time=end_time,
-        end_time=end_time,
-    )
-
-    assert len(observations) == 2
-    by_model = {observation["model"]: observation for observation in observations}
-    assert by_model["gemini-2.5-flash"]["source"] == "google_retrieve_user_quota"
-    assert by_model["gemini-2.5-flash"]["client_family"] == "google_code_assist"
-    assert by_model["gemini-2.5-flash"]["limit_scope"] == "model_requests"
-    assert by_model["gemini-2.5-flash"]["used_percentage"] == pytest.approx(9.3)
-    assert by_model["gemini-2.5-flash"]["quota_period"] == "daily"
-    assert by_model["gemini-2.5-flash-lite"]["used_percentage"] == pytest.approx(2.25)
-
-
-def test_build_rate_limit_observations_skips_google_stale_reset_time() -> None:
-    kwargs = _base_kwargs()
-    kwargs["model"] = "gemini/gemini-2.5-flash"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["litellm_call_id"] = "call-google-stale-reset-time"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-google-stale-reset-time",
-            "passthrough_route_family": "google_code_assist_generate_content",
-            "google_retrieve_user_quota": {
-                "source": "google_retrieve_user_quota",
-                "modelId": "gemini-2.5-flash",
-                "remainingFraction": 0.5,
-                "resetTime": "2026-05-14T12:50:53Z",
-            },
-        }
-    )
-    end_time = datetime(2026, 5, 14, 14, 49, tzinfo=timezone.utc)
-
-    observations = _build_rate_limit_observations(
-        kwargs=kwargs,
-        result={"choices": []},
-        start_time=end_time,
-        end_time=end_time,
-    )
-
-    assert observations == []
-
-
-def test_build_rate_limit_observations_treats_codex_adapter_quota_as_code_assist() -> None:
-    kwargs = _base_kwargs()
-    kwargs["model"] = "gemini-3.1-pro-preview"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["litellm_call_id"] = "call-codex-google-quota-buckets"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-codex-google-quota-buckets",
-            "passthrough_route_family": "codex_google_code_assist_adapter",
-            "codex_adapter_model": "gemini-3.1-pro-preview",
-            "google_retrieve_user_quota": {
-                "source": "google_retrieve_user_quota",
-                "buckets": {
-                    "items": [
-                        {
-                            "modelId": "gemini-3.1-pro-preview",
-                            "tokenType": "REQUESTS",
-                            "remainingFraction": 0.75,
-                            "resetTime": "2026-05-06T00:25:54Z",
-                        }
-                    ]
-                },
-            },
-        }
-    )
-    end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
-
-    observations = _build_rate_limit_observations(
-        kwargs=kwargs,
-        result={"choices": []},
-        start_time=end_time,
-        end_time=end_time,
-    )
-
-    assert len(observations) == 1
-    assert observations[0]["provider"] == "gemini"
-    assert observations[0]["client_family"] == "google_code_assist"
-    assert observations[0]["model"] == "gemini-3.1-pro-preview"
-    assert observations[0]["used_percentage"] == pytest.approx(25.0)
-
-
-def test_build_rate_limit_observations_preserves_antigravity_quota_identity() -> None:
-    kwargs = _base_kwargs()
-    kwargs["model"] = "google-antigravity/claude-sonnet-4-6"
-    kwargs["custom_llm_provider"] = "antigravity"
-    kwargs["litellm_call_id"] = "call-antigravity-claude-quota"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-antigravity-claude-quota",
-            "passthrough_route_family": "anthropic_antigravity_completion_adapter",
-            "aawm_stream_logging_custom_llm_provider": "antigravity",
-            "anthropic_adapter_original_model": ("google-antigravity/claude-sonnet-4-6"),
-            "google_retrieve_user_quota": {
-                "source": "antigravity_retrieve_user_quota",
-                "buckets": {
-                    "items": [
-                        {
-                            "modelId": "claude-sonnet-4-6",
-                            "tokenType": "WTUS",
-                            "remainingFraction": 0.5,
-                            "resetTime": "2026-06-03T15:23:07Z",
-                        },
-                        {
-                            "modelId": "gpt-oss-120b-medium",
-                            "tokenType": "WTUS",
-                            "remainingFraction": 0.5,
-                            "resetTime": "2026-06-03T15:23:07Z",
-                        },
-                        {
-                            "modelId": "gemini-3.5-flash-low",
-                            "tokenType": "WTUS",
-                            "remainingFraction": 0.75,
-                            "resetTime": "2026-06-03T17:31:26Z",
-                        },
-                        {
-                            "modelId": "tab_flash_lite_preview",
-                            "tokenType": "WTUS",
-                            "remainingFraction": 1,
-                        },
-                    ]
-                },
-            },
-        }
-    )
-    end_time = datetime(2026, 6, 3, 14, 29, tzinfo=timezone.utc)
-
-    observations = _build_rate_limit_observations(
-        kwargs=kwargs,
-        result={"choices": []},
-        start_time=end_time,
-        end_time=end_time,
-    )
-
-    assert len(observations) == 2
-    by_scope = {observation["limit_scope"]: observation for observation in observations}
-    vertex_observation = by_scope["vertex_pool"]
-    gemini_observation = by_scope["gemini_pool"]
-    assert vertex_observation["source"] == "antigravity_retrieve_user_quota"
-    assert vertex_observation["provider"] == "antigravity"
-    assert vertex_observation["client_family"] == "antigravity_code_assist"
-    assert vertex_observation["model"] is None
-    assert vertex_observation["model_family"] == "vertex"
-    assert vertex_observation["quota_period"] == "five_hour"
-    assert vertex_observation["window_minutes"] == 300
-    assert vertex_observation["limit_id"] == "antigravity_code_assist"
-    assert vertex_observation["limit_scope"] == "vertex_pool"
-    assert vertex_observation["used_percentage"] == pytest.approx(50.0)
-    assert gemini_observation["model"] is None
-    assert gemini_observation["model_family"] == "gemini"
-    assert gemini_observation["limit_scope"] == "gemini_pool"
-    assert gemini_observation["quota_period"] == "five_hour"
-    assert gemini_observation["used_percentage"] == pytest.approx(25.0)
-    assert vertex_observation["limit_key"].startswith("antigravity:antigravity_code_assist:")
-
-    db_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(vertex_observation)
-    assert db_payload[1] == "antigravity_code_assist"
-    assert db_payload[4] == "antigravity"
-    assert db_payload[5] is None
-    assert db_payload[6] == "antigravity_code_assist:vertex_pool"
-    assert db_payload[7] == "five_hour"
-    assert db_payload[8] == "wtus"
-
-
-def test_build_rate_limit_observations_pools_antigravity_quota_ids() -> None:
-    kwargs = _base_kwargs()
-    kwargs["model"] = "antigravity/gpt-oss-120b-medium"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["litellm_call_id"] = "call-antigravity-provider-quota-ids"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-antigravity-provider-quota-ids",
-            "passthrough_route_family": "codex_google_code_assist_adapter",
-            "google_retrieve_user_quota": {
-                "source": "antigravity_retrieve_user_quota",
-                "buckets": {
-                    "items": [
-                        {
-                            "quotaId": ("antigravity_code_assist_requests_" "gpt-oss-120b-medium"),
-                            "quotaName": "Antigravity GPT-OSS requests",
-                            "modelId": "gpt-oss-120b-medium",
-                            "tokenType": "REQUESTS",
-                            "remainingFraction": 1,
-                            "resetTime": "2026-06-03T21:11:43Z",
-                        },
-                        {
-                            "quotaId": ("antigravity_code_assist_requests_" "gemini-3.5-flash-low"),
-                            "quotaName": "Antigravity Gemini requests",
-                            "modelId": "gemini-3.5-flash-low",
-                            "tokenType": "REQUESTS",
-                            "remainingFraction": 1,
-                            "resetTime": "2026-06-03T17:31:26Z",
-                        },
-                    ]
-                },
-            },
-        }
-    )
-    end_time = datetime(2026, 6, 3, 16, 11, tzinfo=timezone.utc)
-
-    observations = _build_rate_limit_observations(
-        kwargs=kwargs,
-        result={"choices": []},
-        start_time=end_time,
-        end_time=end_time,
-    )
-
-    assert len(observations) == 2
-    by_scope = {observation["limit_scope"]: observation for observation in observations}
-    assert set(by_scope) == {"gemini_pool", "vertex_pool"}
-    for observation in observations:
-        assert observation["source"] == "antigravity_retrieve_user_quota"
-        assert observation["provider"] == "antigravity"
-        assert observation["client_family"] == "antigravity_code_assist"
-        assert observation["model"] is None
-        assert observation["limit_id"] == "antigravity_code_assist"
-        assert observation["quota_period"] == "five_hour"
-        assert observation["quota_type"] == "wtus"
-
-        db_payload = aawm_agent_identity._build_rate_limit_observation_db_payload(observation)
-        assert db_payload[4] == "antigravity"
-        assert db_payload[5] is None
-        assert db_payload[6] in {
-            "antigravity_code_assist:gemini_pool",
-            "antigravity_code_assist:vertex_pool",
-        }
-        assert ":model_requests" not in db_payload[6]
-
-
-def test_build_rate_limit_observations_normalizes_google_quota_period_windows() -> None:
-    kwargs = _base_kwargs()
-    kwargs["model"] = "google-antigravity/claude-opus-4-6-thinking"
-    kwargs["custom_llm_provider"] = "antigravity"
-    kwargs["litellm_call_id"] = "call-antigravity-five-hour-quota"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-antigravity-five-hour-quota",
-            "passthrough_route_family": "anthropic_antigravity_completion_adapter",
-            "aawm_stream_logging_custom_llm_provider": "antigravity",
-            "google_retrieve_user_quota": {
-                "source": "antigravity_retrieve_user_quota",
-                "modelId": "claude-opus-4-6-thinking",
-                "tokenType": "WTUS",
-                "remainingFraction": 0.25,
-                "quotaPeriod": "FIVE-HOUR",
-                "resetTime": "2026-06-03T19:00:00Z",
-            },
-        }
-    )
-    end_time = datetime(2026, 6, 3, 14, 30, tzinfo=timezone.utc)
-
-    observations = _build_rate_limit_observations(
-        kwargs=kwargs,
-        result={"choices": []},
-        start_time=end_time,
-        end_time=end_time,
-    )
-
-    assert len(observations) == 1
-    observation = observations[0]
-    assert observation["source"] == "antigravity_retrieve_user_quota"
-    assert observation["provider"] == "antigravity"
-    assert observation["client_family"] == "antigravity_code_assist"
-    assert observation["model"] is None
-    assert observation["limit_scope"] == "vertex_pool"
-    assert observation["quota_period"] == "five_hour"
-    assert observation["window_minutes"] == 300
-    assert observation["used_percentage"] == pytest.approx(75.0)
-
-
-def test_build_rate_limit_observations_keeps_google_capacity_distinct_from_quota() -> None:
-    kwargs = _base_kwargs()
-    kwargs["model"] = "gemini/gemini-3.1-pro-preview"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["litellm_call_id"] = "call-google-capacity"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-google-capacity",
-            "passthrough_route_family": "google_code_assist_generate_content",
-        }
-    )
-    error = {
-        "error": {
-            "code": 429,
-            "status": "RESOURCE_EXHAUSTED",
-            "message": "The model is overloaded. quota will reset after 120s",
-            "details": [
-                {
-                    "reason": "MODEL_CAPACITY_EXHAUSTED",
-                    "domain": "cloudcode-pa.googleapis.com",
-                    "metadata": {"model": "gemini-3.1-pro-preview"},
-                }
-            ],
-        }
-    }
-    end_time = datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc)
-
-    observations = _build_rate_limit_observations(
-        kwargs=kwargs,
-        result=error,
-        start_time=end_time,
-        end_time=end_time,
-    )
-
-    assert len(observations) == 1
-    observation = observations[0]
-    assert observation["source"] == "google_model_capacity_error"
-    assert observation["status"] == "model_capacity_exhausted"
-    assert observation["exhausted"] is False
-    assert observation["exhaustion_kind"] == "model_capacity"
-    assert observation["reset_hint_seconds"] == 120
-    assert observation["evidence"]["corroboration_required"] is True
 
 
 def test_build_rate_limit_observations_extracts_grok_monthly_billing() -> None:
@@ -9812,7 +9461,7 @@ def test_build_provider_error_observation_preserves_openrouter_429_context() -> 
     assert len(metadata["provider_error_fingerprint"]) == 64
 
 
-def test_build_provider_error_observation_classifies_google_capacity() -> None:
+def test_build_provider_error_observation_classifies_native_gemini_capacity() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gemini/gemini-3.1-pro-preview"
     kwargs["custom_llm_provider"] = "gemini"
@@ -9820,7 +9469,7 @@ def test_build_provider_error_observation_classifies_google_capacity() -> None:
     kwargs["litellm_params"]["metadata"].update(
         {
             "session_id": "session-provider-capacity",
-            "passthrough_route_family": "google_code_assist_generate_content",
+            "passthrough_route_family": "gemini_generate_content",
         }
     )
     error = {
@@ -9831,7 +9480,7 @@ def test_build_provider_error_observation_classifies_google_capacity() -> None:
             "details": [
                 {
                     "reason": "MODEL_CAPACITY_EXHAUSTED",
-                    "domain": "cloudcode-pa.googleapis.com",
+                    "domain": "generativelanguage.googleapis.com",
                     "metadata": {"model": "gemini-3.1-pro-preview"},
                 }
             ],
@@ -13124,7 +12773,7 @@ def test_build_session_history_record_from_langfuse_marks_gemini_quota_as_non_us
     assert record["metadata"]["gemini_control_plane_method"] == "retrieveUserQuota"
 
 
-def test_build_session_history_record_from_langfuse_marks_empty_gemini_adapter_response() -> None:
+def test_build_session_history_record_from_langfuse_marks_empty_native_gemini_response() -> None:
     trace = {
         "id": "trace-empty-gemini",
         "name": "codex",
@@ -13155,7 +12804,7 @@ def test_build_session_history_record_from_langfuse_marks_empty_gemini_adapter_r
         "metadata": {
             "custom_llm_provider": "gemini",
             "client_name": "codex-tui",
-            "passthrough_route_family": "codex_google_code_assist_adapter",
+            "passthrough_route_family": "gemini_generate_content",
             "codex_adapter_output_shape": "openai_responses",
             "aawm_stream_chunk_count": 1,
         },
@@ -13948,6 +13597,60 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_metad
     assert record["tool_names"] == ["google_search"]
 
 
+def test_build_session_history_record_from_langfuse_clears_retired_antigravity_provider() -> None:
+    trace = {
+        "id": "trace-retired-antigravity",
+        "name": "gemini",
+        "sessionId": "session-retired-antigravity",
+        "environment": "dev",
+    }
+    observation = {
+        "id": "obs-retired-antigravity",
+        "type": "GENERATION",
+        "name": "litellm-pass_through_endpoint",
+        "model": "gemini-3.1-pro-low",
+        "apiBase": (
+            "https://daily-cloudcode-pa.googleapis.com/"
+            "v1internal:streamGenerateContent"
+        ),
+        "startTime": "2026-06-03T12:35:20Z",
+        "endTime": "2026-06-03T12:35:22Z",
+        "usage": {
+            "input": 10,
+            "output": 3,
+            "total": 13,
+        },
+        "output": {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "historical route result",
+                    }
+                }
+            ]
+        },
+        "metadata": {
+            "passthrough_route_family": "antigravity_code_assist",
+            "aawm_stream_logging_custom_llm_provider": "antigravity",
+        },
+    }
+
+    record = _build_session_history_record_from_langfuse_trace_observation(
+        trace,
+        observation,
+        backfill_run_id="run-retired-antigravity",
+    )
+
+    assert record is not None
+    assert record["provider"] is None
+    assert (
+        record["metadata"]["passthrough_route_family"]
+        == "antigravity_code_assist"
+    )
+    assert _build_session_history_db_payload(record)[4] is None
+
+
 def test_build_session_history_record_from_langfuse_trace_observation_uses_gemini_thought_modality_details() -> None:
     trace = {
         "id": "trace-gemini-2",
@@ -14605,7 +14308,7 @@ def test_build_session_history_record_uses_gemini_signature_fallback_when_usage_
     assert record["reasoning_present"] is True
 
 
-def test_build_session_history_record_preserves_antigravity_provider_over_google_api_base() -> None:
+def test_build_session_history_record_clears_retired_antigravity_provider() -> None:
     kwargs = _base_kwargs("orchestrator")
     kwargs["litellm_params"]["metadata"].update(
         {
@@ -14652,14 +14355,14 @@ def test_build_session_history_record_preserves_antigravity_provider_over_google
     )
 
     assert record is not None
-    assert record["provider"] == "antigravity"
+    assert record["provider"] is None
     assert record["model"] == "gemini-3.1-pro-low"
     assert record["input_tokens"] == 10
     assert record["output_tokens"] == 3
     assert record["total_tokens"] == 13
 
 
-def test_build_session_history_record_persists_antigravity_gemini_public_cost() -> None:
+def test_build_session_history_record_preserves_retired_route_cost_without_provider_classification() -> None:
     kwargs = _base_kwargs("orchestrator")
     kwargs["litellm_params"]["metadata"].update(
         {
@@ -14707,12 +14410,12 @@ def test_build_session_history_record_persists_antigravity_gemini_public_cost() 
     )
 
     assert record is not None
-    assert record["provider"] == "antigravity"
+    assert record["provider"] is None
     assert record["model"] == "gemini-3.5-flash-low"
     assert record["response_cost_usd"] == pytest.approx(0.000027)
 
 
-def test_build_session_history_record_recovers_codex_antigravity_over_openai_provider() -> None:
+def test_build_session_history_record_clears_retired_codex_antigravity_provider() -> None:
     kwargs = _base_kwargs("codex")
     kwargs["litellm_params"]["metadata"].update(
         {
@@ -14761,13 +14464,13 @@ def test_build_session_history_record_recovers_codex_antigravity_over_openai_pro
     )
 
     assert record is not None
-    assert record["provider"] == "antigravity"
+    assert record["provider"] is None
     assert record["model"] == "gemini-3.1-pro-low"
     assert record["metadata"]["codex_adapter_original_model"] == ("antigravity/gemini-3.1-pro-low")
-    assert _build_session_history_db_payload(record)[4] == "antigravity"
+    assert _build_session_history_db_payload(record)[4] is None
 
 
-def test_build_session_history_record_recovers_anthropic_antigravity_over_gemini_provider() -> None:
+def test_build_session_history_record_clears_retired_anthropic_antigravity_provider() -> None:
     kwargs = _base_kwargs("claude-code")
     kwargs["litellm_params"]["metadata"].update(
         {
@@ -14816,10 +14519,10 @@ def test_build_session_history_record_recovers_anthropic_antigravity_over_gemini
     )
 
     assert record is not None
-    assert record["provider"] == "antigravity"
+    assert record["provider"] is None
     assert record["model"] == "claude-sonnet-4-6"
     assert record["metadata"]["anthropic_adapter_original_model"] == ("google-antigravity/claude-sonnet-4-6")
-    assert _build_session_history_db_payload(record)[4] == "antigravity"
+    assert _build_session_history_db_payload(record)[4] is None
 
 
 def test_build_session_history_record_preserves_opencode_zen_provider_identity() -> None:
@@ -14910,6 +14613,35 @@ def test_rate_limit_storage_provider_preserves_opencode_zen_identity() -> None:
             }
         )
         == "opencode_zen"
+    )
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {
+            "client_family": "antigravity_code_assist",
+            "source": "antigravity_retrieve_user_quota",
+        },
+        {
+            "client_family": "google_code_assist",
+            "source": "google_retrieve_user_quota",
+        },
+    ],
+)
+def test_rate_limit_storage_provider_does_not_infer_retired_code_assist_provider(
+    record: dict[str, str],
+) -> None:
+    assert aawm_agent_identity._rate_limit_storage_provider(record) == "unknown"
+
+
+@pytest.mark.parametrize("provider", ["antigravity", "google_code_assist"])
+def test_rate_limit_storage_provider_preserves_explicit_historical_provider(
+    provider: str,
+) -> None:
+    assert (
+        aawm_agent_identity._rate_limit_storage_provider({"provider": provider})
+        == provider
     )
 
 

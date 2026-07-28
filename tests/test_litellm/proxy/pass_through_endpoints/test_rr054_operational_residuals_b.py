@@ -27,9 +27,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import 
 from litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep import (
     _compact_openai_adapter_claude_context_text,
 )
-from litellm.proxy.pass_through_endpoints.aawm_request_policy.persisted_output import (
-    _compact_expanded_claude_persisted_output_text_for_google_adapter,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -511,29 +508,6 @@ def test_rr054_issue54_adversarial_unclosed_system_reminders_complete_quickly() 
     assert elapsed < 0.5, (
         f"RR-054 #54 OpenAI system-reminder compact still expensive on "
         f"adversarial unclosed openers: {elapsed:.3f}s (len={len(adversarial)})"
-    )
-
-
-def test_rr054_issue54_adversarial_unclosed_openers_google_auxiliary_bound() -> None:
-    adversarial = ("<system-reminder>\n" * 6000) + ("payload " * 20000)
-    assert len(adversarial) > 200_000
-
-    t0 = time.perf_counter()
-    (
-        out,
-        compacted,
-        hooks,
-        meta,
-    ) = _compact_expanded_claude_persisted_output_text_for_google_adapter(
-        adversarial,
-        auxiliary_context_char_cap=128,
-    )
-    elapsed = time.perf_counter() - t0
-
-    assert isinstance(out, str)
-    assert elapsed < 0.5, (
-        f"RR-054 #54 Google auxiliary/system-reminder compact still expensive: "
-        f"{elapsed:.3f}s (len={len(adversarial)})"
     )
 
 

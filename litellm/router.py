@@ -6945,7 +6945,7 @@ class Router:
         Each provider uses diff .env vars for pass-through endpoints, this helper uses the deployment credentials to set the .env vars for pass-through endpoints
         """
         if deployment.litellm_params.use_in_pass_through is True:
-            from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            from litellm.proxy.pass_through_endpoints.passthrough_endpoint_router import (
                 passthrough_endpoint_router,
             )
 

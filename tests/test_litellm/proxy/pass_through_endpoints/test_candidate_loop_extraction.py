@@ -21,9 +21,14 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from starlette.requests import Request
 
 from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
 
 PACKAGE_DIR = Path(package.__file__).resolve().parent
 GOD_PATH = Path(lpe.__file__).resolve()
@@ -107,13 +112,15 @@ def test_god_facade_is_thin_delegate_to_candidate_loop() -> None:
     """``_handle_auto_agent_alias_route`` stays on the god-module but delegates."""
     god_source = _read(GOD_PATH)
     assert (
-        "async def _handle_auto_agent_alias_route(" in god_source
+        "_handle_auto_agent_alias_route = partial(" in god_source
     ), "the legacy loop entrypoint name must be preserved (39 test files depend on it)"
-    fn = _function_node(_parse(GOD_PATH), "_handle_auto_agent_alias_route")
-    assert fn is not None
-    calls = _call_attr_names(fn)
-    assert "_aawm_alias_candidate_loop.handle_alias_route" in calls, (
-        "_handle_auto_agent_alias_route must delegate to " f"candidate_loop.handle_alias_route; calls={sorted(calls)}"
+    assert (
+        "_aawm_anthropic_auto_agent_route.handle_auto_agent_alias_route"
+        in god_source
+    )
+    assert "_aawm_alias_candidate_loop.handle_alias_route" in god_source, (
+        "_handle_auto_agent_alias_route must delegate through the route runtime "
+        "to candidate_loop.handle_alias_route"
     )
 
 
@@ -136,3 +143,50 @@ def test_alias_route_services_defined_in_interfaces_not_god() -> None:
     assert (
         "AliasRouteServices" not in god_classes
     ), "god-module must not redefine AliasRouteServices; it imports it from interfaces"
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_resolves_generic_status_helper_from_live_host() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    services = SimpleNamespace(
+        select_candidate_fn=None,
+        perform_candidate_request_fn=None,
+        resolve_cooldown_publication_fn=None,
+        publish_cooldown_memory_fn=None,
+        persist_cooldown_fn=None,
+        set_session_affinity_fn=None,
+        add_alias_metadata_fn=None,
+        raise_redispatch_fn=None,
+    )
+
+    with pytest.raises(lpe.HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex",
+            alias_model="aawm-test",
+            request=request,
+            prepared_request_body={},
+            max_candidate_attempts=0,
+            get_active_cooldown_state_fn=None,
+            attempts_metadata_key="attempts",
+            skipped_candidates_metadata_key="skipped",
+            no_candidate_detail="no candidates",
+            log_label="test",
+        )
+
+    assert exc_info.value.status_code == 429
+    assert (
+        lpe._extract_adapter_exception_status_code
+        is package.error_signals._extract_adapter_exception_status_code
+    )

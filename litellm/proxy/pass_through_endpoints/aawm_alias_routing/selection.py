@@ -10,12 +10,13 @@ Direct imports from sibling Wave 4/5A modules (``lane_keys``, ``snapshot_select`
 
 from __future__ import annotations
 
-import asyncio
 import time
-from typing import Any, Awaitable, Callable, Optional, Sequence, cast
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from fastapi import HTTPException, Request
 
+from . import cooldown_state as _cooldown_state
+from .cooldown_state import _attach_aawm_alias_routing_state_sources
 from .lane_keys import (
     _codex_auto_agent_candidate_key,
     _resolve_anthropic_auto_agent_native_cooldown_lane_key,
@@ -23,15 +24,12 @@ from .lane_keys import (
     _resolve_codex_auto_agent_xai_lane_key,
 )
 from .openrouter_quota import _apply_openrouter_durable_quota_candidate_cooldown
-from .cooldown_state import _attach_aawm_alias_routing_state_sources
 from .policy import (
     ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS as _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     ANTHROPIC_AUTO_AGENT_MODEL_ALIAS as _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
     ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER as _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-    CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER as _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
-    CODEX_AUTO_AGENT_GOOGLE_PROVIDER as _CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
     CODEX_AUTO_AGENT_MODEL_ALIAS as _CODEX_AUTO_AGENT_MODEL_ALIAS,
@@ -54,10 +52,6 @@ from .snapshot_select import (
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY = "google:auth_degraded"
-_CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS = 5 * 60.0
-
-# ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / cooldown_state.py dependencies)
 # ---------------------------------------------------------------------------
 _get_codex_active_cooldown_state: Optional[
@@ -77,15 +71,9 @@ _get_codex_session_affinity: Optional[
 _get_anthropic_session_affinity: Optional[
     Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]]
 ] = None
-_resolve_google_lane_key: Optional[Callable[[], Awaitable[str]]] = None
-_resolve_antigravity_lane_state: Optional[
-    Callable[[], Awaitable[dict[str, Any]]]
-] = None
 _get_openrouter_adapter_active_cooldown_seconds: Optional[
     Callable[[Optional[str]], Awaitable[float]]
 ] = None
-_google_adapter_rate_limit_lock: Optional[asyncio.Lock] = None
-_google_adapter_rate_limit_until_monotonic_by_key: Optional[dict[str, float]] = None
 _normalize_codex_alias_model: Optional[Callable[[Any], Optional[str]]] = None
 _extract_client_product_label: Optional[
     Callable[[Request, dict[str, Any]], Optional[str]]
@@ -115,11 +103,7 @@ def configure_selection_runtime(
     set_anthropic_cooldown: Callable[[str, float], Awaitable[object]],
     get_codex_session_affinity: Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]],
     get_anthropic_session_affinity: Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]],
-    resolve_google_lane_key: Callable[[], Awaitable[str]],
-    resolve_antigravity_lane_state: Callable[[], Awaitable[dict[str, Any]]],
     get_openrouter_adapter_active_cooldown_seconds: Callable[[Optional[str]], Awaitable[float]],
-    google_adapter_rate_limit_lock: asyncio.Lock,
-    google_adapter_rate_limit_until_monotonic_by_key: dict[str, float],
     normalize_codex_alias_model: Callable[[Any], Optional[str]],
     extract_client_product_label: Callable[[Request, dict[str, Any]], Optional[str]],
     resolve_codex_session_key: Callable[..., Optional[str]],
@@ -146,16 +130,8 @@ def configure_selection_runtime(
     _get_codex_session_affinity = get_codex_session_affinity
     global _get_anthropic_session_affinity
     _get_anthropic_session_affinity = get_anthropic_session_affinity
-    global _resolve_google_lane_key
-    _resolve_google_lane_key = resolve_google_lane_key
-    global _resolve_antigravity_lane_state
-    _resolve_antigravity_lane_state = resolve_antigravity_lane_state
     global _get_openrouter_adapter_active_cooldown_seconds
     _get_openrouter_adapter_active_cooldown_seconds = get_openrouter_adapter_active_cooldown_seconds
-    global _google_adapter_rate_limit_lock
-    _google_adapter_rate_limit_lock = google_adapter_rate_limit_lock
-    global _google_adapter_rate_limit_until_monotonic_by_key
-    _google_adapter_rate_limit_until_monotonic_by_key = google_adapter_rate_limit_until_monotonic_by_key
     global _normalize_codex_alias_model
     _normalize_codex_alias_model = normalize_codex_alias_model
     global _extract_client_product_label
@@ -447,17 +423,6 @@ async def _apply_codex_auto_agent_adapter_local_candidate_cooldown(
     if provider == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
         assert _get_openrouter_adapter_active_cooldown_seconds is not None
         adapter_seconds = await _get_openrouter_adapter_active_cooldown_seconds(model)
-    elif provider == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-        assert _resolve_google_lane_key is not None
-        assert _google_adapter_rate_limit_lock is not None
-        assert _google_adapter_rate_limit_until_monotonic_by_key is not None
-        lane_key = await _resolve_google_lane_key()
-        async with _google_adapter_rate_limit_lock:
-            now = time.monotonic()
-            adapter_seconds = max(
-                0.0,
-                _google_adapter_rate_limit_until_monotonic_by_key.get(lane_key, 0.0) - now,
-            )
     if adapter_seconds <= 0:
         return cooldown_seconds, cooldown_state_source, skip_reason
     if adapter_seconds > cooldown_seconds:
@@ -628,12 +593,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     candidate_template: dict[str, Any],
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
     openai_lane_key: Optional[str] = None,
-    google_lane_key: Optional[str] = None,
-    antigravity_lane_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     assert _get_codex_active_cooldown_state is not None
-    assert _resolve_google_lane_key is not None
-    assert _resolve_antigravity_lane_state is not None
     candidate = dict(candidate_template)
     if openai_lane_key is None:
         openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
@@ -642,26 +603,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     cooldown_state_source_override: Optional[str] = None
     failure_phase: Optional[str] = None
     attempted_provider_call: Optional[bool] = None
-    if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-        if google_lane_key is None:
-            google_lane_key = await _resolve_google_lane_key()
-        lane_key = google_lane_key
-        if lane_key == _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY:
-            forced_cooldown_seconds = _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
-            skip_reason = "auth_degraded"
-            cooldown_state_source_override = "auth_degraded"
-            failure_phase = "auth"
-            attempted_provider_call = False
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
-        if antigravity_lane_state is None:
-            antigravity_lane_state = await _resolve_antigravity_lane_state()
-        lane_key = str(antigravity_lane_state["lane_key"])
-        forced_cooldown_seconds = _auto_agent_alias_float(antigravity_lane_state.get("forced_cooldown_seconds"))
-        skip_reason = cast(Optional[str], antigravity_lane_state.get("skip_reason"))
-        cooldown_state_source_override = cast(Optional[str], antigravity_lane_state.get("cooldown_state_source"))
-        failure_phase = cast(Optional[str], antigravity_lane_state.get("failure_phase"))
-        attempted_provider_call = cast(Optional[bool], antigravity_lane_state.get("attempted_provider_call"))
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+    if candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
         lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
@@ -772,12 +714,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
     openai_lane_key: Optional[str] = None,
     anthropic_lane_key: Optional[str] = None,
-    google_lane_key: Optional[str] = None,
-    antigravity_lane_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     assert _get_anthropic_active_cooldown_state is not None
-    assert _resolve_google_lane_key is not None
-    assert _resolve_antigravity_lane_state is not None
     candidate = dict(candidate_template)
     if openai_lane_key is None:
         openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
@@ -788,26 +726,7 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     cooldown_state_source_override: Optional[str] = None
     failure_phase: Optional[str] = None
     attempted_provider_call: Optional[bool] = None
-    if candidate["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER:
-        if google_lane_key is None:
-            google_lane_key = await _resolve_google_lane_key()
-        lane_key = google_lane_key
-        if lane_key == _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY:
-            forced_cooldown_seconds = _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS
-            skip_reason = "auth_degraded"
-            cooldown_state_source_override = "auth_degraded"
-            failure_phase = "auth"
-            attempted_provider_call = False
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER:
-        if antigravity_lane_state is None:
-            antigravity_lane_state = await _resolve_antigravity_lane_state()
-        lane_key = str(antigravity_lane_state["lane_key"])
-        forced_cooldown_seconds = _auto_agent_alias_float(antigravity_lane_state.get("forced_cooldown_seconds"))
-        skip_reason = cast(Optional[str], antigravity_lane_state.get("skip_reason"))
-        cooldown_state_source_override = cast(Optional[str], antigravity_lane_state.get("cooldown_state_source"))
-        failure_phase = cast(Optional[str], antigravity_lane_state.get("failure_phase"))
-        attempted_provider_call = cast(Optional[bool], antigravity_lane_state.get("attempted_provider_call"))
-    elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
+    if candidate["provider"] == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_XAI_PROVIDER:
         lane_key = _resolve_codex_auto_agent_xai_lane_key(candidate)
@@ -925,29 +844,19 @@ async def _build_codex_auto_agent_candidate_states(
     alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
     client_product_label: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    assert _resolve_google_lane_key is not None
-    assert _resolve_antigravity_lane_state is not None
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
-    google_lane_key: Optional[str] = None
-    antigravity_lane_state: Optional[dict[str, Any]] = None
     states: list[dict[str, Any]] = []
     for candidate_template in _resolve_aawm_alias_selection_enumeration(
         request,
         alias_model,
         client_product_label=client_product_label,
     ).candidates:
-        if candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER and google_lane_key is None:
-            google_lane_key = await _resolve_google_lane_key()
-        if candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER and antigravity_lane_state is None:
-            antigravity_lane_state = await _resolve_antigravity_lane_state()
         states.append(
             await _build_codex_auto_agent_candidate_state(
                 request,
                 candidate_template=candidate_template,
                 alias_model=alias_model,
                 openai_lane_key=openai_lane_key,
-                google_lane_key=google_lane_key,
-                antigravity_lane_state=antigravity_lane_state,
             )
         )
     return states
@@ -959,18 +868,10 @@ async def _build_anthropic_auto_agent_candidate_states(
     alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
 ) -> list[dict[str, Any]]:
     assert _get_anthropic_candidates_for_alias is not None
-    assert _resolve_google_lane_key is not None
-    assert _resolve_antigravity_lane_state is not None
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
-    google_lane_key: Optional[str] = None
-    antigravity_lane_state: Optional[dict[str, Any]] = None
     states: list[dict[str, Any]] = []
     for candidate_template in _get_anthropic_candidates_for_alias(alias_model):
-        if candidate_template["provider"] == _CODEX_AUTO_AGENT_GOOGLE_PROVIDER and google_lane_key is None:
-            google_lane_key = await _resolve_google_lane_key()
-        if candidate_template["provider"] == _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER and antigravity_lane_state is None:
-            antigravity_lane_state = await _resolve_antigravity_lane_state()
         states.append(
             await _build_anthropic_auto_agent_candidate_state(
                 request,
@@ -978,8 +879,6 @@ async def _build_anthropic_auto_agent_candidate_states(
                 alias_model=alias_model,
                 openai_lane_key=openai_lane_key,
                 anthropic_lane_key=anthropic_lane_key,
-                google_lane_key=google_lane_key,
-                antigravity_lane_state=antigravity_lane_state,
             )
         )
     return states
@@ -1670,6 +1569,12 @@ def install(host_globals: dict) -> None:
             _rebound.__dict__.update(_obj.__dict__)
         _mod[_name] = _rebound
         host_globals[_name] = _rebound
+    _mod["_attach_aawm_alias_routing_state_sources"] = (
+        _cooldown_state._attach_aawm_alias_routing_state_sources
+    )
+    host_globals["_attach_aawm_alias_routing_state_sources"] = (
+        _cooldown_state._attach_aawm_alias_routing_state_sources
+    )
     # Copy seam variables into host_globals so rebound functions resolve them.
     host_globals.update({
         "_get_codex_active_cooldown_state": _get_codex_active_cooldown_state,
@@ -1679,10 +1584,6 @@ def install(host_globals: dict) -> None:
         "_set_anthropic_cooldown": _set_anthropic_cooldown,
         "_get_codex_session_affinity": _get_codex_session_affinity,
         "_get_anthropic_session_affinity": _get_anthropic_session_affinity,
-        "_resolve_google_lane_key": _resolve_google_lane_key,
-        "_resolve_antigravity_lane_state": _resolve_antigravity_lane_state,
-        "_google_adapter_rate_limit_lock": _google_adapter_rate_limit_lock,
-        "_google_adapter_rate_limit_until_monotonic_by_key": _google_adapter_rate_limit_until_monotonic_by_key,
         "_normalize_codex_alias_model": _normalize_codex_alias_model,
         "_extract_client_product_label": _extract_client_product_label,
         "_resolve_codex_session_key": _resolve_codex_session_key,

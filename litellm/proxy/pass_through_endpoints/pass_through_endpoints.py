@@ -112,7 +112,6 @@ from .provider_failure_classifiers import (  # noqa: F401
     _is_known_chatgpt_codex_block_page_response,
     _is_known_chatgpt_codex_invalid_encrypted_content_response,
     _is_known_chatgpt_codex_model_not_supported_for_account_response,
-    _is_known_google_code_assist_tos_violation_response,
     _is_known_grok_billing_passthrough_timeout_cancel_response,
     _is_known_grok_build_usage_balance_exhausted_response,
     _is_known_grok_personal_team_spending_limit_response,

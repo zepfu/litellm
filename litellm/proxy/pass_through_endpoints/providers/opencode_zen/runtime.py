@@ -157,10 +157,10 @@ def install(host_globals: dict[str, Any]) -> None:
                 "BaseOpenAIPassThroughHandler"
             )._join_url_paths(base_url, path, provider),
             extract_exception_status_code=lambda exc: _host(
-                "_extract_google_adapter_exception_status_code"
+                "_extract_adapter_exception_status_code"
             )(exc),
             extract_exception_detail=lambda exc: _host(
-                "_extract_google_adapter_exception_detail"
+                "_extract_adapter_exception_detail"
             )(exc),
             merge_metadata=lambda *args, **kwargs: _host("_merge_litellm_metadata")(
                 *args, **kwargs

@@ -70,15 +70,11 @@ operations. Provider algorithms are not implemented in
 wrappers and runtime assembly so existing private imports and monkeypatch-based
 tests continue to observe the same call sites.
 
-Google's larger shaping surface is split by responsibility across
-`providers/google/` modules for content selection and compaction, schema and
-prompt policy, Anthropic replay, tool pairing and aliasing, request assembly and
-preparation, response translation and streaming, persisted-output compaction,
-and error shaping. `providers/google/shaping.py` is a compatibility facade that
-re-exports those provider-owned functions and binds route-layer runtime
-dependencies into the implementation modules. Its checked-in `shaping.pyi`
-records the static callable contract for type checkers; it is not a second
-implementation.
+Retired account-backed AAWM Google adapter routes are outside this architecture.
+They have no current provider package, shaping facade, credential, retry,
+install-order, resolver-priority, persisted-output, or tool-call reconstruction
+contract. Native Gemini, Google AI Studio, Google GenAI, Vertex AI, and
+OpenRouter-hosted Google models remain ordinary supported provider paths.
 
 The same ownership rule applies to Grok normalization and composer repair,
 OpenCode Zen normalization, and OpenRouter error/retry transport. The god-file
@@ -124,14 +120,6 @@ same server-side prompt-cache key across turns.
 
 Neither streaming iterator reimplements cache hashing; request-path adapters
 call the shared helper.
-
-## Gemini route debug (`AAWM_GEMINI_ROUTE_DEBUG`)
-
-When `AAWM_GEMINI_ROUTE_DEBUG=1`, the Chat stream wrapper dumps per-chunk
-Gemini raw/translated diagnostics. The flag is resolved once in
-`AnthropicStreamWrapper.__init__` (not per chunk) and is logged via
-`verbose_logger.debug` so production WARNING-level pipelines and alerting stay
-quiet. This is intentional debug tracing, not a warning condition.
 
 ## Responses streaming event map (summary)
 

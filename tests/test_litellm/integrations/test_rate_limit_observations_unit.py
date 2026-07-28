@@ -42,7 +42,6 @@ from litellm.integrations.aawm_agent_identity import (
     _build_rate_limit_observation_db_payload,
     _extract_anthropic_header_rate_limit_observations,
     _extract_codex_header_rate_limit_observations,
-    _extract_google_quota_observations,
     _extract_grok_billing_observations,
     _extract_openrouter_free_error_observations,
     _extract_xai_oauth_header_rate_limit_observations,
@@ -159,18 +158,6 @@ def _openrouter_free_inputs():
         _base_kwargs("google/gemma-4-31b-it:free", "openrouter", {}),
         _OpenRouterFreeResponse(),
     )
-
-
-def _google_quota_inputs():
-    metadata = {
-        "google_retrieve_user_quota": {
-            "modelId": "gemini-2.5-pro",
-            "remainingRequests": 80,
-            "totalRequests": 100,
-            "resetsAt": "2026-07-02T00:00:00Z",
-        }
-    }
-    return _base_kwargs("gemini-2.5-pro", "gemini", metadata), {}
 
 
 # ---------------------------------------------------------------------------
@@ -623,90 +610,6 @@ OPENROUTER_FREE_DB_PAYLOAD = (
     "call-fixed-1",
 )
 
-GOOGLE_QUOTA_OBSERVATION = {
-    "observed_at": datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc),
-    "provider": "gemini",
-    "client_family": "google_code_assist",
-    "account_hash": None,
-    "environment": None,
-    "tenant_id": None,
-    "repository": None,
-    "session_id": None,
-    "trace_id": None,
-    "litellm_call_id": "call-fixed-1",
-    "route_family": None,
-    "request_model": None,
-    "response_model": None,
-    "model": "gemini-2.5-pro",
-    "model_family": "gemini",
-    "model_tier": "pro",
-    "client_name": None,
-    "client_version": None,
-    "client_user_agent": None,
-    "metadata": {},
-    "source": "google_retrieve_user_quota",
-    "limit_id": "google_code_assist_requests_gemini-2.5-pro",
-    "limit_name": "Google Code Assist gemini-2.5-pro requests",
-    "limit_scope": "model_requests",
-    "window_minutes": 1440,
-    "quota_period": "daily",
-    "quota_type": None,
-    "provider_resets_at": datetime(2026, 7, 2, 0, 0, 0, tzinfo=timezone.utc),
-    "used_percentage": None,
-    "remaining_requests": 80,
-    "used_requests": None,
-    "total_requests": 100,
-    "raw_provider_fields": {
-        "modelId": "gemini-2.5-pro",
-        "remainingRequests": 80,
-        "totalRequests": 100,
-        "resetsAt": "2026-07-02T00:00:00Z",
-    },
-    "evidence": {
-        "signals": [
-            "google_quota_payload",
-        ],
-        "provider_fields": [
-            "modelId",
-            "remainingRequests",
-            "resetsAt",
-            "totalRequests",
-        ],
-        "token_type": None,
-    },
-    "inferred_window_start_at": datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc),
-    "reset_hint_seconds": None,
-    "limit_key": "gemini:google_code_assist:unknown_account:google_code_assist_requests_gemini-2.5-pro:model_requests:1440",
-    "exhausted": False,
-    "status": "observed",
-}
-
-GOOGLE_QUOTA_DB_PAYLOAD = (
-    datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc),
-    "google_code_assist",
-    None,
-    None,
-    "google",
-    "gemini-2.5-pro",
-    "google_code_assist_requests_gemini-2.5-pro:model_requests",
-    "daily",
-    "requests",
-    datetime(2026, 7, 2, 0, 0, 0, tzinfo=timezone.utc),
-    None,
-    100.0,
-    None,
-    80.0,
-    None,
-    None,
-    '{"modelId": "gemini-2.5-pro", "remainingRequests": 80, "totalRequests": 100, "resetsAt": "2026-07-02T00:00:00Z"}',
-    '{"signals": ["google_quota_payload"], "provider_fields": ["modelId", "remainingRequests", "resetsAt", "totalRequests"], "token_type": null}',
-    "google_retrieve_user_quota",
-    None,
-    None,
-    "call-fixed-1",
-)
-
-
 # (case_id, input_builder, extractor, golden_observation, golden_db_payload)
 _CASES = [
     (
@@ -743,13 +646,6 @@ _CASES = [
         _extract_openrouter_free_error_observations,
         OPENROUTER_FREE_OBSERVATION,
         OPENROUTER_FREE_DB_PAYLOAD,
-    ),
-    (
-        "google_quota",
-        _google_quota_inputs,
-        _extract_google_quota_observations,
-        GOOGLE_QUOTA_OBSERVATION,
-        GOOGLE_QUOTA_DB_PAYLOAD,
     ),
 ]
 

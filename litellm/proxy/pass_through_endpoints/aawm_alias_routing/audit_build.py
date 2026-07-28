@@ -11,7 +11,7 @@ modules own the symbols.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional
 
 from fastapi import HTTPException, Request
@@ -36,28 +36,81 @@ _get_auto_agent_alias_request_context: Optional[
 _attach_auto_agent_alias_terminal_context_fields: Optional[
     Callable[..., object]
 ] = None
-_format_auto_agent_alias_timestamp: Optional[Callable[[datetime], str]] = None
+# Owner-concrete implementations (D1-591).  The god-module previously defined
+# these inline and injected them via configure_audit_build_runtime.  A later
+# integrator can remove the ~18 god-module lines and either pass these through
+# configure or omit the parameters entirely.
+
+
+def _auto_agent_alias_int(value: Any) -> Optional[int]:
+    """Coerce *value* to int, returning None on failure."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_auto_agent_alias_timestamp(value: datetime) -> str:
+    """Format *value* as UTC ISO-8601 with trailing Z."""
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _auto_agent_alias_cooldown_until(
+    cooldown_seconds: Optional[float],
+) -> Optional[str]:
+    """Return an ISO-8601 Z timestamp offset by *cooldown_seconds* from now."""
+    if cooldown_seconds is None:
+        return None
+    return _format_auto_agent_alias_timestamp(
+        datetime.now(timezone.utc) + timedelta(seconds=max(0.0, cooldown_seconds))
+    )
+
+
+# Seam variables: default to the owner-concrete functions above.
+# configure_audit_build_runtime() can still override them for testing.
+_format_auto_agent_alias_timestamp: Callable[[datetime], str] = _format_auto_agent_alias_timestamp
 _extract_auto_agent_alias_metadata_value: Optional[Callable[..., Optional[str]]] = None
 _extract_auto_agent_alias_incoming_endpoint: Optional[Callable[..., str]] = None
 _resolve_auto_agent_alias_route_rollup_outgoing_target: Optional[
     Callable[..., Optional[str]]
 ] = None
-_auto_agent_alias_int: Optional[Callable[..., Optional[int]]] = None
-_auto_agent_alias_cooldown_until: Optional[Callable[..., Optional[str]]] = None
+_auto_agent_alias_int: Callable[..., Optional[int]] = _auto_agent_alias_int
+_auto_agent_alias_cooldown_until: Callable[..., Optional[str]] = _auto_agent_alias_cooldown_until
 
 _host_globals: Optional[dict] = None
+_MISSING = object()
+_runtime_restore_stacks: dict[str, list[tuple[object, object, object]]] = {}
+
+
+def _update_host_runtime_callbacks(
+    callbacks: Mapping[str, object],
+    previous_module_values: Mapping[str, object],
+) -> None:
+    if _host_globals is None:
+        return
+    for name, callback in callbacks.items():
+        _runtime_restore_stacks.setdefault(name, []).append(
+            (
+                callback,
+                previous_module_values[name],
+                _host_globals.get(name, _MISSING),
+            )
+        )
+        _host_globals[name] = callback
 
 
 def configure_audit_build_runtime(
     *,
     get_request_context: Callable[..., Mapping[str, Any]],
     attach_terminal_context_fields: Callable[..., object],
-    format_timestamp: Callable[[datetime], str],
+    format_timestamp: Optional[Callable[[datetime], str]] = None,
     extract_metadata_value: Callable[..., Optional[str]],
     extract_incoming_endpoint: Callable[..., str],
     resolve_outgoing_target: Callable[..., Optional[str]],
-    to_int: Callable[..., Optional[int]],
-    cooldown_until: Callable[..., Optional[str]],
+    to_int: Optional[Callable[..., Optional[int]]] = None,
+    cooldown_until: Optional[Callable[..., Optional[str]]] = None,
 ) -> None:
     """Inject god-module and audit_context.py dependencies."""
     global _get_auto_agent_alias_request_context
@@ -69,17 +122,30 @@ def configure_audit_build_runtime(
     global _auto_agent_alias_int
     global _auto_agent_alias_cooldown_until
 
+    previous_module_values = {
+        "_get_auto_agent_alias_request_context": _get_auto_agent_alias_request_context,
+        "_attach_auto_agent_alias_terminal_context_fields": _attach_auto_agent_alias_terminal_context_fields,
+        "_format_auto_agent_alias_timestamp": _format_auto_agent_alias_timestamp,
+        "_extract_auto_agent_alias_metadata_value": _extract_auto_agent_alias_metadata_value,
+        "_extract_auto_agent_alias_incoming_endpoint": _extract_auto_agent_alias_incoming_endpoint,
+        "_resolve_auto_agent_alias_route_rollup_outgoing_target": _resolve_auto_agent_alias_route_rollup_outgoing_target,
+        "_auto_agent_alias_int": _auto_agent_alias_int,
+        "_auto_agent_alias_cooldown_until": _auto_agent_alias_cooldown_until,
+    }
     _get_auto_agent_alias_request_context = get_request_context
     _attach_auto_agent_alias_terminal_context_fields = attach_terminal_context_fields
-    _format_auto_agent_alias_timestamp = format_timestamp
+    if format_timestamp is not None:
+        _format_auto_agent_alias_timestamp = format_timestamp
     _extract_auto_agent_alias_metadata_value = extract_metadata_value
     _extract_auto_agent_alias_incoming_endpoint = extract_incoming_endpoint
     _resolve_auto_agent_alias_route_rollup_outgoing_target = resolve_outgoing_target
-    _auto_agent_alias_int = to_int
-    _auto_agent_alias_cooldown_until = cooldown_until
+    if to_int is not None:
+        _auto_agent_alias_int = to_int
+    if cooldown_until is not None:
+        _auto_agent_alias_cooldown_until = cooldown_until
 
-    if _host_globals is not None:
-        _host_globals.update({
+    _update_host_runtime_callbacks(
+        {
             "_get_auto_agent_alias_request_context": _get_auto_agent_alias_request_context,
             "_attach_auto_agent_alias_terminal_context_fields": _attach_auto_agent_alias_terminal_context_fields,
             "_format_auto_agent_alias_timestamp": _format_auto_agent_alias_timestamp,
@@ -88,7 +154,9 @@ def configure_audit_build_runtime(
             "_resolve_auto_agent_alias_route_rollup_outgoing_target": _resolve_auto_agent_alias_route_rollup_outgoing_target,
             "_auto_agent_alias_int": _auto_agent_alias_int,
             "_auto_agent_alias_cooldown_until": _auto_agent_alias_cooldown_until,
-        })
+        },
+        previous_module_values,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,12 +209,9 @@ def _build_auto_agent_alias_audit_event(
 ) -> dict[str, Any]:
     assert _get_auto_agent_alias_request_context is not None
     assert _attach_auto_agent_alias_terminal_context_fields is not None
-    assert _format_auto_agent_alias_timestamp is not None
     assert _extract_auto_agent_alias_metadata_value is not None
     assert _extract_auto_agent_alias_incoming_endpoint is not None
     assert _resolve_auto_agent_alias_route_rollup_outgoing_target is not None
-    assert _auto_agent_alias_int is not None
-    assert _auto_agent_alias_cooldown_until is not None
 
     normalized_cooldown_seconds = _auto_agent_alias_float(cooldown_seconds)
     if lane_key is None:
@@ -409,6 +474,44 @@ _HOST_FUNCTION_NAMES = (
 )
 
 
+def _host_callback_delegates_to_module(
+    name: str,
+    callback: object,
+    owner_module: object,
+) -> bool:
+    code = getattr(callback, "__code__", None)
+    callback_globals = getattr(callback, "__globals__", None)
+    if code is None or not isinstance(callback_globals, dict):
+        return False
+
+    owner_callback = getattr(owner_module, name, _MISSING)
+    if callback is owner_callback:
+        return False
+    if (
+        callback_globals.get(name) is callback
+        and getattr(callback, "__name__", None) != name
+    ):
+        return True
+
+    referenced_values = [
+        callback_globals.get(global_name, _MISSING)
+        for global_name in code.co_names
+    ]
+    closure_values = []
+    for cell in getattr(callback, "__closure__", None) or ():
+        try:
+            closure_values.append(cell.cell_contents)
+        except ValueError:
+            continue
+
+    if any(value is owner_callback for value in (*referenced_values, *closure_values)):
+        return True
+    references_seam = name in code.co_names or name in code.co_consts
+    return references_seam and any(
+        value is owner_module for value in (*referenced_values, *closure_values)
+    )
+
+
 def install(host_globals: dict) -> None:
     """Rebind moved functions to host_globals for live lookup.
 
@@ -417,8 +520,18 @@ def install(host_globals: dict) -> None:
     rebound object is published to both this module and the host module.
     """
     global _host_globals
-    _host_globals = host_globals
     _mod = globals()
+    owner_module = _sys.modules[__name__]
+    for _name in _SEAM_NAMES:
+        host_callback = host_globals.get(_name, _MISSING)
+        if host_callback is _MISSING or _host_callback_delegates_to_module(
+            _name,
+            host_callback,
+            owner_module,
+        ):
+            continue
+        _mod[_name] = host_callback
+    _host_globals = host_globals
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         _rebound = _FunctionType(
@@ -437,6 +550,17 @@ def install(host_globals: dict) -> None:
             _rebound.__dict__.update(_obj.__dict__)
         _mod[_name] = _rebound
         host_globals[_name] = _rebound
+    from . import audit_context as _audit_context
+
+    for _name in _audit_context._SEAM_NAMES:
+        host_callback = host_globals.get(_name, _MISSING)
+        if host_callback is _MISSING or _host_callback_delegates_to_module(
+            _name,
+            host_callback,
+            _audit_context,
+        ):
+            continue
+        setattr(_audit_context, _name, host_callback)
     # Copy seam variables into host_globals so rebound functions resolve them.
     # Only copy seams not already present (preserves god-module defs and prior rebinds).
     for _sk, _sv in (
@@ -481,6 +605,15 @@ class _SeamPropagatingModule(_types.ModuleType):
         if seam_names is not None and name in seam_names:
             hg = self.__dict__.get("_host_globals")
             if hg is not None:
+                restore_stacks = self.__dict__.get("_runtime_restore_stacks", {})
+                restore_stack = restore_stacks.get(name)
+                if restore_stack and value is restore_stack[-1][1]:
+                    _, _, prior_host_value = restore_stack.pop()
+                    if prior_host_value is self.__dict__["_MISSING"]:
+                        hg.pop(name, None)
+                    else:
+                        hg[name] = prior_host_value
+                    return
                 hg[name] = value
 
 

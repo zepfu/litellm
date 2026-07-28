@@ -13,8 +13,11 @@ Grok side-channel module are used where those modules own the symbols.
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 import random
+import re
 import time
 from typing import Any, Callable, Optional
 
@@ -103,17 +106,246 @@ _KIMI_CODE_SAFE_UPSTREAM_IDS = frozenset({"k3", "kimi-for-coding", "kimi-for-cod
 _KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL = "__managed_account__"
 
 # ---------------------------------------------------------------------------
+# Owner-local header / JSON helpers (D1-591)
+#
+# Exact-semantics copies of the six god-module helpers that error_signals
+# previously received as host callbacks.  Defining them here lets a later
+# integrator remove ~103 lines from llm_passthrough_endpoints.py without a
+# god-module import or mixed host/owner lookup.
+# ---------------------------------------------------------------------------
+
+
+def _extract_adapter_upstream_headers(exc: Any) -> dict[str, Any]:
+    upstream_headers = getattr(exc, "upstream_headers", None)
+    if isinstance(upstream_headers, dict):
+        return {
+            str(header_name): header_value
+            for header_name, header_value in upstream_headers.items()
+            if header_value is not None
+        }
+    response = getattr(exc, "response", None)
+    response_headers = getattr(response, "headers", None)
+    if response_headers is None:
+        return {}
+    return {str(header_name): str(header_value) for header_name, header_value in response_headers.items()}
+
+
+def _get_adapter_header_value(headers: dict[str, Any], header_name: str) -> Optional[str]:
+    if not headers:
+        return None
+    for key, value in headers.items():
+        if not isinstance(key, str):
+            continue
+        if key.lower() != header_name.lower():
+            continue
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return str(value)
+    return None
+
+
+def _parse_retry_after_seconds_from_headers(headers: dict[str, Any]) -> Optional[float]:
+    retry_after_value = _get_adapter_header_value(headers, "Retry-After")
+    if retry_after_value is None:
+        return None
+    try:
+        return max(0.0, float(retry_after_value))
+    except Exception:
+        return None
+
+
+def _parse_rate_limit_reset_wait_seconds_from_headers(headers: dict[str, Any]) -> Optional[float]:
+    reset_value = _get_adapter_header_value(headers, "X-RateLimit-Reset")
+    if reset_value is None:
+        return None
+    try:
+        reset_number = float(reset_value)
+    except Exception:
+        return None
+    if reset_number > 1_000_000_000_000:
+        reset_epoch_seconds = reset_number / 1000.0
+    else:
+        reset_epoch_seconds = reset_number
+    return max(0.0, reset_epoch_seconds - time.time())
+
+
+def _extract_embedded_json_payload_candidates(detail: object) -> list[str]:
+    """Shared exception-detail JSON/bytes extraction (RR-054 #59)."""
+    if isinstance(detail, dict):
+        try:
+            return [json.dumps(detail)]
+        except Exception:
+            return [str(detail)]
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="ignore")
+    else:
+        detail_text = str(detail or "")
+    candidates: list[str] = [detail_text]
+    brace_start = detail_text.find("{")
+    brace_end = detail_text.rfind("}")
+    if brace_start != -1 and brace_end > brace_start:
+        candidates.append(detail_text[brace_start : brace_end + 1])
+    bracket_start = detail_text.find("[")
+    bracket_end = detail_text.rfind("]")
+    if bracket_start != -1 and bracket_end > bracket_start:
+        candidates.append(detail_text[bracket_start : bracket_end + 1])
+    bytes_literal_match = re.search(r'b([\'"]).*', detail_text, re.DOTALL)
+    if bytes_literal_match is not None:
+        try:
+            literal_value = ast.literal_eval(bytes_literal_match.group(0))
+            if isinstance(literal_value, bytes):
+                candidates.append(literal_value.decode("utf-8", errors="ignore"))
+            else:
+                candidates.append(str(literal_value))
+        except Exception:
+            pass
+    # openrouter-style ": b'...'" wrappers
+    if ": b'" in detail_text or ': b"' in detail_text:
+        tail = detail_text.split(": ", 1)[-1].strip()
+        if (tail.startswith("b'") and tail.endswith("'")) or (tail.startswith('b"') and tail.endswith('"')):
+            try:
+                literal_value = ast.literal_eval(tail)
+                if isinstance(literal_value, bytes):
+                    candidates.append(literal_value.decode("utf-8", errors="ignore"))
+                elif isinstance(literal_value, str):
+                    candidates.append(literal_value)
+            except Exception:
+                pass
+    return candidates
+
+
+def _parse_json_payloads_from_text_candidates(
+    candidates: list[str],
+) -> list[object]:
+    parsed_payloads: list[object] = []
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        parsed_payloads.append(parsed)
+    return parsed_payloads
+
+
+# ---------------------------------------------------------------------------
+# Provider-neutral exception helpers and retained OpenRouter error shape
+# ---------------------------------------------------------------------------
+
+
+def _extract_adapter_exception_detail(exc: Any) -> Any:
+    detail = getattr(exc, "detail", None)
+    if detail is not None:
+        return detail
+    response = getattr(exc, "response", None)
+    response_text = getattr(response, "text", None)
+    if response_text is not None:
+        return response_text
+    return getattr(exc, "message", None)
+
+
+def _extract_adapter_error_payloads(exc: Any) -> list[Any]:
+    parsed_payloads: list[Any] = []
+    for candidate in (
+        getattr(exc, "detail", None),
+        getattr(exc, "message", None),
+        str(exc),
+    ):
+        if isinstance(candidate, (dict, list)):
+            parsed_payloads.append(candidate)
+            continue
+        parsed_payloads.extend(
+            _parse_json_payloads_from_text_candidates(
+                _extract_embedded_json_payload_candidates(candidate)
+            )
+        )
+    return parsed_payloads
+
+
+def _extract_adapter_exception_status_code(exc: Any) -> Optional[int]:
+    for source in (exc, getattr(exc, "response", None)):
+        if source is None:
+            continue
+        for attr in ("status_code", "code"):
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+            try:
+                if value is not None:
+                    return int(value)
+            except Exception:
+                continue
+    if "429" in str(exc):
+        return 429
+    return None
+
+
+class _OpenRouterErrorShapeRuntime:
+    def extract_embedded_json_payload_candidates(
+        self,
+        detail: object,
+    ) -> list[str]:
+        return _extract_embedded_json_payload_candidates(detail)
+
+    def parse_json_payloads_from_text_candidates(
+        self,
+        candidates: list[str],
+    ) -> list[object]:
+        return _parse_json_payloads_from_text_candidates(candidates)
+
+    def extract_upstream_headers(self, exc: object) -> dict[str, Any]:
+        return _extract_adapter_upstream_headers(exc)
+
+    def parse_retry_after_seconds_from_headers(
+        self,
+        headers: dict[str, Any],
+    ) -> Optional[float]:
+        return _parse_retry_after_seconds_from_headers(headers)
+
+    def get_header_value(
+        self,
+        headers: dict[str, Any],
+        header_name: str,
+    ) -> Optional[str]:
+        return _get_adapter_header_value(headers, header_name)
+
+    def parse_reset_wait_seconds_from_headers(
+        self,
+        headers: dict[str, Any],
+    ) -> Optional[float]:
+        return _parse_rate_limit_reset_wait_seconds_from_headers(headers)
+
+
+_OPENROUTER_ERROR_SHAPE_RUNTIME = _OpenRouterErrorShapeRuntime()
+
+
+def _extract_openrouter_adapter_raw_message(exc: Any) -> Optional[str]:
+    from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
+        error_shape as _openrouter_error_shape,
+    )
+
+    return _openrouter_error_shape.extract_raw_message(
+        _OPENROUTER_ERROR_SHAPE_RUNTIME,
+        exc,
+    )
+
+
+def _is_openrouter_adapter_provider_raw_error(exc: Any) -> bool:
+    from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
+        error_shape as _openrouter_error_shape,
+    )
+
+    return _openrouter_error_shape.is_provider_raw_error(
+        _OPENROUTER_ERROR_SHAPE_RUNTIME,
+        exc,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / host dependencies)
 # ---------------------------------------------------------------------------
-_extract_google_adapter_exception_detail: Optional[Callable[[Any], Any]] = None
-_extract_google_adapter_error_payloads: Optional[Callable[[Any], list[Any]]] = None
-_is_openrouter_adapter_provider_raw_error: Optional[Callable[[Any], bool]] = None
-_extract_google_adapter_exception_status_code: Optional[Callable[[Any], Optional[int]]] = None
-_extract_adapter_upstream_headers: Optional[Callable[[Any], dict[str, Any]]] = None
-_parse_retry_after_seconds_from_headers: Optional[Callable[[dict[str, Any]], Optional[float]]] = None
-_get_adapter_header_value: Optional[Callable[[dict[str, Any], str], Optional[str]]] = None
-_extract_openrouter_adapter_raw_message: Optional[Callable[[Any], Optional[str]]] = None
-_parse_json_payloads_from_text_candidates: Optional[Callable[[list[str]], list[Any]]] = None
 _get_passthrough_handled_http_error_summary: Optional[Callable[..., str]] = None
 _is_known_grok_build_usage_balance_exhausted_response: Optional[Callable[..., bool]] = None
 _is_known_grok_personal_team_spending_limit_response: Optional[Callable[..., bool]] = None
@@ -133,15 +365,6 @@ _host_globals_ref: dict | None = None
 
 def configure_error_signals_runtime(  # noqa: PLR0915
     *,
-    extract_google_adapter_exception_detail: Callable[[Any], Any],
-    extract_google_adapter_error_payloads: Callable[[Any], list[Any]],
-    is_openrouter_adapter_provider_raw_error: Callable[[Any], bool],
-    extract_google_adapter_exception_status_code: Callable[[Any], Optional[int]],
-    extract_adapter_upstream_headers: Callable[[Any], dict[str, Any]],
-    parse_retry_after_seconds_from_headers: Callable[[dict[str, Any]], Optional[float]],
-    get_adapter_header_value: Callable[[dict[str, Any], str], Optional[str]],
-    extract_openrouter_adapter_raw_message: Callable[[Any], Optional[str]],
-    parse_json_payloads_from_text_candidates: Callable[[list[str]], list[Any]],
     get_passthrough_handled_http_error_summary: Callable[..., str],
     is_known_grok_build_usage_balance_exhausted_response: Callable[..., bool],
     is_known_grok_personal_team_spending_limit_response: Callable[..., bool],
@@ -155,15 +378,6 @@ def configure_error_signals_runtime(  # noqa: PLR0915
 
 ) -> None:
     """Bind host dependencies for error-signal extraction and classification."""
-    global _extract_google_adapter_exception_detail
-    global _extract_google_adapter_error_payloads
-    global _is_openrouter_adapter_provider_raw_error
-    global _extract_google_adapter_exception_status_code
-    global _extract_adapter_upstream_headers
-    global _parse_retry_after_seconds_from_headers
-    global _get_adapter_header_value
-    global _extract_openrouter_adapter_raw_message
-    global _parse_json_payloads_from_text_candidates
     global _get_passthrough_handled_http_error_summary
     global _is_known_grok_build_usage_balance_exhausted_response
     global _is_known_grok_personal_team_spending_limit_response
@@ -174,15 +388,6 @@ def configure_error_signals_runtime(  # noqa: PLR0915
     global _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS
     global _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS
 
-    _extract_google_adapter_exception_detail = extract_google_adapter_exception_detail
-    _extract_google_adapter_error_payloads = extract_google_adapter_error_payloads
-    _is_openrouter_adapter_provider_raw_error = is_openrouter_adapter_provider_raw_error
-    _extract_google_adapter_exception_status_code = extract_google_adapter_exception_status_code
-    _extract_adapter_upstream_headers = extract_adapter_upstream_headers
-    _parse_retry_after_seconds_from_headers = parse_retry_after_seconds_from_headers
-    _get_adapter_header_value = get_adapter_header_value
-    _extract_openrouter_adapter_raw_message = extract_openrouter_adapter_raw_message
-    _parse_json_payloads_from_text_candidates = parse_json_payloads_from_text_candidates
     _get_passthrough_handled_http_error_summary = get_passthrough_handled_http_error_summary
     _is_known_grok_build_usage_balance_exhausted_response = (
         is_known_grok_build_usage_balance_exhausted_response
@@ -206,15 +411,6 @@ def configure_error_signals_runtime(  # noqa: PLR0915
     # functions see the new seam values.
     if _host_globals_ref is not None:
         _mod = globals()
-        _host_globals_ref["_extract_google_adapter_exception_detail"] = _mod["_extract_google_adapter_exception_detail"]
-        _host_globals_ref["_extract_google_adapter_error_payloads"] = _mod["_extract_google_adapter_error_payloads"]
-        _host_globals_ref["_is_openrouter_adapter_provider_raw_error"] = _mod["_is_openrouter_adapter_provider_raw_error"]
-        _host_globals_ref["_extract_google_adapter_exception_status_code"] = _mod["_extract_google_adapter_exception_status_code"]
-        _host_globals_ref["_extract_adapter_upstream_headers"] = _mod["_extract_adapter_upstream_headers"]
-        _host_globals_ref["_parse_retry_after_seconds_from_headers"] = _mod["_parse_retry_after_seconds_from_headers"]
-        _host_globals_ref["_get_adapter_header_value"] = _mod["_get_adapter_header_value"]
-        _host_globals_ref["_extract_openrouter_adapter_raw_message"] = _mod["_extract_openrouter_adapter_raw_message"]
-        _host_globals_ref["_parse_json_payloads_from_text_candidates"] = _mod["_parse_json_payloads_from_text_candidates"]
         _host_globals_ref["_get_passthrough_handled_http_error_summary"] = _mod["_get_passthrough_handled_http_error_summary"]
         _host_globals_ref["_is_known_grok_build_usage_balance_exhausted_response"] = _mod["_is_known_grok_build_usage_balance_exhausted_response"]
         _host_globals_ref["_is_known_grok_personal_team_spending_limit_response"] = _mod["_is_known_grok_personal_team_spending_limit_response"]
@@ -232,8 +428,7 @@ def configure_error_signals_runtime(  # noqa: PLR0915
 
 
 def _codex_auto_agent_error_text(exc: Any) -> str:
-    assert _extract_google_adapter_exception_detail is not None
-    detail = _extract_google_adapter_exception_detail(exc)
+    detail = _extract_adapter_exception_detail(exc)
     if isinstance(detail, bytes):
         detail_text = detail.decode("utf-8", errors="ignore")
     else:
@@ -325,10 +520,8 @@ def _add_codex_auto_agent_text_error_tokens(
 
 
 def _extract_codex_auto_agent_error_tokens(exc: Any) -> set[str]:
-    assert _extract_google_adapter_error_payloads is not None
-    assert _is_openrouter_adapter_provider_raw_error is not None
     tokens: set[str] = set()
-    for parsed in _extract_google_adapter_error_payloads(exc):
+    for parsed in _extract_adapter_error_payloads(exc):
         error_blocks: list[dict[str, Any]] = []
         if isinstance(parsed, dict):
             error = parsed.get("error")
@@ -762,9 +955,8 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
 
 
 def _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc: Any) -> bool:
-    assert _extract_google_adapter_exception_status_code is not None
     assert _is_known_grok_build_usage_balance_exhausted_response is not None
-    status_code = _extract_google_adapter_exception_status_code(exc)
+    status_code = _extract_adapter_exception_status_code(exc)
     return _is_known_grok_build_usage_balance_exhausted_response(
         url=httpx.URL(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
@@ -774,9 +966,8 @@ def _is_codex_auto_agent_grok_build_usage_balance_exhausted(exc: Any) -> bool:
 
 
 def _is_codex_auto_agent_grok_personal_team_spending_limit(exc: Any) -> bool:
-    assert _extract_google_adapter_exception_status_code is not None
     assert _is_known_grok_personal_team_spending_limit_response is not None
-    status_code = _extract_google_adapter_exception_status_code(exc)
+    status_code = _extract_adapter_exception_status_code(exc)
     return _is_known_grok_personal_team_spending_limit_response(
         url=httpx.URL(_CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL),
         custom_llm_provider=litellm.LlmProviders.XAI.value,
@@ -833,10 +1024,9 @@ def _is_codex_auto_agent_grok_account_quota_exhaustion(
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
 ) -> Optional[str]:
-    assert _extract_google_adapter_exception_status_code is not None
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
-    status_code = _extract_google_adapter_exception_status_code(exc)
+    status_code = _extract_adapter_exception_status_code(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
         return "capacity_exhausted"
@@ -881,9 +1071,6 @@ def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
 
 
 def _parse_codex_auto_agent_header_wait_seconds(exc: Any) -> Optional[float]:
-    assert _extract_adapter_upstream_headers is not None
-    assert _parse_retry_after_seconds_from_headers is not None
-    assert _get_adapter_header_value is not None
     headers = _extract_adapter_upstream_headers(exc)
     retry_after = _parse_retry_after_seconds_from_headers(headers)
     if retry_after is not None:
@@ -920,7 +1107,6 @@ def _get_codex_auto_agent_cooldown_seconds(
     *,
     candidate: Optional[dict[str, Any]] = None,
 ) -> float:
-    assert _extract_google_adapter_exception_status_code is not None
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
     error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
@@ -939,7 +1125,7 @@ def _get_codex_auto_agent_cooldown_seconds(
         resolved = _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS
     elif "RESOURCE_EXHAUSTED" in tokens or "RATE_LIMIT_EXCEEDED" in tokens:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-    elif _extract_google_adapter_exception_status_code(exc) in {429, 503, 529}:
+    elif _extract_adapter_exception_status_code(exc) in {429, 503, 529}:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
     else:
         resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
@@ -962,12 +1148,15 @@ def _get_codex_auto_agent_cooldown_seconds(
 
 
 def _iter_codex_auto_agent_error_blocks(exc: Any) -> list[dict[str, Any]]:
-    assert _extract_google_adapter_error_payloads is not None
     payloads: list[Any] = []
     detail = getattr(exc, "detail", None)
     if detail is not None:
         payloads.append(detail)
-    payloads.extend(_extract_google_adapter_error_payloads(exc))
+    payloads.extend(
+        payload
+        for payload in _extract_adapter_error_payloads(exc)
+        if payload is not detail
+    )
 
     error_blocks: list[dict[str, Any]] = []
     for parsed in payloads:
@@ -1009,8 +1198,6 @@ def _get_codex_auto_agent_source_error_summary(
     *,
     status_code: Optional[int],
 ) -> str:
-    assert _extract_openrouter_adapter_raw_message is not None
-    assert _parse_json_payloads_from_text_candidates is not None
     assert _get_passthrough_handled_http_error_summary is not None
     from fastapi import HTTPException
     from starlette import status as http_status
@@ -1077,14 +1264,27 @@ _HOST_FUNCTION_NAMES = (
     "_iter_codex_auto_agent_error_blocks",
     "_extract_codex_auto_agent_error_type_and_code",
     "_get_codex_auto_agent_source_error_summary",
+    "_extract_adapter_exception_detail",
+    "_extract_adapter_error_payloads",
+    "_extract_adapter_exception_status_code",
+    "_extract_openrouter_adapter_raw_message",
+    "_is_openrouter_adapter_provider_raw_error",
+    "_extract_adapter_upstream_headers",
+    "_get_adapter_header_value",
+    "_parse_retry_after_seconds_from_headers",
+    "_parse_rate_limit_reset_wait_seconds_from_headers",
+    "_extract_embedded_json_payload_candidates",
+    "_parse_json_payloads_from_text_candidates",
 )
 
 
 def install(host_globals: dict) -> None:
     """Publish same-object god-module facades for the moved functions.
 
-    Functions retain this module's globals. Host-owned dependencies remain
-    late-bound through the callbacks configured by
+    Functions retain this module's globals. Provider-neutral exception helpers,
+    OpenRouter error-shape helpers, and header/JSON helpers stay owner-local and
+    are published directly; host-owned dependencies remain late-bound through
+    the callbacks configured by
     :func:`configure_error_signals_runtime`.
     """
     global _host_globals_ref

@@ -1,8 +1,4 @@
-"""Process-local OAuth access-token caches (RR-054 #1).
-
-Keeps Google/Antigravity token memoization next to alias-routing state instead
-of declaring extra dicts in the pass-through god-module.
-"""
+"""Provider-neutral process-local OAuth access-token cache primitive."""
 
 from __future__ import annotations
 
@@ -45,7 +41,3 @@ class OAuthAccessTokenCache:
             self.tokens.clear()
             return
         self.tokens.pop(cache_key, None)
-
-
-google_oauth_access_token_cache = OAuthAccessTokenCache()
-antigravity_oauth_access_token_cache = OAuthAccessTokenCache()

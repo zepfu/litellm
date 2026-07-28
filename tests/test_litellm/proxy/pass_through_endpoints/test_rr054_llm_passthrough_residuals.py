@@ -2,17 +2,58 @@
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 import time
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane as cp
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+
+
+# ---------------------------------------------------------------------------
+# #41 native Gemini pass-through missing-key guard (no "Bearer None")
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rr054_issue41_gemini_route_missing_key_raises_401_without_auth() -> None:
+    from fastapi import HTTPException
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    # No `key` query param, no `x-goog-api-key`, no Authorization headers.
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/gemini/v1/models",
+        "raw_path": b"/gemini/v1/models",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 1234),
+        "server": ("test", 80),
+    }
+    request = Request(scope)
+
+    with patch.object(lpe, "user_api_key_auth", new=AsyncMock()) as mock_auth:
+        with pytest.raises(HTTPException) as exc_info:
+            await lpe.gemini_proxy_route(
+                endpoint="v1/models",
+                request=request,
+                fastapi_response=Response(),
+            )
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Missing Google AI Studio pass-through API key."
+    # Guard fires before auth, so no "Bearer None" is ever synthesized/passed.
+    mock_auth.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -93,79 +134,7 @@ async def test_rr054_issue2_durable_write_extends_when_new_expiry_later() -> Non
     assert written["expires_at_epoch"] <= after + 121.0
 
 
-# ---------------------------------------------------------------------------
-# #3 google token cache bound
-# ---------------------------------------------------------------------------
 
-
-def test_rr054_issue3_google_token_cache_is_bounded() -> None:
-    cache: dict[str, str] = {f"k{i}": f"v{i}" for i in range(10)}
-    with patch.object(lpe, "_GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE", 3):
-        lpe._bound_google_adapter_token_cache(cache, max_size=3)
-    assert len(cache) == 3
-    assert "k0" not in cache
-    assert "k9" in cache
-
-
-# ---------------------------------------------------------------------------
-# #5 schema sanitize depth guard
-# ---------------------------------------------------------------------------
-
-
-def test_rr054_issue5_schema_sanitize_depth_guard() -> None:
-    node: dict[str, Any] = {"type": "object"}
-    cur = node
-    for _ in range(200):
-        nxt: dict[str, Any] = {"type": "object"}
-        cur["properties"] = {"x": nxt}
-        cur = nxt
-    # Must not raise RecursionError
-    fixed = lpe._sanitize_google_code_assist_union_schemas(node)
-    assert isinstance(fixed, int)
-
-
-def test_rr054_issue5_schema_sanitize_cycle_guard() -> None:
-    node: dict[str, Any] = {"type": "object", "properties": {}}
-    node["properties"]["self"] = node  # type: ignore[assignment]
-    fixed = lpe._sanitize_google_code_assist_union_schemas(node)
-    assert isinstance(fixed, int)
-
-
-# ---------------------------------------------------------------------------
-# #6/#13 tool-call cache TTL + scope + FIFO reinsert
-# ---------------------------------------------------------------------------
-
-
-def test_rr054_issue6_tool_call_cache_is_scope_isolated() -> None:
-    lpe._codex_google_code_assist_tool_call_name_cache.clear()
-    lpe._codex_google_code_assist_tool_call_arguments_cache.clear()
-    lpe._remember_codex_google_code_assist_tool_call_name("call_1", "Read", '{"path":"a"}', scope_key="tenant-a")
-    lpe._remember_codex_google_code_assist_tool_call_name("call_1", "Write", '{"path":"b"}', scope_key="tenant-b")
-    assert lpe._lookup_codex_google_code_assist_tool_call_name("call_1", scope_key="tenant-a") == "Read"
-    assert lpe._lookup_codex_google_code_assist_tool_call_name("call_1", scope_key="tenant-b") == "Write"
-
-
-def test_rr054_issue13_tool_call_cache_fifo_and_ttl() -> None:
-    lpe._codex_google_code_assist_tool_call_name_cache.clear()
-    lpe._codex_google_code_assist_tool_call_arguments_cache.clear()
-    with patch.object(lpe, "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE", 2):
-        lpe._remember_codex_google_code_assist_tool_call_name("a", "A")
-        lpe._remember_codex_google_code_assist_tool_call_name("b", "B")
-        lpe._remember_codex_google_code_assist_tool_call_name("c", "C")
-        assert lpe._lookup_codex_google_code_assist_tool_call_name("a") is None
-        assert lpe._lookup_codex_google_code_assist_tool_call_name("b") == "B"
-        assert lpe._lookup_codex_google_code_assist_tool_call_name("c") == "C"
-
-    # TTL expiry
-    lpe._codex_google_code_assist_tool_call_name_cache.clear()
-    lpe._remember_codex_google_code_assist_tool_call_name("z", "Z")
-    key = next(iter(lpe._codex_google_code_assist_tool_call_name_cache))
-    name, _exp = lpe._codex_google_code_assist_tool_call_name_cache[key]
-    lpe._codex_google_code_assist_tool_call_name_cache[key] = (
-        name,
-        time.monotonic() - 1,
-    )
-    assert lpe._lookup_codex_google_code_assist_tool_call_name("z") is None
 
 
 # ---------------------------------------------------------------------------
@@ -325,17 +294,6 @@ def test_rr054_issue50_no_candidate_selection_resolves_lane_scoped_session_key()
     assert '"session_key": session_key' in source
 
 
-# ---------------------------------------------------------------------------
-# #57 empty-success helper has single usage return tail
-# ---------------------------------------------------------------------------
-
-
-def test_rr054_issue57_empty_success_helper_single_tail() -> None:
-    import inspect
-
-    source = inspect.getsource(lpe._anthropic_google_shaping._is_codex_google_code_assist_empty_success_model_response)
-    assert source.count("_usage_has_no_more_than_one_output_token") == 2  # empty choices + final
-
 
 def test_rr054_issue32_alias_routing_memory_maps_are_bounded() -> None:
     cache = {f"k{i}": float(i) for i in range(10)}
@@ -411,15 +369,7 @@ def test_rr054_issue33_no_hardcoded_home_zepfu_auth_defaults() -> None:
     source = Path(lpe.__file__).read_text()
     # Operator-absolute auth defaults must not remain first-priority hardcoded.
     assert '"/home/zepfu/.codex/auth.json"' not in source
-    assert '"/home/zepfu/.gemini/oauth_creds.json"' not in source
 
-
-def test_rr054_issue41_gemini_auth_key_none_safe() -> None:
-    # Structural: source must not format Bearer {None}-style blindly.
-    import inspect
-
-    src = inspect.getsource(lpe.gemini_proxy_route)
-    assert 'f"Bearer {google_ai_studio_api_key}"' not in src
 
 
 def test_rr054_issue48_grok_auth_formats_authorization() -> None:
@@ -455,22 +405,6 @@ def test_rr054_issue52_affinity_hydrate_keeps_fresher_memory() -> None:
     assert out["provider"] == "local"
 
 
-def test_rr054_issue53_trim_does_not_pop_only_protected() -> None:
-    contents = [{"role": "user"}, {"role": "model"}]
-    selected = [0, 1]
-    protected = {0, 1}
-    # Force fallback path by max_window 1 and complete exchanges always true via patch
-    with patch.object(
-        lpe,
-        "_selected_google_contents_have_complete_function_exchanges",
-        return_value=True,
-    ):
-        out = lpe._trim_google_content_indices_to_window(
-            contents, selected, protected_text_indices=protected, max_window=1
-        )
-    # Should stop without removing protected-only indices when none removable.
-    assert out == [0, 1] or len(out) <= 2
-
 
 def test_rr054_issue55_redacts_broader_secrets() -> None:
     redacted = lpe._redact_tool_definition_string("token=ghp_abcdefghijklmnopqrstuv")
@@ -490,19 +424,8 @@ def test_rr054_issue56_headers_filtered_for_metadata() -> None:
     assert all("authorization" not in s for s in sources)
 
 
-def test_rr054_issue59_shared_error_payload_extract() -> None:
-    payloads = lpe._extract_google_adapter_error_payloads(Exception('upstream error: {"error":{"message":"boom"}}'))
-    assert any(isinstance(p, dict) and p.get("error") for p in payloads)
-
 
 @pytest.mark.asyncio
-async def test_rr054_issue15_google_lane_negative_cache() -> None:
-    lpe._alias_routing_state.google_lane_negative_until_monotonic = (
-        time.monotonic() + 30
-    )
-    assert await lpe._resolve_codex_auto_agent_google_lane_key() == lpe._CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY
-    lpe._alias_routing_state.google_lane_negative_until_monotonic = 0.0
-
 
 def test_rr054_issue8_change_accumulator_preserves_colliding_keys() -> None:
     acc = lpe._ChangeAccumulator()
@@ -541,36 +464,6 @@ def test_rr054_issue16_vertex_live_docstring_requires_auth_wrapper() -> None:
     doc = inspect.getdoc(lpe.vertex_ai_live_websocket_passthrough) or ""
     assert "user_api_key_auth_websocket" in doc
     assert "Do not register this function" in doc
-
-
-# ---------------------------------------------------------------------------
-# #34 gemini code-assist endpoint path allowlist
-# ---------------------------------------------------------------------------
-
-
-def test_rr054_issue34_code_assist_endpoint_accepts_action_shape() -> None:
-    assert (
-        lpe._normalize_gemini_code_assist_endpoint_path("v1internal:streamGenerateContent")
-        == "/v1internal:streamGenerateContent"
-    )
-    assert (
-        lpe._normalize_gemini_code_assist_endpoint_path("/v1internal:loadCodeAssist?alt=sse")
-        == "/v1internal:loadCodeAssist"
-    )
-
-
-def test_rr054_issue34_code_assist_endpoint_rejects_smuggling() -> None:
-    from fastapi import HTTPException
-
-    with pytest.raises(HTTPException) as exc:
-        lpe._normalize_gemini_code_assist_endpoint_path("v1internal:streamGenerateContent/http://evil.example/bar")
-    assert exc.value.status_code == 400
-
-    with pytest.raises(HTTPException):
-        lpe._normalize_gemini_code_assist_endpoint_path("v1internal:bad-action!")
-
-    with pytest.raises(HTTPException):
-        lpe._normalize_gemini_code_assist_endpoint_path("v1internal:foo/../bar")
 
 
 # ---------------------------------------------------------------------------
@@ -622,10 +515,6 @@ def test_rr054_issue1_11_policy_module_exports_cooldowns() -> None:
         lpe._openrouter_adapter_rate_limit_until_monotonic_by_key
         is alias_routing_state.openrouter_rate_limit.until_monotonic_by_key
     )
-    assert (
-        lpe._google_adapter_rate_limit_until_monotonic_by_key
-        is alias_routing_state.google_rate_limit.until_monotonic_by_key
-    )
 
 
 def test_rr054_issue11_policy_module_owns_candidate_tables_and_allowlists() -> None:
@@ -647,10 +536,21 @@ def test_rr054_issue11_policy_module_owns_candidate_tables_and_allowlists() -> N
         is policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
     )
     assert "gpt-5.3-codex-spark" in policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
-    # God-file re-exports policy-owned tables rather than defining row literals.
+    # God-file installs same-object policy aliases rather than defining rows.
     god_source = Path(lpe.__file__).read_text()
-    assert "_POLICY_CODEX_AUTO_AGENT_CANDIDATES" in god_source
-    assert "_POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS" in god_source
+    assert "_aawm_alias_policy_compat.install_policy_compat_aliases(globals())" in god_source
+    assert "_POLICY_CODEX_AUTO_AGENT_CANDIDATES" not in god_source
+    assert "_POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS" not in god_source
+    assert (
+        package_policy.COMPAT_ALIAS_MAP["_CODEX_AUTO_AGENT_CANDIDATES"]
+        == "CODEX_AUTO_AGENT_CANDIDATES"
+    )
+    assert (
+        package_policy.COMPAT_ALIAS_MAP[
+            "_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS"
+        ]
+        == "ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS"
+    )
     package_source = policy_path.read_text()
     assert "CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (" in package_source
     assert '"last_resort": True,' in package_source
@@ -772,18 +672,11 @@ def test_rr054_issue12_shared_openrouter_retry_and_auto_agent_cooldown() -> None
     shared = inspect.getsource(lpe._apply_auto_agent_alias_cooldown)
     assert "set_candidate_cooldown" in shared
     openrouter_wait = inspect.getsource(lpe._wait_for_openrouter_adapter_cooldown_if_needed)
-    google_wait = inspect.getsource(lpe._wait_for_google_adapter_cooldown_if_needed)
     assert "wait_for_cooldown_if_needed" in openrouter_wait
     assert "wait_for_monotonic_cooldown_map" in inspect.getsource(retry_transport.wait_for_cooldown_if_needed)
-    assert "wait_for_monotonic_cooldown_map" in google_wait
-    # Google multi-budget loop remains distinct (not collapsed into OpenRouter).
-    google_loop = inspect.getsource(lpe._perform_google_adapter_pass_through_request)
     openrouter_loop = inspect.getsource(lpe._run_openrouter_adapter_retry_loop)
-    assert "run_adapter_retry_policy" in google_loop
     assert "retry_transport.run_retry_loop" in openrouter_loop
     assert "run_adapter_retry_policy" in inspect.getsource(retry_transport.run_retry_loop)
-    assert "capacity_total_attempts" in google_loop
-    assert "is_capacity_retry" in google_loop
 
 
 # ---------------------------------------------------------------------------
@@ -804,18 +697,37 @@ def test_rr054_issue10_shared_auto_agent_handler_is_wired() -> None:
     import inspect
 
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        anthropic_auto_agent_route,
+        codex_auto_agent_route,
+    )
 
     assert hasattr(lpe, "_handle_auto_agent_alias_route")
     assert hasattr(lpe, "_dispatch_auto_agent_alias_candidate_request")
-    anth = inspect.getsource(lpe._handle_anthropic_auto_agent_alias_route)
-    codex = inspect.getsource(lpe._handle_codex_auto_agent_alias_route)
-    # Wave 2: both wrappers build the typed ``AliasRouteServices`` bundle and
-    # delegate to the shared ``candidate_loop.handle_alias_route`` (the loop
-    # body moved out of the god-module into the package).
+    anth_facade = lpe._handle_anthropic_auto_agent_alias_route
+    codex_facade = lpe._handle_codex_auto_agent_alias_route
+    assert isinstance(anth_facade, partial)
+    assert isinstance(codex_facade, partial)
+    assert anth_facade.func is anthropic_auto_agent_route.handle_anthropic_auto_agent_alias_route
+    assert codex_facade.func is codex_auto_agent_route.handle_codex_auto_agent_alias_route
+    assert isinstance(
+        anth_facade.args[0],
+        anthropic_auto_agent_route.AnthropicAutoAgentRouteRuntime,
+    )
+    assert isinstance(
+        codex_facade.args[0],
+        codex_auto_agent_route.CodexAutoAgentRouteRuntime,
+    )
+    anth = inspect.getsource(anth_facade.func)
+    codex = inspect.getsource(codex_facade.func)
+    # Anthropic receives the shared candidate loop through runtime injection;
+    # Codex imports the same package owner directly.
     assert "AliasRouteServices" in anth
-    assert "handle_alias_route" in anth
+    assert "runtime.handle_alias_route" in anth
     assert "AliasRouteServices" in codex
-    assert "handle_alias_route" in codex
+    assert codex_auto_agent_route.handle_alias_route is candidate_loop.handle_alias_route
+    assert "return await handle_alias_route(" in codex
+    assert "runtime.handle_alias_route" not in codex
     shared = inspect.getsource(candidate_loop.handle_alias_route)
     assert "signaling redispatch" in shared
     assert "native_grok_continuation_same_candidate_retry" in shared
@@ -882,14 +794,6 @@ def test_rr054_issue35_task_state_prefers_structured_flag_and_env_markers() -> N
     assert selected[0] == 1
     assert selected[2] == "structured"
 
-    # Compatibility wrapper delegates to the provider-owned package contract.
-    wrapper_src = __import__("inspect").getsource(lpe._build_google_adapter_preserved_task_state_message)
-    provider_src = __import__("inspect").getsource(
-        lpe._anthropic_google_shaping._build_google_adapter_preserved_task_state_message
-    )
-    assert "_anthropic_google_shaping" in wrapper_src
-    assert "select_task_state_source" in provider_src
-    assert "preserved_active_task_state_source_kind" in provider_src
 
 
 # ---------------------------------------------------------------------------
@@ -1090,15 +994,6 @@ async def test_rr054_issue27_collect_function_call_args_from_dict_sse() -> None:
     assert any(isinstance(item, dict) and item.get("type") == "function_call" for item in output)
 
 
-def test_rr054_issue1_google_oauth_owned_by_package() -> None:
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import google_oauth
-
-    assert lpe._load_valid_local_google_oauth_access_token is (google_oauth._load_valid_local_google_oauth_access_token)
-    assert lpe._refresh_local_google_oauth_credentials is (google_oauth._refresh_local_google_oauth_credentials)
-    assert lpe._google_oauth_access_token_cache is google_oauth._google_oauth_access_token_cache
-    # Constants re-exported from package owner.
-    assert lpe._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL == google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL
-
 
 def test_rr054_issue12_retry_env_parsers_are_shared() -> None:
     from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
@@ -1108,6 +1003,5 @@ def test_rr054_issue12_retry_env_parsers_are_shared() -> None:
     import inspect
 
     assert "parse_non_negative_int_env" in inspect.getsource(retry_transport.get_max_retries)
-    assert "parse_non_negative_float_env" in inspect.getsource(lpe._get_google_adapter_hidden_retry_budget_seconds)
     assert ar_retry.parse_non_negative_int_env("NOPE", default=2) == 2
     assert ar_retry.parse_non_negative_float_env("NOPE", default=1.5) == 1.5

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from typing import Any, Callable, Optional
 
@@ -20,33 +21,92 @@ from litellm._logging import verbose_aawm_route_logger, verbose_proxy_logger
 # ---------------------------------------------------------------------------
 
 _record_auto_agent_alias_route_status_rollup: Optional[Callable[..., None]] = None
-_aawm_alias_route_verbose_json_enabled: Optional[Callable[[], bool]] = None
-_aawm_alias_route_healthy_json_enabled: Optional[Callable[[], bool]] = None
+
+# Owner-concrete implementations (D1-591).  The god-module previously defined
+# these inline and injected them via configure_audit_persist_runtime.  A later
+# integrator can remove the ~23 god-module lines and either pass these through
+# configure or omit the parameters entirely.
+
+_AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV = "AAWM_ALIAS_ROUTE_VERBOSE_JSON"
+
+
+def _aawm_alias_route_verbose_json_enabled() -> bool:
+    """Whether verbose JSON route logging is enabled via env."""
+    return os.getenv(_AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "debug",
+        "verbose",
+    }
+
+
+def _aawm_alias_route_healthy_json_enabled() -> bool:
+    """Whether healthy-route JSON logging is enabled via env."""
+    return os.getenv("AAWM_ALIAS_ROUTE_LOG_HEALTHY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+# Seam variables: default to the owner-concrete functions above.
+# configure_audit_persist_runtime() can still override them for testing.
+_aawm_alias_route_verbose_json_enabled: Callable[[], bool] = _aawm_alias_route_verbose_json_enabled
+_aawm_alias_route_healthy_json_enabled: Callable[[], bool] = _aawm_alias_route_healthy_json_enabled
 
 _host_globals: Optional[dict] = None
+_MISSING = object()
+_runtime_restore_stacks: dict[str, list[tuple[object, object, object]]] = {}
+
+
+def _update_host_runtime_callbacks(
+    callbacks: dict[str, object],
+    previous_module_values: dict[str, object],
+) -> None:
+    if _host_globals is None:
+        return
+    for name, callback in callbacks.items():
+        _runtime_restore_stacks.setdefault(name, []).append(
+            (
+                callback,
+                previous_module_values[name],
+                _host_globals.get(name, _MISSING),
+            )
+        )
+        _host_globals[name] = callback
 
 
 def configure_audit_persist_runtime(
     *,
     record_route_status_rollup: Callable[..., None],
-    verbose_json_enabled: Callable[[], bool],
-    healthy_json_enabled: Callable[[], bool],
+    verbose_json_enabled: Optional[Callable[[], bool]] = None,
+    healthy_json_enabled: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Inject god-module dependencies.  Must be called before any frozen function."""
     global _record_auto_agent_alias_route_status_rollup
     global _aawm_alias_route_verbose_json_enabled
     global _aawm_alias_route_healthy_json_enabled
 
+    previous_module_values = {
+        "_record_auto_agent_alias_route_status_rollup": _record_auto_agent_alias_route_status_rollup,
+        "_aawm_alias_route_verbose_json_enabled": _aawm_alias_route_verbose_json_enabled,
+        "_aawm_alias_route_healthy_json_enabled": _aawm_alias_route_healthy_json_enabled,
+    }
     _record_auto_agent_alias_route_status_rollup = record_route_status_rollup
-    _aawm_alias_route_verbose_json_enabled = verbose_json_enabled
-    _aawm_alias_route_healthy_json_enabled = healthy_json_enabled
+    if verbose_json_enabled is not None:
+        _aawm_alias_route_verbose_json_enabled = verbose_json_enabled
+    if healthy_json_enabled is not None:
+        _aawm_alias_route_healthy_json_enabled = healthy_json_enabled
 
-    if _host_globals is not None:
-        _host_globals.update({
+    _update_host_runtime_callbacks(
+        {
             "_record_auto_agent_alias_route_status_rollup": _record_auto_agent_alias_route_status_rollup,
             "_aawm_alias_route_verbose_json_enabled": _aawm_alias_route_verbose_json_enabled,
             "_aawm_alias_route_healthy_json_enabled": _aawm_alias_route_healthy_json_enabled,
-        })
+        },
+        previous_module_values,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +120,6 @@ def _emit_auto_agent_alias_route_event(
     level: str = "info",
 ) -> None:
     assert _record_auto_agent_alias_route_status_rollup is not None
-    assert _aawm_alias_route_verbose_json_enabled is not None
-    assert _aawm_alias_route_healthy_json_enabled is not None
 
     _record_auto_agent_alias_route_status_rollup(event)
     if not (_aawm_alias_route_verbose_json_enabled() or _aawm_alias_route_healthy_json_enabled()):
@@ -284,6 +342,44 @@ _HOST_FUNCTION_NAMES = (
 )
 
 
+def _host_callback_delegates_to_module(
+    name: str,
+    callback: object,
+    owner_module: object,
+) -> bool:
+    code = getattr(callback, "__code__", None)
+    callback_globals = getattr(callback, "__globals__", None)
+    if code is None or not isinstance(callback_globals, dict):
+        return False
+
+    owner_callback = getattr(owner_module, name, _MISSING)
+    if callback is owner_callback:
+        return False
+    if (
+        callback_globals.get(name) is callback
+        and getattr(callback, "__name__", None) != name
+    ):
+        return True
+
+    referenced_values = [
+        callback_globals.get(global_name, _MISSING)
+        for global_name in code.co_names
+    ]
+    closure_values = []
+    for cell in getattr(callback, "__closure__", None) or ():
+        try:
+            closure_values.append(cell.cell_contents)
+        except ValueError:
+            continue
+
+    if any(value is owner_callback for value in (*referenced_values, *closure_values)):
+        return True
+    references_seam = name in code.co_names or name in code.co_consts
+    return references_seam and any(
+        value is owner_module for value in (*referenced_values, *closure_values)
+    )
+
+
 def install(host_globals: dict) -> None:
     """Rebind moved functions to host_globals for live lookup.
 
@@ -292,8 +388,18 @@ def install(host_globals: dict) -> None:
     rebound object is published to both this module and the host module.
     """
     global _host_globals
-    _host_globals = host_globals
     _mod = globals()
+    owner_module = _sys.modules[__name__]
+    for _name in _SEAM_NAMES:
+        host_callback = host_globals.get(_name, _MISSING)
+        if host_callback is _MISSING or _host_callback_delegates_to_module(
+            _name,
+            host_callback,
+            owner_module,
+        ):
+            continue
+        _mod[_name] = host_callback
+    _host_globals = host_globals
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         _rebound = _FunctionType(
@@ -346,6 +452,15 @@ class _SeamPropagatingModule(_types.ModuleType):
         if seam_names is not None and name in seam_names:
             hg = self.__dict__.get("_host_globals")
             if hg is not None:
+                restore_stacks = self.__dict__.get("_runtime_restore_stacks", {})
+                restore_stack = restore_stacks.get(name)
+                if restore_stack and value is restore_stack[-1][1]:
+                    _, _, prior_host_value = restore_stack.pop()
+                    if prior_host_value is self.__dict__["_MISSING"]:
+                        hg.pop(name, None)
+                    else:
+                        hg[name] = prior_host_value
+                    return
                 hg[name] = value
 
 

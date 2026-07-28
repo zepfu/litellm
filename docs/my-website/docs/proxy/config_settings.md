@@ -427,33 +427,6 @@ router_settings:
 | AUTH_STRATEGY | Strategy used for authentication (e.g., OAuth, API key)
 | AUTO_REDIRECT_UI_LOGIN_TO_SSO | Flag to enable automatic redirect of UI login page to SSO when SSO is configured. Default is **false**
 | AUDIO_SPEECH_CHUNK_SIZE | Chunk size for audio speech processing. Default is 1024
-| AAWM_GEMINI_ROUTE_DEBUG | When `1`, enables per-chunk Gemini route diagnostics on the Anthropic Chat stream wrapper (`adapters/streaming_iterator`). Flag is read once per stream; logs use `verbose_logger.debug` (not warning).
-| AAWM_GOOGLE_ADAPTER_AUXILIARY_CONTEXT_CHAR_CAP | Character cap for auxiliary context in the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL | Default thinking level sent by the AAWM Google adapter when applicable.
-| AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG | If true, disables the AAWM Google adapter default thinking configuration.
-| AAWM_GOOGLE_ADAPTER_FALLBACK_CONTEXT_CHAR_CAP | Character cap for fallback context in the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_FOLLOWUP_ALLOWED_TOOL_NAMES | Comma-separated allowlist of tool names retained for follow-up AAWM Google adapter turns.
-| AAWM_GOOGLE_ADAPTER_FOLLOWUP_AUXILIARY_CONTEXT_CHAR_CAP | Character cap for follow-up auxiliary context in the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_FOLLOWUP_PERSISTED_OUTPUT_CHAR_CAP | Character cap for persisted output in follow-up AAWM Google adapter turns.
-| AAWM_GOOGLE_ADAPTER_FOLLOWUP_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP | Text-part character cap for follow-up subagent context in the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS | Hidden retry budget in seconds for AAWM Google adapter transient recovery.
-| AAWM_GOOGLE_ADAPTER_MAX_COMPLETION_MESSAGES_WINDOW | Maximum completion-message window retained by the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_MAX_CONCURRENT | Maximum concurrent AAWM Google adapter upstream requests.
-| AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_TEXT_CHARS | Maximum total text characters retained in AAWM Google adapter contents.
-| AAWM_GOOGLE_ADAPTER_MAX_CONTENTS_WINDOW | Maximum contents window retained by the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP | Maximum output-token cap applied by the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_MAX_RETRIES | Maximum retry attempts for AAWM Google adapter requests.
-| AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS | Comma-separated backoff schedule for AAWM Google adapter model-capacity retries.
-| AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES | Maximum model-capacity retry attempts for the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_NATIVE_USER_AGENT | User-Agent value used for native Google Code Assist adapter requests.
-| AAWM_GOOGLE_ADAPTER_NATIVE_X_GOOG_API_CLIENT | `x-goog-api-client` value used for native Google Code Assist adapter requests.
-| AAWM_GOOGLE_ADAPTER_OVERSIZED_TEXT_PART_CHAR_CAP | Character cap for oversized text parts in the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_PERSISTED_OUTPUT_CHAR_CAP | Character cap for persisted output retained by the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_POST_TOOL_COOLDOWN_SECONDS | Cooldown in seconds after Google adapter tool-call turns.
-| AAWM_GOOGLE_ADAPTER_PRESERVED_TASK_STATE_CHAR_CAP | Character cap for preserved task state in the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_PURE_CONTEXT_TEXT_PART_CHAR_CAP | Text-part character cap for pure context entries in the AAWM Google adapter.
-| AAWM_GOOGLE_ADAPTER_SUBAGENT_CONTEXT_TEXT_PART_CHAR_CAP | Text-part character cap for subagent context in the AAWM Google adapter.
-| AAWM_GOOGLE_CODE_ASSIST_PRIME_TTL_SECONDS | TTL in seconds for AAWM Google Code Assist prime/preflight caching.
 | AAWM_NVIDIA_ADAPTER_FORCE_FAKE_STREAM_MODELS | Comma-separated NVIDIA model list that should use fake streaming in the AAWM adapter.
 | AAWM_NVIDIA_ADAPTER_INNER_MAX_RETRIES | Inner retry count for AAWM NVIDIA adapter upstream calls.
 | AAWM_NVIDIA_ADAPTER_MAX_RETRIES | Maximum retry attempts for AAWM NVIDIA adapter requests.
@@ -525,7 +498,6 @@ router_settings:
 | BRAINTRUST_MOCK | Enable mock mode for Braintrust integration testing. When set to true, intercepts Braintrust API calls and returns mock responses without making actual network calls. Default is false
 | BRAINTRUST_MOCK_LATENCY_MS | Mock latency in milliseconds for Braintrust API calls when mock mode is enabled. Simulates network round-trip time. Default is 100ms
 | CACHED_STREAMING_CHUNK_DELAY | Delay in seconds for cached streaming chunks. Default is 0.02
-| CODE_ASSIST_ENDPOINT | Base URL for Google Code Assist API requests.
 | CHATGPT_API_BASE | Base URL for ChatGPT API. Default is https://chatgpt.com/backend-api/codex
 | CHATGPT_AUTH_FILE | Filename for ChatGPT authentication data. Default is "auth.json"
 | CHATGPT_DEFAULT_INSTRUCTIONS | Default system instructions for ChatGPT provider

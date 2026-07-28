@@ -5,9 +5,6 @@ Enforces the behavior-preserving pure-leaf extraction contract from
 
 - ``aawm_adapter_runtime/model_resolution.py``
 - ``aawm_alias_routing/lane_keys.py``
-- ``providers/google/env_policy.py``
-- ``providers/google/context_window.py``
-- ``providers/google/error_signals.py``
 - ``providers/grok/side_channel.py``
 - restored constants redistributed to owning provider modules
 
@@ -24,6 +21,7 @@ import ast
 import hashlib
 import importlib
 import json
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -49,9 +47,6 @@ PROVIDER_DIR = (
 TARGET_MODULE_IMPORT_PATHS: dict[str, str] = {
     "model_resolution": "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.model_resolution",
     "lane_keys": "litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys",
-    "google_env_policy": "litellm.llms.anthropic.experimental_pass_through.providers.google.env_policy",
-    "google_context_window": "litellm.llms.anthropic.experimental_pass_through.providers.google.context_window",
-    "google_error_signals": "litellm.llms.anthropic.experimental_pass_through.providers.google.error_signals",
     "grok_side_channel": "litellm.llms.anthropic.experimental_pass_through.providers.grok.side_channel",
 }
 
@@ -74,7 +69,7 @@ WAVE6A_EXPECTED_COUNTS: dict[str, int] = {
     "sse": 11,
     "tool_call_restore": 14,
     "stream_collect": 9,
-    "payload_validation": 14,
+    "payload_validation": 13,
 }
 
 # ---------------------------------------------------------------------------
@@ -94,18 +89,12 @@ MODEL_RESOLUTION_SYMBOLS: set[str] = {
     "_normalize_opencode_zen_adapter_model_name",
     "_normalize_kimi_code_chat_completions_adapter_model_name",
     "_normalize_alibaba_token_plan_adapter_model_name",
-    "_normalize_anthropic_google_completion_adapter_model_name",
-    "_normalize_antigravity_code_assist_adapter_model_name",
-    "_normalize_codex_google_code_assist_adapter_model_name",
     "_resolve_codex_opencode_zen_adapter_model",
     "_resolve_codex_kimi_chat_completions_adapter_model",
     "_resolve_codex_alibaba_token_plan_adapter_model",
     "_resolve_anthropic_opencode_zen_adapter_model",
     "_resolve_anthropic_kimi_chat_completions_adapter_model",
     "_resolve_anthropic_alibaba_token_plan_adapter_model",
-    "_resolve_anthropic_antigravity_code_assist_adapter_model",
-    "_resolve_codex_google_code_assist_adapter_model",
-    "_resolve_codex_antigravity_code_assist_adapter_model",
     "_normalize_codex_auto_agent_alias_model",
     "_is_codex_auto_agent_alias_model",
     "_resolve_codex_auto_agent_alias_model",
@@ -115,7 +104,6 @@ MODEL_RESOLUTION_SYMBOLS: set[str] = {
     "_resolve_anthropic_openrouter_completion_adapter_model",
     "_resolve_anthropic_nvidia_responses_adapter_model",
     "_resolve_anthropic_openrouter_responses_adapter_model",
-    "_resolve_anthropic_google_completion_adapter_model",
 }
 
 LANE_KEYS_SYMBOLS: set[str] = {
@@ -124,80 +112,12 @@ LANE_KEYS_SYMBOLS: set[str] = {
     "_resolve_codex_auto_agent_openai_lane_key",
     "_resolve_codex_auto_agent_openai_cooldown_lane_key",
     "_get_codex_auto_agent_lane_state_cache_ttl_seconds",
-    "_get_codex_auto_agent_google_lane_cache_key",
-    "_get_codex_auto_agent_antigravity_lane_cache_key",
     "_codex_auto_agent_candidate_key",
     "_resolve_codex_auto_agent_xai_lane_key",
     "_resolve_anthropic_auto_agent_native_lane_key",
     "_resolve_anthropic_auto_agent_native_cooldown_lane_key",
 }
 
-GOOGLE_ENV_POLICY_SYMBOLS: set[str] = {
-    "_get_google_code_assist_prime_ttl_seconds",
-    "_get_google_code_assist_prime_cache_key",
-    "_get_google_adapter_max_concurrent",
-    "_get_google_adapter_shared_lane_key",
-    "_get_google_adapter_rate_limit_key",
-    "_get_google_adapter_rate_limit_key_from_kwargs",
-    "_get_google_adapter_max_retries",
-    "_coerce_non_negative_int",
-    "_coerce_non_negative_float",
-    "_get_google_adapter_post_tool_cooldown_seconds",
-    "_google_code_assist_unwrapped_chunk_contains_tool_call",
-    "_get_google_adapter_max_output_tokens_cap",
-    "_get_google_adapter_default_thinking_level",
-    "_get_google_adapter_max_contents_window",
-    "_get_google_adapter_max_contents_text_chars",
-    "_google_content_has_text",
-    "_get_google_adapter_oversized_text_part_char_cap",
-    "_get_google_adapter_pure_context_text_part_char_cap",
-    "_get_google_adapter_subagent_context_text_part_char_cap",
-    "_get_google_adapter_followup_subagent_context_text_part_char_cap",
-    "_get_google_adapter_followup_allowed_tool_names",
-    "_get_google_adapter_model_capacity_max_retries",
-    "_get_google_adapter_capacity_backoff_seconds",
-    "_get_google_adapter_hidden_retry_budget_seconds",
-    "_get_google_adapter_transient_retry_max_attempts",
-    "_get_google_adapter_transient_backoff_seconds",
-    "_get_google_adapter_fallback_context_char_cap",
-    "_get_google_adapter_system_prompt_policy",
-    "_get_google_code_assist_native_tool_aliases",
-    "_get_google_adapter_max_completion_messages_window",
-    "_get_google_adapter_preserved_task_state_char_cap",
-    "_get_google_adapter_native_user_agent",
-    "_get_google_adapter_native_api_client_header",
-    "_get_google_adapter_persisted_output_char_cap",
-    "_get_google_adapter_auxiliary_context_char_cap",
-    "_get_google_adapter_followup_persisted_output_char_cap",
-    "_get_google_adapter_followup_auxiliary_context_char_cap",
-}
-
-GOOGLE_CONTEXT_WINDOW_SYMBOLS: set[str] = {
-    "_google_content_has_function_exchange",
-    "_google_content_has_function_call",
-    "_apply_google_adapter_contents_window_policy",
-    "_extract_completion_message_text",
-    "_completion_message_has_visible_text",
-    "_estimate_completion_message_text_chars",
-    "_completion_message_has_tool_result",
-    "_completion_message_tool_call_ids",
-    "_completion_message_tool_result_ids",
-    "_trim_completion_message_tail_preserving_tool_pairs",
-    "_apply_google_adapter_completion_message_window",
-    "_google_code_assist_duplicate_tool_results_from_completion_messages",
-    "_google_code_assist_tool_results_from_completion_messages",
-}
-
-GOOGLE_ERROR_SIGNALS_SYMBOLS: set[str] = {
-    "_extract_google_adapter_exception_status_code",
-    "_extract_google_adapter_exception_detail",
-    "_parse_google_rate_limit_reset_seconds",
-    "_extract_google_adapter_error_payloads",
-    "_extract_google_adapter_error_reason",
-    "_extract_google_adapter_error_payload_for_logging",
-    "_record_google_adapter_error_for_logging",
-    "_build_google_adapter_terminal_error_log_context",
-}
 
 GROK_SIDE_CHANNEL_SYMBOLS: set[str] = {
     "_normalize_grok_endpoint_for_target",
@@ -215,18 +135,6 @@ GROK_SIDE_CHANNEL_SYMBOLS: set[str] = {
 }
 
 # Restored constants redistributed to owning provider modules
-RESTORED_CONSTANTS_GOOGLE: set[str] = {
-    "_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME",
-    "_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION",
-    "_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV",
-    "_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT",
-    "_GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT",
-    "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME",
-    "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION",
-    "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV",
-    "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT",
-    "_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT",
-}
 
 RESTORED_CONSTANTS_GROK: set[str] = {
     "_GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL",
@@ -248,20 +156,8 @@ RESTORED_CONSTANTS_OPENCODE_ZEN: set[str] = {
     "_OPENCODE_ZEN_ANTHROPIC_COMPLETION_MODELS",
 }
 
-RESTORED_CONSTANTS_ANTIGRAVITY: set[str] = {
-    "_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST",
-}
 
 RESTORED_CONSTANTS_ANTHROPIC: set[str] = {
-    "_ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL",
-    "_ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS",
-    "_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS",
-    "_ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_ID_ENV_VARS",
-    "_ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_SECRET_ENV_VARS",
-    "_ANTHROPIC_ADAPTER_GEMINI_CLI_BUNDLE_PATH_ENV_VARS",
-    "_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_CLI_BUNDLE_GLOBS",
-    "_ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_ID_PATTERN",
-    "_ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN",
     "_ANTHROPIC_BILLING_HEADER_PREFIX",
 }
 
@@ -290,10 +186,8 @@ RESTORED_CONSTANTS_ALIAS_ROUTING: set[str] = {
 }
 
 ALL_RESTORED_CONSTANTS: set[str] = (
-    RESTORED_CONSTANTS_GOOGLE
-    | RESTORED_CONSTANTS_GROK
+    RESTORED_CONSTANTS_GROK
     | RESTORED_CONSTANTS_OPENCODE_ZEN
-    | RESTORED_CONSTANTS_ANTIGRAVITY
     | RESTORED_CONSTANTS_ANTHROPIC
     | RESTORED_CONSTANTS_ALIAS_ROUTING
 )
@@ -302,9 +196,6 @@ ALL_RESTORED_CONSTANTS: set[str] = (
 SYMBOL_INVENTORY: dict[str, set[str]] = {
     "model_resolution": MODEL_RESOLUTION_SYMBOLS,
     "lane_keys": LANE_KEYS_SYMBOLS,
-    "google_env_policy": GOOGLE_ENV_POLICY_SYMBOLS,
-    "google_context_window": GOOGLE_CONTEXT_WINDOW_SYMBOLS,
-    "google_error_signals": GOOGLE_ERROR_SIGNALS_SYMBOLS,
     "grok_side_channel": GROK_SIDE_CHANNEL_SYMBOLS,
 }
 
@@ -320,10 +211,6 @@ STATE_ALIAS_NAMES: set[str] = {
     "_codex_auto_agent_session_affinity_by_key",
     "_codex_auto_agent_lock",
     "_codex_auto_agent_lane_state_cache_lock",
-    "_codex_auto_agent_google_lane_key_by_key",
-    "_codex_auto_agent_google_lane_key_until_monotonic_by_key",
-    "_codex_auto_agent_antigravity_lane_key_by_key",
-    "_codex_auto_agent_antigravity_lane_key_until_monotonic_by_key",
     "_anthropic_auto_agent_cooldown_until_monotonic_by_key",
     "_anthropic_auto_agent_cooldown_negative_until_monotonic_by_key",
     "_anthropic_auto_agent_session_affinity_by_key",
@@ -397,34 +284,6 @@ class TestMovedBandsNotDefinedInGodModule:
             f"lane_keys symbols still defined as functions in god module: "
             f"{sorted(violations)}"
         )
-
-    def test_google_env_policy_functions_absent_as_defs(self):
-        tree = _parse_god_module()
-        func_defs = _top_level_function_defs(tree)
-        violations = GOOGLE_ENV_POLICY_SYMBOLS & func_defs
-        assert not violations, (
-            f"google_env_policy symbols still defined as functions in god module: "
-            f"{sorted(violations)}"
-        )
-
-    def test_google_context_window_functions_absent_as_defs(self):
-        tree = _parse_god_module()
-        func_defs = _top_level_function_defs(tree)
-        violations = GOOGLE_CONTEXT_WINDOW_SYMBOLS & func_defs
-        assert not violations, (
-            f"google_context_window symbols still defined as functions in god module: "
-            f"{sorted(violations)}"
-        )
-
-    def test_google_error_signals_functions_absent_as_defs(self):
-        tree = _parse_god_module()
-        func_defs = _top_level_function_defs(tree)
-        violations = GOOGLE_ERROR_SIGNALS_SYMBOLS & func_defs
-        assert not violations, (
-            f"google_error_signals symbols still defined as functions in god module: "
-            f"{sorted(violations)}"
-        )
-
     def test_grok_side_channel_functions_absent_as_defs(self):
         tree = _parse_god_module()
         func_defs = _top_level_function_defs(tree)
@@ -491,16 +350,6 @@ class TestFacadeObjectIdentity:
 
     def test_lane_keys_facade_identity(self):
         self._assert_identity_for_module("lane_keys")
-
-    def test_google_env_policy_facade_identity(self):
-        self._assert_identity_for_module("google_env_policy")
-
-    def test_google_context_window_facade_identity(self):
-        self._assert_identity_for_module("google_context_window")
-
-    def test_google_error_signals_facade_identity(self):
-        self._assert_identity_for_module("google_error_signals")
-
     def test_grok_side_channel_facade_identity(self):
         self._assert_identity_for_module("grok_side_channel")
 
@@ -812,11 +661,6 @@ class TestModelResolutionParity:
         assert provider == "openai"
         assert model == "gpt-4o"
 
-    def test_split_provider_prefix_alias(self):
-        provider, model = lpe._split_anthropic_adapter_provider_prefix("agy/some-model")
-        assert provider == "antigravity"
-        assert model == "some-model"
-
     def test_split_provider_prefix_none(self):
         provider, model = lpe._split_anthropic_adapter_provider_prefix("unknown/model")
         assert provider is None
@@ -899,188 +743,6 @@ class TestLaneKeysParity:
         candidate = {"route_family": "other_family"}
         key = lpe._resolve_codex_auto_agent_xai_lane_key(candidate)
         assert key != ""
-
-
-class TestGoogleEnvPolicyParity:
-    """Golden behavior parity for google env-knob getters."""
-
-    def test_coerce_non_negative_int_valid(self):
-        assert lpe._coerce_non_negative_int("5", 10) == 5
-
-    def test_coerce_non_negative_int_none(self):
-        assert lpe._coerce_non_negative_int(None, 10) == 10
-
-    def test_coerce_non_negative_int_negative(self):
-        assert lpe._coerce_non_negative_int("-3", 10) == 0
-
-    def test_coerce_non_negative_int_invalid(self):
-        assert lpe._coerce_non_negative_int("abc", 7) == 7
-
-    def test_coerce_non_negative_float_valid(self):
-        assert lpe._coerce_non_negative_float("2.5", 1.0) == 2.5
-
-    def test_coerce_non_negative_float_none(self):
-        assert lpe._coerce_non_negative_float(None, 1.0) == 1.0
-
-    def test_coerce_non_negative_float_negative(self):
-        assert lpe._coerce_non_negative_float("-1.5", 2.0) == 0.0
-
-    def test_max_output_tokens_cap_default(self, monkeypatch):
-        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP", raising=False)
-        assert lpe._get_google_adapter_max_output_tokens_cap() == 8192
-
-    def test_max_output_tokens_cap_disabled(self, monkeypatch):
-        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP", "0")
-        assert lpe._get_google_adapter_max_output_tokens_cap() is None
-
-    def test_max_output_tokens_cap_custom(self, monkeypatch):
-        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_OUTPUT_TOKENS_CAP", "4096")
-        assert lpe._get_google_adapter_max_output_tokens_cap() == 4096
-
-    def test_default_thinking_level_flash_lite(self, monkeypatch):
-        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG", raising=False)
-        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL", raising=False)
-        assert lpe._get_google_adapter_default_thinking_level("gemini-flash-lite-2.0") == "minimal"
-
-    def test_default_thinking_level_regular(self, monkeypatch):
-        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG", raising=False)
-        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL", raising=False)
-        assert lpe._get_google_adapter_default_thinking_level("gemini-2.5-pro") == "low"
-
-    def test_default_thinking_level_disabled(self, monkeypatch):
-        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG", "1")
-        assert lpe._get_google_adapter_default_thinking_level("gemini-2.5-pro") is None
-
-    def test_default_thinking_level_env_override(self, monkeypatch):
-        monkeypatch.delenv("AAWM_GOOGLE_ADAPTER_DISABLE_DEFAULT_THINKING_CONFIG", raising=False)
-        monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_DEFAULT_THINKING_LEVEL", "high")
-        assert lpe._get_google_adapter_default_thinking_level("gemini-2.5-pro") == "high"
-
-    def test_unwrapped_chunk_contains_tool_call_true(self):
-        chunk = {"candidates": [{"content": {"parts": [{"functionCall": {"name": "test"}}]}}]}
-        assert lpe._google_code_assist_unwrapped_chunk_contains_tool_call(chunk) is True
-
-    def test_unwrapped_chunk_contains_tool_call_false(self):
-        chunk = {"candidates": [{"content": {"parts": [{"text": "hello"}]}}]}
-        assert lpe._google_code_assist_unwrapped_chunk_contains_tool_call(chunk) is False
-
-    def test_unwrapped_chunk_contains_tool_call_empty(self):
-        assert lpe._google_code_assist_unwrapped_chunk_contains_tool_call({}) is False
-
-    def test_estimate_google_content_text_chars_delegates(self):
-        # This delegates to _anthropic_google_shaping; just verify callable
-        result = lpe._estimate_google_content_text_chars({"parts": [{"text": "hello"}]})
-        assert isinstance(result, int)
-
-    def test_google_content_has_text_true(self):
-        assert lpe._google_content_has_text({"parts": [{"text": "hello"}]}) is True
-
-    def test_google_content_has_text_false(self):
-        assert lpe._google_content_has_text({"parts": [{"functionCall": {}}]}) is False
-
-
-class TestGoogleContextWindowParity:
-    """Golden behavior parity for google context window functions."""
-
-    def test_content_has_function_exchange_true(self):
-        block = {"parts": [{"functionCall": {"name": "test"}}]}
-        assert lpe._google_content_has_function_exchange(block) is True
-
-    def test_content_has_function_exchange_response(self):
-        block = {"parts": [{"functionResponse": {"name": "test"}}]}
-        assert lpe._google_content_has_function_exchange(block) is True
-
-    def test_content_has_function_exchange_false(self):
-        block = {"parts": [{"text": "hello"}]}
-        assert lpe._google_content_has_function_exchange(block) is False
-
-    def test_content_has_function_exchange_non_dict(self):
-        assert lpe._google_content_has_function_exchange("not a dict") is False
-
-    def test_content_has_function_call_true(self):
-        block = {"parts": [{"functionCall": {"name": "test"}}]}
-        assert lpe._google_content_has_function_call(block) is True
-
-    def test_content_has_function_call_false_for_response(self):
-        block = {"parts": [{"functionResponse": {"name": "test"}}]}
-        assert lpe._google_content_has_function_call(block) is False
-
-    def test_content_has_function_call_non_dict(self):
-        assert lpe._google_content_has_function_call(None) is False
-
-    def test_completion_message_has_visible_text_string(self):
-        assert lpe._completion_message_has_visible_text({"content": "hello"}) is True
-
-    def test_completion_message_has_visible_text_empty_string(self):
-        assert lpe._completion_message_has_visible_text({"content": "   "}) is False
-
-    def test_completion_message_has_visible_text_list(self):
-        msg = {"content": [{"text": "hello"}]}
-        assert lpe._completion_message_has_visible_text(msg) is True
-
-    def test_completion_message_has_visible_text_non_dict(self):
-        assert lpe._completion_message_has_visible_text("not a dict") is False
-
-    def test_estimate_completion_message_text_chars_string(self):
-        assert lpe._estimate_completion_message_text_chars({"content": "hello"}) == 5
-
-    def test_estimate_completion_message_text_chars_list(self):
-        msg = {"content": [{"text": "ab"}, {"text": "cd"}]}
-        assert lpe._estimate_completion_message_text_chars(msg) == 4
-
-    def test_estimate_completion_message_text_chars_non_dict(self):
-        assert lpe._estimate_completion_message_text_chars(None) == 0
-
-    def test_completion_message_has_tool_result_role(self):
-        assert lpe._completion_message_has_tool_result({"role": "tool"}) is True
-
-    def test_completion_message_has_tool_result_id(self):
-        assert lpe._completion_message_has_tool_result({"tool_call_id": "tc_1"}) is True
-
-    def test_completion_message_has_tool_result_false(self):
-        assert lpe._completion_message_has_tool_result({"role": "user", "content": "hi"}) is False
-
-    def test_completion_message_tool_call_ids(self):
-        msg = {"tool_calls": [{"id": "tc_1"}, {"id": "tc_2"}]}
-        assert lpe._completion_message_tool_call_ids(msg) == {"tc_1", "tc_2"}
-
-    def test_completion_message_tool_call_ids_empty(self):
-        assert lpe._completion_message_tool_call_ids({}) == set()
-
-    def test_completion_message_tool_call_ids_content_tool_use(self):
-        msg = {"content": [{"type": "tool_use", "id": "tc_3"}]}
-        assert lpe._completion_message_tool_call_ids(msg) == {"tc_3"}
-
-    def test_completion_message_tool_result_ids(self):
-        msg = {"role": "tool", "tool_call_id": "tc_1"}
-        result = lpe._completion_message_tool_result_ids(msg)
-        assert "tc_1" in result
-
-
-class TestGoogleErrorSignalsParity:
-    """Golden behavior parity for google error signal parsing."""
-
-    def test_parse_google_rate_limit_reset_seconds_default(self):
-        """With no headers or detail, defaults to 5.0."""
-
-        class FakeExc(Exception):
-            pass
-
-        exc = FakeExc("some error")
-        result = lpe._parse_google_rate_limit_reset_seconds(exc)
-        assert result == 5.0
-
-    def test_extract_exception_status_code_delegates(self):
-        """Verify the delegate is callable and returns None for non-HTTP errors."""
-        result = lpe._extract_google_adapter_exception_status_code(ValueError("test"))
-        assert result is None
-
-    def test_extract_exception_detail_delegates(self):
-        result = lpe._extract_google_adapter_exception_detail(ValueError("test detail"))
-        # Should return something (the detail extraction is provider-specific)
-        assert result is not None or result is None  # callable without error
-
-
 class TestRestoredConstantsParity:
     """Golden parity for restored constants -- values must be stable."""
 
@@ -1093,14 +755,6 @@ class TestRestoredConstantsParity:
         assert isinstance(lpe._OPENCODE_ZEN_DEFAULT_BASE_URL, str)
         assert isinstance(lpe._OPENCODE_ZEN_PROVIDER, str)
         assert isinstance(lpe._OPENCODE_ZEN_FREE_MODELS, (list, tuple, frozenset, set))
-
-    def test_antigravity_constants_exist(self):
-        assert isinstance(lpe._ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST, (list, tuple, frozenset, set))
-
-    def test_google_adapter_policy_constants_exist(self):
-        assert isinstance(lpe._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME, str)
-        assert isinstance(lpe._GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT, str)
-
     def test_codex_reasoning_effort_tiers_exist(self):
         assert isinstance(lpe._CODEX_REASONING_EFFORT_TIERS, (list, tuple))
         assert len(lpe._CODEX_REASONING_EFFORT_TIERS) > 0
@@ -1115,13 +769,6 @@ class TestRestoredConstantsParity:
 
     def test_grok_build_exhausted_url_value(self):
         assert lpe._CODEX_AUTO_AGENT_GROK_BUILD_USAGE_BALANCE_EXHAUSTED_UPSTREAM_URL == "https://cli-chat-proxy.grok.com/v1/responses"
-
-    def test_anthropic_gemini_oauth_constants_exist(self):
-        assert isinstance(lpe._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL, str)
-        assert isinstance(lpe._ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS, (list, tuple))
-        assert isinstance(lpe._ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS, (list, tuple))
-
-
 # ===========================================================================
 # SECTION 6: Signature and annotation contract tests
 # ===========================================================================
@@ -1169,35 +816,6 @@ class TestSignatureContracts:
         for name in sync_funcs:
             fn = getattr(lpe, name)
             assert not inspect.iscoroutinefunction(fn), f"{name} must be sync"
-
-    def test_google_env_policy_functions_are_sync(self):
-        import inspect
-        sync_funcs = [
-            "_coerce_non_negative_int",
-            "_coerce_non_negative_float",
-            "_get_google_adapter_max_output_tokens_cap",
-            "_get_google_adapter_default_thinking_level",
-            "_google_code_assist_unwrapped_chunk_contains_tool_call",
-        ]
-        for name in sync_funcs:
-            fn = getattr(lpe, name)
-            assert not inspect.iscoroutinefunction(fn), f"{name} must be sync"
-
-    def test_google_context_window_functions_are_sync(self):
-        import inspect
-        sync_funcs = [
-            "_google_content_has_function_exchange",
-            "_google_content_has_function_call",
-            "_completion_message_has_visible_text",
-            "_estimate_completion_message_text_chars",
-            "_completion_message_has_tool_result",
-            "_completion_message_tool_call_ids",
-        ]
-        for name in sync_funcs:
-            fn = getattr(lpe, name)
-            assert not inspect.iscoroutinefunction(fn), f"{name} must be sync"
-
-
 # ===========================================================================
 # SECTION 7: Uniqueness -- no symbol appears in multiple target modules
 # ===========================================================================
@@ -1238,7 +856,7 @@ class TestWave6AAdapterRuntimeOwnership:
             for name, import_path in WAVE6A_MODULE_IMPORT_PATHS.items()
         }
 
-    def test_exact_70_symbol_union_without_duplicate_ownership(self):
+    def test_exact_69_symbol_union_without_duplicate_ownership(self):
         seen: dict[str, str] = {}
         duplicates: list[str] = []
         modules = self._modules()
@@ -1253,7 +871,7 @@ class TestWave6AAdapterRuntimeOwnership:
                     )
                 seen[symbol] = module_name
 
-        assert len(seen) == 70
+        assert len(seen) == 69
         assert not duplicates
 
     def test_no_wave6a_symbol_remains_a_god_module_function_def(self):
@@ -1266,7 +884,7 @@ class TestWave6AAdapterRuntimeOwnership:
         remaining = owned & _top_level_function_defs(_parse_god_module())
         assert not remaining
 
-    def test_all_70_facades_share_identity_and_host_globals(self):
+    def test_all_69_facades_share_identity_and_host_globals(self):
         checked = 0
         for module in self._modules().values():
             for symbol in getattr(module, "_HOST_FUNCTION_NAMES"):
@@ -1275,7 +893,7 @@ class TestWave6AAdapterRuntimeOwnership:
                 function = getattr(facade, "__wrapped__", facade)
                 assert function.__globals__ is vars(lpe)
                 checked += 1
-        assert checked == 70
+        assert checked == 69
 
     def test_sse_retains_canonical_shared_helper_ownership(self):
         modules = self._modules()
@@ -1369,8 +987,8 @@ WAVE6D_MODULE_IMPORT_PATHS: dict[str, str] = {
     for name in WAVE6D_MODULE_ORDER
 }
 WAVE6D_EXPECTED_COUNTS: dict[str, int] = {
-    "persisted_output": 14,
-    "observability_metadata": 43,
+    "persisted_output": 7,
+    "observability_metadata": 41,
     "alias_guidance": 6,
 }
 
@@ -1379,16 +997,9 @@ WAVE6D_PERSISTED_OUTPUT_SYMBOLS: set[str] = {
     "_get_claude_persisted_output_root",
     "_resolve_claude_persisted_output_path",
     "_build_claude_persisted_output_source_metadata",
-    "_compact_google_adapter_persisted_output_preview_and_expanded_text",
-    "_compact_expanded_claude_persisted_output_text_for_google_adapter",
-    "_compact_google_adapter_text_part_sequence",
-    "_compact_google_adapter_followup_request_contents",
-    "_compact_google_adapter_persisted_output_value",
-    "_compact_google_adapter_persisted_output_in_anthropic_request_body",
     "_expand_claude_persisted_output_text",
     "_expand_claude_persisted_output_value",
     "_expand_claude_persisted_output_in_anthropic_request_body",
-    "_estimate_google_content_text_chars",
 }
 
 WAVE6D_OBSERVABILITY_METADATA_SYMBOLS: set[str] = {
@@ -1424,8 +1035,6 @@ WAVE6D_OBSERVABILITY_METADATA_SYMBOLS: set[str] = {
     "_prepare_request_body_for_passthrough_observability",
     "_extract_claude_request_breakout_fields",
     "_add_claude_request_breakout_logging_metadata",
-    "_extract_gemini_request_breakout_fields",
-    "_add_gemini_request_breakout_logging_metadata",
     "_extract_codex_request_breakout_fields",
     "_add_codex_request_breakout_logging_metadata",
     "_parse_anthropic_billing_header_text",
@@ -1458,7 +1067,7 @@ for _syms in WAVE6D_SYMBOL_INVENTORY.values():
 
 
 class TestWave6DRequestPolicyOwnership:
-    """Wave 6D structural ownership: 63 functions across 3 modules."""
+    """Wave 6D structural ownership: 54 functions across 3 modules."""
 
     @staticmethod
     def _modules() -> dict[str, object]:
@@ -1467,7 +1076,7 @@ class TestWave6DRequestPolicyOwnership:
             for name, import_path in WAVE6D_MODULE_IMPORT_PATHS.items()
         }
 
-    def test_exact_63_symbol_union_without_duplicate_ownership(self):
+    def test_exact_54_symbol_union_without_duplicate_ownership(self):
         seen: dict[str, str] = {}
         duplicates: list[str] = []
 
@@ -1484,7 +1093,7 @@ class TestWave6DRequestPolicyOwnership:
                     )
                 seen[symbol] = module_name
 
-        assert len(seen) == 63
+        assert len(seen) == 54
         assert not duplicates
 
     def test_no_wave6d_symbol_remains_a_god_module_function_def(self):
@@ -1501,7 +1110,7 @@ class TestWave6DRequestPolicyOwnership:
         host_names = set(getattr(po, "_HOST_FUNCTION_NAMES"))
         assert host_names == WAVE6D_PERSISTED_OUTPUT_SYMBOLS
 
-    def test_all_63_facades_share_identity_with_god_module(self):
+    def test_all_54_facades_share_identity_with_god_module(self):
         modules = self._modules()
         checked = 0
 
@@ -1532,7 +1141,7 @@ class TestWave6DRequestPolicyOwnership:
             )
             checked += 1
 
-        assert checked == 63
+        assert checked == 54
 
     def test_persisted_output_facades_use_host_globals(self):
         """Installed persisted-output functions resolve through host globals."""
@@ -1596,13 +1205,6 @@ class TestWave6DRequestPolicyOwnership:
         assert "alias_guidance" in configure_lines
         assert configure_lines["observability"] < install_lines["persisted_output"]
         assert install_lines["persisted_output"] < configure_lines["alias_guidance"]
-
-    def test_estimate_google_content_text_chars_owned_by_persisted_output(self):
-        """_estimate_google_content_text_chars is Wave 6D persisted_output owned,
-        not google env_policy owned."""
-        assert "_estimate_google_content_text_chars" not in GOOGLE_ENV_POLICY_SYMBOLS
-        assert "_estimate_google_content_text_chars" in WAVE6D_PERSISTED_OUTPUT_SYMBOLS
-
     def test_control_plane_preserves_distinct_get_nested_str_value(self):
         """The control plane retains its own local _get_nested_str_value,
         distinct from the observability_metadata facade."""
@@ -1653,7 +1255,6 @@ class TestWave6DRequestPolicyOwnership:
         """Wave 6D symbols do not overlap with Wave 4 or Wave 6A inventories."""
         prior = ALL_MOVED_FUNCTIONS | ALL_RESTORED_CONSTANTS
         overlap = ALL_WAVE6D_FUNCTIONS & prior
-        # _estimate_google_content_text_chars was removed from env_policy
         assert not overlap, f"Wave 6D overlaps prior waves: {sorted(overlap)}"
 
 
@@ -1764,6 +1365,10 @@ WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS: set[str] = {
     "_prepare_anthropic_request_body_for_passthrough",
 }
 
+WAVE6E_ANTHROPIC_BODY_PREP_GOD_FACADES: set[str] = {
+    "_prepare_anthropic_request_body_for_passthrough",
+}
+
 WAVE6E_SYMBOL_INVENTORY: dict[str, set[str]] = {
     "codex_tool_policy": WAVE6E_CODEX_TOOL_POLICY_SYMBOLS,
     "claude_prompt_replacement": WAVE6E_CLAUDE_PROMPT_REPLACEMENT_SYMBOLS,
@@ -1805,8 +1410,6 @@ class TestWave6ERequestPolicyOwnership:
         assert len(seen) == 76
         assert not duplicates
 
-    WAVE6E_SAME_OBJECT_SYMBOLS: set[str] = set()
-
     WAVE6E_CODEX_TOOL_POLICY_MODULE_ONLY_SYMBOLS: set[str] = {
         "_get_openai_tool_name",
         "_get_openai_tool_type",
@@ -1819,29 +1422,23 @@ class TestWave6ERequestPolicyOwnership:
         "_lookup_model_info_field",
     }
 
-    # Thin callback wrappers: these ARE intentional FunctionDefs in the god
-    # module (they bind CodexToolPolicyCallbacks or normalize_tag_value).
     WAVE6E_WRAPPER_SYMBOLS: set[str] = (
         WAVE6E_CODEX_TOOL_POLICY_SYMBOLS
         - WAVE6E_CODEX_TOOL_POLICY_MODULE_ONLY_SYMBOLS
     )
+    WAVE6E_SAME_OBJECT_SYMBOLS: set[str] = WAVE6E_WRAPPER_SYMBOLS
 
     def test_same_object_facades_not_function_defs(self):
-        """No Wave 6E same-object facades remain on the god module."""
+        """Installed Wave 6E facades are module-owned, not god-module defs."""
         func_defs = _top_level_function_defs(_parse_god_module())
         violations = self.WAVE6E_SAME_OBJECT_SYMBOLS & func_defs
         assert not violations, (
             f"Wave 6E same-object facades defined as FunctionDefs: "
             f"{sorted(violations)}"
         )
-
-    def test_wrapper_facades_are_function_defs(self):
-        """42 codex callback wrappers are intentional FunctionDefs."""
-        func_defs = _top_level_function_defs(_parse_god_module())
-        missing = self.WAVE6E_WRAPPER_SYMBOLS - func_defs
-        assert not missing, (
-            f"Wave 6E wrapper facades missing as FunctionDefs: {sorted(missing)}"
-        )
+        module = self._modules()["codex_tool_policy"]
+        for symbol in self.WAVE6E_SAME_OBJECT_SYMBOLS:
+            assert getattr(lpe, symbol) is getattr(module, symbol)
 
     def test_all_wave6e_symbols_accessible(self):
         """All 76 symbols remain callable on their owning public surface."""
@@ -1879,9 +1476,14 @@ class TestWave6ERequestPolicyOwnership:
                 f"{symbol} not on anthropic_body_prep module"
             )
             assert callable(module_fn), f"{symbol} not callable on module"
-            assert not hasattr(lpe, symbol), (
-                f"{symbol} should be absent from god module"
-            )
+            if symbol in WAVE6E_ANTHROPIC_BODY_PREP_GOD_FACADES:
+                assert getattr(lpe, symbol, None) is module_fn, (
+                    f"{symbol} should be a same-object package facade"
+                )
+            else:
+                assert not hasattr(lpe, symbol), (
+                    f"{symbol} should be absent from god module"
+                )
         codex_mod = importlib.import_module(
             WAVE6E_MODULE_IMPORT_PATHS["codex_tool_policy"]
         )
@@ -1912,16 +1514,25 @@ class TestWave6ERequestPolicyOwnership:
             )
 
     def test_anthropic_body_prep_absent_from_god_module(self):
-        """Anthropic body-prep functions are callable only on their owner module."""
+        """Anthropic body-prep implementation remains package-owned."""
         mod = importlib.import_module(WAVE6E_MODULE_IMPORT_PATHS["anthropic_body_prep"])
+        func_defs = _top_level_function_defs(_parse_god_module())
         for symbol in WAVE6E_ANTHROPIC_BODY_PREP_SYMBOLS:
             module_fn = getattr(mod, symbol)
             assert callable(module_fn), (
                 f"anthropic_body_prep.{symbol}: not callable on module"
             )
-            assert not hasattr(lpe, symbol), (
-                f"anthropic_body_prep.{symbol}: still present on god module"
-            )
+            if symbol in WAVE6E_ANTHROPIC_BODY_PREP_GOD_FACADES:
+                assert getattr(lpe, symbol, None) is module_fn, (
+                    f"anthropic_body_prep.{symbol}: facade identity mismatch"
+                )
+                assert symbol not in func_defs, (
+                    f"anthropic_body_prep.{symbol}: god module re-owns implementation"
+                )
+            else:
+                assert not hasattr(lpe, symbol), (
+                    f"anthropic_body_prep.{symbol}: still present on god module"
+                )
 
     def test_codex_tool_policy_pure_functions_absent_from_god_module(self):
         """Pure codex policy functions are module-owned, not god-module aliases."""
@@ -2158,10 +1769,6 @@ ALL_WAVE6F_FACADES: set[str] = set().union(
 
 WAVE6F_ANTHROPIC_ROUTE_PAIRS: tuple[tuple[str, str], ...] = (
     (
-        "_prepare_anthropic_google_completion_adapter_request",
-        "_handle_anthropic_google_completion_adapter_route",
-    ),
-    (
         "_prepare_anthropic_openai_responses_adapter_route",
         "_handle_anthropic_openai_responses_adapter_route",
     ),
@@ -2270,7 +1877,18 @@ class TestWave6FAdapterRuntimeOwnership:
     def test_dispatch_gate_definition_disposition(self):
         func_defs = _top_level_function_defs(_parse_god_module())
         assert "try_dispatch_codex_request" not in func_defs
-        assert "try_dispatch_anthropic_adapter" in func_defs
+        assert "try_dispatch_anthropic_adapter" not in func_defs
+        modules = self._modules()
+        assert lpe.try_dispatch_codex_request is getattr(
+            modules["codex_dispatch"],
+            "try_dispatch_codex_request",
+        )
+        anthropic_dispatch = lpe.try_dispatch_anthropic_adapter
+        assert isinstance(anthropic_dispatch, partial)
+        assert anthropic_dispatch.func is getattr(
+            modules["anthropic_dispatch"],
+            "try_dispatch_anthropic_adapter",
+        )
 
     def test_all_62_facades_are_accessible(self):
         for symbol in ALL_WAVE6F_FACADES:
@@ -2292,7 +1910,8 @@ class TestWave6FAdapterRuntimeOwnership:
             modules["codex_dispatch"],
             "try_dispatch_codex_request",
         )
-        assert lpe.try_dispatch_anthropic_adapter is not getattr(
+        assert isinstance(lpe.try_dispatch_anthropic_adapter, partial)
+        assert lpe.try_dispatch_anthropic_adapter.func is getattr(
             modules["anthropic_dispatch"],
             "try_dispatch_anthropic_adapter",
         )
@@ -2377,8 +1996,12 @@ class TestWave6FAdapterRuntimeOwnership:
             ):
                 runtime_line = node.lineno
             elif (
-                isinstance(node, ast.AsyncFunctionDef)
-                and node.name == "try_dispatch_anthropic_adapter"
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "try_dispatch_anthropic_adapter"
+                    for target in node.targets
+                )
             ):
                 wrapper_line = node.lineno
 
@@ -2412,9 +2035,9 @@ class TestWave6FAdapterRuntimeOwnership:
             "_add_route_family_logging_metadata"
         }
 
-    def test_all_12_anthropic_route_pairs_and_opencode_wrapper_remain(self):
+    def test_all_11_anthropic_route_pairs_and_opencode_wrapper_remain(self):
         func_defs = _top_level_function_defs(_parse_god_module())
-        assert len(WAVE6F_ANTHROPIC_ROUTE_PAIRS) == 12
+        assert len(WAVE6F_ANTHROPIC_ROUTE_PAIRS) == 11
         for prepare, handle in WAVE6F_ANTHROPIC_ROUTE_PAIRS:
             assert prepare in func_defs
             assert handle in func_defs
@@ -2423,9 +2046,37 @@ class TestWave6FAdapterRuntimeOwnership:
     def test_native_anthropic_route_and_decorator_remain(self):
         tree = _parse_god_module()
         func_defs = _top_level_function_defs(tree)
-        assert "_perform_anthropic_native_passthrough_request" in func_defs
-        assert "_prepare_anthropic_oauth_native_passthrough_headers" in func_defs
-        assert "_prepare_anthropic_context_1m_native_passthrough" in func_defs
+        native = importlib.import_module(
+            "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime."
+            "anthropic_native"
+        )
+        native_symbols = {
+            "_perform_anthropic_native_passthrough_request",
+            "_prepare_anthropic_oauth_native_passthrough_headers",
+            "_prepare_anthropic_context_1m_native_passthrough",
+        }
+        compatibility_function = "_prepare_anthropic_context_1m_native_passthrough"
+        assert native_symbols & func_defs == {compatibility_function}
+        for symbol in native_symbols:
+            assert getattr(lpe, symbol) is getattr(native, symbol)
+        compatibility_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == compatibility_function
+        )
+        native_install = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "_aawm_anthropic_native"
+            and node.value.func.attr == "install"
+        )
+        assert compatibility_node.end_lineno is not None
+        assert compatibility_node.end_lineno < native_install.lineno
         route = next(
             node
             for node in tree.body

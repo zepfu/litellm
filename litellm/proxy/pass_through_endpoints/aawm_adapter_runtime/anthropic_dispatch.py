@@ -50,11 +50,9 @@ class AnthropicDispatchRuntime:
     resolve_xai_oauth: ResolverFn
     resolve_grok_native_oauth: ResolverFn
     resolve_openai_responses: ResolverFn
-    resolve_antigravity: ResolverFn
     resolve_opencode_zen: ResolverFn
     resolve_kimi: ResolverFn
     resolve_alibaba: ResolverFn
-    resolve_google: ResolverFn
     resolve_nvidia: ResolverFn
     resolve_openrouter_completion: ResolverFn
     resolve_openrouter_responses: ResolverFn
@@ -64,7 +62,6 @@ class AnthropicDispatchRuntime:
     handle_xai_oauth_completion: HandlerFn
     handle_grok_native_oauth_responses: HandlerFn
     handle_openai_responses: HandlerFn
-    handle_google_completion: HandlerFn
     handle_opencode_zen: HandlerFn
     handle_kimi: HandlerFn
     handle_alibaba: HandlerFn
@@ -75,8 +72,6 @@ class AnthropicDispatchRuntime:
     # -- classification helper --
     is_oa_xai_responses_model: Callable[[Any], bool]
 
-    # -- constant --
-    antigravity_adapter_provider: str
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +82,9 @@ ANTHROPIC_DISPATCH_SEAM_DISPOSITION: dict[str, str] = {
     "resolve_xai_oauth": "runtime.resolve_xai_oauth",
     "resolve_grok_native_oauth": "runtime.resolve_grok_native_oauth",
     "resolve_openai_responses": "runtime.resolve_openai_responses",
-    "resolve_antigravity": "runtime.resolve_antigravity",
     "resolve_opencode_zen": "runtime.resolve_opencode_zen",
     "resolve_kimi": "runtime.resolve_kimi",
     "resolve_alibaba": "runtime.resolve_alibaba",
-    "resolve_google": "runtime.resolve_google",
     "resolve_nvidia": "runtime.resolve_nvidia",
     "resolve_openrouter_completion": "runtime.resolve_openrouter_completion",
     "resolve_openrouter_responses": "runtime.resolve_openrouter_responses",
@@ -99,7 +92,6 @@ ANTHROPIC_DISPATCH_SEAM_DISPOSITION: dict[str, str] = {
     "handle_xai_oauth_completion": "runtime.handle_xai_oauth_completion",
     "handle_grok_native_oauth_responses": "runtime.handle_grok_native_oauth_responses",
     "handle_openai_responses": "runtime.handle_openai_responses",
-    "handle_google_completion": "runtime.handle_google_completion",
     "handle_opencode_zen": "runtime.handle_opencode_zen",
     "handle_kimi": "runtime.handle_kimi",
     "handle_alibaba": "runtime.handle_alibaba",
@@ -107,7 +99,6 @@ ANTHROPIC_DISPATCH_SEAM_DISPOSITION: dict[str, str] = {
     "handle_openrouter_completion": "runtime.handle_openrouter_completion",
     "handle_openrouter_responses": "runtime.handle_openrouter_responses",
     "is_oa_xai_responses_model": "runtime.is_oa_xai_responses_model",
-    "antigravity_adapter_provider": "runtime.antigravity_adapter_provider",
 }
 
 
@@ -176,18 +167,7 @@ async def try_dispatch_anthropic_adapter(
             **common, adapter_model=adapter_model,
         )
 
-    # 4. Antigravity code-assist (Google completion handler, explicit provider)
-    antigravity_adapter_model = runtime.resolve_antigravity(
-        prepared_request_body, endpoint,
-    )
-    if antigravity_adapter_model is not None:
-        return await runtime.handle_google_completion(
-            **common,
-            adapter_model=antigravity_adapter_model,
-            adapter_provider=runtime.antigravity_adapter_provider,
-        )
-
-    # 5. OpenCode Zen
+    # 4. OpenCode Zen
     opencode_zen_adapter_model = runtime.resolve_opencode_zen(
         prepared_request_body, endpoint,
     )
@@ -196,7 +176,7 @@ async def try_dispatch_anthropic_adapter(
             **common, adapter_model=opencode_zen_adapter_model,
         )
 
-    # 6. Kimi code chat completions
+    # 5. Kimi code chat completions
     kimi_code_adapter_model = runtime.resolve_kimi(
         prepared_request_body, endpoint,
     )
@@ -205,7 +185,7 @@ async def try_dispatch_anthropic_adapter(
             **common, adapter_model=kimi_code_adapter_model,
         )
 
-    # 7. Alibaba token plan
+    # 6. Alibaba token plan
     alibaba_token_plan_adapter_model = runtime.resolve_alibaba(
         prepared_request_body, endpoint,
     )
@@ -214,16 +194,7 @@ async def try_dispatch_anthropic_adapter(
             **common, adapter_model=alibaba_token_plan_adapter_model,
         )
 
-    # 8. Google completion adapter
-    google_adapter_model = runtime.resolve_google(
-        prepared_request_body, endpoint,
-    )
-    if google_adapter_model is not None:
-        return await runtime.handle_google_completion(
-            **common, adapter_model=google_adapter_model,
-        )
-
-    # 9. NVIDIA completion adapter
+    # 7. NVIDIA completion adapter
     nvidia_adapter_model = runtime.resolve_nvidia(
         prepared_request_body, endpoint,
     )
@@ -232,7 +203,7 @@ async def try_dispatch_anthropic_adapter(
             **common, adapter_model=nvidia_adapter_model,
         )
 
-    # 10. OpenRouter completion adapter
+    # 8. OpenRouter completion adapter
     openrouter_completion_adapter_model = runtime.resolve_openrouter_completion(
         prepared_request_body, endpoint,
     )
@@ -241,7 +212,7 @@ async def try_dispatch_anthropic_adapter(
             **common, adapter_model=openrouter_completion_adapter_model,
         )
 
-    # 11. OpenRouter responses adapter
+    # 9. OpenRouter responses adapter
     openrouter_adapter_model = runtime.resolve_openrouter_responses(
         prepared_request_body, endpoint,
     )

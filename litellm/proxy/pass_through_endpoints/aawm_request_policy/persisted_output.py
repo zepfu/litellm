@@ -1,10 +1,10 @@
-"""Wave 6D extraction: Claude persisted-output transformations.
+"""Claude persisted-output transformations.
 
 Behavior-preserving extraction from ``llm_passthrough_endpoints.py``.
 Do not import ``llm_passthrough_endpoints`` at module scope.
 
-The Google provider owns the compaction algorithms. This module owns the
-request-policy delegates and Claude persisted-output file expansion.
+This module owns the request-policy delegates and Claude persisted-output
+file expansion.
 """
 
 from __future__ import annotations
@@ -17,12 +17,6 @@ from pathlib import Path
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
-from litellm.llms.anthropic.experimental_pass_through.providers.google import (
-    env_policy as _google_env_policy,
-)
-from litellm.llms.anthropic.experimental_pass_through.providers.google import (
-    persisted_output as _anthropic_google_shaping,
-)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     lane_keys as _aawm_lane_keys,
 )
@@ -39,18 +33,6 @@ _CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN = (
 _CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN = (
     _aawm_lane_keys._CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN
 )
-_get_google_adapter_auxiliary_context_char_cap = (
-    _google_env_policy._get_google_adapter_auxiliary_context_char_cap
-)
-_get_google_adapter_followup_auxiliary_context_char_cap = (
-    _google_env_policy._get_google_adapter_followup_auxiliary_context_char_cap
-)
-_get_google_adapter_followup_persisted_output_char_cap = (
-    _google_env_policy._get_google_adapter_followup_persisted_output_char_cap
-)
-_get_google_adapter_persisted_output_char_cap = (
-    _google_env_policy._get_google_adapter_persisted_output_char_cap
-)
 
 _persisted_output_logging_callback: Optional[
     Callable[..., dict[str, Any]]
@@ -61,16 +43,10 @@ if TYPE_CHECKING:
     def _format_langfuse_span_timestamp(value: datetime) -> str: ...
 
 _RUNTIME_DEPENDENCY_NAMES = (
-    "_anthropic_google_shaping",
     "_CLAUDE_PERSISTED_OUTPUT_PATTERN",
     "_CLAUDE_PERSISTED_OUTPUT_INLINE_PATTERN",
     "_CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN",
     "_CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN",
-    "_estimate_google_content_text_chars",
-    "_get_google_adapter_auxiliary_context_char_cap",
-    "_get_google_adapter_followup_auxiliary_context_char_cap",
-    "_get_google_adapter_followup_persisted_output_char_cap",
-    "_get_google_adapter_persisted_output_char_cap",
     "_format_langfuse_span_timestamp",
     "_persisted_output_logging_callback",
 )
@@ -80,16 +56,9 @@ _HOST_FUNCTION_NAMES = (
     "_get_claude_persisted_output_root",
     "_resolve_claude_persisted_output_path",
     "_build_claude_persisted_output_source_metadata",
-    "_compact_google_adapter_persisted_output_preview_and_expanded_text",
-    "_compact_expanded_claude_persisted_output_text_for_google_adapter",
-    "_compact_google_adapter_text_part_sequence",
-    "_compact_google_adapter_followup_request_contents",
-    "_compact_google_adapter_persisted_output_value",
-    "_compact_google_adapter_persisted_output_in_anthropic_request_body",
     "_expand_claude_persisted_output_text",
     "_expand_claude_persisted_output_value",
     "_expand_claude_persisted_output_in_anthropic_request_body",
-    "_estimate_google_content_text_chars",
 )
 
 
@@ -103,6 +72,11 @@ def bind_runtime(namespace: Mapping[str, object]) -> None:
 
 def install(host_globals: dict[str, Any]) -> None:
     """Publish same-object host facades with live monkeypatch reachability."""
+    host_globals.setdefault(
+        "_persisted_output_logging_callback",
+        _persisted_output_logging_callback
+        or host_globals.get("_add_claude_persisted_output_logging_metadata"),
+    )
     module_globals = globals()
     for name in _HOST_FUNCTION_NAMES:
         function = module_globals[name]
@@ -130,28 +104,6 @@ def configure_persisted_output_logging_callback(
     """Set the observability-owned logging callback for body-level expansion."""
     global _persisted_output_logging_callback
     _persisted_output_logging_callback = callback
-
-
-def _estimate_google_content_text_chars(content_block: Any) -> int:
-    """Estimate total text characters in a Google content block.
-
-    Single behavior-compatible implementation used by both direct module
-    callers and installed host facades, eliminating the prior dual-path
-    divergence between content_selection and env_policy delegates.
-    """
-    if not isinstance(content_block, dict):
-        return 0
-    parts = content_block.get("parts")
-    if not isinstance(parts, list):
-        return 0
-    total = 0
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        text = part.get("text")
-        if isinstance(text, str):
-            total += len(text)
-    return total
 
 
 def _is_claude_persisted_output_expansion_enabled() -> bool:
@@ -198,68 +150,6 @@ def _build_claude_persisted_output_source_metadata(
         "content_hash": hashlib.sha256(file_bytes).hexdigest(),
         "bytes": len(file_bytes),
     }
-
-
-def _compact_google_adapter_persisted_output_preview_and_expanded_text(
-    text: str,
-    *,
-    cap: int,
-) -> tuple[str, int, set[str], list[dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_persisted_output_preview_and_expanded_text(
-        text,
-        cap=cap,
-    )
-
-
-def _compact_expanded_claude_persisted_output_text_for_google_adapter(
-    text: str,
-    *,
-    persisted_output_char_cap: Optional[int] = None,
-    auxiliary_context_char_cap: Optional[int] = None,
-) -> Tuple[str, int, set[str], list[dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_expanded_claude_persisted_output_text_for_google_adapter(
-        text,
-        persisted_output_char_cap=persisted_output_char_cap,
-        auxiliary_context_char_cap=auxiliary_context_char_cap,
-    )
-
-
-def _compact_google_adapter_text_part_sequence(
-    parts: list[Any],
-) -> Tuple[list[Any], int, set[str], list[dict[str, Any]], bool]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_text_part_sequence(
-        parts
-    )
-
-
-def _compact_google_adapter_followup_request_contents(
-    request_block: dict[str, Any],
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_followup_request_contents(
-        request_block
-    )
-
-
-def _compact_google_adapter_persisted_output_value(
-    value: Any,
-) -> Tuple[Any, int, set[str], list[dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_persisted_output_value(
-        value
-    )
-
-
-def _compact_google_adapter_persisted_output_in_anthropic_request_body(
-    request_body: dict[str, Any],
-) -> Tuple[dict[str, Any], int, set[str], list[dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_persisted_output_in_anthropic_request_body(
-        request_body
-    )
 
 
 def _expand_claude_persisted_output_text(

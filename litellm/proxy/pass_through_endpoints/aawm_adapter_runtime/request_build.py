@@ -508,6 +508,11 @@ def _advertised_custom_tool_function_adapter_names(
     *,
     adapter_model: str,
 ) -> set[str]:
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+        get_openai_tool_name,
+        get_openai_tool_type,
+    )
+
     if not isinstance(request_body, dict):
         return set()
 
@@ -523,8 +528,8 @@ def _advertised_custom_tool_function_adapter_names(
     for tool in tools:
         if not isinstance(tool, dict):
             continue
-        tool_type = _normalize_low_cardinality_tag_value(_get_openai_tool_type(tool))  # noqa: F821
-        tool_name = _normalize_low_cardinality_tag_value(_get_openai_tool_name(tool))  # noqa: F821
+        tool_type = _normalize_low_cardinality_tag_value(get_openai_tool_type(tool))  # noqa: F821
+        tool_name = _normalize_low_cardinality_tag_value(get_openai_tool_name(tool))  # noqa: F821
         if (
             tool_type == "custom"
             and tool_name is not None

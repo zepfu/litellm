@@ -10,13 +10,11 @@ import asyncio
 import importlib
 import json
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 from fastapi import HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -25,9 +23,7 @@ from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_config,
     adapter_driver,
-    antigravity_oauth,
     durable,
-    google_oauth,
     memory,
     oauth_token_cache,
     policy,
@@ -261,8 +257,6 @@ def test_rr054_state_manager_families_and_monotonic_maps() -> None:
     assert manager.family("anthropic") is manager.anthropic
     assert manager.family("codex") is manager.codex
     assert manager.family("other") is manager.codex
-    assert manager.google_oauth is oauth_token_cache.google_oauth_access_token_cache
-    assert manager.antigravity_oauth is oauth_token_cache.antigravity_oauth_access_token_cache
 
     cmap = MonotonicCooldownMap()
     cmap.extend("r1", 1.5, max_size=8)
@@ -391,7 +385,7 @@ async def test_rr054_durable_read_write_max_expiry_and_missing_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# oauth token cache + pure oauth helpers
+# generic OAuth token cache contracts
 # ---------------------------------------------------------------------------
 
 
@@ -410,84 +404,6 @@ def test_rr054_oauth_token_cache_get_set_clear() -> None:
     cache.set("a", "t", int((now + 60) * 1000))
     cache.clear()
     assert cache.tokens == {}
-
-
-def test_rr054_google_oauth_pure_validation_helpers() -> None:
-    google_oauth.configure_google_oauth_runtime(
-        clean_value=google_oauth._default_clean,
-        get_first_secret_value=lambda _names: None,
-        invalidate_google_lane_cache=lambda: None,
-    )
-    assert google_oauth._default_clean("  x  ") == "x"
-    assert google_oauth._default_clean("   ") is None
-    assert google_oauth._default_clean(None) is None
-
-    future_ms = int((time.time() + 120) * 1000)
-    past_ms = int((time.time() - 5) * 1000)
-    assert google_oauth._google_oauth_token_is_valid({"access_token": "abc", "expiry_date": future_ms}) is True
-    assert google_oauth._google_oauth_token_is_valid({"access_token": "abc", "expiry_date": past_ms}) is False
-    assert google_oauth._google_oauth_token_is_valid({"access_token": ""}) is False
-    assert google_oauth._google_oauth_cached_token_is_valid(("tok", future_ms)) is True
-    assert google_oauth._get_google_oauth_expiry_date({"expiry_date": 12.5}) == 12
-    assert google_oauth._get_google_oauth_expiry_date({}) is None
-    assert (
-        google_oauth._get_google_oauth_client_value(
-            {"client_id": " from-auth "},
-            ("client_id",),
-            ("MISSING_ENV",),
-        )
-        == "from-auth"
-    )
-
-
-def test_rr054_antigravity_oauth_pure_validation_helpers() -> None:
-    assert antigravity_oauth._default_clean(" a ") == "a"
-    future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-    past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-    valid = {"token": {"access_token": "tok", "expiry": future}}
-    expired = {"token": {"access_token": "tok", "expiry": past}}
-    assert antigravity_oauth._parse_antigravity_token_expiry(future) is not None
-    assert antigravity_oauth._parse_antigravity_token_expiry("not-a-date") is None
-    assert antigravity_oauth._antigravity_access_token_is_valid(valid) is True
-    assert antigravity_oauth._antigravity_access_token_is_valid(expired) is False
-    assert antigravity_oauth._antigravity_access_token_is_unexpired(valid) is True
-    expiry_ms = antigravity_oauth._get_antigravity_oauth_expiry_date(valid)
-    assert isinstance(expiry_ms, int) and expiry_ms > 0
-    assert antigravity_oauth._antigravity_oauth_cached_token_is_valid(("tok", int((time.time() + 120) * 1000))) is True
-
-    # Package fallback is safe without a response; god-file import may have
-    # already installed production hooks, so isolate both contract branches.
-    previous_format = antigravity_oauth._format_refresh_failure_fn
-    try:
-        antigravity_oauth._format_refresh_failure_fn = None
-        msg = antigravity_oauth._format_refresh_failure(provider_label="Antigravity", response=None)
-        assert "Antigravity" in msg
-        assert "Failed to refresh" in msg
-
-        # Configured production-shaped contract requires a real HTTP response
-        # with status_code + .json() (httpx.Response).
-        def _format(*, provider_label: str, response: Any) -> str:
-            body = response.json()
-            code = body.get("error") if isinstance(body, dict) else None
-            return (
-                f"Failed to refresh {provider_label} OAuth access token "
-                f"(status={response.status_code}, error={code})."
-            )
-
-        antigravity_oauth._format_refresh_failure_fn = _format
-        response = httpx.Response(
-            401,
-            json={"error": "invalid_grant"},
-            request=httpx.Request("POST", "https://oauth.example.test/token"),
-        )
-        configured = antigravity_oauth._format_refresh_failure(
-            provider_label="Antigravity",
-            response=response,
-        )
-        assert "status=401" in configured
-        assert "invalid_grant" in configured
-    finally:
-        antigravity_oauth._format_refresh_failure_fn = previous_format
 
 
 # ---------------------------------------------------------------------------

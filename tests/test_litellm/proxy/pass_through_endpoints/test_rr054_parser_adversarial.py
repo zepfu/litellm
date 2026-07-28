@@ -10,16 +10,9 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.request_build import (
-    _parse_grok_composer_literal_tool_label_blocks,
-    _parse_grok_composer_literal_tool_payload_json,
-    _repair_grok_composer_literal_tool_calls_in_text,
-)
+from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep import (
     _compact_openai_adapter_claude_context_text,
-)
-from litellm.proxy.pass_through_endpoints.aawm_request_policy.persisted_output import (
-    _compact_expanded_claude_persisted_output_text_for_google_adapter,
 )
 
 
@@ -52,18 +45,18 @@ def test_rr054_parser_trailing_valid_json_after_grok_tool_payload() -> None:
         'Input payload: {"cmd": "pwd"}'
     )
 
-    blocks = _parse_grok_composer_literal_tool_label_blocks(text)
+    blocks = lpe._parse_grok_composer_literal_tool_label_blocks(text)
     assert len(blocks) == 2
 
     first = blocks[0]
     assert first["payload"].strip() == '{"cmd": "ls"}'
     first_span = text[int(first["start"]) : int(first["end"])]
     assert trailing_json not in first_span
-    assert _parse_grok_composer_literal_tool_payload_json(first["payload"]) == {
+    assert lpe._parse_grok_composer_literal_tool_payload_json(first["payload"]) == {
         "cmd": "ls"
     }
 
-    leftover, items = _repair_grok_composer_literal_tool_calls_in_text(
+    leftover, items = lpe._repair_grok_composer_literal_tool_calls_in_text(
         text,
         advertised_tools=_exec_command_advertised_tools(),
     )
@@ -79,7 +72,7 @@ def test_rr054_parser_thousands_of_unmatched_system_reminder_openers_bounded() -
     """Thousands of unmatched <system-reminder> openers must stay near-linear.
 
     RR-054 #54: adversarial client text with many openers and no closers must not
-    quadratic-burn reminder compaction. Guarded paths should finish quickly.
+    quadratic-burn reminder compaction. The retained path should finish quickly.
     """
     # Thousands of unmatched openers plus filler (no closers). Unbounded non-greedy
     # DOTALL scans over this shape commonly take multi-second / 10s+; a bounded path
@@ -105,25 +98,5 @@ def test_rr054_parser_thousands_of_unmatched_system_reminder_openers_bounded() -
     assert openai_elapsed < 0.5, (
         "RR-054 #54 OpenAI system-reminder compact still expensive on "
         f"{opener_count} unmatched openers: {openai_elapsed:.3f}s "
-        f"(len={len(adversarial)})"
-    )
-
-    t0 = time.perf_counter()
-    (
-        google_out,
-        google_compacted,
-        _hooks,
-        _meta,
-    ) = _compact_expanded_claude_persisted_output_text_for_google_adapter(
-        adversarial,
-        auxiliary_context_char_cap=128,
-    )
-    google_elapsed = time.perf_counter() - t0
-
-    assert isinstance(google_out, str)
-    assert google_compacted == 0
-    assert google_elapsed < 0.5, (
-        "RR-054 #54 Google auxiliary/system-reminder compact still expensive on "
-        f"{opener_count} unmatched openers: {google_elapsed:.3f}s "
         f"(len={len(adversarial)})"
     )

@@ -36,7 +36,6 @@ def _load(rel: str):
             "_write_credential_payload",
             "credential_path",
         ),
-        ("scripts/antigravity_oauth_refresh.py", "_write_token_data", "auth_path"),
     ],
 )
 def test_credential_writer_ends_at_0600(rel, writer, arg_name, tmp_path: Path):
@@ -75,9 +74,7 @@ def test_credential_writer_ends_at_0600(rel, writer, arg_name, tmp_path: Path):
         else tmp_path / "cred.json"
     )
     fn = getattr(mod, writer)
-    if writer == "_write_token_data":
-        fn(target, {"access_token": "a", "refresh_token": "b"})
-    elif rel == "scripts/kimi_oauth_refresh.py":
+    if rel == "scripts/kimi_oauth_refresh.py":
         fn(
             target,
             {
@@ -139,53 +136,6 @@ def test_grok_writer_refuses_symlink_target(tmp_path: Path):
     with pytest.raises(CredentialPathIsSymlinkError):
         mod._write_credential_payload(target, {"access_token": "nope"})
     assert real.read_text(encoding="utf-8") == '{"keep": true}\n'
-
-
-def test_antigravity_write_token_data_uses_shared_publish_and_refuses_symlink(
-    tmp_path: Path,
-) -> None:
-    """RR-065 consumer migration: Antigravity publishes via shared helpers."""
-    from litellm.secret_managers.credential_file_metadata import (
-        CredentialPathIsSymlinkError,
-    )
-
-    mod = _load("scripts/antigravity_oauth_refresh.py")
-    src = Path(mod.__file__).read_text(encoding="utf-8")
-    assert "write_and_publish_private_text" in src
-    assert 'f".{auth_path.name}.{os.getpid()}.tmp"' not in src
-
-    target = tmp_path / "nested" / "token.json"
-    mod._write_token_data(
-        target,
-        {
-            "token": {
-                "access_token": "a",
-                "refresh_token": "b",
-                "expiry": "2099-01-01T00:00:00Z",
-            }
-        },
-    )
-    assert target.is_file()
-    assert target.stat().st_mode & 0o777 == 0o600
-    assert list(target.parent.glob(".token.json.*.tmp")) == []
-
-    real = tmp_path / "real.json"
-    real.write_text('{"keep":true}', encoding="utf-8")
-    os.chmod(real, 0o600)
-    link = tmp_path / "link-token.json"
-    link.symlink_to(real)
-    with pytest.raises(CredentialPathIsSymlinkError):
-        mod._write_token_data(
-            link,
-            {
-                "token": {
-                    "access_token": "attacker",
-                    "refresh_token": "r",
-                    "expiry": "2099-01-01T00:00:00Z",
-                }
-            },
-        )
-    assert real.read_text(encoding="utf-8") == '{"keep":true}'
 
 
 def test_codex_write_auth_data_refuses_symlink_target(tmp_path: Path):

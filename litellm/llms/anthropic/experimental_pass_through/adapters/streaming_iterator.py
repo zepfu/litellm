@@ -1,7 +1,6 @@
 # What is this?
 ## Translates OpenAI call to Anthropic `/v1/messages` format
 import json
-import os
 import traceback
 from collections import deque
 from inspect import isawaitable
@@ -123,14 +122,6 @@ def encode_anthropic_sse_chunk(chunk: Any) -> Any:
     return chunk
 
 
-def is_aawm_gemini_route_debug_enabled() -> bool:
-    """True when ``AAWM_GEMINI_ROUTE_DEBUG=1`` (resolved once per wrapper).
-
-    Diagnostics use ``verbose_logger.debug``, not warning.
-    """
-    return os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1"
-
-
 class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
     """
     - first chunk return 'message_start'
@@ -187,8 +178,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         self.buffered_tool_calls = {}
         self.tool_call_content_block_indices = {}
         self.tool_call_names = {}
-        # Resolve once: per-chunk getenv is avoidable hot-path work.
-        self._gemini_route_debug = is_aawm_gemini_route_debug_enabled()
 
     def _create_initial_usage_delta(self) -> UsageDelta:
         """
@@ -745,29 +734,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if self._should_suppress_provider_thinking_delta(processed_chunk):
                     continue
 
-                if self._gemini_route_debug and "gemini" in self.model:
-                    try:
-                        choice = chunk.choices[0]
-                        delta = getattr(choice, "delta", None)
-                        verbose_logger.debug(
-                            "Anthropic wrapper debug(sync): model=%s raw_finish=%s raw_content=%r raw_reasoning=%r raw_tool_calls=%s translated_type=%s translated_delta=%s",
-                            self.model,
-                            getattr(choice, "finish_reason", None),
-                            getattr(delta, "content", None),
-                            getattr(delta, "reasoning_content", None),
-                            len(getattr(delta, "tool_calls", None) or []),
-                            processed_chunk.get("type")
-                            if isinstance(processed_chunk, dict)
-                            else type(processed_chunk).__name__,
-                            processed_chunk.get("delta")
-                            if isinstance(processed_chunk, dict)
-                            else None,
-                        )
-                    except Exception:
-                        verbose_logger.exception(
-                            "Anthropic wrapper sync debug logging failed"
-                        )
-
                 if should_start_new_block and not self.sent_content_block_finish:
                     # Queue the sequence: content_block_stop -> content_block_start.
                     # Preserve the triggering delta for every block transition.
@@ -919,29 +885,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 )
                 if self._should_suppress_provider_thinking_delta(processed_chunk):
                     continue
-
-                if self._gemini_route_debug and "gemini" in self.model:
-                    try:
-                        choice = chunk.choices[0]
-                        delta = getattr(choice, "delta", None)
-                        verbose_logger.debug(
-                            "Anthropic wrapper debug(async): model=%s raw_finish=%s raw_content=%r raw_reasoning=%r raw_tool_calls=%s translated_type=%s translated_delta=%s",
-                            self.model,
-                            getattr(choice, "finish_reason", None),
-                            getattr(delta, "content", None),
-                            getattr(delta, "reasoning_content", None),
-                            len(getattr(delta, "tool_calls", None) or []),
-                            processed_chunk.get("type")
-                            if isinstance(processed_chunk, dict)
-                            else type(processed_chunk).__name__,
-                            processed_chunk.get("delta")
-                            if isinstance(processed_chunk, dict)
-                            else None,
-                        )
-                    except Exception:
-                        verbose_logger.exception(
-                            "Anthropic wrapper async debug logging failed"
-                        )
 
                 # Check if this is a usage chunk and we have a held stop_reason chunk
                 if (

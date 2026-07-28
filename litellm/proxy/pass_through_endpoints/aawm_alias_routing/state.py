@@ -1,8 +1,8 @@
 """Process-local alias-routing state manager (RR-054 #1).
 
-Owns cooldown / affinity / lane-cache dicts, their asyncio.Locks, the
-read-pilot evidence gate, round-robin cursor, and OpenRouter quota cache
-so the pass-through god-module does not declare the state maps itself.
+Owns cooldown and affinity maps, their asyncio.Locks, probe-lock state, the
+read-pilot evidence gate, round-robin cursor, and OpenRouter caches so the
+pass-through god-module does not declare the state maps itself.
 """
 
 from __future__ import annotations
@@ -12,10 +12,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-from .oauth_token_cache import (
-    antigravity_oauth_access_token_cache,
-    google_oauth_access_token_cache,
-)
 from .memory import (
     DEFAULT_MEMORY_STATE_MAX_SIZE,
     bound_memory_map,
@@ -196,7 +192,7 @@ class AliasFamilyState:
 
 @dataclass
 class MonotonicCooldownMap:
-    """Generic process-local cooldown map + lock (OpenRouter/Google rate limits)."""
+    """Generic process-local cooldown map and lock."""
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     until_monotonic_by_key: dict[str, float] = field(default_factory=dict)
@@ -241,20 +237,11 @@ class AliasRoutingStateManager:
         self.codex = AliasFamilyState()
         self.anthropic = AliasFamilyState()
         self.lane_state_cache_lock = asyncio.Lock()
-        self.google_lane_key_until_monotonic_by_key: dict[str, float] = {}
-        self.google_lane_key_by_key: dict[str, str] = {}
-        self.google_lane_negative_until_monotonic = 0.0
-        self.antigravity_lane_key_until_monotonic_by_key: dict[str, float] = {}
-        self.antigravity_lane_key_by_key: dict[str, str] = {}
-        self.antigravity_auth_degraded_log_until_monotonic = 0.0
         self.log_until_monotonic_by_key: dict[str, float] = {}
         self.candidate_probe_locks: dict[str, asyncio.Lock] = {}
         self.candidate_probe_locks_guard = asyncio.Lock()
         self.openrouter_rate_limit = MonotonicCooldownMap()
         self.openrouter_failure_circuit = MonotonicCooldownMap()
-        self.google_rate_limit = MonotonicCooldownMap()
-        self.google_oauth = google_oauth_access_token_cache
-        self.antigravity_oauth = antigravity_oauth_access_token_cache
         # Wave 5B: read-pilot evidence gate with its own separate AliasFamilyState
         self.read_pilot_gate = CooldownEvidenceGate(family_state=AliasFamilyState())
         # Wave 5B: per-alias round-robin rotation cursor
@@ -281,22 +268,15 @@ class AliasRoutingStateManager:
 
         Every map is cleared with ``.clear()`` -- never reassigned -- so the
         module-global aliases in ``llm_passthrough_endpoints`` (which are bound
-        to these exact dict objects) stay valid and observe the reset. Scalar
-        cooldown/log timestamps are reset to ``0.0``.
+        to these exact dict objects) stay valid and observe the reset. The
+        OpenRouter quota cache is reset by replacing its immutable tuple.
         """
         self.codex.clear_for_tests()
         self.anthropic.clear_for_tests()
-        self.google_lane_key_until_monotonic_by_key.clear()
-        self.google_lane_key_by_key.clear()
-        self.google_lane_negative_until_monotonic = 0.0
-        self.antigravity_lane_key_until_monotonic_by_key.clear()
-        self.antigravity_lane_key_by_key.clear()
-        self.antigravity_auth_degraded_log_until_monotonic = 0.0
         self.log_until_monotonic_by_key.clear()
         self.candidate_probe_locks.clear()
         self.openrouter_rate_limit.clear_for_tests()
         self.openrouter_failure_circuit.clear_for_tests()
-        self.google_rate_limit.clear_for_tests()
         # Wave 5B: gate, cursor, quota
         self.read_pilot_gate._key_state.clear()
         self.read_pilot_gate._family_state.evidence_events_by_key.clear()

@@ -48,7 +48,6 @@ EXPECTED_SYMBOLS_ORDER: tuple[str, ...] = (
     "_coerce_optional_int",
     "_usage_has_no_more_than_one_output_token",
     "_model_response_usage_dict",
-    "_is_codex_google_code_assist_empty_success_model_response",
     "_raise_codex_auto_agent_empty_success_response",
     "_build_failed_responses_diagnostic",
     "_raise_codex_auto_agent_malformed_tool_call_text_payload",
@@ -164,7 +163,6 @@ class TestPayloadValidationDependencyIsolation:
             "_collect_responses_response_from_stream",
             "_responses_sse_from_repaired_response_body",
             "_build_empty_success_responses_diagnostic",
-            "_anthropic_google_shaping",
             "_aawm_alias_streaming",
         }
         leaked = host_seams & runtime_imported

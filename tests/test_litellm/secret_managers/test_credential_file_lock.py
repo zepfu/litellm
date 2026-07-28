@@ -28,8 +28,8 @@ def test_scripts_delegate_to_shared_lock() -> None:
     import importlib.util
     import sys
 
-    path = Path("scripts/antigravity_oauth_refresh.py")
-    name = "antigravity_lock_ut"
+    path = Path("scripts/grok_oidc_refresh.py")
+    name = "grok_lock_ut"
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)

@@ -59,10 +59,7 @@ if TYPE_CHECKING:
     _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT: list[int]
     _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES: int
     _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS: int
-    _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER: str
     _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: str
-    _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER: str
-    _CODEX_AUTO_AGENT_GOOGLE_PROVIDER: str
     _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: str
     _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: str
     _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: str
@@ -95,7 +92,6 @@ if TYPE_CHECKING:
     def _get_openrouter_target_base() -> str: ...
     def _get_proxy_shared_aiohttp_session() -> Optional[Any]: ...
     def _grok_native_candidate_unavailable_detail(exc: Exception) -> Optional[str]: ...
-    async def _handle_codex_google_code_assist_adapter_route(**kwargs: Any) -> Response: ...
     def _is_codex_auto_agent_empty_success_responses_body(body: Any) -> bool: ...
     def _is_codex_auto_agent_malformed_tool_call_text_output(body: Any) -> bool: ...
     def _is_failed_responses_body(body: Any) -> bool: ...
@@ -200,29 +196,6 @@ async def _perform_codex_auto_agent_alias_candidate_request(
 ) -> Response:
     adapter_model = candidate["model"]
 
-    async def _google() -> Response:
-        return await _handle_codex_google_code_assist_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _antigravity() -> Response:
-        return await _handle_codex_google_code_assist_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
-            use_alias_candidate_probe=True,
-        )
-
     async def _openrouter_completion() -> Response:
         return await _perform_codex_auto_agent_openrouter_completion_request(
             request=request,
@@ -304,8 +277,6 @@ async def _perform_codex_auto_agent_alias_candidate_request(
     return await _dispatch_auto_agent_alias_candidate_request(
         candidate=candidate,
         provider_handlers={
-            _CODEX_AUTO_AGENT_GOOGLE_PROVIDER: _google,
-            _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER: _antigravity,
             _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
             _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: _alibaba_token_plan,

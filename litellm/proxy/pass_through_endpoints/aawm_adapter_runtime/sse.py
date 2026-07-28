@@ -65,6 +65,10 @@ _HOST_FUNCTION_NAMES = (
     "_build_anthropic_streaming_response_from_completion_adapter_stream",
 )
 
+_HOST_GLOBAL_DEFAULTS = (
+    ("SimpleNamespace", SimpleNamespace),
+)
+
 
 def install(host_globals: dict) -> None:
     """Rebind moved functions to host_globals for live lookup.
@@ -74,6 +78,8 @@ def install(host_globals: dict) -> None:
     rebound object is published to both this module and the host module.
     """
     _mod = globals()
+    for _dependency_name, _dependency in _HOST_GLOBAL_DEFAULTS:
+        host_globals.setdefault(_dependency_name, _dependency)
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         _rebound = FunctionType(

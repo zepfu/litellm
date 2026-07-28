@@ -29,8 +29,6 @@ from . import policy
 REGISTERED_PROVIDERS: frozenset[str] = frozenset(
     {
         policy.CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-        policy.CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
-        policy.CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
         policy.CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
         policy.CODEX_AUTO_AGENT_XAI_PROVIDER,
         policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,

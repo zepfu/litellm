@@ -46,6 +46,30 @@ if TYPE_CHECKING:
         metadata: Dict[str, Any],
     ) -> Optional[str]: ...
 
+_RETIRED_GOOGLE_AGENT_PROVIDER_NAMES = {
+    "antigravity",
+    "agy",
+    "google-antigravity",
+    "google_code_assist",
+    "google-code-assist",
+}
+_RETIRED_GOOGLE_AGENT_MARKERS = ("antigravity", "code_assist", "code-assist")
+_RETIRED_GOOGLE_AGENT_API_BASE_MARKERS = ("cloudcode-pa.googleapis.com",)
+
+
+def _is_retired_google_agent_reference(*values: Any) -> bool:
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = value.strip().lower()
+        if normalized in _RETIRED_GOOGLE_AGENT_PROVIDER_NAMES:
+            return True
+        if any(marker in normalized for marker in _RETIRED_GOOGLE_AGENT_MARKERS):
+            return True
+        if any(marker in normalized for marker in _RETIRED_GOOGLE_AGENT_API_BASE_MARKERS):
+            return True
+    return False
+
 
 def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
     if not isinstance(candidate, str) or not candidate.strip():
@@ -53,10 +77,10 @@ def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
     candidate_lower = candidate.strip().lower()
     if candidate_lower in {"unknown", "none", "null", "litellm"}:
         return None
-    if candidate_lower in {"google", "google_code_assist", "google-code-assist"}:
+    if candidate_lower in _RETIRED_GOOGLE_AGENT_PROVIDER_NAMES:
+        return None
+    if candidate_lower == "google":
         return "gemini"
-    if candidate_lower in {"agy", "google-antigravity"}:
-        return "antigravity"
     if candidate_lower in {"nvidia", "nvidia_nim", "nvidia-nim"}:
         return "nvidia_nim"
     if candidate_lower in {"opencode", "opencode-zen", "opencode_zen", "zen"}:
@@ -72,7 +96,6 @@ def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
         "local-llm",
         "local_biomed",
         "local-biomed",
-        "antigravity",
         "openrouter",
         "opencode_zen",
         "openai",
@@ -104,6 +127,8 @@ def _session_history_provider_from_model(model: Any) -> Optional[str]:
     model_lower = str(model or "").strip().lower()
     if not model_lower or model_lower == "unknown":
         return None
+    if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
+        return None
     if model_lower.startswith("local_embed/"):
         return "local_embed"
     if model_lower.startswith("local_rerank/"):
@@ -120,8 +145,6 @@ def _session_history_provider_from_model(model: Any) -> Optional[str]:
         return "openrouter"
     if model_lower.startswith(("opencode/", "opencode-zen/", "zen/")):
         return "opencode_zen"
-    if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
-        return "antigravity"
     if "gemini" in model_lower or model_lower.startswith("google/"):
         return "gemini"
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
@@ -142,6 +165,8 @@ def _session_history_provider_from_route_family(route_family: Any) -> Optional[s
     if not isinstance(route_family, str) or not route_family.strip():
         return None
     route_lower = route_family.lower()
+    if _is_retired_google_agent_reference(route_lower):
+        return None
     if "grok" in route_lower or "xai" in route_lower:
         return "xai"
     if "nvidia" in route_lower:
@@ -150,8 +175,6 @@ def _session_history_provider_from_route_family(route_family: Any) -> Optional[s
         return "openrouter"
     if "opencode" in route_lower:
         return "opencode_zen"
-    if "antigravity" in route_lower:
-        return "antigravity"
     if "local_embed" in route_lower or "local-embed" in route_lower:
         return "local_embed"
     if "local_rerank" in route_lower or "local-rerank" in route_lower:
@@ -177,14 +200,14 @@ def _session_history_adapter_target_provider(
         if not tag_lower.startswith("anthropic-adapter-target:"):
             continue
         target = tag_lower.split(":", 1)[1].strip()
+        if _is_retired_google_agent_reference(target):
+            return None
         if target.startswith(("google", "gemini")):
             return "gemini"
         if target.startswith("openrouter"):
             return "openrouter"
         if target.startswith(("opencode", "opencode_zen", "zen")):
             return "opencode_zen"
-        if target.startswith(("antigravity", "agy", "google-antigravity")):
-            return "antigravity"
         if target.startswith("nvidia"):
             return "nvidia_nim"
         if target.startswith(("xai", "grok")):
@@ -219,6 +242,24 @@ def _normalize_session_history_provider(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     metadata = metadata or {}
+    if _is_retired_google_agent_reference(
+        provider,
+        model,
+        metadata.get("passthrough_route_family"),
+        metadata.get("codex_auto_agent_selected_provider"),
+        metadata.get("anthropic_auto_agent_selected_provider"),
+        metadata.get("aawm_auto_agent_selected_provider"),
+        metadata.get("custom_llm_provider"),
+        metadata.get("provider"),
+        metadata.get("litellm_provider"),
+        metadata.get("aawm_stream_logging_custom_llm_provider"),
+        metadata.get("anthropic_adapter_original_model"),
+        metadata.get("codex_adapter_original_model"),
+        metadata.get("api_base"),
+        _maybe_get(metadata.get("hidden_params"), "api_base"),
+        metadata.get("user_api_key_request_route"),
+    ):
+        return None
     adapter_target_provider = _session_history_adapter_target_provider(metadata)
     if adapter_target_provider is not None:
         return adapter_target_provider
@@ -273,6 +314,8 @@ def _normalize_session_history_provider(
     request_route = metadata.get("user_api_key_request_route")
     if isinstance(request_route, str) and request_route.strip():
         route_lower = request_route.lower()
+        if _is_retired_google_agent_reference(route_lower):
+            return None
         if "gemini" in route_lower or "google" in route_lower:
             return "gemini"
         if route_lower.startswith("/v1/"):
@@ -283,6 +326,8 @@ def _normalize_session_history_provider(
     api_base = metadata.get("api_base") or _maybe_get(metadata.get("hidden_params"), "api_base")
     if isinstance(api_base, str) and api_base.strip():
         api_base_lower = api_base.lower()
+        if _is_retired_google_agent_reference(api_base_lower):
+            return None
         if "api.x.ai" in api_base_lower or "cli-chat-proxy.grok.com" in api_base_lower:
             return "xai"
         if "integrate.api.nvidia.com" in api_base_lower:
@@ -536,6 +581,8 @@ def _session_history_provider_from_api_base(
     if not sanitized:
         return None
     api_base_lower = sanitized.lower()
+    if _is_retired_google_agent_reference(api_base_lower):
+        return None
     if "api.x.ai" in api_base_lower or "cli-chat-proxy.grok.com" in api_base_lower:
         return "xai"
     if "integrate.api.nvidia.com" in api_base_lower:
@@ -800,6 +847,7 @@ def _resolve_xai_grok_model_override(
 
 
 _HOST_FUNCTION_NAMES = (
+    "_is_retired_google_agent_reference",
     "_normalize_session_history_provider_name",
     "_session_history_provider_from_model_catalog",
     "_session_history_provider_from_model",

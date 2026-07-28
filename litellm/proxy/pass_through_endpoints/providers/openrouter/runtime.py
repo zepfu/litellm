@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, TypeVar, Union
 
@@ -24,6 +25,76 @@ _ANTHROPIC_ADAPTER_OPENROUTER_API_KEY_ENV_VARS = (
     "AAWM_OPENROUTER_API_KEY",
     "OPENROUTER_API_KEY",
 )
+
+_HOST_FUNCTION_NAMES = (
+    "_get_openrouter_adapter_rate_limit_key",
+    "_is_openrouter_adapter_free_model",
+    "_get_openrouter_adapter_wait_keys",
+    "_extract_openrouter_adapter_exception_status_code",
+    "_extract_openrouter_adapter_error_payload",
+    "_extract_openrouter_adapter_provider_name",
+    "_extract_openrouter_adapter_retry_after_seconds",
+    "_extract_openrouter_adapter_raw_message",
+    "_is_openrouter_adapter_no_endpoint_candidate_error",
+    "_maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable",
+    "_is_openrouter_adapter_provider_raw_error",
+    "_extract_openrouter_adapter_error_headers",
+    "_get_openrouter_adapter_header_value",
+    "_extract_openrouter_adapter_reset_wait_seconds",
+    "_is_openrouter_adapter_long_window_rate_limit",
+    "_get_openrouter_adapter_cooldown_keys",
+    "_get_openrouter_adapter_retry_wait_seconds",
+    "_get_openrouter_adapter_max_retries",
+    "_get_openrouter_adapter_backoff_seconds",
+    "_get_openrouter_adapter_hidden_retry_budget_seconds",
+    "_get_openrouter_adapter_post_failure_cooldown_seconds",
+    "_maybe_raise_openrouter_adapter_failure_circuit_open",
+    "_openrouter_adapter_open_failure_circuit",
+    "_clear_openrouter_adapter_failure_circuit",
+    "_get_openrouter_adapter_active_cooldown_seconds",
+    "_wait_for_openrouter_adapter_cooldown_if_needed",
+    "_set_openrouter_adapter_cooldown",
+    "_run_openrouter_adapter_retry_loop",
+    "_perform_openrouter_completion_adapter_operation",
+    "_perform_openrouter_adapter_pass_through_request",
+    "_get_openrouter_api_key",
+    "_get_anthropic_adapter_openrouter_api_key",
+    "_get_openrouter_target_base",
+    "_get_anthropic_adapter_openrouter_target_base",
+    "_openrouter_chat_message_function_call",
+    "_openrouter_chat_message_has_valid_content_or_tool_calls",
+    "_copy_openrouter_message_value",
+    "_serialize_openrouter_tool_call_arguments",
+    "_normalize_openrouter_chat_message_tool_call_arguments",
+    "_sanitize_openrouter_completion_messages_for_chat_completion",
+    "_apply_openrouter_completion_message_sanitization",
+    "_build_openrouter_default_headers",
+)
+
+
+def _is_empty_text_content(content: Any) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content.strip() == ""
+    if not isinstance(content, list):
+        return False
+    if not content:
+        return True
+    for part in content:
+        if isinstance(part, str):
+            if part.strip():
+                return False
+            continue
+        if not isinstance(part, dict):
+            return False
+        part_type = part.get("type")
+        if part_type not in (None, "text", "output_text"):
+            return False
+        text = part.get("text")
+        if not isinstance(text, str) or text.strip():
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -60,6 +131,105 @@ def _require_runtime() -> Runtime:
     if _runtime is None:
         raise RuntimeError("OpenRouter runtime has not been configured")
     return _runtime
+
+
+def install(host_globals: dict[str, Any]) -> None:
+    """Configure live host dependencies and publish same-object facades."""
+
+    def _host(name: str) -> Any:
+        return host_globals[name]
+
+    retry_transport_runtime = _anthropic_openrouter_retry_transport.Runtime(
+        rate_limit=_host("_alias_routing_state").openrouter_rate_limit,
+        failure_circuit_until_monotonic_by_key=_host(
+            "_openrouter_adapter_failure_circuit_until_monotonic_by_key"
+        ),
+        clean_secret_string=lambda value: _host("_clean_secret_string")(value),
+        extract_embedded_json_payload_candidates=lambda value: _host(
+            "_extract_embedded_json_payload_candidates"
+        )(value),
+        parse_json_payloads_from_text_candidates=lambda values: _host(
+            "_parse_json_payloads_from_text_candidates"
+        )(list(values)),
+        extract_upstream_headers=lambda exc: _host(
+            "_extract_adapter_upstream_headers"
+        )(exc),
+        parse_retry_after_seconds_from_headers=lambda headers: _host(
+            "_parse_retry_after_seconds_from_headers"
+        )(dict(headers)),
+        get_header_value=lambda headers, name: _host("_get_adapter_header_value")(
+            dict(headers),
+            name,
+        ),
+        parse_reset_wait_seconds_from_headers=lambda headers: _host(
+            "_parse_rate_limit_reset_wait_seconds_from_headers"
+        )(dict(headers)),
+        raise_candidate_unavailable=lambda message: _host(
+            "_raise_openrouter_auto_agent_candidate_unavailable"
+        )(message),
+        maybe_raise_alias_probe_cooldown=lambda *args, **kwargs: _host(
+            "_maybe_raise_openrouter_adapter_alias_probe_cooldown"
+        )(*args, **kwargs),
+        get_completion_model=lambda model: _host(
+            "_get_openrouter_completion_adapter_upstream_model"
+        )(model),
+        pass_through_request=lambda **kwargs: _host("pass_through_request")(
+            **kwargs
+        ),
+        wait_for_cooldown=lambda *args, **kwargs: _host(
+            "_wait_for_openrouter_adapter_cooldown_if_needed"
+        )(*args, **kwargs),
+        set_cooldown_callback=lambda *args, **kwargs: _host(
+            "_set_openrouter_adapter_cooldown"
+        )(*args, **kwargs),
+        maybe_raise_failure_circuit_open_callback=lambda *args, **kwargs: _host(
+            "_maybe_raise_openrouter_adapter_failure_circuit_open"
+        )(*args, **kwargs),
+        open_failure_circuit_callback=lambda *args, **kwargs: _host(
+            "_openrouter_adapter_open_failure_circuit"
+        )(*args, **kwargs),
+        clear_failure_circuit_callback=lambda model: _host(
+            "_clear_openrouter_adapter_failure_circuit"
+        )(model),
+        log_debug=_host("verbose_proxy_logger").debug,
+        log_warning=_host("verbose_proxy_logger").warning,
+        getenv=os.getenv,
+        sleep=lambda seconds: _host("asyncio").sleep(seconds),
+        monotonic=lambda: _host("time").monotonic(),
+    )
+    configure_openrouter_runtime(
+        Runtime(
+            retry_transport_runtime=retry_transport_runtime,
+            clean_secret_string=lambda value: _host("_clean_secret_string")(value),
+            get_first_secret_value=lambda names: _host("_get_first_secret_value")(
+                names
+            ),
+            getenv=os.getenv,
+            get_secret_str=lambda name: _host("get_secret_str")(name),
+            sanitize_opencode_zen_completion_messages=lambda kwargs: _host(
+                "_sanitize_opencode_zen_completion_messages_for_chat_completion"
+            )(kwargs),
+            chat_message_role=lambda message: _host("_opencode_zen_chat_message_role")(
+                message
+            ),
+            chat_message_tool_call_ids=lambda message: _host(
+                "_opencode_zen_chat_message_tool_call_ids"
+            )(message),
+            chat_message_tool_result_id=lambda message: _host(
+                "_opencode_zen_chat_message_tool_result_id"
+            )(message),
+            is_empty_text_content=_is_empty_text_content,
+            merge_litellm_metadata=lambda *args, **kwargs: _host(
+                "_merge_litellm_metadata"
+            )(*args, **kwargs),
+            build_langfuse_span_descriptor=lambda *args, **kwargs: _host(
+                "_build_langfuse_span_descriptor"
+            )(*args, **kwargs),
+        )
+    )
+    module_globals = globals()
+    for name in _HOST_FUNCTION_NAMES:
+        host_globals[name] = module_globals[name]
 
 
 def _retry_runtime() -> _anthropic_openrouter_retry_transport.Runtime:

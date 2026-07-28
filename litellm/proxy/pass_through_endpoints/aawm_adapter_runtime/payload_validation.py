@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     # Host-global modules (bound via install())
-    _anthropic_google_shaping: Any
     _aawm_alias_streaming: Any
 
     # Host-global constants
@@ -66,7 +65,6 @@ _HOST_FUNCTION_NAMES = (
     "_coerce_optional_int",
     "_usage_has_no_more_than_one_output_token",
     "_model_response_usage_dict",
-    "_is_codex_google_code_assist_empty_success_model_response",
     "_raise_codex_auto_agent_empty_success_response",
     "_build_failed_responses_diagnostic",
     "_raise_codex_auto_agent_malformed_tool_call_text_payload",
@@ -273,11 +271,6 @@ def _model_response_usage_dict(usage: Any) -> dict[str, Any]:
         if value is not None:
             result[field] = value
     return result
-
-
-def _is_codex_google_code_assist_empty_success_model_response(model_response: Any) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())  # noqa: F821
-    return _anthropic_google_shaping._is_codex_google_code_assist_empty_success_model_response(model_response)  # noqa: F821
 
 
 def _raise_codex_auto_agent_empty_success_response(

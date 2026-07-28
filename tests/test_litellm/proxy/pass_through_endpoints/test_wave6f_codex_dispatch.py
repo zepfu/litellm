@@ -170,10 +170,7 @@ class TestNoneFallThrough:
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_antigravity_code_assist_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_google_code_assist_adapter_model": lambda body, *, endpoint: None,
             "_normalize_codex_reasoning_effort_for_resolved_route": lambda body, *, resolved_route: (body, None),
-            "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
         result = await host["try_dispatch_codex_request"](**kwargs)
@@ -187,10 +184,7 @@ class TestNoneFallThrough:
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_antigravity_code_assist_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_google_code_assist_adapter_model": lambda body, *, endpoint: None,
             "_normalize_codex_reasoning_effort_for_resolved_route": lambda body, *, resolved_route: (body, None),
-            "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
         result = await host["try_dispatch_codex_request"](**kwargs)
@@ -204,10 +198,7 @@ class TestNoneFallThrough:
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_antigravity_code_assist_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_google_code_assist_adapter_model": lambda body, *, endpoint: None,
             "_normalize_codex_reasoning_effort_for_resolved_route": lambda body, *, resolved_route: (body, None),
-            "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
         result = await host["try_dispatch_codex_request"](**kwargs)
@@ -227,15 +218,12 @@ class TestNoneFallThrough:
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_antigravity_code_assist_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_google_code_assist_adapter_model": lambda body, *, endpoint: None,
             "_normalize_codex_reasoning_effort_for_resolved_route": (
                 lambda body, *, resolved_route: (
                     {**body, "reasoning": {"effort": "high"}},
                     {"normalized": True},
                 )
             ),
-            "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
 
@@ -263,8 +251,6 @@ def _make_dispatch_host(
         "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
         "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
         "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
-        "_resolve_codex_antigravity_code_assist_adapter_model": lambda body, *, endpoint: None,
-        "_resolve_codex_google_code_assist_adapter_model": lambda body, *, endpoint: None,
     }
     if matching_adapter in resolvers:
         resolvers[matching_adapter] = lambda body, *, endpoint: adapter_model
@@ -285,9 +271,7 @@ def _make_dispatch_host(
         "_handle_codex_opencode_zen_adapter_route": _fake_adapter_route,
         "_handle_codex_kimi_chat_completions_adapter_route": _fake_adapter_route,
         "_handle_codex_alibaba_token_plan_adapter_route": _fake_adapter_route,
-        "_handle_codex_google_code_assist_adapter_route": _fake_adapter_route,
         "_normalize_codex_reasoning_effort_for_resolved_route": lambda body, *, resolved_route: (body, None),
-        "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
     }
     return host, sentinel_response
 
@@ -332,23 +316,6 @@ class TestSupportedDispatch:
         result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is sentinel
 
-    @pytest.mark.asyncio
-    async def test_antigravity_dispatch(self) -> None:
-        host, sentinel = _make_dispatch_host(
-            matching_adapter="_resolve_codex_antigravity_code_assist_adapter_model",
-        )
-        codex_dispatch.install(host)
-        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
-        assert result is sentinel
-
-    @pytest.mark.asyncio
-    async def test_google_code_assist_dispatch(self) -> None:
-        host, sentinel = _make_dispatch_host(
-            matching_adapter="_resolve_codex_google_code_assist_adapter_model",
-        )
-        codex_dispatch.install(host)
-        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
-        assert result is sentinel
 
 
 # ===================================================================
@@ -375,8 +342,6 @@ class TestDispatchOrdering:
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: "zen-model",
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_antigravity_code_assist_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_google_code_assist_adapter_model": lambda body, *, endpoint: None,
             "_apply_codex_auto_agent_prevention_guidance_to_request_body": lambda body: (body, []),
             "_apply_aawm_read_agent_guidance_to_request_body": lambda body, *, alias_model, target_field: (body, []),
             "_prepare_request_body_for_passthrough_observability": lambda *, request, request_body: request_body,
@@ -385,9 +350,7 @@ class TestDispatchOrdering:
             "_handle_codex_opencode_zen_adapter_route": _zen_route,
             "_handle_codex_kimi_chat_completions_adapter_route": _zen_route,
             "_handle_codex_alibaba_token_plan_adapter_route": _zen_route,
-            "_handle_codex_google_code_assist_adapter_route": _zen_route,
             "_normalize_codex_reasoning_effort_for_resolved_route": lambda body, *, resolved_route: (body, None),
-            "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
         result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
@@ -412,8 +375,6 @@ class TestErrorPropagation:
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_antigravity_code_assist_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_google_code_assist_adapter_model": lambda body, *, endpoint: None,
             "_apply_codex_auto_agent_prevention_guidance_to_request_body": lambda body: (body, []),
             "_apply_aawm_read_agent_guidance_to_request_body": lambda body, *, alias_model, target_field: (body, []),
             "_prepare_request_body_for_passthrough_observability": lambda *, request, request_body: request_body,
@@ -422,9 +383,7 @@ class TestErrorPropagation:
             "_handle_codex_opencode_zen_adapter_route": _exploding_route,
             "_handle_codex_kimi_chat_completions_adapter_route": _exploding_route,
             "_handle_codex_alibaba_token_plan_adapter_route": _exploding_route,
-            "_handle_codex_google_code_assist_adapter_route": _exploding_route,
             "_normalize_codex_reasoning_effort_for_resolved_route": lambda body, *, resolved_route: (body, None),
-            "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
         with pytest.raises(RuntimeError, match="upstream failure"):
@@ -440,10 +399,7 @@ class TestErrorPropagation:
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_antigravity_code_assist_adapter_model": lambda body, *, endpoint: None,
-            "_resolve_codex_google_code_assist_adapter_model": lambda body, *, endpoint: None,
             "_normalize_codex_reasoning_effort_for_resolved_route": lambda body, *, resolved_route: (body, None),
-            "_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER": "antigravity",
         }
         codex_dispatch.install(host)
         with pytest.raises(ValueError, match="resolver boom"):

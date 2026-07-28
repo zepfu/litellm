@@ -22,11 +22,7 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.common im
     _coerce_upstream_error_payload,
     _extract_passthrough_exception_detail,
     _is_anthropic_passthrough_target,
-    _is_google_code_assist_passthrough_target,
     _is_xai_passthrough_target,
-)
-from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.google_code_assist import (
-    _is_known_google_code_assist_tos_violation_response,
 )
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
     _get_openai_model_not_found_error_summary,
@@ -63,7 +59,6 @@ __all__ = [
     "_extract_passthrough_exception_detail",
     "_is_xai_passthrough_target",
     "_is_anthropic_passthrough_target",
-    "_is_google_code_assist_passthrough_target",
     "_is_known_grok_billing_passthrough_timeout_cancel_response",
     "_is_known_grok_signals_auth_context_response",
     "_is_known_grok_personal_team_spending_limit_response",
@@ -78,7 +73,6 @@ __all__ = [
     "_is_known_chatgpt_codex_invalid_encrypted_content_response",
     "_is_known_chatgpt_codex_model_not_supported_for_account_response",
     "_get_passthrough_chatgpt_codex_model_not_supported_failure_kind",
-    "_is_known_google_code_assist_tos_violation_response",
     "_is_known_openai_model_not_found_response",
     "_get_openai_model_not_found_error_summary",
     "_get_openai_model_not_found_failure_kind",

@@ -36,14 +36,20 @@ _get_codex_auto_agent_source_error_summary: Optional[Callable[..., Optional[str]
 _build_safe_kimi_code_selection_telemetry: Optional[Callable[..., dict[str, Any]]] = None
 
 # --- god-module / host seams ---
-_extract_google_adapter_exception_status_code: Optional[Callable[..., Optional[int]]] = None
+_extract_exception_status_code: Optional[Callable[..., Optional[int]]] = None
 _safe_set_request_parsed_body: Optional[Callable[..., None]] = None
 _emit_auto_agent_alias_route_event: Optional[Callable[..., None]] = None
 _build_auto_agent_alias_audit_event: Optional[Callable[..., dict[str, Any]]] = None
 _build_auto_agent_alias_audit_events: Optional[Callable[..., list[dict[str, Any]]]] = None
 _persist_auto_agent_alias_audit_only_events_best_effort: Optional[Callable[..., None]] = None
-_aawm_alias_route_verbose_json_enabled: Optional[Callable[[], bool]] = None
-_aawm_alias_route_healthy_json_enabled: Optional[Callable[[], bool]] = None
+# Default to owner-concrete implementations from audit_persist (D1-591).
+from .audit_persist import (
+    _aawm_alias_route_healthy_json_enabled as _default_healthy_json_enabled,
+    _aawm_alias_route_verbose_json_enabled as _default_verbose_json_enabled,
+)
+
+_aawm_alias_route_verbose_json_enabled: Callable[[], bool] = _default_verbose_json_enabled
+_aawm_alias_route_healthy_json_enabled: Callable[[], bool] = _default_healthy_json_enabled
 _merge_litellm_metadata: Optional[Callable[..., dict[str, Any]]] = None
 _normalize_low_cardinality_tag_value: Optional[Callable[..., Optional[str]]] = None
 _normalize_codex_auto_agent_alias_model: Optional[Callable[..., Optional[str]]] = None
@@ -62,6 +68,50 @@ _read_pilot_gate_record: Optional[Callable[..., Any]] = None
 
 # Reference to host_globals set by install(); configure updates it too.
 _host_globals_ref: dict | None = None
+_MISSING = object()
+_RUNTIME_STATE_NAMES = (
+    "_extract_codex_auto_agent_error_tokens",
+    "_extract_codex_auto_agent_error_type_and_code",
+    "_parse_codex_auto_agent_header_wait_seconds",
+    "_get_codex_auto_agent_source_error_summary",
+    "_build_safe_kimi_code_selection_telemetry",
+    "_extract_exception_status_code",
+    "_safe_set_request_parsed_body",
+    "_emit_auto_agent_alias_route_event",
+    "_build_auto_agent_alias_audit_event",
+    "_build_auto_agent_alias_audit_events",
+    "_persist_auto_agent_alias_audit_only_events_best_effort",
+    "_aawm_alias_route_verbose_json_enabled",
+    "_aawm_alias_route_healthy_json_enabled",
+    "_merge_litellm_metadata",
+    "_normalize_low_cardinality_tag_value",
+    "_normalize_codex_auto_agent_alias_model",
+    "_normalize_anthropic_auto_agent_alias_model",
+    "_load_bundled_model_cost_map_for_codex_policy",
+    "_get_model_info",
+    "_model_cost",
+    "_openai_provider_value",
+    "_classify_failure",
+    "_read_pilot_gate_record",
+)
+_runtime_restore_stacks: dict[str, list[tuple[object, object, object]]] = {}
+
+
+def _update_host_runtime_callbacks(
+    callbacks: Mapping[str, object],
+    previous_module_values: Mapping[str, object],
+) -> None:
+    if _host_globals_ref is None:
+        return
+    for name, callback in callbacks.items():
+        _runtime_restore_stacks.setdefault(name, []).append(
+            (
+                callback,
+                previous_module_values[name],
+                _host_globals_ref.get(name, _MISSING),
+            )
+        )
+        _host_globals_ref[name] = callback
 
 
 def configure_attempt_records_runtime(  # noqa: PLR0915
@@ -79,8 +129,8 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     build_audit_event: Callable[..., dict[str, Any]],
     build_audit_events: Callable[..., list[dict[str, Any]]],
     persist_audit_only_events: Callable[..., Any],
-    verbose_json_enabled: Callable[[], bool],
-    healthy_json_enabled: Callable[[], bool],
+    verbose_json_enabled: Optional[Callable[[], bool]] = None,
+    healthy_json_enabled: Optional[Callable[[], bool]] = None,
     merge_metadata: Callable[..., dict[str, Any]],
     normalize_tag_value: Callable[..., Optional[str]],
     normalize_codex_alias_model: Callable[..., Optional[str]],
@@ -97,6 +147,9 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
 
 ) -> None:
     """Bind god-module / error_signals / classification owned dependencies."""
+    previous_module_values = {
+        name: globals()[name] for name in _RUNTIME_STATE_NAMES
+    }
     global _extract_codex_auto_agent_error_tokens
     _extract_codex_auto_agent_error_tokens = extract_error_tokens
     global _extract_codex_auto_agent_error_type_and_code
@@ -107,8 +160,8 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     _get_codex_auto_agent_source_error_summary = get_source_error_summary
     global _build_safe_kimi_code_selection_telemetry
     _build_safe_kimi_code_selection_telemetry = build_kimi_telemetry
-    global _extract_google_adapter_exception_status_code
-    _extract_google_adapter_exception_status_code = extract_status_code
+    global _extract_exception_status_code
+    _extract_exception_status_code = extract_status_code
     global _safe_set_request_parsed_body
     _safe_set_request_parsed_body = safe_set_parsed_body
     global _emit_auto_agent_alias_route_event
@@ -120,9 +173,11 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     global _persist_auto_agent_alias_audit_only_events_best_effort
     _persist_auto_agent_alias_audit_only_events_best_effort = persist_audit_only_events
     global _aawm_alias_route_verbose_json_enabled
-    _aawm_alias_route_verbose_json_enabled = verbose_json_enabled
+    if verbose_json_enabled is not None:
+        _aawm_alias_route_verbose_json_enabled = verbose_json_enabled
     global _aawm_alias_route_healthy_json_enabled
-    _aawm_alias_route_healthy_json_enabled = healthy_json_enabled
+    if healthy_json_enabled is not None:
+        _aawm_alias_route_healthy_json_enabled = healthy_json_enabled
     global _merge_litellm_metadata
     _merge_litellm_metadata = merge_metadata
     global _normalize_low_cardinality_tag_value
@@ -143,33 +198,13 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     _classify_failure = classify_failure
     global _read_pilot_gate_record
     _read_pilot_gate_record = read_pilot_gate_record
-    # If install() has been called, also update host_globals so rebound
-    # functions see the new seam values.
-    if _host_globals_ref is not None:
-        _mod = globals()
-        _host_globals_ref["_extract_codex_auto_agent_error_tokens"] = _mod["_extract_codex_auto_agent_error_tokens"]
-        _host_globals_ref["_extract_codex_auto_agent_error_type_and_code"] = _mod["_extract_codex_auto_agent_error_type_and_code"]
-        _host_globals_ref["_parse_codex_auto_agent_header_wait_seconds"] = _mod["_parse_codex_auto_agent_header_wait_seconds"]
-        _host_globals_ref["_get_codex_auto_agent_source_error_summary"] = _mod["_get_codex_auto_agent_source_error_summary"]
-        _host_globals_ref["_build_safe_kimi_code_selection_telemetry"] = _mod["_build_safe_kimi_code_selection_telemetry"]
-        _host_globals_ref["_extract_google_adapter_exception_status_code"] = _mod["_extract_google_adapter_exception_status_code"]
-        _host_globals_ref["_safe_set_request_parsed_body"] = _mod["_safe_set_request_parsed_body"]
-        _host_globals_ref["_emit_auto_agent_alias_route_event"] = _mod["_emit_auto_agent_alias_route_event"]
-        _host_globals_ref["_build_auto_agent_alias_audit_event"] = _mod["_build_auto_agent_alias_audit_event"]
-        _host_globals_ref["_build_auto_agent_alias_audit_events"] = _mod["_build_auto_agent_alias_audit_events"]
-        _host_globals_ref["_persist_auto_agent_alias_audit_only_events_best_effort"] = _mod["_persist_auto_agent_alias_audit_only_events_best_effort"]
-        _host_globals_ref["_aawm_alias_route_verbose_json_enabled"] = _mod["_aawm_alias_route_verbose_json_enabled"]
-        _host_globals_ref["_aawm_alias_route_healthy_json_enabled"] = _mod["_aawm_alias_route_healthy_json_enabled"]
-        _host_globals_ref["_merge_litellm_metadata"] = _mod["_merge_litellm_metadata"]
-        _host_globals_ref["_normalize_low_cardinality_tag_value"] = _mod["_normalize_low_cardinality_tag_value"]
-        _host_globals_ref["_normalize_codex_auto_agent_alias_model"] = _mod["_normalize_codex_auto_agent_alias_model"]
-        _host_globals_ref["_normalize_anthropic_auto_agent_alias_model"] = _mod["_normalize_anthropic_auto_agent_alias_model"]
-        _host_globals_ref["_load_bundled_model_cost_map_for_codex_policy"] = _mod["_load_bundled_model_cost_map_for_codex_policy"]
-        _host_globals_ref["_get_model_info"] = _mod["_get_model_info"]
-        _host_globals_ref["_model_cost"] = _mod["_model_cost"]
-        _host_globals_ref["_openai_provider_value"] = _mod["_openai_provider_value"]
-        _host_globals_ref["_classify_failure"] = _mod["_classify_failure"]
-        _host_globals_ref["_read_pilot_gate_record"] = _mod["_read_pilot_gate_record"]
+    # If install() has been called, also update host_globals so configured
+    # callbacks remain live for facades published there.
+    _mod = globals()
+    _update_host_runtime_callbacks(
+        {name: _mod[name] for name in _RUNTIME_STATE_NAMES},
+        previous_module_values,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,13 +224,13 @@ def _update_codex_auto_agent_retryable_attempt_record(
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> set[str]:
     assert _extract_codex_auto_agent_error_tokens is not None
-    assert _extract_google_adapter_exception_status_code is not None
+    assert _extract_exception_status_code is not None
     assert _extract_codex_auto_agent_error_type_and_code is not None
     assert _parse_codex_auto_agent_header_wait_seconds is not None
     assert _get_codex_auto_agent_source_error_summary is not None
 
     error_tokens = _extract_codex_auto_agent_error_tokens(exc)
-    error_status_code = _extract_google_adapter_exception_status_code(exc)
+    error_status_code = _extract_exception_status_code(exc)
     error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
     retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
     source_error = _get_codex_auto_agent_source_error_summary(
@@ -250,8 +285,6 @@ def _record_auto_agent_alias_attempt_started(
     add_alias_metadata_fn: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     assert _safe_set_request_parsed_body is not None
-    assert _aawm_alias_route_verbose_json_enabled is not None
-    assert _aawm_alias_route_healthy_json_enabled is not None
     assert _emit_auto_agent_alias_route_event is not None
 
     candidate_body = add_alias_metadata_fn(
@@ -303,13 +336,13 @@ def _record_read_pilot_cooldown_evidence(
     ``origin`` (upstream/client/unknown; only ``upstream`` ever advances a key
     toward cooling) is stamped on the attempt record for downstream audit.
     """
-    assert _extract_google_adapter_exception_status_code is not None
+    assert _extract_exception_status_code is not None
     assert _get_codex_auto_agent_source_error_summary is not None
     assert _parse_codex_auto_agent_header_wait_seconds is not None
     assert _classify_failure is not None
     assert _read_pilot_gate_record is not None
 
-    error_status_code = _extract_google_adapter_exception_status_code(exc)
+    error_status_code = _extract_exception_status_code(exc)
     source_error = _get_codex_auto_agent_source_error_summary(exc, status_code=error_status_code)
     retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
     event = _classify_failure(
@@ -759,6 +792,44 @@ _HOST_FUNCTION_NAMES = (
 )
 
 
+def _host_callback_delegates_to_module(
+    name: str,
+    callback: object,
+    owner_module: object,
+) -> bool:
+    code = getattr(callback, "__code__", None)
+    callback_globals = getattr(callback, "__globals__", None)
+    if code is None or not isinstance(callback_globals, dict):
+        return False
+
+    owner_callback = getattr(owner_module, name, _MISSING)
+    if callback is owner_callback:
+        return False
+    if (
+        callback_globals.get(name) is callback
+        and getattr(callback, "__name__", None) != name
+    ):
+        return True
+
+    referenced_values = [
+        callback_globals.get(global_name, _MISSING)
+        for global_name in code.co_names
+    ]
+    closure_values = []
+    for cell in getattr(callback, "__closure__", None) or ():
+        try:
+            closure_values.append(cell.cell_contents)
+        except ValueError:
+            continue
+
+    if any(value is owner_callback for value in (*referenced_values, *closure_values)):
+        return True
+    references_seam = name in code.co_names or name in code.co_consts
+    return references_seam and any(
+        value is owner_module for value in (*referenced_values, *closure_values)
+    )
+
+
 def install(host_globals: dict) -> None:
     """Publish same-object god-module facades for the moved functions.
 
@@ -767,7 +838,63 @@ def install(host_globals: dict) -> None:
     :func:`configure_attempt_records_runtime`.
     """
     global _host_globals_ref
-    _host_globals_ref = host_globals
     _mod = globals()
+    owner_module = _sys.modules[__name__]
+    for _name in _RUNTIME_STATE_NAMES:
+        host_callback = host_globals.get(_name, _MISSING)
+        if host_callback is _MISSING or _host_callback_delegates_to_module(
+            _name,
+            host_callback,
+            owner_module,
+        ):
+            continue
+        _mod[_name] = host_callback
+    _host_globals_ref = host_globals
     for _name in _HOST_FUNCTION_NAMES:
         host_globals[_name] = _mod[_name]
+
+    from . import audit_context as _audit_context
+
+    for _name in _audit_context._SEAM_NAMES:
+        host_callback = host_globals.get(_name, _MISSING)
+        if host_callback is _MISSING or _host_callback_delegates_to_module(
+            _name,
+            host_callback,
+            _audit_context,
+        ):
+            continue
+        setattr(_audit_context, _name, host_callback)
+
+
+# ---------------------------------------------------------------------------
+# Module __setattr__ propagation for callback restores and monkeypatches
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+import types as _types
+
+_SEAM_NAMES = frozenset(_RUNTIME_STATE_NAMES)
+
+
+class _SeamPropagatingModule(_types.ModuleType):
+    def __setattr__(self, name: str, value: object) -> None:
+        super().__setattr__(name, value)
+        seam_names = self.__dict__.get("_SEAM_NAMES")
+        if seam_names is None or name not in seam_names:
+            return
+        host_globals = self.__dict__.get("_host_globals_ref")
+        if host_globals is None:
+            return
+        restore_stacks = self.__dict__.get("_runtime_restore_stacks", {})
+        restore_stack = restore_stacks.get(name)
+        if restore_stack and value is restore_stack[-1][1]:
+            _, _, prior_host_value = restore_stack.pop()
+            if prior_host_value is self.__dict__["_MISSING"]:
+                host_globals.pop(name, None)
+            else:
+                host_globals[name] = prior_host_value
+            return
+        host_globals[name] = value
+
+
+_sys.modules[__name__].__class__ = _SeamPropagatingModule

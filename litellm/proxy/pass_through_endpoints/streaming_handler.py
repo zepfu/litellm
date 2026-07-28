@@ -25,9 +25,6 @@ from litellm.proxy.aawm_route_logging import (
     record_aawm_route_rollup_turn,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
-from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
-    sanitize_google_code_assist_quota_for_logging,
-)
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     EndpointType,
     PassthroughStandardLoggingPayload,
@@ -261,25 +258,6 @@ class PassThroughStreamingHandler:
         return metadata
 
     @staticmethod
-    def _extract_google_code_assist_streaming_quota(
-        all_chunks: List[str],
-        *,
-        source: str = "google_retrieve_user_quota",
-    ) -> Optional[Dict[str, Any]]:
-        for chunk in reversed(all_chunks):
-            parsed_objects = (
-                GeminiPassthroughLoggingHandler._parse_stream_chunk_json_objects(chunk)
-            )
-            for parsed_object in reversed(parsed_objects):
-                sanitized_quota = sanitize_google_code_assist_quota_for_logging(
-                    parsed_object,
-                    source=source,
-                )
-                if sanitized_quota:
-                    return sanitized_quota
-        return None
-
-    @staticmethod
     def _format_span_timestamp(value: datetime) -> str:
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
@@ -390,7 +368,7 @@ class PassThroughStreamingHandler:
     def _build_streaming_logging_error_context(
         *,
         litellm_logging_obj: LiteLLMLoggingObj,
-        response: httpx.Response,
+        response: Optional[httpx.Response],
         url_route: str,
         request_body: dict,
         endpoint_type: EndpointType,
@@ -465,7 +443,7 @@ class PassThroughStreamingHandler:
             ),
         )
         if context.get("status_code") is None:
-            context["status_code"] = response.status_code
+            context["status_code"] = response.status_code if response is not None else None
         set_default(
             "trace_id",
             PassThroughStreamingHandler._first_streaming_logging_context_value(
@@ -489,7 +467,7 @@ class PassThroughStreamingHandler:
     @staticmethod
     def _capture_stream_shape(
         *,
-        response: httpx.Response,
+        response: Optional[httpx.Response],
         endpoint_type: EndpointType,
         url_route: str,
         request_body: dict,
@@ -500,7 +478,7 @@ class PassThroughStreamingHandler:
         litellm_call_id: Optional[str],
     ) -> None:
         try:
-            upstream_request = response.request
+            upstream_request = response.request if response is not None else None
         except RuntimeError:
             upstream_request = None
         capture_passthrough_stream_shape(
@@ -1019,7 +997,7 @@ class PassThroughStreamingHandler:
         *,
         litellm_logging_obj: LiteLLMLoggingObj,
         passthrough_success_handler_obj: PassThroughEndpointLogging,
-        response: httpx.Response,
+        response: Optional[httpx.Response],
         url_route: str,
         request_body: dict,
         endpoint_type: EndpointType,
@@ -1063,59 +1041,29 @@ class PassThroughStreamingHandler:
             or getattr(litellm_logging_obj, "litellm_call_id", None),
         )
 
-        if custom_llm_provider in {"gemini", "antigravity"}:
-            if not passthrough_success_handler_obj.is_gemini_route(
-                url_route, custom_llm_provider
-            ):
-                handler_branch = set_branch(
-                    handler_branch_state,
-                    "google_code_assist_control_plane",
+        if custom_llm_provider == "gemini" and passthrough_success_handler_obj.is_gemini_route(
+            url_route, custom_llm_provider
+        ):
+            handler_branch = set_branch(handler_branch_state, "gemini")
+            gemini_passthrough_logging_handler_result = (
+                GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
+                    litellm_logging_obj=litellm_logging_obj,
+                    passthrough_success_handler_obj=passthrough_success_handler_obj,
+                    url_route=url_route,
+                    request_body=request_body,
+                    endpoint_type=endpoint_type,
+                    start_time=start_time,
+                    all_chunks=all_chunks,
+                    model=model,
+                    end_time=end_time,
+                    kwargs=kwargs,
+                    custom_llm_provider=custom_llm_provider or "gemini",
                 )
-                if "retrieveUserQuota" not in url_route:
-                    return None, kwargs, handler_branch, True
-                handler_branch = set_branch(
-                    handler_branch_state,
-                    "google_code_assist_quota",
-                )
-                quota_source = (
-                    "antigravity_retrieve_user_quota"
-                    if custom_llm_provider == "antigravity"
-                    else "google_retrieve_user_quota"
-                )
-                sanitized_quota = (
-                    PassThroughStreamingHandler._extract_google_code_assist_streaming_quota(
-                        all_chunks,
-                        source=quota_source,
-                    )
-                )
-                if not sanitized_quota:
-                    return None, kwargs, handler_branch, True
-                metadata["google_retrieve_user_quota"] = sanitized_quota
-                metadata["aawm_rate_limit_observation_only"] = True
-                standard_logging_response_object = StandardPassThroughResponseObject(
-                    response="\n".join(all_chunks)
-                )
-            else:
-                handler_branch = set_branch(handler_branch_state, "gemini")
-                gemini_passthrough_logging_handler_result = (
-                    GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
-                        litellm_logging_obj=litellm_logging_obj,
-                        passthrough_success_handler_obj=passthrough_success_handler_obj,
-                        url_route=url_route,
-                        request_body=request_body,
-                        endpoint_type=endpoint_type,
-                        start_time=start_time,
-                        all_chunks=all_chunks,
-                        model=model,
-                        end_time=end_time,
-                        kwargs=kwargs,
-                        custom_llm_provider=custom_llm_provider or "gemini",
-                    )
-                )
-                standard_logging_response_object = (
-                    gemini_passthrough_logging_handler_result["result"]
-                )
-                kwargs.update(gemini_passthrough_logging_handler_result["kwargs"])
+            )
+            standard_logging_response_object = (
+                gemini_passthrough_logging_handler_result["result"]
+            )
+            kwargs.update(gemini_passthrough_logging_handler_result["kwargs"])
         elif endpoint_type == EndpointType.OPENAI:
             handler_branch = set_branch(handler_branch_state, "openai")
             openai_passthrough_logging_handler_result = (
@@ -1257,13 +1205,13 @@ class PassThroughStreamingHandler:
     async def _route_streaming_logging_to_handler(
         litellm_logging_obj: LiteLLMLoggingObj,
         passthrough_success_handler_obj: PassThroughEndpointLogging,
-        response: httpx.Response,
         url_route: str,
         request_body: dict,
         endpoint_type: EndpointType,
         start_time: datetime,
         raw_bytes: List[bytes],
         end_time: datetime,
+        response: Optional[httpx.Response] = None,
         precomputed_lines: Optional[List[str]] = None,
         model: Optional[str] = None,
         passthrough_logging_payload: Optional[PassthroughStandardLoggingPayload] = None,

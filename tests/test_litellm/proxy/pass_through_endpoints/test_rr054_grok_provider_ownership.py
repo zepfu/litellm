@@ -2,8 +2,9 @@
 
 Strict finding #1 assigns provider request shaping to
 ``providers/<provider>/normalization.py``. The proxy module may retain
-compatibility names, but those names must be thin delegates rather than
-duplicate Grok sanitization or input-rewrite implementations.
+compatibility names, but those names must be thin delegates or same-object
+package facades rather than duplicate Grok sanitization or input-rewrite
+implementations.
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
     normalization,
 )
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+    codex_tool_policy,
+)
 
 
 OWNER_PATH = Path(normalization.__file__).resolve()
@@ -70,6 +74,17 @@ PROXY_DELEGATES = {
     "_rewrite_grok_native_unsupported_input_items_in_place": (
         "_aawm_codex_tool_policy.rewrite_grok_native_unsupported_input_items_in_place"
     ),
+}
+
+CODEX_TOOL_POLICY_INSTALLED_FACADES = {
+    "_stringify_grok_native_input_item_value",
+    "_format_grok_native_function_call_input_message",
+    "_format_grok_native_function_call_output_input_message",
+    "_rewrite_grok_native_input_item_for_model_input",
+    "_is_anthropic_grok_native_responses_adapter_body",
+    "_add_grok_native_input_item_rewrite_logging_metadata",
+    "_rewrite_grok_native_unsupported_input_items_from_request_body",
+    "_rewrite_grok_native_unsupported_input_items_in_place",
 }
 
 
@@ -208,11 +223,18 @@ def test_rr054_grok_proxy_request_shaping_names_are_thin_delegates() -> None:
                 f"{function_name} retains Grok request-shaping logic "
                 f"({len(statements)} statements)"
             )
+        elif function_name in CODEX_TOOL_POLICY_INSTALLED_FACADES:
+            assert getattr(lpe, function_name) is getattr(
+                codex_tool_policy,
+                function_name,
+            ), (
+                f"{function_name} must be the same object as "
+                f"codex_tool_policy.{function_name}"
+            )
         else:
             # Wave 6B pattern: same-object assignment to extracted module
             assert function_name in proxy_assignments, (
-                f"{function_name} must be defined as a thin delegate or "
-                f"same-object facade assignment"
+                f"{function_name} must remain an extracted provider facade"
             )
             assigned_value = proxy_assignments[function_name]
             assert isinstance(assigned_value, ast.Attribute), (

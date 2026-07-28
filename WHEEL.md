@@ -85,8 +85,8 @@ Current responsibilities:
   including system/provider-equivalent, tool-advertisement, conversation,
   residual/other, and deterministic system-classifier buckets
 - provider-originated `public.rate_limit_observations` capture for Codex/OpenAI
-  response headers, Anthropic response headers, Google Code Assist quota
-  payloads, and provider quota/capacity errors
+  response headers, Anthropic response headers, and provider quota/capacity
+  errors
 - reusable `public.rate_limit_intervals` materialized-view/index bootstrap for
   repeated session-history usage reporting
 - passive `public.provider_error_observations` capture from failed provider
@@ -405,9 +405,8 @@ The current Anthropic-route multi-provider adapter work is split intentionally:
   - model-scoped Kimi namespace-function allowlists in the model config archive
     and bundled fallback catalog
 
-In other words: OpenAI/Codex, Google Code Assist, OpenRouter, and NVIDIA
-adaptation on `/anthropic/v1/messages` is currently base-fork behavior, not an
-overlay wheel.
+In other words: OpenAI/Codex, OpenRouter, and NVIDIA adaptation on
+`/anthropic/v1/messages` is currently base-fork behavior, not an overlay wheel.
 
 ### What infra should pin
 

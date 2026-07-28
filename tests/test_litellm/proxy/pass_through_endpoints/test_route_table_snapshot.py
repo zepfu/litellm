@@ -37,11 +37,6 @@ _EXPECTED_ROUTES: frozenset[tuple[str, tuple[str, ...], str]] = frozenset(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
         ),
         (
-            "/antigravity/{endpoint:path}",
-            ("DELETE", "GET", "PATCH", "POST", "PUT"),
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",
-        ),
-        (
             "/assemblyai/{endpoint:path}",
             ("DELETE", "GET", "PATCH", "POST", "PUT"),
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints",

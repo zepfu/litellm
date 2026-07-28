@@ -6,8 +6,7 @@ This repository has two distinct local validation paths:
 - the Anthropic-route adapter harness for real Claude CLI validation on `:4001`
 
 The adapter suite is the one that matters for the Anthropic -> OpenAI/Codex,
-Anthropic -> Google Code Assist, Anthropic -> OpenRouter, and Anthropic ->
-NVIDIA work.
+Anthropic -> OpenRouter, and Anthropic -> NVIDIA work.
 
 For the production promotion process, see `PROD_RELEASE.md`.
 
@@ -272,9 +271,9 @@ These default adapter cases are expected to pass on the real Claude CLI path:
 - `claude_adapter_codex_tool_activity`
 - `claude_adapter_spark`
 
-Claude subagent fanout cases are no longer default gates. Run
-`claude_adapter_gemini_fanout` or `claude_adapter_peeromega_fanout` explicitly
-with `--cases` when validating fanout behavior.
+The Claude subagent fanout case is no longer a default gate. Run
+`claude_adapter_peeromega_fanout` explicitly with `--cases` when validating
+fanout behavior.
 
 The native Anthropic rate-limit gate is also explicit while the live native
 auth path is being stabilized:
@@ -286,13 +285,22 @@ python3 scripts/local-ci/run_anthropic_adapter_acceptance.py \
   --write-artifact /tmp/native-anthropic-rate-limit.json
 ```
 
-Native Codex and native Gemini rate-limit gates are also explicit canaries:
+The native Codex rate-limit gate remains an explicit canary:
 
 ```bash
 python3 scripts/local-ci/run_anthropic_adapter_acceptance.py \
   --target dev \
-  --cases native_openai_passthrough_responses_codex native_gemini_passthrough_generate_content \
-  --write-artifact /tmp/native-codex-gemini-rate-limits.json
+  --cases native_openai_passthrough_responses_codex \
+  --write-artifact /tmp/native-codex-rate-limits.json
+```
+
+Native Gemini passthrough is retained, but its removed anthropic-adapter
+harness cases are not restored. Run the current focused pytest coverage:
+
+```bash
+./.venv/bin/python -m pytest -p no:rerunfailures \
+  tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py \
+  -q
 ```
 
 The OpenRouter free daily request meter has an explicit opt-in gate:
@@ -316,11 +324,6 @@ daily snapshots are intentionally deduped at insert time.
 These are real validations, but they are allowed to warn instead of failing the
 suite when the upstream provider is noisy:
 
-- Google Code Assist: `claude_adapter_gemini31_pro`,
-  `claude_adapter_gemini31_flash`
-  - route to Google Code Assist directly
-  - single-model `429` / `RESOURCE_EXHAUSTED` responses can still be upstream
-    noise, which is why the individual model cases remain warning-only
 - `claude_adapter_openrouter_free`
 - `claude_adapter_gpt_oss_20b`
   - excluded from the default full suite; run explicitly with
@@ -328,8 +331,6 @@ suite when the upstream provider is noisy:
     validation
   - also checks the OpenRouter free daily request row, but failures stay
     warning-only with the rest of this canary
-- `claude_adapter_gemma_31b`
-- `claude_adapter_gemma_26b_a4b`
 - `claude_adapter_nemotron_super`
 
 `claude_adapter_gpt_oss_120b` is not warning-only. It is an excluded opt-in
@@ -364,7 +365,6 @@ Keep these out of the standard adapter harness run for now:
 ### Preferred Anthropic-adapter model spellings
 
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
-- direct Google Code Assist targets: `google/gemini-3.1-pro-preview`, `google/gemini-3-flash-preview`, `google/gemini-3.1-flash-lite-preview`
 - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
 - explicit OpenRouter wildcard targets: any normalized `openrouter/*` model may route through the OpenRouter Responses adapter, even when the exact model is not hardcoded in the local canary allowlist
 - explicit NVIDIA wildcard targets: any normalized `nvidia/*` model may route
@@ -422,34 +422,15 @@ Warning-only free-model canaries are still allowed to soft-fail on upstream
 timeouts or provider throttling. Those outcomes should remain warnings /
 `soft_failures` in the harness artifact rather than hard suite failures.
 
-`google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` stay in the
-config as opt-in canaries, but they are excluded from the default full suite
-and should only run when explicitly requested.
+`google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` remain
+OpenRouter-hosted manual-only candidates. No current Anthropic adapter harness
+cases are defined for them.
 
 Operational expectation:
 - adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may
   still appear as adapter warning/backoff lines in `litellm-dev` logs
 - they should not emit the generic pass-through exception traceback for the
   current request path
-
-### Source of truth for Gemini routing
-
-The `gemini-3.1*` adapter lane does **not** go through OpenRouter. It routes
-directly to Google Code Assist using the local Google OAuth credentials mounted
-into `litellm-dev`.
-
-Current request-shape conclusion:
-- the Gemini CLI bundle and the Anthropic adapter both send the same Code
-  Assist envelope: `model`, `project`, `user_prompt_id`, and `request` with
-  `session_id` / `contents` / tools / generation config
-- if standalone Gemini CLI use is healthy but `claude_adapter_gemini_fanout`
-  fails, treat that first as a local pacing/serialization regression rather
-  than as authoritative provider-capacity evidence
-
-Do not treat Google `429` / `RESOURCE_EXHAUSTED` / `MODEL_CAPACITY_EXHAUSTED`
-responses as authoritative provider truth by themselves. Only close them as
-provider issues after interactive Gemini CLI `/model` corroboration on the same
-account context.
 
 Telemetry expectation:
 - when explicit Gemini reasoning token counts are missing but thought
@@ -553,14 +534,6 @@ Telemetry expectation:
   - cost tracking should not remain permanently zero or unmapped; if NVIDIA
     lacks usable non-free pricing, use the closest equivalent OpenRouter
     pricing as the fallback basis
-- for opt-in Gemini fanout acceptance, do not assume every Gemini child model emits
-  its own command row; the stable invariant is:
-  - session-wide delegated `Agent` rows are present on the parent session
-  - `claude_adapter_gemini_fanout` should persist at least three parent-session
-    `Agent` rows and `claude_adapter_peeromega_fanout` should persist at least
-    seven
-  - `public.session_history` still contains provider/model/cost rows for each
-    expected Gemini child model
 - for prompt/CLI-overhead changes, `public.session_history` should also carry
   the estimated input-token breakdown fields and the harness should populate
   `summary.prompt_overhead_cost_share`; treat those token shares as estimates
@@ -591,10 +564,9 @@ only runs when both `AAWM_CAPTURE=1` and `LITELLM_LOG=DEBUG` are set.
 ## Naming notes
 
 Anthropic fanout prompts should keep using the Claude agent names from
-`~/.claude/agents`, for example `gemini-3-flash-preview` or `gpt-5-4`.
-Those agent files now point at explicit provider-prefixed model values such as
-`google/gemini-3-flash-preview` and `openai/gpt-5.4`, so the prompt-side agent
-name and the underlying routed model string are intentionally different.
+`~/.claude/agents`, for example `gpt-5-4`. Those agent files point at explicit
+provider-prefixed model values such as `openai/gpt-5.4`, so the prompt-side
+agent name and the underlying routed model string are intentionally different.
 
 ## Promotion rule for new adapted models
 
@@ -606,8 +578,7 @@ Before promoting a new model from canary/manual-only to a hard gate, require:
 - no provider-family egress violations
 
 For OpenRouter candidates, do not require Langfuse generation usage fields to be
-clean yet. For Google Code Assist candidates, quota-window `429`s are not on
-their own evidence of a bad adapter route.
+clean yet.
 
 ## Release artifact
 

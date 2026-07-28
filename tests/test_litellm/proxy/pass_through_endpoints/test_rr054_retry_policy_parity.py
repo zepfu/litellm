@@ -3,7 +3,6 @@
 Covers:
 - OpenRouter completion vs pass-through shared retry-loop behavior
 - Codex/Anthropic auto-agent cooldown scope semantics via shared applicator
-- Google distinct multi-budget policy (capacity vs generic rate-limit vs transient)
 - Shared non-negative env parsers used by adapter retry knobs
 
 No production code is modified by this suite; failures surface live divergences.
@@ -88,51 +87,6 @@ def _openrouter_429(
         },
         "user_id": "user_test",
     }
-    return exc
-
-
-def _google_capacity_429() -> ProxyException:
-    exc = ProxyException(
-        message="No capacity available for model gemini-3.1-pro-preview",
-        type="None",
-        param="None",
-        code=429,
-    )
-    exc.detail = (
-        '429: b\'{\n  "error": {\n    "code": 429,\n'
-        '    "message": "No capacity available for model gemini-3.1-pro-preview",\n'
-        '    "status": "RESOURCE_EXHAUSTED",\n'
-        '    "details": [\n      {\n'
-        '        "@type": "type.googleapis.com/google.rpc.ErrorInfo",\n'
-        '        "reason": "MODEL_CAPACITY_EXHAUSTED",\n'
-        '        "domain": "cloudcode-pa.googleapis.com",\n'
-        '        "metadata": {"model": "gemini-3.1-pro-preview"}\n'
-        "      }\n    ]\n  }\n}\n'"
-    )
-    return exc
-
-
-def _google_generic_429(*, reset_after_s: int = 4) -> ProxyException:
-    exc = ProxyException(
-        message=f"You have exhausted your capacity on this model. Your quota will reset after {reset_after_s}s.",
-        type="None",
-        param="None",
-        code=429,
-    )
-    exc.detail = (
-        f'b\'{{"error":{{"message":"quota reset after {reset_after_s}s"}}}}\''
-    )
-    return exc
-
-
-def _google_transient_503() -> ProxyException:
-    exc = ProxyException(
-        message="upstream unavailable",
-        type="None",
-        param="None",
-        code=503,
-    )
-    exc.detail = {"error": {"message": "upstream unavailable", "code": 503}}
     return exc
 
 
@@ -495,134 +449,6 @@ async def test_rr054_12_codex_and_anthropic_setters_write_distinct_alias_familie
 
 
 # ---------------------------------------------------------------------------
-# Google distinct multi-budget policy
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_rr054_12_google_capacity_uses_capacity_budget_not_generic(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """MODEL_CAPACITY_EXHAUSTED must honor capacity_max_retries, not max_retries."""
-    # Generic budget would stop at 1 attempt (max_retries=0); capacity allows more.
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_RETRIES", "0")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES", "2")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS", "5,15,30")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS", "0")
-
-    capacity_err = _google_capacity_429()
-    successful = Response(content=b'{"ok":true}', media_type="application/json")
-    set_cooldown = AsyncMock()
-
-    with patch.object(
-        lpe,
-        "pass_through_request",
-        new=AsyncMock(side_effect=[capacity_err, capacity_err, successful]),
-    ) as mock_pt, patch.object(
-        lpe, "_wait_for_google_adapter_cooldown_if_needed", new=AsyncMock()
-    ), patch.object(
-        lpe, "_set_google_adapter_cooldown", new=set_cooldown
-    ):
-        result = await lpe._perform_google_adapter_pass_through_request(
-            request=MagicMock(),
-            google_adapter_rate_limit_key="lane-capacity",
-        )
-
-    assert result is successful
-    # capacity_max_retries=2 => total_attempts=3, success on 3rd.
-    assert mock_pt.await_count == 3
-    # Capacity path uses schedule backoff (+1s buffer on set).
-    assert [c.args[1] for c in set_cooldown.await_args_list] == [6.0, 16.0]
-
-
-@pytest.mark.asyncio
-async def test_rr054_12_google_generic_rate_limit_uses_max_retries_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Non-capacity 429s must stop at max_retries+1 and not use capacity budget."""
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_RETRIES", "1")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES", "5")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS", "0")
-
-    err = _google_generic_429(reset_after_s=4)
-    set_cooldown = AsyncMock()
-
-    with patch.object(
-        lpe, "pass_through_request", new=AsyncMock(side_effect=[err, err])
-    ) as mock_pt, patch.object(
-        lpe, "_wait_for_google_adapter_cooldown_if_needed", new=AsyncMock()
-    ), patch.object(
-        lpe, "_set_google_adapter_cooldown", new=set_cooldown
-    ):
-        with pytest.raises(ProxyException):
-            await lpe._perform_google_adapter_pass_through_request(
-                request=MagicMock(),
-                google_adapter_rate_limit_key="lane-generic",
-            )
-
-    # max_retries=1 => 2 attempts only (capacity budget must not extend this).
-    assert mock_pt.await_count == 2
-    assert set_cooldown.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_rr054_12_google_transient_uses_distinct_transient_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Transient 503s must sleep via transient backoff and not set rate-limit cooldown."""
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_RETRIES", "0")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_MAX_RETRIES", "0")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS", "0")
-
-    transient = _google_transient_503()
-    successful = Response(content=b'{"ok":true}', media_type="application/json")
-    set_cooldown = AsyncMock()
-    sleep_mock = AsyncMock()
-
-    with patch.object(
-        lpe, "pass_through_request", new=AsyncMock(side_effect=[transient, successful])
-    ) as mock_pt, patch.object(
-        lpe, "_wait_for_google_adapter_cooldown_if_needed", new=AsyncMock()
-    ), patch.object(
-        lpe, "_set_google_adapter_cooldown", new=set_cooldown
-    ), patch.object(
-        lpe.asyncio, "sleep", new=sleep_mock
-    ):
-        result = await lpe._perform_google_adapter_pass_through_request(
-            request=MagicMock(),
-            google_adapter_rate_limit_key="lane-transient",
-        )
-
-    assert result is successful
-    assert mock_pt.await_count == 2
-    set_cooldown.assert_not_awaited()
-    sleep_mock.assert_awaited()
-    # Transient schedule comes from shared passthrough hidden-retry wait helper.
-    waited = sleep_mock.await_args.args[0]
-    assert waited == lpe._get_google_adapter_transient_backoff_seconds(1)
-
-
-@pytest.mark.asyncio
-async def test_rr054_12_google_does_not_collapse_capacity_into_openrouter_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Google must keep multi-budget knobs; OpenRouter has a single attempt budget."""
-    # Prove Google capacity backoff schedule is independent of OpenRouter schedule.
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MODEL_CAPACITY_BACKOFF_SECONDS", "7,11")
-    monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS", "2,10,20")
-    assert lpe._get_google_adapter_capacity_backoff_seconds(1) == 7.0
-    assert lpe._get_google_adapter_capacity_backoff_seconds(2) == 11.0
-    assert lpe._get_openrouter_adapter_backoff_seconds(1) == 2.0
-    assert lpe._get_openrouter_adapter_backoff_seconds(2) == 10.0
-    # Google exposes three distinct budget helpers; OpenRouter does not.
-    assert callable(lpe._get_google_adapter_max_retries)
-    assert callable(lpe._get_google_adapter_model_capacity_max_retries)
-    assert callable(lpe._get_google_adapter_transient_retry_max_attempts)
-    assert not hasattr(lpe, "_get_openrouter_adapter_model_capacity_max_retries")
-    assert not hasattr(lpe, "_get_openrouter_adapter_transient_retry_max_attempts")
-
-
-# ---------------------------------------------------------------------------
 # Shared retry env parsing
 # ---------------------------------------------------------------------------
 
@@ -665,18 +491,12 @@ def test_rr054_12_adapter_knobs_use_shared_env_parsers(
 ) -> None:
     monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_MAX_RETRIES", "5")
     monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS", "12.5")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_MAX_RETRIES", "4")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS", "9.25")
 
     assert lpe._get_openrouter_adapter_max_retries() == 5
     assert lpe._get_openrouter_adapter_hidden_retry_budget_seconds() == 12.5
-    assert lpe._get_google_adapter_max_retries() == 4
-    assert lpe._get_google_adapter_hidden_retry_budget_seconds() == 9.25
 
     monkeypatch.setenv("AAWM_OPENROUTER_ADAPTER_MAX_RETRIES", "-1")
-    monkeypatch.setenv("AAWM_GOOGLE_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS", "bad")
     assert lpe._get_openrouter_adapter_max_retries() == 0
-    assert lpe._get_google_adapter_hidden_retry_budget_seconds() == 0.0
 
 
 def test_rr054_12_projected_hidden_retry_within_budget_helper() -> None:
@@ -707,22 +527,16 @@ def test_rr054_12_projected_hidden_retry_within_budget_helper() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rr054_12_openrouter_and_google_wait_helpers_use_shared_map_wait(
+async def test_rr054_12_openrouter_wait_helper_uses_shared_map_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both provider wait helpers must route through wait_for_monotonic_cooldown_map."""
+    """OpenRouter wait helper must route through wait_for_monotonic_cooldown_map."""
     shared = AsyncMock(return_value=0.0)
     with patch.object(ar_retry, "wait_for_monotonic_cooldown_map", new=shared), patch.object(
         lpe._aawm_alias_retry, "wait_for_monotonic_cooldown_map", new=shared
     ):
         await lpe._wait_for_openrouter_adapter_cooldown_if_needed("or-key")
-        await lpe._wait_for_google_adapter_cooldown_if_needed("g-key")
 
-    assert shared.await_count == 2
-    labels = []
-    for call in shared.await_args_list:
-        labels.append(call.kwargs.get("log_label") or call.args[2] if len(call.args) > 2 else call.kwargs.get("log_label"))
-    # Accept kwargs form primarily.
+    assert shared.await_count == 1
     kwargs_labels = [c.kwargs.get("log_label") for c in shared.await_args_list]
     assert "OpenRouter adapter" in kwargs_labels
-    assert "Google adapter" in kwargs_labels

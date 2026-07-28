@@ -346,6 +346,32 @@ def test_install_order_identity_model_resolution_wins() -> None:
     assert not (opencode_model_names & zen_published_names)
 
 
+def test_install_observes_late_generic_exception_helper_patches() -> None:
+    prior_runtime = zen_runtime._runtime
+    host_globals: dict[str, Any] = {
+        "_extract_adapter_exception_status_code": lambda exc: 418,
+        "_extract_adapter_exception_detail": lambda exc: "initial-detail",
+    }
+    zen_runtime.install(host_globals)
+
+    try:
+        runtime = zen_runtime._require_runtime()
+        exc = RuntimeError("boom")
+        assert runtime.extract_exception_status_code(exc) == 418
+        assert runtime.extract_exception_detail(exc) == "initial-detail"
+
+        host_globals["_extract_adapter_exception_status_code"] = lambda exc: 429
+        host_globals["_extract_adapter_exception_detail"] = (
+            lambda exc: "patched-detail"
+        )
+
+        assert runtime.extract_exception_status_code(exc) == 429
+        assert runtime.extract_exception_detail(exc) == "patched-detail"
+    finally:
+        zen_runtime._runtime = prior_runtime
+        zen_runtime._get_anthropic_opencode_zen_normalization_runtime.cache_clear()
+
+
 @pytest.mark.asyncio
 async def test_responses_stream_normalization_for_codex() -> None:
     response = SimpleNamespace(

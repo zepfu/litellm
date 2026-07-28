@@ -17,9 +17,6 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.chatgpt_c
     _is_known_chatgpt_codex_invalid_encrypted_content_response,
     _is_known_chatgpt_codex_model_not_supported_for_account_response,
 )
-from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.google_code_assist import (
-    _is_known_google_code_assist_tos_violation_response,
-)
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
     _get_openai_model_not_found_error_summary,
     _get_openai_model_not_found_failure_kind,
@@ -261,30 +258,6 @@ def _classify_chatgpt_codex_model_not_supported(
     )
 
 
-def _classify_google_code_assist_tos(
-    *,
-    request: Request,
-    url: Optional[httpx.URL],
-    custom_llm_provider: Optional[str],
-    status_code: Optional[int],
-    exc: Exception,
-) -> Optional[PassthroughProviderFailureClassification]:
-    if not _is_known_google_code_assist_tos_violation_response(
-        url=url,
-        custom_llm_provider=custom_llm_provider,
-        status_code=status_code,
-        exc=exc,
-    ):
-        return None
-    return PassthroughProviderFailureClassification(
-        name="google_code_assist_tos",
-        failure_kind="google_code_assist_tos_violation",
-        log_message=(
-            "Pass through endpoint surfaced Google Code Assist account TOS "
-            "violation status=%s error=%s"
-        ),
-    )
-
 
 def _classify_openai_model_not_found(
     *,
@@ -348,7 +321,6 @@ PASSTHROUGH_PROVIDER_FAILURE_CLASSIFIERS: Sequence[ProviderFailureClassifier] = 
     _classify_chatgpt_codex_block_page,
     _classify_chatgpt_codex_invalid_encrypted_content,
     _classify_chatgpt_codex_model_not_supported,
-    _classify_google_code_assist_tos,
     _classify_openai_model_not_found,
     _classify_anthropic_known_failure,
 )

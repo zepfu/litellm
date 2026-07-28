@@ -35,6 +35,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     anthropic_adapter_calls as _wave6f_anthropic_calls,
 )
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import runtime_memory
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -59,8 +60,6 @@ ARCHITECTURE_OWNED_MODULES = {
     "policy": "Candidate tables, aliases, model allowlists, cooldown defaults",
     "state": "Cooldown, affinity, OAuth, lane-cache, and candidate probe-lock state",
     "durable": "Durable Redis keys, max-expiry writes, negative reads, DualCache",
-    "google_oauth": "Google OAuth file/token I/O",
-    "antigravity_oauth": "Antigravity OAuth file/token I/O",
     "adapter_config": "Config-driven nine-route preparation/execution plans",
     "adapter_driver": "Config-driven nine-route preparation/execution plans",
     "provider_shaping": "Provider text/JSON shaping primitives",
@@ -150,8 +149,6 @@ SEAM_DEFINITIONS: dict[str, set[str]] = {
     },
     "oauth_token_cache": {
         "OAuthAccessTokenCache",
-        "google_oauth_access_token_cache",
-        "antigravity_oauth_access_token_cache",
     },
 }
 
@@ -222,31 +219,21 @@ MODULE_SUBSTANCE_MARKERS: dict[str, tuple[str, ...]] = {
         "def select_task_state_source",
         "def resolve_task_state_markers",
     ),
-    "google_oauth": (
-        "def _load_valid_local_google_oauth_access_token",
-        "def _refresh_local_google_oauth_credentials",
-        "configure_google_oauth_runtime",
-    ),
-    "antigravity_oauth": (
-        "def _load_valid_local_antigravity_access_token",
-        "def _refresh_local_antigravity_oauth_token_data",
-        "ANTIGRAVITY",
-    ),
     "oauth_token_cache": (
         "class OAuthAccessTokenCache",
-        "google_oauth_access_token_cache",
-        "antigravity_oauth_access_token_cache",
     ),
 }
 
-# God-file thin wrappers that are allowed to exist if they *call* the package.
-ALLOWED_GOD_THIN_WRAPPERS: dict[str, str] = {
-    "_bound_aawm_alias_routing_memory_map": "_aawm_alias_memory.bound_memory_map",
+# God-file compatibility names installed as same-object package facades.
+INSTALLED_GOD_FACADES = {
+    "_bound_aawm_alias_routing_memory_map": (
+        runtime_memory.bound_aawm_alias_routing_memory_map
+    ),
     "_hydrate_aawm_alias_routing_cooldown_memory": (
-        "_aawm_alias_memory.hydrate_cooldown_memory"
+        runtime_memory.hydrate_aawm_alias_routing_cooldown_memory
     ),
     "_hydrate_aawm_alias_routing_affinity_memory": (
-        "_aawm_alias_memory.hydrate_affinity_memory"
+        runtime_memory.hydrate_aawm_alias_routing_affinity_memory
     ),
 }
 
@@ -816,18 +803,11 @@ def test_rr054_god_file_imports_package_owners() -> None:
         "from .aawm_alias_routing import retry as _aawm_alias_retry",
         "from .aawm_alias_routing import durable as _aawm_alias_durable",
         "from .aawm_alias_routing.state import alias_routing_state as _alias_routing_state",
-        "from .aawm_alias_routing import google_oauth as _aawm_google_oauth",
-        "from .aawm_alias_routing import antigravity_oauth as _aawm_antigravity_oauth",
         "from .aawm_alias_routing import provider_shaping as _aawm_provider_shaping",
         "from .aawm_alias_routing import streaming as _aawm_alias_streaming",
     ]
     missing = [line for line in required_imports if line not in god_source]
     assert not missing, f"god-file missing package imports: {missing}"
-    google_provider_source = "\n".join(
-        _read(path)
-        for path in (PROVIDER_DIR / "google").glob("*.py")
-    )
-    assert "_aawm_task_state.select_task_state_source" in google_provider_source
 
 
 def test_rr054_god_file_binds_durable_helpers_to_package() -> None:
@@ -876,12 +856,6 @@ def test_rr054_god_file_state_maps_are_package_identity_bound() -> None:
         lpe._anthropic_auto_agent_session_affinity_by_key
         is alias_routing_state.anthropic.session_affinity_by_key
     )
-    assert lpe._google_oauth_access_token_cache is (
-        alias_routing_state.google_oauth.tokens
-    )
-    assert lpe._antigravity_oauth_access_token_cache is (
-        alias_routing_state.antigravity_oauth.tokens
-    )
 
     # God-file must not reconstruct the process maps.
     god_source = _read(GOD_PATH)
@@ -890,43 +864,20 @@ def test_rr054_god_file_state_maps_are_package_identity_bound() -> None:
         "_anthropic_auto_agent_cooldown_until_monotonic_by_key: dict",
         "_codex_auto_agent_session_affinity_by_key: dict",
         "_anthropic_auto_agent_session_affinity_by_key: dict",
-        "_google_oauth_access_token_cache: dict",
-        "_antigravity_oauth_access_token_cache: dict",
     ):
         assert snippet not in god_source, (
             f"god-file re-owns process map via local annotation: {snippet}"
         )
 
 
-def test_rr054_allowed_god_thin_wrappers_delegate_to_package() -> None:
+def test_rr054_god_memory_facades_are_installed_from_package() -> None:
     god_tree = _parse(GOD_PATH)
-    god_source = _read(GOD_PATH)
-    for wrapper, required_call in ALLOWED_GOD_THIN_WRAPPERS.items():
-        assert f"def {wrapper}(" in god_source or f"async def {wrapper}(" in god_source, (
-            f"expected thin wrapper {wrapper} on god-file"
+    god_functions = _top_level_function_class_names(god_tree)
+    for facade_name, owner in INSTALLED_GOD_FACADES.items():
+        assert facade_name not in god_functions, (
+            f"{facade_name} must remain package-owned, not a god FunctionDef"
         )
-        fn = _function_node(god_tree, wrapper)
-        assert fn is not None, f"missing AST node for {wrapper}"
-        calls = _call_attr_names(fn)
-        assert required_call in calls, (
-            f"{wrapper} must call package seam {required_call}; calls={sorted(calls)}"
-        )
-        # Thinness: wrapper body should not re-implement hydration / finalize
-        # control flow (heuristic: few statements).
-        assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
-        body_stmts = [
-            s
-            for s in fn.body
-            if not (
-                isinstance(s, ast.Expr)
-                and isinstance(s.value, ast.Constant)
-                and isinstance(s.value.value, str)
-            )
-        ]
-        assert len(body_stmts) <= 6, (
-            f"{wrapper} looks too large to be a thin delegate "
-            f"({len(body_stmts)} stmts); possible dual implementation"
-        )
+        assert getattr(lpe, facade_name) is owner
 
 
 def test_rr054_nine_adapter_route_handlers_delegate_to_package_driver() -> None:

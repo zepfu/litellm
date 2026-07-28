@@ -6,11 +6,10 @@ Provider-specific Pass-Through Endpoints
 Use litellm with Anthropic SDK, Vertex AI SDK, Cohere SDK, etc.
 """
 
-import ast
-import asyncio
+import asyncio  # noqa: F401 - live compatibility binding for provider runtimes
 import codecs  # noqa: F401 - compatibility binding for extracted Wave 6A facades
 import copy
-import hashlib
+import hashlib  # noqa: F401 - live host global for installed lane-key functions
 import json
 import os
 import random  # noqa: F401 - compatibility binding for extracted Wave 5C facades
@@ -19,23 +18,17 @@ import time
 from datetime import datetime, timedelta, timezone
 from inspect import isawaitable  # noqa: F401 - Wave 6A facade host binding
 from pathlib import Path
-from functools import lru_cache
-from types import SimpleNamespace
+from functools import lru_cache, partial
 from typing import (
     Any,
     Awaitable,
     Callable,
-    Mapping,
-    Never,
     Optional,
-    Sequence,
     Tuple,
     TypeVar,
     Union,
     cast,
 )
-from urllib.parse import parse_qsl, urlencode, urlparse
-
 import httpx
 from fastapi import (
     APIRouter,
@@ -55,8 +48,6 @@ globals()["status"] = fastapi_status
 import litellm
 from litellm import get_llm_provider
 from litellm._logging import verbose_proxy_logger
-from uuid import NAMESPACE_URL, uuid5
-from litellm._uuid import uuid4
 from litellm.constants import (
     ALLOWED_VERTEX_AI_PASSTHROUGH_HEADERS,
     BEDROCK_AGENT_RUNTIME_PASS_THROUGH_ROUTES,
@@ -67,7 +58,7 @@ from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_grok_literal_tool_label_transcript_text,  # noqa: F401 - Wave 6A host binding
 )
 from litellm.integrations.aawm_passthrough_shape_capture import (
-    capture_passthrough_shape,
+    capture_passthrough_shape,  # noqa: F401 - pending shape-capture install wiring
 )
 from litellm.proxy.aawm_runtime_error_logging import (
     schedule_persist_malformed_tool_call_detection,  # noqa: F401 - Wave 6A host binding
@@ -75,8 +66,6 @@ from litellm.proxy.aawm_runtime_error_logging import (
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_API_BASE,
 )
-from litellm.llms.anthropic.common_utils import is_anthropic_oauth_key
-from litellm.types.llms.anthropic import ANTHROPIC_OAUTH_BETA_HEADER
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,  # noqa: F401 - Wave 6F facade host binding
 )
@@ -88,7 +77,6 @@ from litellm.llms.xai.oauth import (
 )
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._types import *
-from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
@@ -106,15 +94,12 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     create_websocket_passthrough_route,
     pass_through_request,
     websocket_passthrough_request,
-    _classify_passthrough_hidden_retry_failure,
+    _classify_passthrough_hidden_retry_failure,  # noqa: F401 - pending retry-classifier install wiring
     _get_passthrough_handled_http_error_summary,
     _get_passthrough_hidden_retry_wait_seconds,  # noqa: F401  # consumed by rebound env_policy functions
     _is_known_grok_build_usage_balance_exhausted_response,
     _is_known_grok_personal_team_spending_limit_response,
-    _record_passthrough_hidden_retry_metadata,
-)
-from litellm.proxy.pass_through_endpoints.google_code_assist_quota import (
-    sanitize_google_code_assist_quota_for_logging as _sanitize_google_code_assist_quota_for_logging,
+    _record_passthrough_hidden_retry_metadata,  # noqa: F401 - pending retry-metadata install wiring
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.types import Payload
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
@@ -124,19 +109,10 @@ from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
     composer_repair as _anthropic_grok_composer_repair,  # noqa: F401 - Wave 6A host binding
 )
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
-    normalization as _anthropic_grok_normalization,
+    normalization as _anthropic_grok_normalization,  # noqa: F401 - runtime globals() binding
 )
 from litellm.llms.anthropic.experimental_pass_through.providers import (
     common as _anthropic_provider_common,
-)
-from litellm.llms.anthropic.experimental_pass_through.providers.antigravity import (
-    adapter as _anthropic_antigravity_provider,
-)
-from litellm.llms.anthropic.experimental_pass_through.providers.google import (
-    process_cache as _anthropic_google_process_cache,
-)
-from litellm.llms.anthropic.experimental_pass_through.providers.google import (
-    shaping as _anthropic_google_shaping,
 )
 from litellm.llms.anthropic.experimental_pass_through.providers.nvidia import (
     adapter as _anthropic_nvidia_provider,
@@ -156,20 +132,17 @@ from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen imp
 from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
     adapter as _anthropic_openrouter_provider,
 )
-from litellm.llms.anthropic.experimental_pass_through.providers.openrouter import (
-    retry_transport as _anthropic_openrouter_retry_transport,
-)
 from litellm.llms.anthropic.experimental_pass_through.providers.xai import (
     adapter as _anthropic_xai_provider,
 )
 from litellm.proxy.aawm_route_logging import (
-    aresolve_aawm_route_host_attribution,
-    build_aawm_route_rollup_group_header_label,
+    aresolve_aawm_route_host_attribution,  # noqa: F401 - rollup install host binding
+    build_aawm_route_rollup_group_header_label,  # noqa: F401 - rollup install host binding
     emit_aawm_route_access_log,  # noqa: F401 - Wave 6F facade host binding
-    emit_aawm_route_status_event,
-    record_aawm_route_rollup,
+    emit_aawm_route_status_event,  # noqa: F401 - rollup install host binding
+    record_aawm_route_rollup,  # noqa: F401 - rollup install host binding
     record_aawm_route_rollup_turn,  # noqa: F401 - Wave 6F facade host binding
-    resolve_aawm_route_host_attribution,
+    resolve_aawm_route_host_attribution,  # noqa: F401 - rollup install host binding
 )
 
 try:
@@ -230,79 +203,6 @@ from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
 
 from .passthrough_endpoint_router import PassthroughEndpointRouter
-from .aawm_alias_routing_policy import (
-    ANTHROPIC_AAWM_CODE_ALIAS as _POLICY_ANTHROPIC_AAWM_CODE_ALIAS,
-    ANTHROPIC_AAWM_CODE_CANDIDATES as _POLICY_ANTHROPIC_AAWM_CODE_CANDIDATES,
-    ANTHROPIC_AAWM_LOW_ALIAS as _POLICY_ANTHROPIC_AAWM_LOW_ALIAS,
-    ANTHROPIC_AAWM_LOW_CANDIDATES as _POLICY_ANTHROPIC_AAWM_LOW_CANDIDATES,
-    ANTHROPIC_AAWM_ORCHESTRATION_ALIAS as _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_ALIAS,
-    ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES as _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES,
-    ANTHROPIC_AAWM_READ_ALIAS as _POLICY_ANTHROPIC_AAWM_READ_ALIAS,
-    ANTHROPIC_AAWM_SOTA_ALIAS as _POLICY_ANTHROPIC_AAWM_SOTA_ALIAS,
-    ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES,
-    ANTHROPIC_AAWM_SOTA_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_CANDIDATES,
-    ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES,
-    ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES,
-    ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES as _POLICY_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES,
-    ANTHROPIC_AUTO_AGENT_CANDIDATES as _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES,
-    ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS as _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-    ANTHROPIC_AUTO_AGENT_HAIKU_MODEL as _POLICY_ANTHROPIC_AUTO_AGENT_HAIKU_MODEL,
-    ANTHROPIC_AUTO_AGENT_MODEL_ALIAS as _POLICY_ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-    ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER as _POLICY_ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
-    ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES as _POLICY_ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES,
-    ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS as _POLICY_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS,
-    ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS as _POLICY_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS,
-    ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS as _POLICY_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS,
-    ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS as _POLICY_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS,
-    ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS as _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS,
-    ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER as _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
-    ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS as _POLICY_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS,
-    CODEX_AAWM_CODE_ALIAS as _POLICY_CODEX_AAWM_CODE_ALIAS,
-    CODEX_AAWM_CODE_CANDIDATES as _POLICY_CODEX_AAWM_CODE_CANDIDATES,
-    CODEX_AAWM_LOW_ALIAS as _POLICY_CODEX_AAWM_LOW_ALIAS,
-    CODEX_AAWM_LOW_CANDIDATES as _POLICY_CODEX_AAWM_LOW_CANDIDATES,
-    CODEX_AAWM_ORCHESTRATION_ALIAS as _POLICY_CODEX_AAWM_ORCHESTRATION_ALIAS,
-    CODEX_AAWM_ORCHESTRATION_CANDIDATES as _POLICY_CODEX_AAWM_ORCHESTRATION_CANDIDATES,
-    CODEX_AAWM_READ_ALIAS as _POLICY_CODEX_AAWM_READ_ALIAS,
-    CODEX_AAWM_SOTA_ALIAS as _POLICY_CODEX_AAWM_SOTA_ALIAS,
-    CODEX_AAWM_SOTA_ALIBABA_ALIAS as _POLICY_CODEX_AAWM_SOTA_ALIBABA_ALIAS,
-    CODEX_AAWM_SOTA_ALIBABA_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_ALIBABA_CANDIDATES,
-    CODEX_AAWM_SOTA_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_CANDIDATES,
-    CODEX_AAWM_SOTA_DEEPSEEK_ALIAS as _POLICY_CODEX_AAWM_SOTA_DEEPSEEK_ALIAS,
-    CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES,
-    CODEX_AAWM_SOTA_GLM_ALIAS as _POLICY_CODEX_AAWM_SOTA_GLM_ALIAS,
-    CODEX_AAWM_SOTA_GLM_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_GLM_CANDIDATES,
-    CODEX_AAWM_SOTA_OPENAI_ALIAS as _POLICY_CODEX_AAWM_SOTA_OPENAI_ALIAS,
-    CODEX_AAWM_SOTA_OPENAI_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_OPENAI_CANDIDATES,
-    CODEX_AAWM_SOTA_MOONSHOT_ALIAS as _POLICY_CODEX_AAWM_SOTA_MOONSHOT_ALIAS,
-    CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES,
-    CODEX_AAWM_SOTA_XAI_ALIAS as _POLICY_CODEX_AAWM_SOTA_XAI_ALIAS,
-    CODEX_AAWM_SOTA_XAI_CANDIDATES as _POLICY_CODEX_AAWM_SOTA_XAI_CANDIDATES,
-    CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER as _POLICY_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER,
-    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
-    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-    CODEX_AUTO_AGENT_CANDIDATES as _POLICY_CODEX_AUTO_AGENT_CANDIDATES,
-    CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS as _POLICY_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-    CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS as _POLICY_CAPACITY_COOLDOWN,
-    CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS as _POLICY_DEFAULT_COOLDOWN,
-    CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS as _POLICY_RATE_LIMIT_COOLDOWN,
-    CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS as _POLICY_TRANSIENT_COOLDOWN,
-    CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS as _POLICY_USAGE_LIMIT_COOLDOWN,
-    CODEX_AUTO_AGENT_GOOGLE_PROVIDER as _POLICY_CODEX_AUTO_AGENT_GOOGLE_PROVIDER,
-    CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
-    CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
-    CODEX_AUTO_AGENT_MODEL_ALIAS as _POLICY_CODEX_AUTO_AGENT_MODEL_ALIAS,
-    CODEX_AUTO_AGENT_NATIVE_PROVIDER as _POLICY_CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-    CODEX_AUTO_AGENT_OPENCODE_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY,
-    CODEX_AUTO_AGENT_OPENCODE_PROVIDER as _POLICY_CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
-    CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
-    CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _POLICY_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
-    CODEX_AUTO_AGENT_XAI_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_XAI_LANE_KEY,
-    CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY as _POLICY_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY,
-    CODEX_AUTO_AGENT_XAI_PROVIDER as _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER,
-    CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES as _POLICY_CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES,
-    KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS as _POLICY_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,
-)
 
 from .aawm_alias_routing import adapter_config as _aawm_adapter_config  # noqa: F401 - Wave 6F facade host binding
 from .aawm_alias_routing import adapter_driver as _aawm_adapter_driver
@@ -313,15 +213,17 @@ from .aawm_alias_routing import responses_finalize as _aawm_responses_finalize
 # Compatibility host global for transplanted Google env-policy functions/tests.
 from .aawm_alias_routing import retry as _aawm_alias_retry  # noqa: F401
 from .aawm_alias_routing import streaming as _aawm_alias_streaming  # noqa: F401 - Wave 6F facade host binding
-from .aawm_alias_routing import google_oauth as _aawm_google_oauth
-from .aawm_alias_routing import antigravity_oauth as _aawm_antigravity_oauth
 from .aawm_alias_routing import candidate_loop as _aawm_alias_candidate_loop
 from .aawm_alias_routing import durable as _aawm_alias_durable
 
 # Wave 4 pure-leaf extraction imports
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen import constants as _opencode_zen_constants
-from litellm.llms.anthropic.experimental_pass_through.providers.antigravity import constants as _antigravity_constants
 from .aawm_alias_routing import lane_keys as _aawm_lane_keys
+from .aawm_alias_routing import request_metadata as _aawm_request_metadata
+from .aawm_alias_routing import runtime_memory as _aawm_runtime_memory
+from .aawm_adapter_runtime import alias_candidate_dispatch as _aawm_alias_candidate_dispatch
+from .aawm_adapter_runtime import anthropic_auto_agent_route as _aawm_anthropic_auto_agent_route
+from .aawm_adapter_runtime import codex_auto_agent_route as _aawm_codex_auto_agent_route
 from .aawm_adapter_runtime import model_resolution as _aawm_adapter_model_resolution
 from . import aawm_adapter_runtime as _aawm_adapter_runtime
 from .aawm_adapter_runtime import anthropic_adapter_calls as _aawm_anthropic_adapter_calls  # noqa: F401 - Wave 6F integration import
@@ -329,26 +231,22 @@ from .aawm_adapter_runtime import anthropic_dispatch as _aawm_anthropic_dispatch
 from .aawm_adapter_runtime import codex_candidate_calls as _aawm_codex_candidate_calls  # noqa: F401 - Wave 6F integration import
 from .aawm_adapter_runtime import codex_dispatch as _aawm_codex_dispatch  # noqa: F401 - Wave 6F integration import
 from .aawm_request_policy import alias_guidance as _aawm_alias_guidance
-from .aawm_request_policy import observability_metadata as _aawm_observability_metadata
-from .aawm_request_policy import persisted_output as _aawm_persisted_output
+from .aawm_request_policy import observability_metadata as _aawm_observability_metadata  # noqa: F401 - install(globals()) pending wiring
+from .aawm_request_policy import persisted_output as _aawm_persisted_output  # noqa: F401 - install(globals()) pending wiring
 from .aawm_request_policy import codex_tool_policy as _aawm_codex_tool_policy
 from .aawm_request_policy import anthropic_body_prep as _aawm_anthropic_body_prep
-from litellm.llms.anthropic.experimental_pass_through.providers.google import env_policy as _google_env_policy
-from litellm.llms.anthropic.experimental_pass_through.providers.google import context_window as _google_context_window
-from litellm.llms.anthropic.experimental_pass_through.providers.google import error_signals as _google_error_signals
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import side_channel as _grok_side_channel
+
+_prepare_anthropic_request_body_for_passthrough = (
+    _aawm_anthropic_body_prep._prepare_anthropic_request_body_for_passthrough
+)
 
 # Wave 6B extracted provider modules
 from litellm.proxy.pass_through_endpoints.providers import common as _wave6b_common
-from litellm.proxy.pass_through_endpoints.providers.antigravity import runtime as _wave6b_antigravity_runtime
 from litellm.proxy.pass_through_endpoints.providers.openrouter import runtime as _wave6b_openrouter_runtime
 from litellm.proxy.pass_through_endpoints.providers.nvidia import runtime as _wave6b_nvidia_runtime
-from litellm.proxy.pass_through_endpoints.providers.opencode_zen import runtime as _wave6b_opencode_zen_runtime
+from litellm.proxy.pass_through_endpoints.providers.opencode_zen import runtime as _wave6b_opencode_zen_runtime  # noqa: F401 - install(globals()) pending wiring
 from litellm.proxy.pass_through_endpoints.providers.xai import request_prep as _wave6b_xai_request_prep
-from litellm.proxy.pass_through_endpoints.providers.google import retry_runtime as _google_retry_runtime
-from litellm.proxy.pass_through_endpoints.providers.google import codex_code_assist as _google_codex_code_assist
-
-from .aawm_alias_routing import interfaces as _aawm_alias_interfaces
 from .aawm_alias_routing.state import alias_routing_state as _alias_routing_state
 
 
@@ -363,15 +261,14 @@ _AAWM_REQUEST_BODY_WALK_MAX_NODES = 4000
 _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS = 5000
 _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES = 8 * 1024 * 1024
 _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS = 5.0
-_CODEX_AUTO_AGENT_GOOGLE_LANE_NEGATIVE_TTL_SECONDS = 15.0
-_CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY = "google:auth_degraded"
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_TTL_SECONDS = _google_codex_code_assist._CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_TTL_SECONDS
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE = _google_codex_code_assist._CODEX_GOOGLE_CODE_ASSIST_TOOL_CALL_NAME_CACHE_MAX_SIZE
-_codex_google_code_assist_tool_call_name_cache = (
-    _anthropic_google_process_cache._codex_google_code_assist_tool_call_name_cache
-)
-_codex_google_code_assist_tool_call_arguments_cache = (
-    _anthropic_google_process_cache._codex_google_code_assist_tool_call_arguments_cache
+_GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST = frozenset(
+    {
+        "accept",
+        "authorization",
+        "content-type",
+        "user-agent",
+        "x-goog-api-client",
+    }
 )
 # Default probe-compatible retry set includes 429 + common 5xx.
 _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT = [
@@ -384,64 +281,6 @@ _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT = [
 _NativeGrokContinuationRetryMetadata = dict[str, Any]
 _RetryResultT = TypeVar("_RetryResultT")
 _WalkResultT = TypeVar("_WalkResultT")
-
-
-def _should_log_aawm_alias_routing_event(log_key: str) -> bool:
-    now = time.monotonic()
-    until = _aawm_alias_routing_log_until_monotonic_by_key.get(log_key, 0.0)
-    if now < until:
-        return False
-    _aawm_alias_routing_log_until_monotonic_by_key[log_key] = now + 30.0
-    _bound_aawm_alias_routing_memory_map(_aawm_alias_routing_log_until_monotonic_by_key)
-    return True
-
-
-def _replace_request_body_in_place(
-    request_body: Payload,
-    updated_body: Payload,
-) -> None:
-    if updated_body is request_body:
-        return
-    request_body.clear()
-    request_body.update(updated_body)
-
-
-def _bound_aawm_alias_routing_memory_map(
-    cache: dict,
-    *,
-    max_size: int = _AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE,
-) -> None:
-    _aawm_alias_memory.bound_memory_map(cache, max_size=max_size)
-
-
-def _hydrate_aawm_alias_routing_cooldown_memory(
-    *,
-    memory_map: dict[str, float],
-    cooldown_key: str,
-    expires_at_epoch: float,
-) -> None:
-    _aawm_alias_memory.hydrate_cooldown_memory(
-        memory_map=memory_map,
-        cooldown_key=cooldown_key,
-        expires_at_epoch=expires_at_epoch,
-        max_size=_AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE,
-    )
-
-
-def _hydrate_aawm_alias_routing_affinity_memory(
-    *,
-    memory_map: dict[str, dict[str, Any]],
-    session_key: str,
-    payload: dict[str, Any],
-    expires_at_epoch: float,
-) -> dict[str, Any]:
-    return _aawm_alias_memory.hydrate_affinity_memory(
-        memory_map=memory_map,
-        session_key=session_key,
-        payload=payload,
-        expires_at_epoch=expires_at_epoch,
-        max_size=_AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE,
-    )
 
 
 class _ChangeAccumulator:
@@ -475,13 +314,13 @@ _codex_auto_agent_lock = _alias_routing_state.codex.lock
 _anthropic_auto_agent_cooldown_until_monotonic_by_key = _alias_routing_state.anthropic.cooldown_until_monotonic_by_key
 _anthropic_auto_agent_session_affinity_by_key = _alias_routing_state.anthropic.session_affinity_by_key
 _anthropic_auto_agent_lock = _alias_routing_state.anthropic.lock
-_codex_auto_agent_google_lane_key_until_monotonic_by_key = _alias_routing_state.google_lane_key_until_monotonic_by_key
-_codex_auto_agent_google_lane_key_by_key = _alias_routing_state.google_lane_key_by_key
-_codex_auto_agent_antigravity_lane_key_until_monotonic_by_key = (
-    _alias_routing_state.antigravity_lane_key_until_monotonic_by_key
-)
-_codex_auto_agent_antigravity_lane_key_by_key = _alias_routing_state.antigravity_lane_key_by_key
 _codex_auto_agent_lane_state_cache_lock = _alias_routing_state.lane_state_cache_lock
+_openrouter_adapter_rate_limit_until_monotonic_by_key = (
+    _alias_routing_state.openrouter_rate_limit.until_monotonic_by_key
+)
+_openrouter_adapter_failure_circuit_until_monotonic_by_key = (
+    _alias_routing_state.openrouter_failure_circuit.until_monotonic_by_key
+)
 _codex_auto_agent_cooldown_negative_until_monotonic_by_key = (
     _alias_routing_state.codex.cooldown_negative_until_monotonic_by_key
 )
@@ -490,82 +329,91 @@ _anthropic_auto_agent_cooldown_negative_until_monotonic_by_key = (
 )
 _aawm_alias_routing_log_until_monotonic_by_key = _alias_routing_state.log_until_monotonic_by_key
 
+_aawm_runtime_memory.configure_runtime_memory(
+    runtime=_aawm_runtime_memory.RuntimeMemoryRuntime(
+        log_until_map=_aawm_alias_routing_log_until_monotonic_by_key,
+        max_size=_AAWM_ALIAS_ROUTING_MEMORY_STATE_MAX_SIZE,
+    )
+)
+_should_log_aawm_alias_routing_event = (
+    _aawm_runtime_memory.should_log_aawm_alias_routing_event
+)
+_replace_request_body_in_place = _aawm_runtime_memory.replace_request_body_in_place
+_bound_aawm_alias_routing_memory_map = (
+    _aawm_runtime_memory.bound_aawm_alias_routing_memory_map
+)
+_hydrate_aawm_alias_routing_cooldown_memory = (
+    _aawm_runtime_memory.hydrate_aawm_alias_routing_cooldown_memory
+)
+_hydrate_aawm_alias_routing_affinity_memory = (
+    _aawm_runtime_memory.hydrate_aawm_alias_routing_affinity_memory
+)
+
 # Policy aliases (RR-054 #11): static tables live in aawm_alias_routing.policy.
-_CODEX_AUTO_AGENT_MODEL_ALIAS = _POLICY_CODEX_AUTO_AGENT_MODEL_ALIAS
-_CODEX_AUTO_AGENT_NATIVE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_NATIVE_PROVIDER
-_CODEX_AUTO_AGENT_GOOGLE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_GOOGLE_PROVIDER
-_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
-_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER = _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER = _POLICY_CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER
-_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
-_CODEX_AUTO_AGENT_XAI_PROVIDER = _POLICY_CODEX_AUTO_AGENT_XAI_PROVIDER
-_CODEX_AUTO_AGENT_OPENCODE_PROVIDER = _POLICY_CODEX_AUTO_AGENT_OPENCODE_PROVIDER
-_CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-_CODEX_AUTO_AGENT_XAI_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_LANE_KEY
-_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY
-_CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
-_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
-_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = _POLICY_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
-_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = _POLICY_DEFAULT_COOLDOWN
-_CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS = _POLICY_CAPACITY_COOLDOWN
-_CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = _POLICY_RATE_LIMIT_COOLDOWN
-_CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS = _POLICY_USAGE_LIMIT_COOLDOWN
-_CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS = _POLICY_TRANSIENT_COOLDOWN
-_CODEX_AUTO_AGENT_CANDIDATES = _POLICY_CODEX_AUTO_AGENT_CANDIDATES
-_CODEX_AAWM_READ_ALIAS = _POLICY_CODEX_AAWM_READ_ALIAS
-_CODEX_AAWM_SOTA_ALIAS = _POLICY_CODEX_AAWM_SOTA_ALIAS
-_CODEX_AAWM_CODE_ALIAS = _POLICY_CODEX_AAWM_CODE_ALIAS
-_CODEX_AAWM_LOW_ALIAS = _POLICY_CODEX_AAWM_LOW_ALIAS
-_CODEX_AAWM_ORCHESTRATION_ALIAS = _POLICY_CODEX_AAWM_ORCHESTRATION_ALIAS
-_CODEX_AAWM_SOTA_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_CANDIDATES
-_CODEX_AAWM_SOTA_OPENAI_ALIAS = _POLICY_CODEX_AAWM_SOTA_OPENAI_ALIAS
-_CODEX_AAWM_SOTA_XAI_ALIAS = _POLICY_CODEX_AAWM_SOTA_XAI_ALIAS
-_CODEX_AAWM_SOTA_MOONSHOT_ALIAS = _POLICY_CODEX_AAWM_SOTA_MOONSHOT_ALIAS
-_CODEX_AAWM_SOTA_ALIBABA_ALIAS = _POLICY_CODEX_AAWM_SOTA_ALIBABA_ALIAS
-_CODEX_AAWM_SOTA_DEEPSEEK_ALIAS = _POLICY_CODEX_AAWM_SOTA_DEEPSEEK_ALIAS
-_CODEX_AAWM_SOTA_GLM_ALIAS = _POLICY_CODEX_AAWM_SOTA_GLM_ALIAS
-_CODEX_AAWM_SOTA_OPENAI_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_OPENAI_CANDIDATES
-_CODEX_AAWM_SOTA_XAI_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_XAI_CANDIDATES
-_CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES
-_CODEX_AAWM_SOTA_ALIBABA_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_ALIBABA_CANDIDATES
-_CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES
-_CODEX_AAWM_SOTA_GLM_CANDIDATES = _POLICY_CODEX_AAWM_SOTA_GLM_CANDIDATES
-_CODEX_AAWM_CODE_CANDIDATES = _POLICY_CODEX_AAWM_CODE_CANDIDATES
-_CODEX_AAWM_LOW_CANDIDATES = _POLICY_CODEX_AAWM_LOW_CANDIDATES
-_CODEX_AAWM_ORCHESTRATION_CANDIDATES = _POLICY_CODEX_AAWM_ORCHESTRATION_CANDIDATES
-_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS = _POLICY_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-_ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = _POLICY_ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-_ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER = _POLICY_ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER
-_ANTHROPIC_AUTO_AGENT_HAIKU_MODEL = _POLICY_ANTHROPIC_AUTO_AGENT_HAIKU_MODEL
-_ANTHROPIC_AUTO_AGENT_CANDIDATES = _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES
-_ANTHROPIC_AAWM_READ_ALIAS = _POLICY_ANTHROPIC_AAWM_READ_ALIAS
-_ANTHROPIC_AAWM_SOTA_ALIAS = _POLICY_ANTHROPIC_AAWM_SOTA_ALIAS
-_ANTHROPIC_AAWM_CODE_ALIAS = _POLICY_ANTHROPIC_AAWM_CODE_ALIAS
-_ANTHROPIC_AAWM_LOW_ALIAS = _POLICY_ANTHROPIC_AAWM_LOW_ALIAS
-_ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_ALIAS
-_ANTHROPIC_AAWM_SOTA_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_CANDIDATES
-_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES
-_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES
-_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES
-_ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES = _POLICY_ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES
-_ANTHROPIC_AAWM_CODE_CANDIDATES = _POLICY_ANTHROPIC_AAWM_CODE_CANDIDATES
-_ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES = _POLICY_ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES
-_ANTHROPIC_AAWM_LOW_CANDIDATES = _POLICY_ANTHROPIC_AAWM_LOW_CANDIDATES
-_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS = _POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS = _POLICY_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
-_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS = _POLICY_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS
-_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS = _POLICY_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS
-_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS = _POLICY_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS
-_ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES = (
-    _POLICY_ANTHROPIC_GOOGLE_COMPLETION_ADAPTER_ALLOWED_MODEL_PREFIXES
-)
-_CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES = (
-    _POLICY_CODEX_GOOGLE_CODE_ASSIST_ADAPTER_ALLOWED_MODEL_PREFIXES
-)
-_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER = _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
-_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS = _POLICY_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS
-_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS = _POLICY_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS
-_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS = _POLICY_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS
+from .aawm_alias_routing import policy as _aawm_alias_policy_compat
+_aawm_alias_policy_compat.install_policy_compat_aliases(globals())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -719,32 +567,7 @@ _write_aawm_alias_routing_durable_payload = _aawm_alias_durable.write_aawm_alias
 _AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX = _aawm_alias_durable.AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX
 _AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT = _aawm_alias_durable.AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT
 
-_ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL = _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_TOKEN_URL
-_ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS = _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_AUTH_FILE_ENV_VARS
-_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS = _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_DEFAULT_AUTH_PATHS
-_ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_ID_ENV_VARS = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_ID_ENV_VARS
-)
-_ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_SECRET_ENV_VARS = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_OAUTH_CLIENT_SECRET_ENV_VARS
-)
-_ANTHROPIC_ADAPTER_GEMINI_CLI_BUNDLE_PATH_ENV_VARS = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_CLI_BUNDLE_PATH_ENV_VARS
-)
-_ANTHROPIC_ADAPTER_GEMINI_DEFAULT_CLI_BUNDLE_GLOBS = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_DEFAULT_CLI_BUNDLE_GLOBS
-)
-_ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_ID_PATTERN = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_ID_PATTERN
-)
-_ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN = (
-    _aawm_google_oauth._ANTHROPIC_ADAPTER_GEMINI_CLI_OAUTH_CLIENT_SECRET_PATTERN
-)
-
-
 # --- restored missing constants from HEAD (ordered) ---
-
-_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST = _antigravity_constants._ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST
 
 _OPENCODE_ZEN_DEFAULT_BASE_URL = _opencode_zen_constants._OPENCODE_ZEN_DEFAULT_BASE_URL
 _OPENCODE_ZEN_PROVIDER = _opencode_zen_constants._OPENCODE_ZEN_PROVIDER
@@ -766,17 +589,6 @@ _CLAUDE_PERSISTED_OUTPUT_INLINE_PATTERN = _aawm_lane_keys._CLAUDE_PERSISTED_OUTP
 _CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN = _aawm_lane_keys._CLAUDE_EXPANDED_PERSISTED_OUTPUT_INLINE_PATTERN
 _CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN = _aawm_lane_keys._CLAUDE_EXPANDED_AUXILIARY_CONTEXT_INLINE_PATTERN
 _ANTHROPIC_BILLING_HEADER_PREFIX = _anthropic_providers_common._ANTHROPIC_BILLING_HEADER_PREFIX
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME = _google_env_policy._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_NAME
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION = _google_env_policy._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_VERSION
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV = _google_env_policy._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_ENV
-_GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT = _google_env_policy._GOOGLE_ADAPTER_SYSTEM_PROMPT_POLICY_DEFAULT
-_GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT = _google_env_policy._GOOGLE_ADAPTER_COMPACT_SYSTEM_PROMPT
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_NAME
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_VERSION
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT
-_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT = _google_env_policy._CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_PROMPT
-
 _CODEX_REASONING_EFFORT_TIERS = _aawm_lane_keys._CODEX_REASONING_EFFORT_TIERS
 _CODEX_REASONING_EFFORT_TIER_INDEX = _aawm_lane_keys._CODEX_REASONING_EFFORT_TIER_INDEX
 _CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS = _aawm_lane_keys._CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS
@@ -819,8 +631,6 @@ _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
 _AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV = "AAWM_ALIAS_ROUTE_VERBOSE_JSON"
 _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS = 5 * 60.0
 _CODEX_AUTO_AGENT_AUTH_DEGRADED_LOG_INTERVAL_SECONDS = 60.0
-_CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY = "antigravity:auth_degraded"
-
 _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS = frozenset(
     {
         "HIGH_DEMAND",
@@ -839,18 +649,6 @@ _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS = frozenset(
     }
 )
 
-_GOOGLE_ADAPTER_PRESERVED_SYSTEM_PROMPT_HEADING = "# Preserved Project And Safety Instructions"
-_GOOGLE_ADAPTER_ORIGINAL_SYSTEM_PROMPT_HEADING = "# Original Claude System Instructions"
-_GOOGLE_ADAPTER_CLAUDE_OVERHEAD_MARKERS = (
-    "you are claude code",
-    "anthropic's official cli for claude",
-    "anthropic's official claude cli",
-    "claude code's slash commands",
-    "claude code slash commands",
-)
-_GOOGLE_ADAPTER_SYNTHETIC_TOOL_CONTEXT_PATTERN = re.compile(
-    r"\ACalling (?:tool [A-Za-z0-9_.:-]+|tools: [A-Za-z0-9_.:,\-\s]+)\.\Z"
-)
 _OPENAI_ADAPTER_CONTEXT_MARKERS: tuple[tuple[str, str], ...] = (
     ("SubagentStart hook additional context:", "subagentstart"),
     ("SubAgentStart hook additional context:", "subagentstart"),
@@ -866,12 +664,6 @@ Parallel tool calls are enabled. When the current user task asks for multiple in
 Follow the latest user task exactly. Use the provided tool schemas as the source of truth for arguments. Emit no assistant text before tool calls when the task asks for tool calls only. After tool results return, provide the requested final answer.
 
 Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message."""
-_PASSTHROUGH_SESSION_ID_HEADER_NAMES = (
-    "session_id",
-    "Session_Id",
-    "x-session-id",
-    "X-Session-Id",
-)
 _PASS_THROUGH_HEADER_PREFIX = "x-pass-"
 _AAWM_TENANT_ID_HEADER_NAMES = (
     "x-aawm-tenant-id",
@@ -883,69 +675,6 @@ _AAWM_TENANT_ID_HEADER_NAMES = (
     "x-litellm-team-id",
     "x-team-id",
 )
-_PASSTHROUGH_REPOSITORY_HEADER_NAMES = (
-    "x-aawm-repository",
-    "x-litellm-repository",
-    "x-repository",
-    "x-git-repository",
-)
-_PASSTHROUGH_REPOSITORY_BODY_KEYS = frozenset(
-    {
-        "repository",
-        "repo",
-        "workspace_root",
-        "workspaceRoot",
-        "project_root",
-        "projectRoot",
-        "root_path",
-        "rootPath",
-        "working_directory",
-        "workingDirectory",
-        "cwd_path",
-        "cwdPath",
-        "cwd_uri",
-        "cwdUri",
-    }
-)
-_PASSTHROUGH_REPOSITORY_TEXT_PATTERNS = (
-    re.compile(
-        r"<environment_context>[\s\S]{0,2000}<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>",
-        re.IGNORECASE,
-    ),
-    re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
-    re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
-    re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^`'\"\n<]+)"),
-    re.compile(
-        r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
-        re.IGNORECASE,
-    ),
-)
-_PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES = {
-    "...",
-    "memories",
-    "new",
-    "path",
-    "project",
-    "remote",
-    "repo",
-    "repository",
-    "unknown",
-}
-_PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES = {
-    "agent",
-    "analyst",
-    "architect",
-    "engineer",
-    "infra",
-    "ops",
-    "orchestrator",
-    "principal",
-    "qa",
-    "researcher",
-    "reviewer",
-    "salvage",
-    "tester",
-}
 _PASSTHROUGH_REPOSITORY_AGENT_ID_RE = re.compile(
     r"^agent-[a-f0-9]{3,}$",
     re.IGNORECASE,
@@ -959,8 +688,6 @@ _PASSTHROUGH_REPOSITORY_TRANSCRIPT_ARTIFACT_RE = re.compile(
     re.IGNORECASE,
 )
 _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS = frozenset({"/messages", "/v1/messages"})
-
-_CODEX_GOOGLE_CODE_ASSIST_DEFAULT_MAX_TOKENS = 8192
 
 _ANTHROPIC_ADAPTER_OPENAI_FORWARD_HEADER_ALLOWLIST = (
     "authorization",
@@ -1040,31 +767,6 @@ router.post(
 
 
 
-_GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST = frozenset(
-    {
-        "accept",
-        "authorization",
-        "content-type",
-        "user-agent",
-        "x-goog-api-client",
-    }
-)
-
-_ANTIGRAVITY_CODE_ASSIST_DEFAULT_BASE_URL = "https://daily-cloudcode-pa.googleapis.com"
-_ANTIGRAVITY_CLIENT_HEADER_DEFAULT = "antigravity-cli/1.0.4"
-# RR-054 #1: Antigravity OAuth path/client constants owned by package.
-_ANTIGRAVITY_AUTH_FILE_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_AUTH_FILE_ENV_VARS
-_ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_MANAGED_AUTH_FILE_ENV_VARS
-_ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_SEED_AUTH_FILE_ENV_VARS
-_ANTIGRAVITY_DEFAULT_AUTH_PATHS = _aawm_antigravity_oauth._ANTIGRAVITY_DEFAULT_AUTH_PATHS
-_ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_OAUTH_CLIENT_ID_ENV_VARS
-_ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV_VARS
-_ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS = _aawm_antigravity_oauth._ANTIGRAVITY_CLI_BINARY_PATH_ENV_VARS
-_ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS = _aawm_antigravity_oauth._ANTIGRAVITY_DEFAULT_CLI_BINARY_PATHS
-_ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN = _aawm_antigravity_oauth._ANTIGRAVITY_CLI_OAUTH_CLIENT_ID_VALUE_PATTERN
-_ANTIGRAVITY_CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN = (
-    _aawm_antigravity_oauth._ANTIGRAVITY_CLI_OAUTH_CLIENT_SECRET_VALUE_PATTERN
-)
 _CLAUDE_AGENT_SPEC_DIR_ENV_VARS = (
     "LITELLM_CLAUDE_AGENTS_DIR",
     "CLAUDE_AGENTS_DIR",
@@ -1096,206 +798,8 @@ _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
 _claude_agent_model_cache: dict[Path, tuple[Optional[int], Optional[str]]] = {}
 # RR-054 #1: OAuth access-token caches owned by aawm_alias_routing package.
-_google_oauth_access_token_cache = _alias_routing_state.google_oauth.tokens
-_google_oauth_access_token_lock = _alias_routing_state.google_oauth.lock
-_antigravity_oauth_access_token_cache = _alias_routing_state.antigravity_oauth.tokens
-_antigravity_oauth_access_token_lock = _alias_routing_state.antigravity_oauth.lock
 # RR-054 #1/#3: Google process state is constructed only by the provider owner.
-_GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE = _anthropic_google_process_cache._GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE
-_google_code_assist_project_cache = _anthropic_google_process_cache._google_code_assist_project_cache
-_google_code_assist_project_lock = _anthropic_google_process_cache._google_code_assist_project_lock
-_google_code_assist_prime_until_monotonic_by_key = (
-    _anthropic_google_process_cache._google_code_assist_prime_until_monotonic_by_key
-)
-_google_code_assist_prime_quota_by_key = _anthropic_google_process_cache._google_code_assist_prime_quota_by_key
-_google_code_assist_prime_lock = _anthropic_google_process_cache._google_code_assist_prime_lock
-_google_adapter_semaphores = _anthropic_google_process_cache._google_adapter_semaphores
-_google_adapter_rate_limit_lock = _alias_routing_state.google_rate_limit.lock
-_google_adapter_rate_limit_until_monotonic_by_key = _alias_routing_state.google_rate_limit.until_monotonic_by_key
-
-
-async def _post_code_assist_json(
-    *,
-    url: str,
-    headers: dict[str, str],
-    body: dict[str, object],
-    timeout: float,
-) -> _anthropic_google_process_cache.HttpResponse:
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        return await client.post(url, headers=headers, json=body)
-
-
-def _raise_code_assist_process_cache_http_error(
-    *,
-    status_code: int,
-    detail: str,
-) -> Never:
-    raise HTTPException(status_code=status_code, detail=detail)
-
-
 @lru_cache(maxsize=1)
-def _get_anthropic_google_process_cache_runtime() -> _anthropic_google_process_cache.Runtime:
-    return _anthropic_google_process_cache.Runtime(
-        get_target_base=lambda provider: _get_code_assist_adapter_target_base(provider),
-        build_headers=lambda **kwargs: _build_code_assist_adapter_native_headers(**kwargs),
-        validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
-        post_json=_post_code_assist_json,
-        capture_shape=lambda **kwargs: capture_passthrough_shape(**kwargs),
-        clean_value=lambda value: _clean_codex_auth_value(value),
-        raise_http_error=_raise_code_assist_process_cache_http_error,
-        get_prime_ttl_seconds=lambda: _get_google_code_assist_prime_ttl_seconds(),
-        get_prime_cache_key=lambda token, project: (_get_google_code_assist_prime_cache_key(token, project)),
-        sanitize_quota=lambda value, source: (_sanitize_google_code_assist_quota_for_logging(value, source=source)),
-        get_max_concurrent=lambda: _get_google_adapter_max_concurrent(),
-        get_rate_limit_key=lambda model, **kwargs: (_get_google_adapter_rate_limit_key(model, **kwargs)),
-        monotonic=time.monotonic,
-        debug_enabled=lambda: os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1",
-        log_info=lambda message, value: verbose_proxy_logger.info(message, value),
-        default_provider=litellm.LlmProviders.GEMINI.value,
-    )
-
-
-def _bound_google_adapter_token_cache(cache: dict, *, max_size: int = _GOOGLE_ADAPTER_TOKEN_CACHE_MAX_SIZE) -> None:
-    return _anthropic_google_process_cache._bound_google_adapter_token_cache(
-        cache,
-        max_size=max_size,
-    )
-
-
-_google_adapter_user_prompt_turn_lock = _anthropic_google_process_cache._google_adapter_user_prompt_turn_lock
-_google_adapter_user_prompt_turn_counters = _anthropic_google_process_cache._google_adapter_user_prompt_turn_counters
-_openrouter_adapter_rate_limit_lock = _alias_routing_state.openrouter_rate_limit.lock
-_openrouter_adapter_rate_limit_until_monotonic_by_key = (
-    _alias_routing_state.openrouter_rate_limit.until_monotonic_by_key
-)
-_openrouter_adapter_failure_circuit_until_monotonic_by_key = (
-    _alias_routing_state.openrouter_failure_circuit.until_monotonic_by_key
-)
-_CODEX_SPAWN_AGENT_TOOL_NAME = "spawn_agent"
-_CODEX_MULTI_AGENT_TOOL_SEARCH_TYPE = "tool_search"
-_CODEX_SPAWN_AGENT_FANOUT_POLICY_PATCH_ID = "spawn-agent-fanout-policy"
-_CODEX_SPAWN_AGENT_PAYLOAD_SCHEMA_PATCH_ID = "spawn-agent-payload-schema"
-_CODEX_CORE_TOOL_GUIDANCE_PATCH_PREFIX = "core-tool-guidance"
-_CODEX_UNSUPPORTED_HOSTED_TOOLS_MODEL_INFO_FIELD = "unsupported_hosted_tools"
-_CODEX_UNSUPPORTED_REQUEST_PARAMS_MODEL_INFO_FIELD = "unsupported_request_params"
-_CODEX_UNSUPPORTED_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "unsupported_input_item_types"
-_CODEX_REWRITE_INPUT_ITEM_TYPES_MODEL_INFO_FIELD = "rewrite_input_item_types"
-_CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = "custom_tool_function_adapters"
-_CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = "namespace_tool_function_adapters"
-_CODEX_SPAWN_AGENT_FANOUT_POLICY = (
-    "Use subagents to parallelize independent work while keeping one local owner "
-    "on the critical path. Follow the current operator and project instructions "
-    "that authorize fanout; do not treat generic depth or investigation wording "
-    "as permission to launch unrelated autonomous fanout. Do not duplicate the "
-    "same task across agents.\n\n"
-    "For read-only or exploration workers, call multi_agent_v1.spawn_agent with "
-    'lower-case payload fields: model="aawm-codex-agent-auto", '
-    'fork_turns="none" unless context sharing is explicitly needed, and message '
-    "containing the read-only boundary plus the audit task. If a fix is needed, "
-    "the worker should describe the patch only.\n\n"
-    "For coding workers, this read-only payload does not apply. Include the "
-    "selected coding model from the configured coding-model priority order, "
-    "assign a clear disjoint write set, and tell workers they are not alone in "
-    "the codebase. They must not revert unrelated edits.\n\n"
-    "Use the latest frontier model for cross-document architecture, migration-risk "
-    "review, and high-stakes database safety reasoning. Use the latest Codex model "
-    "for bounded implementation tasks with clear, disjoint write ownership. Use "
-    "mini-class agents for narrow grep/read-only scans, documentation consistency "
-    "checks, test inventory, and quick QA passes. For database or migration "
-    "work, prefer read-only explorer subagents; the main owner should run live "
-    "database commands so target verification and credential handling stay in "
-    "one place."
-)
-_CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
-    "agent_type": {
-        "type": "string",
-        "description": (
-            "Optional configured agent role. Use a role whose config selects the "
-            "required model and execution policy."
-        ),
-    },
-    "model": {
-        "type": "string",
-        "description": (
-            "Optional lower-case model override accepted by the orchestrator. "
-            "Use aawm-codex-agent-auto for read-only/exploration workers; use "
-            "the selected coding model for coding workers."
-        ),
-    },
-    "fork_turns": {
-        "type": "string",
-        "enum": ["none", "all"],
-        "description": (
-            "Which parent turns to fork into the worker. Use none for isolated "
-            "workers unless the complete parent context is explicitly required."
-        ),
-    },
-    "message": {
-        "type": "string",
-        "description": (
-            "Plain-text task prompt for the worker, including read-only or "
-            "coding scope, file boundaries, and final-answer requirements."
-        ),
-    },
-}
-_CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER = (
-    "agent_type",
-    "model",
-    "fork_turns",
-    "message",
-)
-_CODEX_CORE_TOOL_GUIDANCE_BY_NAME: dict[str, str] = {
-    "bash": (
-        "Claude Code core tool reliability guidance: Use Bash for inspection, "
-        "test, and simple commands. Prefer structured Edit or Write tools for "
-        "source changes instead of complex sed, perl, awk, or shell-quoted "
-        "rewrites. After a shell quoting or syntax error, do not retry a more "
-        "complex one-liner; switch to a smaller structured edit or report the "
-        "exact blocker."
-    ),
-    "edit": (
-        "Claude Code core tool reliability guidance: Edit old_string must be "
-        "copied from the current file contents. If an Edit fails with "
-        "`String to replace not found in file`, do not retry the same "
-        "old_string. Re-read the exact target span, narrow the hunk to the "
-        "smallest stable current context, and then retry once with current "
-        "text."
-    ),
-    "read": (
-        "Claude Code core tool reliability guidance: Use bounded reads for "
-        "large transcript, task-output, or log files. For .output transcript "
-        "files, use offset/limit or available transcript search/meta tools "
-        "instead of unbounded full-file reads."
-    ),
-    "write": (
-        "Claude Code core tool reliability guidance: Use Write for new files or "
-        "known full-file replacements. Before overwriting an existing file, read "
-        "the current file first and preserve unrelated content."
-    ),
-}
-_CODEX_SPAWN_AGENT_RESTRICTIVE_DESCRIPTION_PATTERNS = (
-    re.compile(
-        r"Only use `?spawn_agent`? if and only if the user explicitly asks for "
-        r"sub-?agents, delegation, or parallel agent work\.\s*"
-        r"Requests for depth, thoroughness, research, investigation, or detailed "
-        r"codebase analysis do not count as permission to spawn\.\s*"
-        r"Agent-role guidance below only helps choose which agent to use after "
-        r"spawning is already authorized; it never authorizes spawning by itself\.",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"Only use `?spawn_agent`? if and only if the user explicitly asks for "
-        r"sub-?agents, delegation, or parallel agent work\.",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"I may only use `?spawn_agent`? when the user explicitly asks for "
-        r"sub-?agents, delegation, or parallel agent work\.",
-        re.IGNORECASE,
-    ),
-)
-
-
 def _is_openai_responses_endpoint(endpoint: str) -> bool:
     normalized_path = httpx.URL(endpoint).path.rstrip("/")
     if not normalized_path.startswith("/"):
@@ -1496,15 +1000,6 @@ _normalize_kimi_code_chat_completions_adapter_model_name = _aawm_adapter_model_r
 _normalize_alibaba_token_plan_adapter_model_name = _aawm_adapter_model_resolution._normalize_alibaba_token_plan_adapter_model_name
 
 
-_normalize_anthropic_google_completion_adapter_model_name = _aawm_adapter_model_resolution._normalize_anthropic_google_completion_adapter_model_name
-
-
-_normalize_antigravity_code_assist_adapter_model_name = _aawm_adapter_model_resolution._normalize_antigravity_code_assist_adapter_model_name
-
-
-_normalize_codex_google_code_assist_adapter_model_name = _aawm_adapter_model_resolution._normalize_codex_google_code_assist_adapter_model_name
-
-
 _resolve_codex_opencode_zen_adapter_model = _aawm_adapter_model_resolution._resolve_codex_opencode_zen_adapter_model
 
 
@@ -1523,15 +1018,6 @@ _resolve_anthropic_kimi_chat_completions_adapter_model = _aawm_adapter_model_res
 _resolve_anthropic_alibaba_token_plan_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_alibaba_token_plan_adapter_model
 
 
-_resolve_anthropic_antigravity_code_assist_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_antigravity_code_assist_adapter_model
-
-
-_resolve_codex_google_code_assist_adapter_model = _aawm_adapter_model_resolution._resolve_codex_google_code_assist_adapter_model
-
-
-_resolve_codex_antigravity_code_assist_adapter_model = _aawm_adapter_model_resolution._resolve_codex_antigravity_code_assist_adapter_model
-
-
 _normalize_codex_auto_agent_alias_model = _aawm_adapter_model_resolution._normalize_codex_auto_agent_alias_model
 
 
@@ -1547,6 +1033,16 @@ _get_codex_auto_agent_header = _aawm_lane_keys._get_codex_auto_agent_header
 _hash_codex_auto_agent_lane_value = _aawm_lane_keys._hash_codex_auto_agent_lane_value
 
 
+_extract_passthrough_session_id = (
+    _aawm_observability_metadata._extract_passthrough_session_id
+)
+_aawm_request_metadata.configure_request_metadata_runtime(
+    extract_passthrough_session_id=_extract_passthrough_session_id,
+    get_codex_auto_agent_header=_get_codex_auto_agent_header,
+)
+_aawm_request_metadata.install(globals())
+
+
 _resolve_codex_auto_agent_openai_lane_key = _aawm_lane_keys._resolve_codex_auto_agent_openai_lane_key
 
 
@@ -1556,168 +1052,8 @@ _resolve_codex_auto_agent_openai_cooldown_lane_key = _aawm_lane_keys._resolve_co
 _get_codex_auto_agent_lane_state_cache_ttl_seconds = _aawm_lane_keys._get_codex_auto_agent_lane_state_cache_ttl_seconds
 
 
-_get_codex_auto_agent_google_lane_cache_key = _aawm_lane_keys._get_codex_auto_agent_google_lane_cache_key
-
-
-_get_codex_auto_agent_antigravity_lane_cache_key = _aawm_lane_keys._get_codex_auto_agent_antigravity_lane_cache_key
-
-
-def _invalidate_codex_auto_agent_google_lane_cache() -> None:
-    cache_key = _get_codex_auto_agent_google_lane_cache_key()
-    _codex_auto_agent_google_lane_key_until_monotonic_by_key.pop(cache_key, None)
-    _codex_auto_agent_google_lane_key_by_key.pop(cache_key, None)
-
-
-def _invalidate_codex_auto_agent_antigravity_lane_cache() -> None:
-    cache_key = _get_codex_auto_agent_antigravity_lane_cache_key()
-    _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.pop(
-        cache_key,
-        None,
-    )
-    _codex_auto_agent_antigravity_lane_key_by_key.pop(cache_key, None)
-
-
 def _invalidate_codex_auto_agent_lane_state_caches() -> None:
-    _invalidate_codex_auto_agent_google_lane_cache()
-    _invalidate_codex_auto_agent_antigravity_lane_cache()
-
-
-async def _resolve_codex_auto_agent_google_lane_key() -> str:
-    if time.monotonic() < _alias_routing_state.google_lane_negative_until_monotonic:
-        return _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY
-    cache_key = _get_codex_auto_agent_google_lane_cache_key()
-    ttl_seconds = _get_codex_auto_agent_lane_state_cache_ttl_seconds()
-    if ttl_seconds > 0:
-        async with _codex_auto_agent_lane_state_cache_lock:
-            cached_until = _codex_auto_agent_google_lane_key_until_monotonic_by_key.get(cache_key, 0.0)
-            if cached_until > time.monotonic():
-                cached_lane_key = _codex_auto_agent_google_lane_key_by_key.get(cache_key)
-                if isinstance(cached_lane_key, str) and cached_lane_key:
-                    return cached_lane_key
-
-    try:
-        google_access_token = await _load_valid_local_google_oauth_access_token()
-        google_project = await _get_or_load_google_code_assist_project(google_access_token)
-        lane_key = _get_google_adapter_rate_limit_key(
-            None,
-            access_token=google_access_token,
-            companion_project=google_project,
-        )
-    except Exception:
-        _invalidate_codex_auto_agent_google_lane_cache()
-        _alias_routing_state.google_lane_negative_until_monotonic = (
-            time.monotonic() + _CODEX_AUTO_AGENT_GOOGLE_LANE_NEGATIVE_TTL_SECONDS
-        )
-        if _should_log_aawm_alias_routing_event("google-lane-resolve-failed"):
-            verbose_proxy_logger.warning(
-                "Codex auto-agent alias could not resolve Google Code Assist lane; "
-                "marking auth-degraded (negative-cached %.1fs)",
-                _CODEX_AUTO_AGENT_GOOGLE_LANE_NEGATIVE_TTL_SECONDS,
-                exc_info=True,
-            )
-        return _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY
-
-    if ttl_seconds > 0:
-        async with _codex_auto_agent_lane_state_cache_lock:
-            _codex_auto_agent_google_lane_key_by_key[cache_key] = lane_key
-            _codex_auto_agent_google_lane_key_until_monotonic_by_key[cache_key] = time.monotonic() + ttl_seconds
-    return lane_key
-
-
-async def _resolve_codex_auto_agent_google_lane_state() -> Payload:
-    lane_key = await _resolve_codex_auto_agent_google_lane_key()
-    if lane_key != _CODEX_AUTO_AGENT_GOOGLE_AUTH_DEGRADED_LANE_KEY:
-        return {"lane_key": lane_key}
-    return {
-        "lane_key": lane_key,
-        "forced_cooldown_seconds": _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS,
-        "skip_reason": "auth_degraded",
-        "cooldown_state_source": "auth_degraded",
-        "failure_phase": "auth",
-        "attempted_provider_call": False,
-    }
-
-
-def _is_codex_auto_agent_antigravity_auth_degraded_exception(exc: Any) -> bool:
-    return _anthropic_antigravity_provider._is_codex_auto_agent_antigravity_auth_degraded_exception(
-        exc,
-        runtime=_get_anthropic_antigravity_runtime(),
-    )
-
-
-def _log_codex_auto_agent_antigravity_auth_degraded(exc: HTTPException) -> None:
-    now = time.monotonic()
-    if now < _alias_routing_state.antigravity_auth_degraded_log_until_monotonic:
-        return
-    _alias_routing_state.antigravity_auth_degraded_log_until_monotonic = (
-        now + _CODEX_AUTO_AGENT_AUTH_DEGRADED_LOG_INTERVAL_SECONDS
-    )
-    verbose_proxy_logger.warning(
-        "Codex auto-agent alias marked Antigravity Code Assist lane degraded; "
-        "using auth-degraded lane sentinel until sidecar refresh is available "
-        "(provider=antigravity, failure_kind=auth_degraded, status_code=%s, "
-        "cooldown_seconds=%.1f, detail=%s)",
-        exc.status_code,
-        _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS,
-        str(exc.detail),
-    )
-
-
-async def _resolve_codex_auto_agent_antigravity_lane_key() -> str:
-    cache_key = _get_codex_auto_agent_antigravity_lane_cache_key()
-    ttl_seconds = _get_codex_auto_agent_lane_state_cache_ttl_seconds()
-    if ttl_seconds > 0:
-        async with _codex_auto_agent_lane_state_cache_lock:
-            cached_until = _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key.get(cache_key, 0.0)
-            if cached_until > time.monotonic():
-                cached_lane_key = _codex_auto_agent_antigravity_lane_key_by_key.get(cache_key)
-                if isinstance(cached_lane_key, str) and cached_lane_key:
-                    return cached_lane_key
-
-    try:
-        antigravity_access_token = await _load_valid_local_antigravity_access_token()
-        antigravity_project = await _get_or_load_google_code_assist_project(
-            antigravity_access_token,
-            adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
-        )
-        lane_key = "antigravity:{}".format(
-            _get_google_adapter_rate_limit_key(
-                None,
-                access_token=antigravity_access_token,
-                companion_project=antigravity_project,
-            )
-        )
-    except Exception as exc:
-        if _is_codex_auto_agent_antigravity_auth_degraded_exception(exc):
-            _invalidate_codex_auto_agent_antigravity_lane_cache()
-            _log_codex_auto_agent_antigravity_auth_degraded(cast(HTTPException, exc))
-            return _CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY
-        _invalidate_codex_auto_agent_antigravity_lane_cache()
-        verbose_proxy_logger.error(
-            "Codex auto-agent alias could not resolve Antigravity Code Assist lane; using default lane",
-            exc_info=True,
-        )
-        return "__default__"
-
-    if ttl_seconds > 0 and lane_key != "__default__":
-        async with _codex_auto_agent_lane_state_cache_lock:
-            _codex_auto_agent_antigravity_lane_key_by_key[cache_key] = lane_key
-            _codex_auto_agent_antigravity_lane_key_until_monotonic_by_key[cache_key] = time.monotonic() + ttl_seconds
-    return lane_key
-
-
-async def _resolve_codex_auto_agent_antigravity_lane_state() -> dict[str, Any]:
-    lane_key = await _resolve_codex_auto_agent_antigravity_lane_key()
-    if lane_key != _CODEX_AUTO_AGENT_ANTIGRAVITY_AUTH_DEGRADED_LANE_KEY:
-        return {"lane_key": lane_key}
-    return {
-        "lane_key": lane_key,
-        "forced_cooldown_seconds": _CODEX_AUTO_AGENT_AUTH_DEGRADED_COOLDOWN_SECONDS,
-        "skip_reason": "auth_degraded",
-        "cooldown_state_source": "auth_degraded",
-        "failure_phase": "auth",
-        "attempted_provider_call": False,
-    }
+    pass
 
 
 def _resolve_codex_auto_agent_session_key(
@@ -1773,343 +1109,106 @@ def _auto_agent_alias_cooldown_until(
     )
 
 
-def _extract_auto_agent_alias_session_id(
-    request: Request,
-    request_body: dict[str, Any],
-) -> Optional[str]:
-    metadata = request_body.get("litellm_metadata")
-    if isinstance(metadata, dict):
-        session_id = _clean_codex_auth_value(metadata.get("session_id"))
-        if session_id is not None:
-            return session_id
-    passthrough_session_id = _extract_passthrough_session_id(request, request_body)
-    if passthrough_session_id is not None:
-        return passthrough_session_id
-    headers = _safe_get_request_headers(request)
-    for header_name in ("session_id", "session-id", "x-session-id"):
-        header_value = _get_codex_auto_agent_header(headers, header_name)
-        if header_value is not None:
-            return header_value
-    return None
+_aawm_audit_context.configure_audit_context_runtime(
+    clean_secret_string=lambda *a, **kw: _clean_secret_string(*a, **kw),
+    extract_metadata_value=lambda *a, **kw: _extract_auto_agent_alias_metadata_value(
+        *a, **kw
+    ),
+    extract_client_product_label=lambda *a, **kw: (
+        _extract_auto_agent_alias_client_product_label(*a, **kw)
+    ),
+    resolve_host_attribution=lambda *a, **kw: (
+        _resolve_auto_agent_alias_route_host_attribution(*a, **kw)
+    ),
+    extract_session_id=lambda *a, **kw: _extract_auto_agent_alias_session_id(
+        *a, **kw
+    ),
+    build_rollup_group_header_label=lambda *a, **kw: (
+        _build_auto_agent_alias_rollup_group_header_label(*a, **kw)
+    ),
+    has_continuation_state=lambda *a, **kw: (
+        _codex_auto_agent_request_has_continuation_state(*a, **kw)
+    ),
+)
+_aawm_audit_context.install(globals())
+uuid4 = _aawm_audit_context.uuid4
 
+_aawm_audit_build.configure_audit_build_runtime(
+    get_request_context=lambda *a, **kw: _get_auto_agent_alias_request_context(
+        *a, **kw
+    ),
+    attach_terminal_context_fields=lambda *a, **kw: (
+        _attach_auto_agent_alias_terminal_context_fields(*a, **kw)
+    ),
+    format_timestamp=_format_auto_agent_alias_timestamp,
+    extract_metadata_value=lambda *a, **kw: _extract_auto_agent_alias_metadata_value(
+        *a, **kw
+    ),
+    extract_incoming_endpoint=lambda *a, **kw: (
+        _extract_auto_agent_alias_incoming_endpoint(*a, **kw)
+    ),
+    resolve_outgoing_target=lambda *a, **kw: (
+        _resolve_auto_agent_alias_route_rollup_outgoing_target(*a, **kw)
+    ),
+    to_int=_auto_agent_alias_int,
+    cooldown_until=_auto_agent_alias_cooldown_until,
+)
+_aawm_audit_build.install(globals())
 
-def _extract_auto_agent_alias_metadata_value(
-    request_body: dict[str, Any],
-    *keys: str,
-) -> Optional[str]:
-    metadata = request_body.get("litellm_metadata")
-    if not isinstance(metadata, dict):
-        return None
-    for key in keys:
-        value = _clean_codex_auth_value(metadata.get(key))
-        if value is not None:
-            return value
-    return None
+_aawm_audit_persist.configure_audit_persist_runtime(
+    record_route_status_rollup=lambda *a, **kw: (
+        _record_auto_agent_alias_route_status_rollup(*a, **kw)
+    ),
+    verbose_json_enabled=lambda: _aawm_alias_route_verbose_json_enabled(),
+    healthy_json_enabled=lambda: _aawm_alias_route_healthy_json_enabled(),
+)
+_aawm_audit_persist.install(globals())
 
-
-def _normalize_auto_agent_alias_client_product(value: Any) -> Optional[str]:
-    cleaned = _clean_codex_auth_value(value)
-    if cleaned is None:
-        return None
-    product = cleaned.split()[0].strip("()")
-    if not product:
-        return None
-    if "/" not in product:
-        return product
-    name, version = product.split("/", 1)
-    normalized_name = name.lower().replace("_", "-")
-    if normalized_name in {"codex", "codex-cli", "codex-tui", "codex-cli-rs"}:
-        name = "Codex"
-    elif normalized_name in {"claude", "claude-cli", "claude-code"}:
-        name = "Claude"
-    elif normalized_name in {"grok", "grok-build", "grok-pager"}:
-        name = "Grok"
-    return f"{name}/{version}"
-
-
-def _extract_auto_agent_alias_client_product_label(
-    request: Request,
-    request_body: dict[str, Any],
-) -> Optional[str]:
-    metadata = request_body.get("litellm_metadata")
-    if isinstance(metadata, dict):
-        for key in (
-            "client_name_version",
-            "client_label",
-            "client_user_agent",
-            "user_agent",
-        ):
-            value = _normalize_auto_agent_alias_client_product(metadata.get(key))
-            if value:
-                return value
-        name = _normalize_auto_agent_alias_client_product(metadata.get("client_name"))
-        version = _clean_codex_auth_value(metadata.get("client_version"))
-        if name and version and "/" not in name:
-            return f"{name}/{version}"
-        if name:
-            return name
-    headers = _safe_get_request_headers(request)
-    for header_name in (
-        "x-aawm-client",
-        "x-litellm-client",
-        "x-client-name-version",
-        "user-agent",
-    ):
-        value = _normalize_auto_agent_alias_client_product(_get_codex_auto_agent_header(headers, header_name))
-        if value:
-            return value
-    return None
-
-
-def _extract_auto_agent_alias_incoming_endpoint(request: Request) -> str:
-    parsed_url = urlparse(str(getattr(request, "url", "") or ""))
-    path = parsed_url.path or getattr(request, "path", None) or "/"
-    safe_pairs: list[tuple[str, str]] = []
-    for key, value in parse_qsl(parsed_url.query, keep_blank_values=True):
-        if key.lower() not in {"alt", "api-version", "beta", "stream"}:
-            continue
-        safe_key = _clean_codex_auth_value(key)
-        safe_value = _clean_codex_auth_value(value)
-        if safe_key and safe_value is not None:
-            safe_pairs.append((safe_key, safe_value))
-    if not safe_pairs:
-        return path
-    return f"{path}?{urlencode(safe_pairs)}"
-
-
-def _resolve_auto_agent_alias_route_rollup_outgoing_target(
-    *,
-    route_family: Optional[str],
-    target_url: Optional[Union[str, httpx.URL]] = None,
-) -> Optional[str]:
-    cleaned_route_family = _clean_codex_auth_value(route_family)
-    if target_url is not None:
-        return _get_anthropic_adapter_access_log_target_label(target_url)
-    route_family_target_labels = {
-        "codex_opencode_zen_adapter": "opencode.ai/zen/v1/chat/completions",
-        "codex_openrouter_completion_adapter": "openrouter.ai/api/v1/chat/completions",
-        "anthropic_opencode_zen_responses_adapter": "opencode.ai/zen/v1/responses",
-        "anthropic_opencode_zen_completion_adapter": "opencode.ai/zen/v1/chat/completions",
-    }
-    return route_family_target_labels.get(cleaned_route_family or "", cleaned_route_family)
-
-
-
-
-
-
-
-
-
-
-def _auto_agent_alias_model_rollup_label(event: dict[str, Any]) -> Optional[str]:
-    model = _clean_codex_auth_value(event.get("model"))
-    alias_model = _clean_codex_auth_value(event.get("alias_model"))
-    if model and alias_model and model != alias_model:
-        return f"{model}({alias_model})"
-    return model or alias_model
-
-
-def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str]:
-    event_type = str(event.get("event_type") or "")
-    candidate_status = str(event.get("candidate_status") or "")
-    selection_reason = str(event.get("selection_reason") or "")
-    failure_class = str(event.get("failure_class") or "")
-    cooldown_scope = str(event.get("cooldown_scope") or "")
-    if event_type == "no_candidate_available":
-        return "Exhausted"
-    if "auth_degraded" in candidate_status or "auth_degraded" in selection_reason:
-        return "Degraded"
-    # request-local / no-cooldown failures must not look like durable cool-downs.
-    # Note: do not substring-match "cooldown" — retryable_no_cooldown contains it.
-    if candidate_status == "retryable_no_cooldown" or cooldown_scope == "none":
-        if event.get("error_status_code") or failure_class:
-            return "Failed"
-        return None
-    if cooldown_scope == "request_local":
-        if event.get("error_status_code") or failure_class or event.get("redispatch_required"):
-            return "Failed"
-        return None
-    if candidate_status in {
-        "cooldown_set",
-        "terminal_in_flight_cooldown_set",
-        "skipped_cooldown",
-    } or (
-        candidate_status.startswith("skipped_")
-        and "cooldown" in candidate_status
-        and "auth_degraded" not in candidate_status
-    ):
-        return "Cooling Down"
-    if cooldown_scope == "candidate" or (event.get("redispatch_required") and cooldown_scope != "request_local"):
-        return "Cooling Down"
-    if failure_class in {"rate_limited", "capacity_exhausted", "transient_error"}:
-        return "Cooling Down"
-    if event.get("error_status_code") or failure_class:
-        return "Failed"
-    return None
-
-
-def _auto_agent_alias_route_status_message(event: dict[str, Any]) -> str:
-    parts: list[str] = []
-    source_error = _clean_codex_auth_value(event.get("source_error"))
-    if source_error is not None:
-        parts.append(f"source_error={source_error}")
-    for key in (
-        "failure_class",
-        "error_type",
-        "error_code",
-        "error_status_code",
-        "candidate_status",
-        "selection_reason",
-    ):
-        value = event.get(key)
-        if value is not None:
-            parts.append(f"{key}={value}")
-    error_tokens = event.get("error_tokens")
-    if isinstance(error_tokens, list) and error_tokens:
-        parts.append("error_tokens={}".format(",".join(str(v) for v in error_tokens[:5])))
-    return "; ".join(parts) or "route status changed"
-
-
-def _resolve_auto_agent_alias_route_host_attribution(
-    request: Request,
-) -> dict[str, Optional[str]]:
-    """Non-blocking host attribution for sync audit/event builders (RR-054 #4).
-
-    Reverse-DNS is never performed inline on the event loop: the shared resolver
-    defaults to ``allow_blocking_lookup=False`` and schedules background enrichment.
-    Async request paths that need a full lookup should await
-    ``_aresolve_auto_agent_alias_route_host_attribution``.
-    """
-    try:
-        return resolve_aawm_route_host_attribution(
-            request,
-            allow_blocking_lookup=False,
-        )
-    except Exception:
-        return {
-            "client_ip": None,
-            "client_ip_source": None,
-            "host_name": None,
-            "host_name_source": None,
-        }
-
-
-async def _aresolve_auto_agent_alias_route_host_attribution(
-    request: Request,
-) -> dict[str, Optional[str]]:
-    """Async host attribution that offloads DNS via aresolve (RR-054 #4)."""
-    try:
-        return await aresolve_aawm_route_host_attribution(
-            request,
-            allow_blocking_lookup=True,
-        )
-    except Exception:
-        return {
-            "client_ip": None,
-            "client_ip_source": None,
-            "host_name": None,
-            "host_name_source": None,
-        }
-
-
-def _build_auto_agent_alias_rollup_group_header_label(
-    *,
-    repository: Optional[str],
-    client_product_label: Optional[str],
-    host_name: Optional[str],
-) -> Optional[str]:
-    return build_aawm_route_rollup_group_header_label(
-        repository=repository,
-        client_product_label=client_product_label,
-        host_name=host_name,
-    )
-
-
-def _resolve_auto_agent_alias_route_rollup_group_header_label(
-    event: dict[str, Any],
-) -> Optional[str]:
-    group_header_label = _clean_codex_auth_value(event.get("rollup_group_header_label"))
-    if not group_header_label:
-        return None
-    host_name = _clean_codex_auth_value(event.get("host_name"))
-    if "@" in group_header_label or not host_name:
-        return group_header_label
-    return f"{group_header_label}@{host_name}"
-
-
-def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
-    status = _auto_agent_alias_route_rollup_status(event)
-    if status is None:
-        return
-    alias_model = _clean_codex_auth_value(event.get("alias_model"))
-    model_labels: list[str] = []
-    model_label = _auto_agent_alias_model_rollup_label(event)
-    if model_label:
-        model_labels.append(model_label)
-    candidates = event.get("candidates")
-    if isinstance(candidates, list):
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            candidate_model = _clean_codex_auth_value(candidate.get("model"))
-            if candidate_model and alias_model and candidate_model != alias_model:
-                candidate_model = f"{candidate_model}({alias_model})"
-            if candidate_model and candidate_model not in model_labels:
-                model_labels.append(candidate_model)
-    if not model_labels:
-        return
-
-    message = _auto_agent_alias_route_status_message(event)
-    for label in model_labels:
-        emit_aawm_route_status_event(
-            alias_model=alias_model,
-            model_label=label.split("(", 1)[0],
-            status=status,
-            message=message,
-        )
-
-    group_header_label = _resolve_auto_agent_alias_route_rollup_group_header_label(event)
-    incoming_endpoint = _clean_codex_auth_value(event.get("incoming_endpoint"))
-    outgoing_target = (
-        _clean_codex_auth_value(event.get("outgoing_target"))
-        or _resolve_auto_agent_alias_route_rollup_outgoing_target(
-            route_family=_clean_codex_auth_value(event.get("route_family")),
-            target_url=event.get("target_url"),
-        )
-        or "candidate_selection"
-    )
-    if not group_header_label or not incoming_endpoint:
-        return
-    for label in model_labels:
-        record_aawm_route_rollup(
-            group_header_label=group_header_label,
-            incoming_endpoint=incoming_endpoint,
-            outgoing_target=outgoing_target,
-            model_label=label,
-            turns=0,
-            status=status,
-            message=_clean_codex_auth_value(event.get("source_error")),
-        )
+_aawm_audit_events.configure_audit_events_runtime(
+    get_request_context=lambda *a, **kw: _get_auto_agent_alias_request_context(
+        *a, **kw
+    ),
+    attach_terminal_context_fields=lambda *a, **kw: (
+        _attach_auto_agent_alias_terminal_context_fields(*a, **kw)
+    ),
+    format_timestamp=_format_auto_agent_alias_timestamp,
+    extract_metadata_value=lambda *a, **kw: _extract_auto_agent_alias_metadata_value(
+        *a, **kw
+    ),
+    extract_incoming_endpoint=lambda *a, **kw: (
+        _extract_auto_agent_alias_incoming_endpoint(*a, **kw)
+    ),
+    resolve_codex_session_key=lambda *a, **kw: (
+        _resolve_codex_auto_agent_session_key(*a, **kw)
+    ),
+    resolve_anthropic_session_key=lambda *a, **kw: (
+        _resolve_anthropic_auto_agent_session_key(*a, **kw)
+    ),
+    emit_route_event=lambda *a, **kw: _emit_auto_agent_alias_route_event(*a, **kw),
+    build_audit_events=lambda *a, **kw: _build_auto_agent_alias_audit_events(
+        *a, **kw
+    ),
+    persist_audit_only_events=lambda *a, **kw: (
+        _persist_auto_agent_alias_audit_only_events_best_effort(*a, **kw)
+    ),
+)
+_aawm_audit_events.install(globals())
 
 
 # ---------------------------------------------------------------------------
-# Wave 5D: facade imports from audit_context / audit_build / audit_persist /
-# audit_events extraction modules.  Each name below is the SAME object as the
-# target module's definition.
+# Wave 7: Rollup functions owned by aawm_alias_routing/rollup.py
+# ---------------------------------------------------------------------------
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import rollup as _aawm_rollup
+
+_aawm_rollup.install(globals())
+
+
+# ---------------------------------------------------------------------------
+# Wave 5D compatibility constants not published by owner install APIs.
 # ---------------------------------------------------------------------------
 
-# -- audit_persist logger compatibility binding --
-# Same logger object used by audit_persist; bound here so existing tests that
-# monkeypatch ``lpe.verbose_aawm_route_logger.info`` intercept live emission.
 verbose_aawm_route_logger = _aawm_audit_persist.verbose_aawm_route_logger
 
-# -- audit_persist facades --
-_emit_auto_agent_alias_route_event = _aawm_audit_persist._emit_auto_agent_alias_route_event
-_should_emit_auto_agent_alias_route_event = _aawm_audit_persist._should_emit_auto_agent_alias_route_event
-_persist_auto_agent_alias_audit_only_events_best_effort = _aawm_audit_persist._persist_auto_agent_alias_audit_only_events_best_effort
-
-# -- audit_context constants --
 _AUTO_AGENT_ROLE_DECLARATION_RE = _aawm_audit_context._AUTO_AGENT_ROLE_DECLARATION_RE
 _AUTO_AGENT_KNOWN_ROLE_NAMES = _aawm_audit_context._AUTO_AGENT_KNOWN_ROLE_NAMES
 _AUTO_AGENT_PRIOR_TOOL_ITEM_TYPES = _aawm_audit_context._AUTO_AGENT_PRIOR_TOOL_ITEM_TYPES
@@ -2117,164 +1216,13 @@ _AUTO_AGENT_FILE_EDIT_TOOL_NAMES = _aawm_audit_context._AUTO_AGENT_FILE_EDIT_TOO
 _AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY = _aawm_audit_context._AUTO_AGENT_REQUEST_CALL_ID_STATE_KEY
 _AUTO_AGENT_REQUEST_CONTEXT_STATE_KEY = _aawm_audit_context._AUTO_AGENT_REQUEST_CONTEXT_STATE_KEY
 
-# -- audit_context facades --
-_extract_auto_agent_alias_text_blobs = _aawm_audit_context._extract_auto_agent_alias_text_blobs
-_extract_auto_agent_alias_role_from_text = _aawm_audit_context._extract_auto_agent_alias_role_from_text
-_infer_auto_agent_alias_role_from_request_body = _aawm_audit_context._infer_auto_agent_alias_role_from_request_body
-_iter_auto_agent_alias_metadata_dicts = _aawm_audit_context._iter_auto_agent_alias_metadata_dicts
-_extract_auto_agent_alias_agent_dispatch_fields = _aawm_audit_context._extract_auto_agent_alias_agent_dispatch_fields
-_walk_auto_agent_alias_prior_tool_activity = _aawm_audit_context._walk_auto_agent_alias_prior_tool_activity
-_summarize_auto_agent_alias_actual_prior_tool_activity = _aawm_audit_context._summarize_auto_agent_alias_actual_prior_tool_activity
-_classify_auto_agent_alias_terminal_activity_status = _aawm_audit_context._classify_auto_agent_alias_terminal_activity_status
-_get_or_create_auto_agent_alias_request_call_id = _aawm_audit_context._get_or_create_auto_agent_alias_request_call_id
 _AutoAgentAliasRequestContext = _aawm_audit_context._AutoAgentAliasRequestContext
-_normalize_auto_agent_alias_request_context = _aawm_audit_context._normalize_auto_agent_alias_request_context
-_clean_optional_string = _aawm_audit_context._clean_optional_string
-_get_auto_agent_alias_request_context = _aawm_audit_context._get_auto_agent_alias_request_context
-_attach_auto_agent_alias_terminal_context_fields = _aawm_audit_context._attach_auto_agent_alias_terminal_context_fields
-
-# -- audit_build facades --
-_is_auto_agent_alias_in_flight_cooldown_http_exception = _aawm_audit_build._is_auto_agent_alias_in_flight_cooldown_http_exception
-_build_auto_agent_alias_audit_event = _aawm_audit_build._build_auto_agent_alias_audit_event
-_build_auto_agent_alias_audit_events = _aawm_audit_build._build_auto_agent_alias_audit_events
-_codex_auto_agent_request_has_continuation_state = _aawm_audit_build._codex_auto_agent_request_has_continuation_state
-
-# -- audit_events facades --
-_enrich_auto_agent_alias_terminal_event_from_attempts = _aawm_audit_events._enrich_auto_agent_alias_terminal_event_from_attempts
-_emit_auto_agent_alias_no_candidate_event = _aawm_audit_events._emit_auto_agent_alias_no_candidate_event
-
-
-_raise_codex_auto_agent_in_flight_cooldown = _aawm_selection._raise_codex_auto_agent_in_flight_cooldown
-
-
-_build_auto_agent_redispatch_http_exception_detail = _aawm_selection._build_auto_agent_redispatch_http_exception_detail
-
-
-_raise_codex_auto_agent_redispatch_required = _aawm_selection._raise_codex_auto_agent_redispatch_required
-
-
-_get_codex_auto_agent_active_cooldown_state = _aawm_cooldown_state._get_codex_auto_agent_active_cooldown_state
-
-
-_get_codex_auto_agent_active_cooldown_seconds = _aawm_cooldown_state._get_codex_auto_agent_active_cooldown_seconds
-
-
-_set_codex_auto_agent_cooldown = _aawm_cooldown_state._set_codex_auto_agent_cooldown
-
-
-_get_codex_auto_agent_session_affinity = _aawm_cooldown_state._get_codex_auto_agent_session_affinity
-
-
-_set_codex_auto_agent_session_affinity = _aawm_cooldown_state._set_codex_auto_agent_session_affinity
-
-
-_find_codex_auto_agent_candidate = _aawm_selection._find_codex_auto_agent_candidate
-
-
-_find_codex_auto_agent_affinity_candidate = _aawm_selection._find_codex_auto_agent_affinity_candidate
-
-
-_is_auto_agent_candidate_state_available = _aawm_selection._is_auto_agent_candidate_state_available
-
-
-_build_auto_agent_skipped_candidates_from_states = _aawm_selection._build_auto_agent_skipped_candidates_from_states
-
-
-_apply_codex_auto_agent_forced_candidate_cooldown = _aawm_selection._apply_codex_auto_agent_forced_candidate_cooldown
-
-
-_apply_anthropic_auto_agent_forced_candidate_cooldown = _aawm_selection._apply_anthropic_auto_agent_forced_candidate_cooldown
-
-
-_apply_codex_auto_agent_request_local_candidate_state = _aawm_selection._apply_codex_auto_agent_request_local_candidate_state
-
-
-_apply_codex_auto_agent_adapter_local_candidate_cooldown = _aawm_selection._apply_codex_auto_agent_adapter_local_candidate_cooldown
-
-
-_apply_kimi_code_managed_account_lane_cooldown = _aawm_selection._apply_kimi_code_managed_account_lane_cooldown
-
-
-_build_codex_auto_agent_candidate_state = _aawm_selection._build_codex_auto_agent_candidate_state
-
-
-_get_anthropic_auto_agent_candidate_cooldown_state = _aawm_selection._get_anthropic_auto_agent_candidate_cooldown_state
-
-
-_build_anthropic_auto_agent_candidate_state = _aawm_selection._build_anthropic_auto_agent_candidate_state
-
-
-_build_codex_auto_agent_candidate_states = _aawm_selection._build_codex_auto_agent_candidate_states
-
-
-_attach_aawm_alias_routing_state_sources = _aawm_cooldown_state._attach_aawm_alias_routing_state_sources
-
-
-_select_codex_auto_agent_candidate = _aawm_selection._select_codex_auto_agent_candidate
-
-# Wave 5C: error_signals facades
-_add_codex_auto_agent_text_error_tokens = _aawm_error_signals._add_codex_auto_agent_text_error_tokens
-_build_codex_auto_agent_native_grok_continuation_retry_metadata = _aawm_error_signals._build_codex_auto_agent_native_grok_continuation_retry_metadata
-_build_safe_kimi_code_selection_telemetry = _aawm_error_signals._build_safe_kimi_code_selection_telemetry
-_classify_codex_auto_agent_retryable_exhaustion = _aawm_error_signals._classify_codex_auto_agent_retryable_exhaustion
-_classify_kimi_code_auto_agent_probe_failure = _aawm_error_signals._classify_kimi_code_auto_agent_probe_failure
-_codex_auto_agent_error_text = _aawm_error_signals._codex_auto_agent_error_text
-_extract_codex_auto_agent_error_tokens = _aawm_error_signals._extract_codex_auto_agent_error_tokens
-_extract_codex_auto_agent_error_type_and_code = _aawm_error_signals._extract_codex_auto_agent_error_type_and_code
-_get_codex_auto_agent_candidate_cooldown_scope = _aawm_error_signals._get_codex_auto_agent_candidate_cooldown_scope
-_get_codex_auto_agent_cooldown_scope = _aawm_error_signals._get_codex_auto_agent_cooldown_scope
-_get_codex_auto_agent_cooldown_seconds = _aawm_error_signals._get_codex_auto_agent_cooldown_seconds
-_get_codex_auto_agent_grok_account_quota_lane_cooldown_key = _aawm_error_signals._get_codex_auto_agent_grok_account_quota_lane_cooldown_key
-_get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds = _aawm_error_signals._get_codex_auto_agent_native_grok_continuation_transient_backoff_seconds
-_get_codex_auto_agent_native_grok_continuation_transient_max_attempts = _aawm_error_signals._get_codex_auto_agent_native_grok_continuation_transient_max_attempts
-_get_codex_auto_agent_source_error_summary = _aawm_error_signals._get_codex_auto_agent_source_error_summary
-_get_kimi_code_managed_account_cooldown_key = _aawm_error_signals._get_kimi_code_managed_account_cooldown_key
-_get_safe_kimi_code_probe_failure_metadata = _aawm_error_signals._get_safe_kimi_code_probe_failure_metadata
-_is_codex_auto_agent_durable_cooldown_error_class = _aawm_error_signals._is_codex_auto_agent_durable_cooldown_error_class
-_is_codex_auto_agent_grok_4_5_candidate = _aawm_error_signals._is_codex_auto_agent_grok_4_5_candidate
-_is_codex_auto_agent_grok_account_quota_candidate = _aawm_error_signals._is_codex_auto_agent_grok_account_quota_candidate
-_is_codex_auto_agent_grok_account_quota_exhaustion = _aawm_error_signals._is_codex_auto_agent_grok_account_quota_exhaustion
-_is_codex_auto_agent_grok_build_usage_balance_exhausted = _aawm_error_signals._is_codex_auto_agent_grok_build_usage_balance_exhausted
-_is_codex_auto_agent_grok_personal_team_spending_limit = _aawm_error_signals._is_codex_auto_agent_grok_personal_team_spending_limit
-_is_codex_auto_agent_native_grok_4_5_candidate = _aawm_error_signals._is_codex_auto_agent_native_grok_4_5_candidate
-_is_codex_auto_agent_native_grok_continuation_transient_retry_eligible = _aawm_error_signals._is_codex_auto_agent_native_grok_continuation_transient_retry_eligible
-_is_codex_auto_agent_retryable_exhaustion = _aawm_error_signals._is_codex_auto_agent_retryable_exhaustion
-_is_codex_auto_agent_spark_candidate = _aawm_error_signals._is_codex_auto_agent_spark_candidate
-_is_codex_auto_agent_transient_internal_error_class = _aawm_error_signals._is_codex_auto_agent_transient_internal_error_class
-_is_codex_auto_agent_xai_candidate = _aawm_error_signals._is_codex_auto_agent_xai_candidate
-_is_kimi_code_auto_agent_candidate = _aawm_error_signals._is_kimi_code_auto_agent_candidate
-_iter_codex_auto_agent_error_blocks = _aawm_error_signals._iter_codex_auto_agent_error_blocks
-_parse_codex_auto_agent_header_wait_seconds = _aawm_error_signals._parse_codex_auto_agent_header_wait_seconds
-_plan_codex_auto_agent_native_grok_continuation_transient_retry = _aawm_error_signals._plan_codex_auto_agent_native_grok_continuation_transient_retry
 _KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL = _aawm_error_signals._KIMI_CODE_MANAGED_ACCOUNT_COOLDOWN_MODEL
 _KIMI_CODE_SAFE_FAILURE_KINDS = _aawm_error_signals._KIMI_CODE_SAFE_FAILURE_KINDS
 _KIMI_CODE_SAFE_FAILURE_SCOPES = _aawm_error_signals._KIMI_CODE_SAFE_FAILURE_SCOPES
 _KIMI_CODE_SAFE_METADATA_GATES = _aawm_error_signals._KIMI_CODE_SAFE_METADATA_GATES
 _KIMI_CODE_SAFE_RESET_REASONS = _aawm_error_signals._KIMI_CODE_SAFE_RESET_REASONS
 _KIMI_CODE_SAFE_UPSTREAM_IDS = _aawm_error_signals._KIMI_CODE_SAFE_UPSTREAM_IDS
-
-# Wave 5C: cooldown_apply facades
-_apply_anthropic_auto_agent_alias_cooldown = _aawm_cooldown_apply._apply_anthropic_auto_agent_alias_cooldown
-_apply_auto_agent_alias_cooldown = _aawm_cooldown_apply._apply_auto_agent_alias_cooldown
-_apply_codex_auto_agent_alias_cooldown = _aawm_cooldown_apply._apply_codex_auto_agent_alias_cooldown
-_apply_read_pilot_gated_cooldown = _aawm_cooldown_apply._apply_read_pilot_gated_cooldown
-_persist_anthropic_cooldown_durable = _aawm_cooldown_apply._persist_anthropic_cooldown_durable
-_persist_codex_cooldown_durable = _aawm_cooldown_apply._persist_codex_cooldown_durable
-_resolve_auto_agent_cooldown_publication_plan = _aawm_cooldown_apply._resolve_auto_agent_cooldown_publication_plan
-_set_codex_auto_agent_candidate_cooldowns = _aawm_cooldown_apply._set_codex_auto_agent_candidate_cooldowns
-
-# Wave 5C: attempt_records facades
-_add_anthropic_auto_agent_alias_metadata = _aawm_attempt_records._add_anthropic_auto_agent_alias_metadata
-_add_codex_auto_agent_alias_metadata = _aawm_attempt_records._add_codex_auto_agent_alias_metadata
-_extract_codex_reasoning_effort = _aawm_attempt_records._extract_codex_reasoning_effort
-_get_codex_reasoning_effort_ceiling = _aawm_attempt_records._get_codex_reasoning_effort_ceiling
-_normalize_codex_reasoning_effort_for_resolved_route = _aawm_attempt_records._normalize_codex_reasoning_effort_for_resolved_route
-_record_auto_agent_alias_attempt_failure = _aawm_attempt_records._record_auto_agent_alias_attempt_failure
-_record_auto_agent_alias_attempt_started = _aawm_attempt_records._record_auto_agent_alias_attempt_started
-_record_read_pilot_cooldown_evidence = _aawm_attempt_records._record_read_pilot_cooldown_evidence
-_update_codex_auto_agent_retryable_attempt_record = _aawm_attempt_records._update_codex_auto_agent_retryable_attempt_record
-
-
 
 def _aawm_alias_route_verbose_json_enabled() -> bool:
     return os.getenv(_AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV, "").strip().lower() in {
@@ -2429,822 +1377,6 @@ _resolve_anthropic_nvidia_responses_adapter_model = _aawm_adapter_model_resoluti
 _resolve_anthropic_openrouter_responses_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_openrouter_responses_adapter_model
 
 
-_resolve_anthropic_google_completion_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_google_completion_adapter_model
-
-
-_get_anthropic_adapter_google_auth_file_path = _aawm_google_oauth._get_anthropic_adapter_google_auth_file_path
-
-
-_extract_google_oauth_client_values_from_bundle_text = (
-    _aawm_google_oauth._extract_google_oauth_client_values_from_bundle_text
-)
-
-
-_add_google_cli_bundle_candidate_files = _aawm_google_oauth._add_google_cli_bundle_candidate_files
-
-
-_iter_google_oauth_client_bundle_candidates = _aawm_google_oauth._iter_google_oauth_client_bundle_candidates
-
-
-_load_google_oauth_client_values_from_local_gemini_cli_bundle = (
-    _aawm_google_oauth._load_google_oauth_client_values_from_local_gemini_cli_bundle
-)
-
-
-_load_local_google_oauth_credentials = _aawm_google_oauth._load_local_google_oauth_credentials
-
-
-_google_oauth_token_is_valid = _aawm_google_oauth._google_oauth_token_is_valid
-
-
-_google_oauth_cached_token_is_valid = _aawm_google_oauth._google_oauth_cached_token_is_valid
-
-
-_get_google_oauth_expiry_date = _aawm_google_oauth._get_google_oauth_expiry_date
-
-
-_get_google_oauth_client_value = _aawm_google_oauth._get_google_oauth_client_value
-
-
-_refresh_local_google_oauth_credentials = _aawm_google_oauth._refresh_local_google_oauth_credentials
-
-
-_load_valid_local_google_oauth_access_token = _aawm_google_oauth._load_valid_local_google_oauth_access_token
-
-
-def _extract_google_adapter_agent_name_from_completion_messages(
-    completion_messages: list[dict[str, Any]],
-) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_agent_name_from_completion_messages(completion_messages)
-
-
-def _extract_google_adapter_latest_user_prompt_text(completion_messages: list[dict[str, Any]]) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_latest_user_prompt_text(completion_messages)
-
-
-def _extract_google_adapter_latest_tool_result_fingerprint(completion_messages: list[dict[str, Any]]) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_latest_tool_result_fingerprint(completion_messages)
-
-
-def _resolve_google_adapter_session_id(
-    request: Request,
-    completion_messages: list[dict[str, Any]],
-    *,
-    google_model: str,
-) -> tuple[str, str]:
-    direct_session_id = (
-        _get_request_header_or_passthrough_alias(request, "session_id")
-        or _safe_get_request_headers(request).get("x-claude-code-session-id")
-        or _safe_get_request_headers(request).get("X-Claude-Code-Session-Id")
-    )
-    trace_id = (
-        _get_request_header_or_passthrough_alias(request, "langfuse_trace_id")
-        or _get_request_header_or_passthrough_alias(request, "langfuse_existing_trace_id")
-        or _get_request_header_or_passthrough_alias(request, "trace_id")
-    )
-    trace_name = _get_request_header_or_passthrough_alias(request, "langfuse_trace_name")
-    agent_name = _extract_google_adapter_agent_name_from_completion_messages(completion_messages)
-
-    if isinstance(direct_session_id, str) and direct_session_id:
-        seed = f"direct_session_id:{direct_session_id}|model:{google_model}"
-        return str(uuid5(NAMESPACE_URL, seed)), "direct_session_id"
-
-    identity_name = None
-    identity_source = None
-    if isinstance(trace_name, str) and trace_name:
-        identity_name = trace_name
-        identity_source = "trace_name"
-    elif isinstance(agent_name, str) and agent_name:
-        identity_name = agent_name
-        identity_source = "agent_name"
-
-    if identity_name:
-        seed = f"{identity_source}:{identity_name}|model:{google_model}"
-        return str(uuid5(NAMESPACE_URL, seed)), identity_source or "derived"
-
-    if isinstance(trace_id, str) and trace_id:
-        seed = f"trace_id:{trace_id}|model:{google_model}"
-        return str(uuid5(NAMESPACE_URL, seed)), "trace_id"
-
-    return str(uuid4()), "generated_uuid"
-
-
-def _resolve_google_adapter_user_prompt_id(
-    request: Request,
-    completion_messages: list[dict[str, Any]],
-    *,
-    google_model: str,
-    session_id: str,
-) -> str:
-    trace_id = (
-        _get_request_header_or_passthrough_alias(request, "langfuse_trace_id")
-        or _get_request_header_or_passthrough_alias(request, "langfuse_existing_trace_id")
-        or _get_request_header_or_passthrough_alias(request, "trace_id")
-    )
-    if isinstance(trace_id, str) and trace_id:
-        seed = f"user_prompt_trace_id:{trace_id}|model:{google_model}"
-        return str(uuid5(NAMESPACE_URL, seed))
-
-    latest_tool_result = _extract_google_adapter_latest_tool_result_fingerprint(completion_messages)
-    if isinstance(latest_tool_result, str) and latest_tool_result:
-        seed = f"user_prompt_tool_result:{latest_tool_result}|" f"session_id:{session_id}|model:{google_model}"
-        return str(uuid5(NAMESPACE_URL, seed))
-
-    latest_user_prompt = _extract_google_adapter_latest_user_prompt_text(completion_messages)
-    if isinstance(latest_user_prompt, str) and latest_user_prompt:
-        prompt_hash = hashlib.sha1(latest_user_prompt.encode("utf-8")).hexdigest()[:16]
-        seed = f"user_prompt_hash:{prompt_hash}|session_id:{session_id}|model:{google_model}"
-        return str(uuid5(NAMESPACE_URL, seed))
-
-    seed = f"user_prompt_session:{session_id}|model:{google_model}"
-    return str(uuid5(NAMESPACE_URL, seed))
-
-
-def _build_code_assist_adapter_native_headers(
-    *,
-    adapter_provider: str,
-    access_token: str,
-    model: Optional[str],
-    accept: str,
-) -> dict[str, str]:
-    if adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER:
-        headers = _build_antigravity_native_headers(access_token)
-        headers["Accept"] = accept
-        return headers
-    return _build_google_adapter_native_headers(
-        access_token=access_token,
-        model=model,
-        accept=accept,
-    )
-
-
-def _get_code_assist_adapter_target_base(adapter_provider: str) -> str:
-    if adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER:
-        return _get_antigravity_passthrough_target_base()
-    return _get_anthropic_adapter_google_target_base()
-
-
-async def _get_or_load_google_code_assist_project(
-    access_token: str,
-    *,
-    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
-) -> str:
-    return await _anthropic_google_process_cache._get_or_load_google_code_assist_project(
-        access_token,
-        runtime=_get_anthropic_google_process_cache_runtime(),
-        adapter_provider=adapter_provider,
-    )
-
-
-_get_google_code_assist_prime_ttl_seconds = _google_env_policy._get_google_code_assist_prime_ttl_seconds
-
-
-_get_google_code_assist_prime_cache_key = _google_env_policy._get_google_code_assist_prime_cache_key
-
-
-_get_google_adapter_max_concurrent = _google_env_policy._get_google_adapter_max_concurrent
-
-
-_get_google_adapter_shared_lane_key = _google_env_policy._get_google_adapter_shared_lane_key
-
-
-_get_google_adapter_rate_limit_key = _google_env_policy._get_google_adapter_rate_limit_key
-
-
-_get_google_adapter_rate_limit_key_from_kwargs = _google_env_policy._get_google_adapter_rate_limit_key_from_kwargs
-
-
-def _get_google_adapter_semaphore(
-    model: Optional[str] = None,
-    *,
-    access_token: Optional[str] = None,
-    companion_project: Optional[str] = None,
-    rate_limit_key: Optional[str] = None,
-) -> asyncio.Semaphore:
-    return _anthropic_google_process_cache._get_google_adapter_semaphore(
-        model,
-        runtime=_get_anthropic_google_process_cache_runtime(),
-        access_token=access_token,
-        companion_project=companion_project,
-        rate_limit_key=rate_limit_key,
-    )
-
-
-_get_google_adapter_max_retries = _google_env_policy._get_google_adapter_max_retries
-
-
-_coerce_non_negative_int = _google_env_policy._coerce_non_negative_int
-
-
-_coerce_non_negative_float = _google_env_policy._coerce_non_negative_float
-
-
-_get_google_adapter_post_tool_cooldown_seconds = _google_env_policy._get_google_adapter_post_tool_cooldown_seconds
-
-
-_google_code_assist_unwrapped_chunk_contains_tool_call = _google_env_policy._google_code_assist_unwrapped_chunk_contains_tool_call
-
-
-_get_google_adapter_max_output_tokens_cap = _google_env_policy._get_google_adapter_max_output_tokens_cap
-
-
-_get_google_adapter_default_thinking_level = _google_env_policy._get_google_adapter_default_thinking_level
-
-
-_get_google_adapter_max_contents_window = _google_env_policy._get_google_adapter_max_contents_window
-
-
-_get_google_adapter_max_contents_text_chars = _google_env_policy._get_google_adapter_max_contents_text_chars
-
-
-_estimate_google_content_text_chars = _aawm_persisted_output._estimate_google_content_text_chars
-
-
-_google_content_has_text = _google_env_policy._google_content_has_text
-
-
-_google_content_has_function_exchange = _google_context_window._google_content_has_function_exchange
-
-
-_google_content_has_function_call = _google_context_window._google_content_has_function_call
-
-
-def _google_content_function_call_ids(content_block: Any) -> set[str]:
-    if not isinstance(content_block, dict):
-        return set()
-    parts = content_block.get("parts")
-    if not isinstance(parts, list):
-        return set()
-    function_call_ids: set[str] = set()
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        function_call = part.get("functionCall")
-        if not isinstance(function_call, dict):
-            function_call = part.get("function_call")
-        if not isinstance(function_call, dict):
-            continue
-        function_call_id = function_call.get("id")
-        if isinstance(function_call_id, str) and function_call_id.strip():
-            function_call_ids.add(function_call_id.strip())
-    return function_call_ids
-
-
-def _google_content_function_response_ids(content_block: Any) -> set[str]:
-    if not isinstance(content_block, dict):
-        return set()
-    parts = content_block.get("parts")
-    if not isinstance(parts, list):
-        return set()
-    function_response_ids: set[str] = set()
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        function_response = part.get("functionResponse")
-        if not isinstance(function_response, dict):
-            function_response = part.get("function_response")
-        if not isinstance(function_response, dict):
-            continue
-        response_payload = function_response.get("response")
-        nested_tool_use_id = response_payload.get("tool_use_id") if isinstance(response_payload, dict) else None
-        for candidate in (function_response.get("id"), nested_tool_use_id):
-            if isinstance(candidate, str) and candidate.strip():
-                function_response_ids.add(candidate.strip())
-    return function_response_ids
-
-
-def _selected_google_contents_have_paired_function_responses(contents: list[Any], selected_indices: list[int]) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._selected_google_contents_have_paired_function_responses(
-        contents, selected_indices
-    )
-
-
-def _selected_google_contents_have_complete_function_exchanges(
-    contents: list[Any], selected_indices: list[int]
-) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._selected_google_contents_have_complete_function_exchanges(
-        contents, selected_indices
-    )
-
-
-def _find_prior_google_function_call_content_index(
-    contents: list[Any],
-    *,
-    before_index: int,
-    function_response_id: str,
-) -> Optional[int]:
-    for index in range(before_index - 1, -1, -1):
-        if function_response_id in _google_content_function_call_ids(contents[index]):
-            return index
-    return None
-
-
-def _add_required_google_function_call_pair_indices(contents: list[Any], selected_indices: list[int]) -> list[int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._add_required_google_function_call_pair_indices(contents, selected_indices)
-
-
-def _trim_google_content_indices_to_window(
-    contents: list[Any], selected_indices: list[int], *, protected_text_indices: set[int], max_window: int
-) -> list[int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._trim_google_content_indices_to_window(
-        contents, selected_indices, protected_text_indices=protected_text_indices, max_window=max_window
-    )
-
-
-_get_google_adapter_oversized_text_part_char_cap = _google_env_policy._get_google_adapter_oversized_text_part_char_cap
-
-
-_get_google_adapter_pure_context_text_part_char_cap = _google_env_policy._get_google_adapter_pure_context_text_part_char_cap
-
-
-_get_google_adapter_subagent_context_text_part_char_cap = _google_env_policy._get_google_adapter_subagent_context_text_part_char_cap
-
-
-_get_google_adapter_followup_subagent_context_text_part_char_cap = _google_env_policy._get_google_adapter_followup_subagent_context_text_part_char_cap
-
-
-_get_google_adapter_followup_allowed_tool_names = _google_env_policy._get_google_adapter_followup_allowed_tool_names
-
-
-def _request_block_has_google_function_response(request_block: dict[str, Any]) -> bool:
-    contents = request_block.get("contents")
-    if not isinstance(contents, list):
-        return False
-    for item in contents:
-        if not isinstance(item, dict):
-            continue
-        parts = item.get("parts")
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            if isinstance(part.get("functionResponse"), dict) or isinstance(part.get("function_response"), dict):
-                return True
-    return False
-
-
-def _trim_google_adapter_followup_tools(request_block: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._trim_google_adapter_followup_tools(request_block)
-
-
-def _is_google_function_call_allowed_predecessor(content_block: Any) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._is_google_function_call_allowed_predecessor(content_block)
-
-
-def _merge_google_model_content_parts(first_content: dict[str, Any], second_content: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._merge_google_model_content_parts(first_content, second_content)
-
-
-def _google_adapter_function_call_anchor_content() -> dict[str, Any]:
-    return {
-        "role": "user",
-        "parts": [
-            {"text": ("[Gemini adapter inserted a conversation boundary before " "a preserved historical tool call.]")}
-        ],
-    }
-
-
-def _repair_google_adapter_function_call_turn_adjacency(request_block: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._repair_google_adapter_function_call_turn_adjacency(request_block)
-
-
-def _split_google_adapter_inline_context_and_prompt(request_block: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._split_google_adapter_inline_context_and_prompt(request_block)
-
-
-def _compact_google_adapter_oversized_text_part(
-    part: Any, *, cap: int, pure_context_cap: int, head_keep: int, tail_keep: int, is_followup_request: bool
-) -> tuple[Any, bool, dict[str, int]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_oversized_text_part(
-        part,
-        cap=cap,
-        pure_context_cap=pure_context_cap,
-        head_keep=head_keep,
-        tail_keep=tail_keep,
-        is_followup_request=is_followup_request,
-    )
-
-
-def _compact_google_adapter_oversized_text_parts(request_block: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._compact_google_adapter_oversized_text_parts(request_block)
-
-
-_apply_google_adapter_contents_window_policy = _google_context_window._apply_google_adapter_contents_window_policy
-
-
-def _apply_google_adapter_generation_config_policy(
-    request_block: dict[str, Any], *, model: Optional[str]
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_adapter_generation_config_policy(request_block, model=model)
-
-
-def _apply_google_adapter_request_shape_policy(payload: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_adapter_request_shape_policy(payload)
-
-
-_extract_google_adapter_exception_status_code = _google_error_signals._extract_google_adapter_exception_status_code
-
-
-_extract_google_adapter_exception_detail = _google_error_signals._extract_google_adapter_exception_detail
-
-
-def _extract_adapter_upstream_headers(exc: Any) -> dict[str, Any]:
-    upstream_headers = getattr(exc, "upstream_headers", None)
-    if isinstance(upstream_headers, dict):
-        return {
-            str(header_name): header_value
-            for header_name, header_value in upstream_headers.items()
-            if header_value is not None
-        }
-    response = getattr(exc, "response", None)
-    response_headers = getattr(response, "headers", None)
-    if response_headers is None:
-        return {}
-    return {str(header_name): str(header_value) for header_name, header_value in response_headers.items()}
-
-
-def _get_adapter_header_value(headers: dict[str, Any], header_name: str) -> Optional[str]:
-    if not headers:
-        return None
-    for key, value in headers.items():
-        if not isinstance(key, str):
-            continue
-        if key.lower() != header_name.lower():
-            continue
-        if value is None:
-            return None
-        if isinstance(value, str):
-            stripped = value.strip()
-            return stripped or None
-        return str(value)
-    return None
-
-
-def _parse_retry_after_seconds_from_headers(headers: dict[str, Any]) -> Optional[float]:
-    retry_after_value = _get_adapter_header_value(headers, "Retry-After")
-    if retry_after_value is None:
-        return None
-    try:
-        return max(0.0, float(retry_after_value))
-    except Exception:
-        return None
-
-
-def _parse_rate_limit_reset_wait_seconds_from_headers(headers: dict[str, Any]) -> Optional[float]:
-    reset_value = _get_adapter_header_value(headers, "X-RateLimit-Reset")
-    if reset_value is None:
-        return None
-    try:
-        reset_number = float(reset_value)
-    except Exception:
-        return None
-    if reset_number > 1_000_000_000_000:
-        reset_epoch_seconds = reset_number / 1000.0
-    else:
-        reset_epoch_seconds = reset_number
-    return max(0.0, reset_epoch_seconds - time.time())
-
-
-_parse_google_rate_limit_reset_seconds = _google_error_signals._parse_google_rate_limit_reset_seconds
-
-
-def _extract_embedded_json_payload_candidates(detail: object) -> list[str]:
-    """Shared exception-detail JSON/bytes extraction (RR-054 #59)."""
-    if isinstance(detail, dict):
-        try:
-            return [json.dumps(detail)]
-        except Exception:
-            return [str(detail)]
-    if isinstance(detail, bytes):
-        detail_text = detail.decode("utf-8", errors="ignore")
-    else:
-        detail_text = str(detail or "")
-    candidates: list[str] = [detail_text]
-    brace_start = detail_text.find("{")
-    brace_end = detail_text.rfind("}")
-    if brace_start != -1 and brace_end > brace_start:
-        candidates.append(detail_text[brace_start : brace_end + 1])
-    bracket_start = detail_text.find("[")
-    bracket_end = detail_text.rfind("]")
-    if bracket_start != -1 and bracket_end > bracket_start:
-        candidates.append(detail_text[bracket_start : bracket_end + 1])
-    bytes_literal_match = re.search(r'b([\'"]).*', detail_text, re.DOTALL)
-    if bytes_literal_match is not None:
-        try:
-            literal_value = ast.literal_eval(bytes_literal_match.group(0))
-            if isinstance(literal_value, bytes):
-                candidates.append(literal_value.decode("utf-8", errors="ignore"))
-            else:
-                candidates.append(str(literal_value))
-        except Exception:
-            pass
-    # openrouter-style ": b'...'" wrappers
-    if ": b'" in detail_text or ': b"' in detail_text:
-        tail = detail_text.split(": ", 1)[-1].strip()
-        if (tail.startswith("b'") and tail.endswith("'")) or (tail.startswith('b"') and tail.endswith('"')):
-            try:
-                literal_value = ast.literal_eval(tail)
-                if isinstance(literal_value, bytes):
-                    candidates.append(literal_value.decode("utf-8", errors="ignore"))
-                elif isinstance(literal_value, str):
-                    candidates.append(literal_value)
-            except Exception:
-                pass
-    return candidates
-
-
-def _parse_json_payloads_from_text_candidates(
-    candidates: list[str],
-) -> list[object]:
-    parsed_payloads: list[object] = []
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except Exception:
-            continue
-        parsed_payloads.append(parsed)
-    return parsed_payloads
-
-
-_extract_google_adapter_error_payloads = _google_error_signals._extract_google_adapter_error_payloads
-
-
-_extract_google_adapter_error_reason = _google_error_signals._extract_google_adapter_error_reason
-
-
-_extract_google_adapter_error_payload_for_logging = _google_error_signals._extract_google_adapter_error_payload_for_logging
-
-
-_record_google_adapter_error_for_logging = _google_error_signals._record_google_adapter_error_for_logging
-
-
-_get_google_adapter_model_capacity_max_retries = _google_env_policy._get_google_adapter_model_capacity_max_retries
-
-
-_get_google_adapter_capacity_backoff_seconds = _google_env_policy._get_google_adapter_capacity_backoff_seconds
-
-
-_get_google_adapter_hidden_retry_budget_seconds = _google_env_policy._get_google_adapter_hidden_retry_budget_seconds
-
-
-_get_google_adapter_transient_retry_max_attempts = _google_env_policy._get_google_adapter_transient_retry_max_attempts
-
-
-_get_google_adapter_transient_backoff_seconds = _google_env_policy._get_google_adapter_transient_backoff_seconds
-
-
-def _is_google_adapter_transient_retryable_failure(
-    exc: Any, *, status_code: Optional[int], error_reason: Optional[str]
-) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._is_google_adapter_transient_retryable_failure(
-        exc, status_code=status_code, error_reason=error_reason
-    )
-
-
-_build_google_adapter_terminal_error_log_context = _google_error_signals._build_google_adapter_terminal_error_log_context
-
-
-_GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES = (
-    _google_retry_runtime._GOOGLE_ADAPTER_TRANSIENT_UPSTREAM_STATUS_CODES
-)
-
-_google_adapter_hidden_retry_kwargs_from_passthrough_kwargs = (
-    _google_retry_runtime._google_adapter_hidden_retry_kwargs_from_passthrough_kwargs
-)
-
-_record_google_adapter_hidden_retry_metadata = (
-    _google_retry_runtime._record_google_adapter_hidden_retry_metadata
-)
-
-_record_google_adapter_terminal_transient_failure_metadata = (
-    _google_retry_runtime._record_google_adapter_terminal_transient_failure_metadata
-)
-
-_google_adapter_hidden_retry_metadata = (
-    _google_retry_runtime._google_adapter_hidden_retry_metadata
-)
-
-_record_google_adapter_success_after_transient_retry = (
-    _google_retry_runtime._record_google_adapter_success_after_transient_retry
-)
-
-_log_google_adapter_terminal_transient_failure = (
-    _google_retry_runtime._log_google_adapter_terminal_transient_failure
-)
-
-_wait_for_google_adapter_cooldown_if_needed = (
-    _google_retry_runtime._wait_for_google_adapter_cooldown_if_needed
-)
-
-_set_google_adapter_cooldown = _google_retry_runtime._set_google_adapter_cooldown
-
-_handle_google_adapter_rate_limit_failure = (
-    _google_retry_runtime._handle_google_adapter_rate_limit_failure
-)
-
-_handle_google_adapter_transient_failure = (
-    _google_retry_runtime._handle_google_adapter_transient_failure
-)
-
-_perform_google_adapter_pass_through_request = (
-    _google_retry_runtime._perform_google_adapter_pass_through_request
-)
-
-_google_retry_runtime.configure_google_retry_runtime(
-    _google_retry_runtime.Runtime(
-        process_cache_runtime=_get_anthropic_google_process_cache_runtime(),
-        rate_limit=_alias_routing_state.google_rate_limit,
-        get_rate_limit_key_from_kwargs=lambda kwargs: (
-            _get_google_adapter_rate_limit_key_from_kwargs(kwargs)
-        ),
-        get_max_retries=lambda: _get_google_adapter_max_retries(),
-        coerce_non_negative_int=lambda value, default: (
-            _coerce_non_negative_int(value, default)
-        ),
-        coerce_non_negative_float=lambda value, default: (
-            _coerce_non_negative_float(value, default)
-        ),
-        get_model_capacity_max_retries=lambda: (
-            _get_google_adapter_model_capacity_max_retries()
-        ),
-        get_capacity_backoff_seconds=lambda attempt: (
-            _get_google_adapter_capacity_backoff_seconds(attempt)
-        ),
-        get_hidden_retry_budget_seconds=lambda: (
-            _get_google_adapter_hidden_retry_budget_seconds()
-        ),
-        get_transient_retry_max_attempts=lambda: (
-            _get_google_adapter_transient_retry_max_attempts()
-        ),
-        get_transient_backoff_seconds=lambda attempt: (
-            _get_google_adapter_transient_backoff_seconds(attempt)
-        ),
-        extract_exception_status_code=lambda exc: (
-            _extract_google_adapter_exception_status_code(exc)
-        ),
-        extract_error_reason=lambda exc: (
-            _extract_google_adapter_error_reason(exc)
-        ),
-        parse_rate_limit_reset_seconds=lambda exc: (
-            _parse_google_rate_limit_reset_seconds(exc)
-        ),
-        is_transient_retryable_failure=lambda exc, **kwargs: (
-            _is_google_adapter_transient_retryable_failure(exc, **kwargs)
-        ),
-        classify_hidden_retry_failure=lambda exc: (
-            _classify_passthrough_hidden_retry_failure(exc)
-        ),
-        record_error_for_logging=lambda passthrough_kwargs, **kwargs: (
-            _record_google_adapter_error_for_logging(passthrough_kwargs, **kwargs)
-        ),
-        record_hidden_retry_metadata=lambda kwargs, **kw: (
-            _record_passthrough_hidden_retry_metadata(kwargs, **kw)
-        ),
-        build_terminal_error_log_context=lambda passthrough_kwargs, **kwargs: (
-            _build_google_adapter_terminal_error_log_context(
-                passthrough_kwargs, **kwargs
-            )
-        ),
-        pass_through_request=lambda **kwargs: pass_through_request(**kwargs),
-        bound_token_cache=lambda cache: _bound_google_adapter_token_cache(cache),
-        sleep=lambda seconds: asyncio.sleep(seconds),
-        log_debug=verbose_proxy_logger.debug,
-        log_warning=verbose_proxy_logger.warning,
-        log_error=verbose_proxy_logger.error,
-        host_globals=globals(),
-    )
-)
-
-# Wave 6C Phase 2: Google Code Assist extraction install
-_google_codex_code_assist.install(globals())
-
-_ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME = _anthropic_openrouter_retry_transport.Runtime(
-    rate_limit=_alias_routing_state.openrouter_rate_limit,
-    failure_circuit_until_monotonic_by_key=(_openrouter_adapter_failure_circuit_until_monotonic_by_key),
-    clean_secret_string=lambda value: _clean_secret_string(value),
-    extract_embedded_json_payload_candidates=(_extract_embedded_json_payload_candidates),
-    parse_json_payloads_from_text_candidates=lambda values: (_parse_json_payloads_from_text_candidates(list(values))),
-    extract_upstream_headers=_extract_adapter_upstream_headers,
-    parse_retry_after_seconds_from_headers=lambda headers: (_parse_retry_after_seconds_from_headers(dict(headers))),
-    get_header_value=lambda headers, name: _get_adapter_header_value(
-        dict(headers),
-        name,
-    ),
-    parse_reset_wait_seconds_from_headers=lambda headers: (
-        _parse_rate_limit_reset_wait_seconds_from_headers(dict(headers))
-    ),
-    raise_candidate_unavailable=(_raise_openrouter_auto_agent_candidate_unavailable),
-    maybe_raise_alias_probe_cooldown=(_maybe_raise_openrouter_adapter_alias_probe_cooldown),
-    get_completion_model=_get_openrouter_completion_adapter_upstream_model,
-    pass_through_request=lambda **kwargs: pass_through_request(**kwargs),
-    wait_for_cooldown=lambda *args, **kwargs: (_wait_for_openrouter_adapter_cooldown_if_needed(*args, **kwargs)),
-    set_cooldown_callback=lambda *args, **kwargs: (_set_openrouter_adapter_cooldown(*args, **kwargs)),
-    maybe_raise_failure_circuit_open_callback=lambda *args, **kwargs: (
-        _maybe_raise_openrouter_adapter_failure_circuit_open(*args, **kwargs)
-    ),
-    open_failure_circuit_callback=lambda *args, **kwargs: (_openrouter_adapter_open_failure_circuit(*args, **kwargs)),
-    clear_failure_circuit_callback=lambda model: (_clear_openrouter_adapter_failure_circuit(model)),
-    log_debug=verbose_proxy_logger.debug,
-    log_warning=verbose_proxy_logger.warning,
-    getenv=lambda name: os.getenv(name),
-    sleep=lambda seconds: asyncio.sleep(seconds),
-    monotonic=lambda: time.monotonic(),
-)
-
-
-_get_openrouter_adapter_rate_limit_key = _wave6b_openrouter_runtime._get_openrouter_adapter_rate_limit_key
-
-
-_is_openrouter_adapter_free_model = _wave6b_openrouter_runtime._is_openrouter_adapter_free_model
-
-
-_get_openrouter_adapter_wait_keys = _wave6b_openrouter_runtime._get_openrouter_adapter_wait_keys
-
-
-_extract_openrouter_adapter_exception_status_code = _wave6b_openrouter_runtime._extract_openrouter_adapter_exception_status_code
-
-
-_extract_openrouter_adapter_error_payload = _wave6b_openrouter_runtime._extract_openrouter_adapter_error_payload
-
-
-_extract_openrouter_adapter_provider_name = _wave6b_openrouter_runtime._extract_openrouter_adapter_provider_name
-
-
-_extract_openrouter_adapter_retry_after_seconds = _wave6b_openrouter_runtime._extract_openrouter_adapter_retry_after_seconds
-
-
-_extract_openrouter_adapter_raw_message = _wave6b_openrouter_runtime._extract_openrouter_adapter_raw_message
-
-
-_is_openrouter_adapter_no_endpoint_candidate_error = _wave6b_openrouter_runtime._is_openrouter_adapter_no_endpoint_candidate_error
-
-
-_maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable = _wave6b_openrouter_runtime._maybe_raise_openrouter_adapter_alias_probe_no_endpoint_unavailable
-
-
-_is_openrouter_adapter_provider_raw_error = _wave6b_openrouter_runtime._is_openrouter_adapter_provider_raw_error
-
-
-_extract_openrouter_adapter_error_headers = _wave6b_openrouter_runtime._extract_openrouter_adapter_error_headers
-
-
-_get_openrouter_adapter_header_value = _wave6b_openrouter_runtime._get_openrouter_adapter_header_value
-
-
-_extract_openrouter_adapter_reset_wait_seconds = _wave6b_openrouter_runtime._extract_openrouter_adapter_reset_wait_seconds
-
-
-_is_openrouter_adapter_long_window_rate_limit = _wave6b_openrouter_runtime._is_openrouter_adapter_long_window_rate_limit
-
-
-_get_openrouter_adapter_cooldown_keys = _wave6b_openrouter_runtime._get_openrouter_adapter_cooldown_keys
-
-
-_get_openrouter_adapter_retry_wait_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_retry_wait_seconds
-
-
-_get_openrouter_adapter_max_retries = _wave6b_openrouter_runtime._get_openrouter_adapter_max_retries
-
-
-_get_openrouter_adapter_backoff_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_backoff_seconds
-
-
-_get_openrouter_adapter_hidden_retry_budget_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_hidden_retry_budget_seconds
-
-
-_get_openrouter_adapter_post_failure_cooldown_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_post_failure_cooldown_seconds
-
-
-_maybe_raise_openrouter_adapter_failure_circuit_open = _wave6b_openrouter_runtime._maybe_raise_openrouter_adapter_failure_circuit_open
-
-
-_openrouter_adapter_open_failure_circuit = _wave6b_openrouter_runtime._openrouter_adapter_open_failure_circuit
-
-
-_clear_openrouter_adapter_failure_circuit = _wave6b_openrouter_runtime._clear_openrouter_adapter_failure_circuit
-
-
-_get_openrouter_adapter_active_cooldown_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_active_cooldown_seconds
-
-# Wave 5A: bind quota state and adapter helpers into openrouter_quota.
 def _get_openrouter_free_daily_quota_cache() -> tuple[Optional[float], float]:
     return _alias_routing_state.get_openrouter_free_quota_cache()
 
@@ -3258,6 +1390,9 @@ async def _fetch_openrouter_quota_row_via_facade():
     on this module is visible to the openrouter_quota module."""
     return await _fetch_openrouter_free_daily_quota_row()
 
+
+_get_openrouter_adapter_active_cooldown_seconds = _wave6b_openrouter_runtime._get_openrouter_adapter_active_cooldown_seconds
+_get_openrouter_adapter_rate_limit_key = _wave6b_openrouter_runtime._get_openrouter_adapter_rate_limit_key
 
 _aawm_openrouter_quota.configure_openrouter_quota_runtime(
     get_quota_cache=_get_openrouter_free_daily_quota_cache,
@@ -3278,6 +1413,7 @@ _aawm_openrouter_quota.configure_openrouter_quota_runtime(
 _aawm_cooldown_state.configure_cooldown_state_runtime(
     manager=_alias_routing_state,
 )
+_aawm_cooldown_state.install(globals())
 
 # Wave 5B: bind god-module / cooldown_state dependencies into selection.
 # Late-binding lambdas ensure the god-module names are resolved at call time.
@@ -3289,11 +1425,7 @@ _aawm_selection.configure_selection_runtime(
     set_anthropic_cooldown=lambda *a, **kw: _set_anthropic_auto_agent_cooldown(*a, **kw),
     get_codex_session_affinity=lambda *a, **kw: _get_codex_auto_agent_session_affinity(*a, **kw),
     get_anthropic_session_affinity=lambda *a, **kw: _get_anthropic_auto_agent_session_affinity(*a, **kw),
-    resolve_google_lane_key=lambda *a, **kw: _resolve_codex_auto_agent_google_lane_key(*a, **kw),
-    resolve_antigravity_lane_state=lambda *a, **kw: _resolve_codex_auto_agent_antigravity_lane_state(*a, **kw),
     get_openrouter_adapter_active_cooldown_seconds=lambda *a, **kw: _get_openrouter_adapter_active_cooldown_seconds(*a, **kw),
-    google_adapter_rate_limit_lock=_google_adapter_rate_limit_lock,
-    google_adapter_rate_limit_until_monotonic_by_key=_google_adapter_rate_limit_until_monotonic_by_key,
     normalize_codex_alias_model=lambda *a, **kw: _normalize_codex_auto_agent_alias_model(*a, **kw),
     extract_client_product_label=lambda *a, **kw: _extract_auto_agent_alias_client_product_label(*a, **kw),
     resolve_codex_session_key=lambda *a, **kw: _resolve_codex_auto_agent_session_key(*a, **kw),
@@ -3305,19 +1437,12 @@ _aawm_selection.configure_selection_runtime(
     is_kimi_code_candidate=lambda *a, **kw: _is_kimi_code_auto_agent_candidate(*a, **kw),
     get_kimi_managed_account_cooldown_key=lambda *a, **kw: _get_kimi_code_managed_account_cooldown_key(*a, **kw),
 )
+_aawm_selection.install(globals())
 
-# Wave 5C: bind host dependencies into error_signals.
-# Late-binding lambdas ensure god-module names resolve at call time.
+# Wave 5C: bind retained host dependencies into error_signals. Generic
+# exception, OpenRouter error-shape, header, and JSON helpers are owner-local
+# and are published into this module by install().
 _aawm_error_signals.configure_error_signals_runtime(
-    extract_google_adapter_exception_detail=lambda *a, **kw: _extract_google_adapter_exception_detail(*a, **kw),
-    extract_google_adapter_error_payloads=lambda *a, **kw: _extract_google_adapter_error_payloads(*a, **kw),
-    is_openrouter_adapter_provider_raw_error=lambda *a, **kw: _is_openrouter_adapter_provider_raw_error(*a, **kw),
-    extract_google_adapter_exception_status_code=lambda *a, **kw: _extract_google_adapter_exception_status_code(*a, **kw),
-    extract_adapter_upstream_headers=lambda *a, **kw: _extract_adapter_upstream_headers(*a, **kw),
-    parse_retry_after_seconds_from_headers=lambda *a, **kw: _parse_retry_after_seconds_from_headers(*a, **kw),
-    get_adapter_header_value=lambda *a, **kw: _get_adapter_header_value(*a, **kw),
-    extract_openrouter_adapter_raw_message=lambda *a, **kw: _extract_openrouter_adapter_raw_message(*a, **kw),
-    parse_json_payloads_from_text_candidates=lambda *a, **kw: _parse_json_payloads_from_text_candidates(*a, **kw),
     get_passthrough_handled_http_error_summary=lambda *a, **kw: _get_passthrough_handled_http_error_summary(*a, **kw),
     is_known_grok_build_usage_balance_exhausted_response=lambda *a, **kw: _is_known_grok_build_usage_balance_exhausted_response(*a, **kw),
     is_known_grok_personal_team_spending_limit_response=lambda *a, **kw: _is_known_grok_personal_team_spending_limit_response(*a, **kw),
@@ -3328,6 +1453,11 @@ _aawm_error_signals.configure_error_signals_runtime(
     native_grok_backoff_max_seconds=_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS,
     native_grok_backoff_jitter_seconds=_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS,
 )
+_aawm_error_signals.install(globals())
+
+# Wave 6B: configure the provider-neutral OpenRouter runtime and publish its
+# historical host compatibility surface after generic error/header helpers.
+_wave6b_openrouter_runtime.install(globals())
 
 # Wave 5C: bind error_signals / selection / cooldown_state / durable / state
 # dependencies into cooldown_apply.
@@ -3344,6 +1474,7 @@ _aawm_cooldown_apply.configure_cooldown_apply_runtime(
     read_pilot_gate=_read_pilot_cooldown_gate,
     state_manager=_alias_routing_state,
 )
+_aawm_cooldown_apply.install(globals())
 
 # Wave 5C: bind error_signals / classification / host dependencies into
 # attempt_records.
@@ -3353,7 +1484,7 @@ _aawm_attempt_records.configure_attempt_records_runtime(
     parse_header_wait_seconds=lambda *a, **kw: _parse_codex_auto_agent_header_wait_seconds(*a, **kw),
     get_source_error_summary=lambda *a, **kw: _get_codex_auto_agent_source_error_summary(*a, **kw),
     build_kimi_telemetry=lambda *a, **kw: _build_safe_kimi_code_selection_telemetry(*a, **kw),
-    extract_status_code=lambda *a, **kw: _extract_google_adapter_exception_status_code(*a, **kw),
+    extract_status_code=lambda *a, **kw: _extract_adapter_exception_status_code(*a, **kw),
     safe_set_parsed_body=lambda *a, **kw: _safe_set_request_parsed_body(*a, **kw),
     emit_route_event=lambda *a, **kw: _emit_auto_agent_alias_route_event(*a, **kw),
     build_audit_event=lambda *a, **kw: _build_auto_agent_alias_audit_event(*a, **kw),
@@ -3375,6 +1506,7 @@ _aawm_attempt_records.configure_attempt_records_runtime(
     classify_failure=lambda *a, **kw: _aawm_alias_classification.classify_failure(*a, **kw),
     read_pilot_gate_record=lambda *a, **kw: _read_pilot_cooldown_gate.record(*a, **kw),
 )
+_aawm_attempt_records.install(globals())
 
 _wait_for_openrouter_adapter_cooldown_if_needed = _wave6b_openrouter_runtime._wait_for_openrouter_adapter_cooldown_if_needed
 
@@ -3391,512 +1523,10 @@ _perform_openrouter_completion_adapter_operation = _wave6b_openrouter_runtime._p
 _perform_openrouter_adapter_pass_through_request = _wave6b_openrouter_runtime._perform_openrouter_adapter_pass_through_request
 
 
-async def _prime_google_code_assist_session(
-    access_token: str,
-    companion_project: str,
-    *,
-    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
-) -> Optional[dict[str, Any]]:
-    return await _anthropic_google_process_cache._prime_google_code_assist_session(
-        access_token,
-        companion_project,
-        runtime=_get_anthropic_google_process_cache_runtime(),
-        adapter_provider=adapter_provider,
-    )
 
-
-_load_local_google_oauth_access_token = _aawm_google_oauth._load_local_google_oauth_access_token
-
-
-def _get_anthropic_adapter_google_target_base() -> str:
-    return os.getenv("CODE_ASSIST_ENDPOINT") or "https://cloudcode-pa.googleapis.com"
-
-
-def _normalize_google_completion_adapter_model_name(model: str) -> str:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_google_completion_adapter_model_name(model)
-
-
-def _sanitize_google_schema_array_items(schema_node: Any, *, _depth: int = 0, _seen: Optional[set[int]] = None) -> int:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._sanitize_google_schema_array_items(schema_node, _depth=_depth, _seen=_seen)
-
-
-
-
-_GOOGLE_CODE_ASSIST_SCHEMA_SANITIZE_MAX_DEPTH = _google_codex_code_assist._GOOGLE_CODE_ASSIST_SCHEMA_SANITIZE_MAX_DEPTH
-
-
-
-
-_extract_completion_message_text = _google_context_window._extract_completion_message_text
-
-
-def _is_google_adapter_synthetic_tool_context_text(text: Any) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._is_google_adapter_synthetic_tool_context_text(text)
-
-
-def _is_google_adapter_synthetic_tool_context_message(message: Any) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._is_google_adapter_synthetic_tool_context_message(message)
-
-
-_get_google_adapter_fallback_context_char_cap = _google_env_policy._get_google_adapter_fallback_context_char_cap
-
-
-def _inject_google_adapter_fallback_text_context(
-    google_request_dict: dict[str, Any], completion_messages: list[dict[str, Any]]
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._inject_google_adapter_fallback_text_context(
-        google_request_dict, completion_messages
-    )
-
-
-_get_google_adapter_system_prompt_policy = _google_env_policy._get_google_adapter_system_prompt_policy
-
-
-def _get_codex_google_code_assist_tool_contract_policy() -> str:
-    raw_value = _clean_codex_auth_value(os.getenv(_CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_ENV))
-    if raw_value is None:
-        return _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT
-    normalized_value = raw_value.strip().lower()
-    if normalized_value in {"0", "false", "disabled", "none", "off"}:
-        return "off"
-    if normalized_value in {"1", "true", "enabled", "on", "append"}:
-        return "append"
-    return _CODEX_GOOGLE_CODE_ASSIST_TOOL_CONTRACT_POLICY_DEFAULT
-
-
-def _extract_google_adapter_system_text_from_content(content: Any) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_system_text_from_content(content)
-
-
-def _replace_google_adapter_system_message_text(message: dict[str, Any], rewritten_text: str) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._replace_google_adapter_system_message_text(message, rewritten_text)
-
-
-def _append_codex_google_code_assist_tool_contract_to_system_text(system_text: str) -> str:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._append_codex_google_code_assist_tool_contract_to_system_text(system_text)
-
-
-def _apply_codex_google_code_assist_tool_contract_policy(
-    completion_kwargs: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_codex_google_code_assist_tool_contract_policy(completion_kwargs)
-
-
-def _is_google_adapter_claude_overhead_block(block: str) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._is_google_adapter_claude_overhead_block(block)
-
-
-def _strip_google_adapter_claude_system_overhead(system_text: str) -> tuple[str, int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._strip_google_adapter_claude_system_overhead(system_text)
-
-
-def _build_google_adapter_system_prompt_policy_text(
-    *, original_text: str, policy_mode: str
-) -> tuple[str, dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_google_adapter_system_prompt_policy_text(
-        original_text=original_text, policy_mode=policy_mode
-    )
-
-
-def _apply_google_adapter_system_prompt_policy(
-    completion_kwargs: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_adapter_system_prompt_policy(completion_kwargs)
-
-
-def _normalize_codex_openai_chat_kwargs_for_google_code_assist(
-    completion_kwargs: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_openai_chat_kwargs_for_google_code_assist(completion_kwargs)
-
-
-
-
-def _has_codex_google_code_assist_anthropic_tool_replay_blocks(messages: list[Any]) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._has_codex_google_code_assist_anthropic_tool_replay_blocks(messages)
-
-
-
-
-def _normalize_codex_google_code_assist_anthropic_assistant_message(
-    *, message: dict[str, Any], message_index: int
-) -> tuple[dict[str, Any], int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_anthropic_assistant_message(
-        message=message, message_index=message_index
-    )
-
-
-
-
-def _normalize_codex_google_code_assist_anthropic_user_message(
-    *, message: dict[str, Any], message_index: int
-) -> tuple[list[dict[str, Any]], int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_anthropic_user_message(
-        message=message, message_index=message_index
-    )
-
-
-def _build_codex_google_code_assist_anthropic_replay_changes(
-    *, repaired_count: int, converted_tool_use_count: int, converted_tool_result_count: int
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_google_code_assist_anthropic_replay_changes(
-        repaired_count=repaired_count,
-        converted_tool_use_count=converted_tool_use_count,
-        converted_tool_result_count=converted_tool_result_count,
-    )
-
-
-
-
-def _deterministic_codex_google_code_assist_tool_call_id(
-    *, message_index: int, tool_call_index: int, tool_call: dict[str, Any]
-) -> str:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._deterministic_codex_google_code_assist_tool_call_id(
-        message_index=message_index, tool_call_index=tool_call_index, tool_call=tool_call
-    )
-
-
-def _next_codex_google_code_assist_tool_messages(
-    messages: list[Any], *, message_index: int
-) -> list[tuple[int, dict[str, Any]]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._next_codex_google_code_assist_tool_messages(messages, message_index=message_index)
-
-
-def _paired_codex_google_code_assist_tool_message(
-    next_tool_messages: list[tuple[int, dict[str, Any]]], *, tool_call_index: int
-) -> tuple[int, dict[str, Any]] | None:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._paired_codex_google_code_assist_tool_message(
-        next_tool_messages, tool_call_index=tool_call_index
-    )
-
-
-def _repair_codex_google_code_assist_tool_call_id(
-    *,
-    message_index: int,
-    tool_call_index: int,
-    tool_call: dict[str, Any],
-    paired_tool_message: tuple[int, dict[str, Any]] | None,
-    copy_message_at: Callable[[int], Optional[dict[str, Any]]],
-) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._repair_codex_google_code_assist_tool_call_id(
-        message_index=message_index,
-        tool_call_index=tool_call_index,
-        tool_call=tool_call,
-        paired_tool_message=paired_tool_message,
-        copy_message_at=copy_message_at,
-    )
-
-
-
-
-def _normalize_codex_google_code_assist_reasoning_effort(
-    mappable_params: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_codex_google_code_assist_reasoning_effort(mappable_params)
-
-
-def _normalize_google_code_assist_thinking_max_tokens(
-    completion_kwargs: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._normalize_google_code_assist_thinking_max_tokens(completion_kwargs)
-
-
-
-
-def _infer_single_codex_google_code_assist_function_tool_name(tools: Any) -> Optional[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._infer_single_codex_google_code_assist_function_tool_name(tools)
-
-
-def _is_codex_google_code_assist_empty_text_content(content: Any) -> bool:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._is_codex_google_code_assist_empty_text_content(content)
-
-
-def _previous_codex_google_code_assist_assistant_index(messages: list[Any], *, before_index: int) -> Optional[int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._previous_codex_google_code_assist_assistant_index(
-        messages, before_index=before_index
-    )
-
-
-def _previous_codex_google_code_assist_contiguous_assistant_index(
-    messages: list[Any], *, before_index: int
-) -> Optional[int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._previous_codex_google_code_assist_contiguous_assistant_index(
-        messages, before_index=before_index
-    )
-
-
-def _previous_codex_google_code_assist_tool_call(
-    messages: list[Any], *, before_index: int, tool_call_id: str
-) -> Optional[dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._previous_codex_google_code_assist_tool_call(
-        messages, before_index=before_index, tool_call_id=tool_call_id
-    )
-
-
-
-
-def _build_codex_google_code_assist_synthetic_tool_call(
-    *, tool_call_id: str, function_name: str, function_arguments: str
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_google_code_assist_synthetic_tool_call(
-        tool_call_id=tool_call_id, function_name=function_name, function_arguments=function_arguments
-    )
-
-
-def _append_codex_google_code_assist_tool_call_to_assistant(
-    *, assistant_message: dict[str, Any], synthetic_tool_call: dict[str, Any]
-) -> tuple[dict[str, Any], bool]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._append_codex_google_code_assist_tool_call_to_assistant(
-        assistant_message=assistant_message, synthetic_tool_call=synthetic_tool_call
-    )
-
-
-def _build_codex_google_code_assist_tool_pair_repair_changes(
-    *, repaired_count: int, inserted_count: int, blank_text_suppressed_count: int, repaired_names: set[str]
-) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_codex_google_code_assist_tool_pair_repair_changes(
-        repaired_count=repaired_count,
-        inserted_count=inserted_count,
-        blank_text_suppressed_count=blank_text_suppressed_count,
-        repaired_names=repaired_names,
-    )
-
-
-
-
-def _append_codex_google_code_assist_orphan_tool_result_context(
-    *, messages: list[Any], index: int, context_text: str
-) -> None:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._append_codex_google_code_assist_orphan_tool_result_context(
-        messages=messages, index=index, context_text=context_text
-    )
-
-
-def _sanitize_codex_google_code_assist_orphan_tool_results(
-    completion_kwargs: dict[str, Any], *, scope_key: Optional[str] = None
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._sanitize_codex_google_code_assist_orphan_tool_results(
-        completion_kwargs, scope_key=scope_key
-    )
-
-
-
-
-_get_google_code_assist_native_tool_aliases = _google_env_policy._get_google_code_assist_native_tool_aliases
-
-
-def _apply_google_code_assist_alias_to_function_block(
-    function_block: dict[str, Any], *, aliases: dict[str, str], tool_name_mapping: dict[str, str]
-) -> tuple[dict[str, Any], Optional[str]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_alias_to_function_block(
-        function_block, aliases=aliases, tool_name_mapping=tool_name_mapping
-    )
-
-
-def _apply_google_code_assist_alias_to_tool(
-    tool: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]
-) -> tuple[Any, Optional[str]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_alias_to_tool(
-        tool, aliases=aliases, tool_name_mapping=tool_name_mapping
-    )
-
-
-def _apply_google_code_assist_aliases_to_tool_calls(
-    tool_calls: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]
-) -> tuple[Any, set[str]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_aliases_to_tool_calls(
-        tool_calls, aliases=aliases, tool_name_mapping=tool_name_mapping
-    )
-
-
-def _apply_google_code_assist_aliases_to_message(
-    message: Any, *, aliases: dict[str, str], tool_name_mapping: dict[str, str]
-) -> tuple[Any, set[str]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_aliases_to_message(
-        message, aliases=aliases, tool_name_mapping=tool_name_mapping
-    )
-
-
-def _apply_google_code_assist_native_tool_aliases(
-    completion_kwargs: dict[str, Any], tool_name_mapping: dict[str, str]
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._apply_google_code_assist_native_tool_aliases(completion_kwargs, tool_name_mapping)
-
-
-_get_google_adapter_max_completion_messages_window = _google_env_policy._get_google_adapter_max_completion_messages_window
-
-
-_completion_message_has_visible_text = _google_context_window._completion_message_has_visible_text
-
-
-def _inject_google_adapter_tool_call_context_text(
-    messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._inject_google_adapter_tool_call_context_text(messages)
-
-
-_estimate_completion_message_text_chars = _google_context_window._estimate_completion_message_text_chars
-
-
-_completion_message_has_tool_result = _google_context_window._completion_message_has_tool_result
-
-
-_completion_message_tool_call_ids = _google_context_window._completion_message_tool_call_ids
-
-
-_completion_message_tool_result_ids = _google_context_window._completion_message_tool_result_ids
-
-
-_trim_completion_message_tail_preserving_tool_pairs = _google_context_window._trim_completion_message_tail_preserving_tool_pairs
-
-
-_get_google_adapter_preserved_task_state_char_cap = _google_env_policy._get_google_adapter_preserved_task_state_char_cap
-
-
-def _extract_google_adapter_preserved_task_excerpt(text: str) -> str:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_adapter_preserved_task_excerpt(text)
-
-
-def _build_google_adapter_preserved_task_state_message(
-    messages: list[dict[str, Any]],
-) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_google_adapter_preserved_task_state_message(messages)
-
-
-_apply_google_adapter_completion_message_window = _google_context_window._apply_google_adapter_completion_message_window
-
-
-
-
-_google_code_assist_duplicate_tool_results_from_completion_messages = _google_context_window._google_code_assist_duplicate_tool_results_from_completion_messages
-
-
-
-
-_google_code_assist_tool_results_from_completion_messages = _google_context_window._google_code_assist_tool_results_from_completion_messages
-
-
-
-
-def _extract_google_code_assist_text_metrics(content_block: Any) -> tuple[int, int]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_code_assist_text_metrics(content_block)
-
-
-def _summarize_google_code_assist_content_preview_entry(content_entry: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._summarize_google_code_assist_content_preview_entry(content_entry)
-
-
-def _summarize_google_code_assist_request_contents_shape(
-    request_block: dict[str, Any], summary: dict[str, Any]
-) -> None:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._summarize_google_code_assist_request_contents_shape(request_block, summary)
-
-
-def _summarize_google_code_assist_generation_config_shape(
-    request_block: dict[str, Any], summary: dict[str, Any]
-) -> None:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._summarize_google_code_assist_generation_config_shape(request_block, summary)
-
-
-def _extract_google_code_assist_function_names(request_block: Any) -> list[str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._extract_google_code_assist_function_names(request_block)
-
-
-def _summarize_google_code_assist_request_shape(payload: Any) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._summarize_google_code_assist_request_shape(payload)
-
-
-
-
-def _build_responses_response_from_adapter_response(response_obj: Any) -> Response:
-    return Response(
-        content=_serialize_responses_adapter_response(response_obj),
-        media_type="application/json",
-    )
-
-
-
-
-
-
-def _wrap_streaming_response_with_release_callback(
-    response: StreamingResponse,
-    release_callback: Any,
-) -> StreamingResponse:
-    released = False
-
-    def _release_once() -> None:
-        nonlocal released
-        if released:
-            return
-        released = True
-        try:
-            release_callback()
-        except Exception:
-            verbose_proxy_logger.exception("Failed to release adapted streaming response guard callback")
-
-    original_iterator = getattr(response, "body_iterator", None)
-    if original_iterator is None:
-        _release_once()
-        return response
-
-    async def _wrapped_iterator():
-        try:
-            async for chunk in original_iterator:
-                yield chunk
-        finally:
-            _release_once()
-
-    response.body_iterator = _wrapped_iterator()
-    return response
+# Wave 7: response_utils owner install
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import response_utils as _aawm_response_utils
+_aawm_response_utils.install(globals())
 
 
 _get_openrouter_api_key = _wave6b_openrouter_runtime._get_openrouter_api_key
@@ -3951,17 +1581,6 @@ _get_anthropic_adapter_openrouter_target_base = _wave6b_openrouter_runtime._get_
 
 
 # Wave 6B: published by _wave6b_opencode_zen_runtime.install(globals())
-
-
-def _antigravity_candidate_unavailable_detail(__exc, *__, **___):
-    return _wave6b_common._antigravity_candidate_unavailable_detail(__exc, runtime=_wave6b_common_live_runtime())
-
-
-def _raise_antigravity_auto_agent_candidate_unavailable(__exc, *__, **___):
-    return _wave6b_common._raise_antigravity_auto_agent_candidate_unavailable(__exc, runtime=_wave6b_common_live_runtime())
-
-
-_is_grok_unsupported_reasoning_parameter_detail = _wave6b_common._is_grok_unsupported_reasoning_parameter_detail
 
 
 def _codex_native_openai_candidate_unavailable_detail(__exc, *__, **___):
@@ -4077,88 +1696,9 @@ _apply_openrouter_completion_message_sanitization = _wave6b_openrouter_runtime._
 _build_openrouter_default_headers = _wave6b_openrouter_runtime._build_openrouter_default_headers
 
 
-def _get_claude_agent_spec_dir() -> Optional[Path]:
-    for env_var in _CLAUDE_AGENT_SPEC_DIR_ENV_VARS:
-        value = os.getenv(env_var)
-        if not isinstance(value, str) or not value.strip():
-            continue
-        candidate = Path(value).expanduser()
-        if candidate.is_dir():
-            return candidate
-
-    for raw_path in _CLAUDE_AGENT_SPEC_DEFAULT_DIRS:
-        candidate = Path(raw_path).expanduser()
-        if candidate.is_dir():
-            return candidate
-
-    return None
-
-
-def _extract_model_from_markdown_frontmatter(markdown_text: str) -> Optional[str]:
-    if not markdown_text.startswith("---\n"):
-        return None
-
-    closing_index = markdown_text.find("\n---", 4)
-    if closing_index == -1:
-        return None
-
-    frontmatter = markdown_text[4:closing_index]
-    match = re.search(r"(?m)^model:\s*(?P<model>.+?)\s*$", frontmatter)
-    if match is None:
-        return None
-
-    model_value = match.group("model").strip().strip('"').strip("'")
-    return model_value or None
-
-
-def _read_claude_agent_markdown(candidate_path: Path) -> Optional[str]:
-    try:
-        markdown_bytes = candidate_path.read_bytes()
-    except OSError:
-        return None
-
-    for encoding in ("utf-8", "cp1252", "latin-1"):
-        try:
-            return markdown_bytes.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-
-    return markdown_bytes.decode("utf-8", errors="replace")
-
-
-def _load_claude_agent_declared_model(agent_name: str) -> Optional[str]:
-    normalized_agent_name = agent_name.strip()
-    if not normalized_agent_name:
-        return None
-
-    if normalized_agent_name != Path(normalized_agent_name).name:
-        return None
-
-    agents_dir = _get_claude_agent_spec_dir()
-    if agents_dir is None:
-        return None
-
-    candidate_path = agents_dir / f"{normalized_agent_name}.md"
-    if not candidate_path.is_file():
-        return None
-
-    try:
-        stat_result = candidate_path.stat()
-    except OSError:
-        return None
-
-    cache_entry = _claude_agent_model_cache.get(candidate_path)
-    cache_key = getattr(stat_result, "st_mtime_ns", None)
-    if cache_entry is not None and cache_entry[0] == cache_key:
-        return cache_entry[1]
-
-    markdown_text = _read_claude_agent_markdown(candidate_path)
-    if markdown_text is None:
-        return None
-
-    model_name = _extract_model_from_markdown_frontmatter(markdown_text)
-    _claude_agent_model_cache[candidate_path] = (cache_key, model_name)
-    return model_name
+# Wave 7: claude_agent_spec owner install
+from litellm.proxy.pass_through_endpoints.aawm_request_policy import claude_agent_spec as _aawm_claude_agent_spec
+_aawm_claude_agent_spec.install(globals())
 
 
 _aawm_alias_durable.configure_durable_runtime(
@@ -4172,27 +1712,7 @@ _aawm_alias_durable.configure_durable_runtime(
 )
 
 
-AntigravityOAuthTokenData = dict[str, object]
-AntigravityPassthroughRequestBody = dict[str, object]
 PassthroughLoggingMetadata = dict[str, object]
-
-
-def _build_google_debug_header_summary(headers: dict[str, Any]) -> dict[str, Any]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_google_debug_header_summary(headers)
-
-
-_get_google_adapter_native_user_agent = _google_env_policy._get_google_adapter_native_user_agent
-
-
-_get_google_adapter_native_api_client_header = _google_env_policy._get_google_adapter_native_api_client_header
-
-
-def _build_google_adapter_native_headers(*, access_token: str, model: Optional[str], accept: str) -> dict[str, str]:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return _anthropic_google_shaping._build_google_adapter_native_headers(
-        access_token=access_token, model=model, accept=accept
-    )
 
 
 def _write_json_file_atomic(
@@ -4446,423 +1966,6 @@ def _get_proxy_shared_aiohttp_session() -> Optional[Any]:
     return shared_aiohttp_session
 
 
-
-
-
-
-
-
-
-
-def _log_google_completion_adapter_debug(
-    *,
-    prepared_request_body: dict[str, Any],
-    wrapped_request_body: dict[str, Any],
-    google_model: str,
-    adapter_headers: dict[str, str],
-    sanitized_schema_fix_count: int,
-    generation_policy_changes: dict[str, Any],
-) -> None:
-    if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") != "1":
-        return
-
-    try:
-        debug_shape = _summarize_google_code_assist_request_shape(wrapped_request_body)
-        request_payload = wrapped_request_body.get("request") if isinstance(wrapped_request_body, dict) else None
-        function_names = _extract_google_code_assist_function_names(request_payload)
-        litellm_metadata = (
-            prepared_request_body.get("litellm_metadata") if isinstance(prepared_request_body, dict) else None
-        )
-        google_persisted_output_compacted_count = (
-            litellm_metadata.get("google_adapter_persisted_output_compacted_count")
-            if isinstance(litellm_metadata, dict)
-            else None
-        )
-        completion_message_window_debug = (
-            litellm_metadata.get("google_adapter_completion_message_window")
-            if isinstance(litellm_metadata, dict)
-            else None
-        )
-        verbose_proxy_logger.info(
-            "Gemini adapter debug: model=%s upstream_headers=%s schema_fixes=%s google_persisted_output_compacted_count=%s completion_message_window=%s generation_policy_changes=%s body_shape=%s function_names=%s",
-            google_model,
-            _build_google_debug_header_summary(adapter_headers),
-            sanitized_schema_fix_count,
-            google_persisted_output_compacted_count,
-            completion_message_window_debug,
-            generation_policy_changes,
-            debug_shape,
-            function_names,
-        )
-    except Exception:
-        verbose_proxy_logger.exception("Gemini adapter debug logging failed")
-
-
-async def _prepare_anthropic_google_completion_adapter_request(
-    *,
-    request: Request,
-    prepared_request_body: dict[str, Any],
-    adapter_model: str,
-    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
-) -> SimpleNamespace:
-    _anthropic_google_shaping.bind_runtime(globals())
-    return await _anthropic_google_shaping._prepare_anthropic_google_completion_adapter_request(
-        request=request,
-        prepared_request_body=prepared_request_body,
-        adapter_model=adapter_model,
-        adapter_provider=adapter_provider,
-    )
-
-
-def _release_google_adapter_semaphore_once(
-    google_adapter_semaphore: Any,
-    release_state: dict[str, bool],
-    *,
-    google_model: str,
-) -> None:
-    if release_state.get("released"):
-        return
-    release_state["released"] = True
-    google_adapter_semaphore.release()
-    if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
-        verbose_proxy_logger.info(
-            "Google adapter semaphore released for model=%s",
-            google_model,
-        )
-
-
-async def _perform_anthropic_google_completion_adapter_request(
-    *,
-    request: Request,
-    user_api_key_dict: UserAPIKeyAuth,
-    adapter_request: SimpleNamespace,
-    use_alias_candidate_probe: bool = False,
-) -> Response:
-    from litellm.litellm_core_utils.litellm_logging import Logging
-
-    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
-        url=str(adapter_request.annotated_target_url),
-        headers=adapter_request.adapter_headers,
-        credential_family="google",
-        expected_target_family="google",
-    )
-    _annotate_request_scope_for_adapted_access_log(
-        request,
-        adapter_request.annotated_target_url,
-    )
-
-    google_adapter_semaphore = _get_google_adapter_semaphore(
-        rate_limit_key=adapter_request.google_adapter_rate_limit_key
-    )
-    await google_adapter_semaphore.acquire()
-    release_state = {"released": False}
-    if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1":
-        verbose_proxy_logger.info(
-            "Google adapter semaphore acquired for model=%s stream=%s",
-            adapter_request.google_model,
-            adapter_request.is_stream,
-        )
-
-    stream_release_attached = False
-    try:
-        upstream_response = await _perform_google_adapter_pass_through_request(
-            request=request,
-            target=adapter_request.target_url,
-            custom_headers=adapter_request.adapter_headers,
-            user_api_key_dict=user_api_key_dict,
-            custom_body=adapter_request.wrapped_request_body,
-            forward_headers=False,
-            query_params=adapter_request.target_query_params,
-            stream=adapter_request.is_stream,
-            custom_llm_provider=adapter_request.custom_llm_provider,
-            egress_credential_family="google",
-            expected_target_family="google",
-            google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
-            google_adapter_max_retries=0 if use_alias_candidate_probe else None,
-            google_adapter_model_capacity_max_retries=(0 if use_alias_candidate_probe else None),
-            google_adapter_hidden_retry_budget_seconds=(0 if use_alias_candidate_probe else None),
-        )
-
-        if not isinstance(upstream_response, StreamingResponse):
-            raise HTTPException(
-                status_code=502,
-                detail="Google Code Assist adapter expected a streaming response.",
-            )
-
-        if adapter_request.client_requested_stream:
-            streaming_response = _build_anthropic_streaming_response_from_google_code_assist_stream(
-                response=upstream_response,
-                adapter_model=adapter_request.google_model,
-                tool_name_mapping=adapter_request.tool_name_mapping,
-                gemini_optional_params=adapter_request.gemini_optional_params,
-                rate_limit_key=adapter_request.google_adapter_rate_limit_key,
-            )
-            stream_release_attached = True
-            return _wrap_streaming_response_with_release_callback(
-                streaming_response,
-                lambda: _release_google_adapter_semaphore_once(
-                    google_adapter_semaphore,
-                    release_state,
-                    google_model=adapter_request.google_model,
-                ),
-            )
-
-        logging_obj = Logging(
-            model=adapter_request.google_model,
-            messages=adapter_request.completion_messages,
-            stream=False,
-            call_type="completion",
-            start_time=datetime.now(),
-            litellm_call_id=str(uuid4()),
-            function_id="anthropic_google_completion_adapter",
-        )
-        logging_obj.optional_params = adapter_request.gemini_optional_params
-
-        return await _collect_google_code_assist_response_from_stream(
-            response=upstream_response,
-            adapter_model=adapter_request.google_model,
-            tool_name_mapping=adapter_request.tool_name_mapping,
-            logging_obj=logging_obj,
-        )
-    finally:
-        if not adapter_request.is_stream or not stream_release_attached:
-            _release_google_adapter_semaphore_once(
-                google_adapter_semaphore,
-                release_state,
-                google_model=adapter_request.google_model,
-            )
-
-
-async def _handle_anthropic_google_completion_adapter_route(
-    *,
-    endpoint: str,
-    request: Request,
-    fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth,
-    prepared_request_body: dict[str, Any],
-    adapter_model: str,
-    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
-    use_alias_candidate_probe: bool = False,
-) -> Response:
-    try:
-        adapter_request = await _prepare_anthropic_google_completion_adapter_request(
-            request=request,
-            prepared_request_body=prepared_request_body,
-            adapter_model=adapter_model,
-            adapter_provider=adapter_provider,
-        )
-    except Exception as exc:
-        if (
-            use_alias_candidate_probe
-            and adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
-            and _antigravity_candidate_unavailable_detail(exc) is not None
-        ):
-            _raise_antigravity_auto_agent_candidate_unavailable(exc)
-        raise
-    return await _perform_anthropic_google_completion_adapter_request(
-        request=request,
-        user_api_key_dict=user_api_key_dict,
-        adapter_request=adapter_request,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-    )
-
-
-async def _perform_codex_google_code_assist_adapter_request(
-    *,
-    request: Request,
-    user_api_key_dict: UserAPIKeyAuth,
-    adapter_request: SimpleNamespace,
-    use_alias_candidate_probe: bool = False,
-) -> Response:
-    from litellm.litellm_core_utils.litellm_logging import Logging
-    from litellm.responses.litellm_completion_transformation.transformation import (
-        LiteLLMCompletionResponsesConfig,
-    )
-
-    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
-        url=str(adapter_request.annotated_target_url),
-        headers=adapter_request.adapter_headers,
-        credential_family="google",
-        expected_target_family="google",
-    )
-    _annotate_request_scope_for_adapted_access_log(
-        request,
-        adapter_request.annotated_target_url,
-    )
-
-    google_adapter_semaphore = _get_google_adapter_semaphore(
-        rate_limit_key=adapter_request.google_adapter_rate_limit_key
-    )
-    await google_adapter_semaphore.acquire()
-    release_state = {"released": False}
-    stream_release_attached = False
-    try:
-        upstream_response = await _perform_google_adapter_pass_through_request(
-            request=request,
-            target=adapter_request.target_url,
-            custom_headers=adapter_request.adapter_headers,
-            user_api_key_dict=user_api_key_dict,
-            custom_body=adapter_request.wrapped_request_body,
-            forward_headers=False,
-            query_params=adapter_request.target_query_params,
-            stream=adapter_request.is_stream,
-            custom_llm_provider=adapter_request.custom_llm_provider,
-            egress_credential_family="google",
-            expected_target_family="google",
-            google_adapter_rate_limit_key=adapter_request.google_adapter_rate_limit_key,
-            google_adapter_max_retries=0 if use_alias_candidate_probe else None,
-            google_adapter_model_capacity_max_retries=(0 if use_alias_candidate_probe else None),
-            google_adapter_hidden_retry_budget_seconds=(0 if use_alias_candidate_probe else None),
-        )
-
-        if not isinstance(upstream_response, StreamingResponse):
-            raise HTTPException(
-                status_code=502,
-                detail="Google Code Assist adapter expected a streaming response.",
-            )
-
-        if adapter_request.client_requested_stream:
-            streaming_response = _build_codex_streaming_response_from_google_code_assist_stream(
-                response=upstream_response,
-                adapter_request=adapter_request,
-            )
-            stream_release_attached = True
-            return _wrap_streaming_response_with_release_callback(
-                streaming_response,
-                lambda: _release_google_adapter_semaphore_once(
-                    google_adapter_semaphore,
-                    release_state,
-                    google_model=adapter_request.google_model,
-                ),
-            )
-
-        logging_obj = Logging(
-            model=adapter_request.google_model,
-            messages=adapter_request.completion_messages,
-            stream=False,
-            call_type="completion",
-            start_time=datetime.now(),
-            litellm_call_id=str(uuid4()),
-            function_id="codex_google_code_assist_adapter",
-        )
-        logging_obj.optional_params = adapter_request.gemini_optional_params
-        model_response = await _collect_google_code_assist_model_response_from_stream(
-            response=upstream_response,
-            adapter_model=adapter_request.google_model,
-            logging_obj=logging_obj,
-        )
-        model_response = _restore_google_adapter_tool_call_names(
-            model_response,
-            adapter_request.tool_name_mapping,
-        )
-        if use_alias_candidate_probe and _is_codex_google_code_assist_empty_success_model_response(model_response):
-            _raise_codex_auto_agent_empty_success_response(
-                response_body={
-                    "id": _mapping_or_attr_get(model_response, "id"),
-                    "model": _mapping_or_attr_get(
-                        model_response,
-                        "model",
-                        adapter_request.google_model,
-                    ),
-                    "status": "completed",
-                    "output": [],
-                    "usage": _model_response_usage_dict(_mapping_or_attr_get(model_response, "usage")),
-                },
-                adapter_model=adapter_request.google_model,
-                adapter="codex_auto_agent_google_code_assist",
-                adapter_label="Gemini Code Assist",
-            )
-        responses_api_response = (
-            LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-                chat_completion_response=model_response,
-                request_input=adapter_request.codex_request_input,
-                responses_api_request=adapter_request.responses_api_request,
-            )
-        )
-        return _build_responses_response_from_adapter_response(responses_api_response)
-    finally:
-        if not adapter_request.is_stream or not stream_release_attached:
-            _release_google_adapter_semaphore_once(
-                google_adapter_semaphore,
-                release_state,
-                google_model=adapter_request.google_model,
-            )
-
-
-async def _handle_codex_google_code_assist_adapter_route(
-    *,
-    endpoint: str,
-    request: Request,
-    fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth,
-    prepared_request_body: dict[str, Any],
-    adapter_model: str,
-    adapter_provider: str = litellm.LlmProviders.GEMINI.value,
-    use_alias_candidate_probe: bool = False,
-) -> Response:
-    try:
-        adapter_request = await _prepare_codex_google_code_assist_adapter_request(
-            request=request,
-            prepared_request_body=prepared_request_body,
-            adapter_model=adapter_model,
-            adapter_provider=adapter_provider,
-        )
-    except Exception as exc:
-        if (
-            use_alias_candidate_probe
-            and adapter_provider == _ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER
-            and _antigravity_candidate_unavailable_detail(exc) is not None
-        ):
-            _raise_antigravity_auto_agent_candidate_unavailable(exc)
-        raise
-    return await _perform_codex_google_code_assist_adapter_request(
-        request=request,
-        user_api_key_dict=user_api_key_dict,
-        adapter_request=adapter_request,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-    )
-
-
-
-
-_aawm_responses_finalize.configure_responses_finalize_runtime(
-    _aawm_responses_finalize.ResponsesFinalizeRuntime(
-        annotate_request=lambda *args, **kwargs: (_annotate_request_scope_for_adapted_access_log(*args, **kwargs)),
-        validate_stream=lambda *args, **kwargs: (_validate_alias_candidate_responses_stream_if_needed(*args, **kwargs)),
-        collect_stream=lambda *args, **kwargs: (_collect_responses_response_from_stream(*args, **kwargs)),
-        build_response=lambda *args, **kwargs: (_build_anthropic_response_from_responses_response(*args, **kwargs)),
-        copy_headers=lambda *args, **kwargs: (_copy_translated_anthropic_adapter_response_headers(*args, **kwargs)),
-        build_streaming_response=lambda *args, **kwargs: (
-            _build_anthropic_streaming_response_from_responses_stream(*args, **kwargs)
-        ),
-        decode_response_body=lambda *args, **kwargs: (_decode_http_response_body(*args, **kwargs)),
-        build_malformed_context=lambda *args, **kwargs: (
-            _build_malformed_intake_context_for_anthropic_responses_adapter(*args, **kwargs)
-        ),
-    )
-)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 _ANTHROPIC_OPENAI_PROVIDER_RUNTIME = _anthropic_openai_provider.Runtime(
     resolve_auth_context=lambda request: (_resolve_anthropic_openai_responses_adapter_auth_context(request)),
     compact_context=lambda body, **kwargs: (
@@ -4945,33 +2048,60 @@ _ANTHROPIC_OPENROUTER_PROVIDER_RUNTIME = _anthropic_openrouter_provider.Runtime(
         )
     ),
     log_debug=lambda message, *args: verbose_proxy_logger.debug(message, *args),
-    build_responses_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
-    apply_parallel_policy=lambda body: (_apply_openrouter_adapter_parallel_instruction_policy(body)),
+    build_responses_body=lambda body, **kwargs: (
+        _build_anthropic_responses_adapter_request_body(body, **kwargs)
+    ),
+    apply_parallel_policy=lambda body: (
+        _apply_openrouter_adapter_parallel_instruction_policy(body)
+    ),
     apply_forced_tool_choice=lambda source, translated: (
         _apply_forced_bash_tool_choice_for_responses_adapter(source, translated)
     ),
     contains_mcp_tools=lambda body: _responses_request_contains_mcp_tools(body),
     get_api_key=lambda: _get_anthropic_adapter_openrouter_api_key(),
-    raise_candidate_unavailable=lambda detail: (_raise_openrouter_auto_agent_candidate_unavailable(str(detail))),
+    raise_candidate_unavailable=lambda detail: (
+        _raise_openrouter_auto_agent_candidate_unavailable(str(detail))
+    ),
     get_target_base=lambda: _get_anthropic_adapter_openrouter_target_base(),
-    normalize_endpoint=lambda **kwargs: (BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)),
+    normalize_endpoint=lambda **kwargs: (
+        BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(**kwargs)
+    ),
     join_url=lambda *args: BaseOpenAIPassThroughHandler._join_url_paths(*args),
     url_factory=httpx.URL,
-    assemble_headers=lambda **kwargs: (BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)),
+    assemble_headers=lambda **kwargs: (
+        BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)
+    ),
     build_default_headers=lambda: _build_openrouter_default_headers(),
-    perform_responses_request=lambda **kwargs: (_perform_openrouter_adapter_pass_through_request(**kwargs)),
-    get_completion_model=lambda model: (_get_openrouter_completion_adapter_upstream_model(model)),
-    prepare_completion_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
-    validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
-    perform_completion_operation=lambda **kwargs: (_perform_openrouter_completion_adapter_operation(**kwargs)),
+    perform_responses_request=lambda **kwargs: (
+        _perform_openrouter_adapter_pass_through_request(**kwargs)
+    ),
+    get_completion_model=lambda model: (
+        _get_openrouter_completion_adapter_upstream_model(model)
+    ),
+    prepare_completion_body=lambda body, **kwargs: (
+        _prepare_anthropic_completion_adapter_request_body(body, **kwargs)
+    ),
+    validate_egress=lambda **kwargs: (
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)
+    ),
+    perform_completion_operation=lambda **kwargs: (
+        _perform_openrouter_completion_adapter_operation(**kwargs)
+    ),
     provider=litellm.LlmProviders.OPENROUTER.value,
     provider_target=litellm.LlmProviders.OPENROUTER.value,
 )
 
+
 _ANTHROPIC_OPENCODE_ZEN_PROVIDER_RUNTIME = _anthropic_opencode_zen_provider.Runtime(
-    build_responses_body=lambda body, **kwargs: (_build_anthropic_responses_adapter_request_body(body, **kwargs)),
-    add_logging_metadata=lambda body, **kwargs: (_add_opencode_zen_logging_metadata(body, **kwargs)),
-    apply_parallel_policy=lambda body: (_apply_openrouter_adapter_parallel_instruction_policy(body)),
+    build_responses_body=lambda body, **kwargs: (
+        _build_anthropic_responses_adapter_request_body(body, **kwargs)
+    ),
+    add_logging_metadata=lambda body, **kwargs: (
+        _add_opencode_zen_logging_metadata(body, **kwargs)
+    ),
+    apply_parallel_policy=lambda body: (
+        _apply_openrouter_adapter_parallel_instruction_policy(body)
+    ),
     apply_forced_tool_choice=lambda source, translated: (
         _apply_forced_bash_tool_choice_for_responses_adapter(source, translated)
     ),
@@ -4979,17 +2109,37 @@ _ANTHROPIC_OPENCODE_ZEN_PROVIDER_RUNTIME = _anthropic_opencode_zen_provider.Runt
     contains_mcp_tools=lambda body: _responses_request_contains_mcp_tools(body),
     get_target_base=lambda: _get_opencode_zen_target_base(),
     join_url=lambda **kwargs: _join_opencode_zen_passthrough_url(**kwargs),
-    build_headers=lambda request, **kwargs: (_build_opencode_zen_headers(request, **kwargs)),
-    unavailable_detail=lambda exc: (_opencode_zen_candidate_unavailable_detail(exc)),
-    raise_candidate_unavailable=lambda exc: (_raise_opencode_zen_auto_agent_candidate_unavailable(exc)),
+    build_headers=lambda request, **kwargs: (
+        _build_opencode_zen_headers(request, **kwargs)
+    ),
+    unavailable_detail=lambda exc: _opencode_zen_candidate_unavailable_detail(exc),
+    raise_candidate_unavailable=lambda exc: (
+        _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
+    ),
     url_factory=httpx.URL,
-    prepare_completion_body=lambda body, **kwargs: (_prepare_anthropic_completion_adapter_request_body(body, **kwargs)),
-    load_api_key=lambda **kwargs: (_load_opencode_zen_api_key_for_candidate(**kwargs)),
-    assemble_headers=lambda **kwargs: (BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)),
-    validate_egress=lambda **kwargs: (HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)),
+    prepare_completion_body=lambda body, **kwargs: (
+        _prepare_anthropic_completion_adapter_request_body(body, **kwargs)
+    ),
+    load_api_key=lambda **kwargs: (
+        _load_opencode_zen_api_key_for_candidate(**kwargs)
+    ),
+    assemble_headers=lambda **kwargs: (
+        BaseOpenAIPassThroughHandler._assemble_headers(**kwargs)
+    ),
+    validate_egress=lambda **kwargs: (
+        HttpPassThroughEndpointHelpers.validate_outgoing_egress(**kwargs)
+    ),
     provider=_OPENCODE_ZEN_PROVIDER,
     completion_provider=litellm.LlmProviders.OPENAI.value,
 )
+
+
+
+
+
+
+
+
 
 
 async def _prepare_anthropic_openai_responses_adapter_route(
@@ -5441,6 +2591,9 @@ def _clean_secret_string(value: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+_wave6b_opencode_zen_runtime.install(globals())
+
+
 def _get_first_secret_value(secret_names: tuple[str, ...]) -> Optional[str]:
     for secret_name in secret_names:
         value = _clean_secret_string(get_secret_str(secret_name))
@@ -5449,12 +2602,6 @@ def _get_first_secret_value(secret_names: tuple[str, ...]) -> Optional[str]:
     return None
 
 
-# RR-054 #1: wire Google OAuth package runtime deps after helpers exist.
-_aawm_google_oauth.configure_google_oauth_runtime(
-    clean_value=_clean_codex_auth_value,
-    get_first_secret_value=_get_first_secret_value,
-    invalidate_google_lane_cache=_invalidate_codex_auto_agent_google_lane_cache,
-)
 
 
 def _normalize_aawm_sslmode(value: Optional[str]) -> Optional[str]:
@@ -5468,18 +2615,6 @@ def _normalize_aawm_sslmode(value: Optional[str]) -> Optional[str]:
     if lowered in {"0", "false", "no", "off"}:
         return "disable"
     return cleaned
-
-
-_get_google_adapter_persisted_output_char_cap = _google_env_policy._get_google_adapter_persisted_output_char_cap
-
-
-_get_google_adapter_auxiliary_context_char_cap = _google_env_policy._get_google_adapter_auxiliary_context_char_cap
-
-
-_get_google_adapter_followup_persisted_output_char_cap = _google_env_policy._get_google_adapter_followup_persisted_output_char_cap
-
-
-_get_google_adapter_followup_auxiliary_context_char_cap = _google_env_policy._get_google_adapter_followup_auxiliary_context_char_cap
 
 
 def _is_anthropic_web_search_tool(value: dict[str, Any]) -> bool:
@@ -5576,193 +2711,6 @@ def _get_openai_passthrough_target_base(request: Request, endpoint: str) -> str:
         if _request_uses_codex_native_auth(request):
             return os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
     return os.getenv("OPENAI_API_BASE") or "https://api.openai.com/"
-
-
-def _is_gemini_code_assist_endpoint(endpoint: str) -> bool:
-    normalized_endpoint = endpoint.lstrip("/")
-    return normalized_endpoint.startswith("v1internal:")
-
-
-_GEMINI_CODE_ASSIST_ENDPOINT_ACTION_RE = re.compile(r"^v1internal:[A-Za-z][A-Za-z0-9_]*$")
-
-
-def _normalize_gemini_code_assist_endpoint_path(endpoint: str) -> str:
-    """RR-054 #34: strict path for Code Assist v1internal:action routes.
-
-    httpx.URL(...).path cannot be used because the colon is intentional action
-    syntax (not a scheme). Reject anything outside the known shape so query/path
-    smuggling cannot ride the OAuth-forwarding lane.
-    """
-    candidate = endpoint.split("?", 1)[0].strip()
-    if not candidate:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Gemini Code Assist endpoint path",
-        )
-    if not candidate.startswith("/"):
-        candidate = "/" + candidate
-    # Disallow multi-segment smuggling while preserving the single action path.
-    body = candidate.lstrip("/")
-    if "/" in body or "\\" in body or "://" in body or ".." in body:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Gemini Code Assist endpoint path",
-        )
-    if not _GEMINI_CODE_ASSIST_ENDPOINT_ACTION_RE.fullmatch(body):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Gemini Code Assist endpoint action",
-        )
-    return candidate
-
-
-def _get_gemini_passthrough_target_base(
-    endpoint: str,
-    has_google_oauth_bearer: bool,
-) -> str:
-    if has_google_oauth_bearer and _is_gemini_code_assist_endpoint(endpoint):
-        return os.getenv("CODE_ASSIST_ENDPOINT") or "https://cloudcode-pa.googleapis.com"
-
-    return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
-
-
-_iter_antigravity_auth_file_path_candidates = _aawm_antigravity_oauth._iter_antigravity_auth_file_path_candidates
-
-
-_get_antigravity_auth_file_path = _aawm_antigravity_oauth._get_antigravity_auth_file_path
-
-
-_load_antigravity_oauth_token_data_from_path = _aawm_antigravity_oauth._load_antigravity_oauth_token_data_from_path
-
-
-_load_local_antigravity_oauth_token_data = _aawm_antigravity_oauth._load_local_antigravity_oauth_token_data
-
-
-_parse_antigravity_token_expiry = _aawm_antigravity_oauth._parse_antigravity_token_expiry
-
-
-_antigravity_access_token_is_valid = _aawm_antigravity_oauth._antigravity_access_token_is_valid
-
-
-_antigravity_access_token_is_unexpired = _aawm_antigravity_oauth._antigravity_access_token_is_unexpired
-
-
-_antigravity_oauth_cached_token_is_valid = _aawm_antigravity_oauth._antigravity_oauth_cached_token_is_valid
-
-
-_get_antigravity_oauth_expiry_date = _aawm_antigravity_oauth._get_antigravity_oauth_expiry_date
-
-
-def _iter_antigravity_cli_binary_candidates(*__args, **__kwargs):
-    return _wave6b_antigravity_runtime._iter_antigravity_cli_binary_candidates(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
-
-
-_extract_antigravity_oauth_client_values_from_cli_text = (
-    _aawm_antigravity_oauth._extract_antigravity_oauth_client_values_from_cli_text
-)
-
-
-_add_antigravity_oauth_client_candidate = _aawm_antigravity_oauth._add_antigravity_oauth_client_candidate
-
-
-_extract_antigravity_oauth_client_value_candidates_from_cli_text = (
-    _aawm_antigravity_oauth._extract_antigravity_oauth_client_value_candidates_from_cli_text
-)
-
-
-_load_antigravity_oauth_client_values_from_local_cli_binary = (
-    _aawm_antigravity_oauth._load_antigravity_oauth_client_values_from_local_cli_binary
-)
-
-
-_load_antigravity_oauth_client_value_candidates_from_local_cli_binary = (
-    _aawm_antigravity_oauth._load_antigravity_oauth_client_value_candidates_from_local_cli_binary
-)
-
-
-_get_antigravity_oauth_client_value_from_token_data = (
-    _aawm_antigravity_oauth._get_antigravity_oauth_client_value_from_token_data
-)
-
-
-_get_antigravity_oauth_client_value_candidates = _aawm_antigravity_oauth._get_antigravity_oauth_client_value_candidates
-
-
-# RR-054 #1: wire Antigravity OAuth package runtime deps after helpers exist.
-_aawm_antigravity_oauth.configure_antigravity_oauth_runtime(
-    clean_value=_clean_codex_auth_value,
-    get_first_secret_value=_get_first_secret_value,
-    invalidate_lane_cache=_invalidate_codex_auto_agent_antigravity_lane_cache,
-    write_json_atomic=_write_json_file_atomic,
-    iter_cli_binaries=_iter_antigravity_cli_binary_candidates,
-    oauth_error_code=_get_oauth_token_error_code,
-    format_refresh_failure=_format_oauth_refresh_failure_detail,
-)
-
-
-_write_antigravity_oauth_token_data_atomic = _aawm_antigravity_oauth._write_antigravity_oauth_token_data_atomic
-
-
-_get_antigravity_cli_refresh_home = _aawm_antigravity_oauth._get_antigravity_cli_refresh_home
-
-
-_get_antigravity_cli_refresh_timeout_seconds = _aawm_antigravity_oauth._get_antigravity_cli_refresh_timeout_seconds
-
-
-_refresh_local_antigravity_oauth_token_data_via_cli = (
-    _aawm_antigravity_oauth._refresh_local_antigravity_oauth_token_data_via_cli
-)
-
-
-_refresh_local_antigravity_oauth_token_data = _aawm_antigravity_oauth._refresh_local_antigravity_oauth_token_data
-
-
-_load_valid_local_antigravity_access_token = _aawm_antigravity_oauth._load_valid_local_antigravity_access_token
-
-
-def _get_antigravity_passthrough_target_base(*__args, **__kwargs):
-    return _wave6b_antigravity_runtime._get_antigravity_passthrough_target_base(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
-
-
-def _get_antigravity_client_header(*__args, **__kwargs):
-    return _wave6b_antigravity_runtime._get_antigravity_client_header(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
-
-
-@lru_cache(maxsize=1)
-def _get_anthropic_antigravity_runtime():
-    return _wave6b_antigravity_runtime._get_anthropic_antigravity_runtime(runtime=_wave6b_antigravity_live_runtime())
-
-
-def _build_antigravity_native_headers(*__args, **__kwargs):
-    return _wave6b_antigravity_runtime._build_antigravity_native_headers(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
-
-
-_request_has_google_oauth_bearer = _wave6b_antigravity_runtime._request_has_google_oauth_bearer
-
-
-def _get_antigravity_litellm_auth_header(*__args, **__kwargs):
-    return _wave6b_antigravity_runtime._get_antigravity_litellm_auth_header(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
-
-
-def _prepare_antigravity_request_body_for_passthrough(*__args, **__kwargs):
-    return _wave6b_antigravity_runtime._prepare_antigravity_request_body_for_passthrough(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
-
-
-def _get_antigravity_request_project(*__args, **__kwargs):
-    return _wave6b_antigravity_runtime._get_antigravity_request_project(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
-
-
-def _get_antigravity_passthrough_logging_metadata(*__args, **__kwargs):
-    return _wave6b_antigravity_runtime._get_antigravity_passthrough_logging_metadata(*__args, runtime=_wave6b_antigravity_live_runtime(), **__kwargs)
-
-
-_normalize_antigravity_endpoint_for_target = _wave6b_antigravity_runtime._normalize_antigravity_endpoint_for_target
-
-
-_join_antigravity_passthrough_url = _wave6b_antigravity_runtime._join_antigravity_passthrough_url
-
-
-_is_antigravity_streaming_endpoint = _wave6b_antigravity_runtime._is_antigravity_streaming_endpoint
 
 
 def _get_grok_passthrough_target_base() -> str:
@@ -6033,10 +2981,7 @@ async def llm_passthrough_factory_proxy_route(
     if base_target_url is None:
         raise HTTPException(status_code=404, detail=f"Provider {custom_llm_provider} api base not found")
 
-    if _is_gemini_code_assist_endpoint(endpoint):
-        encoded_endpoint = _normalize_gemini_code_assist_endpoint_path(endpoint)
-    else:
-        encoded_endpoint = httpx.URL(endpoint).path
+    encoded_endpoint = httpx.URL(endpoint).path
 
     # Ensure endpoint starts with '/' for proper URL construction
     if not encoded_endpoint.startswith("/"):
@@ -6099,6 +3044,14 @@ async def llm_passthrough_factory_proxy_route(
     return received_value
 
 
+def _get_gemini_passthrough_target_base(
+    endpoint: str,
+    has_google_oauth_bearer: bool,
+) -> str:
+    _ = endpoint, has_google_oauth_bearer
+    return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
+
+
 @router.api_route(
     "/gemini/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -6134,10 +3087,7 @@ async def gemini_proxy_route(
         endpoint=endpoint,
         has_google_oauth_bearer=_is_google_oauth,
     )
-    if _is_gemini_code_assist_endpoint(endpoint):
-        encoded_endpoint = _normalize_gemini_code_assist_endpoint_path(endpoint)
-    else:
-        encoded_endpoint = httpx.URL(endpoint).path
+    encoded_endpoint = httpx.URL(endpoint).path
 
     # Ensure endpoint starts with '/' for proper URL construction
     if not encoded_endpoint.startswith("/"):
@@ -6172,22 +3122,6 @@ async def gemini_proxy_route(
 
     if request.method == "POST":
         request_body = await get_request_body(request)
-        if os.getenv("AAWM_GEMINI_ROUTE_DEBUG") == "1" and _is_google_oauth:
-            debug_headers = _build_google_debug_header_summary(dict(request.headers))
-            debug_body_summary = _summarize_google_code_assist_request_shape(request_body)
-            request_block = (
-                request_body.get("request")
-                if isinstance(request_body, dict) and isinstance(request_body.get("request"), dict)
-                else request_body
-            )
-            function_names = _extract_google_code_assist_function_names(request_block)
-            verbose_proxy_logger.info(
-                "Gemini passthrough debug: endpoint=%s headers=%s body_shape=%s function_names=%s",
-                endpoint,
-                debug_headers,
-                debug_body_summary,
-                function_names,
-            )
         prepared_request_body = _add_gemini_request_breakout_logging_metadata(request_body)
         gemini_route_family = _get_gemini_passthrough_route_family(endpoint)
         if gemini_route_family is not None:
@@ -6242,7 +3176,7 @@ async def opencode_zen_proxy_route(
     """
     user_api_key_dict = await user_api_key_auth(
         request=request,
-        api_key=_get_antigravity_litellm_auth_header(request),
+        api_key=_get_grok_litellm_auth_header(request),
     )
 
     target_url = _join_opencode_zen_passthrough_url(
@@ -6300,93 +3234,9 @@ async def opencode_zen_proxy_route(
 
 
 @router.api_route(
-    "/antigravity/{endpoint:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-    tags=["Antigravity Code Assist Pass-through", "pass-through"],
-)
-async def antigravity_proxy_route(
-    endpoint: str,
-    request: Request,
-    fastapi_response: Response,
-):
-    """
-    Native Antigravity CLI pass-through for Google Code Assist.
-
-    Antigravity uses its own Google OAuth credential and Code Assist client
-    headers. LiteLLM auth should be supplied separately with
-    `x-litellm-api-key` or a `key` query parameter when preserving an inbound
-    Google OAuth Authorization header.
-    """
-    user_api_key_dict = await user_api_key_auth(
-        request=request,
-        api_key=_get_antigravity_litellm_auth_header(request),
-    )
-
-    has_google_oauth_bearer = _request_has_google_oauth_bearer(request)
-    local_antigravity_access_token: Optional[str] = None
-    custom_headers: dict[str, str]
-    if has_google_oauth_bearer:
-        custom_headers = {}
-    else:
-        local_antigravity_access_token = await _load_valid_local_antigravity_access_token()
-        custom_headers = _build_antigravity_native_headers(local_antigravity_access_token)
-
-    target_url = _join_antigravity_passthrough_url(
-        base_target_url=_get_antigravity_passthrough_target_base(),
-        endpoint=endpoint,
-    )
-    query_params = {key: value for key, value in dict(request.query_params).items() if str(key).lower() != "key"}
-
-    custom_body: Optional[dict[str, Any]] = None
-    passthrough_logging_metadata = _get_antigravity_passthrough_logging_metadata(request)
-    if request.method in {"POST", "PUT", "PATCH"}:
-        request_body = await get_request_body(request)
-        if isinstance(request_body, dict):
-            custom_body = _prepare_antigravity_request_body_for_passthrough(
-                request=request,
-                request_body=request_body,
-            )
-            request_project = _get_antigravity_request_project(request_body)
-            if local_antigravity_access_token is not None and request_project is not None:
-                google_quota_observation = await _prime_google_code_assist_session(
-                    local_antigravity_access_token,
-                    request_project,
-                    adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
-                )
-                if google_quota_observation:
-                    litellm_metadata = custom_body.setdefault(
-                        "litellm_metadata",
-                        {},
-                    )
-                    if isinstance(litellm_metadata, dict):
-                        litellm_metadata["google_retrieve_user_quota"] = google_quota_observation
-            if custom_body is not request_body:
-                _safe_set_request_parsed_body(request, custom_body)
-            custom_metadata = custom_body.get("litellm_metadata")
-            if isinstance(custom_metadata, dict):
-                passthrough_logging_metadata = dict(custom_metadata)
-
-    return await pass_through_request(
-        request=request,
-        target=target_url,
-        custom_headers=custom_headers,
-        user_api_key_dict=user_api_key_dict,
-        custom_body=custom_body,
-        forward_headers=has_google_oauth_bearer,
-        query_params=query_params,
-        stream=_is_antigravity_streaming_endpoint(endpoint, request),
-        custom_llm_provider="antigravity",
-        egress_credential_family="google",
-        expected_target_family="google",
-        allowed_forward_headers=(list(_ANTIGRAVITY_FORWARD_HEADER_ALLOWLIST) if has_google_oauth_bearer else None),
-        passthrough_logging_metadata=passthrough_logging_metadata,
-    )
-
-
-@router.api_route(
     "/grok/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-    tags=["Grok Build Pass-through", "pass-through"],
+    tags=["Grok Pass-through", "pass-through"],
 )
 async def grok_proxy_route(
     endpoint: str,
@@ -6815,569 +3665,65 @@ async def is_streaming_request_fn(request: Request) -> bool:
     return False
 
 
-async def _dispatch_auto_agent_alias_candidate_request(
-    *,
-    candidate: Payload,
-    provider_handlers: Mapping[str, Callable[[], Awaitable[Response]]],
-    default_handler: Callable[[], Awaitable[Response]],
-    route_family_handlers: Optional[Mapping[str, Mapping[str, Callable[[], Awaitable[Response]]]]] = None,
-) -> Response:
-    """Table-driven provider/route_family candidate dispatch (RR-054 #10).
-
-    Anthropic and Codex families keep different handler callables, but share one
-    dispatch shape so provider branching does not re-grow divergent control flow.
-    """
-    provider = str(candidate.get("provider") or "")
-    route_family = str(candidate.get("route_family") or "")
-    if route_family_handlers and provider in route_family_handlers:
-        family_map = route_family_handlers[provider]
-        handler = family_map.get(route_family) or family_map.get("*")
-        if handler is not None:
-            return await handler()
-    handler = provider_handlers.get(provider)
-    if handler is not None:
-        return await handler()
-    return await default_handler()
-
-
-async def _perform_anthropic_auto_agent_alias_candidate_request(
-    *,
-    endpoint: str,
-    request: Request,
-    fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth,
-    candidate: dict[str, Any],
-    candidate_body: dict[str, Any],
-    target_url: str,
-    custom_headers: dict[str, Any],
-) -> Response:
-    adapter_model = candidate["model"]
-
-    async def _openai() -> Response:
-        return await _handle_anthropic_openai_responses_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _antigravity() -> Response:
-        return await _handle_anthropic_google_completion_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _google() -> Response:
-        return await _handle_anthropic_google_completion_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _openrouter_completion() -> Response:
-        return await _handle_anthropic_openrouter_completion_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _openrouter_responses() -> Response:
-        return await _handle_anthropic_openrouter_responses_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _xai_oauth() -> Response:
-        return await _handle_anthropic_xai_oauth_responses_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _grok_native() -> Response:
-        return await _handle_anthropic_grok_native_oauth_responses_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _opencode() -> Response:
-        return await _handle_anthropic_opencode_zen_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _kimi_code() -> Response:
-        return await _handle_anthropic_kimi_chat_completions_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _alibaba_token_plan() -> Response:
-        return await _handle_anthropic_alibaba_token_plan_adapter_route(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            prepared_request_body=candidate_body,
-            adapter_model=adapter_model,
-            use_alias_candidate_probe=True,
-        )
-
-    async def _native() -> Response:
-        native_candidate_body = candidate_body
-        native_custom_headers = custom_headers
-        blocked_pass_through_prefixed_headers: Optional[list[str]] = None
-        (
-            native_candidate_body,
-            _normalized_native_model_alias,
-        ) = _normalize_anthropic_native_passthrough_model_alias(native_candidate_body)
-        (
-            native_candidate_body,
-            native_custom_headers,
-            normalized_context_1m_model,
-        ) = _prepare_anthropic_context_1m_native_passthrough(
-            request=request,
-            request_body=native_candidate_body,
-            custom_headers=native_custom_headers,
-        )
-        if normalized_context_1m_model:
-            blocked_pass_through_prefixed_headers = [_ANTHROPIC_BETA_HEADER_NAME]
-        _safe_set_request_parsed_body(request, native_candidate_body)
-        return await _perform_anthropic_native_passthrough_request(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            target_url=target_url,
-            custom_headers=native_custom_headers,
-            blocked_pass_through_prefixed_headers=blocked_pass_through_prefixed_headers,
-        )
-
-    return await _dispatch_auto_agent_alias_candidate_request(
-        candidate=candidate,
-        provider_handlers={
-            _CODEX_AUTO_AGENT_NATIVE_PROVIDER: _openai,
-            _CODEX_AUTO_AGENT_ANTIGRAVITY_PROVIDER: _antigravity,
-            _CODEX_AUTO_AGENT_GOOGLE_PROVIDER: _google,
-            _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
-            _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
-            _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: _alibaba_token_plan,
-        },
-        route_family_handlers={
-            _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
-                "anthropic_openrouter_completion_adapter": _openrouter_completion,
-                "*": _openrouter_responses,
-            },
-            _CODEX_AUTO_AGENT_XAI_PROVIDER: {
-                "anthropic_xai_oauth_responses_adapter": _xai_oauth,
-                "*": _grok_native,
-            },
-        },
-        default_handler=_native,
-    )
-
 
 _AutoAgentAliasSelectionFn = Callable[..., Awaitable[dict[str, Any]]]
 _AutoAgentAliasMetadataFn = Callable[..., dict[str, Any]]
 
 
-async def _handle_auto_agent_alias_route(  # noqa: PLR0915
-    *,
-    alias_family: str,
-    alias_model: str,
-    request: Request,
-    prepared_request_body: Payload,
-    max_candidate_attempts: int,
-    select_candidate_fn: _AutoAgentAliasSelectionFn,
-    add_alias_metadata_fn: _AutoAgentAliasMetadataFn,
-    perform_candidate_request_fn: Callable[..., Awaitable[Response]],
-    get_active_cooldown_state_fn: Callable[[str], Awaitable[tuple[float, str]]],
-    set_session_affinity_fn: Callable[..., Awaitable[object]],
-    apply_cooldown_fn: Callable[..., Awaitable[str]],
-    raise_redispatch_required_fn: Callable[..., None],
-    attempts_metadata_key: str,
-    skipped_candidates_metadata_key: str,
-    no_candidate_detail: str,
-    log_label: str,
-) -> Response:
-    """Shared Anthropic/Codex auto-agent alias candidate loop (RR-054 #10).
-
-    Thin façade that adapts the legacy per-call seam callables into the typed
-    :class:`AliasRouteServices` bundle and delegates to
-    :func:`aawm_alias_routing.candidate_loop.handle_alias_route`, which owns the
-    R3-1 widened-lock single-flight publication. The production wrappers
-    (``_handle_codex_auto_agent_alias_route`` /
-    ``_handle_anthropic_auto_agent_alias_route``) build the services directly;
-    this façade keeps the legacy seam contract for the RR-054 single-flight
-    tests. Process-local publication uses the same synchronous family-memory
-    writer as production. The legacy async applicator is isolated in the
-    post-release persistence callback and never enters the typed synchronous
-    publisher contract.
-    """
-    legacy_request: Optional[Request] = None
-    legacy_candidate: dict[str, Any] = {}
-    legacy_lane_key: Optional[str] = None
-    legacy_selected_cooldown_key = ""
-    legacy_cooldown_seconds = 0.0
-    legacy_error_class: Optional[str] = None
-    legacy_grok_account_quota_exhausted = False
-    legacy_kimi_failure_metadata: Optional[dict[str, Any]] = None
-    legacy_is_read_pilot_lane = False
-    family_state = (
-        _alias_routing_state.anthropic
-        if alias_family == "anthropic_auto_agent"
-        else _alias_routing_state.codex
-    )
-
-    def _legacy_resolve_publication(
-        *,
-        request: Optional[Request],
-        candidate: dict[str, Any],
-        lane_key: Optional[str],
-        selected_cooldown_key: str,
-        cooldown_seconds: float,
-        error_class: Optional[str],
-        grok_account_quota_exhausted: bool = False,
-        kimi_failure_metadata: Optional[dict[str, Any]] = None,
-        is_read_pilot_lane: bool = False,
-    ) -> _aawm_alias_interfaces.CooldownPublicationPlan:
-        nonlocal legacy_request
-        nonlocal legacy_candidate
-        nonlocal legacy_lane_key
-        nonlocal legacy_selected_cooldown_key
-        nonlocal legacy_cooldown_seconds
-        nonlocal legacy_error_class
-        nonlocal legacy_grok_account_quota_exhausted
-        nonlocal legacy_kimi_failure_metadata
-        nonlocal legacy_is_read_pilot_lane
-        legacy_request = request
-        legacy_candidate = candidate
-        legacy_lane_key = lane_key
-        legacy_selected_cooldown_key = selected_cooldown_key
-        legacy_cooldown_seconds = cooldown_seconds
-        legacy_error_class = error_class
-        legacy_grok_account_quota_exhausted = grok_account_quota_exhausted
-        legacy_kimi_failure_metadata = kimi_failure_metadata
-        legacy_is_read_pilot_lane = is_read_pilot_lane
-        return _resolve_auto_agent_cooldown_publication_plan(
-            request=request,
-            candidate=candidate,
-            lane_key=lane_key,
-            selected_cooldown_key=selected_cooldown_key,
-            cooldown_seconds=cooldown_seconds,
-            error_class=error_class,
-            grok_account_quota_exhausted=grok_account_quota_exhausted,
-            kimi_failure_metadata=kimi_failure_metadata,
-            is_read_pilot_lane=is_read_pilot_lane,
-        )
-
-    def _legacy_publish_memory(*, keys: Sequence[str], seconds: float) -> None:
-        for key in keys:
-            family_state.set_cooldown_memory(key, seconds)
-
-    async def _legacy_persist(*, keys: Sequence[str], seconds: float) -> None:
-        if legacy_request is None:
-            raise RuntimeError("legacy cooldown resolver did not capture a request")
-        await apply_cooldown_fn(
-            request=legacy_request,
-            candidate=legacy_candidate,
-            lane_key=legacy_lane_key,
-            selected_cooldown_key=legacy_selected_cooldown_key,
-            cooldown_seconds=legacy_cooldown_seconds,
-            error_class=legacy_error_class,
-            grok_account_quota_exhausted=legacy_grok_account_quota_exhausted,
-            kimi_failure_metadata=legacy_kimi_failure_metadata,
-            is_read_pilot_lane=legacy_is_read_pilot_lane,
-        )
-
-    async def _legacy_get_active_cooldown_state(
-        cooldown_key: str,
-    ) -> tuple[float, str]:
-        memory_seconds = family_state.get_memory_cooldown_remaining(cooldown_key)
-        if memory_seconds > 0:
-            return memory_seconds, "memory"
-        return await get_active_cooldown_state_fn(cooldown_key)
-
-    # The legacy seam callables are type-erased (``Callable[..., ...]``); cast
-    # them to the typed protocols at this bridge boundary. The production
-    # wrappers pass conforming functions directly and need no cast.
-    services = _aawm_alias_interfaces.AliasRouteServices(
-        select_candidate_fn=cast(_aawm_alias_interfaces.SelectCandidateFn, select_candidate_fn),
-        perform_candidate_request_fn=cast(
-            _aawm_alias_interfaces.PerformCandidateRequestFn, perform_candidate_request_fn
+_ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME = (
+    _aawm_anthropic_auto_agent_route.AnthropicAutoAgentRouteRuntime(
+        handle_alias_route=lambda *args, **kwargs: (
+            _aawm_alias_candidate_loop.handle_alias_route(*args, **kwargs)
         ),
-        resolve_cooldown_publication_fn=_legacy_resolve_publication,
-        publish_cooldown_memory_fn=_legacy_publish_memory,
-        persist_cooldown_fn=_legacy_persist,
-        set_session_affinity_fn=cast(_aawm_alias_interfaces.SetSessionAffinityFn, set_session_affinity_fn),
-        add_alias_metadata_fn=add_alias_metadata_fn,
-        raise_redispatch_fn=raise_redispatch_required_fn,
+        resolve_cooldown_publication=lambda *args, **kwargs: (
+            _resolve_auto_agent_cooldown_publication_plan(*args, **kwargs)
+        ),
+        anthropic_family_state=_alias_routing_state.anthropic,
+        codex_family_state=_alias_routing_state.codex,
+        normalize_alias_model=lambda model: (
+            _normalize_anthropic_auto_agent_alias_model(model)
+        ),
+        default_alias_model=_ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+        perform_candidate_request=lambda *args, **kwargs: (
+            _perform_anthropic_auto_agent_alias_candidate_request(*args, **kwargs)
+        ),
+        select_candidate=lambda *args, **kwargs: (
+            _select_anthropic_auto_agent_candidate(*args, **kwargs)
+        ),
+        publish_cooldown_memory=lambda *args, **kwargs: (
+            _publish_anthropic_cooldown_memory(*args, **kwargs)
+        ),
+        persist_cooldown_durable=lambda *args, **kwargs: (
+            _persist_anthropic_cooldown_durable(*args, **kwargs)
+        ),
+        set_session_affinity=lambda *args, **kwargs: (
+            _set_anthropic_auto_agent_session_affinity(*args, **kwargs)
+        ),
+        add_alias_metadata=lambda *args, **kwargs: (
+            _add_anthropic_auto_agent_alias_metadata(*args, **kwargs)
+        ),
+        raise_redispatch_required=lambda *args, **kwargs: (
+            _raise_anthropic_auto_agent_redispatch_required(*args, **kwargs)
+        ),
+        get_candidates_for_alias=lambda *args, **kwargs: (
+            _get_anthropic_auto_agent_candidates_for_alias(*args, **kwargs)
+        ),
+        get_active_cooldown_state=lambda *args, **kwargs: (
+            _get_anthropic_auto_agent_active_cooldown_state(*args, **kwargs)
+        ),
     )
-    return await _aawm_alias_candidate_loop.handle_alias_route(
-        services,
-        alias_family=alias_family,
-        alias_model=alias_model,
-        request=request,
-        prepared_request_body=prepared_request_body,
-        max_candidate_attempts=max_candidate_attempts,
-        get_active_cooldown_state_fn=_legacy_get_active_cooldown_state,
-        attempts_metadata_key=attempts_metadata_key,
-        skipped_candidates_metadata_key=skipped_candidates_metadata_key,
-        no_candidate_detail=no_candidate_detail,
-        log_label=log_label,
-    )
+)
+_handle_auto_agent_alias_route = partial(
+    _aawm_anthropic_auto_agent_route.handle_auto_agent_alias_route,
+    _ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME,
+)
+_handle_anthropic_auto_agent_alias_route = partial(
+    _aawm_anthropic_auto_agent_route.handle_anthropic_auto_agent_alias_route,
+    _ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME,
+)
 
-
-async def _handle_anthropic_auto_agent_alias_route(
-    *,
-    endpoint: str,
-    request: Request,
-    fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth,
-    prepared_request_body: dict[str, Any],
-    target_url: str,
-    custom_headers: dict[str, Any],
-) -> Response:
-    alias_model = (
-        _normalize_anthropic_auto_agent_alias_model(prepared_request_body.get("model"))
-        or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-    )
-
-    async def _perform_candidate_request(
-        *,
-        candidate: dict[str, Any],
-        candidate_body: dict[str, Any],
-    ) -> Response:
-        return await _perform_anthropic_auto_agent_alias_candidate_request(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            candidate=candidate,
-            candidate_body=candidate_body,
-            target_url=target_url,
-            custom_headers=custom_headers,
-        )
-
-    services = _aawm_alias_interfaces.AliasRouteServices(
-        select_candidate_fn=_select_anthropic_auto_agent_candidate,
-        perform_candidate_request_fn=_perform_candidate_request,
-        resolve_cooldown_publication_fn=_resolve_auto_agent_cooldown_publication_plan,
-        publish_cooldown_memory_fn=_publish_anthropic_cooldown_memory,
-        persist_cooldown_fn=_persist_anthropic_cooldown_durable,
-        set_session_affinity_fn=_set_anthropic_auto_agent_session_affinity,
-        add_alias_metadata_fn=_add_anthropic_auto_agent_alias_metadata,
-        raise_redispatch_fn=_raise_anthropic_auto_agent_redispatch_required,
-    )
-    return await _aawm_alias_candidate_loop.handle_alias_route(
-        services,
-        alias_family="anthropic_auto_agent",
-        alias_model=alias_model,
-        request=request,
-        prepared_request_body=prepared_request_body,
-        max_candidate_attempts=len(_get_anthropic_auto_agent_candidates_for_alias(alias_model)),
-        get_active_cooldown_state_fn=_get_anthropic_auto_agent_active_cooldown_state,
-        attempts_metadata_key="anthropic_auto_agent_attempts",
-        skipped_candidates_metadata_key="anthropic_auto_agent_skipped_candidates",
-        no_candidate_detail="No Anthropic auto-agent alias candidates were available.",
-        log_label="Anthropic",
-    )
-
-
-async def _perform_anthropic_native_passthrough_request(
-    *,
-    endpoint: str,
-    request: Request,
-    fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth,
-    target_url: str,
-    custom_headers: dict[str, Any],
-    blocked_pass_through_prefixed_headers: Optional[list[str]] = None,
-) -> Response:
-    is_streaming_request = await is_streaming_request_fn(request)
-    endpoint_func = create_pass_through_route(
-        endpoint=endpoint,
-        target=target_url,
-        custom_headers=custom_headers,
-        _forward_headers=True,
-        is_streaming_request=is_streaming_request,
-        blocked_pass_through_prefixed_headers=blocked_pass_through_prefixed_headers,
-    )
-    received_value = await endpoint_func(
-        request,
-        fastapi_response,
-        user_api_key_dict,
-    )
-    return received_value
-
-
-_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX = "[1m]"
-_ANTHROPIC_CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07"
-_ANTHROPIC_BETA_HEADER_NAME = "anthropic-beta"
-_ANTHROPIC_BETA_XPASS_HEADER_NAME = f"x-pass-{_ANTHROPIC_BETA_HEADER_NAME}"
-_ANTHROPIC_DANGEROUS_DIRECT_BROWSER_ACCESS_HEADER_NAME = "anthropic-dangerous-direct-browser-access"
-_ANTHROPIC_NATIVE_PASSTHROUGH_MODEL_ALIASES = {
-    "opus": "claude-opus-4-6",
-    "opus-4-6": "claude-opus-4-6",
-    "opus-4-8": "claude-opus-4-8",
-    "fable-5": "claude-fable-5",
-    "claude-fable-5": "claude-fable-5",
-    "sonnet": "claude-sonnet-4-20250514",
-    "sonnet-4-6": "claude-sonnet-4-6",
-    "sonnet-4-20250514": "claude-sonnet-4-20250514",
-    "sonnet-5": "claude-sonnet-5",
-    "claude-sonnet-5": "claude-sonnet-5",
-    "haiku": "claude-haiku-4-5",
-    "haiku-4-5": "claude-haiku-4-5",
-    "haiku-4-5-20251001": "claude-haiku-4-5-20251001",
-}
-
-
-def _get_header_value_case_insensitive(
-    headers: Any,
-    header_name: str,
-) -> Optional[str]:
-    header_value = headers.get(header_name)
-    if header_value is not None:
-        return str(header_value)
-
-    lowered_header_name = header_name.lower()
-    for candidate_name, candidate_value in headers.items():
-        if str(candidate_name).lower() == lowered_header_name:
-            return str(candidate_value)
-    return None
-
-
-def _append_anthropic_beta_header_value(
-    headers: dict[str, Any],
-    beta_value: str,
-) -> dict[str, Any]:
-    existing_header_name = next(
-        (header_name for header_name in headers if str(header_name).lower() == _ANTHROPIC_BETA_HEADER_NAME),
-        None,
-    )
-    existing_beta = headers.pop(existing_header_name) if existing_header_name is not None else None
-    if existing_beta is None:
-        headers[_ANTHROPIC_BETA_HEADER_NAME] = beta_value
-        return headers
-
-    existing_values = [value.strip() for value in str(existing_beta).split(",") if value.strip()]
-    if beta_value not in existing_values:
-        existing_values.append(beta_value)
-    headers[_ANTHROPIC_BETA_HEADER_NAME] = ", ".join(existing_values)
-    return headers
-
-
-def _prepare_anthropic_oauth_native_passthrough_headers(
-    *,
-    request: Request,
-    custom_headers: dict[str, Any],
-) -> tuple[dict[str, Any], bool]:
-    auth_header = _get_header_value_case_insensitive(request.headers, "authorization")
-    if not is_anthropic_oauth_key(auth_header):
-        return custom_headers, False
-
-    updated_headers = dict(custom_headers)
-    request_beta = _get_header_value_case_insensitive(
-        request.headers,
-        _ANTHROPIC_BETA_HEADER_NAME,
-    )
-    if request_beta:
-        for beta_value in str(request_beta).split(","):
-            stripped_beta_value = beta_value.strip()
-            if stripped_beta_value:
-                _append_anthropic_beta_header_value(
-                    updated_headers,
-                    stripped_beta_value,
-                )
-    _append_anthropic_beta_header_value(
-        updated_headers,
-        ANTHROPIC_OAUTH_BETA_HEADER,
-    )
-    updated_headers[_ANTHROPIC_DANGEROUS_DIRECT_BROWSER_ACCESS_HEADER_NAME] = "true"
-    return updated_headers, True
-
-
-def _normalize_anthropic_native_passthrough_model_alias(
-    request_body: dict[str, Any],
-) -> tuple[dict[str, Any], bool]:
-    model = request_body.get("model")
-    if not isinstance(model, str):
-        return request_body, False
-
-    stripped_model = model.strip()
-    if not stripped_model:
-        return request_body, False
-
-    suffix = ""
-    alias_model = stripped_model
-    if stripped_model.lower().endswith(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX):
-        suffix = stripped_model[-len(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX) :]
-        alias_model = stripped_model[: -len(_ANTHROPIC_CONTEXT_1M_MODEL_SUFFIX)].strip()
-
-    normalized_model = _ANTHROPIC_NATIVE_PASSTHROUGH_MODEL_ALIASES.get(alias_model.lower())
-    if normalized_model is None:
-        return request_body, False
-
-    provider_model = f"{normalized_model}{suffix}"
-    if provider_model == stripped_model:
-        return request_body, False
-
-    updated_body = dict(request_body)
-    updated_body["model"] = provider_model
-    metadata = updated_body.get("litellm_metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-    else:
-        metadata = dict(metadata)
-    metadata.setdefault("inbound_model_alias", stripped_model)
-    metadata.setdefault("requested_model_alias", stripped_model)
-    metadata.setdefault("model_alias_label", stripped_model)
-    metadata["anthropic_native_passthrough_model_alias"] = stripped_model
-    metadata["anthropic_native_passthrough_normalized_model"] = provider_model
-    updated_body["litellm_metadata"] = metadata
-    return updated_body, True
+# Wave 7: anthropic_native owner install
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import anthropic_native as _aawm_anthropic_native
 
 
 def _prepare_anthropic_context_1m_native_passthrough(
@@ -7429,6 +3775,66 @@ def _prepare_anthropic_context_1m_native_passthrough(
         _ANTHROPIC_CONTEXT_1M_BETA_HEADER,
     )
     return updated_body, updated_headers, True
+
+
+_aawm_anthropic_native.install(
+    globals(),
+    runtime=_aawm_anthropic_native.AnthropicNativeRuntime(
+        is_streaming_request_fn=lambda request: is_streaming_request_fn(request),
+        create_pass_through_route=lambda *args, **kwargs: create_pass_through_route(
+            *args, **kwargs
+        ),
+    ),
+)
+
+_aawm_alias_candidate_dispatch.install(
+    globals(),
+    runtime=_aawm_alias_candidate_dispatch.AliasCandidateDispatchRuntime(
+        handle_openai_responses=lambda **kwargs: (
+            _handle_anthropic_openai_responses_adapter_route(**kwargs)
+        ),
+        handle_openrouter_completion=lambda **kwargs: (
+            _handle_anthropic_openrouter_completion_adapter_route(**kwargs)
+        ),
+        handle_openrouter_responses=lambda **kwargs: (
+            _handle_anthropic_openrouter_responses_adapter_route(**kwargs)
+        ),
+        handle_xai_oauth_responses=lambda **kwargs: (
+            _handle_anthropic_xai_oauth_responses_adapter_route(**kwargs)
+        ),
+        handle_grok_native_oauth_responses=lambda **kwargs: (
+            _handle_anthropic_grok_native_oauth_responses_adapter_route(**kwargs)
+        ),
+        handle_opencode_zen=lambda **kwargs: (
+            _handle_anthropic_opencode_zen_adapter_route(**kwargs)
+        ),
+        handle_kimi_chat_completions=lambda **kwargs: (
+            _handle_anthropic_kimi_chat_completions_adapter_route(**kwargs)
+        ),
+        handle_alibaba_token_plan=lambda **kwargs: (
+            _handle_anthropic_alibaba_token_plan_adapter_route(**kwargs)
+        ),
+        normalize_native_model_alias=lambda body: (
+            _normalize_anthropic_native_passthrough_model_alias(body)
+        ),
+        prepare_context_1m_native=lambda **kwargs: (
+            _prepare_anthropic_context_1m_native_passthrough(**kwargs)
+        ),
+        safe_set_request_parsed_body=lambda request, body: (
+            _safe_set_request_parsed_body(request, body)
+        ),
+        perform_native_passthrough=lambda **kwargs: (
+            _perform_anthropic_native_passthrough_request(**kwargs)
+        ),
+        provider_native=_CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        provider_openrouter=_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
+        provider_xai=_CODEX_AUTO_AGENT_XAI_PROVIDER,
+        provider_opencode=_CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
+        provider_kimi=_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+        provider_alibaba=_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        anthropic_beta_header_name=_ANTHROPIC_BETA_HEADER_NAME,
+    ),
+)
 
 
 @router.api_route(
@@ -7499,9 +3905,7 @@ async def anthropic_proxy_route(  # noqa: PLR0915
             expanded_count,
             hooks,
             billing_header_fields,
-        ) = await _aawm_anthropic_body_prep._prepare_anthropic_request_body_for_passthrough(
-            request, request_body
-        )
+        ) = await _prepare_anthropic_request_body_for_passthrough(request, request_body)
         if prepared_request_body is not request_body:
             _safe_set_request_parsed_body(request, prepared_request_body)
             verbose_proxy_logger.debug(
@@ -8912,389 +5316,62 @@ async def openai_proxy_route(
 
 
 
-async def _handle_codex_auto_agent_alias_route(
-    *,
-    endpoint: str,
-    request: Request,
-    fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth,
-    prepared_request_body: dict[str, Any],
-    target_url: str,
-    api_key: Optional[str],
-    forward_headers: bool,
-) -> Response:
-    alias_model = (
-        _normalize_codex_auto_agent_alias_model(prepared_request_body.get("model")) or _CODEX_AUTO_AGENT_MODEL_ALIAS
-    )
-    client_product_label = _extract_auto_agent_alias_client_product_label(request, prepared_request_body)
-
-    async def _perform_candidate_request(
-        *,
-        candidate: dict[str, Any],
-        candidate_body: dict[str, Any],
-    ) -> Response:
-        return await _perform_codex_auto_agent_alias_candidate_request(
-            endpoint=endpoint,
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            candidate=candidate,
-            candidate_body=candidate_body,
-            target_url=target_url,
-            api_key=api_key,
-            forward_headers=forward_headers,
-        )
-
-    services = _aawm_alias_interfaces.AliasRouteServices(
-        select_candidate_fn=_select_codex_auto_agent_candidate,
-        perform_candidate_request_fn=_perform_candidate_request,
-        resolve_cooldown_publication_fn=_resolve_auto_agent_cooldown_publication_plan,
-        publish_cooldown_memory_fn=_publish_codex_cooldown_memory,
-        persist_cooldown_fn=_persist_codex_cooldown_durable,
-        set_session_affinity_fn=_set_codex_auto_agent_session_affinity,
-        add_alias_metadata_fn=_add_codex_auto_agent_alias_metadata,
-        raise_redispatch_fn=_raise_codex_auto_agent_redispatch_required,
-    )
-    return await _aawm_alias_candidate_loop.handle_alias_route(
-        services,
-        alias_family="codex_auto_agent",
-        alias_model=alias_model,
-        request=request,
-        prepared_request_body=prepared_request_body,
-        max_candidate_attempts=len(
-            _resolve_aawm_alias_selection_enumeration(
-                request,
-                alias_model,
-                client_product_label=client_product_label,
-            ).candidates
+_CODEX_AUTO_AGENT_ROUTE_RUNTIME = (
+    _aawm_codex_auto_agent_route.CodexAutoAgentRouteRuntime(
+        normalize_alias_model_fn=lambda *args, **kwargs: (
+            _normalize_codex_auto_agent_alias_model(*args, **kwargs)
         ),
-        get_active_cooldown_state_fn=_get_codex_auto_agent_active_cooldown_state,
-        attempts_metadata_key="codex_auto_agent_attempts",
-        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
-        no_candidate_detail="No Codex auto-agent alias candidates were available.",
-        log_label="Codex",
+        default_alias_model=_CODEX_AUTO_AGENT_MODEL_ALIAS,
+        extract_client_product_label_fn=lambda *args, **kwargs: (
+            _extract_auto_agent_alias_client_product_label(*args, **kwargs)
+        ),
+        perform_candidate_request_fn=lambda *args, **kwargs: (
+            _perform_codex_auto_agent_alias_candidate_request(*args, **kwargs)
+        ),
+        select_candidate_fn=lambda *args, **kwargs: (
+            _select_codex_auto_agent_candidate(*args, **kwargs)
+        ),
+        resolve_cooldown_publication_fn=lambda *args, **kwargs: (
+            _resolve_auto_agent_cooldown_publication_plan(*args, **kwargs)
+        ),
+        publish_cooldown_memory_fn=lambda *args, **kwargs: (
+            _publish_codex_cooldown_memory(*args, **kwargs)
+        ),
+        persist_cooldown_fn=lambda *args, **kwargs: (
+            _persist_codex_cooldown_durable(*args, **kwargs)
+        ),
+        set_session_affinity_fn=lambda *args, **kwargs: (
+            _set_codex_auto_agent_session_affinity(*args, **kwargs)
+        ),
+        add_alias_metadata_fn=lambda *args, **kwargs: (
+            _add_codex_auto_agent_alias_metadata(*args, **kwargs)
+        ),
+        raise_redispatch_fn=lambda *args, **kwargs: (
+            _raise_codex_auto_agent_redispatch_required(*args, **kwargs)
+        ),
+        get_active_cooldown_state_fn=lambda *args, **kwargs: (
+            _get_codex_auto_agent_active_cooldown_state(*args, **kwargs)
+        ),
+        resolve_selection_enumeration_fn=lambda *args, **kwargs: (
+            _resolve_aawm_alias_selection_enumeration(*args, **kwargs)
+        ),
     )
+)
+_handle_codex_auto_agent_alias_route = partial(
+    _aawm_codex_auto_agent_route.handle_codex_auto_agent_alias_route,
+    _CODEX_AUTO_AGENT_ROUTE_RUNTIME,
+)
 
 
-class BaseOpenAIPassThroughHandler:
-    @staticmethod
-    async def _prepare_openai_oa_xai_context(
-        *,
-        endpoint: str,
-        request_body: dict[str, Any],
-    ) -> Optional[tuple[str, str, dict[str, Any], str]]:
-        (
-            prepared_oa_xai,
-            oa_xai_api_base,
-            oa_xai_api_key,
-        ) = await _prepare_oa_xai_passthrough_request(
-            request_body,
-            sanitize_responses_request=_is_openai_responses_endpoint(endpoint),
-        )
-        if not prepared_oa_xai:
-            return None
-        if oa_xai_api_base is None or oa_xai_api_key is None:
-            raise Exception("OpenAI passthrough requests for xAI OAuth models require a managed xAI OAuth credential.")
-
-        request_body["model"] = _to_xai_native_passthrough_model(request_body.get("model"))
-        openai_route_family = _get_openai_passthrough_route_family(endpoint)
-        encoded_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
-            endpoint=endpoint,
-            base_target_url=oa_xai_api_base,
-        )
-        updated_url = BaseOpenAIPassThroughHandler._join_url_paths(
-            base_url=httpx.URL(oa_xai_api_base),
-            path=encoded_endpoint,
-            custom_llm_provider=litellm.LlmProviders.XAI,
-        )
-        prepared_request_body = _merge_litellm_metadata(
-            request_body,
-            tags_to_add=[
-                f"openai-passthrough-route:{openai_route_family}",
-            ],
-            extra_fields={
-                "openai_passthrough_route_family": openai_route_family,
-            },
-        )
-        return (
-            oa_xai_api_base,
-            oa_xai_api_key,
-            prepared_request_body,
-            updated_url,
-        )
-
-    @staticmethod
-    async def _prepare_openai_grok_native_oauth_context(
-        *,
-        endpoint: str,
-        request: Request,
-        request_body: dict[str, Any],
-        extra_headers: Optional[dict],
-    ) -> Optional[tuple[str, dict[str, Any], dict[str, Any], str]]:
-        (
-            prepared_grok_native,
-            grok_target_base_url,
-            grok_headers,
-            grok_prepared_body,
-        ) = await _prepare_grok_native_oauth_passthrough_request(
-            request_body,
-            request=request,
-            tags_to_add=[
-                "openai-grok-native-responses-adapter",
-            ],
-            extra_fields={
-                "openai_passthrough_route_family": (_get_openai_passthrough_route_family(endpoint)),
-                "grok_native_entrypoint": "openai_responses",
-            },
-        )
-        if not prepared_grok_native:
-            return None
-        if grok_target_base_url is None:
-            raise Exception("OpenAI passthrough requests for Grok native OAuth models require a Grok target base URL.")
-
-        merged_headers = {
-            **(extra_headers or {}),
-            **grok_headers,
-        }
-        updated_url = _join_grok_passthrough_url(
-            base_target_url=grok_target_base_url,
-            endpoint="/v1/responses",
-        )
-        return (
-            grok_target_base_url,
-            merged_headers,
-            grok_prepared_body,
-            updated_url,
-        )
-
-    @staticmethod
-    async def _base_openai_pass_through_handler(  # noqa: PLR0915
-        endpoint: str,
-        request: Request,
-        fastapi_response: Response,
-        user_api_key_dict: UserAPIKeyAuth,
-        base_target_url: str,
-        api_key: Optional[str],
-        custom_llm_provider: litellm.LlmProviders,
-        extra_headers: Optional[dict] = None,
-        forward_headers: bool = False,
-    ):
-        encoded_endpoint = BaseOpenAIPassThroughHandler._normalize_endpoint_for_target(
-            endpoint=endpoint,
-            base_target_url=base_target_url,
-        )
-
-        # Construct the full target URL by properly joining the base URL and endpoint path
-        base_url = httpx.URL(base_target_url)
-        updated_url = BaseOpenAIPassThroughHandler._join_url_paths(
-            base_url=base_url,
-            path=encoded_endpoint,
-            custom_llm_provider=custom_llm_provider,
-        )
-        egress_credential_family: Optional[str] = None
-        expected_target_family: Optional[str] = None
-        endpoint_custom_body: Optional[dict[str, Any]] = None
-
-        if request.method == "POST":
-            request_body = await get_request_body(request)
-            prepared_request_body = request_body
-            body_was_prepared = False
-            is_codex_responses_request = _request_uses_codex_native_auth(request) and _is_openai_responses_endpoint(
-                endpoint
-            )
-            if (
-                _resolve_codex_auto_agent_alias_model(
-                    prepared_request_body,
-                    endpoint=endpoint,
-                )
-                is not None
-            ):
-                is_codex_responses_request = True
-            if is_codex_responses_request:
-                prepared_request_body = _add_route_family_logging_metadata(
-                    prepared_request_body,
-                    "codex_responses",
-                )
-                (
-                    prepared_request_body,
-                    _codex_tool_description_patch_events,
-                ) = _apply_codex_tool_description_patches_to_request_body(prepared_request_body)
-                (
-                    prepared_request_body,
-                    _codex_unsupported_hosted_tools,
-                ) = _drop_unsupported_codex_hosted_tools_from_request_body(prepared_request_body)
-                (
-                    prepared_request_body,
-                    _codex_unsupported_request_params,
-                ) = _drop_unsupported_codex_request_params_from_request_body(prepared_request_body)
-                (
-                    prepared_request_body,
-                    _codex_unsupported_input_items,
-                ) = _drop_unsupported_codex_input_items_from_request_body(prepared_request_body)
-                if _is_oa_xai_request_body(prepared_request_body) or _is_grok_native_oauth_request_body(
-                    prepared_request_body
-                ):
-                    (
-                        prepared_request_body,
-                        _codex_removed_empty_tool_choice,
-                    ) = _drop_tool_choice_without_tools_from_request_body(prepared_request_body)
-                prepared_request_body = _add_codex_request_breakout_logging_metadata(prepared_request_body)
-            oa_xai_context = await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
-                endpoint=endpoint,
-                request_body=prepared_request_body,
-            )
-            if oa_xai_context is not None:
-                body_was_prepared = True
-                (
-                    base_target_url,
-                    api_key,
-                    prepared_request_body,
-                    updated_url,
-                ) = oa_xai_context
-                custom_llm_provider = litellm.LlmProviders.XAI
-                forward_headers = False
-                egress_credential_family = "xai"
-                expected_target_family = "xai"
-            elif _is_openai_responses_endpoint(endpoint):
-                grok_native_context = await BaseOpenAIPassThroughHandler._prepare_openai_grok_native_oauth_context(
-                    endpoint=endpoint,
-                    request=request,
-                    request_body=prepared_request_body,
-                    extra_headers=extra_headers,
-                )
-                if grok_native_context is not None:
-                    body_was_prepared = True
-                    (
-                        base_target_url,
-                        extra_headers,
-                        prepared_request_body,
-                        updated_url,
-                    ) = grok_native_context
-                    api_key = None
-                    custom_llm_provider = litellm.LlmProviders.XAI
-                    forward_headers = False
-                    egress_credential_family = "xai"
-                    expected_target_family = "xai"
-                elif is_codex_responses_request:
-                    dispatched_response = await try_dispatch_codex_request(
-                        endpoint=endpoint,
-                        request=request,
-                        request_body=request_body,
-                        prepared_request_body=prepared_request_body,
-                        fastapi_response=fastapi_response,
-                        user_api_key_dict=user_api_key_dict,
-                        target_url=str(updated_url),
-                        api_key=api_key,
-                        forward_headers=forward_headers,
-                    )
-                    if dispatched_response is not None:
-                        return dispatched_response
-            else:
-                prepared_request_body = _add_route_family_logging_metadata(
-                    prepared_request_body,
-                    _get_openai_passthrough_route_family(endpoint),
-                )
-            prepared_request_body = _prepare_request_body_for_passthrough_observability(
-                request=request,
-                request_body=prepared_request_body,
-            )
-            if body_was_prepared or prepared_request_body is not request_body:
-                _safe_set_request_parsed_body(request, prepared_request_body)
-                endpoint_custom_body = prepared_request_body
-
-        ## check for streaming
-        is_streaming_request = "stream" in str(updated_url)
-
-        ## CREATE PASS-THROUGH
-        endpoint_func = create_pass_through_route(
-            endpoint=endpoint,
-            target=str(updated_url),
-            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
-                api_key=api_key, request=request, extra_headers=extra_headers
-            ),
-            _forward_headers=forward_headers,
-            is_streaming_request=is_streaming_request,  # type: ignore
-            custom_llm_provider=custom_llm_provider.value
-            if isinstance(custom_llm_provider, litellm.LlmProviders)
-            else custom_llm_provider,
-            egress_credential_family=egress_credential_family,
-            expected_target_family=expected_target_family,
-        )  # dynamically construct pass-through endpoint based on incoming path
-        return await endpoint_func(
-            request,
-            fastapi_response,
-            user_api_key_dict,
-            custom_body=endpoint_custom_body,
-        )
-
-    @staticmethod
-    def _append_openai_beta_header(headers: dict, request: Request) -> dict:
-        """
-        Appends the OpenAI-Beta header to the headers if the request is an OpenAI Assistants API request
-        """
-        if RouteChecks._is_assistants_api_request(request) is True and "OpenAI-Beta" not in headers:
-            headers["OpenAI-Beta"] = "assistants=v2"
-        return headers
-
-    @staticmethod
-    def _assemble_headers(api_key: Optional[str], request: Request, extra_headers: Optional[dict] = None) -> dict:
-        base_headers = {}
-        if api_key is not None:
-            base_headers = {
-                "authorization": "Bearer {}".format(api_key),
-                "api-key": "{}".format(api_key),
-            }
-        if extra_headers is not None:
-            base_headers.update(extra_headers)
-        return BaseOpenAIPassThroughHandler._append_openai_beta_header(
-            headers=base_headers,
-            request=request,
-        )
-
-    @staticmethod
-    def _join_url_paths(
-        base_url: httpx.URL,
-        path: str,
-        custom_llm_provider: Union[litellm.LlmProviders, str],
-    ) -> str:
-        """
-        Properly joins a base URL with a path, preserving any existing path in the base URL.
-        """
-        # Join paths correctly by removing trailing/leading slashes as needed
-        if not base_url.path or base_url.path == "/":
-            # If base URL has no path, just use the new path
-            joined_path_str = str(base_url.copy_with(path=path))
-        else:
-            # Otherwise, combine the paths
-            base_path = base_url.path.rstrip("/")
-            clean_path = path.lstrip("/")
-            full_path = f"{base_path}/{clean_path}"
-            joined_path_str = str(base_url.copy_with(path=full_path))
-
-        # Apply OpenAI-specific path handling for both branches
-        if custom_llm_provider == litellm.LlmProviders.OPENAI and "/v1/" not in joined_path_str:
-            # Insert v1 after api.openai.com for OpenAI requests
-            joined_path_str = joined_path_str.replace("api.openai.com/", "api.openai.com/v1/")
-
-        return joined_path_str
-
-    @staticmethod
-    def _normalize_endpoint_for_target(endpoint: str, base_target_url: str) -> str:
-        normalized_endpoint = httpx.URL(endpoint).path
-        if not normalized_endpoint.startswith("/"):
-            normalized_endpoint = "/" + normalized_endpoint
-
-        base_url = httpx.URL(base_target_url)
-        if (
-            base_url.host
-            and "chatgpt.com" in base_url.host
-            and base_url.path.rstrip("/") == "/backend-api/codex"
-            and normalized_endpoint.startswith("/v1/")
-        ):
-            return normalized_endpoint[len("/v1") :]
-        if base_url.path.rstrip("/") == "/v1" and normalized_endpoint.startswith("/v1/"):
-            return normalized_endpoint[len("/v1") :]
-        return normalized_endpoint
+# ---------------------------------------------------------------------------
+# Wave 7: BaseOpenAIPassThroughHandler owned by
+# aawm_adapter_runtime/openai_passthrough_handler.py. The class is imported
+# and re-exported here; its DI runtime is installed lazily after all host
+# callbacks are published (see install block near module tail).
+# ---------------------------------------------------------------------------
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_passthrough_handler import (  # noqa: E402
+    BaseOpenAIPassThroughHandler,
+)
 
 
 @router.api_route(
@@ -9574,48 +5651,16 @@ def create_generic_websocket_passthrough_endpoint(
 def _wave6b_common_live_runtime() -> _wave6b_common.Runtime:
     """Build a common Runtime with live host-global lookup."""
     return _wave6b_common.Runtime(
-        extract_status_code=lambda exc: _extract_google_adapter_exception_status_code(exc),
-        extract_detail=lambda exc: _extract_google_adapter_exception_detail(exc),
+        extract_status_code=lambda exc: _extract_adapter_exception_status_code(exc),
+        extract_detail=lambda exc: _extract_adapter_exception_detail(exc),
     )
 
 
-def _wave6b_antigravity_live_runtime() -> _wave6b_antigravity_runtime.Runtime:
-    """Build an Antigravity Runtime with live host-global lookup."""
-    return _wave6b_antigravity_runtime.Runtime(
-        clean_value=lambda v: _clean_codex_auth_value(v),
-        merge_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
-        prepare_observability=lambda **kw: _prepare_request_body_for_passthrough_observability(**kw),
-        split_provider_prefix=lambda v: _split_anthropic_adapter_provider_prefix(v),
-        format_api_key=lambda v: _format_litellm_passthrough_api_key(v),
-        oauth_error_code=lambda r: _get_oauth_token_error_code(r),
-        allowed_models=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_ALLOWED_MODELS,
-    )
-
-
-# -- OpenRouter runtime configuration --
-_wave6b_openrouter_runtime.configure_openrouter_runtime(
-    _wave6b_openrouter_runtime.Runtime(
-        retry_transport_runtime=_ANTHROPIC_OPENROUTER_RETRY_TRANSPORT_RUNTIME,
-        clean_secret_string=lambda v: _clean_secret_string(v),
-        get_first_secret_value=lambda names: _get_first_secret_value(names),
-        getenv=lambda name: os.getenv(name),
-        get_secret_str=lambda name: get_secret_str(name),
-        sanitize_opencode_zen_completion_messages=lambda kw: _sanitize_opencode_zen_completion_messages_for_chat_completion(kw),
-        chat_message_role=lambda msg: _opencode_zen_chat_message_role(msg),
-        chat_message_tool_call_ids=lambda msg: _opencode_zen_chat_message_tool_call_ids(msg),
-        chat_message_tool_result_id=lambda msg: _opencode_zen_chat_message_tool_result_id(msg),
-        is_empty_text_content=lambda c: _is_codex_google_code_assist_empty_text_content(c),
-        merge_litellm_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
-        build_langfuse_span_descriptor=lambda *a, **kw: _build_langfuse_span_descriptor(*a, **kw),
-    )
-)
-
-# -- NVIDIA runtime configuration --
 _wave6b_nvidia_runtime.configure_nvidia_runtime(
     _wave6b_nvidia_runtime.NvidiaRuntimeDependencies(
         get_first_secret_value=lambda names: _get_first_secret_value(names),
-        clean_secret_string=lambda v: _clean_secret_string(v),
-        clean_auth_value=lambda v: _clean_codex_auth_value(v),
+        clean_secret_string=lambda value: _clean_secret_string(value),
+        clean_auth_value=lambda value: _clean_codex_auth_value(value),
         get_env=lambda name: os.getenv(name),
         sleep=lambda seconds: asyncio.sleep(seconds),
         log_debug=verbose_proxy_logger.debug,
@@ -9623,450 +5668,138 @@ _wave6b_nvidia_runtime.configure_nvidia_runtime(
     )
 )
 
-# -- xAI request-prep runtime configuration --
 _wave6b_xai_request_prep.configure_xai_request_prep_runtime(
     _wave6b_xai_request_prep.build_default_xai_request_prep_runtime(
-        get_model_metadata_entry=lambda m: _get_model_metadata_entry(m),
-        get_openai_tool_type=lambda t: _aawm_codex_tool_policy.get_openai_tool_type(t),
-        normalize_low_cardinality_tag_value=lambda v: _normalize_low_cardinality_tag_value(v),
-        dedupe_sorted_str_list=lambda lst: _dedupe_sorted_str_list(lst),
-        merge_litellm_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
-        build_langfuse_span_descriptor=lambda *a, **kw: _build_langfuse_span_descriptor(*a, **kw),
-        drop_unsupported_codex_hosted_tools_from_request_body=lambda b: _drop_unsupported_codex_hosted_tools_from_request_body(b),
-        drop_unsupported_codex_request_params_from_request_body=lambda b: _drop_unsupported_codex_request_params_from_request_body(b),
-        drop_unsupported_codex_input_items_from_request_body=lambda b: _drop_unsupported_codex_input_items_from_request_body(b),
-        drop_tool_choice_without_tools_from_request_body=lambda b: _drop_tool_choice_without_tools_from_request_body(b),
-        replace_request_body_in_place=lambda orig, new: _replace_request_body_in_place(orig, new),
-        safe_get_request_headers=lambda req: _safe_get_request_headers(req),
-        get_case_insensitive_header=lambda hdrs, name: _get_case_insensitive_header(hdrs, name),
-        get_rewrite_input_item_types_for_model=lambda m: _get_rewrite_input_item_types_for_model(m),
+        get_model_metadata_entry=lambda model: _get_model_metadata_entry(model),
+        get_openai_tool_type=lambda tool: (
+            _aawm_codex_tool_policy.get_openai_tool_type(tool)
+        ),
+        normalize_low_cardinality_tag_value=lambda value: (
+            _normalize_low_cardinality_tag_value(value)
+        ),
+        dedupe_sorted_str_list=lambda values: _dedupe_sorted_str_list(values),
+        merge_litellm_metadata=lambda *args, **kwargs: (
+            _merge_litellm_metadata(*args, **kwargs)
+        ),
+        build_langfuse_span_descriptor=lambda *args, **kwargs: (
+            _build_langfuse_span_descriptor(*args, **kwargs)
+        ),
+        drop_unsupported_codex_hosted_tools_from_request_body=lambda body: (
+            _drop_unsupported_codex_hosted_tools_from_request_body(body)
+        ),
+        drop_unsupported_codex_request_params_from_request_body=lambda body: (
+            _drop_unsupported_codex_request_params_from_request_body(body)
+        ),
+        drop_unsupported_codex_input_items_from_request_body=lambda body: (
+            _drop_unsupported_codex_input_items_from_request_body(body)
+        ),
+        drop_tool_choice_without_tools_from_request_body=lambda body: (
+            _drop_tool_choice_without_tools_from_request_body(body)
+        ),
+        replace_request_body_in_place=lambda original, replacement: (
+            _replace_request_body_in_place(original, replacement)
+        ),
+        safe_get_request_headers=lambda request: _safe_get_request_headers(
+            request
+        ),
+        get_case_insensitive_header=lambda headers, name: (
+            _get_case_insensitive_header(headers, name)
+        ),
+        get_rewrite_input_item_types_for_model=lambda model: (
+            _get_rewrite_input_item_types_for_model(model)
+        ),
         get_grok_passthrough_target_base=lambda: _get_grok_passthrough_target_base(),
-        get_grok_native_oauth_access_token=lambda: get_grok_native_oauth_access_token(),
+        get_grok_native_oauth_access_token=lambda: (
+            get_grok_native_oauth_access_token()
+        ),
     )
 )
 
-# -- OpenCode Zen install (configures runtime + publishes same-object facades) --
-_wave6b_opencode_zen_runtime.install(globals())
-
-
-# Wave 4 runtime injection -- FunctionType rebind for live host-global lookup
-_aawm_lane_keys.install(globals())
-_aawm_selection.install(globals())
-_aawm_cooldown_state.install(globals())
-_aawm_error_signals.install(globals())
-_aawm_cooldown_apply.install(globals())
-_aawm_attempt_records.install(globals())
-_aawm_selection._attach_aawm_alias_routing_state_sources = (
-    _aawm_cooldown_state._attach_aawm_alias_routing_state_sources
-)
-_aawm_adapter_model_resolution.install(globals())
-_aawm_adapter_runtime.install(globals())
-_google_env_policy.install(globals())
-_google_context_window.install(globals())
-_google_error_signals.install(globals())
-_grok_side_channel.install(globals())
-
-# Wave 5D runtime injection -- FunctionType rebind for live host-global lookup
-_aawm_audit_context.install(globals())
-_aawm_audit_build.install(globals())
-_aawm_audit_persist.install(globals())
-_aawm_audit_events.install(globals())
-
-# Bind Wave 5D runtimes after installation so module fixtures restore the
-# canonical rebound facades instead of pre-install wrappers.
-_aawm_audit_context.configure_audit_context_runtime(
-    clean_secret_string=_clean_secret_string,
-    extract_metadata_value=_extract_auto_agent_alias_metadata_value,
-    extract_client_product_label=_extract_auto_agent_alias_client_product_label,
-    resolve_host_attribution=_resolve_auto_agent_alias_route_host_attribution,
-    extract_session_id=_extract_auto_agent_alias_session_id,
-    build_rollup_group_header_label=_build_auto_agent_alias_rollup_group_header_label,
-    has_continuation_state=_codex_auto_agent_request_has_continuation_state,
-)
-_aawm_audit_build.configure_audit_build_runtime(
-    get_request_context=_get_auto_agent_alias_request_context,
-    attach_terminal_context_fields=_attach_auto_agent_alias_terminal_context_fields,
-    format_timestamp=_format_auto_agent_alias_timestamp,
-    extract_metadata_value=_extract_auto_agent_alias_metadata_value,
-    extract_incoming_endpoint=_extract_auto_agent_alias_incoming_endpoint,
-    resolve_outgoing_target=_resolve_auto_agent_alias_route_rollup_outgoing_target,
-    to_int=_auto_agent_alias_int,
-    cooldown_until=_auto_agent_alias_cooldown_until,
-)
-_aawm_audit_persist.configure_audit_persist_runtime(
-    record_route_status_rollup=_record_auto_agent_alias_route_status_rollup,
-    verbose_json_enabled=_aawm_alias_route_verbose_json_enabled,
-    healthy_json_enabled=_aawm_alias_route_healthy_json_enabled,
-)
-_aawm_audit_events.configure_audit_events_runtime(
-    get_request_context=_get_auto_agent_alias_request_context,
-    attach_terminal_context_fields=_attach_auto_agent_alias_terminal_context_fields,
-    format_timestamp=_format_auto_agent_alias_timestamp,
-    extract_metadata_value=_extract_auto_agent_alias_metadata_value,
-    extract_incoming_endpoint=_extract_auto_agent_alias_incoming_endpoint,
-    resolve_codex_session_key=_resolve_codex_auto_agent_session_key,
-    resolve_anthropic_session_key=_resolve_anthropic_auto_agent_session_key,
-    emit_route_event=_emit_auto_agent_alias_route_event,
-    build_audit_events=_build_auto_agent_alias_audit_events,
-    persist_audit_only_events=_persist_auto_agent_alias_audit_only_events_best_effort,
-)
 
 
 # ---------------------------------------------------------------------------
-# Wave 6D observability-metadata same-object facades
+# Wave 7: observability-metadata owner install (publishes shared primitives)
 # ---------------------------------------------------------------------------
-_merge_litellm_metadata = _aawm_observability_metadata._merge_litellm_metadata
-_format_langfuse_span_timestamp = _aawm_observability_metadata._format_langfuse_span_timestamp
-_build_langfuse_span_descriptor = _aawm_observability_metadata._build_langfuse_span_descriptor
-_normalize_low_cardinality_tag_value = _aawm_observability_metadata._normalize_low_cardinality_tag_value
-_dedupe_sorted_str_list = _aawm_observability_metadata._dedupe_sorted_str_list
-_iter_anthropic_text_fragments = _aawm_observability_metadata._iter_anthropic_text_fragments
-_extract_claude_agent_and_tenant_from_request_body = _aawm_observability_metadata._extract_claude_agent_and_tenant_from_request_body
-_add_claude_child_agent_observability_metadata = _aawm_observability_metadata._add_claude_child_agent_observability_metadata
-_detect_claude_post_rewrite_context_files = _aawm_observability_metadata._detect_claude_post_rewrite_context_files
-_add_claude_post_rewrite_context_file_logging_metadata = _aawm_observability_metadata._add_claude_post_rewrite_context_file_logging_metadata
-_get_nested_str_value = _aawm_observability_metadata._get_nested_str_value
-_extract_passthrough_session_id = _aawm_observability_metadata._extract_passthrough_session_id
-_normalize_passthrough_repository = _aawm_observability_metadata._normalize_passthrough_repository
-_extract_passthrough_repository_from_text = _aawm_observability_metadata._extract_passthrough_repository_from_text
-_walk_request_value_with_budget = _aawm_observability_metadata._walk_request_value_with_budget
-_extract_passthrough_repository_from_body_text = _aawm_observability_metadata._extract_passthrough_repository_from_body_text
-_extract_passthrough_repository = _aawm_observability_metadata._extract_passthrough_repository
-_get_passthrough_trace_environment = _aawm_observability_metadata._get_passthrough_trace_environment
-_add_passthrough_trace_context_metadata = _aawm_observability_metadata._add_passthrough_trace_context_metadata
-_truncate_tool_definition_string = _aawm_observability_metadata._truncate_tool_definition_string
-_redact_tool_definition_string = _aawm_observability_metadata._redact_tool_definition_string
-_sanitize_tool_definition_value = _aawm_observability_metadata._sanitize_tool_definition_value
-_tool_definition_name = _aawm_observability_metadata._tool_definition_name
-_tool_definition_description = _aawm_observability_metadata._tool_definition_description
-_tool_definition_parameters = _aawm_observability_metadata._tool_definition_parameters
-_build_tool_definition_snapshot_entry = _aawm_observability_metadata._build_tool_definition_snapshot_entry
-_tool_definition_snapshot_hash = _aawm_observability_metadata._tool_definition_snapshot_hash
-_build_passthrough_tool_definition_metadata = _aawm_observability_metadata._build_passthrough_tool_definition_metadata
-_add_passthrough_tool_definition_metadata = _aawm_observability_metadata._add_passthrough_tool_definition_metadata
-_prepare_request_body_for_passthrough_observability = _aawm_observability_metadata._prepare_request_body_for_passthrough_observability
-_extract_openai_passthrough_tool_choice = _aawm_observability_metadata._extract_openai_passthrough_tool_choice
-_extract_claude_request_breakout_fields = _aawm_observability_metadata._extract_claude_request_breakout_fields
-_add_claude_request_breakout_logging_metadata = _aawm_observability_metadata._add_claude_request_breakout_logging_metadata
-_extract_gemini_request_breakout_fields = _aawm_observability_metadata._extract_gemini_request_breakout_fields
-_add_gemini_request_breakout_logging_metadata = _aawm_observability_metadata._add_gemini_request_breakout_logging_metadata
-_extract_codex_request_breakout_fields = _aawm_observability_metadata._extract_codex_request_breakout_fields
-_add_codex_request_breakout_logging_metadata = _aawm_observability_metadata._add_codex_request_breakout_logging_metadata
-_parse_anthropic_billing_header_text = _aawm_observability_metadata._parse_anthropic_billing_header_text
-_extract_anthropic_billing_header_fields = _aawm_observability_metadata._extract_anthropic_billing_header_fields
-_extract_anthropic_billing_header_fields_from_request_body = _aawm_observability_metadata._extract_anthropic_billing_header_fields_from_request_body
-_add_anthropic_billing_header_logging_metadata = _aawm_observability_metadata._add_anthropic_billing_header_logging_metadata
-_add_claude_persisted_output_logging_metadata = _aawm_observability_metadata._add_claude_persisted_output_logging_metadata
-_add_route_family_logging_metadata = _aawm_observability_metadata._add_route_family_logging_metadata
-_ANTHROPIC_BILLING_HEADER_PREFIX = _aawm_observability_metadata._ANTHROPIC_BILLING_HEADER_PREFIX
-_AAWM_TOOL_DEFINITION_CAPTURE_VERSION = _aawm_observability_metadata._AAWM_TOOL_DEFINITION_CAPTURE_VERSION
-_AAWM_TOOL_DEFINITION_MAX_TOOLS = _aawm_observability_metadata._AAWM_TOOL_DEFINITION_MAX_TOOLS
-_PASSTHROUGH_SESSION_ID_HEADER_NAMES = _aawm_observability_metadata._PASSTHROUGH_SESSION_ID_HEADER_NAMES
-_PASSTHROUGH_REPOSITORY_HEADER_NAMES = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_HEADER_NAMES
-_PASSTHROUGH_REPOSITORY_BODY_KEYS = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_BODY_KEYS
-_PASSTHROUGH_REPOSITORY_TEXT_PATTERNS = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_TEXT_PATTERNS
-_PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES
-_PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES = _aawm_observability_metadata._PASSTHROUGH_REPOSITORY_AGENT_ROLE_VALUES
-_append_codex_auto_agent_prevention_guidance_to_instructions = _aawm_alias_guidance._append_codex_auto_agent_prevention_guidance_to_instructions
-_is_aawm_read_agent_alias_model = _aawm_alias_guidance._is_aawm_read_agent_alias_model
-_append_aawm_read_agent_guidance_to_text = _aawm_alias_guidance._append_aawm_read_agent_guidance_to_text
-_append_aawm_read_agent_guidance_to_anthropic_system = _aawm_alias_guidance._append_aawm_read_agent_guidance_to_anthropic_system
-_apply_aawm_read_agent_guidance_to_request_body = _aawm_alias_guidance._apply_aawm_read_agent_guidance_to_request_body
-_apply_codex_auto_agent_prevention_guidance_to_request_body = _aawm_alias_guidance._apply_codex_auto_agent_prevention_guidance_to_request_body
-
-
-# ---------------------------------------------------------------------------
-# Wave 6D request-policy runtime configuration and facade installation
-# ---------------------------------------------------------------------------
-
-# 1. Observability metadata: bind host callbacks for tenant, headers, env.
 _aawm_observability_metadata.configure_observability_metadata_runtime(
     get_explicit_tenant_id=_get_aawm_tenant_header,
     get_request_headers=_safe_get_request_headers,
     get_env=os.getenv,
 )
+_aawm_observability_metadata.install(globals())
 
-# 2. Persisted-output logging callback: publish into host globals so rebound
-#    persisted-output functions resolve the callback at call time.
-_persisted_output_logging_callback = (
-    _aawm_observability_metadata._add_claude_persisted_output_logging_metadata
+# ---------------------------------------------------------------------------
+# Wave 7: codex-tool-policy owner install (replaces 42 inline wrappers)
+# ---------------------------------------------------------------------------
+_aawm_codex_tool_policy.configure_and_install_codex_tool_policy(
+    globals(),
+    _aawm_codex_tool_policy.CodexToolPolicyHostDeps(
+        normalize_tag_value=_normalize_low_cardinality_tag_value,
+        dedupe_sorted=_dedupe_sorted_str_list,
+        merge_metadata=_merge_litellm_metadata,
+        build_span=_build_langfuse_span_descriptor,
+        get_model_cost_map=lambda: litellm.model_cost,
+        normalize_grok_native_oauth_model=normalize_grok_native_oauth_model,
+        is_oa_xai_model=is_oa_xai_model,
+        resolve_oa_xai_upstream_model=resolve_oa_xai_upstream_model,
+        normalize_kimi_model_name=_normalize_kimi_code_chat_completions_adapter_model_name,
+        normalize_kimi_custom_tool_outputs=lambda b: _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(b),
+        grok_normalization=_anthropic_grok_normalization,
+        grok_normalization_runtime=_anthropic_grok_normalization.Runtime(
+            normalize_tag=_normalize_low_cardinality_tag_value,
+            dedupe_sorted=_dedupe_sorted_str_list,
+            merge_metadata=_merge_litellm_metadata,
+            build_span=_build_langfuse_span_descriptor,
+            get_rewrite_input_item_types=lambda *a, **kw: globals()[
+                "_get_rewrite_input_item_types_for_model"
+            ](*a, **kw),
+        ),
+        request_body_walk_max_depth=_AAWM_REQUEST_BODY_WALK_MAX_DEPTH,
+    ),
 )
 
-# 3. Persisted-output: bind runtime deps, configure callback, install facades.
-_aawm_persisted_output.bind_runtime(globals())
-_aawm_persisted_output.configure_persisted_output_logging_callback(
-    _persisted_output_logging_callback
+# ---------------------------------------------------------------------------
+# Wave 7: OpenAI pass-through handler runtime installation
+# ---------------------------------------------------------------------------
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+    openai_passthrough_handler as _aawm_openai_passthrough_handler,
 )
+
+_aawm_openai_passthrough_handler.install_runtime(
+    _aawm_openai_passthrough_handler.build_runtime_from_host()
+)
+
+
+
+# ---------------------------------------------------------------------------
+# Wave 6E anthropic-body-prep runtime configuration
+# ---------------------------------------------------------------------------
 _aawm_persisted_output.install(globals())
 
-# 4. Alias guidance: bind canonical observability merge/span callbacks.
 _aawm_alias_guidance.configure_alias_guidance_runtime(
     callbacks=_aawm_alias_guidance.AliasGuidanceCallbacks(
         merge_litellm_metadata=_merge_litellm_metadata,
         build_langfuse_span_descriptor=_build_langfuse_span_descriptor,
     ),
 )
-
-
-
-# ---------------------------------------------------------------------------
-# Wave 6E codex-tool-policy same-object facades
-# ---------------------------------------------------------------------------
-
-# Build the shared CodexToolPolicyCallbacks with live host-global lookups.
-_CODEX_TOOL_POLICY_CALLBACKS = _aawm_codex_tool_policy.CodexToolPolicyCallbacks(
-    normalize_tag_value=_normalize_low_cardinality_tag_value,
-    dedupe_sorted=_dedupe_sorted_str_list,
-    merge_metadata=_merge_litellm_metadata,
-    build_span=_build_langfuse_span_descriptor,
-    get_model_cost_map=lambda: litellm.model_cost,
-    normalize_grok_native_oauth_model=normalize_grok_native_oauth_model,
-    is_oa_xai_model=is_oa_xai_model,
-    resolve_oa_xai_upstream_model=resolve_oa_xai_upstream_model,
-    normalize_kimi_model_name=_normalize_kimi_code_chat_completions_adapter_model_name,
-    normalize_kimi_custom_tool_outputs=lambda b: _kimi_code_adapters.normalize_kimi_code_custom_tool_outputs(b),
-    grok_normalization=_anthropic_grok_normalization,
-    grok_normalization_runtime=_get_anthropic_grok_normalization_runtime(),
-    request_body_walk_max_depth=_AAWM_REQUEST_BODY_WALK_MAX_DEPTH,
+_append_codex_auto_agent_prevention_guidance_to_instructions = (
+    _aawm_alias_guidance._append_codex_auto_agent_prevention_guidance_to_instructions
+)
+_is_aawm_read_agent_alias_model = (
+    _aawm_alias_guidance._is_aawm_read_agent_alias_model
+)
+_append_aawm_read_agent_guidance_to_text = (
+    _aawm_alias_guidance._append_aawm_read_agent_guidance_to_text
+)
+_append_aawm_read_agent_guidance_to_anthropic_system = (
+    _aawm_alias_guidance._append_aawm_read_agent_guidance_to_anthropic_system
+)
+_apply_aawm_read_agent_guidance_to_request_body = (
+    _aawm_alias_guidance._apply_aawm_read_agent_guidance_to_request_body
+)
+_apply_codex_auto_agent_prevention_guidance_to_request_body = (
+    _aawm_alias_guidance._apply_codex_auto_agent_prevention_guidance_to_request_body
 )
 
-# -- Pure functions (same-object identity) --
-
-# -- Functions binding normalize_tag_value --
-
-def _patch_codex_spawn_agent_tool_description(tool, *, tool_index):
-    return _aawm_codex_tool_policy.patch_codex_spawn_agent_tool_description(
-        tool, tool_index=tool_index, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _get_codex_core_tool_guidance(tool_name):
-    return _aawm_codex_tool_policy.get_codex_core_tool_guidance(
-        tool_name, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _append_codex_core_tool_guidance_to_description(description, *, guidance):
-    return _aawm_codex_tool_policy.append_codex_core_tool_guidance_to_description(
-        description, guidance=guidance,
-    )
-
-def _patch_codex_multi_agent_tool_search_description(tool, *, tool_index):
-    return _aawm_codex_tool_policy.patch_codex_multi_agent_tool_search_description(
-        tool, tool_index=tool_index, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _patch_codex_core_tool_description(tool, *, tool_index):
-    return _aawm_codex_tool_policy.patch_codex_core_tool_description(
-        tool, tool_index=tool_index, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _adapt_codex_custom_tool_definitions(tools, *, adapter_names):
-    return _aawm_codex_tool_policy.adapt_codex_custom_tool_definitions(
-        tools, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _adapted_custom_tool_call_ids(input_items, *, adapter_names):
-    return _aawm_codex_tool_policy.adapted_custom_tool_call_ids(
-        input_items, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _adapt_codex_custom_tool_input_items(input_items, *, adapter_names):
-    return _aawm_codex_tool_policy.adapt_codex_custom_tool_input_items(
-        input_items, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _adapt_codex_custom_tool_choice(tool_choice, *, adapter_names):
-    return _aawm_codex_tool_policy.adapt_codex_custom_tool_choice(
-        tool_choice, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _adapt_codex_namespace_tool_definitions(tools, *, adapter_names):
-    return _aawm_codex_tool_policy.adapt_codex_namespace_tool_definitions(
-        tools, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _adapt_codex_namespace_input_items(input_items, *, adapter_names):
-    return _aawm_codex_tool_policy.adapt_codex_namespace_input_items(
-        input_items, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _adapt_codex_namespace_tool_choice(tool_choice, *, adapter_names):
-    return _aawm_codex_tool_policy.adapt_codex_namespace_tool_choice(
-        tool_choice, adapter_names=adapter_names, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-def _openai_tool_choice_references_tool_type(tool_choice, tool_types):
-    return _aawm_codex_tool_policy.openai_tool_choice_references_tool_type(
-        tool_choice, tool_types, normalize_tag_value=_normalize_low_cardinality_tag_value,
-    )
-
-# -- Functions binding CodexToolPolicyCallbacks --
-def _get_codex_tool_policy_model_cost_candidates(model):
-    return _aawm_codex_tool_policy.get_codex_tool_policy_model_cost_candidates(
-        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _get_unsupported_hosted_tool_types_for_model(model):
-    return _aawm_codex_tool_policy.get_unsupported_hosted_tool_types_for_model(
-        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _get_unsupported_request_param_names_for_model(model):
-    return _aawm_codex_tool_policy.get_unsupported_request_param_names_for_model(
-        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _get_unsupported_input_item_types_for_model(model):
-    return _aawm_codex_tool_policy.get_unsupported_input_item_types_for_model(
-        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _get_rewrite_input_item_types_for_model(model):
-    return _aawm_codex_tool_policy.get_rewrite_input_item_types_for_model(
-        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _get_custom_tool_function_adapter_names_for_model(model):
-    return _aawm_codex_tool_policy.get_custom_tool_function_adapter_names_for_model(
-        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _get_namespace_tool_function_adapter_names_for_model(model):
-    return _aawm_codex_tool_policy.get_namespace_tool_function_adapter_names_for_model(
-        model, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _add_codex_custom_tool_function_adapter_logging_metadata(
-    request_body, *, adapted_tools, adapted_input_items, adapted_tool_choice,
-):
-    return _aawm_codex_tool_policy.add_codex_custom_tool_function_adapter_logging_metadata(
-        request_body,
-        adapted_tools=adapted_tools,
-        adapted_input_items=adapted_input_items,
-        adapted_tool_choice=adapted_tool_choice,
-        callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _adapt_codex_custom_tools_to_functions_from_request_body(request_body):
-    return _aawm_codex_tool_policy.adapt_codex_custom_tools_to_functions_from_request_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _add_codex_namespace_tool_function_adapter_logging_metadata(
-    request_body, *, adapted_tools, adapted_input_items, adapted_tool_choice, skipped_tools,
-):
-    return _aawm_codex_tool_policy.add_codex_namespace_tool_function_adapter_logging_metadata(
-        request_body,
-        adapted_tools=adapted_tools,
-        adapted_input_items=adapted_input_items,
-        adapted_tool_choice=adapted_tool_choice,
-        skipped_tools=skipped_tools,
-        callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _adapt_codex_namespace_tools_to_functions_from_request_body(request_body):
-    return _aawm_codex_tool_policy.adapt_codex_namespace_tools_to_functions_from_request_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _add_codex_unsupported_hosted_tool_logging_metadata(
-    request_body, *, removed_tools, removed_tool_choice,
-):
-    return _aawm_codex_tool_policy.add_codex_unsupported_hosted_tool_logging_metadata(
-        request_body,
-        removed_tools=removed_tools,
-        removed_tool_choice=removed_tool_choice,
-        callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _add_tool_choice_without_tools_logging_metadata(request_body, *, removed_tool_choice):
-    return _aawm_codex_tool_policy.add_tool_choice_without_tools_logging_metadata(
-        request_body, removed_tool_choice=removed_tool_choice, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _drop_tool_choice_without_tools_from_request_body(request_body):
-    return _aawm_codex_tool_policy.drop_tool_choice_without_tools_from_request_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _add_codex_unsupported_request_param_logging_metadata(request_body, *, removed_params):
-    return _aawm_codex_tool_policy.add_codex_unsupported_request_param_logging_metadata(
-        request_body, removed_params=removed_params, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _drop_unsupported_codex_request_params_from_request_body(request_body):
-    return _aawm_codex_tool_policy.drop_unsupported_codex_request_params_from_request_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _add_codex_unsupported_input_item_logging_metadata(request_body, *, removed_items):
-    return _aawm_codex_tool_policy.add_codex_unsupported_input_item_logging_metadata(
-        request_body, removed_items=removed_items, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _drop_unsupported_codex_input_items_from_request_body(request_body):
-    return _aawm_codex_tool_policy.drop_unsupported_codex_input_items_from_request_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _drop_unsupported_codex_hosted_tools_from_request_body(request_body):
-    return _aawm_codex_tool_policy.drop_unsupported_codex_hosted_tools_from_request_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _add_codex_tool_description_patch_logging_metadata(request_body, patch_events):
-    return _aawm_codex_tool_policy.add_codex_tool_description_patch_logging_metadata(
-        request_body, patch_events, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _apply_codex_tool_description_patches_to_request_body(request_body):
-    return _aawm_codex_tool_policy.apply_codex_tool_description_patches_to_request_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _stringify_grok_native_input_item_value(value):
-    return _aawm_codex_tool_policy.stringify_grok_native_input_item_value(
-        value, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _format_grok_native_function_call_input_message(item, *, include_correlation_ref=False):
-    return _aawm_codex_tool_policy.format_grok_native_function_call_input_message(
-        item, include_correlation_ref=include_correlation_ref, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _format_grok_native_function_call_output_input_message(item, *, include_correlation_ref=False):
-    return _aawm_codex_tool_policy.format_grok_native_function_call_output_input_message(
-        item, include_correlation_ref=include_correlation_ref, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _rewrite_grok_native_input_item_for_model_input(item, *, item_type, include_correlation_ref=False):
-    return _aawm_codex_tool_policy.rewrite_grok_native_input_item_for_model_input(
-        item, item_type=item_type, include_correlation_ref=include_correlation_ref,
-        callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _is_anthropic_grok_native_responses_adapter_body(request_body):
-    return _aawm_codex_tool_policy.is_anthropic_grok_native_responses_adapter_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _add_grok_native_input_item_rewrite_logging_metadata(request_body, *, rewritten_items):
-    return _aawm_codex_tool_policy.add_grok_native_input_item_rewrite_logging_metadata(
-        request_body, rewritten_items=rewritten_items, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _rewrite_grok_native_unsupported_input_items_from_request_body(request_body):
-    return _aawm_codex_tool_policy.rewrite_grok_native_unsupported_input_items_from_request_body(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-def _rewrite_grok_native_unsupported_input_items_in_place(request_body):
-    return _aawm_codex_tool_policy.rewrite_grok_native_unsupported_input_items_in_place(
-        request_body, callbacks=_CODEX_TOOL_POLICY_CALLBACKS,
-    )
-
-# ---------------------------------------------------------------------------
-# Wave 6E anthropic-body-prep runtime configuration
-# ---------------------------------------------------------------------------
 _aawm_anthropic_body_prep.configure_anthropic_body_prep_runtime(
     expand_persisted_output=_expand_claude_persisted_output_in_anthropic_request_body,
     extract_billing_header_fields=_extract_anthropic_billing_header_fields_from_request_body,
@@ -10085,7 +5818,39 @@ _aawm_anthropic_body_prep.configure_anthropic_body_prep_runtime(
 # ---------------------------------------------------------------------------
 # Wave 6F adapter-call facades and dispatch runtime
 # ---------------------------------------------------------------------------
+_aawm_lane_keys.install(globals())
+_aawm_adapter_model_resolution.install(globals())
+_aawm_adapter_runtime.install(globals())
 _aawm_adapter_runtime.install_wave6f(globals())
+
+_aawm_responses_finalize.configure_responses_finalize_runtime(
+    _aawm_responses_finalize.ResponsesFinalizeRuntime(
+        annotate_request=lambda *args, **kwargs: globals()[
+            "_annotate_request_scope_for_adapted_access_log"
+        ](*args, **kwargs),
+        validate_stream=lambda *args, **kwargs: globals()[
+            "_validate_alias_candidate_responses_stream_if_needed"
+        ](*args, **kwargs),
+        collect_stream=lambda *args, **kwargs: globals()[
+            "_collect_responses_response_from_stream"
+        ](*args, **kwargs),
+        build_response=lambda *args, **kwargs: globals()[
+            "_build_anthropic_response_from_responses_response"
+        ](*args, **kwargs),
+        copy_headers=lambda *args, **kwargs: globals()[
+            "_copy_translated_anthropic_adapter_response_headers"
+        ](*args, **kwargs),
+        build_streaming_response=lambda *args, **kwargs: globals()[
+            "_build_anthropic_streaming_response_from_responses_stream"
+        ](*args, **kwargs),
+        decode_response_body=lambda *args, **kwargs: globals()[
+            "_decode_http_response_body"
+        ](*args, **kwargs),
+        build_malformed_context=lambda *args, **kwargs: globals()[
+            "_build_malformed_intake_context_for_anthropic_responses_adapter"
+        ](*args, **kwargs),
+    )
+)
 
 _ANTHROPIC_DISPATCH_RUNTIME = _aawm_anthropic_dispatch.AnthropicDispatchRuntime(
     resolve_xai_oauth=lambda body, endpoint: _resolve_anthropic_xai_oauth_adapter_model(
@@ -10097,9 +5862,6 @@ _ANTHROPIC_DISPATCH_RUNTIME = _aawm_anthropic_dispatch.AnthropicDispatchRuntime(
     resolve_openai_responses=lambda body, endpoint: _resolve_anthropic_openai_responses_adapter_model(
         body, endpoint=endpoint
     ),
-    resolve_antigravity=lambda body, endpoint: _resolve_anthropic_antigravity_code_assist_adapter_model(
-        body, endpoint=endpoint
-    ),
     resolve_opencode_zen=lambda body, endpoint: _resolve_anthropic_opencode_zen_adapter_model(
         body, endpoint=endpoint
     ),
@@ -10107,9 +5869,6 @@ _ANTHROPIC_DISPATCH_RUNTIME = _aawm_anthropic_dispatch.AnthropicDispatchRuntime(
         body, endpoint=endpoint
     ),
     resolve_alibaba=lambda body, endpoint: _resolve_anthropic_alibaba_token_plan_adapter_model(
-        body, endpoint=endpoint
-    ),
-    resolve_google=lambda body, endpoint: _resolve_anthropic_google_completion_adapter_model(
         body, endpoint=endpoint
     ),
     resolve_nvidia=lambda body, endpoint: _resolve_anthropic_nvidia_responses_adapter_model(
@@ -10133,9 +5892,6 @@ _ANTHROPIC_DISPATCH_RUNTIME = _aawm_anthropic_dispatch.AnthropicDispatchRuntime(
     handle_openai_responses=lambda **kwargs: _handle_anthropic_openai_responses_adapter_route(
         **kwargs
     ),
-    handle_google_completion=lambda **kwargs: _handle_anthropic_google_completion_adapter_route(
-        **kwargs
-    ),
     handle_opencode_zen=lambda **kwargs: _handle_anthropic_opencode_zen_adapter_route(
         **kwargs
     ),
@@ -10155,27 +5911,13 @@ _ANTHROPIC_DISPATCH_RUNTIME = _aawm_anthropic_dispatch.AnthropicDispatchRuntime(
         **kwargs
     ),
     is_oa_xai_responses_model=lambda model: _is_oa_xai_responses_model(model),
-    antigravity_adapter_provider=_ANTIGRAVITY_CODE_ASSIST_ADAPTER_PROVIDER,
 )
 
 
-async def try_dispatch_anthropic_adapter(
-    *,
-    endpoint: str,
-    request: Request,
-    fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth,
-    prepared_request_body: Payload,
-) -> Optional[Response]:
-    """Dispatch an Anthropic-shaped request to a recognized adapter route."""
-    return await _aawm_anthropic_dispatch.try_dispatch_anthropic_adapter(
-        _ANTHROPIC_DISPATCH_RUNTIME,
-        endpoint=endpoint,
-        request=request,
-        fastapi_response=fastapi_response,
-        user_api_key_dict=user_api_key_dict,
-        prepared_request_body=prepared_request_body,
-    )
+try_dispatch_anthropic_adapter = partial(
+    _aawm_anthropic_dispatch.try_dispatch_anthropic_adapter,
+    _ANTHROPIC_DISPATCH_RUNTIME,
+)
 
 
 # Wave 5B: backward-compat module __getattr__ for manager-owned quota cache.
