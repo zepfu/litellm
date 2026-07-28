@@ -6,6 +6,7 @@ from typing import Any, Coroutine, Dict, List, Literal, Optional, Union
 import litellm
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
 from litellm.llms.base_llm.rerank.transformation import BaseRerankConfig
 from litellm.llms.bedrock.rerank.handler import BedrockRerankHandler
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
@@ -23,6 +24,66 @@ together_rerank = TogetherAIRerank()
 bedrock_rerank = BedrockRerankHandler()
 base_llm_http_handler = BaseLLMHTTPHandler()
 #################################################
+
+_NVIDIA_NIM_RERANK_LOGGING_MASKER = SensitiveDataMasker()
+_NVIDIA_NIM_RERANK_LOGGING_EXCLUDED_KEYS = frozenset(
+    {
+        "_nvidia_nim_rerank_ctx",
+        "adaptation_records",
+        "adaptation_truncated_count",
+        "client",
+        "headers",
+        "litellm_logging_obj",
+        "rerank_response_context",
+        "secret_fields",
+    }
+)
+
+
+def _sanitize_nvidia_nim_rerank_logging_value(
+    value: Any, dropped_param_names: set[str]
+) -> Any:
+    """Remove NVIDIA rerank request-only and sensitive values from logging."""
+    if isinstance(value, dict):
+        sanitized: Dict[Any, Any] = {}
+        for key, nested_value in value.items():
+            key_name = str(key)
+            if (
+                key_name in dropped_param_names
+                or key_name in _NVIDIA_NIM_RERANK_LOGGING_EXCLUDED_KEYS
+                or _NVIDIA_NIM_RERANK_LOGGING_MASKER.is_sensitive_key(key_name)
+            ):
+                continue
+            sanitized[key] = _sanitize_nvidia_nim_rerank_logging_value(
+                nested_value, dropped_param_names
+            )
+        return sanitized
+    if isinstance(value, list):
+        return [
+            _sanitize_nvidia_nim_rerank_logging_value(item, dropped_param_names)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _sanitize_nvidia_nim_rerank_logging_value(item, dropped_param_names)
+            for item in value
+        )
+    return value
+
+
+def _get_nvidia_nim_rerank_dropped_param_names(
+    rerank_response_context: Dict[str, Any],
+) -> set[str]:
+    records = rerank_response_context.get("adaptation_records", [])
+    if not isinstance(records, list):
+        return set()
+    return {
+        str(record["name"])
+        for record in records
+        if isinstance(record, dict)
+        and record.get("action") == "dropped"
+        and record.get("name") is not None
+    }
 
 
 @client
@@ -166,25 +227,44 @@ def rerank(  # noqa: PLR0915
             max_tokens_per_doc=max_tokens_per_doc,
             non_default_params=kwargs,
         )
+        rerank_response_context: Dict[str, Any] = {}
+        pop_response_context = getattr(
+            rerank_provider_config, "pop_rerank_response_context", None
+        )
+        if callable(pop_response_context):
+            rerank_response_context = pop_response_context(optional_rerank_params)
         verbose_logger.info(f"optional_rerank_params: {optional_rerank_params}")
         if isinstance(optional_params.timeout, str):
             optional_params.timeout = float(optional_params.timeout)
 
         model_response = RerankResponse()
 
+        logging_kwargs: Dict[str, Any] = kwargs
+        logging_litellm_params: Dict[str, Any] = {
+            "litellm_call_id": litellm_call_id,
+            "proxy_server_request": proxy_server_request,
+            "model_info": model_info,
+            "preset_cache_key": None,
+            "stream_response": {},
+            **optional_params.model_dump(exclude_unset=True),
+        }
+        if _custom_llm_provider == litellm.LlmProviders.NVIDIA_NIM:
+            dropped_param_names = _get_nvidia_nim_rerank_dropped_param_names(
+                rerank_response_context
+            )
+            logging_kwargs = _sanitize_nvidia_nim_rerank_logging_value(
+                dict(kwargs), dropped_param_names
+            )
+            logging_litellm_params = _sanitize_nvidia_nim_rerank_logging_value(
+                logging_litellm_params, dropped_param_names
+            )
+
         litellm_logging_obj.update_from_kwargs(
-            kwargs=kwargs,
+            kwargs=logging_kwargs,
             model=model,
             user=user,
             optional_params=dict(optional_rerank_params),
-            litellm_params={
-                "litellm_call_id": litellm_call_id,
-                "proxy_server_request": proxy_server_request,
-                "model_info": model_info,
-                "preset_cache_key": None,
-                "stream_response": {},
-                **optional_params.model_dump(exclude_unset=True),
-            },
+            litellm_params=logging_litellm_params,
             custom_llm_provider=_custom_llm_provider,
         )
 
@@ -352,6 +432,7 @@ def rerank(  # noqa: PLR0915
                 model=model,
                 custom_llm_provider=_custom_llm_provider,
                 optional_rerank_params=optional_rerank_params,
+                rerank_response_context=rerank_response_context,
                 logging_obj=litellm_logging_obj,
                 provider_config=rerank_provider_config,
                 timeout=optional_params.timeout,

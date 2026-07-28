@@ -998,6 +998,7 @@ class BaseLLMHTTPHandler:
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
         client: Optional[Union[HTTPHandler, AsyncHTTPHandler]] = None,
+        rerank_response_context: Optional[Dict[str, Any]] = None,
     ) -> RerankResponse:
         # get config from model, custom llm provider
         headers = provider_config.validate_environment(
@@ -1020,15 +1021,23 @@ class BaseLLMHTTPHandler:
         )
 
         ## LOGGING
+        logging_api_key = api_key
+        logging_additional_args = {
+            "complete_input_dict": data,
+            "api_base": api_base,
+            "headers": headers,
+        }
+        is_nvidia_nim = custom_llm_provider == litellm.LlmProviders.NVIDIA_NIM
+        if is_nvidia_nim:
+            logging_api_key = None
+            logging_additional_args.pop("headers", None)
         logging_obj.pre_call(
             input=optional_rerank_params.get("query", ""),
-            api_key=api_key,
-            additional_args={
-                "complete_input_dict": data,
-                "api_base": api_base,
-                "headers": headers,
-            },
+            api_key=logging_api_key,
+            additional_args=logging_additional_args,
         )
+        if is_nvidia_nim:
+            logging_obj.model_call_details.pop("api_key", None)
 
         if _is_async is True:
             return self.arerank(  # type: ignore
@@ -1043,6 +1052,7 @@ class BaseLLMHTTPHandler:
                 api_key=api_key,
                 timeout=timeout,
                 client=client,
+                rerank_response_context=rerank_response_context,
             )
 
         if client is None or not isinstance(client, HTTPHandler):
@@ -1070,6 +1080,7 @@ class BaseLLMHTTPHandler:
             logging_obj=logging_obj,
             api_key=api_key,
             request_data=data,
+            optional_params=rerank_response_context or {},
         )
 
     async def arerank(
@@ -1085,6 +1096,7 @@ class BaseLLMHTTPHandler:
         api_key: Optional[str] = None,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[Union[HTTPHandler, AsyncHTTPHandler]] = None,
+        rerank_response_context: Optional[Dict[str, Any]] = None,
     ) -> RerankResponse:
         if client is None or not isinstance(client, AsyncHTTPHandler):
             async_httpx_client = get_async_httpx_client(
@@ -1109,6 +1121,7 @@ class BaseLLMHTTPHandler:
             logging_obj=logging_obj,
             api_key=api_key,
             request_data=request_data,
+            optional_params=rerank_response_context or {},
         )
 
     def _prepare_audio_transcription_request(
