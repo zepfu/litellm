@@ -13,6 +13,7 @@ from uuid import uuid4
 from openai.types.responses.response_create_params import ResponseInputParam
 from starlette.responses import StreamingResponse
 
+from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.types import Payload
 
 
@@ -89,6 +90,103 @@ def _ordered_unique_str_values(values: list[Optional[str]]) -> list[str]:
     return unique_values
 
 
+def _resolve_unsupported_tools_mode(request_body: Payload) -> str:
+    """Resolve the caller-visible unsupported-tools policy mode.
+
+    Reads ``litellm_metadata.opencode_zen_unsupported_tools_mode``.
+    Absence means ``strict``.  Unknown values yield a sanitized HTTP 400.
+    """
+    metadata = request_body.get("litellm_metadata")
+    if not isinstance(metadata, dict):
+        return "strict"
+    raw_mode = metadata.get("opencode_zen_unsupported_tools_mode")
+    if raw_mode is None:
+        return "strict"
+    if raw_mode in ("strict", "drop"):
+        return raw_mode
+    raise ProxyException(
+        message=(
+            "OpenCode Zen unsupported-tools mode must be 'strict' or "
+            "'drop'."
+        ),
+        type="invalid_request_error",
+        param="opencode_zen_unsupported_tools_mode",
+        code=400,
+    )
+
+
+def _enforce_tool_choice_after_drop(
+    body: Payload,
+    retained_function_names: set[str],
+    has_retained_functions: bool,
+) -> None:
+    """Validate and adjust ``tool_choice`` after unsupported tool removal.
+
+    Mutates *body* in place (already a shallow copy owned by the caller).
+    """
+    tool_choice = body.get("tool_choice")
+    if tool_choice is None:
+        return
+
+    if isinstance(tool_choice, str):
+        if tool_choice == "none":
+            return
+        if tool_choice == "auto":
+            if not has_retained_functions:
+                body.pop("tool_choice", None)
+            return
+        if tool_choice in ("required", "any"):
+            if has_retained_functions:
+                return
+            raise ProxyException(
+                message=(
+                    "OpenCode Zen tool choice requires at least one "
+                    "supported function tool."
+                ),
+                type="invalid_request_error",
+                param="tool_choice",
+                code=400,
+            )
+        raise ProxyException(
+            message="OpenCode Zen received an unsupported tool_choice value.",
+            type="invalid_request_error",
+            param="tool_choice",
+            code=400,
+        )
+
+    if isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type")
+        if tc_type == "function":
+            name = tool_choice.get("name")
+            if isinstance(name, str) and name and name in retained_function_names:
+                return
+            raise ProxyException(
+                message=(
+                    "OpenCode Zen tool choice references a removed "
+                    "or missing function."
+                ),
+                type="invalid_request_error",
+                param="tool_choice",
+                code=400,
+            )
+        raise ProxyException(
+            message=(
+                "OpenCode Zen drop mode rejects non-function tool "
+                "choice types."
+            ),
+            type="invalid_request_error",
+            param="tool_choice",
+            code=400,
+        )
+
+    raise ProxyException(
+        message="OpenCode Zen received an unsupported tool_choice shape.",
+        type="invalid_request_error",
+        param="tool_choice",
+        code=400,
+    )
+
+
 def strip_unsupported_responses_tools(
     runtime: Runtime,
     request_body: Payload,
@@ -97,28 +195,66 @@ def strip_unsupported_responses_tools(
     if not isinstance(tools, list):
         return request_body
 
+    mode = _resolve_unsupported_tools_mode(request_body)
+
     supported_tools: list[object] = []
     removed_tool_types: list[Optional[str]] = []
     removed_tool_names: list[Optional[str]] = []
     for tool in tools:
         tool_type = tool.get("type") if isinstance(tool, dict) else None
-        if tool_type == "function":
+        tool_name = get_responses_tool_name(runtime, tool)
+        if tool_type == "function" and tool_name:
             supported_tools.append(tool)
             continue
         removed_tool_types.append(
             str(tool_type) if tool_type is not None else "unknown"
         )
-        removed_tool_names.append(get_responses_tool_name(runtime, tool))
+        removed_tool_names.append(tool_name)
 
     removed_count = len(tools) - len(supported_tools)
     if removed_count <= 0:
         return request_body
 
+    if mode == "strict":
+        raise ProxyException(
+            message=(
+                "OpenCode Zen strict tool policy rejects unsupported or "
+                "malformed tools. Remove non-function tools or set "
+                "litellm_metadata.opencode_zen_unsupported_tools_mode "
+                "to 'drop'."
+            ),
+            type="invalid_request_error",
+            param="tools",
+            code=400,
+        )
+
+    # -- drop mode --
     updated_body = dict(request_body)
     if supported_tools:
         updated_body["tools"] = supported_tools
     else:
         updated_body.pop("tools", None)
+
+    retained_function_names = {
+        name
+        for tool in supported_tools
+        if isinstance(tool, dict)
+        and (name := get_responses_tool_name(runtime, tool)) is not None
+    }
+    _enforce_tool_choice_after_drop(
+        updated_body, retained_function_names, bool(supported_tools)
+    )
+
+    if "allowed_tools" in updated_body:
+        raise ProxyException(
+            message=(
+                "OpenCode Zen drop mode does not support 'allowed_tools' "
+                "when unsupported tools are removed."
+            ),
+            type="invalid_request_error",
+            param="allowed_tools",
+            code=400,
+        )
 
     return runtime.merge_metadata(
         updated_body,

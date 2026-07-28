@@ -20,6 +20,7 @@ from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen imp
 from litellm.proxy.pass_through_endpoints.providers.opencode_zen import (
     runtime as zen_runtime,
 )
+from litellm.proxy._types import ProxyException
 
 
 def _assemble_headers(
@@ -435,6 +436,501 @@ def test_build_codex_streaming_response_preserves_transport_fields() -> None:
     assert normalized.media_type == "text/event-stream"
 
 
+# ---------------------------------------------------------------------------
+# D1-545: Auth fail-closed tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_api_key_env_precedence_litellm_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LITELLM_OPENCODE_API_KEY takes precedence over OPENCODE_API_KEY."""
+    monkeypatch.setenv("LITELLM_OPENCODE_API_KEY", "primary-key")
+    monkeypatch.setenv("OPENCODE_API_KEY", "secondary-key")
+
+    assert await zen_runtime._load_local_opencode_zen_api_key() == "primary-key"
+
+
+@pytest.mark.asyncio
+async def test_api_key_env_precedence_second_used_when_first_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENCODE_API_KEY", "fallback-key")
+
+    assert await zen_runtime._load_local_opencode_zen_api_key() == "fallback-key"
+
+
+@pytest.mark.asyncio
+async def test_auth_file_env_precedence_litellm_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LITELLM_OPENCODE_AUTH_FILE takes precedence over OPENCODE_AUTH_FILE."""
+    primary = tmp_path / "primary.json"
+    secondary = tmp_path / "secondary.json"
+    primary.write_text(json.dumps({"opencode": {"type": "api", "key": "pk"}}))
+    secondary.write_text(json.dumps({"opencode": {"type": "api", "key": "sk"}}))
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(primary))
+    monkeypatch.setenv("OPENCODE_AUTH_FILE", str(secondary))
+
+    assert await zen_runtime._load_local_opencode_zen_api_key() == "pk"
+
+
+@pytest.mark.asyncio
+async def test_explicit_missing_auth_file_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured but missing auth file must fail without trying defaults."""
+    missing = tmp_path / "nonexistent.json"
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(missing))
+
+    with pytest.raises(ValueError, match="LITELLM_OPENCODE_AUTH_FILE"):
+        await zen_runtime._load_local_opencode_zen_api_key()
+
+
+@pytest.mark.asyncio
+async def test_explicit_non_file_auth_path_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory configured as auth file must fail."""
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(tmp_path))
+
+    with pytest.raises(ValueError, match="LITELLM_OPENCODE_AUTH_FILE"):
+        await zen_runtime._load_local_opencode_zen_api_key()
+
+
+@pytest.mark.asyncio
+async def test_explicit_unreadable_auth_file_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable auth file must fail with sanitized message."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}")
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(auth_file))
+
+    original_read = Path.read_text
+
+    def _deny_read(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == auth_file:
+            raise PermissionError("denied")
+        return original_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _deny_read)
+
+    with pytest.raises(ValueError, match="not readable") as exc_info:
+        await zen_runtime._load_local_opencode_zen_api_key()
+    # Sanitized: no path value, no raw exception text
+    assert str(auth_file) not in str(exc_info.value)
+    assert "denied" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_explicit_malformed_json_auth_file_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{not json")
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(auth_file))
+
+    with pytest.raises(ValueError, match="valid JSON") as exc_info:
+        await zen_runtime._load_local_opencode_zen_api_key()
+    assert "{not json" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_explicit_invalid_auth_shape_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auth file with wrong provider shape must fail."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(json.dumps({"other_provider": {"key": "x"}}))
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(auth_file))
+
+    with pytest.raises(ValueError, match="API-key auth"):
+        await zen_runtime._load_local_opencode_zen_api_key()
+
+
+@pytest.mark.asyncio
+async def test_explicit_auth_type_not_api_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps({"opencode": {"type": "oauth", "key": "tok"}})
+    )
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(auth_file))
+
+    with pytest.raises(ValueError, match="API-key auth"):
+        await zen_runtime._load_local_opencode_zen_api_key()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_default_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no auth-file env is set, HOME-relative defaults are used."""
+    default_dir = tmp_path / ".local" / "share" / "opencode"
+    default_dir.mkdir(parents=True)
+    default_auth = default_dir / "auth.json"
+    default_auth.write_text(
+        json.dumps({"opencode": {"type": "api", "key": "default-key"}})
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert await zen_runtime._load_local_opencode_zen_api_key() == "default-key"
+
+
+@pytest.mark.asyncio
+async def test_no_default_auth_file_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no auth-file env and no default file exists, fail clearly."""
+    monkeypatch.setenv("HOME", str(tmp_path / "empty_home"))
+
+    with pytest.raises(FileNotFoundError, match="auth file not found"):
+        await zen_runtime._load_local_opencode_zen_api_key()
+
+
+@pytest.mark.asyncio
+async def test_absolute_container_style_auth_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absolute paths (container mounts) work without HOME expansion."""
+    container_path = tmp_path / "secrets" / "opencode" / "auth.json"
+    container_path.parent.mkdir(parents=True)
+    container_path.write_text(
+        json.dumps({"opencode": {"type": "api", "key": "container-key"}})
+    )
+    monkeypatch.setenv("OPENCODE_AUTH_FILE", str(container_path))
+
+    assert await zen_runtime._load_local_opencode_zen_api_key() == "container-key"
+
+
+@pytest.mark.asyncio
+async def test_error_messages_do_not_expose_path_or_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Errors may name the env var but never the path value or content."""
+    secret_path = tmp_path / "super-secret-location.json"
+    secret_path.write_text("SENSITIVE_CONTENT")
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(secret_path))
+    # Make it a directory to trigger missing-file error
+    secret_path.unlink()
+    secret_path.mkdir()
+
+    with pytest.raises(ValueError) as exc_info:
+        await zen_runtime._load_local_opencode_zen_api_key()
+    msg = str(exc_info.value)
+    assert "LITELLM_OPENCODE_AUTH_FILE" in msg
+    assert str(secret_path) not in msg
+    assert "SENSITIVE_CONTENT" not in msg
+
+
+@pytest.mark.asyncio
+async def test_first_auth_env_authoritative_no_later_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If LITELLM_OPENCODE_AUTH_FILE is set but missing, OPENCODE_AUTH_FILE
+    is NOT consulted."""
+    missing = tmp_path / "missing.json"
+    valid = tmp_path / "valid.json"
+    valid.write_text(json.dumps({"opencode": {"type": "api", "key": "v"}}))
+    monkeypatch.setenv("LITELLM_OPENCODE_AUTH_FILE", str(missing))
+    monkeypatch.setenv("OPENCODE_AUTH_FILE", str(valid))
+
+    with pytest.raises(ValueError, match="LITELLM_OPENCODE_AUTH_FILE"):
+        await zen_runtime._load_local_opencode_zen_api_key()
+
+
+# ---------------------------------------------------------------------------
+# D1-546: Tool policy tests
+# ---------------------------------------------------------------------------
+
+
+def _tool_policy_runtime() -> normalization.Runtime:
+    """Minimal runtime for tool-policy tests."""
+    return normalization.Runtime(
+        clean_secret_string=_clean_secret,
+        merge_metadata=_merge_metadata_for_tools,
+        add_logging_metadata=lambda body, **_kwargs: body,
+        build_span=lambda **kwargs: kwargs,
+        transform_responses_api_request_to_chat_completion_request=(
+            lambda **_kwargs: {}
+        ),
+        async_responses_api_session_handler=_async_empty_payload,
+        iterate_responses_sse_events=_iterate_events,
+        coerce_namespace_to_mapping=lambda value: value,
+        responses_output_item_has_meaningful_content=_meaningful_output,
+        streaming_response_factory=StreamingResponse,
+    )
+
+
+def _merge_metadata_for_tools(
+    body: dict[str, Any],
+    *,
+    tags_to_add: list[str] | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    updated = dict(body)
+    meta = dict(updated.get("litellm_metadata") or {})
+    if tags_to_add:
+        meta.setdefault("tags", []).extend(tags_to_add)
+    if extra_fields:
+        meta.update(extra_fields)
+    updated["litellm_metadata"] = meta
+    return updated
+
+
+def _fn_tool(name: str) -> dict[str, Any]:
+    return {"type": "function", "name": name, "parameters": {}}
+
+
+def _hosted_tool(tool_type: str = "web_search") -> dict[str, Any]:
+    return {"type": tool_type}
+
+
+def test_strict_mode_default_rejects_non_function_tools() -> None:
+    """Default (no mode metadata) is strict: rejects unsupported tools."""
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("read"), _hosted_tool("web_search")],
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+
+
+def test_strict_mode_rejects_malformed_function_tool() -> None:
+    """A function tool without a name is malformed and rejected in strict."""
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [{"type": "function", "parameters": {}}],
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+
+
+def test_strict_mode_does_not_mutate_caller_body() -> None:
+    rt = _tool_policy_runtime()
+    original_tools = [_fn_tool("a"), _hosted_tool()]
+    body: dict[str, Any] = {"tools": list(original_tools)}
+    with pytest.raises(ProxyException):
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert body["tools"] == original_tools
+
+
+def test_drop_mode_retains_function_tools_and_records_metadata() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("read"), _hosted_tool("code_interpreter"), _fn_tool("write")],
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    assert len(result["tools"]) == 2
+    meta = result["litellm_metadata"]
+    assert meta["opencode_zen_removed_unsupported_tool_count"] == 1
+    assert meta["opencode_zen_removed_unsupported_tool_types"] == ["code_interpreter"]
+
+
+def test_drop_mode_all_unsupported_removes_tools_key() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_hosted_tool("web_search"), _hosted_tool("code_interpreter")],
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    assert "tools" not in result
+    meta = result["litellm_metadata"]
+    assert meta["opencode_zen_removed_unsupported_tool_count"] == 2
+
+
+def test_drop_mode_tool_choice_auto_omitted_when_no_functions() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_hosted_tool()],
+        "tool_choice": "auto",
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    assert "tool_choice" not in result
+
+
+def test_drop_mode_tool_choice_auto_kept_when_functions_remain() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("x"), _hosted_tool()],
+        "tool_choice": "auto",
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    assert result["tool_choice"] == "auto"
+
+
+def test_drop_mode_tool_choice_none_preserved() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_hosted_tool()],
+        "tool_choice": "none",
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    assert result["tool_choice"] == "none"
+
+
+def test_drop_mode_tool_choice_required_rejected_no_functions() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_hosted_tool()],
+        "tool_choice": "required",
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+
+
+def test_drop_mode_tool_choice_any_rejected_no_functions() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_hosted_tool()],
+        "tool_choice": "any",
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+
+
+def test_drop_mode_named_function_choice_retained() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("read"), _hosted_tool()],
+        "tool_choice": {"type": "function", "name": "read"},
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    assert result["tool_choice"] == {"type": "function", "name": "read"}
+
+
+def test_drop_mode_named_function_choice_removed_rejected() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("read"), _hosted_tool("shell")],
+        "tool_choice": {"type": "function", "name": "shell"},
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+
+
+def test_drop_mode_non_function_tool_choice_dict_rejected() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("a"), _hosted_tool()],
+        "tool_choice": {"type": "web_search"},
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+
+
+def test_drop_mode_unknown_tool_choice_string_rejected() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("a"), _hosted_tool()],
+        "tool_choice": "banana",
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+
+
+def test_drop_mode_allowed_tools_rejected() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("a"), _hosted_tool()],
+        "allowed_tools": ["a"],
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+
+
+def test_unknown_mode_yields_400() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("a"), _hosted_tool()],
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "yolo"},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+    assert "strict" in str(exc_info.value.message)
+    assert "drop" in str(exc_info.value.message)
+
+
+def test_drop_mode_metadata_no_value_leakage() -> None:
+    """Metadata records only bounded type/name, never definitions/schemas."""
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [
+            _fn_tool("safe"),
+            {
+                "type": "mcp",
+                "name": "secret_tool",
+                "server_url": "https://internal.corp/mcp",
+                "headers": {"Authorization": "Bearer tok123"},
+                "schema": {"type": "object", "properties": {"x": {"type": "string"}}},
+            },
+        ],
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    meta = result["litellm_metadata"]
+    meta_str = json.dumps(meta)
+    assert "internal.corp" not in meta_str
+    assert "tok123" not in meta_str
+    assert "properties" not in meta_str
+    assert meta["opencode_zen_removed_unsupported_tool_types"] == ["mcp"]
+    assert meta["opencode_zen_removed_unsupported_tool_names"] == ["secret_tool"]
+
+
+def test_all_function_tools_no_removal_passthrough() -> None:
+    """When all tools are valid functions, body is returned unchanged."""
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [_fn_tool("a"), _fn_tool("b")],
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "strict"},
+    }
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    assert result is body
+
+
+def test_non_dict_tool_rejected_in_strict() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": ["not_a_dict"],
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
 
 @pytest.mark.asyncio
 async def test_installed_host_facade_patch_reaches_candidate_loader(

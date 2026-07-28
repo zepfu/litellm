@@ -44,6 +44,8 @@ NORMALIZATION_PATH = (
 PROVIDER_OWNED_NORMALIZERS = {
     "get_responses_tool_name",
     "strip_unsupported_responses_tools",
+    "_resolve_unsupported_tools_mode",
+    "_enforce_tool_choice_after_drop",
     "chat_message_role",
     "chat_tool_call_id",
     "chat_message_tool_call_ids",
@@ -101,6 +103,11 @@ PROVIDER_SUBSTANCE_MARKERS = {
         "opencode-zen-unsupported-tools-stripped",
         "opencode_zen_removed_unsupported_tool_count",
     ),
+    "tool policy enforcement": (
+        "opencode_zen_unsupported_tools_mode",
+        "ProxyException",
+        "_enforce_tool_choice_after_drop",
+    ),
     "stream normalization": (
         "response.output_text.delta",
         "response.output_item.added",
@@ -120,7 +127,8 @@ SUBSTANTIVE_FUNCTION_MINIMUM_NODES = {
     "normalize_codex_request": 80,
     "normalize_responses_stream_for_codex": 140,
     "sanitize_completion_messages_for_chat_completion": 80,
-    "strip_unsupported_responses_tools": 45,
+    "strip_unsupported_responses_tools": 80,
+    "_enforce_tool_choice_after_drop": 45,
 }
 
 

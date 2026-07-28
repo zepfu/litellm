@@ -235,12 +235,24 @@ def _get_opencode_zen_target_base() -> str:
 
 
 def _get_opencode_zen_auth_file_path() -> Optional[Path]:
+    """Resolve the OpenCode Zen auth file path.
+
+    The first nonempty auth-file environment variable is authoritative.
+    If it is set but the path is missing or not a regular file, raise
+    immediately without consulting later variables or HOME defaults.
+    HOME-relative defaults are used only when no auth-file variable is
+    configured.
+    """
     for env_name in _constants._OPENCODE_ZEN_AUTH_FILE_ENV_VARS:
         value = _clean_secret_string(os.getenv(env_name))
         if value:
             candidate = Path(value).expanduser()
-            if candidate.is_file():
-                return candidate
+            if not candidate.is_file():
+                raise ValueError(
+                    f"OpenCode Zen auth file configured via {env_name} "
+                    "is missing or not a regular file."
+                )
+            return candidate
 
     for candidate_str in _constants._OPENCODE_ZEN_DEFAULT_AUTH_PATHS:
         candidate = Path(candidate_str).expanduser()
@@ -256,6 +268,14 @@ async def _load_local_opencode_zen_api_key() -> str:
     if explicit_key is not None:
         return explicit_key
 
+    # Identify the configured source for error attribution (env var name
+    # only, never the path value).
+    configured_source: Optional[str] = None
+    for env_name in _constants._OPENCODE_ZEN_AUTH_FILE_ENV_VARS:
+        if _clean_secret_string(os.getenv(env_name)):
+            configured_source = env_name
+            break
+
     auth_path = _get_opencode_zen_auth_file_path()
     if auth_path is None:
         raise FileNotFoundError(
@@ -264,12 +284,23 @@ async def _load_local_opencode_zen_api_key() -> str:
             "'LITELLM_OPENCODE_AUTH_FILE'."
         )
 
+    source_label = configured_source or "default"
+
     try:
-        auth_data = json.loads(auth_path.read_text(encoding="utf-8"))
-    except Exception as exc:
+        raw_text = auth_path.read_text(encoding="utf-8")
+    except Exception:
         raise ValueError(
-            f"Unable to read OpenCode Zen auth file at {auth_path}"
-        ) from exc
+            f"OpenCode Zen auth file configured via {source_label} "
+            "is not readable."
+        ) from None
+
+    try:
+        auth_data = json.loads(raw_text)
+    except Exception:
+        raise ValueError(
+            f"OpenCode Zen auth file configured via {source_label} "
+            "does not contain valid JSON."
+        ) from None
 
     provider_auth = (
         auth_data.get("opencode") if isinstance(auth_data, dict) else None
@@ -286,8 +317,8 @@ async def _load_local_opencode_zen_api_key() -> str:
     )
     if api_key is None or auth_type not in {None, "api"}:
         raise ValueError(
-            "OpenCode Zen auth file must contain provider 'opencode' "
-            "with API-key auth."
+            f"OpenCode Zen auth file configured via {source_label} "
+            "must contain provider 'opencode' with API-key auth."
         )
     return api_key
 
