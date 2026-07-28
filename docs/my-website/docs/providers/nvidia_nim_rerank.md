@@ -1,15 +1,16 @@
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-# Nvidia NIM - Rerank
+# NVIDIA NIM - Rerank
 
-Use Nvidia NIM Rerank models through LiteLLM.
+Use NVIDIA NIM rerank models through LiteLLM's Cohere-compatible `rerank`
+interface.
 
 | Property | Details |
 |----------|---------|
-| Description | Nvidia NIM provides high-performance reranking models for semantic search and retrieval-augmented generation (RAG) |
-| Provider Doc | [Nvidia NIM API Reference ↗](https://docs.api.nvidia.com/nim/reference/) |
-| Supported Endpoint | `/rerank` |
+| Description | NVIDIA NIM provides reranking models for semantic search and retrieval-augmented generation (RAG) |
+| Provider Doc | [NVIDIA NIM API Reference ↗](https://docs.api.nvidia.com/nim/reference/) |
+| LiteLLM Endpoint | `/rerank` |
 
 ## Overview
 
@@ -19,11 +20,12 @@ Nvidia NIM rerank models help you:
 - Filter and rank large document sets efficiently
 
 **Supported Models:**
-- All Nvidia NIM rerank models on their platform
+- NVIDIA NIM rerank models with LiteLLM model metadata
 
 :::tip
 
-See the full list of LiteLLM supported Nvidia NIM rerank models on [Nvidia NIM](https://models.litellm.ai)
+See the full list of LiteLLM supported NVIDIA NIM models on
+[models.litellm.ai](https://models.litellm.ai).
 
 :::
 
@@ -32,7 +34,7 @@ See the full list of LiteLLM supported Nvidia NIM rerank models on [Nvidia NIM](
 ### LiteLLM Python SDK
 
 <Tabs>
-<TabItem value="mistral-4b-shared" label="Mistral 4B Shared Endpoint">
+<TabItem value="mistral-4b-catalog" label="Catalog Model">
 
 ```python
 import litellm
@@ -55,7 +57,7 @@ print(response)
 ```
 
 </TabItem>
-<TabItem value="mistral-4b" label="Mistral 4B Model">
+<TabItem value="mistral-4b-body-alias" label="Catalog Body Model Alias">
 
 ```python
 import litellm
@@ -64,7 +66,7 @@ import os
 os.environ['NVIDIA_NIM_API_KEY'] = "nvapi-..."
 
 response = litellm.rerank(
-    model="nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3",
+    model="nvidia_nim/nv-rerank-qa-mistral-4b:1",
     query="What is the GPU memory bandwidth of H100 SXM?",
     documents=[
         "The Hopper GPU is paired with the Grace CPU using NVIDIA's ultra-fast chip-to-chip interconnect, delivering 900GB/s of bandwidth.",
@@ -79,6 +81,16 @@ print(response)
 
 </TabItem>
 </Tabs>
+
+:::caution
+
+NVIDIA has deprecated `nv-rerankqa-mistral-4b-v3`. Existing deployments may
+continue to use the compatibility alias
+`nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3`, but new configurations should
+use the catalog-supported `nvidia_nim/nvidia/rerank-qa-mistral-4b` model in the
+first tab above.
+
+:::
 
 **Response:**
 ```json
@@ -141,32 +153,39 @@ curl -X POST http://0.0.0.0:4000/rerank \
   }'
 ```
 
-## `/v1/ranking` Models
+## Endpoint families
 
-Some Nvidia NIM rerank models use the `/v1/ranking` endpoint instead of the default `/v1/retrieval/{model}/reranking` endpoint.
+LiteLLM supports both NVIDIA NIM rerank endpoint families:
 
-Use the `ranking/` prefix to force requests to the `/v1/ranking` endpoint:
+| NVIDIA NIM endpoint | LiteLLM model form | Resolution |
+|----------|----------|----------|
+| `/v1/retrieval/{model}/reranking` | `nvidia_nim/<model>` | Catalog metadata may instead select a shared retrieval `endpoint_path` and `body_model`. Without rerank metadata, LiteLLM derives the model-in-path URL shown in this column. |
+| `/v1/ranking` | `nvidia_nim/ranking/<model>` | The `ranking/` prefix selects the fixed endpoint, and the cleaned model name is sent in the JSON body. |
+
+Use the `ranking/` segment after `nvidia_nim/` to select `/v1/ranking`.
 
 :::caution
 
-Nvidia has retired some older hosted rerank endpoints, including the previous
-`llama-3.2-nv-rerankqa-1b-v2` hosted route. Only add `ranking/` routes for
-models that Nvidia currently documents as available for your account or
-deployment.
+NVIDIA has retired the hosted `llama-3.2-nv-rerankqa-1b-v2` route. The
+`/v1/ranking` examples below retain its catalog entry only to document
+compatibility with an existing or self-hosted deployment; they are not a
+recommendation for new hosted configurations. Only add a `ranking/` route for
+a model that NVIDIA documents as available to your account or deployment.
 
 :::
 
 ### LiteLLM Python SDK
 
-```python showLineNumbers title="Force /v1/ranking endpoint with ranking/ prefix"
+```python showLineNumbers title="Compatibility only: select /v1/ranking"
 import litellm
 import os
 
 os.environ['NVIDIA_NIM_API_KEY'] = "nvapi-..."
 
-# Use "ranking/" prefix to force /v1/ranking endpoint
+# Compatibility only: this retired hosted model may remain on existing or
+# self-hosted deployments.
 response = litellm.rerank(
-    model="nvidia_nim/ranking/nvidia/current-ranking-model",
+    model="nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2",
     query="which way did the traveler go?",
     documents=[
         "two roads diverged in a yellow wood...",
@@ -184,9 +203,10 @@ print(response)
 
 ```yaml showLineNumbers title="config.yaml"
 model_list:
-  - model_name: nvidia-ranking
+  - model_name: nvidia-ranking-compat
     litellm_params:
-      model: nvidia_nim/ranking/nvidia/current-ranking-model
+      # Compatibility only: verify this model exists on your deployment.
+      model: nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2
       api_key: os.environ/NVIDIA_NIM_API_KEY
 ```
 
@@ -195,7 +215,7 @@ curl -X POST http://0.0.0.0:4000/rerank \
   -H "Authorization: Bearer sk-1234" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "nvidia-ranking",
+    "model": "nvidia-ranking-compat",
     "query": "which way did the traveler go?",
     "documents": [
       "two roads diverged in a yellow wood...",
@@ -205,57 +225,105 @@ curl -X POST http://0.0.0.0:4000/rerank \
   }'
 ```
 
-### Understanding Model Resolution
+### Understanding model resolution
 
-**Ranking Endpoint (`/v1/ranking`):**
+**Catalog-backed shared retrieval endpoint:**
 
 ```
-model: nvidia_nim/ranking/nvidia/current-ranking-model
-       └────┬────┘ └──┬──┘ └─────────────┬──────────────────┘
-            │        │                   │
-            │        │                   └────▶ Model name sent to provider
-            │        │
-            │        └────────────────────────▶ Tells LiteLLM the request/response and url should be sent to Nvidia NIM /v1/ranking endpoint
-            │
-            └─────────────────────────────────▶ Provider prefix
+LiteLLM model: nvidia_nim/nvidia/rerank-qa-mistral-4b
+Catalog endpoint_path: /v1/retrieval/nvidia/reranking
+Catalog body_model: nv-rerank-qa-mistral-4b:1
 
-API URL: https://ai.api.nvidia.com/v1/ranking
+Provider URL: https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking
+Provider JSON model: nv-rerank-qa-mistral-4b:1
 ```
 
-**Visual Flow:**
+The typed catalog entry takes precedence over generic model-in-path derivation.
+For a retrieval model without rerank metadata, LiteLLM strips the
+`nvidia_nim/` prefix, derives
+`/v1/retrieval/{clean_model}/reranking`, and converts underscores to periods in
+the JSON body model. This fallback describes routing behavior; it does not
+confirm that an uncataloged model is available.
+
+**Endpoint flow:**
 
 ```
 Client Request                LiteLLM                              Provider API
 ──────────────              ────────────                         ─────────────
 
-# Default reranking endpoint
-model: "nvidia_nim/nvidia/model-name"
-                            1. Extracts model: nvidia/model-name
-                            2. Routes to default endpoint ──────▶ POST /v1/retrieval/nvidia/model-name/reranking
+# Catalog-backed shared retrieval endpoint
+model: "nvidia_nim/nvidia/rerank-qa-mistral-4b"
+                            1. Reads catalog endpoint_path ─────▶ POST /v1/retrieval/nvidia/reranking
+                            2. Reads catalog body_model          Body: {"model": "nv-rerank-qa-mistral-4b:1", ...}
 
 
-# Forced ranking endpoint  
-model: "nvidia_nim/ranking/nvidia/model-name"
+# Compatibility-only ranking endpoint
+model: "nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2"
                             1. Detects "ranking/" prefix
-                            2. Extracts model: nvidia/model-name
+                            2. Extracts model: nvidia/llama-3.2-nv-rerankqa-1b-v2
                             3. Routes to ranking endpoint ──────▶ POST /v1/ranking
-                                                                  Body: {"model": "nvidia/model-name", ...}
+                                                                  Body: {"model": "nvidia/llama-3.2-nv-rerankqa-1b-v2", ...}
 ```
 
 **When to use each endpoint:**
 
 | Endpoint | Model Prefix | Use Case |
 |----------|--------------|----------|
-| `/v1/retrieval/{model}/reranking` | `nvidia_nim/<model>` | Default for most rerank models |
-| `/v1/ranking` | `nvidia_nim/ranking/<model>` | For currently available Nvidia NIM models that require this endpoint |
+| Catalog `endpoint_path` | `nvidia_nim/<catalog-model>` | Preferred for catalog-backed rerank models, including shared retrieval endpoints |
+| Derived `/v1/retrieval/{model}/reranking` | `nvidia_nim/<model>` | Fallback for models without rerank metadata; availability must be verified separately |
+| `/v1/ranking` | `nvidia_nim/ranking/<model>` | Compatibility or deployment-specific models that require the ranking endpoint |
 
 :::tip
 
-Check Nvidia's model deployment page for your selected model to see which endpoint it requires.
+Check NVIDIA's model deployment page for your selected model to see which
+endpoint it requires.
 
 :::
 
-## API Parameters
+### Exact provider request bodies
+
+For the default retrieval family:
+
+```python
+response = litellm.rerank(
+    model="nvidia_nim/nvidia/rerank-qa-mistral-4b",
+    query="What is GPU bandwidth?",
+    documents=["H100 has 3TB/s", "A100 has 2TB/s"],
+    top_n=2,
+    truncate="END",
+)
+```
+
+LiteLLM sends:
+
+```json
+{
+  "model": "nv-rerank-qa-mistral-4b:1",
+  "query": {"text": "What is GPU bandwidth?"},
+  "passages": [{"text": "H100 has 3TB/s"}, {"text": "A100 has 2TB/s"}],
+  "top_k": 2,
+  "truncate": "END"
+}
+```
+
+For `/v1/ranking`, the following exact body is compatibility-only for an
+existing deployment of the retired catalog model:
+
+```json
+{
+  "model": "nvidia/llama-3.2-nv-rerankqa-1b-v2",
+  "query": {"text": "Which GPU is faster?"},
+  "passages": [{"text": "H100 is fast"}, {"text": "A100 is slower"}],
+  "top_k": 1
+}
+```
+
+The corresponding LiteLLM request uses
+`model="nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2"`,
+`query="Which GPU is faster?"`, `documents=["H100 is fast", "A100 is slower"]`,
+and `top_n=1`.
+
+## API parameters
 
 ### Required Parameters
 
@@ -263,19 +331,80 @@ Check Nvidia's model deployment page for your selected model to see which endpoi
 |-----------|------|-------------|
 | `model` | string | The Nvidia NIM rerank model name with `nvidia_nim/` prefix |
 | `query` | string | The search query to rank documents against |
-| `documents` | array | List of documents to rank (1-1000 documents) |
+| `documents` | array | Documents to rank |
 
 ### Optional Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `top_n` | integer | All documents | Number of top-ranked documents to return |
+| `top_n` | integer | All documents | Mapped to NVIDIA NIM's `top_k` |
 
 ### Nvidia-Specific Parameters
 
-**`truncate`**: Controls how text is truncated if it exceeds the model's context window
-- `"NONE"`: No truncation (request may fail if too long)
-- `"END"`: Truncate from the end of the text
+**`truncate`** controls truncation when text exceeds the model's context
+window. Valid values are `"NONE"` and `"END"`.
+
+LiteLLM does not support Cohere's `rank_fields`, `max_chunks_per_doc`, or
+`max_tokens_per_doc` for NVIDIA NIM. By default, providing one raises an
+`UnsupportedParamsError`; with `drop_params=True`, LiteLLM drops it instead:
+
+```python
+response = litellm.rerank(
+    model="nvidia_nim/nvidia/rerank-qa-mistral-4b",
+    query="GPU performance",
+    documents=["High performance computing", "Fast GPU processing"],
+    rank_fields=["text"],
+    drop_params=True,
+)
+```
+
+`top_n` is recorded as a provider rename to `top_k` in internal adaptation
+metadata. Dropped unsupported parameters are recorded by name, action, and
+reason; values are not recorded.
+
+### Parameter adaptation metadata
+
+When an adaptation occurs, LiteLLM writes two flat keys directly under
+`response._hidden_params`: `provider_parameter_adaptations` and
+`provider_parameter_adaptations_truncated_count`. The records contain exactly
+`name`, `action`, and `reason`; parameter values are never included.
+
+For a normal `top_n` to `top_k` rename, the relevant keys are:
+
+```json
+{
+  "provider_parameter_adaptations": [
+    {
+      "name": "top_n",
+      "action": "renamed",
+      "reason": "provider_rename"
+    }
+  ],
+  "provider_parameter_adaptations_truncated_count": 0
+}
+```
+
+For an unsupported parameter dropped with `drop_params=True`, the corresponding
+value-free record is:
+
+```json
+{
+  "provider_parameter_adaptations": [
+    {
+      "name": "rank_fields",
+      "action": "dropped",
+      "reason": "unsupported_param"
+    }
+  ],
+  "provider_parameter_adaptations_truncated_count": 0
+}
+```
+
+### `return_documents`
+
+`return_documents` controls local LiteLLM response shaping and is never sent
+to NVIDIA NIM. It defaults to including returned document text. Set it to
+`False` to return indexes and relevance scores without document text:
 
 ```python
 response = litellm.rerank(
@@ -283,9 +412,21 @@ response = litellm.rerank(
     query="GPU performance",
     documents=["High performance computing", "Fast GPU processing"],
     top_n=2,
-    truncate="END",  # Nvidia-specific parameter
+    truncate="END",
+    return_documents=False,
 )
 ```
+
+## Model-driven endpoint and body metadata
+
+For typed catalog models with rerank metadata, LiteLLM uses `endpoint_path` to
+select the provider URL and `body_model` for the JSON `model` field. This
+supports shared endpoints such as `/v1/retrieval/nvidia/reranking`, where the
+model is selected by the body rather than embedded in the URL.
+
+Only models without rerank metadata use generic model-in-path derivation for
+the retrieval family. The `nvidia_nim/` and optional `ranking/` prefixes are
+LiteLLM routing syntax and are not sent as part of the provider model name.
 
 ## Authentication
 
@@ -319,15 +460,23 @@ response = litellm.rerank(
 
 ## Custom API Base URL
 
-You can override the default base URL in several ways:
+LiteLLM resolves the NVIDIA NIM rerank API base in this order:
 
-**Option 1: Environment Variable**
+1. `api_base` passed in the request or proxy model configuration
+2. `NVIDIA_NIM_RERANK_API_BASE`
+3. `NVIDIA_NIM_API_BASE`, unless it points to `integrate.api.nvidia.com`
+4. `https://ai.api.nvidia.com`
+
+The `integrate.api.nvidia.com` base is for other NVIDIA NIM endpoint families,
+so LiteLLM ignores it as a rerank fallback and uses the hosted rerank base.
+
+**Option 1: Dedicated rerank environment variable**
 
 ```bash
-export NVIDIA_NIM_API_BASE="https://your-custom-endpoint.com"
+export NVIDIA_NIM_RERANK_API_BASE="https://your-custom-endpoint.com"
 ```
 
-**Option 2: Pass as parameter**
+**Option 2: Pass `api_base` directly**
 
 ```python
 response = litellm.rerank(
@@ -338,9 +487,20 @@ response = litellm.rerank(
 )
 ```
 
-**Option 3: Full URL (including model path)**
+**Option 3: Shared NVIDIA NIM environment fallback**
 
-If you have the complete endpoint URL, you can pass it directly:
+```bash
+export NVIDIA_NIM_API_BASE="https://your-custom-endpoint.com"
+```
+
+Use this only when the same base is appropriate for rerank traffic. Prefer
+`NVIDIA_NIM_RERANK_API_BASE` when rerank and other NVIDIA NIM APIs use different
+hosts.
+
+**Option 4: Full retrieval endpoint URL**
+
+If `api_base` already contains a `/retrieval/` endpoint path, LiteLLM uses the
+URL as-is:
 
 ```python
 response = litellm.rerank(
