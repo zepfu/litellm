@@ -27838,6 +27838,26 @@
         "litellm_provider": "nvidia_nim",
         "mode": "rerank",
         "output_cost_per_token": 0.0,
+        "provider_specific_entry": {
+            "rerank": {
+                "body_model": "nv-rerank-qa-mistral-4b:1",
+                "endpoint_path": "/v1/retrieval/nvidia/reranking"
+            }
+        },
+        "source": "https://build.nvidia.com/nvidia/rerank-qa-mistral-4b"
+    },
+    "nvidia_nim/nv-rerank-qa-mistral-4b:1": {
+        "input_cost_per_query": 0.0,
+        "input_cost_per_token": 0.0,
+        "litellm_provider": "nvidia_nim",
+        "mode": "rerank",
+        "output_cost_per_token": 0.0,
+        "provider_specific_entry": {
+            "rerank": {
+                "body_model": "nv-rerank-qa-mistral-4b:1",
+                "endpoint_path": "/v1/retrieval/nvidia/reranking"
+            }
+        },
         "source": "https://build.nvidia.com/nvidia/rerank-qa-mistral-4b"
     },
     "nvidia_nim/nvidia/nv-rerankqa-mistral-4b-v3": {
@@ -27845,21 +27865,39 @@
         "input_cost_per_token": 0.0,
         "litellm_provider": "nvidia_nim",
         "mode": "rerank",
-        "output_cost_per_token": 0.0
+        "output_cost_per_token": 0.0,
+        "provider_specific_entry": {
+            "rerank": {
+                "body_model": "nvidia/nv-rerankqa-mistral-4b-v3",
+                "endpoint_path": "/v1/retrieval/nvidia/reranking"
+            }
+        }
     },
     "nvidia_nim/nvidia/llama-3_2-nv-rerankqa-1b-v2": {
         "input_cost_per_query": 0.0,
         "input_cost_per_token": 0.0,
         "litellm_provider": "nvidia_nim",
         "mode": "rerank",
-        "output_cost_per_token": 0.0
+        "output_cost_per_token": 0.0,
+        "provider_specific_entry": {
+            "rerank": {
+                "body_model": "nvidia/llama-3.2-nv-rerankqa-1b-v2",
+                "endpoint_path": "/v1/retrieval/nvidia/llama-3_2-nv-rerankqa-1b-v2/reranking"
+            }
+        }
     },
     "nvidia_nim/ranking/nvidia/llama-3.2-nv-rerankqa-1b-v2": {
         "input_cost_per_query": 0.0,
         "input_cost_per_token": 0.0,
         "litellm_provider": "nvidia_nim",
         "mode": "rerank",
-        "output_cost_per_token": 0.0
+        "output_cost_per_token": 0.0,
+        "provider_specific_entry": {
+            "rerank": {
+                "body_model": "nvidia/llama-3.2-nv-rerankqa-1b-v2",
+                "endpoint_path": "/v1/ranking"
+            }
+        }
     },
     "nvidia_nim/deepseek-ai/deepseek-v3.1-terminus": {
         "input_cost_per_token": 2e-07,

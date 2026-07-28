@@ -77,10 +77,11 @@ class TestAdaptationCollector:
             c.add("p", "dropped", "because_i_said_so")
 
     def test_should_expose_typed_literal_sets(self):
-        assert VALID_ACTIONS == ("dropped", "rejected")
+        assert VALID_ACTIONS == ("dropped", "rejected", "renamed")
         assert "unsupported_param" in VALID_REASONS
         assert "extra_body_policy" in VALID_REASONS
         assert "invalid_type" in VALID_REASONS
+        assert "provider_rename" in VALID_REASONS
         assert "non_string_key" not in VALID_REASONS
 
 

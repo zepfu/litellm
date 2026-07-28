@@ -133,6 +133,7 @@ class ProviderSpecificModelInfo(TypedDict, total=False):
     supports_audio_output: Optional[bool]
     supports_pdf_input: Optional[bool]
     supports_native_streaming: Optional[bool]
+    supports_max_completion_tokens: Optional[bool]
     supports_parallel_function_calling: Optional[bool]
     supports_web_search: Optional[bool]
     supports_reasoning: Optional[bool]
@@ -144,6 +145,16 @@ class ProviderSpecificModelInfo(TypedDict, total=False):
     supports_xhigh_reasoning_effort: Optional[bool]
     supports_max_reasoning_effort: Optional[bool]
     default_reasoning_effort: Optional[str]
+
+
+class NvidiaNimRerankMetadata(TypedDict):
+    endpoint_path: str
+    body_model: str
+
+
+class NvidiaNimModelMetadata(TypedDict, total=False):
+    supports_max_completion_tokens: Optional[bool]
+    rerank: NvidiaNimRerankMetadata
 
 
 class SearchContextCostPerQuery(TypedDict, total=False):
@@ -254,11 +265,12 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
             "chat",
             "audio_transcription",
             "responses",
+            "rerank",
         ]
     ]
     tpm: Optional[int]
     rpm: Optional[int]
-    provider_specific_entry: Optional[Dict[str, float]]
+    provider_specific_entry: Optional[Dict[str, Any]]
     uses_embed_content: Optional[bool]
     unsupported_hosted_tools: Optional[List[str]]
     custom_tool_function_adapters: Optional[List[str]]
@@ -270,6 +282,47 @@ class ModelInfo(ModelInfoBase, total=False):
     """
 
     supported_openai_params: Required[Optional[List[str]]]
+
+
+def get_nvidia_nim_model_metadata(model: str) -> NvidiaNimModelMetadata:
+    """Return normalized NVIDIA NIM metadata through ``get_model_info``."""
+    from litellm.utils import get_model_info
+
+    try:
+        model_info = get_model_info(
+            model=model,
+            custom_llm_provider="nvidia_nim",
+        )
+    except Exception:
+        return NvidiaNimModelMetadata()
+
+    if model_info.get("litellm_provider") != "nvidia_nim":
+        return NvidiaNimModelMetadata()
+
+    normalized = NvidiaNimModelMetadata()
+    supports_max_completion_tokens = model_info.get("supports_max_completion_tokens")
+
+    provider_specific_entry = model_info.get("provider_specific_entry")
+    if isinstance(provider_specific_entry, Mapping):
+        if supports_max_completion_tokens is None:
+            supports_max_completion_tokens = provider_specific_entry.get(
+                "supports_max_completion_tokens"
+            )
+
+        rerank_metadata = provider_specific_entry.get("rerank")
+        if isinstance(rerank_metadata, Mapping):
+            endpoint_path = rerank_metadata.get("endpoint_path")
+            body_model = rerank_metadata.get("body_model")
+            if isinstance(endpoint_path, str) and isinstance(body_model, str):
+                normalized["rerank"] = NvidiaNimRerankMetadata(
+                    endpoint_path=endpoint_path,
+                    body_model=body_model,
+                )
+
+    if isinstance(supports_max_completion_tokens, bool):
+        normalized["supports_max_completion_tokens"] = supports_max_completion_tokens
+
+    return normalized
 
 
 class GenericStreamingChunk(TypedDict, total=False):

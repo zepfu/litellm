@@ -84,17 +84,95 @@ import litellm
 import os
 
 response = litellm.embedding(
-    model="nvidia_nim/nvidia/nv-embedqa-e5-v5",               # add `nvidia_nim/` prefix to model so litellm knows to route to Nvidia NIM
+    model="nvidia_nim/nvidia/nv-embedqa-e5-v5",
     input=["good morning from litellm"],
-    encoding_format = "float", 
-    user_id = "user-1234",
+    encoding_format="float",
+    user="user-1234",
 
     # Nvidia NIM Specific Parameters
-    input_type = "passage", # Optional
-    truncate = "NONE" # Optional
+    input_type="passage",
+    truncate="NONE",
 )
 print(response)
 ```
+
+### Embedding parameters
+
+NVIDIA NIM embeddings support these OpenAI-compatible top-level fields:
+
+| Field | Request location |
+|---|---|
+| `dimensions` | Top level |
+| `encoding_format` | Top level |
+| `user` | Top level |
+
+These NVIDIA-specific fields are sent in the provider request body:
+
+| Field | Request location |
+|---|---|
+| `input_type` | `extra_body` |
+| `truncate` | `extra_body` |
+| `modality` | `extra_body` |
+| `embedding_type` | `extra_body` |
+
+`None` values are omitted. LiteLLM also omits the health-check-only
+`max_tokens` field from NVIDIA embedding requests.
+
+NVIDIA embedding parameter handling is strict by default. Unsupported
+top-level fields, reserved/internal fields, and unsupported `extra_body` keys
+raise `UnsupportedParamsError`; the error reports parameter names only and
+does not include parameter values.
+
+Set `drop_params=True` on a request, set `litellm.drop_params = True`, or enable
+`drop_params: true` in proxy settings to drop unsupported fields instead:
+
+```python
+response = litellm.embedding(
+    model="nvidia_nim/nvidia/nv-embedqa-e5-v5",
+    input=["good morning from litellm"],
+    input_type="query",
+    drop_params=True,
+    unsupported_field="not sent to NVIDIA",
+)
+```
+
+When fields are dropped or rejected, LiteLLM records bounded, value-free
+details in internal request metadata:
+
+```json
+{
+  "provider_parameter_adaptations": [
+    {
+      "name": "unsupported_field",
+      "action": "dropped",
+      "reason": "unsupported_param"
+    }
+  ],
+  "provider_parameter_adaptations_truncated_count": 0
+}
+```
+
+Adaptation records contain parameter names, actions, and reasons only. They do
+not contain parameter values and are not sent in NVIDIA request bodies or
+OpenAI SDK kwargs. Strict rejections write `rejected` records to canonical
+logging metadata before `UnsupportedParamsError` is raised; the provider is not
+called.
+
+`provider_parameter_adaptations` and
+`provider_parameter_adaptations_truncated_count` are reserved metadata keys.
+LiteLLM removes caller-supplied values for both keys from `metadata` and proxy
+`litellm_metadata` before canonical logging metadata is assembled. Unrelated
+metadata is preserved, and genuine LiteLLM adaptation records cannot be
+overridden by caller metadata.
+
+### Explicit `extra_body`
+
+An explicit `extra_body` must be a dictionary and may contain only
+`input_type`, `truncate`, `modality`, and `embedding_type`. Do not repeat a
+field in both the top-level call and `extra_body`; collisions are rejected in
+strict mode and the top-level value wins in drop mode. Reserved fields such as
+`api_key`, `api_base`, `model`, `input`, `timeout`, and `extra_headers` are
+never accepted inside `extra_body`.
 
 
 ## **Usage - LiteLLM Proxy Server**

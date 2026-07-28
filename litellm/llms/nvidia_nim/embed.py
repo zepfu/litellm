@@ -239,6 +239,15 @@ class NvidiaNimEmbeddingConfig:
         # Phase 2: Decide (raise or record).
         deduped_sorted = sorted(set(violation_names))
         if deduped_sorted:
+            self._record_violations(
+                deduped_sorted,
+                extra_body_violations,
+                explicit_extra_body,
+                preexisting_is_dict,
+                preexisting_eb,
+                adaptation_collector,
+                strict=strict,
+            )
             if strict:
                 raise UnsupportedParamsError(
                     message=_bounded_names_message(
@@ -248,14 +257,6 @@ class NvidiaNimEmbeddingConfig:
                     model="",
                     llm_provider="nvidia_nim",
                 )
-            self._record_violations(
-                deduped_sorted,
-                extra_body_violations,
-                explicit_extra_body,
-                preexisting_is_dict,
-                preexisting_eb,
-                adaptation_collector,
-            )
 
         # Phase 3: Mutate (only reached if no strict error).
         for key in preexisting_bad_keys:
@@ -325,6 +326,8 @@ class NvidiaNimEmbeddingConfig:
         preexisting_is_dict: bool,
         preexisting_eb: Any,
         adaptation_collector: Optional[AdaptationCollector],
+        *,
+        strict: bool,
     ) -> None:
         """Record violations in the collector with appropriate reasons."""
         if adaptation_collector is None:
@@ -339,6 +342,10 @@ class NvidiaNimEmbeddingConfig:
             elif name in extra_body_set:
                 adaptation_collector.add(
                     name, action="rejected", reason="extra_body_policy"
+                )
+            elif strict:
+                adaptation_collector.add(
+                    name, action="rejected", reason="unsupported_param"
                 )
             else:
                 adaptation_collector.add(

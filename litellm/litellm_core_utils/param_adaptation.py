@@ -9,7 +9,7 @@ bodies or global/class state.
 """
 
 from dataclasses import dataclass
-from typing import List, Literal, Sequence, Tuple
+from typing import Dict, List, Literal, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -17,20 +17,27 @@ from typing import List, Literal, Sequence, Tuple
 
 MAX_RECORDS: int = 32
 MAX_PARAM_NAME_LENGTH: int = 64
+PROVIDER_PARAMETER_ADAPTATIONS_METADATA_KEY = "provider_parameter_adaptations"
+PROVIDER_PARAMETER_ADAPTATIONS_TRUNCATED_COUNT_METADATA_KEY = (
+    "provider_parameter_adaptations_truncated_count"
+)
 
 # ---------------------------------------------------------------------------
 # Typed literals
 # ---------------------------------------------------------------------------
 
-AdaptationAction = Literal["dropped", "rejected"]
-AdaptationReason = Literal["unsupported_param", "extra_body_policy", "invalid_type"]
+AdaptationAction = Literal["dropped", "rejected", "renamed"]
+AdaptationReason = Literal[
+    "unsupported_param", "extra_body_policy", "invalid_type", "provider_rename"
+]
 
 # Runtime-validation tuples (mirror the Literal aliases).
-VALID_ACTIONS: Tuple[str, ...] = ("dropped", "rejected")
+VALID_ACTIONS: Tuple[str, ...] = ("dropped", "rejected", "renamed")
 VALID_REASONS: Tuple[str, ...] = (
     "unsupported_param",
     "extra_body_policy",
     "invalid_type",
+    "provider_rename",
 )
 
 
@@ -162,6 +169,24 @@ class AdaptationCollector:
     def truncated_count(self) -> int:
         """Number of events dropped due to the record cap."""
         return self._truncated_count
+
+    def to_metadata(self) -> dict:
+        """Serialize records as deterministic, value-free request metadata."""
+        records: List[Dict[str, str]] = [
+            {
+                "name": record.name,
+                "action": record.action,
+                "reason": record.reason,
+            }
+            for record in sorted(
+                self._records,
+                key=lambda record: (record.name, record.action, record.reason),
+            )
+        ]
+        return {
+            PROVIDER_PARAMETER_ADAPTATIONS_METADATA_KEY: records,
+            PROVIDER_PARAMETER_ADAPTATIONS_TRUNCATED_COUNT_METADATA_KEY: self._truncated_count,
+        }
 
     def __len__(self) -> int:
         return len(self._records)

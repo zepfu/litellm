@@ -163,7 +163,9 @@ curl -X POST 'http://0.0.0.0:4000/v1/embeddings' \
 
 :::info
 
-Any non-openai params, will be treated as provider-specific params, and sent in the request body as kwargs to the provider.
+Provider-specific parameters are mapped according to each provider's request
+policy. Providers with an explicit policy, such as NVIDIA NIM, do not forward
+arbitrary keyword arguments.
 
 [**See Reserved Params**](https://github.com/BerriAI/litellm/blob/2f5f85cb52f36448d1f8bbfbd3b8af8167d0c4c8/litellm/main.py#L3130)
 
@@ -196,6 +198,30 @@ input=["good morning from litellm"]
 - `api_key`: *string (optional)* - The API key to authenticate and authorize requests. If not provided, the default API key is used.
 
 - `api_type`: *string (optional)* - The type of API to use.
+
+### NVIDIA NIM embedding parameters
+
+For `nvidia_nim/<model>` embedding requests, LiteLLM preserves `dimensions`,
+`encoding_format`, and `user` as top-level OpenAI fields. It maps
+`input_type`, `truncate`, `modality`, and `embedding_type` into the NVIDIA
+provider body.
+
+NVIDIA embedding requests are strict by default. Unsupported fields raise a
+names-only `UnsupportedParamsError`. Set request-local `drop_params=True`, the
+global `litellm.drop_params = True`, or proxy `drop_params: true` to drop them.
+Dropped and rejected fields are recorded without values under
+`provider_parameter_adaptations`, with overflow reported under
+`provider_parameter_adaptations_truncated_count`.
+Strict failures persist `rejected` records in canonical logging metadata before
+raising and do not call the provider. Both keys are reserved: caller values
+under either key are removed from `metadata` and proxy `litellm_metadata`,
+while unrelated metadata is preserved.
+
+An explicit `extra_body` must be a dictionary containing only
+`input_type`, `truncate`, `modality`, or `embedding_type`. Reserved/internal
+fields and collisions with fields already supplied at the top level are not
+forwarded. `None` values and the health-check-only `max_tokens` field are
+omitted.
 
 ### Output from `litellm.embedding()`
 
@@ -706,4 +732,3 @@ All supported models can be found here: https://studio.nebius.ai/models/embeddin
 | BAAI/bge-en-icl | `embedding(model="nebius/BAAI/bge-en-icl", input)`              | 
 | BAAI/bge-multilingual-gemma2 | `embedding(model="nebius/BAAI/bge-multilingual-gemma2", input)` | 
 | intfloat/e5-mistral-7b-instruct | `embedding(model="nebius/intfloat/e5-mistral-7b-instruct", input)`      | 
-

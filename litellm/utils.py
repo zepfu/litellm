@@ -71,6 +71,11 @@ from litellm.constants import (
     OPENAI_EMBEDDING_PARAMS,
     TOOL_CHOICE_OBJECT_TOKEN_COUNT,
 )
+from litellm.litellm_core_utils.param_adaptation import (
+    PROVIDER_PARAMETER_ADAPTATIONS_METADATA_KEY,
+    PROVIDER_PARAMETER_ADAPTATIONS_TRUNCATED_COUNT_METADATA_KEY,
+    AdaptationCollector,
+)
 
 _CachingHandlerResponse = None
 _LLMCachingHandler = None
@@ -244,6 +249,14 @@ from typing import (
 )
 
 from openai import OpenAIError as OriginalError
+
+_PROVIDER_PARAMETER_ADAPTATION_METADATA_KEYS = (
+    PROVIDER_PARAMETER_ADAPTATIONS_METADATA_KEY,
+    PROVIDER_PARAMETER_ADAPTATIONS_TRUNCATED_COUNT_METADATA_KEY,
+)
+_PROVIDER_PARAMETER_ADAPTATION_METADATA: contextvars.ContextVar[
+    Optional[Tuple[Dict[str, Any], ...]]
+] = contextvars.ContextVar("provider_parameter_adaptation_metadata", default=None)
 
 # These are lazy loaded via __getattr__
 from litellm.llms.base_llm.base_utils import (
@@ -1432,6 +1445,12 @@ def client(original_function):  # noqa: PLR0915
         # Check if this is an async function. If so only execute the async function
         call_type = original_function.__name__
         if _is_async_request(kwargs):
+            model = args[0] if len(args) > 0 else kwargs.get("model", None)
+            _prepare_provider_parameter_adaptation_request_metadata(
+                call_type=call_type,
+                model=model,
+                kwargs=kwargs,
+            )
             # [OPTIONAL] CHECK MAX RETRIES / REQUEST
             if litellm.num_retries_per_request is not None:
                 # check if previous_models passed in as ['litellm_params']['metadata]['previous_models']
@@ -1463,6 +1482,12 @@ def client(original_function):  # noqa: PLR0915
 
             return result
 
+        model: Optional[str] = args[0] if len(args) > 0 else kwargs.get("model", None)
+        _prepare_provider_parameter_adaptation_request_metadata(
+            call_type=call_type,
+            model=model,
+            kwargs=kwargs,
+        )
         # Prints Exactly what was passed to litellm function - don't execute any logic here - it should just print
         print_args_passed_to_litellm(original_function, args, kwargs)
         start_time = datetime.datetime.now()
@@ -1474,8 +1499,6 @@ def client(original_function):  # noqa: PLR0915
         # only set litellm_call_id if its not in kwargs
         if "litellm_call_id" not in kwargs:
             kwargs["litellm_call_id"] = str(uuid.uuid4())
-
-        model: Optional[str] = args[0] if len(args) > 0 else kwargs.get("model", None)
 
         try:
             if logging_obj is None:
@@ -1597,7 +1620,20 @@ def client(original_function):  # noqa: PLR0915
                 except Exception as e:
                     print_verbose(f"Error while checking max token limit: {str(e)}")
             # MODEL CALL
-            result = original_function(*args, **kwargs)
+            parameter_adaptation_token = (
+                _set_provider_parameter_adaptation_request_context(
+                    call_type=call_type,
+                    model=model,
+                    kwargs=kwargs,
+                    logging_obj=logging_obj,
+                )
+            )
+            try:
+                result = original_function(*args, **kwargs)
+            finally:
+                _reset_provider_parameter_adaptation_request_context(
+                    parameter_adaptation_token
+                )
             end_time = datetime.datetime.now()
             if _is_streaming_request(
                 kwargs=kwargs,
@@ -1780,6 +1816,13 @@ def client(original_function):  # noqa: PLR0915
 
     @wraps(original_function)
     async def wrapper_async(*args, **kwargs):  # noqa: PLR0915
+        call_type = original_function.__name__
+        model: Optional[str] = args[0] if len(args) > 0 else kwargs.get("model", None)
+        _prepare_provider_parameter_adaptation_request_metadata(
+            call_type=call_type,
+            model=model,
+            kwargs=kwargs,
+        )
         print_args_passed_to_litellm(original_function, args, kwargs)
         start_time = datetime.datetime.now()
         result = None
@@ -1796,11 +1839,9 @@ def client(original_function):  # noqa: PLR0915
             start_time=start_time,
         )
         # only set litellm_call_id if its not in kwargs
-        call_type = original_function.__name__
         if "litellm_call_id" not in kwargs:
             kwargs["litellm_call_id"] = str(uuid.uuid4())
 
-        model: Optional[str] = args[0] if len(args) > 0 else kwargs.get("model", None)
         is_completion_with_fallbacks = kwargs.get("fallbacks") is not None
 
         try:
@@ -1893,7 +1934,20 @@ def client(original_function):  # noqa: PLR0915
                     print_verbose(f"Error while checking max token limit: {str(e)}")
 
             # MODEL CALL
-            result = await original_function(*args, **kwargs)
+            parameter_adaptation_token = (
+                _set_provider_parameter_adaptation_request_context(
+                    call_type=call_type,
+                    model=model,
+                    kwargs=kwargs,
+                    logging_obj=logging_obj,
+                )
+            )
+            try:
+                result = await original_function(*args, **kwargs)
+            finally:
+                _reset_provider_parameter_adaptation_request_context(
+                    parameter_adaptation_token
+                )
             end_time = datetime.datetime.now()
 
             if _is_streaming_request(
@@ -2115,6 +2169,113 @@ def _is_async_request(
     ):
         return True
     return False
+
+
+def _is_provider_parameter_adaptation_request(
+    call_type: str,
+    model: Optional[str],
+    kwargs: Dict[str, Any],
+) -> bool:
+    if call_type not in (CallTypes.embedding.value, CallTypes.aembedding.value):
+        return False
+    return kwargs.get("custom_llm_provider") == "nvidia_nim" or (
+        isinstance(model, str) and model.startswith("nvidia_nim/")
+    )
+
+
+def _scrub_provider_parameter_adaptation_metadata(metadata: Any) -> None:
+    if not isinstance(metadata, dict):
+        return
+    for key in _PROVIDER_PARAMETER_ADAPTATION_METADATA_KEYS:
+        metadata.pop(key, None)
+
+
+def _prepare_provider_parameter_adaptation_request_metadata(
+    call_type: str,
+    model: Optional[str],
+    kwargs: Dict[str, Any],
+) -> None:
+    """Scrub caller-controlled adaptation fields before logging merges metadata."""
+    if not _is_provider_parameter_adaptation_request(
+        call_type=call_type,
+        model=model,
+        kwargs=kwargs,
+    ):
+        return
+
+    _scrub_provider_parameter_adaptation_metadata(kwargs.get("metadata"))
+    _scrub_provider_parameter_adaptation_metadata(kwargs.get("litellm_metadata"))
+    if kwargs.get("metadata") is None:
+        kwargs["metadata"] = {}
+
+
+def _set_provider_parameter_adaptation_request_context(
+    call_type: str,
+    model: Optional[str],
+    kwargs: Dict[str, Any],
+    logging_obj: Optional[LiteLLMLoggingObject],
+) -> Optional[contextvars.Token]:
+    """Expose request and canonical logging metadata to provider param mapping."""
+    if _PROVIDER_PARAMETER_ADAPTATION_METADATA.get() is not None:
+        return None
+    if not _is_provider_parameter_adaptation_request(
+        call_type=call_type,
+        model=model,
+        kwargs=kwargs,
+    ):
+        return None
+
+    _prepare_provider_parameter_adaptation_request_metadata(
+        call_type=call_type,
+        model=model,
+        kwargs=kwargs,
+    )
+    metadata_targets: List[Dict[str, Any]] = []
+    request_metadata = kwargs.get("metadata")
+    if isinstance(request_metadata, dict):
+        metadata_targets.append(request_metadata)
+
+    if logging_obj is not None:
+        logging_obj.update_from_kwargs(
+            kwargs=kwargs,
+            optional_params=getattr(logging_obj, "optional_params", {}),
+        )
+        logging_params = logging_obj.model_call_details.get("litellm_params")
+        if isinstance(logging_params, dict):
+            _scrub_provider_parameter_adaptation_metadata(
+                logging_params.get("metadata")
+            )
+            _scrub_provider_parameter_adaptation_metadata(
+                logging_params.get("litellm_metadata")
+            )
+            logging_metadata = logging_params.get("metadata")
+            if not isinstance(logging_metadata, dict):
+                logging_metadata = {}
+                logging_params["metadata"] = logging_metadata
+            if all(logging_metadata is not target for target in metadata_targets):
+                metadata_targets.append(logging_metadata)
+
+    if not metadata_targets:
+        return None
+    return _PROVIDER_PARAMETER_ADAPTATION_METADATA.set(tuple(metadata_targets))
+
+
+def _reset_provider_parameter_adaptation_request_context(
+    token: Optional[contextvars.Token],
+) -> None:
+    if token is not None:
+        _PROVIDER_PARAMETER_ADAPTATION_METADATA.reset(token)
+
+
+def _persist_provider_parameter_adaptations(
+    collector: AdaptationCollector,
+) -> None:
+    if len(collector) == 0 and collector.truncated_count == 0:
+        return
+    metadata_targets = _PROVIDER_PARAMETER_ADAPTATION_METADATA.get()
+    if metadata_targets is not None:
+        for metadata in metadata_targets:
+            metadata.update(collector.to_metadata())
 
 
 _STREAMING_CALL_TYPES = frozenset(
@@ -3370,15 +3531,31 @@ def get_optional_params_embeddings(  # noqa: PLR0915
         )
 
     elif custom_llm_provider == "nvidia_nim":
-        supported_params = get_supported_openai_params(
-            model=model or "",
-            custom_llm_provider="nvidia_nim",
-            request_type="embeddings",
-        )
-        _check_valid_arg(supported_params=supported_params)
-        optional_params = litellm.nvidiaNimEmbeddingConfig.map_openai_params(
-            non_default_params=non_default_params, optional_params={}, kwargs=kwargs
-        )
+        effective_drop_params = litellm.drop_params is True or drop_params is True
+        adaptation_collector = AdaptationCollector()
+        nvidia_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if not _should_drop_param(
+                k=key,
+                additional_drop_params=additional_drop_params,
+            )
+        }
+        try:
+            optional_params = litellm.nvidiaNimEmbeddingConfig.map_openai_params(
+                non_default_params=non_default_params,
+                optional_params={},
+                kwargs=nvidia_kwargs,
+                strict=not effective_drop_params,
+                adaptation_collector=adaptation_collector,
+            )
+        except UnsupportedParamsError:
+            _persist_provider_parameter_adaptations(adaptation_collector)
+            raise
+        _persist_provider_parameter_adaptations(adaptation_collector)
+        if not optional_params.get("extra_body"):
+            optional_params.pop("extra_body", None)
+        return optional_params
     elif custom_llm_provider == "vertex_ai" or custom_llm_provider == "gemini":
         supported_params = get_supported_openai_params(
             model=model,
@@ -5816,6 +5993,9 @@ def _get_model_info_helper(  # noqa: PLR0915
                 supports_pdf_input=_model_info.get("supports_pdf_input", None),
                 supports_embedding_image_input=_model_info.get("supports_embedding_image_input", None),
                 supports_native_streaming=_model_info.get("supports_native_streaming", None),
+                supports_max_completion_tokens=_model_info.get(
+                    "supports_max_completion_tokens", None
+                ),
                 supports_web_search=_model_info.get("supports_web_search", None),
                 supports_url_context=_model_info.get("supports_url_context", None),
                 supports_reasoning=_model_info.get("supports_reasoning", None),
