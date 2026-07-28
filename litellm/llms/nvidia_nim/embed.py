@@ -8,8 +8,18 @@ This file only contains param mapping logic
 API calling is done using the OpenAI SDK with an api_base
 """
 
-import types
 from typing import Optional
+
+
+class _NvidiaNimEmbeddingGetConfig:
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self._get_default_config
+        return instance._get_instance_config
+
+    @staticmethod
+    def _get_default_config():
+        return {}
 
 
 class NvidiaNimEmbeddingConfig:
@@ -17,13 +27,7 @@ class NvidiaNimEmbeddingConfig:
     Reference: https://docs.api.nvidia.com/nim/reference/nvidia-nv-embedqa-e5-v5-infer
     """
 
-    # OpenAI params
-    encoding_format: Optional[str] = None
-    user: Optional[str] = None
-
-    # Nvidia NIM params
-    input_type: Optional[str] = None
-    truncate: Optional[str] = None
+    get_config = _NvidiaNimEmbeddingGetConfig()
 
     def __init__(
         self,
@@ -32,28 +36,13 @@ class NvidiaNimEmbeddingConfig:
         input_type: Optional[str] = None,
         truncate: Optional[str] = None,
     ) -> None:
-        locals_ = locals().copy()
-        for key, value in locals_.items():
-            if key != "self" and value is not None:
-                setattr(self.__class__, key, value)
+        self.encoding_format = encoding_format
+        self.user = user
+        self.input_type = input_type
+        self.truncate = truncate
 
-    @classmethod
-    def get_config(cls):
-        return {
-            k: v
-            for k, v in cls.__dict__.items()
-            if not k.startswith("__")
-            and not isinstance(
-                v,
-                (
-                    types.FunctionType,
-                    types.BuiltinFunctionType,
-                    classmethod,
-                    staticmethod,
-                ),
-            )
-            and v is not None
-        }
+    def _get_instance_config(self):
+        return {k: v for k, v in self.__dict__.items() if not k.startswith("_") and v is not None}
 
     def get_supported_openai_params(
         self,

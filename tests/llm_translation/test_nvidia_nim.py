@@ -18,6 +18,7 @@ import litellm
 from litellm import Choices, Message, ModelResponse, EmbeddingResponse, Usage
 from litellm import completion
 from base_rerank_unit_tests import BaseLLMRerankTest
+from litellm.llms.nvidia_nim.embed import NvidiaNimEmbeddingConfig
 import litellm
 
 
@@ -357,3 +358,150 @@ class TestNvidiaNim(BaseLLMRerankTest):
     def get_expected_cost(self) -> float:
         """Nvidia NIM rerank models are free (cost = 0.0)"""
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# D1-541: NvidiaNimEmbeddingConfig instance-local state isolation tests
+# ---------------------------------------------------------------------------
+
+
+class TestNvidiaNimEmbeddingConfigIsolation:
+    """Prove constructor state is instance-local, not class-level."""
+
+    def test_two_conflicting_instances_remain_isolated(self):
+        a = NvidiaNimEmbeddingConfig(input_type="passage", truncate="END")
+        b = NvidiaNimEmbeddingConfig(input_type="query", truncate="NONE")
+        assert a.get_config() == {"input_type": "passage", "truncate": "END"}
+        assert b.get_config() == {"input_type": "query", "truncate": "NONE"}
+
+    def test_default_after_configured_has_no_stale_values(self):
+        _configured = NvidiaNimEmbeddingConfig(encoding_format="float", user="u1", input_type="passage", truncate="END")
+        default = NvidiaNimEmbeddingConfig()
+        assert default.get_config() == {}
+
+    def test_concurrent_construction_no_cross_instance_mutation(self):
+        import concurrent.futures
+
+        def make(idx: int):
+            return NvidiaNimEmbeddingConfig(input_type=f"type_{idx}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            instances = list(pool.map(make, range(64)))
+
+        for idx, inst in enumerate(instances):
+            assert inst.get_config() == {"input_type": f"type_{idx}"}
+
+    def test_repeated_get_config_calls_are_stable(self):
+        cfg = NvidiaNimEmbeddingConfig(input_type="passage", truncate="END")
+        first = cfg.get_config()
+        for _ in range(5):
+            assert cfg.get_config() == first
+
+    def test_config_names_are_instance_only_and_defaults_are_none(self):
+        config_names = {"encoding_format", "user", "input_type", "truncate"}
+        assert config_names.isdisjoint(vars(NvidiaNimEmbeddingConfig))
+
+        default = NvidiaNimEmbeddingConfig()
+        assert vars(default) == {
+            "encoding_format": None,
+            "user": None,
+            "input_type": None,
+            "truncate": None,
+        }
+
+    def test_class_get_config_call_remains_compatible(self):
+        configured = NvidiaNimEmbeddingConfig(input_type="passage", truncate="END")
+
+        assert NvidiaNimEmbeddingConfig.get_config() == {}
+        assert configured.get_config() == {
+            "input_type": "passage",
+            "truncate": "END",
+        }
+
+
+class TestNvidiaNimEmbeddingConfigMapping:
+    """Existing mapping behavior remains intact after instance-local refactor."""
+
+    def test_map_openai_params_routes_input_type_and_truncate_to_extra_body(self):
+        cfg = NvidiaNimEmbeddingConfig()
+        result = cfg.map_openai_params(
+            non_default_params={"input_type": "passage", "truncate": "END"},
+            optional_params={},
+        )
+        assert result["extra_body"]["input_type"] == "passage"
+        assert result["extra_body"]["truncate"] == "END"
+
+    def test_map_openai_params_passes_dimensions_top_level(self):
+        cfg = NvidiaNimEmbeddingConfig()
+        result = cfg.map_openai_params(
+            non_default_params={"dimensions": 1024},
+            optional_params={},
+        )
+        assert result["dimensions"] == 1024
+        assert "dimensions" not in result.get("extra_body", {})
+
+    def test_map_openai_params_drops_max_tokens(self):
+        cfg = NvidiaNimEmbeddingConfig()
+        result = cfg.map_openai_params(
+            non_default_params={"max_tokens": 1, "input_type": "query"},
+            optional_params={},
+        )
+        assert "max_tokens" not in result
+        assert "max_tokens" not in result.get("extra_body", {})
+        assert result["extra_body"]["input_type"] == "query"
+
+    def test_map_openai_params_kwargs_forwarded_to_extra_body(self):
+        cfg = NvidiaNimEmbeddingConfig()
+        result = cfg.map_openai_params(
+            non_default_params={},
+            optional_params={},
+            kwargs={"custom_key": "custom_val", "max_tokens": 99},
+        )
+        assert result["extra_body"]["custom_key"] == "custom_val"
+        assert "max_tokens" not in result["extra_body"]
+
+    def test_get_supported_openai_params(self):
+        cfg = NvidiaNimEmbeddingConfig()
+        assert cfg.get_supported_openai_params() == [
+            "encoding_format",
+            "user",
+            "dimensions",
+        ]
+
+
+class TestNvidiaNimEmbeddingConfigSubclassDescriptor:
+    """Descriptor binding stays correct when the config is subclassed."""
+
+    def test_subclass_class_access_and_instance_isolation(self):
+        class Sub(NvidiaNimEmbeddingConfig):
+            pass
+
+        # Class-level access returns the empty default.
+        assert Sub.get_config() == {}
+
+        # Configured subclass instance exposes only its own state.
+        configured = Sub(input_type="passage", truncate="END")
+        assert configured.get_config() == {"input_type": "passage", "truncate": "END"}
+
+        # A fresh default instance (subclass and parent) has no stale state.
+        assert Sub().get_config() == {}
+        assert NvidiaNimEmbeddingConfig().get_config() == {}
+
+
+class TestNvidiaNimEmbeddingConfigLazySingleton:
+    """Public litellm.nvidiaNimEmbeddingConfig lazy lookup compatibility."""
+
+    def test_lazy_singleton_resolves_and_maps_params(self):
+        singleton = litellm.nvidiaNimEmbeddingConfig
+
+        # Resolves to a config instance with an empty default config.
+        assert isinstance(singleton, NvidiaNimEmbeddingConfig)
+        assert singleton.get_config() == {}
+
+        # Basic mapping compatibility is preserved through the public lookup.
+        result = singleton.map_openai_params(
+            non_default_params={"input_type": "passage", "truncate": "END"},
+            optional_params={},
+        )
+        assert result["extra_body"]["input_type"] == "passage"
+        assert result["extra_body"]["truncate"] == "END"
