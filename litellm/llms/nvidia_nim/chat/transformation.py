@@ -9,46 +9,38 @@ API calling is done using the OpenAI SDK with an api_base
 """
 from typing import Callable, Optional
 
-import litellm
 from litellm.exceptions import UnsupportedParamsError
 from litellm.litellm_core_utils.param_adaptation import AdaptationCollector
 from litellm.llms.openai.chat.gpt_transformation import OpenAIGPTConfig
-from litellm.utils import _get_potential_model_names, supports_reasoning
+from litellm.types.utils import get_nvidia_nim_model_metadata
+from litellm.utils import supports_reasoning
 
-# Catalog / typed-metadata follow-up (D1-556):
-# ``supports_max_completion_tokens`` is not yet part of the ``ModelInfoBase``
-# TypedDict returned by ``get_model_info`` / ``_get_model_info_helper``.
-# The resolver below reads the *raw* catalog entry as a bridge.  Once the
-# typed field is added to ``ModelInfoBase`` and the catalog JSON, this
-# resolver can be replaced by a direct ``get_model_info`` call.
+# Catalog follow-up (D1-556): populate ``supports_max_completion_tokens``
+# in nvidia_nim model entries in model_prices_and_context_window.json for
+# models whose NIM endpoint natively accepts ``max_completion_tokens``.
+# Until that metadata exists every model defaults to the conservative
+# ``max_tokens``-only policy, preserving the historical mapping.
 _METADATA_KEY_NATIVE_MCT = "supports_max_completion_tokens"
 
 _TOKEN_LIMIT_FIELDS = frozenset({"max_tokens", "max_completion_tokens"})
 
-# Injectable resolver signature: (model, provider) -> raw entry | None.
+# Injectable resolver signature: (model, provider) -> metadata dict | None.
 MetadataResolver = Callable[[str, str], Optional[dict]]
 
 
 def _default_metadata_resolver(model: str, provider: str) -> Optional[dict]:
-    """Resolve raw model metadata via normalized name lookup.
+    """Resolve NVIDIA NIM metadata via the typed normalized helper.
 
-    Uses ``_get_potential_model_names`` (the same normalization path used
-    by ``get_model_info``) so that provider-prefixed
-    (``nvidia_nim/vendor/model``) and unprefixed (``vendor/model``)
-    inputs resolve identically.
+    Delegates to ``get_nvidia_nim_model_metadata`` which internally uses
+    ``get_model_info`` with normalized name resolution, so provider-prefixed
+    (``nvidia_nim/vendor/model``) and unprefixed (``vendor/model``) inputs
+    resolve identically.
 
-    Returns the raw ``litellm.model_cost`` entry or ``None``.
+    Returns the ``NvidiaNimModelMetadata`` dict (a plain dict at runtime)
+    or ``None`` on unexpected failure.
     """
     try:
-        names = _get_potential_model_names(model=model, custom_llm_provider=provider)
-        for candidate in (
-            names["combined_model_name"],
-            names["combined_stripped_model_name"],
-        ):
-            entry = litellm.model_cost.get(candidate)
-            if entry is not None:
-                return entry
-        return None
+        return dict(get_nvidia_nim_model_metadata(model))
     except Exception:
         return None
 

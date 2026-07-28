@@ -34,10 +34,6 @@ def _mct_resolver(model: str, *, supported: bool):
     """
     table = {
         model: {
-            "input_cost_per_token": 0.0,
-            "litellm_provider": "nvidia_nim",
-            "mode": "chat",
-            "output_cost_per_token": 0.0,
             "supports_max_completion_tokens": supported,
         }
     }
@@ -46,6 +42,17 @@ def _mct_resolver(model: str, *, supported: bool):
         return table.get(m)
 
     return resolver
+
+
+def _synthetic_mct_entry(*, supported: bool) -> dict:
+    """Minimal model_cost entry exercising the typed helper path."""
+    return {
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "litellm_provider": "nvidia_nim",
+        "mode": "chat",
+        "supports_max_completion_tokens": supported,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -239,55 +246,110 @@ class TestTokenPolicyNativeMCT:
 
 
 # ---------------------------------------------------------------------------
-# Normalized metadata lookup: provider-prefixed and unprefixed
+# Typed helper integration: prefixed/unprefixed synthetic true/false/absent
 # ---------------------------------------------------------------------------
 
 
-class TestNormalizedMetadataLookup:
-    """Provider-prefixed and unprefixed model inputs resolve identically.
+class TestTypedHelperIntegration:
+    """Prove the default resolver uses get_nvidia_nim_model_metadata.
 
-    Uses the default normalized resolver against ``litellm.model_cost``
-    (monkeypatched dict entry, not class/global resolver mutation).
+    These tests exercise the real typed helper path by injecting synthetic
+    model_cost entries (monkeypatch auto-reverts).  No class/global resolver
+    mutation.
     """
 
-    def test_unprefixed_model_lookup(self, monkeypatch) -> None:
+    def test_unprefixed_synthetic_true(self, monkeypatch) -> None:
         monkeypatch.setitem(
             litellm.model_cost,
-            "nvidia_nim/vendor/mct-model",
-            {"supports_max_completion_tokens": True},
+            "nvidia_nim/vendor/synth-true",
+            _synthetic_mct_entry(supported=True),
         )
         config = NvidiaNimConfig()
-        assert config._provider_supports_max_completion_tokens("vendor/mct-model")
+        assert config._provider_supports_max_completion_tokens("vendor/synth-true")
 
-    def test_provider_prefixed_model_lookup(self, monkeypatch) -> None:
+    def test_prefixed_synthetic_true(self, monkeypatch) -> None:
         monkeypatch.setitem(
             litellm.model_cost,
-            "nvidia_nim/vendor/mct-model",
-            {"supports_max_completion_tokens": True},
+            "nvidia_nim/vendor/synth-true",
+            _synthetic_mct_entry(supported=True),
         )
         config = NvidiaNimConfig()
         assert config._provider_supports_max_completion_tokens(
-            "nvidia_nim/vendor/mct-model"
+            "nvidia_nim/vendor/synth-true"
         )
 
-    def test_prefixed_and_unprefixed_give_same_result(self, monkeypatch) -> None:
+    def test_unprefixed_synthetic_false(self, monkeypatch) -> None:
         monkeypatch.setitem(
             litellm.model_cost,
-            "nvidia_nim/vendor/mct-model",
-            {"supports_max_completion_tokens": True},
+            "nvidia_nim/vendor/synth-false",
+            _synthetic_mct_entry(supported=False),
         )
         config = NvidiaNimConfig()
-        unprefixed = config._provider_supports_max_completion_tokens("vendor/mct-model")
-        prefixed = config._provider_supports_max_completion_tokens(
-            "nvidia_nim/vendor/mct-model"
-        )
-        assert unprefixed == prefixed is True
+        assert not config._provider_supports_max_completion_tokens("vendor/synth-false")
 
-    def test_unknown_model_returns_false(self) -> None:
+    def test_prefixed_synthetic_false(self, monkeypatch) -> None:
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "nvidia_nim/vendor/synth-false",
+            _synthetic_mct_entry(supported=False),
+        )
+        config = NvidiaNimConfig()
+        assert not config._provider_supports_max_completion_tokens(
+            "nvidia_nim/vendor/synth-false"
+        )
+
+    def test_absent_model_returns_false(self) -> None:
         config = NvidiaNimConfig()
         assert not config._provider_supports_max_completion_tokens(
             "totally/nonexistent-model-xyz"
         )
+
+    def test_prefixed_and_unprefixed_identical(self, monkeypatch) -> None:
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "nvidia_nim/vendor/synth-true",
+            _synthetic_mct_entry(supported=True),
+        )
+        config = NvidiaNimConfig()
+        unprefixed = config._provider_supports_max_completion_tokens(
+            "vendor/synth-true"
+        )
+        prefixed = config._provider_supports_max_completion_tokens(
+            "nvidia_nim/vendor/synth-true"
+        )
+        assert unprefixed == prefixed is True
+
+    def test_synthetic_true_drives_native_alias_passthrough(self, monkeypatch) -> None:
+        """End-to-end: synthetic true metadata -> alias preserved natively."""
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "nvidia_nim/vendor/synth-true",
+            _synthetic_mct_entry(supported=True),
+        )
+        config = NvidiaNimConfig()
+        result = config.map_openai_params(
+            non_default_params={"max_completion_tokens": 7777},
+            optional_params={},
+            model="vendor/synth-true",
+            drop_params=False,
+        )
+        assert result == {"max_completion_tokens": 7777}
+
+    def test_synthetic_false_drives_conservative_mapping(self, monkeypatch) -> None:
+        """End-to-end: synthetic false metadata -> alias mapped to max_tokens."""
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "nvidia_nim/vendor/synth-false",
+            _synthetic_mct_entry(supported=False),
+        )
+        config = NvidiaNimConfig()
+        result = config.map_openai_params(
+            non_default_params={"max_completion_tokens": 7777},
+            optional_params={},
+            model="vendor/synth-false",
+            drop_params=False,
+        )
+        assert result == {"max_tokens": 7777}
 
 
 # ---------------------------------------------------------------------------
