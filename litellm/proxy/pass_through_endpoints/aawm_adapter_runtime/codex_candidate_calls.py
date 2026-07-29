@@ -141,6 +141,7 @@ _HOST_FUNCTION_NAMES = (
     "_handle_codex_alibaba_token_plan_adapter_route",
     # OpenCode
     "_handle_codex_opencode_zen_adapter_route",
+    "_consume_opencode_zen_tools_mode_header",
     # D1-574 OpenCode direct 429
     "_opencode_zen_direct_safe_retry_after",
     "_maybe_raise_opencode_zen_direct_rate_limit",
@@ -1063,6 +1064,52 @@ def _opencode_zen_direct_stream_terminal_error(exc: Exception) -> Optional[str]:
     )
 
 
+def _consume_opencode_zen_tools_mode_header(
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    use_alias_candidate_probe: bool,
+) -> dict[str, Any]:
+    """D1-574/MS-033: consume case-local unsupported-tools-mode header.
+
+    Direct mode only. Body litellm_metadata wins if already present.
+    """
+    if use_alias_candidate_probe:
+        return prepared_request_body
+
+    _header_mode_raw = request.headers.get(
+        "x-aawm-opencode-zen-unsupported-tools-mode"
+    )
+    if _header_mode_raw is None:
+        return prepared_request_body
+
+    _header_mode = _header_mode_raw.strip()
+    _existing_metadata = prepared_request_body.get("litellm_metadata")
+    _existing_mode = (
+        _existing_metadata.get("opencode_zen_unsupported_tools_mode")
+        if isinstance(_existing_metadata, dict)
+        else None
+    )
+    if _existing_mode is not None:
+        return prepared_request_body
+
+    if _header_mode != "drop":
+        raise ProxyException(
+            message=(
+                "x-aawm-opencode-zen-unsupported-tools-mode must be "
+                "'drop' when set."
+            ),
+            type="invalid_request_error",
+            param="x-aawm-opencode-zen-unsupported-tools-mode",
+            code=400,
+        )
+
+    prepared_request_body = dict(prepared_request_body)
+    _meta = dict(prepared_request_body.get("litellm_metadata") or {})
+    _meta["opencode_zen_unsupported_tools_mode"] = "drop"
+    prepared_request_body["litellm_metadata"] = _meta
+    return prepared_request_body
+
+
 async def _handle_codex_opencode_zen_adapter_route(
     *,
     endpoint: str,
@@ -1078,6 +1125,9 @@ async def _handle_codex_opencode_zen_adapter_route(
     )
 
     _ = fastapi_response
+    prepared_request_body = _consume_opencode_zen_tools_mode_header(
+        request, prepared_request_body, use_alias_candidate_probe
+    )
     normalized_request = await _anthropic_opencode_zen_normalization.normalize_codex_request(
         _get_anthropic_opencode_zen_normalization_runtime(),
         prepared_request_body,

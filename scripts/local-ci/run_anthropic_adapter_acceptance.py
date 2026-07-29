@@ -385,7 +385,7 @@ def _extract_command_session_id(stdout: str) -> str | None:
 
     def _walk(value: Any) -> str | None:
         if isinstance(value, dict):
-            for key in ('session_id', 'sessionId', 'thread_id', 'threadId'):
+            for key in ('session_id', 'sessionId'):
                 candidate = value.get(key)
                 if isinstance(candidate, str) and candidate.strip():
                     return candidate.strip()
@@ -404,6 +404,23 @@ def _extract_command_session_id(stdout: str) -> str | None:
         found = _walk(obj)
         if found:
             return found
+    return None
+
+
+def _extract_command_thread_id(stdout: str) -> str | None:
+    """Extract thread_id from a top-level ``thread.started`` JSONL event.
+
+    Only accepts events whose ``type`` is exactly ``thread.started`` and
+    that carry a top-level ``thread_id`` or ``threadId`` string.  This
+    prevents conflation with unrelated nested objects or session IDs.
+    """
+    for obj in RA._parse_stdout_json_objects(stdout):
+        if obj.get("type") != "thread.started":
+            continue
+        for key in ("thread_id", "threadId"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     return None
 
 
@@ -4428,6 +4445,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         and bool(config.get('provider_error_observations_validation'))
     )
     command_session_id = _extract_command_session_id(run['stdout'])
+    command_thread_id = _extract_command_thread_id(run['stdout'])
     if (
         not config.get('match_trace_session_id_from_stdout')
         and isinstance(config.get('expected_trace_session_id'), str)
@@ -4736,12 +4754,19 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     failures.extend(empty_success_failures)
 
     if use_failure_observability:
-        session_history_summary = {
-            'record': None,
-            'records': [],
-            'skipped': 'expected_api_error',
-        }
-        session_history_failures = []
+        if config.get('session_history_validation'):
+            session_history_summary, session_history_failures = _validate_session_history(
+                family=name,
+                session_id=command_session_id,
+                checks=config.get('session_history_validation') or {},
+            )
+        else:
+            session_history_summary = {
+                'record': None,
+                'records': [],
+                'skipped': 'expected_api_error',
+            }
+            session_history_failures = []
     else:
         session_history_summary, session_history_failures = _validate_session_history(
             family=name,
@@ -4877,6 +4902,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             "lookup_error": lookup_error,
             "filtered_trace_ids": filtered_trace_ids,
             "command_session_id": command_session_id,
+            "command_thread_id": command_thread_id,
             "trace_context": trace_context_summary,
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,

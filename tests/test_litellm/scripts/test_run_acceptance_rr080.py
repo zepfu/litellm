@@ -395,7 +395,7 @@ def test_validate_codex_applies_minimum_trace_count(ra) -> None:
 
     with (
         patch.object(ra, "_run_command", side_effect=fake_run),
-        patch.object(ra, "_poll_langfuse_named_traces", return_value=[]),
+        patch.object(ra, "_poll_langfuse_session_traces", return_value=([], None)),
         patch.object(
             ra,
             "_validate_generation_observations",
@@ -739,7 +739,7 @@ def test_validate_codex_timeout_produces_precise_failure(ra) -> None:
 
     with (
         patch.object(ra, "_run_command", return_value=timeout_run),
-        patch.object(ra, "_poll_langfuse_named_traces", return_value=[]),
+        patch.object(ra, "_poll_langfuse_session_traces", return_value=([], None)),
         patch.object(ra, "_validate_generation_observations", return_value=([], [], [])),
         patch.object(ra, "_validate_trace_enrichment", return_value=({}, [], [])),
         patch.object(ra, "_validate_trace_context", return_value=({}, [])),
@@ -936,7 +936,7 @@ def test_run_family_with_evidence_retains_run_on_observability_failure(ra) -> No
         patch.object(ra, "_run_command", return_value=run_result),
         patch.object(
             ra,
-            "_poll_langfuse_named_traces",
+            "_poll_langfuse_session_traces",
             side_effect=Exception("HTTP Error 401: Unauthorized"),
         ),
     ):

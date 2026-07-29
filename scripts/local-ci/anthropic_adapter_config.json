@@ -594,6 +594,8 @@
         "model_providers.{codex_profile}.http_headers.langfuse_trace_name=\"{case_name}\"",
         "-c",
         "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.x-aawm-opencode-zen-unsupported-tools-mode=\"drop\"",
         "--json",
         "-s",
         "read-only",
@@ -725,7 +727,27 @@
         "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
         "docker_container_name": "litellm-dev"
       },
-      "timeout_seconds": 180
+      "timeout_seconds": 180,
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_equals": {
+              "provider": "opencode_zen",
+              "model": "big-pickle"
+            },
+            "metadata_required_equals": {
+              "passthrough_route_family": "codex_opencode_zen_adapter"
+            }
+          }
+        ]
+      }
     },
     "native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration": {
       "verification_alias": "aawm-sota-moonshot",

@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from contextvars import ContextVar
 from typing import Any
 
@@ -1388,6 +1389,23 @@ def _extract_command_session_id(stdout: str) -> str | None:
     return None
 
 
+def _extract_command_thread_id(stdout: str) -> str | None:
+    """Extract thread_id from a top-level ``thread.started`` JSONL event.
+
+    Only accepts events whose ``type`` is exactly ``thread.started`` and
+    that carry a top-level ``thread_id`` or ``threadId`` string.  This
+    prevents conflation with unrelated nested objects or session IDs.
+    """
+    for obj in _parse_stdout_json_objects(stdout):
+        if obj.get("type") != "thread.started":
+            continue
+        for key in ("thread_id", "threadId"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def _extract_trace_environment(trace: dict[str, Any]) -> str | None:
     value = trace.get("environment")
     if isinstance(value, str) and value.strip():
@@ -2351,6 +2369,38 @@ def _docker_status() -> str:
     return result.stdout.strip()
 
 
+def _inject_codex_session_id(command: list[str]) -> tuple[list[str], str]:
+    """Append a run-unique Codex session ID header if not already present.
+
+    Uses the existing ``-c model_providers.<profile>.http_headers.session_id=...``
+    mechanics.  Returns (possibly-new command, generated session id).
+    A preexisting explicit session override is preserved as-is.
+    """
+    # Find the profile from -p <profile>
+    profile = "litellm"
+    for i, token in enumerate(command):
+        if token == "-p" and i + 1 < len(command):
+            profile = command[i + 1]
+            break
+
+    # Check for preexisting session_id override
+    session_prefix = f"model_providers.{profile}.http_headers.session_id="
+    for token in command:
+        if session_prefix in token:
+            # Extract existing value (strip quotes)
+            raw = token.split(session_prefix, 1)[1].strip().strip('"').strip("'")
+            if raw:
+                return command, raw
+
+    run_session = f"acceptance-{uuid.uuid4().hex[:16]}"
+    injected = list(command)
+    injected.extend([
+        "-c",
+        f'model_providers.{profile}.http_headers.session_id="{run_session}"',
+    ])
+    return injected, run_session
+
+
 def _validate_codex(
     config: dict[str, Any],
     *,
@@ -2359,21 +2409,23 @@ def _validate_codex(
     secret_key: str,
 ) -> dict[str, Any]:
     started = _utcnow()
-    run = _run_command(config["command"], timeout_seconds=int(config.get("timeout_seconds", 300)))
+    effective_command, run_session = _inject_codex_session_id(config["command"])
+    run = _run_command(effective_command, timeout_seconds=int(config.get("timeout_seconds", 300)))
     _record_family_run_evidence(run)
     command_session_id = _extract_command_session_id(run["stdout"])
+    command_thread_id = _extract_command_thread_id(run["stdout"])
     post_run_wait_seconds = float(config.get("post_run_wait_seconds", 0) or 0)
     if post_run_wait_seconds > 0:
         time.sleep(post_run_wait_seconds)
     expected_trace_names = config.get("expected_trace_names", [])
     expected_user_ids = config.get("expected_user_ids", [])
-    traces = _poll_langfuse_named_traces(
+    traces, lookup_error = _poll_langfuse_session_traces(
         query_url=query_url,
         public_key=public_key,
         secret_key=secret_key,
-        names=expected_trace_names,
         user_id=expected_user_ids[0] if expected_user_ids else None,
         start_time=started,
+        session_id=run_session,
         timeout_seconds=int(config.get("langfuse_poll_timeout_seconds", 45)),
     )
     actual_trace_names = sorted({trace.get("name") for trace in traces if trace.get("name")})
@@ -2381,6 +2433,12 @@ def _validate_codex(
     trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
     failures: list[str] = []
     warnings: list[str] = []
+    if not traces:
+        failures.append(
+            f"codex session trace lookup returned no traces for session {run_session}"
+        )
+    if lookup_error:
+        warnings.append(f"Codex Langfuse session lookup warning: {lookup_error}")
     if run.get("timed_out"):
         failures.append(
             f"codex command timed out after {run.get('timeout_seconds', '?')}s"
@@ -2466,6 +2524,8 @@ def _validate_codex(
             "trace_ids": trace_ids,
             "trace_count": len(traces),
             "command_session_id": command_session_id,
+            "command_thread_id": command_thread_id,
+            "run_session": run_session,
             "trace_context": trace_context_summary,
             "trace_enrichment": trace_enrichment_summary,
             "generation_metadata": generation_metadata_summary,

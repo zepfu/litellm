@@ -539,7 +539,9 @@ def test_config_case_uses_failure_observability_and_read_only_codex():
     assert "--dangerously-bypass-approvals-and-sandbox" not in case["command"]
     assert "required_trace_tags" not in case
     assert "allowed_generation_routes" not in case
-    assert "session_history_validation" not in case
+    shv = case["session_history_validation"]
+    assert shv["expected_rows"][0]["required_equals"]["provider"] == "opencode_zen"
+    assert shv["expected_rows"][0]["required_equals"]["model"] == "big-pickle"
     assert "required_generation_metadata_truthy" not in case
     expected = case["provider_error_observations_validation"]["expected_rows"][0]
     assert expected["required_equals"] == {
@@ -563,3 +565,89 @@ def test_config_dev_profile_declares_container_owned_credentials():
     assert dev["langfuse_public_key_container_env"] == "LANGFUSE_PUBLIC_KEY"
     assert dev["langfuse_secret_key_container_env"] == "LANGFUSE_SECRET_KEY"
     assert "validation_db_host" not in _config()["target_profiles"]["prod"]
+
+
+def test_failure_observability_with_session_history_calls_validator(
+    harness, monkeypatch
+):
+    """session_history_validation must execute for failure-observability cases."""
+    _neutralize_case_dependencies(harness, monkeypatch)
+    call_log: list[dict] = []
+
+    def tracking_validate_session_history(**kwargs):
+        call_log.append(kwargs)
+        return {"record": None, "records": []}, ["session row missing"]
+
+    monkeypatch.setattr(
+        harness, "_validate_session_history", tracking_validate_session_history
+    )
+    # Build run result manually to avoid _run_expected_error_case re-neutralizing
+    run = {"exit_code": 1, "stdout": _result_json(429), "stderr": ""}
+    attempts = [
+        {"attempt": 1, "api_error_status": 429, "is_error": True, "exit_code": 1}
+    ]
+    monkeypatch.setattr(
+        harness,
+        "_run_command_with_retry",
+        lambda config: (harness.RA._utcnow(), run, attempts),
+    )
+    monkeypatch.setattr(
+        harness, "_extract_command_session_id", lambda value: "test-session"
+    )
+    config = {
+        "expected_api_error_status": 429,
+        "match_trace_session_id_from_stdout": False,
+        "expected_trace_session_id": "test-session",
+        "provider_error_observations_validation": {
+            "expected_rows": [{"required_equals": {"status_code": 429}}]
+        },
+        "session_history_validation": {
+            "expected_rows": [
+                {"required_equals": {"provider": "opencode_zen"}}
+            ]
+        },
+    }
+    result = harness._validate_case(
+        "case",
+        config,
+        query_url="http://127.0.0.1:3000",
+        public_key="pk",
+        secret_key="sk",
+        litellm_base_url="http://127.0.0.1:4001",
+    )
+    assert len(call_log) == 1
+    assert call_log[0]["family"] == "case"
+    assert call_log[0]["session_id"] == "test-session"
+    assert result["passed"] is False
+    assert any("session row missing" in f for f in result["failures"])
+
+
+def test_failure_observability_without_session_history_still_skips(
+    harness, monkeypatch
+):
+    """No session_history_validation config preserves skip behavior."""
+    result = _run_expected_error_case(
+        harness,
+        monkeypatch,
+        stdout=_result_json(429),
+    )
+    assert result["passed"] is True
+    assert result["session_history"]["skipped"] == "expected_api_error"
+
+
+def test_validate_case_records_command_thread_id(harness, monkeypatch):
+    """_validate_case records command_thread_id separately from session_id."""
+    _neutralize_case_dependencies(harness, monkeypatch)
+    stdout_with_thread = (
+        json.dumps({"type": "thread.started", "thread_id": "thr-abc"})
+        + "\n"
+        + _result_json(429)
+    )
+    result = _run_expected_error_case(
+        harness,
+        monkeypatch,
+        stdout=stdout_with_thread,
+    )
+    assert result["langfuse"]["command_thread_id"] == "thr-abc"
+    assert result["langfuse"]["command_session_id"] == "test-session"
+    assert result["langfuse"]["command_thread_id"] != result["langfuse"]["command_session_id"]

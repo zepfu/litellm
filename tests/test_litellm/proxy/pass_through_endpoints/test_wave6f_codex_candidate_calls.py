@@ -38,6 +38,14 @@ EXPECTED_PUBLIC_SYMBOLS = frozenset(
         "_perform_codex_alibaba_token_plan_adapter_call",
         "_handle_codex_alibaba_token_plan_adapter_route",
         "_handle_codex_opencode_zen_adapter_route",
+        "_consume_opencode_zen_tools_mode_header",
+        # D1-574 OpenCode direct 429
+        "_opencode_zen_direct_safe_retry_after",
+        "_maybe_raise_opencode_zen_direct_rate_limit",
+        "_opencode_zen_direct_stream_terminal_error",
+        "_OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES",
+        "_OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS",
+        "_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES",
     }
 )
 
@@ -139,7 +147,9 @@ class TestInstallSeam:
         codex_candidate_calls.install(host)
         for name in codex_candidate_calls._HOST_FUNCTION_NAMES:
             assert name in host, f"install() did not publish {name}"
-            assert callable(host[name])
+            # Constants like _OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES are not callable
+            if not name.startswith("_OPENCODE_ZEN_DIRECT_"):
+                assert callable(host[name])
 
     def test_install_rebinds_globals(self):
         host: dict[str, Any] = {"__builtins__": __builtins__}
