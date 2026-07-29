@@ -320,3 +320,7 @@ general_settings:
         accept: application/json
       forward_headers: false
       cost_per_request: 0.0
+
+environment_variables:
+  LITELLM_KIMI_NATIVE_CONTRACT_PATH: "/app/.analysis/kimi-native-contract.json"
+  LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED: "true"
