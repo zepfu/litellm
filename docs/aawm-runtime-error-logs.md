@@ -367,6 +367,24 @@ callbacks with sanitized context, but they do not create active
 `.analysis/*-error.jsonl` exception-intake rows unless a separate callback or
 logging failure occurs.
 
+### Direct OpenCode Zen capacity failures and access visibility
+
+Direct OpenCode Zen capacity, free-usage, and rate-limit failures are translated
+to client-visible HTTP `429` responses. D1-573-compatible access visibility
+still applies: failed direct OpenCode requests, including translated `429`
+responses, remain visible in the AAWM route access log. Only successful,
+recognized probes are suppressible. A failed probe or direct request must not
+be hidden because its status was translated.
+
+The direct `429` presentation is bounded and sanitized. A valid bounded numeric
+upstream `Retry-After` may be preserved as a sanitized `Retry-After` header; the
+client-facing error must not include raw provider response bodies,
+credentials, account identifiers, or tracebacks. After the first stream event,
+the equivalent failure is a bounded terminal stream event, with the same
+redaction requirements. Alias candidate routes retain their own fallback,
+cooldown, and candidate-unavailable logging semantics rather than adopting the
+direct-route presentation.
+
 The direct Grok billing passthrough endpoint has one additional degraded
 telemetry class. When `/grok/v1/billing` receives the known upstream `400`
 timeout/cancel body (`The operation was cancelled` / `Timeout expired`), the

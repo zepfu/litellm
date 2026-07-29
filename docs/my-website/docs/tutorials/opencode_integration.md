@@ -100,6 +100,36 @@ Create `~/.config/opencode/opencode.json` (global config):
 The keys in the "models" object (e.g., "gpt-4", "claude-3-5-sonnet-20241022") should match the `model_name` values from your LiteLLM configuration. The "name" field provides a friendly display name that will appear as an alias in OpenCode.
 :::
 
+### OpenCode Zen authentication and request behavior
+
+For OpenCode Zen, an explicit API-key override is consulted first. When no
+explicit API-key override is configured, the first configured auth-file path
+is authoritative. If `LITELLM_OPENCODE_AUTH_FILE` or `OPENCODE_AUTH_FILE` is
+selected, a missing, unreadable, malformed, or otherwise invalid file fails
+closed; LiteLLM does not fall through to another configured path or host
+credentials. When neither auth-file path is configured, LiteLLM may discover
+the normal auth file under `HOME`. Authentication errors are sanitized and do
+not expose credential contents or the path value.
+
+OpenCode Zen supports function tools in the adapted Responses request. The
+unsupported Responses tool policy is `strict` by default: a request containing
+an unsupported or malformed tool is rejected instead of silently changing the
+agent's capabilities. For compatibility, the request metadata may explicitly
+set `opencode_zen_unsupported_tools_mode` to `drop`. In `drop` mode, unsupported
+tools are removed and an incompatible `tool_choice` is rejected rather than
+being silently forced to a different choice. Adaptation metadata is bounded
+and value-free: it records the removal count and limited tool-type
+classifications, never tool names, arguments, or contents.
+
+Direct OpenCode Zen capacity or rate-limit failures are returned as a
+sanitized HTTP `429`. A valid bounded numeric upstream `Retry-After` may be
+preserved as a sanitized `Retry-After` header. Direct routes do not hide these
+failures behind retries. Alias routes keep their candidate
+fallback and cooldown behavior. If a stream has already emitted its first
+event, a qualifying direct capacity failure is represented by a bounded
+terminal `response.failed` event rather than a traceback or raw provider
+payload.
+
 ### Step 3: Connect to LiteLLM Provider
 
 Launch OpenCode:
