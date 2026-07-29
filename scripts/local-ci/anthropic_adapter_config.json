@@ -11,7 +11,14 @@
       "litellm_base_url": "http://127.0.0.1:4001",
       "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
       "docker_container_name": "litellm-dev",
-      "expected_trace_environment": "dev"
+      "expected_trace_environment": "dev",
+      "validation_db_host": "127.0.0.1",
+      "validation_db_port": "6433",
+      "validation_db_name": "litellm_dev",
+      "validation_db_user": "litellm_dev",
+      "validation_db_password_container_env": "AAWM_DB_PASSWORD",
+      "langfuse_public_key_container_env": "LANGFUSE_PUBLIC_KEY",
+      "langfuse_secret_key_container_env": "LANGFUSE_SECRET_KEY"
     },
     "prod": {
       "litellm_base_url": "http://127.0.0.1:4000",
@@ -64,6 +71,7 @@
     "native_openrouter_free_daily_meter_chat",
     "native_openai_passthrough_responses",
     "native_openai_passthrough_responses_codex",
+    "native_openai_passthrough_responses_codex_opencode_zen_big_pickle",
     "native_openai_passthrough_responses_codex_tool_activity",
     "native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration",
     "native_openai_passthrough_responses_codex_aawm_sota_alibaba_collaboration",
@@ -568,6 +576,156 @@
       },
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60
+    },
+    "native_openai_passthrough_responses_codex_opencode_zen_big_pickle": {
+      "cli_passthrough": "codex",
+      "command": [
+        "codex",
+        "exec",
+        "-p",
+        "{codex_profile}",
+        "-m",
+        "opencode_zen/big-pickle",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.x-litellm-end-user-id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_user_id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_name=\"{case_name}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
+        "--json",
+        "-s",
+        "read-only",
+        "-C",
+        "{repository_root}",
+        "Reply with exactly two words: opencode pickle"
+      ],
+      "expected_api_error_status": 429,
+      "match_trace_session_id_from_stdout": false,
+      "post_run_wait_seconds": 2,
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": true
+        }
+      },
+      "command_stdout_text_checks": {
+        "forbidden_substrings": [
+          "sk-",
+          "Bearer ",
+          "Authorization:",
+          "api_key",
+          "raw_body",
+          "raw_response_body",
+          "raw_provider_body",
+          "provider_response_body",
+          "account_id",
+          "account_identifier",
+          "account_email",
+          "500 Internal Server Error",
+          "HTTP 500",
+          "\"status_code\": 500",
+          "\"status_code\":500",
+          "\"api_error_status\": 500",
+          "\"api_error_status\":500",
+          "Traceback (most recent call last)"
+        ],
+        "forbidden_regex": [
+          "(?i)(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}(?![A-Z0-9._%+-])"
+        ],
+        "maximum_chars": 12000
+      },
+      "command_stderr_text_checks": {
+        "forbidden_substrings": [
+          "Traceback",
+          "sk-",
+          "Bearer ",
+          "Authorization:",
+          "api_key",
+          "raw_body",
+          "raw_response_body",
+          "raw_provider_body",
+          "provider_response_body",
+          "account_id",
+          "account_identifier",
+          "account_email",
+          "500 Internal Server Error",
+          "HTTP 500",
+          "\"status_code\": 500",
+          "\"status_code\":500",
+          "\"api_error_status\": 500",
+          "\"api_error_status\":500"
+        ],
+        "forbidden_regex": [
+          "(?i)(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}(?![A-Z0-9._%+-])"
+        ],
+        "maximum_chars": 12000
+      },
+      "provider_error_observations_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_equals": {
+              "provider": "opencode_zen",
+              "model": "big-pickle",
+              "route_family": "codex_opencode_zen_adapter",
+              "status_code": 429
+            },
+            "required_truthy": [
+              "litellm_call_id"
+            ],
+            "retry_after_seconds_minimum": 0,
+            "retry_after_seconds_maximum": 86400,
+            "maximum_metadata_chars": 4096,
+            "forbidden_metadata_keys": [
+              "raw_body",
+              "raw_response_body",
+              "raw_provider_body",
+              "provider_response_body",
+              "upstream_response_body",
+              "account_id",
+              "account_identifier",
+              "account_email",
+              "email"
+            ],
+            "forbidden_substrings": [
+              "sk-",
+              "bearer ",
+              "authorization:",
+              "raw provider body",
+              "account identifier"
+            ],
+            "forbid_email_like": true
+          }
+        ]
+      },
+      "runtime_log_checks": {
+        "disable_default_429_traceback_check": true,
+        "forbidden_substrings": [
+          "Exception in ASGI application",
+          "Traceback (most recent call last)",
+          "sk-",
+          "api_key",
+          "raw_body",
+          "raw_response_body",
+          "raw_provider_body",
+          "provider_response_body",
+          "account_id",
+          "account_identifier",
+          "account_email"
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 180
     },
     "native_openai_passthrough_responses_codex_aawm_sota_moonshot_collaboration": {
       "verification_alias": "aawm-sota-moonshot",
@@ -3997,7 +4155,7 @@
       "command": [
         "claude",
         "-p",
-        "Dispatch to the sota-moonshot agent. Do not perform these steps yourself; wait for the actual child response. The child must call Read on scripts/local-ci/sequential_core_tools_fixture.txt in its first assistant message with no text. After the Read tool result, the child must call Grep with pattern exactly `sequential-core-tools-grep`, path exactly `scripts/local-ci/sequential_core_tools_fixture.txt`, and output_mode exactly `content` in a second assistant message with no text. After the Grep tool result, the child must stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: MOONSHOT ANTHROPIC AGENTIC TOOL CONTINUATION PASSED",
+        "Dispatch to the sota-moonshot agent. Do not perform these steps yourself; wait for the actual child response. The child must call Read on scripts/local-ci/sequential_core_tools_fixture.txt from . in its first assistant message with no text. After the Read tool result, the child must call Grep with pattern exactly `sequential-core-tools-grep`, path exactly `scripts/local-ci/sequential_core_tools_fixture.txt`, and output_mode exactly `content` in a second assistant message with no text. After the Grep tool result, the child must stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: MOONSHOT ANTHROPIC AGENTIC TOOL CONTINUATION PASSED",
         "--output-format",
         "json",
         "--permission-mode",
@@ -4604,7 +4762,7 @@
       "command": [
         "claude",
         "-p",
-        "Moonshot Claude tool-usage acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first assistant message dispatch exactly two children concurrently using exactly two Agent tool calls and no text: sota-moonshot-stress-a and sota-moonshot-stress-b. Do not perform either child's work yourself. Each child must complete exactly two sequential batches of three parallel read-only tool calls. Batch 1 must be one assistant message with no text containing Read for scripts/local-ci/sequential_core_tools_fixture.txt, Glob with pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from `.`, and Grep with pattern exactly `sequential-core-tools-grep`, path exactly `scripts/local-ci/sequential_core_tools_fixture.txt`, and output_mode exactly `content`. Only after all Batch 1 tool results return, Batch 2 must be one assistant message with no text containing Read for scripts/local-ci/codex_moonshot_model_catalog.json, Glob with pattern exactly `scripts/local-ci/codex_moonshot_model_catalog.json` from `.`, and Grep with pattern exactly `aawm-sota-moonshot`, path exactly `scripts/local-ci/codex_moonshot_model_catalog.json`, and output_mode exactly `content`. Child A must then return only CHILD_A_TWO_PARALLEL_BATCHES_PASSED. Child B must then return only CHILD_B_TWO_PARALLEL_BATCHES_PASSED. Wait for both actual child responses and verify both markers. Then return exactly these three lines with no Markdown, explanation, or additional text: CLAUDE_MOONSHOT_TOOL_USAGE_PASSED, CHILD_A_TWO_PARALLEL_BATCHES_PASSED, and CHILD_B_TWO_PARALLEL_BATCHES_PASSED, one marker per line in that order. If Agent dispatch, either child, either parallel batch, or either marker fails, report the exact blocker and do not emit the success markers.",
+        "Moonshot Claude tool-usage acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first assistant message dispatch exactly two children concurrently using exactly two Agent tool calls and no text: sota-moonshot-stress-a and sota-moonshot-stress-b. Do not perform either child's work yourself. Each child must complete exactly two sequential batches of three parallel read-only tool calls. Batch 1 must be one assistant message with no text containing Read for scripts/local-ci/sequential_core_tools_fixture.txt, Glob with pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from ., and Grep with pattern exactly `sequential-core-tools-grep`, path exactly `scripts/local-ci/sequential_core_tools_fixture.txt`, and output_mode exactly `content`. Only after all Batch 1 tool results return, Batch 2 must be one assistant message with no text containing Read for scripts/local-ci/codex_moonshot_model_catalog.json, Glob with pattern exactly `scripts/local-ci/codex_moonshot_model_catalog.json` from ., and Grep with pattern exactly `aawm-sota-moonshot`, path exactly `scripts/local-ci/codex_moonshot_model_catalog.json`, and output_mode exactly `content`. Child A must then return only CHILD_A_TWO_PARALLEL_BATCHES_PASSED. Child B must then return only CHILD_B_TWO_PARALLEL_BATCHES_PASSED. Wait for both actual child responses and verify both markers. Then return exactly these three lines with no Markdown, explanation, or additional text: CLAUDE_MOONSHOT_TOOL_USAGE_PASSED, CHILD_A_TWO_PARALLEL_BATCHES_PASSED, and CHILD_B_TWO_PARALLEL_BATCHES_PASSED, one marker per line in that order. If Agent dispatch, either child, either parallel batch, or either marker fails, report the exact blocker and do not emit the success markers.",
         "--output-format",
         "json",
         "--permission-mode",
@@ -4858,7 +5016,7 @@
       "command": [
         "claude",
         "-p",
-        "Alibaba Claude tool-usage acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first assistant message dispatch exactly two children concurrently using exactly two Agent tool calls and no text: sota-alibaba-stress-a and sota-alibaba-stress-b. Do not perform either child's work yourself. Each child must complete exactly two sequential batches of three parallel read-only tool calls. Batch 1 must be one assistant message with no text containing Read for scripts/local-ci/sequential_core_tools_fixture.txt, Glob with pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from `.`, and Grep with pattern exactly `sequential-core-tools-grep`, path exactly `scripts/local-ci/sequential_core_tools_fixture.txt`, and output_mode exactly `content`. Only after all Batch 1 tool results return, Batch 2 must be one assistant message with no text containing Read for scripts/local-ci/codex_alibaba_model_catalog.json, Glob with pattern exactly `scripts/local-ci/codex_alibaba_model_catalog.json` from `.`, and Grep with pattern exactly `aawm-sota-alibaba`, path exactly `scripts/local-ci/codex_alibaba_model_catalog.json`, and output_mode exactly `content`. Child A must then return only CHILD_A_TWO_PARALLEL_BATCHES_PASSED. Child B must then return only CHILD_B_TWO_PARALLEL_BATCHES_PASSED. Wait for both actual child responses and verify both markers. Then return exactly these three lines with no Markdown, explanation, or additional text: CLAUDE_ALIBABA_TOOL_USAGE_PASSED, CHILD_A_TWO_PARALLEL_BATCHES_PASSED, and CHILD_B_TWO_PARALLEL_BATCHES_PASSED, one marker per line in that order. If Agent dispatch, either child, either parallel batch, or either marker fails, report the exact blocker and do not emit the success markers.",
+        "Alibaba Claude tool-usage acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first assistant message dispatch exactly two children concurrently using exactly two Agent tool calls and no text: sota-alibaba-stress-a and sota-alibaba-stress-b. Do not perform either child's work yourself. Each child must complete exactly two sequential batches of three parallel read-only tool calls. Batch 1 must be one assistant message with no text containing Read for scripts/local-ci/sequential_core_tools_fixture.txt, Glob with pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from ., and Grep with pattern exactly `sequential-core-tools-grep`, path exactly `scripts/local-ci/sequential_core_tools_fixture.txt`, and output_mode exactly `content`. Only after all Batch 1 tool results return, Batch 2 must be one assistant message with no text containing Read for scripts/local-ci/codex_alibaba_model_catalog.json, Glob with pattern exactly `scripts/local-ci/codex_alibaba_model_catalog.json` from ., and Grep with pattern exactly `aawm-sota-alibaba`, path exactly `scripts/local-ci/codex_alibaba_model_catalog.json`, and output_mode exactly `content`. Child A must then return only CHILD_A_TWO_PARALLEL_BATCHES_PASSED. Child B must then return only CHILD_B_TWO_PARALLEL_BATCHES_PASSED. Wait for both actual child responses and verify both markers. Then return exactly these three lines with no Markdown, explanation, or additional text: CLAUDE_ALIBABA_TOOL_USAGE_PASSED, CHILD_A_TWO_PARALLEL_BATCHES_PASSED, and CHILD_B_TWO_PARALLEL_BATCHES_PASSED, one marker per line in that order. If Agent dispatch, either child, either parallel batch, or either marker fails, report the exact blocker and do not emit the success markers.",
         "--output-format",
         "json",
         "--permission-mode",

@@ -78,6 +78,36 @@ UNRELATED_RUNTIME_LOG_ERROR_SIGNATURES = [
 ]
 # Bound docker CLI calls so an unresponsive daemon/logs cannot hang the suite.
 DEFAULT_DOCKER_SUBPROCESS_TIMEOUT_SECONDS = 30
+
+_CONTAINER_ENV_CACHE: dict[tuple[str, str], str | None] = {}
+
+
+def _resolve_container_env_value(container_name: str, env_name: str) -> str | None:
+    """Retrieve a single named env var from a running container via docker exec.
+
+    Results are cached per (container, env_name) pair.  The value is never
+    printed, logged, or stored in artifacts.  Returns ``None`` on any failure.
+    """
+    cache_key = (container_name, env_name)
+    if cache_key in _CONTAINER_ENV_CACHE:
+        return _CONTAINER_ENV_CACHE[cache_key]
+    value: str | None = None
+    try:
+        result = subprocess.run(
+            ['docker', 'exec', container_name, 'printenv', env_name],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=DEFAULT_DOCKER_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            value = result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    _CONTAINER_ENV_CACHE[cache_key] = value
+    return value
+
 # Tight window for positive "unrelated concurrent traffic" evidence around a match.
 UNRELATED_RUNTIME_LOG_LOCAL_CONTEXT_CHARS = 800
 # Failures that may be soft-failed when provider-unavailable log evidence is present.
@@ -257,6 +287,7 @@ def _validate_command_text_checks(
     required_suffix = checks.get("required_suffix")
     required_substrings = _as_string_list(checks.get("required_substrings"))
     forbidden_substrings = _as_string_list(checks.get("forbidden_substrings"))
+    forbidden_regex = _as_string_list(checks.get("forbidden_regex"))
     minimum_chars = checks.get("minimum_chars")
     maximum_chars = checks.get("maximum_chars")
 
@@ -278,6 +309,18 @@ def _validate_command_text_checks(
             failures.append(
                 f"{family} {label} contained forbidden substring {substring!r}"
             )
+    for pattern in forbidden_regex:
+        try:
+            matched = re.search(pattern, text) is not None
+        except re.error as exc:
+            failures.append(
+                f"{family} {label} has invalid forbidden regex {pattern!r}: {exc}"
+            )
+            continue
+        if matched:
+            failures.append(
+                f"{family} {label} matched forbidden regex {pattern!r}"
+            )
     if minimum_chars is not None and len(text) < int(minimum_chars):
         failures.append(
             f"{family} {label} below minimum length: expected >= {int(minimum_chars)}, got {len(text)}"
@@ -294,6 +337,7 @@ def _validate_command_text_checks(
         "required_suffix": required_suffix,
         "required_substrings": required_substrings,
         "forbidden_substrings": forbidden_substrings,
+        "forbidden_regex": forbidden_regex,
     }, failures
 
 
@@ -846,10 +890,52 @@ def _apply_target_profile_to_config(  # noqa: PLR0915
                 target=target,
                 case_name=case_name,
             )
+        _apply_profile_validation_db_overrides(updated_case, profile)
         updated_cases[case_name] = updated_case
 
     updated_config['cases'] = updated_cases
     return updated_config
+
+
+_DB_VALIDATION_KEYS = (
+    'session_history_validation',
+    'rate_limit_observations_validation',
+    'provider_error_observations_validation',
+    'tool_activity_validation',
+)
+
+
+def _apply_profile_validation_db_overrides(
+    case_config: dict[str, Any],
+    profile: dict[str, str],
+) -> None:
+    """Override DB connection settings in all DB-backed validation blocks.
+
+    Only applies when the target profile carries ``validation_db_*`` keys.
+    Profiles without them (e.g. prod) leave case-level settings untouched.
+    The password is never stored in the config; only the container name and
+    env-var name are recorded so ``_validation_db_settings`` can resolve it
+    at runtime via ``_resolve_container_env_value``.
+    """
+    db_host = profile.get('validation_db_host')
+    if not db_host:
+        return
+    container_name = profile.get('docker_container_name', '')
+    password_container_env = profile.get('validation_db_password_container_env', '')
+    for key in _DB_VALIDATION_KEYS:
+        block = case_config.get(key)
+        if not isinstance(block, dict):
+            continue
+        block['db_host'] = db_host
+        if profile.get('validation_db_port'):
+            block['db_port'] = int(profile['validation_db_port'])
+        if profile.get('validation_db_name'):
+            block['db_name'] = profile['validation_db_name']
+        if profile.get('validation_db_user'):
+            block['db_user'] = profile['validation_db_user']
+        if password_container_env and container_name:
+            block['db_password_container'] = container_name
+            block['db_password_container_env'] = password_container_env
 
 
 def _resolve_harness_tenant_id(
@@ -2057,17 +2143,26 @@ def _validate_runtime_logs(
         or 'litellm-dev'
     )
     tail_lines = int(checks.get('tail_lines') or 400)
+    default_upstream_error_substrings = list(
+        DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS
+    )
+    if bool(checks.get('disable_default_429_traceback_check')):
+        default_upstream_error_substrings = [
+            substring
+            for substring in default_upstream_error_substrings
+            if 'Exception occured - 429:' not in substring
+        ]
     forbidden_substrings = [
         *DEFAULT_RUNTIME_LOG_FORBIDDEN_SUBSTRINGS,
+        *default_upstream_error_substrings,
         *list(checks.get('forbidden_substrings') or []),
     ]
-    if not bool(checks.get('disable_default_429_traceback_check')):
-        forbidden_substrings.extend(DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS)
     if bool(checks.get('disable_default_error_signature_check')):
         configured_substrings = list(checks.get('forbidden_substrings') or [])
-        forbidden_substrings = configured_substrings
-        if not bool(checks.get('disable_default_429_traceback_check')):
-            forbidden_substrings.extend(DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS)
+        forbidden_substrings = [
+            *configured_substrings,
+            *default_upstream_error_substrings,
+        ]
     forbidden_substrings = sorted(set(forbidden_substrings))
 
     summary: dict[str, Any] = {
@@ -2423,7 +2518,19 @@ def _validation_db_settings(
     db_name = str(checks.get('db_name') or 'aawm_tristore')
     db_user = str(checks.get('db_user') or 'aawm')
     db_password = None
-    if isinstance(checks.get('db_password_env'), str):
+    if isinstance(checks.get('db_password_container_env'), str):
+        container_name = str(checks.get('db_password_container') or '').strip()
+        env_name = str(checks['db_password_container_env']).strip()
+        if not container_name or not env_name:
+            return None, [
+                f'{family} missing target-owned DB credential configuration for {validation_name} validation'
+            ]
+        db_password = _resolve_container_env_value(container_name, env_name)
+        if db_password is None:
+            return None, [
+                f'{family} could not retrieve target-owned DB credential for {validation_name} validation'
+            ]
+    elif isinstance(checks.get('db_password_env'), str):
         db_password = os.environ.get(str(checks['db_password_env']))
     if db_password is None and isinstance(checks.get('db_password'), str):
         db_password = str(checks['db_password'])
@@ -2919,6 +3026,174 @@ def _validate_rate_limit_observations(
         'matched_records': matched_records,
         'latest_snapshot_cutoff': latest_cutoff.isoformat(),
     }, match_failures, warnings
+
+
+_EMAIL_LIKE_RE = re.compile(
+    r'(?i)(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![A-Z0-9._%+-])'
+)
+
+
+def _mapping_keys(value: Any) -> list[str]:
+    keys: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            keys.append(str(key))
+            keys.extend(_mapping_keys(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            keys.extend(_mapping_keys(nested))
+    return keys
+
+
+def _provider_error_record_failures(
+    *,
+    family: str,
+    record: dict[str, Any],
+    checks: dict[str, Any],
+) -> list[str]:
+    failures: list[str] = []
+    for key in checks.get('required_truthy') or []:
+        if not record.get(key):
+            failures.append(
+                f'{family} provider_error_observations `{key}` is not truthy'
+            )
+
+    retry_after = record.get('retry_after_seconds')
+    if retry_after is not None:
+        if isinstance(retry_after, bool) or not isinstance(retry_after, (int, float)):
+            failures.append(
+                f'{family} provider_error_observations retry_after_seconds is not numeric'
+            )
+        else:
+            minimum = checks.get('retry_after_seconds_minimum')
+            maximum = checks.get('retry_after_seconds_maximum')
+            if minimum is not None and retry_after < float(minimum):
+                failures.append(
+                    f'{family} provider_error_observations retry_after_seconds below minimum'
+                )
+            if maximum is not None and retry_after > float(maximum):
+                failures.append(
+                    f'{family} provider_error_observations retry_after_seconds above maximum'
+                )
+
+    metadata = record.get('metadata')
+    metadata_text = json.dumps(metadata or {}, sort_keys=True, default=str)
+    maximum_metadata_chars = checks.get('maximum_metadata_chars')
+    if (
+        maximum_metadata_chars is not None
+        and len(metadata_text) > int(maximum_metadata_chars)
+    ):
+        failures.append(
+            f'{family} provider_error_observations metadata exceeds maximum length'
+        )
+
+    normalized_keys = {key.strip().lower() for key in _mapping_keys(metadata)}
+    for forbidden_key in checks.get('forbidden_metadata_keys') or []:
+        if str(forbidden_key).strip().lower() in normalized_keys:
+            failures.append(
+                f'{family} provider_error_observations metadata contained forbidden key'
+            )
+    metadata_text_lower = metadata_text.lower()
+    for substring in checks.get('forbidden_substrings') or []:
+        if str(substring).lower() in metadata_text_lower:
+            failures.append(
+                f'{family} provider_error_observations metadata contained forbidden text'
+            )
+    if checks.get('forbid_email_like') and _EMAIL_LIKE_RE.search(metadata_text):
+        failures.append(
+            f'{family} provider_error_observations metadata contained email-like text'
+        )
+    return failures
+
+
+def _validate_provider_error_records(
+    *,
+    family: str,
+    records: list[dict[str, Any]],
+    checks: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    expected_rows = checks.get('expected_rows') or []
+    matched_records: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for expected_row in expected_rows:
+        matches = [
+            record
+            for record in records
+            if all(
+                record.get(key) == expected
+                for key, expected in (expected_row.get('required_equals') or {}).items()
+            )
+        ]
+        if not matches:
+            failures.append(
+                f'{family} missing correlated provider_error_observations row'
+            )
+            continue
+        record = matches[0]
+        failures.extend(
+            _provider_error_record_failures(
+                family=family,
+                record=record,
+                checks=expected_row,
+            )
+        )
+        matched_records.append(_normalize_db_record(record))
+    return matched_records, failures
+
+
+def _validate_provider_error_observations(
+    *,
+    family: str,
+    session_id: str | None,
+    checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    if not checks:
+        return {'records': [], 'matched_records': []}, []
+    if not session_id:
+        return {'records': [], 'matched_records': []}, [
+            f'{family} missing command session_id for provider_error_observations validation'
+        ]
+
+    db_settings, db_failures = _validation_db_settings(
+        family=family,
+        checks=checks,
+        validation_name='provider_error_observations',
+    )
+    if db_settings is None:
+        return {'records': [], 'matched_records': []}, db_failures
+
+    query = '''
+        select observed_at, created_at, environment, provider, model,
+               model_group, route_family, status_code, error_type, error_code,
+               error_class, retry_after_seconds, expected_reset_at, session_id,
+               trace_id, litellm_call_id, metadata
+        from public.provider_error_observations
+        where session_id = %s
+        order by observed_at desc, id desc
+    '''
+    conn = _validation_db_connection(db_settings)
+    poll_timeout_seconds = max(0.0, float(checks.get('poll_timeout_seconds') or 0))
+    poll_interval_seconds = max(0.1, float(checks.get('poll_interval_seconds') or 1))
+    poll_deadline = time.monotonic() + poll_timeout_seconds
+    records: list[dict[str, Any]] = []
+    matched_records: list[dict[str, Any]] = []
+    failures: list[str] = []
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(query, (session_id,))
+            records = cur.fetchall()
+        matched_records, failures = _validate_provider_error_records(
+            family=family,
+            records=records,
+            checks=checks,
+        )
+        if not failures or time.monotonic() >= poll_deadline:
+            break
+        time.sleep(poll_interval_seconds)
+    return {
+        'records': [_normalize_db_record(record) for record in records],
+        'matched_records': matched_records,
+    }, failures
 
 
 def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:  # noqa: PLR0915
@@ -4115,8 +4390,43 @@ def _run_command_with_retry(*, config: dict[str, Any]) -> tuple[Any, dict[str, A
     return final_started, final_run, attempts
 
 
+def _command_api_error_status(
+    *,
+    run: dict[str, Any],
+    command_attempts: list[dict[str, Any]],
+) -> int | None:
+    if command_attempts:
+        status = command_attempts[-1].get('api_error_status')
+        if isinstance(status, int):
+            return status
+    parsed_stdout = _parse_command_output_json(str(run.get('stdout') or ''))
+    if isinstance(parsed_stdout, dict):
+        status = parsed_stdout.get('api_error_status')
+        if isinstance(status, int):
+            return status
+        if parsed_stdout.get('is_error') is True:
+            status = parsed_stdout.get('status_code')
+            if isinstance(status, int):
+                return status
+    return None
+
+
 def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_key: str, secret_key: str, litellm_base_url: str) -> dict[str, Any]:  # noqa: PLR0915
     started, run, command_attempts = _run_command_with_retry(config=config)
+    observed_api_error_status = _command_api_error_status(
+        run=run,
+        command_attempts=command_attempts,
+    )
+    expected_api_error_status = config.get('expected_api_error_status')
+    expected_api_error_matched = (
+        run.get('exit_code') != 0
+        and isinstance(expected_api_error_status, int)
+        and observed_api_error_status == expected_api_error_status
+    )
+    use_failure_observability = (
+        expected_api_error_matched
+        and bool(config.get('provider_error_observations_validation'))
+    )
     command_session_id = _extract_command_session_id(run['stdout'])
     if (
         not config.get('match_trace_session_id_from_stdout')
@@ -4143,7 +4453,9 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         and isinstance(command_session_id, str)
         and command_session_id.strip()
     )
-    if expected_trace_names:
+    if use_failure_observability:
+        traces, lookup_error = [], None
+    elif expected_trace_names:
         # Prefer name-based lookup when the suite already knows which traces should exist.
         # This avoids spending the full session lookup timeout on providers that log a
         # null trace.sessionId; trace-context validation below still enforces sessionId
@@ -4179,43 +4491,68 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     failures: list[str] = []
     warnings: list[str] = []
     if run['exit_code'] != 0:
-        failures.append(f'{name} command failed')
+        if expected_api_error_matched:
+            warnings.append(
+                f'{name} command exited nonzero with expected API error status {expected_api_error_status}'
+            )
+        else:
+            failures.append(f'{name} command failed')
     if lookup_error:
         warnings.append(f'{name} Langfuse lookup warning: {lookup_error}')
-    for trace_name in expected_trace_names:
-        if trace_name not in actual_trace_names:
-            failures.append(f'missing {name} trace name: {trace_name}')
-    for user_id in expected_user_ids:
-        if user_id not in actual_user_ids:
-            failures.append(f'missing {name} user id: {user_id}')
-    trace_user_ids_by_name_summary, trace_user_ids_by_name_failures = (
-        _validate_trace_user_ids_by_name(
-            family=name,
-            traces=traces,
-            expected=expected_trace_user_ids_by_name,
+    if use_failure_observability:
+        trace_user_ids_by_name_summary = {
+            'skipped': 'expected_api_error',
+        }
+        trace_user_ids_by_name_failures = []
+    else:
+        for trace_name in expected_trace_names:
+            if trace_name not in actual_trace_names:
+                failures.append(f'missing {name} trace name: {trace_name}')
+        for user_id in expected_user_ids:
+            if user_id not in actual_user_ids:
+                failures.append(f'missing {name} user id: {user_id}')
+        trace_user_ids_by_name_summary, trace_user_ids_by_name_failures = (
+            _validate_trace_user_ids_by_name(
+                family=name,
+                traces=traces,
+                expected=expected_trace_user_ids_by_name,
+            )
         )
-    )
     failures.extend(trace_user_ids_by_name_failures)
-    if bool(config.get('require_trace_user_id')) and traces and not actual_user_ids:
+    if (
+        not use_failure_observability
+        and bool(config.get('require_trace_user_id'))
+        and traces
+        and not actual_user_ids
+    ):
         failures.append(f'{name} traces did not include a Langfuse userId')
 
-    raw_generation_observations, generation_observations, generation_failures = RA._validate_generation_observations(
-        family=name,
-        query_url=query_url,
-        public_key=public_key,
-        secret_key=secret_key,
-        trace_ids=trace_ids,
-        start_time=started,
-        allowed_request_routes=config.get('allowed_generation_routes'),
-        skip_quality_checks=bool(config.get('skip_generation_quality_checks')),
-        allow_zero_cost=bool(config.get('allow_zero_cost')),
-        allow_reference_cost_when_invoice_unknown=bool(
-            config.get('allow_reference_cost_when_invoice_unknown')
-        ),
-        allow_unknown_cost_when_invoice_unknown=bool(
-            config.get('allow_unknown_cost_when_invoice_unknown')
-        ),
-    )
+    if use_failure_observability:
+        raw_generation_observations = []
+        generation_observations = []
+        generation_failures = []
+    else:
+        (
+            raw_generation_observations,
+            generation_observations,
+            generation_failures,
+        ) = RA._validate_generation_observations(
+            family=name,
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            trace_ids=trace_ids,
+            start_time=started,
+            allowed_request_routes=config.get('allowed_generation_routes'),
+            skip_quality_checks=bool(config.get('skip_generation_quality_checks')),
+            allow_zero_cost=bool(config.get('allow_zero_cost')),
+            allow_reference_cost_when_invoice_unknown=bool(
+                config.get('allow_reference_cost_when_invoice_unknown')
+            ),
+            allow_unknown_cost_when_invoice_unknown=bool(
+                config.get('allow_unknown_cost_when_invoice_unknown')
+            ),
+        )
     failures.extend(generation_failures)
 
     filtered_trace_ids = sorted(
@@ -4227,32 +4564,52 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     )
     filtered_traces = [trace for trace in traces if trace.get('id') in set(filtered_trace_ids)]
 
-    trace_enrichment_summary, trace_enrichment_failures, trace_enrichment_warnings = RA._validate_trace_enrichment(
-        family=name,
-        traces=filtered_traces,
-        required_tags=config.get('required_trace_tags'),
-        required_tag_prefixes=config.get('required_trace_tag_prefixes'),
-        warning_tag_prefixes=config.get('warning_trace_tag_prefixes'),
-    )
+    if use_failure_observability:
+        trace_enrichment_summary = {'skipped': 'expected_api_error'}
+        trace_enrichment_failures = []
+        trace_enrichment_warnings = []
+    else:
+        (
+            trace_enrichment_summary,
+            trace_enrichment_failures,
+            trace_enrichment_warnings,
+        ) = RA._validate_trace_enrichment(
+            family=name,
+            traces=filtered_traces,
+            required_tags=config.get('required_trace_tags'),
+            required_tag_prefixes=config.get('required_trace_tag_prefixes'),
+            warning_tag_prefixes=config.get('warning_trace_tag_prefixes'),
+        )
     failures.extend(trace_enrichment_failures)
     warnings.extend(trace_enrichment_warnings)
 
-    trace_context_summary, trace_context_failures = RA._validate_trace_context(
-        family=name,
-        traces=filtered_traces,
-        expected_environment=config.get('expected_trace_environment'),
-        require_trace_session_id=bool(config.get('require_trace_session_id')),
-        expected_trace_session_id=(command_session_id if config.get('match_trace_session_id_from_stdout') else config.get('expected_trace_session_id')),
-        require_trace_ids_distinct_from_session_ids=bool(config.get('require_trace_ids_distinct_from_session_ids')),
-    )
+    if use_failure_observability:
+        trace_context_summary = {'skipped': 'expected_api_error'}
+        trace_context_failures = []
+    else:
+        trace_context_summary, trace_context_failures = RA._validate_trace_context(
+            family=name,
+            traces=filtered_traces,
+            expected_environment=config.get('expected_trace_environment'),
+            require_trace_session_id=bool(config.get('require_trace_session_id')),
+            expected_trace_session_id=(command_session_id if config.get('match_trace_session_id_from_stdout') else config.get('expected_trace_session_id')),
+            require_trace_ids_distinct_from_session_ids=bool(config.get('require_trace_ids_distinct_from_session_ids')),
+        )
     failures.extend(trace_context_failures)
 
-    generation_metadata_summary, generation_metadata_failures = RA._validate_generation_metadata(
-        family=name,
-        observations=raw_generation_observations,
-        required_metadata_truthy=config.get('required_generation_metadata_truthy'),
-        required_metadata_minimums=config.get('required_generation_metadata_minimums'),
-    )
+    if use_failure_observability:
+        generation_metadata_summary = {'skipped': 'expected_api_error'}
+        generation_metadata_failures = []
+    else:
+        (
+            generation_metadata_summary,
+            generation_metadata_failures,
+        ) = RA._validate_generation_metadata(
+            family=name,
+            observations=raw_generation_observations,
+            required_metadata_truthy=config.get('required_generation_metadata_truthy'),
+            required_metadata_minimums=config.get('required_generation_metadata_minimums'),
+        )
     failures.extend(generation_metadata_failures)
 
     request_payload_summary, request_payload_failures, request_payload_warnings = _validate_logged_request_payload_checks(
@@ -4313,15 +4670,18 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         failures.extend(aawm_dynamic_injection_failures)
         warnings.extend(aawm_dynamic_injection_warnings)
 
-    _, span_observations, span_failures = RA._validate_span_observations(
-        family=name,
-        query_url=query_url,
-        public_key=public_key,
-        secret_key=secret_key,
-        trace_ids=filtered_trace_ids,
-        start_time=started,
-        required_names=config.get('required_span_names'),
-    )
+    if use_failure_observability:
+        span_observations, span_failures = {'skipped': 'expected_api_error'}, []
+    else:
+        _, span_observations, span_failures = RA._validate_span_observations(
+            family=name,
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            trace_ids=filtered_trace_ids,
+            start_time=started,
+            required_names=config.get('required_span_names'),
+        )
     failures.extend(span_failures)
 
     command_json_summary, command_json_failures = _validate_command_output_json(
@@ -4339,6 +4699,15 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         )
     )
     failures.extend(command_output_text_failures)
+    command_stdout_text_summary, command_stdout_text_failures = (
+        _validate_command_text_checks(
+            family=name,
+            text=run["stdout"],
+            checks=config.get("command_stdout_text_checks") or {},
+            label="command stdout",
+        )
+    )
+    failures.extend(command_stdout_text_failures)
     command_stderr_text_summary, command_stderr_text_failures = (
         _validate_command_text_checks(
             family=name,
@@ -4366,11 +4735,19 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     )
     failures.extend(empty_success_failures)
 
-    session_history_summary, session_history_failures = _validate_session_history(
-        family=name,
-        session_id=command_session_id,
-        checks=config.get('session_history_validation') or {},
-    )
+    if use_failure_observability:
+        session_history_summary = {
+            'record': None,
+            'records': [],
+            'skipped': 'expected_api_error',
+        }
+        session_history_failures = []
+    else:
+        session_history_summary, session_history_failures = _validate_session_history(
+            family=name,
+            session_id=command_session_id,
+            checks=config.get('session_history_validation') or {},
+        )
     failures.extend(session_history_failures)
     session_history_passed = (
         not bool(session_history_failures)
@@ -4388,6 +4765,15 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     )
     failures.extend(rate_limit_observations_failures)
     warnings.extend(rate_limit_observations_warnings)
+    (
+        provider_error_observations_summary,
+        provider_error_observations_failures,
+    ) = _validate_provider_error_observations(
+        family=name,
+        session_id=command_session_id,
+        checks=config.get('provider_error_observations_validation') or {},
+    )
+    failures.extend(provider_error_observations_failures)
     tool_activity_summary, tool_activity_failures = _validate_tool_activity(
         family=name,
         session_id=command_session_id,
@@ -4503,12 +4889,14 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         },
         "command_json": command_json_summary,
         "command_output_text": command_output_text_summary,
+        "command_stdout_text": command_stdout_text_summary,
         "command_stderr_text": command_stderr_text_summary,
         "codex_collaboration": codex_collaboration_summary,
         "empty_success": empty_success_summary,
         "session_history": session_history_summary,
         "session_history_passed": session_history_passed,
         "rate_limit_observations": rate_limit_observations_summary,
+        "provider_error_observations": provider_error_observations_summary,
         "tool_activity": tool_activity_summary,
         "transcript_tool_use": transcript_tool_use_summary,
         "bash_stdout_report": bash_stdout_report_summary,
@@ -5637,11 +6025,28 @@ def _resolve_main_credentials(
     *,
     config: dict[str, Any],
     args: argparse.Namespace,
+    profile: dict[str, str] | None = None,
 ) -> tuple[str, str, str, str, str] | int:
     public_key_env = config.get('langfuse_public_key_env', 'LANGFUSE_PUBLIC_KEY')
     secret_key_env = config.get('langfuse_secret_key_env', 'LANGFUSE_SECRET_KEY')
-    public_key = os.environ.get(public_key_env, '')
-    secret_key = os.environ.get(secret_key_env, '')
+    public_key = ''
+    secret_key = ''
+    container_name = (profile or {}).get('docker_container_name', '')
+    pk_container_env = (profile or {}).get('langfuse_public_key_container_env', '')
+    sk_container_env = (profile or {}).get('langfuse_secret_key_container_env', '')
+    container_owned_credentials = bool(pk_container_env or sk_container_env)
+    if container_owned_credentials:
+        if not container_name or not pk_container_env or not sk_container_env:
+            _emit_stderr('Missing target-owned Langfuse credential configuration')
+            return 2
+        public_key = _resolve_container_env_value(container_name, pk_container_env) or ''
+        secret_key = _resolve_container_env_value(container_name, sk_container_env) or ''
+        if not public_key or not secret_key:
+            _emit_stderr('Could not retrieve target-owned Langfuse credentials')
+            return 2
+    else:
+        public_key = os.environ.get(public_key_env, '')
+        secret_key = os.environ.get(secret_key_env, '')
     query_url = (
         args.langfuse_query_url
         or os.environ.get('LANGFUSE_QUERY_URL')
@@ -5789,7 +6194,7 @@ def main() -> int:
         profile=profile,
     )
 
-    credentials = _resolve_main_credentials(config=config, args=args)
+    credentials = _resolve_main_credentials(config=config, args=args, profile=profile)
     if isinstance(credentials, int):
         return credentials
     public_key, secret_key, query_url, public_key_env, secret_key_env = credentials
