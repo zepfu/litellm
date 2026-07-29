@@ -677,6 +677,32 @@ def _tool_policy_runtime() -> normalization.Runtime:
     )
 
 
+def _codex_normalization_runtime() -> normalization.Runtime:
+    def _transform(**kwargs: Any) -> dict[str, Any]:
+        responses_request = kwargs["responses_api_request"]
+        tool_choice = responses_request.get("tool_choice")
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            tool_choice = "required"
+        return (
+            {"tool_choice": tool_choice}
+            if tool_choice is not None
+            else {}
+        )
+
+    return normalization.Runtime(
+        clean_secret_string=_clean_secret,
+        merge_metadata=_merge_metadata_for_tools,
+        add_logging_metadata=lambda body, **_kwargs: body,
+        build_span=lambda **kwargs: kwargs,
+        transform_responses_api_request_to_chat_completion_request=_transform,
+        async_responses_api_session_handler=_async_empty_payload,
+        iterate_responses_sse_events=_iterate_events,
+        coerce_namespace_to_mapping=lambda value: value,
+        responses_output_item_has_meaningful_content=_meaningful_output,
+        streaming_response_factory=StreamingResponse,
+    )
+
+
 def _merge_metadata_for_tools(
     body: dict[str, Any],
     *,
@@ -742,7 +768,10 @@ def test_drop_mode_retains_function_tools_and_records_metadata() -> None:
     assert len(result["tools"]) == 2
     meta = result["litellm_metadata"]
     assert meta["opencode_zen_removed_unsupported_tool_count"] == 1
-    assert meta["opencode_zen_removed_unsupported_tool_types"] == ["code_interpreter"]
+    assert meta["opencode_zen_removed_unsupported_tool_types"] == [
+        "code_interpreter"
+    ]
+    assert meta["opencode_zen_removed_unsupported_tool_names"] == []
 
 
 def test_drop_mode_all_unsupported_removes_tools_key() -> None:
@@ -766,6 +795,126 @@ def test_drop_mode_tool_choice_auto_omitted_when_no_functions() -> None:
     }
     result = normalization.strip_unsupported_responses_tools(rt, body)
     assert "tool_choice" not in result
+
+
+def test_empty_tools_auto_omitted_without_caller_mutation() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": [],
+        "tool_choice": "auto",
+    }
+
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+
+    assert result == {"tools": []}
+    assert result is not body
+    assert body == {
+        "tools": [],
+        "tool_choice": "auto",
+    }
+
+
+@pytest.mark.asyncio
+async def test_normalize_codex_request_preserves_named_function_choice() -> None:
+    rt = _codex_normalization_runtime()
+    body: dict[str, Any] = {
+        "model": "opencode/big-pickle",
+        "input": "test",
+        "tools": [_fn_tool("read")],
+        "tool_choice": {"type": "function", "name": "read"},
+    }
+
+    result = await normalization.normalize_codex_request(
+        rt,
+        body,
+        adapter_model="big-pickle",
+    )
+
+    assert result.completion_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "read"},
+    }
+    assert body["tool_choice"] == {"type": "function", "name": "read"}
+    assert body["tools"] == [_fn_tool("read")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tools", "tool_choice"),
+    [
+        (
+            [_fn_tool("read")],
+            {"type": "function", "name": "missing"},
+        ),
+        (
+            [_fn_tool("read")],
+            {"type": "web_search", "name": "search"},
+        ),
+        (
+            None,
+            {"type": "function", "name": "read"},
+        ),
+        (None, "required"),
+        (None, "any"),
+        (None, "tool"),
+    ],
+)
+async def test_normalize_codex_request_rejects_unsatisfied_tool_choice(
+    tools: list[dict[str, Any]] | None,
+    tool_choice: object,
+) -> None:
+    rt = _codex_normalization_runtime()
+    body: dict[str, Any] = {
+        "model": "opencode/big-pickle",
+        "input": "test",
+        "tool_choice": tool_choice,
+    }
+    if tools is not None:
+        body["tools"] = tools
+    original_body = json.loads(json.dumps(body))
+
+    with pytest.raises(ProxyException) as exc_info:
+        await normalization.normalize_codex_request(
+            rt,
+            body,
+            adapter_model="big-pickle",
+        )
+
+    assert str(exc_info.value.code) == "400"
+    assert body == original_body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_choice", "expected_tool_choice"),
+    [
+        ("auto", None),
+        ("none", "none"),
+    ],
+)
+async def test_normalize_codex_request_handles_no_tools_satisfiable_choices(
+    tool_choice: str,
+    expected_tool_choice: str | None,
+) -> None:
+    rt = _codex_normalization_runtime()
+    body: dict[str, Any] = {
+        "model": "opencode/big-pickle",
+        "input": "test",
+        "tool_choice": tool_choice,
+    }
+    original_body = dict(body)
+
+    result = await normalization.normalize_codex_request(
+        rt,
+        body,
+        adapter_model="big-pickle",
+    )
+
+    if expected_tool_choice is None:
+        assert "tool_choice" not in result.completion_kwargs
+    else:
+        assert result.completion_kwargs["tool_choice"] == expected_tool_choice
+    assert body == original_body
 
 
 def test_drop_mode_tool_choice_auto_kept_when_functions_remain() -> None:
@@ -886,6 +1035,30 @@ def test_unknown_mode_yields_400() -> None:
     assert "drop" in str(exc_info.value.message)
 
 
+def test_unknown_mode_without_tools_yields_400() -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "secret-mode"},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+    assert "secret-mode" not in str(exc_info.value.message)
+
+
+@pytest.mark.parametrize("mode", ["strict", "drop"])
+def test_malformed_non_list_tools_rejected(mode: str) -> None:
+    rt = _tool_policy_runtime()
+    body: dict[str, Any] = {
+        "tools": {"type": "function", "name": "not-a-list"},
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": mode},
+    }
+    with pytest.raises(ProxyException) as exc_info:
+        normalization.strip_unsupported_responses_tools(rt, body)
+    assert str(exc_info.value.code) == "400"
+    assert "not-a-list" not in str(exc_info.value.message)
+
+
 def test_drop_mode_metadata_no_value_leakage() -> None:
     """Metadata records only bounded type/name, never definitions/schemas."""
     rt = _tool_policy_runtime()
@@ -909,7 +1082,55 @@ def test_drop_mode_metadata_no_value_leakage() -> None:
     assert "tok123" not in meta_str
     assert "properties" not in meta_str
     assert meta["opencode_zen_removed_unsupported_tool_types"] == ["mcp"]
-    assert meta["opencode_zen_removed_unsupported_tool_names"] == ["secret_tool"]
+    assert meta["opencode_zen_removed_unsupported_tool_names"] == []
+
+
+def test_drop_mode_metadata_is_bounded_for_many_secret_like_tools() -> None:
+    rt = _tool_policy_runtime()
+    secret_values = [
+        f"secret-name-{index}-" + ("n" * 1000) for index in range(40)
+    ]
+    secret_types = [
+        f"secret-type-{index}-" + ("t" * 1000) for index in range(40)
+    ]
+    body: dict[str, Any] = {
+        "tools": [
+            {
+                "type": secret_type,
+                "name": secret_name,
+                "description": "secret-description-" + ("d" * 1000),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"secret": {"type": "string"}},
+                },
+                "server_url": "https://secret.example.invalid/mcp",
+                "arguments": {"token": "secret-token-value"},
+            }
+            for secret_name, secret_type in zip(secret_values, secret_types)
+        ],
+        "litellm_metadata": {"opencode_zen_unsupported_tools_mode": "drop"},
+    }
+
+    result = normalization.strip_unsupported_responses_tools(rt, body)
+    meta = result["litellm_metadata"]
+    adaptation_metadata = {
+        key: value
+        for key, value in meta.items()
+        if key.startswith("opencode_zen_removed_unsupported_tool_")
+    }
+    serialized = json.dumps(adaptation_metadata)
+
+    assert adaptation_metadata == {
+        "opencode_zen_removed_unsupported_tool_count": 40,
+        "opencode_zen_removed_unsupported_tool_types": ["unknown"],
+        "opencode_zen_removed_unsupported_tool_names": [],
+    }
+    assert len(serialized) < 300
+    for secret_value in (*secret_values, *secret_types):
+        assert secret_value not in serialized
+    assert "secret-description" not in serialized
+    assert "secret.example.invalid" not in serialized
+    assert "secret-token-value" not in serialized
 
 
 def test_all_function_tools_no_removal_passthrough() -> None:

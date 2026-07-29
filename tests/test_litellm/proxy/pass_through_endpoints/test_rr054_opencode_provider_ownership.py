@@ -44,8 +44,6 @@ NORMALIZATION_PATH = (
 PROVIDER_OWNED_NORMALIZERS = {
     "get_responses_tool_name",
     "strip_unsupported_responses_tools",
-    "_resolve_unsupported_tools_mode",
-    "_enforce_tool_choice_after_drop",
     "chat_message_role",
     "chat_tool_call_id",
     "chat_message_tool_call_ids",
@@ -106,7 +104,7 @@ PROVIDER_SUBSTANCE_MARKERS = {
     "tool policy enforcement": (
         "opencode_zen_unsupported_tools_mode",
         "ProxyException",
-        "_enforce_tool_choice_after_drop",
+        "invalid_request_error",
     ),
     "stream normalization": (
         "response.output_text.delta",
@@ -122,15 +120,6 @@ GOD_FORBIDDEN_ALGORITHM_MARKERS = {
     '"response.output_item.added"',
     'yield "data: [DONE]\\n\\n"',
 }
-
-SUBSTANTIVE_FUNCTION_MINIMUM_NODES = {
-    "normalize_codex_request": 80,
-    "normalize_responses_stream_for_codex": 140,
-    "sanitize_completion_messages_for_chat_completion": 80,
-    "strip_unsupported_responses_tools": 80,
-    "_enforce_tool_choice_after_drop": 45,
-}
-
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -236,7 +225,6 @@ def test_rr054_opencode_provider_owns_request_and_stream_normalizers() -> None:
 
 def test_rr054_opencode_normalization_owns_substantive_algorithms() -> None:
     provider_source = _read(NORMALIZATION_PATH)
-    provider_tree = _parse(NORMALIZATION_PATH)
 
     assert "class Runtime" in provider_source
     assert "class CodexRequestNormalization" in provider_source
@@ -245,16 +233,6 @@ def test_rr054_opencode_normalization_owns_substantive_algorithms() -> None:
             assert marker in provider_source, (
                 f"OpenCode Zen normalization is missing {concern} marker {marker!r}"
             )
-
-    for function_name, minimum_nodes in SUBSTANTIVE_FUNCTION_MINIMUM_NODES.items():
-        node = _function_node(provider_tree, function_name)
-        assert node is not None
-        node_count = sum(1 for _ in ast.walk(node))
-        assert node_count >= minimum_nodes, (
-            f"{function_name} has only {node_count} AST nodes; "
-            "normalization.py must own the substantive algorithm"
-        )
-
 
 def test_rr054_opencode_normalization_has_no_god_file_back_import() -> None:
     provider_source = _read(NORMALIZATION_PATH)

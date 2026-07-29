@@ -80,13 +80,47 @@ def get_responses_tool_name(
     return None
 
 
-def _ordered_unique_str_values(values: list[Optional[str]]) -> list[str]:
+_MAX_REMOVED_TOOL_TYPE_CATEGORIES = 8
+_REMOVED_TOOL_TYPE_CATEGORIES = {
+    "apply_patch": "apply_patch",
+    "code_interpreter": "code_interpreter",
+    "computer": "computer",
+    "computer_use_preview": "computer",
+    "custom": "custom",
+    "file_search": "file_search",
+    "image_generation": "image_generation",
+    "local_shell": "shell",
+    "mcp": "mcp",
+    "namespace": "namespace",
+    "shell": "shell",
+    "tool_search": "tool_search",
+    "web_search": "web_search",
+    "web_search_preview": "web_search",
+}
+
+
+def _removed_tool_type_category(tool: object) -> str:
+    if not isinstance(tool, dict):
+        return "unknown"
+    tool_type = tool.get("type")
+    if not isinstance(tool_type, str):
+        return "unknown"
+    return _REMOVED_TOOL_TYPE_CATEGORIES.get(tool_type, "unknown")
+
+
+def _ordered_unique_str_values(
+    values: list[Optional[str]],
+    *,
+    max_values: int,
+) -> list[str]:
     unique_values: list[str] = []
     for value in values:
         if not isinstance(value, str) or not value:
             continue
         if value not in unique_values:
             unique_values.append(value)
+        if len(unique_values) >= max_values:
+            break
     return unique_values
 
 
@@ -115,12 +149,12 @@ def _resolve_unsupported_tools_mode(request_body: Payload) -> str:
     )
 
 
-def _enforce_tool_choice_after_drop(
+def _enforce_responses_tool_choice(
     body: Payload,
     retained_function_names: set[str],
     has_retained_functions: bool,
 ) -> None:
-    """Validate and adjust ``tool_choice`` after unsupported tool removal.
+    """Validate and adjust ``tool_choice`` for retained function tools.
 
     Mutates *body* in place (already a shallow copy owned by the caller).
     """
@@ -135,7 +169,7 @@ def _enforce_tool_choice_after_drop(
             if not has_retained_functions:
                 body.pop("tool_choice", None)
             return
-        if tool_choice in ("required", "any"):
+        if tool_choice in ("required", "any", "tool"):
             if has_retained_functions:
                 return
             raise ProxyException(
@@ -191,31 +225,47 @@ def strip_unsupported_responses_tools(
     runtime: Runtime,
     request_body: Payload,
 ) -> Payload:
+    mode = _resolve_unsupported_tools_mode(request_body)
+    if "tools" not in request_body:
+        updated_body = dict(request_body)
+        _enforce_responses_tool_choice(updated_body, set(), False)
+        if "allowed_tools" in updated_body:
+            raise ProxyException(
+                message=(
+                    "OpenCode Zen does not support 'allowed_tools' "
+                    "without retained function tools."
+                ),
+                type="invalid_request_error",
+                param="allowed_tools",
+                code=400,
+            )
+        return (
+            updated_body
+            if updated_body != request_body
+            else request_body
+        )
+
     tools = request_body.get("tools")
     if not isinstance(tools, list):
-        return request_body
-
-    mode = _resolve_unsupported_tools_mode(request_body)
+        raise ProxyException(
+            message="OpenCode Zen requires 'tools' to be a list.",
+            type="invalid_request_error",
+            param="tools",
+            code=400,
+        )
 
     supported_tools: list[object] = []
-    removed_tool_types: list[Optional[str]] = []
-    removed_tool_names: list[Optional[str]] = []
+    removed_tool_type_categories: list[Optional[str]] = []
     for tool in tools:
         tool_type = tool.get("type") if isinstance(tool, dict) else None
         tool_name = get_responses_tool_name(runtime, tool)
         if tool_type == "function" and tool_name:
             supported_tools.append(tool)
             continue
-        removed_tool_types.append(
-            str(tool_type) if tool_type is not None else "unknown"
-        )
-        removed_tool_names.append(tool_name)
+        removed_tool_type_categories.append(_removed_tool_type_category(tool))
 
     removed_count = len(tools) - len(supported_tools)
-    if removed_count <= 0:
-        return request_body
-
-    if mode == "strict":
+    if removed_count > 0 and mode == "strict":
         raise ProxyException(
             message=(
                 "OpenCode Zen strict tool policy rejects unsupported or "
@@ -228,12 +278,12 @@ def strip_unsupported_responses_tools(
             code=400,
         )
 
-    # -- drop mode --
     updated_body = dict(request_body)
-    if supported_tools:
-        updated_body["tools"] = supported_tools
-    else:
-        updated_body.pop("tools", None)
+    if removed_count > 0:
+        if supported_tools:
+            updated_body["tools"] = supported_tools
+        else:
+            updated_body.pop("tools", None)
 
     retained_function_names = {
         name
@@ -241,7 +291,7 @@ def strip_unsupported_responses_tools(
         if isinstance(tool, dict)
         and (name := get_responses_tool_name(runtime, tool)) is not None
     }
-    _enforce_tool_choice_after_drop(
+    _enforce_responses_tool_choice(
         updated_body, retained_function_names, bool(supported_tools)
     )
 
@@ -256,17 +306,25 @@ def strip_unsupported_responses_tools(
             code=400,
         )
 
+    if removed_count <= 0:
+        return (
+            updated_body
+            if updated_body != request_body
+            else request_body
+        )
+
     return runtime.merge_metadata(
         updated_body,
         tags_to_add=["opencode-zen-unsupported-tools-stripped"],
         extra_fields={
             "opencode_zen_removed_unsupported_tool_count": removed_count,
             "opencode_zen_removed_unsupported_tool_types": (
-                _ordered_unique_str_values(removed_tool_types)
+                _ordered_unique_str_values(
+                    removed_tool_type_categories,
+                    max_values=_MAX_REMOVED_TOOL_TYPE_CATEGORIES,
+                )
             ),
-            "opencode_zen_removed_unsupported_tool_names": (
-                _ordered_unique_str_values(removed_tool_names)
-            ),
+            "opencode_zen_removed_unsupported_tool_names": [],
         },
     )
 
@@ -490,6 +548,17 @@ async def normalize_codex_request(
             metadata=litellm_metadata,
         )
     )
+    responses_tool_choice = responses_api_request.get("tool_choice")
+    if (
+        isinstance(responses_tool_choice, dict)
+        and responses_tool_choice.get("type") == "function"
+    ):
+        named_function = responses_tool_choice.get("name")
+        if isinstance(named_function, str) and named_function:
+            completion_kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {"name": named_function},
+            }
     completion_kwargs["metadata"] = litellm_metadata
     previous_response_id = responses_api_request.get("previous_response_id")
     if previous_response_id:
