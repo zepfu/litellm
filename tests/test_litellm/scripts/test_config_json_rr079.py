@@ -147,3 +147,49 @@ def test_should_enforce_minimum_trace_count_from_config_values(ra, config) -> No
     )
     assert full_fail
     assert "14" in full_fail[0]
+
+
+# ---------------------------------------------------------------------------
+# D1-574/MS-033: target_profiles and credential source in config.json
+# ---------------------------------------------------------------------------
+
+
+def test_config_declares_target_profiles(config) -> None:
+    profiles = config.get("target_profiles")
+    assert isinstance(profiles, dict)
+    assert "dev" in profiles
+    assert "prod" in profiles
+
+    dev = profiles["dev"]
+    assert dev["litellm_base_url"] == "http://127.0.0.1:4001"
+    assert dev["anthropic_base_url"] == "http://127.0.0.1:4001/anthropic"
+    assert dev["gemini_base_url"] == "http://127.0.0.1:4001/gemini"
+    assert dev["codex_profile"] == "litellm-dev"
+    assert dev["docker_container_name"] == "litellm-dev"
+    assert dev["expected_trace_environment"] == "dev"
+
+    prod = profiles["prod"]
+    assert prod["litellm_base_url"] == "http://127.0.0.1:4000"
+    assert prod["anthropic_base_url"] == "http://127.0.0.1:4000/anthropic"
+    assert prod["gemini_base_url"] == "http://127.0.0.1:4000/gemini"
+    assert prod["codex_profile"] == "litellm"
+    assert prod["docker_container_name"] == "aawm-litellm"
+    assert prod["expected_trace_environment"] == "prod"
+
+
+def test_config_declares_target_container_credential_source(config) -> None:
+    assert config.get("langfuse_credential_source") == "target_container"
+
+
+def test_config_target_profiles_match_adapter_harness_contract(config) -> None:
+    """Dev/prod profiles must match the adapter harness BUILT_IN_TARGET_PROFILES
+    contract (run_anthropic_adapter_acceptance.py lines 25-36)."""
+    dev = config["target_profiles"]["dev"]
+    prod = config["target_profiles"]["prod"]
+    # Adapter harness dev: :4001, litellm-dev, environment dev
+    assert dev["litellm_base_url"].endswith(":4001")
+    assert dev["docker_container_name"] == "litellm-dev"
+    assert dev["expected_trace_environment"] == "dev"
+    # Adapter harness prod: :4000, environment prod
+    assert prod["litellm_base_url"].endswith(":4000")
+    assert prod["expected_trace_environment"] == "prod"

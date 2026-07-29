@@ -30,13 +30,26 @@ Adapter case prompts use paths relative to the repository root. Run the adapter
 harness from the checkout it belongs to so fixture paths such as
 `scripts/local-ci/sequential_core_tools_fixture.txt` resolve consistently.
 
-## Required Environment
+## Target And Credentials
 
-- `LANGFUSE_PUBLIC_KEY`
-- `LANGFUSE_SECRET_KEY`
-- optional: `LANGFUSE_QUERY_URL`
-- optional: `LITELLM_BASE_URL`
-- optional: `ACCEPTANCE_CONFIG_PATH`
+The checked-in config resolves Langfuse credentials from the selected target
+container (`litellm-dev` for dev, `aawm-litellm` for prod). Host
+`LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` values are not used as fallback
+credentials for that default contract. The named container must expose both
+variables or the harness fails before client execution.
+
+Target selection precedence is `--target`, `ACCEPTANCE_TARGET`, config
+`target`, then exact inference from the effective `LITELLM_BASE_URL`. Unknown
+or ambiguous URLs and explicit target/URL conflicts fail before Docker
+lifecycle or provider CLI work. The default checked-in `:4000` URL selects
+`prod`; `LITELLM_BASE_URL=http://127.0.0.1:4001` selects `dev`.
+
+Optional harness environment:
+
+- `LANGFUSE_QUERY_URL`
+- `LITELLM_BASE_URL`
+- `ACCEPTANCE_TARGET`
+- `ACCEPTANCE_CONFIG_PATH`
 
 Provider CLIs must also be installed and configured separately.
 
@@ -47,8 +60,8 @@ through, but Langfuse, database, PostgreSQL, and LiteLLM admin secrets such as
 keys, including `LITELLM_BASE_URL`, are inherited.
 
 The shell wrapper does not source `.env`. It parses the file and exports only
-Langfuse settings plus named harness overrides to the parent Python process;
-database and unrelated provider secrets in `.env` are ignored.
+allowlisted harness settings that were not already supplied by the invoking
+environment; database and unrelated provider secrets in `.env` are ignored.
 
 CLI stdout and stderr stored in the JSON artifact are capped at 200,000
 characters per stream by default. Set `ACCEPTANCE_CLI_OUTPUT_MAX_CHARS` to tune

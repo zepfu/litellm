@@ -4,11 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ARTIFACT_PATH="${1:-$ROOT/.analysis/artifacts/local-acceptance-$(date -u +%Y%m%dT%H%M%SZ).json}"
 CLI_CLAUDE_FANOUT_MODE="${2:-}"
-REBUILD_LITELLM_DEV="${REBUILD_LITELLM_DEV:-1}"
-BUILD_STATE_PATH="${BUILD_STATE_PATH:-$ROOT/.analysis/artifacts/litellm-dev-build-state.json}"
-CONFIG_PATH="${ACCEPTANCE_CONFIG_PATH:-scripts/local-ci/config.json}"
 
 cd "$ROOT"
+
+declare -A HARNESS_INCOMING_ENV_PRESENT=()
+while IFS='=' read -r incoming_key _; do
+  HARNESS_INCOMING_ENV_PRESENT["$incoming_key"]=1
+done < <(env)
 
 # RR-081 Medium #3: do NOT `set -a; source .env` (that re-exports every secret
 # into the process environment inherited by provider CLIs). Load only the keys
@@ -28,6 +30,7 @@ load_harness_dotenv() {
     "LITELLM_BASE_URL"
     "LITELLM_PORT"
     "ACCEPTANCE_CONFIG_PATH"
+    "ACCEPTANCE_TARGET"
     "ACCEPTANCE_CLI_OUTPUT_MAX_CHARS"
     "CLAUDE_FANOUT_MODE"
     "REBUILD_LITELLM_DEV"
@@ -59,7 +62,7 @@ load_harness_dotenv() {
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Strip CR (Windows line endings) and leading/trailing whitespace.
-    line="${line//$''/}"
+    line="${line//$'\r'/}"
     # Trim leading whitespace.
     line="${line#"${line%%[![:space:]]*}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
@@ -86,28 +89,21 @@ load_harness_dotenv() {
       fi
     fi
     # Export only allowlisted keys (no `set -a` / full-file source).
-    export "$key=$value"
+    if [[ -z "${HARNESS_INCOMING_ENV_PRESENT[$key]+x}" ]]; then
+      export "$key=$value"
+    fi
   done < "$env_file"
 }
 
 load_harness_dotenv "$ROOT/.env"
 
-export LANGFUSE_QUERY_URL="${LANGFUSE_QUERY_URL:-http://127.0.0.1:3000}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-CLAUDE_FANOUT_MODE="${CLI_CLAUDE_FANOUT_MODE:-${CLAUDE_FANOUT_MODE:-minimal}}"
-
-resolve_litellm_base_url() {
-  "$PYTHON_BIN" - "$CONFIG_PATH" <<'PY'
-import json
-import os
-import pathlib
-import sys
-
-config_path = pathlib.Path(sys.argv[1])
-config = json.loads(config_path.read_text())
-print(os.environ.get("LITELLM_BASE_URL") or config.get("litellm_base_url", "http://127.0.0.1:4001"))
-PY
-}
+REBUILD_LITELLM_DEV="${REBUILD_LITELLM_DEV-1}"
+BUILD_STATE_PATH="${BUILD_STATE_PATH-$ROOT/.analysis/artifacts/litellm-dev-build-state.json}"
+CONFIG_PATH="${ACCEPTANCE_CONFIG_PATH-scripts/local-ci/config.json}"
+ACCEPTANCE_TARGET="${ACCEPTANCE_TARGET-}"
+export LANGFUSE_QUERY_URL="${LANGFUSE_QUERY_URL-http://127.0.0.1:3000}"
+PYTHON_BIN="${PYTHON_BIN-python3}"
+CLAUDE_FANOUT_MODE="${CLI_CLAUDE_FANOUT_MODE:-${CLAUDE_FANOUT_MODE-minimal}}"
 
 compute_build_fingerprint() {
   "$PYTHON_BIN" - <<'PY'
@@ -243,7 +239,24 @@ persist_litellm_dev_build_state() {
   fi
 }
 
-TARGET_LITELLM_BASE_URL="$(resolve_litellm_base_url)"
+TARGET_RESOLUTION_ARGS=(
+  scripts/local-ci/run_acceptance.py
+  --config "$CONFIG_PATH"
+  --resolve-target-json
+)
+if [[ -n "$ACCEPTANCE_TARGET" ]]; then
+  TARGET_RESOLUTION_ARGS+=(--target "$ACCEPTANCE_TARGET")
+fi
+TARGET_RESOLUTION_JSON="$("$PYTHON_BIN" "${TARGET_RESOLUTION_ARGS[@]}")"
+IFS=$'\t' read -r ACCEPTANCE_TARGET TARGET_LITELLM_BASE_URL < <(
+  "$PYTHON_BIN" -c \
+    'import json,sys; d=json.load(sys.stdin); print(d["target_name"], d["litellm_base_url"], sep="\t")' \
+    <<<"$TARGET_RESOLUTION_JSON"
+)
+if [[ -z "$ACCEPTANCE_TARGET" || -z "$TARGET_LITELLM_BASE_URL" ]]; then
+  echo "Acceptance target preflight returned an incomplete profile." >&2
+  exit 2
+fi
 
 if [[ "$TARGET_LITELLM_BASE_URL" == "http://127.0.0.1:4001" ]]; then
   if [[ "$REBUILD_LITELLM_DEV" == "1" ]] && should_rebuild_litellm_dev; then
@@ -279,4 +292,5 @@ fi
 exec "$PYTHON_BIN" scripts/local-ci/run_acceptance.py \
   --config "$CONFIG_PATH" \
   --claude-fanout-mode "$CLAUDE_FANOUT_MODE" \
+  --target "$ACCEPTANCE_TARGET" \
   --write-artifact "$ARTIFACT_PATH"

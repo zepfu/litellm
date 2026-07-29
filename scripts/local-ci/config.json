@@ -4,6 +4,25 @@
   "langfuse_query_url": "http://127.0.0.1:3000",
   "langfuse_public_key_env": "LANGFUSE_PUBLIC_KEY",
   "langfuse_secret_key_env": "LANGFUSE_SECRET_KEY",
+  "langfuse_credential_source": "target_container",
+  "target_profiles": {
+    "dev": {
+      "litellm_base_url": "http://127.0.0.1:4001",
+      "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+      "gemini_base_url": "http://127.0.0.1:4001/gemini",
+      "codex_profile": "litellm-dev",
+      "docker_container_name": "litellm-dev",
+      "expected_trace_environment": "dev"
+    },
+    "prod": {
+      "litellm_base_url": "http://127.0.0.1:4000",
+      "anthropic_base_url": "http://127.0.0.1:4000/anthropic",
+      "gemini_base_url": "http://127.0.0.1:4000/gemini",
+      "codex_profile": "litellm",
+      "docker_container_name": "aawm-litellm",
+      "expected_trace_environment": "prod"
+    }
+  },
   "codex": {
     "command": [
       "codex",

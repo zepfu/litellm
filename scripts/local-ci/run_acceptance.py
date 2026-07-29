@@ -12,12 +12,12 @@ import pathlib
 import re
 import shlex
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from typing import Any
 
 
@@ -284,6 +284,8 @@ def _rewrite_config_path_tokens(value: Any, config_dir: pathlib.Path) -> Any:
 
 def _load_suite_config(path: pathlib.Path) -> dict[str, Any]:
     config = _load_json(path)
+    if not isinstance(config, dict):
+        raise SystemExit("Acceptance config must be a JSON object")
     return _rewrite_config_path_tokens(config, path.resolve().parent)
 
 
@@ -324,6 +326,345 @@ def _resolve_litellm_base_url(config: dict[str, Any]) -> str:
     return os.environ.get("LITELLM_BASE_URL") or config.get(
         "litellm_base_url", "http://127.0.0.1:4001"
     )
+
+
+# ---------------------------------------------------------------------------
+# Target profile system (D1-574/MS-033): consistent dev/prod route rewriting.
+# Follows the established adapter-harness pattern
+# (run_anthropic_adapter_acceptance.py).
+# ---------------------------------------------------------------------------
+
+BUILT_IN_TARGET_PROFILES: dict[str, dict[str, str]] = {
+    "dev": {
+        "litellm_base_url": "http://127.0.0.1:4001",
+        "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        "gemini_base_url": "http://127.0.0.1:4001/gemini",
+        "codex_profile": "litellm-dev",
+        "docker_container_name": "litellm-dev",
+        "expected_trace_environment": "dev",
+    },
+    "prod": {
+        "litellm_base_url": "http://127.0.0.1:4000",
+        "anthropic_base_url": "http://127.0.0.1:4000/anthropic",
+        "gemini_base_url": "http://127.0.0.1:4000/gemini",
+        "codex_profile": "litellm",
+        "docker_container_name": "aawm-litellm",
+        "expected_trace_environment": "prod",
+    },
+}
+
+_DOCKER_SUBPROCESS_TIMEOUT_SECONDS = 15
+_TARGET_PROFILE_REQUIRED_KEYS = (
+    "litellm_base_url",
+    "anthropic_base_url",
+    "gemini_base_url",
+    "codex_profile",
+    "docker_container_name",
+    "expected_trace_environment",
+)
+_TARGET_PROFILE_ARTIFACT_KEYS = (
+    "target_name",
+    *_TARGET_PROFILE_REQUIRED_KEYS,
+)
+
+
+def _resolve_container_env_value(
+    container_name: str,
+    env_name: str,
+    *,
+    cache: dict[tuple[str, str], str] | None = None,
+) -> str | None:
+    """Retrieve a named env var from a running container via docker exec.
+
+    Successful results may be cached within one harness invocation. Failed
+    lookups are never cached. Values are never printed, logged, or persisted.
+    """
+    cache_key = (container_name, env_name)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    value: str | None = None
+    try:
+        result = subprocess.run(
+            ["docker", "exec", container_name, "printenv", env_name],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=_DOCKER_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            value = result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    if value is not None and cache is not None:
+        cache[cache_key] = value
+    return value
+
+
+def _merged_target_profiles(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    profiles = {name: dict(profile) for name, profile in BUILT_IN_TARGET_PROFILES.items()}
+    if "target_profiles" in config and not isinstance(config["target_profiles"], dict):
+        raise SystemExit("target_profiles must be an object")
+    configured = config.get("target_profiles")
+    if isinstance(configured, dict):
+        for name, configured_profile in configured.items():
+            if not isinstance(name, str) or not isinstance(configured_profile, dict):
+                raise SystemExit("target_profiles must map names to profile objects")
+            profile = dict(profiles.get(name, {}))
+            if not all(isinstance(key, str) for key in configured_profile):
+                raise SystemExit("target profile keys must be strings")
+            profile.update(configured_profile)
+            profiles[name] = profile
+    return profiles
+
+
+def _validate_target_profile(name: str, profile: dict[str, Any]) -> None:
+    invalid = [
+        key
+        for key in _TARGET_PROFILE_REQUIRED_KEYS
+        if not isinstance(profile.get(key), str) or not profile[key].strip()
+    ]
+    if invalid:
+        raise SystemExit(
+            f"Acceptance target `{name}` has missing or non-string required keys: "
+            f"{', '.join(invalid)}"
+        )
+
+
+def _normalize_base_url(value: Any) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _infer_target_from_base_url(
+    config: dict[str, Any],
+    profiles: dict[str, dict[str, Any]],
+) -> str:
+    """Infer exactly one merged target from the effective LiteLLM base URL.
+
+    Unknown and ambiguous URLs fail closed before lifecycle or client work.
+    """
+    base_url = _normalize_base_url(_resolve_litellm_base_url(config))
+    matches = [
+        name
+        for name, profile in profiles.items()
+        if _normalize_base_url(profile.get("litellm_base_url")) == base_url
+    ]
+    if not matches:
+        raise SystemExit(
+            f"Effective LITELLM_BASE_URL `{base_url}` does not match any configured "
+            "acceptance target profile"
+        )
+    if len(matches) > 1:
+        raise SystemExit(
+            f"Effective LITELLM_BASE_URL `{base_url}` is ambiguous across target "
+            f"profiles: {', '.join(sorted(matches))}"
+        )
+    return matches[0]
+
+
+def _resolve_target_profile(
+    config: dict[str, Any], target: str | None = None
+) -> dict[str, str]:
+    """Resolve the effective target profile from CLI arg, env, config, or URL.
+
+    Precedence: explicit ``target`` arg > ``ACCEPTANCE_TARGET`` env >
+    config ``target`` key > inferred merged profile match for the effective
+    ``LITELLM_BASE_URL``. Explicit target and URL conflicts fail closed.
+    """
+    profiles = _merged_target_profiles(config)
+    env_target = os.environ.get("ACCEPTANCE_TARGET")
+    config_target = config.get("target")
+    effective_target = target or env_target or config_target
+    target_source = (
+        "command line"
+        if target
+        else "ACCEPTANCE_TARGET"
+        if env_target
+        else "config target"
+        if config_target
+        else "LITELLM_BASE_URL"
+    )
+    if not effective_target:
+        effective_target = _infer_target_from_base_url(config, profiles)
+    if effective_target not in profiles:
+        valid = ", ".join(sorted(profiles))
+        raise SystemExit(
+            f"Unknown acceptance target `{effective_target}`. Valid targets: {valid}"
+        )
+    profile = dict(profiles[effective_target])
+    _validate_target_profile(str(effective_target), profile)
+    explicit_url = os.environ.get("LITELLM_BASE_URL")
+    if explicit_url and _normalize_base_url(explicit_url) != _normalize_base_url(
+        profile["litellm_base_url"]
+    ):
+        raise SystemExit(
+            f"{target_source} selected target `{effective_target}` but "
+            f"LITELLM_BASE_URL `{explicit_url}` conflicts with its profile URL "
+            f"`{profile['litellm_base_url']}`"
+        )
+    if config_target and not target and not env_target:
+        configured_url = config.get("litellm_base_url")
+        if configured_url and _normalize_base_url(configured_url) != _normalize_base_url(
+            profile["litellm_base_url"]
+        ):
+            raise SystemExit(
+                f"config target `{effective_target}` conflicts with configured "
+                f"litellm_base_url `{configured_url}`"
+            )
+    profile["target_name"] = str(effective_target)
+    return profile
+
+
+def _public_target_profile(profile: dict[str, str]) -> dict[str, str]:
+    """Return the non-secret target fields permitted in artifacts/preflight."""
+    return {
+        key: profile[key]
+        for key in _TARGET_PROFILE_ARTIFACT_KEYS
+        if isinstance(profile.get(key), str)
+    }
+
+
+def _require_family_config(config: dict[str, Any], family_name: str) -> dict[str, Any]:
+    family = config.get(family_name)
+    if not isinstance(family, dict):
+        raise SystemExit(f"Acceptance config requires `{family_name}` as an object")
+    command = family.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(token, str) for token in command)
+    ):
+        raise SystemExit(
+            f"Acceptance config `{family_name}.command` must be a non-empty list[str]"
+        )
+    if "env" in family and not isinstance(family["env"], dict):
+        raise SystemExit(f"Acceptance config `{family_name}.env` must be an object")
+    return family
+
+
+def _apply_target_profile(config: dict[str, Any], profile: dict[str, str]) -> None:
+    """Rewrite family routes in-place for the selected target profile.
+
+    Codex: rewrites the ``-p <profile>`` argument.
+    Claude: rewrites ``env.ANTHROPIC_BASE_URL``.
+    Gemini: injects ``env.CODE_ASSIST_ENDPOINT`` (OAuth Code Assist contract).
+    All families: ``expected_trace_environment`` is set from the profile.
+    """
+    config["litellm_base_url"] = profile["litellm_base_url"]
+    expected_env = profile["expected_trace_environment"]
+    codex = _require_family_config(config, "codex")
+    claude = _require_family_config(config, "claude")
+    gemini = _require_family_config(config, "gemini")
+
+    # --- Codex: rewrite -p <profile> in command (fail closed) ---
+    codex["expected_trace_environment"] = expected_env
+    codex_command = codex["command"]
+    codex_profile = profile["codex_profile"]
+    profile_flags = [
+        i for i, token in enumerate(codex_command) if token == "-p"
+    ]
+    if len(profile_flags) != 1 or profile_flags[0] + 1 >= len(codex_command):
+        raise SystemExit(
+            f"Cannot apply target profile: codex command requires exactly one "
+            f"rewritable `-p <profile>` argument. Refusing to run "
+            f"with an unrouted command under target "
+            f"`{profile.get('expected_trace_environment', '?')}`."
+        )
+    codex_command[profile_flags[0] + 1] = codex_profile
+
+    # --- Claude: rewrite ANTHROPIC_BASE_URL ---
+    claude["expected_trace_environment"] = expected_env
+    env_block = claude.setdefault("env", {})
+    env_block["ANTHROPIC_BASE_URL"] = profile["anthropic_base_url"]
+    fanout_modes = claude.get("fanout_modes", {})
+    if not isinstance(fanout_modes, dict):
+        raise SystemExit(
+            "Cannot apply target profile: claude fanout_modes must be an object"
+        )
+    for mode_name, mode_cfg in fanout_modes.items():
+        if not isinstance(mode_name, str) or not isinstance(mode_cfg, dict):
+            raise SystemExit(
+                "Cannot apply target profile: claude fanout modes must map names "
+                "to objects"
+            )
+        mode_command = mode_cfg.get("command")
+        if (
+            not isinstance(mode_command, list)
+            or not mode_command
+            or not all(isinstance(token, str) for token in mode_command)
+        ):
+            raise SystemExit(
+                f"Acceptance config `claude.fanout_modes.{mode_name}.command` "
+                "must be a non-empty list[str]"
+            )
+        mode_env = mode_cfg.setdefault("env", {})
+        if not isinstance(mode_env, dict):
+            raise SystemExit(
+                f"Cannot apply target profile: claude fanout mode "
+                f"`{mode_name}` env must be an object"
+            )
+        mode_cfg["expected_trace_environment"] = expected_env
+        mode_env["ANTHROPIC_BASE_URL"] = profile["anthropic_base_url"]
+
+    # --- Gemini: inject CODE_ASSIST_ENDPOINT for OAuth routing ---
+    gemini["expected_trace_environment"] = expected_env
+    gemini_env = gemini.setdefault("env", {})
+    gemini_env["CODE_ASSIST_ENDPOINT"] = profile["gemini_base_url"]
+
+
+def _resolve_langfuse_credentials(
+    config: dict[str, Any],
+    profile: dict[str, str] | None,
+    *,
+    container_env_cache: dict[tuple[str, str], str] | None = None,
+) -> tuple[str, str]:
+    """Resolve Langfuse credentials from the target container or host env.
+
+    When config declares ``langfuse_credential_source=target_container`` and a
+    profile with ``docker_container_name`` is active, credentials are resolved
+    exclusively from the container. Missing/unreadable container credentials
+    fail closed -- no fallback to host/.env values. Secret values are never
+    logged or persisted.
+    """
+    public_key_env = config.get("langfuse_public_key_env", "LANGFUSE_PUBLIC_KEY")
+    secret_key_env = config.get("langfuse_secret_key_env", "LANGFUSE_SECRET_KEY")
+    credential_source = config.get("langfuse_credential_source", "host_env")
+
+    if credential_source == "target_container":
+        if profile is None:
+            raise SystemExit(
+                "langfuse_credential_source=target_container requires a resolved "
+                "acceptance target profile"
+            )
+        container = profile.get("docker_container_name", "")
+        if not container:
+            raise SystemExit(
+                "langfuse_credential_source=target_container but target profile "
+                "has no docker_container_name"
+            )
+        pk = _resolve_container_env_value(
+            container, public_key_env, cache=container_env_cache
+        )
+        sk = _resolve_container_env_value(
+            container, secret_key_env, cache=container_env_cache
+        )
+        if not pk or not sk:
+            raise SystemExit(
+                f"Failed to resolve Langfuse credentials from container "
+                f"`{container}` ({public_key_env}/{secret_key_env}). "
+                f"Refusing to fall back to host environment."
+            )
+        return pk, sk
+
+    # Default: host environment (existing behavior).
+    pk = os.environ.get(public_key_env, "")
+    sk = os.environ.get(secret_key_env, "")
+    if not pk or not sk:
+        raise SystemExit(
+            f"Missing Langfuse credentials in env vars {public_key_env}/{secret_key_env}"
+        )
+    return pk, sk
+
 
 
 def _build_claude_harness_user_id(
@@ -1837,6 +2178,21 @@ def _poll_langfuse_named_traces(
         time.sleep(interval_seconds)
 
 
+def _decode_partial_output(value: Any) -> str:
+    """Decode subprocess partial output that may be str or bytes.
+
+    ``subprocess.TimeoutExpired`` may carry bytes for stdout/stderr even when
+    ``text=True`` was requested (CPython behaviour varies by platform/version).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
 def _run_command(
     command: list[str],
     *,
@@ -1860,6 +2216,36 @@ def _run_command(
             timeout=timeout_seconds,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        duration = round(time.time() - started, 3)
+        raw_stdout = _decode_partial_output(exc.stdout)
+        raw_stderr = _decode_partial_output(exc.stderr)
+        raw_stdout = raw_stdout.strip()
+        raw_stderr = raw_stderr.strip()
+        max_chars = (
+            _cli_output_max_chars()
+            if output_max_chars is None
+            else max(0, int(output_max_chars))
+        )
+        stdout, stdout_truncated = _truncate_captured_text(raw_stdout, max_chars)
+        stderr, stderr_truncated = _truncate_captured_text(raw_stderr, max_chars)
+        return {
+            "command": effective_command,
+            "command_string": " ".join(shlex.quote(part) for part in effective_command),
+            "exit_code": -1,
+            "duration_seconds": duration,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "stdout_original_chars": len(raw_stdout),
+            "stderr_original_chars": len(raw_stderr),
+            "output_max_chars": max_chars,
+            "response_excerpt": _response_excerpt(stdout, stderr),
+            "timed_out": True,
+            "timeout_seconds": timeout_seconds,
+            "phase": "client_subprocess",
+        }
     finally:
         if settings_overlay_path is not None:
             try:
@@ -1974,6 +2360,7 @@ def _validate_codex(
 ) -> dict[str, Any]:
     started = _utcnow()
     run = _run_command(config["command"], timeout_seconds=int(config.get("timeout_seconds", 300)))
+    _record_family_run_evidence(run)
     command_session_id = _extract_command_session_id(run["stdout"])
     post_run_wait_seconds = float(config.get("post_run_wait_seconds", 0) or 0)
     if post_run_wait_seconds > 0:
@@ -1994,7 +2381,11 @@ def _validate_codex(
     trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
     failures: list[str] = []
     warnings: list[str] = []
-    if run["exit_code"] != 0:
+    if run.get("timed_out"):
+        failures.append(
+            f"codex command timed out after {run.get('timeout_seconds', '?')}s"
+        )
+    elif run["exit_code"] != 0:
         failures.append("codex command failed")
     failures.extend(
         _enforce_minimum_trace_count(family="codex", traces=traces, config=config)
@@ -2095,7 +2486,12 @@ def _validate_gemini(
     secret_key: str,
 ) -> dict[str, Any]:
     started = _utcnow()
-    run = _run_command(config["command"], timeout_seconds=int(config.get("timeout_seconds", 300)))
+    run = _run_command(
+        config["command"],
+        extra_env=config.get("env"),
+        timeout_seconds=int(config.get("timeout_seconds", 300)),
+    )
+    _record_family_run_evidence(run)
     command_session_id = _extract_command_session_id(run["stdout"])
     post_run_wait_seconds = float(config.get("post_run_wait_seconds", 0) or 0)
     if post_run_wait_seconds > 0:
@@ -2117,7 +2513,11 @@ def _validate_gemini(
     trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
     failures: list[str] = []
     warnings: list[str] = []
-    if run["exit_code"] != 0:
+    if run.get("timed_out"):
+        failures.append(
+            f"gemini command timed out after {run.get('timeout_seconds', '?')}s"
+        )
+    elif run["exit_code"] != 0:
         failures.append("gemini command failed")
     failures.extend(
         _enforce_minimum_trace_count(family="gemini", traces=traces, config=config)
@@ -2255,6 +2655,7 @@ def _validate_claude(
         extra_env=effective_config.get("env"),
         timeout_seconds=int(effective_config.get("timeout_seconds", 300)),
     )
+    _record_family_run_evidence(run)
     command_session_id = _extract_command_session_id(run["stdout"])
     post_run_wait_seconds = float(effective_config.get("post_run_wait_seconds", 0) or 0)
     if post_run_wait_seconds > 0:
@@ -2291,7 +2692,11 @@ def _validate_claude(
     trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
     failures: list[str] = []
     warnings: list[str] = []
-    if run["exit_code"] != 0:
+    if run.get("timed_out"):
+        failures.append(
+            f"claude command timed out after {run.get('timeout_seconds', '?')}s"
+        )
+    elif run["exit_code"] != 0:
         failures.append("claude command failed")
     failures.extend(
         _enforce_minimum_trace_count(
@@ -2515,7 +2920,35 @@ def _build_summary(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _family_error_result(name: str, exc: Exception) -> dict[str, Any]:
+def _family_error_result(
+    name: str,
+    exc: Exception,
+    *,
+    run_evidence: dict[str, Any] | None = None,
+    phase: str = "initialization",
+) -> dict[str, Any]:
+    """Build a family error result, preserving subprocess evidence if available.
+
+    When ``run_evidence`` is provided (the subprocess completed or timed out
+    before the observability phase failed), the artifact retains command,
+    exit code, bounded stdout/stderr, and the phase where failure occurred.
+    """
+    if run_evidence:
+        result = dict(run_evidence)
+        result["phase"] = phase
+        result["streaming_checked"] = False
+        result["langfuse"] = {
+            "expected_trace_names": [],
+            "actual_trace_names": [],
+            "expected_user_ids": [],
+            "actual_user_ids": [],
+            "trace_ids": [],
+            "trace_count": 0,
+        }
+        result["passed"] = False
+        result["failures"] = [f"{name} {phase} error: {exc}"]
+        result["warnings"] = []
+        return result
     return {
         "command": [],
         "command_string": "",
@@ -2524,6 +2957,7 @@ def _family_error_result(name: str, exc: Exception) -> dict[str, Any]:
         "stdout": "",
         "stderr": "",
         "response_excerpt": "",
+        "phase": phase,
         "streaming_checked": False,
         "langfuse": {
             "expected_trace_names": [],
@@ -2534,15 +2968,50 @@ def _family_error_result(name: str, exc: Exception) -> dict[str, Any]:
             "trace_count": 0,
         },
         "passed": False,
-        "failures": [f"{name} validator error: {exc}"],
+        "failures": [f"{name} {phase} error: {exc}"],
         "warnings": [],
     }
+
+
+def _run_family_with_evidence(
+    name: str,
+    validate_fn: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Run a family validator, preserving subprocess evidence on failure.
+
+    If the validator raises after the subprocess has run, the returned result
+    retains command, exit code, bounded stdout/stderr, and phase.
+    """
+    invocation: dict[str, Any] = {}
+    token = _CURRENT_FAMILY_INVOCATION.set(invocation)
+    try:
+        return validate_fn(*args, **kwargs)
+    except Exception as exc:
+        run_evidence = invocation.get("run_evidence")
+        phase = "observability_validation" if run_evidence else "initialization"
+        return _family_error_result(name, exc, run_evidence=run_evidence, phase=phase)
+    finally:
+        _CURRENT_FAMILY_INVOCATION.reset(token)
+
+
+_CURRENT_FAMILY_INVOCATION: ContextVar[dict[str, Any] | None] = ContextVar(
+    "acceptance_family_invocation",
+    default=None,
+)
+
+
+def _record_family_run_evidence(run: dict[str, Any]) -> None:
+    invocation = _CURRENT_FAMILY_INVOCATION.get()
+    if invocation is not None:
+        invocation["run_evidence"] = run
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run local CLI acceptance checks through litellm-dev.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to suite config JSON.")
-    parser.add_argument("--write-artifact", required=True, help="Where to write the JSON artifact.")
+    parser.add_argument("--write-artifact", default=None, help="Where to write the JSON artifact.")
     parser.add_argument("--langfuse-query-url", default=None, help="Override Langfuse query URL.")
     parser.add_argument(
         "--claude-fanout-mode",
@@ -2550,27 +3019,42 @@ def main() -> int:
         default="minimal",
         help="Claude fan-out validation depth.",
     )
+    parser.add_argument(
+        "--target",
+        default=None,
+        help="Target profile (dev/prod). Rewrites family routes consistently.",
+    )
+    parser.add_argument(
+        "--resolve-target-json",
+        action="store_true",
+        help="Resolve and validate the target profile, print JSON, and exit.",
+    )
     args = parser.parse_args()
 
     config_path = pathlib.Path(args.config)
-    artifact_path = pathlib.Path(args.write_artifact)
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
     config = _load_suite_config(config_path)
 
-    public_key_env = config.get("langfuse_public_key_env", "LANGFUSE_PUBLIC_KEY")
-    secret_key_env = config.get("langfuse_secret_key_env", "LANGFUSE_SECRET_KEY")
-    public_key = os.environ.get(public_key_env, "")
-    secret_key = os.environ.get(secret_key_env, "")
+    target_profile = _resolve_target_profile(config, target=args.target)
+    _apply_target_profile(config, target_profile)
+    if args.resolve_target_json:
+        print(  # noqa: T201 - intentional machine-readable CLI output
+            json.dumps(_public_target_profile(target_profile), sort_keys=True)
+        )
+        return 0
+    if not args.write_artifact:
+        parser.error("--write-artifact is required unless --resolve-target-json is used")
+    artifact_path = pathlib.Path(args.write_artifact)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+
+    container_env_cache: dict[tuple[str, str], str] = {}
+    public_key, secret_key = _resolve_langfuse_credentials(
+        config,
+        target_profile,
+        container_env_cache=container_env_cache,
+    )
     query_url = args.langfuse_query_url or os.environ.get("LANGFUSE_QUERY_URL") or config.get(
         "langfuse_query_url", "http://127.0.0.1:3000"
     )
-
-    if not public_key or not secret_key:
-        print(
-            f"Missing Langfuse credentials in env vars {public_key_env}/{secret_key_env}",
-            file=sys.stderr,
-        )
-        return 2
 
     artifact: dict[str, Any] = {
         "suite_version": config.get("suite_version", 1),
@@ -2578,44 +3062,42 @@ def main() -> int:
         "git_commit": _git_value("rev-parse", "HEAD"),
         "git_branch": _git_value("branch", "--show-current"),
         "environment": {
-            "litellm_base_url": _resolve_litellm_base_url(config),
+            "litellm_base_url": target_profile["litellm_base_url"],
             "langfuse_query_url": query_url,
             "docker_litellm_dev_status": _docker_status(),
+            "target_profile": _public_target_profile(target_profile),
         },
         "results": {},
         "summary": {},
     }
 
-    try:
-        artifact["results"]["codex"] = _validate_codex(
-            config["codex"],
-            query_url=query_url,
-            public_key=public_key,
-            secret_key=secret_key,
-        )
-    except Exception as exc:
-        artifact["results"]["codex"] = _family_error_result("codex", exc)
+    artifact["results"]["codex"] = _run_family_with_evidence(
+        "codex",
+        _validate_codex,
+        config["codex"],
+        query_url=query_url,
+        public_key=public_key,
+        secret_key=secret_key,
+    )
 
-    try:
-        artifact["results"]["gemini"] = _validate_gemini(
-            config["gemini"],
-            query_url=query_url,
-            public_key=public_key,
-            secret_key=secret_key,
-        )
-    except Exception as exc:
-        artifact["results"]["gemini"] = _family_error_result("gemini", exc)
+    artifact["results"]["gemini"] = _run_family_with_evidence(
+        "gemini",
+        _validate_gemini,
+        config["gemini"],
+        query_url=query_url,
+        public_key=public_key,
+        secret_key=secret_key,
+    )
 
-    try:
-        artifact["results"]["claude"] = _validate_claude(
-            config["claude"],
-            query_url=query_url,
-            public_key=public_key,
-            secret_key=secret_key,
-            fanout_mode=args.claude_fanout_mode,
-        )
-    except Exception as exc:
-        artifact["results"]["claude"] = _family_error_result("claude", exc)
+    artifact["results"]["claude"] = _run_family_with_evidence(
+        "claude",
+        _validate_claude,
+        config["claude"],
+        query_url=query_url,
+        public_key=public_key,
+        secret_key=secret_key,
+        fanout_mode=args.claude_fanout_mode,
+    )
 
     artifact["summary"] = _build_summary(artifact["results"])
     artifact_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
