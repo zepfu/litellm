@@ -101,6 +101,9 @@ if TYPE_CHECKING:
     def _opencode_zen_candidate_unavailable_detail(exc: Exception) -> Optional[str]: ...
     async def _perform_openrouter_adapter_pass_through_request(**kwargs: Any) -> Any: ...
     async def _perform_openrouter_completion_adapter_operation(**kwargs: Any) -> Any: ...
+    def _classify_codex_auto_agent_retryable_exhaustion(exc: Any) -> Optional[str]: ...
+    def _extract_adapter_upstream_headers(exc: Any) -> dict[str, Any]: ...
+    def _parse_retry_after_seconds_from_headers(headers: dict[str, Any]) -> Optional[float]: ...
     def _raise_codex_auto_agent_empty_success_response(**kwargs: Any) -> Any: ...
     def _raise_codex_auto_agent_failed_responses_payload(**kwargs: Any) -> Any: ...
     def _raise_codex_auto_agent_malformed_tool_call_text_payload(**kwargs: Any) -> Any: ...
@@ -138,6 +141,13 @@ _HOST_FUNCTION_NAMES = (
     "_handle_codex_alibaba_token_plan_adapter_route",
     # OpenCode
     "_handle_codex_opencode_zen_adapter_route",
+    # D1-574 OpenCode direct 429
+    "_opencode_zen_direct_safe_retry_after",
+    "_maybe_raise_opencode_zen_direct_rate_limit",
+    "_opencode_zen_direct_stream_terminal_error",
+    "_OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES",
+    "_OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS",
+    "_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES",
 )
 
 
@@ -965,6 +975,94 @@ async def _handle_codex_alibaba_token_plan_adapter_route(
     return validated_response
 
 
+
+# ── D1-574: OpenCode Zen direct-route 429 preservation ─────────────
+
+_OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES = frozenset(
+    {"capacity_exhausted", "rate_limited", "usage_limit_reached"}
+)
+_OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS = 86400.0
+_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES = 65536
+
+
+def _opencode_zen_direct_safe_retry_after(exc: Exception) -> Optional[str]:
+    """Extract a safe, bounded Retry-After value from upstream headers."""
+    headers = _extract_adapter_upstream_headers(exc)
+    raw_retry_after: Any = None
+    for header_name, header_value in headers.items():
+        if str(header_name).lower() == "retry-after":
+            raw_retry_after = header_value
+            break
+    if raw_retry_after is None:
+        return None
+    try:
+        raw_retry_after_seconds = float(str(raw_retry_after).strip())
+    except (TypeError, ValueError):
+        return None
+    if not (
+        0
+        <= raw_retry_after_seconds
+        <= _OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS
+    ):
+        return None
+    retry_after = _parse_retry_after_seconds_from_headers(headers)
+    if retry_after is None:
+        return None
+    if not (
+        0 <= retry_after <= _OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS
+    ):
+        return None
+    if retry_after == int(retry_after):
+        return str(int(retry_after))
+    return str(round(retry_after, 1))
+
+
+def _maybe_raise_opencode_zen_direct_rate_limit(exc: Exception) -> None:
+    """Raise a bounded 429 ProxyException for qualifying direct-mode failures."""
+    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
+    if error_class not in _OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES:
+        return
+    retry_after = _opencode_zen_direct_safe_retry_after(exc)
+    headers = {"Retry-After": retry_after} if retry_after is not None else None
+    raise ProxyException(
+        message=(
+            "OpenCode Zen upstream capacity is temporarily exhausted. "
+            "Retry later."
+        ),
+        type="rate_limit_error",
+        param="model",
+        code=429,
+        headers=headers,
+    ) from exc
+
+
+def _opencode_zen_direct_stream_terminal_error(exc: Exception) -> Optional[str]:
+    """Return a bounded response.failed SSE event for post-first-event failures."""
+    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
+    if error_class not in _OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES:
+        return None
+    payload = {
+        "type": "response.failed",
+        "response": {
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "type": "rate_limit_error",
+                "code": "opencode_zen_capacity_exhausted",
+                "message": (
+                    "OpenCode Zen upstream capacity is temporarily "
+                    "exhausted."
+                ),
+            },
+        },
+    }
+    return (
+        "event: response.failed\ndata: "
+        + json.dumps(payload, separators=(",", ":"))
+        + "\n\n"
+    )
+
+
 async def _handle_codex_opencode_zen_adapter_route(
     *,
     endpoint: str,
@@ -1036,13 +1134,16 @@ async def _handle_codex_opencode_zen_adapter_route(
     except Exception as exc:
         if use_alias_candidate_probe and _opencode_zen_candidate_unavailable_detail(exc) is not None:
             _raise_opencode_zen_auto_agent_candidate_unavailable(exc)
+        # D1-574: direct-mode capacity/rate-limit/usage-limit -> bounded 429
+        if not use_alias_candidate_probe:
+            _maybe_raise_opencode_zen_direct_rate_limit(exc)
         raise
     if bool(request_body.get("stream")):
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
             LiteLLMCompletionStreamingIterator,
         )
 
-        return StreamingResponse(
+        stream_response = StreamingResponse(
             _responses_sse_from_iterator(
                 LiteLLMCompletionStreamingIterator(
                     model=adapter_model,
@@ -1056,9 +1157,27 @@ async def _handle_codex_opencode_zen_adapter_route(
                     rollup_kwargs,
                     adapter_label="OpenCode Zen",
                 ),
+                on_stream_error=(
+                    None
+                    if use_alias_candidate_probe
+                    else _opencode_zen_direct_stream_terminal_error
+                ),
             ),
             media_type="text/event-stream",
         )
+        if use_alias_candidate_probe:
+            return stream_response
+        # D1-574: peek for pre-first-byte streaming failures
+        try:
+            peek = await _aawm_alias_streaming.peek_streaming_response(
+                stream_response,
+                max_chunks=1,
+                max_bytes=_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES,
+            )
+        except Exception as peek_exc:
+            _maybe_raise_opencode_zen_direct_rate_limit(peek_exc)
+            raise
+        return peek.response
 
     responses_api_response = (
         LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(

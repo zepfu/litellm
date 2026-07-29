@@ -173,9 +173,12 @@ async def _iterate_responses_sse_events(
 async def _responses_sse_from_iterator(
     responses_iterator: Any,
     on_complete: Optional[Callable[[], None]] = None,
+    on_stream_error: Optional[Callable[[Exception], Optional[str]]] = None,
 ) -> Any:
+    has_emitted = False
     try:
         async for event in responses_iterator:
+            has_emitted = True
             event_type = _mapping_or_attr_get(event, "type")
             serialized = _serialize_responses_adapter_response(event)
             if isinstance(event_type, str) and event_type:
@@ -185,6 +188,15 @@ async def _responses_sse_from_iterator(
         if on_complete is not None:
             on_complete()
         yield "data: [DONE]\n\n"
+    except Exception as stream_exc:
+        if not has_emitted:
+            raise
+        if on_stream_error is not None:
+            terminal_event = on_stream_error(stream_exc)
+            if terminal_event is not None:
+                yield terminal_event
+                return
+        raise
     finally:
         close_targets = (
             responses_iterator,

@@ -5071,6 +5071,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 "client_name": "codex_exec",
                 "passthrough_route_family": "codex_responses",
                 "tags": ["route:codex_responses"],
+                "opencode_zen_unsupported_tools_mode": "drop",
             },
         }
 
@@ -5593,6 +5594,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 "client_name": "codex_exec",
                 "passthrough_route_family": "codex_responses",
                 "tags": ["route:codex_responses"],
+                "opencode_zen_unsupported_tools_mode": "drop",
             },
         }
 
@@ -5670,12 +5672,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "tool_search",
             "web_search",
         ]
-        assert litellm_metadata["opencode_zen_removed_unsupported_tool_names"] == [
-            "apply_patch",
-            "shell",
-            "tool_search",
-            "web_search",
-        ]
+        assert litellm_metadata["opencode_zen_removed_unsupported_tool_names"] == []
         assert "route:codex_opencode_zen_adapter" in litellm_metadata["tags"]
         assert "codex-opencode-zen-adapter" in litellm_metadata["tags"]
         assert "opencode-zen-unsupported-tools-stripped" in litellm_metadata["tags"]
@@ -22886,8 +22883,10 @@ async def test_codex_opencode_zen_direct_route_keeps_high_demand_error(monkeypat
                 use_alias_candidate_probe=False,
             )
 
-    assert exc_info.value is high_demand_error
-    assert _classify_codex_auto_agent_retryable_exhaustion(exc_info.value) == ("capacity_exhausted")
+    # D1-574: direct-mode capacity errors are now translated to bounded 429
+    assert exc_info.value.code == "429"
+    assert exc_info.value.type == "rate_limit_error"
+    assert exc_info.value is not high_demand_error
 
 
 @pytest.mark.asyncio
@@ -31207,3 +31206,574 @@ async def test_codex_grok_safety_denial_falls_back_request_locally_without_durab
     assert all(skipped["model"] != "xai/grok-4.5" for skipped in selection["skipped"])
 
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(spark_cooldown_key, None)
+
+
+# ===========================================================================
+# D1-574: OpenCode Zen direct-route 429 preservation
+# ===========================================================================
+
+
+class TestD1574OpenCodeDirectRateLimit:
+    """Direct-mode capacity/rate-limit/usage-limit -> bounded 429."""
+
+    @pytest.mark.asyncio
+    async def test_proxy_route_presents_sanitized_429_with_retry_after(self):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+        from litellm.proxy.proxy_server import openai_exception_handler
+
+        raw_provider_body = "RAW_PROVIDER_BODY account=user@example.com"
+        secret = "sk-opencode-secret-value"
+        capacity_error = ProxyException(
+            message=f"We're currently experiencing high demand. {raw_provider_body} {secret}",
+            type="rate_limit_error",
+            param="model",
+            code=429,
+        )
+        capacity_error.detail = {
+            "error": {
+                "code": 429,
+                "message": raw_provider_body,
+                "type": "rate_limit_error",
+            }
+        }
+        capacity_error.upstream_headers = {
+            "Retry-After": "17",
+            "X-Provider-Secret": secret,
+        }
+
+        request_body = {
+            "model": "opencode/deepseek-v4-flash",
+            "input": "hello",
+            "stream": False,
+        }
+        encoded_body = json.dumps(request_body).encode("utf-8")
+
+        async def receive():
+            return {
+                "type": "http.request",
+                "body": encoded_body,
+                "more_body": False,
+            }
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/openai_passthrough/v1/responses",
+                "raw_path": b"/openai_passthrough/v1/responses",
+                "query_string": b"",
+                "server": ("testserver", 80),
+                "client": ("127.0.0.1", 50000),
+                "headers": [
+                    (b"authorization", b"Bearer client-test-key"),
+                    (b"content-type", b"application/json"),
+                    (b"originator", b"codex_cli_rs"),
+                    (b"session_id", b"d1-574-proxy-boundary"),
+                ],
+            },
+            receive,
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_opencode_zen_api_key_for_candidate",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.acompletion",
+            new=AsyncMock(side_effect=capacity_error),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            new=AsyncMock(
+                side_effect=AssertionError(
+                    "direct OpenCode request fell through to generic passthrough"
+                )
+            ),
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await openai_proxy_route(
+                    endpoint="v1/responses",
+                    request=request,
+                    fastapi_response=Response(),
+                    user_api_key_dict=MagicMock(),
+                )
+        response = await openai_exception_handler(request, exc_info.value)
+
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == "17"
+        assert float(response.headers["retry-after"]) >= 0
+        response_text = response.body.decode("utf-8")
+        assert "OpenCode Zen upstream capacity is temporarily exhausted" in response_text
+        assert raw_provider_body not in response_text
+        assert secret not in response_text
+        assert "user@example.com" not in response_text
+        assert "traceback" not in response_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_direct_non_stream_capacity_returns_429(self):
+        """Non-streaming direct OpenCode capacity failure returns 429 ProxyException."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _maybe_raise_opencode_zen_direct_rate_limit,
+        )
+        from litellm.proxy._types import ProxyException
+
+        exc = RuntimeError("FreeUsageLimitError: free usage limit reached")
+        exc.status_code = 429
+        with pytest.raises(ProxyException) as exc_info:
+            _maybe_raise_opencode_zen_direct_rate_limit(exc)
+        assert exc_info.value.code == "429"
+        assert exc_info.value.type == "rate_limit_error"
+        assert "capacity" in exc_info.value.message.lower() or "exhausted" in exc_info.value.message.lower()
+        # No raw exception text leakage
+        assert "FreeUsageLimitError" not in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_direct_non_stream_rate_limited_returns_429(self):
+        """Direct mode with status_code=429 classifies as rate_limited -> 429."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _maybe_raise_opencode_zen_direct_rate_limit,
+        )
+        from litellm.proxy._types import ProxyException
+
+        exc = RuntimeError("too many requests")
+        exc.status_code = 429
+        with pytest.raises(ProxyException) as exc_info:
+            _maybe_raise_opencode_zen_direct_rate_limit(exc)
+        assert exc_info.value.code == "429"
+
+    @pytest.mark.asyncio
+    async def test_direct_non_stream_auth_error_not_429(self):
+        """Auth failures are NOT translated to 429."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _maybe_raise_opencode_zen_direct_rate_limit,
+        )
+
+        exc = RuntimeError("invalid api key")
+        exc.status_code = 401
+        # Should not raise - auth is not in the 429 error classes
+        _maybe_raise_opencode_zen_direct_rate_limit(exc)
+
+    @pytest.mark.asyncio
+    async def test_direct_non_stream_internal_error_not_429(self):
+        """500 internal errors are NOT translated to 429."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _maybe_raise_opencode_zen_direct_rate_limit,
+        )
+
+        exc = RuntimeError("internal server error")
+        exc.status_code = 500
+        _maybe_raise_opencode_zen_direct_rate_limit(exc)
+
+    @pytest.mark.asyncio
+    async def test_valid_retry_after_preserved(self):
+        """Valid numeric Retry-After header is canonicalized and preserved."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _opencode_zen_direct_safe_retry_after,
+        )
+
+        exc = RuntimeError("rate limited")
+        exc.response = type("R", (), {"headers": {"Retry-After": "30"}})()
+        result = _opencode_zen_direct_safe_retry_after(exc)
+        assert result == "30"
+
+    @pytest.mark.asyncio
+    async def test_retry_after_float_canonicalized(self):
+        """Float Retry-After is rounded to 1 decimal."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _opencode_zen_direct_safe_retry_after,
+        )
+
+        exc = RuntimeError("rate limited")
+        exc.response = type("R", (), {"headers": {"Retry-After": "12.5"}})()
+        result = _opencode_zen_direct_safe_retry_after(exc)
+        assert result == "12.5"
+
+    @pytest.mark.asyncio
+    async def test_retry_after_excessive_omitted(self):
+        """Retry-After above ceiling is omitted."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _opencode_zen_direct_safe_retry_after,
+        )
+
+        exc = RuntimeError("rate limited")
+        exc.response = type("R", (), {"headers": {"Retry-After": "999999"}})()
+        result = _opencode_zen_direct_safe_retry_after(exc)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_retry_after_date_form_omitted(self):
+        """HTTP-date Retry-After is omitted (not numeric)."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _opencode_zen_direct_safe_retry_after,
+        )
+
+        exc = RuntimeError("rate limited")
+        exc.response = type("R", (), {"headers": {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}})()
+        result = _opencode_zen_direct_safe_retry_after(exc)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_retry_after_negative_omitted(self):
+        """Negative Retry-After is rejected before parser normalization."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _opencode_zen_direct_safe_retry_after,
+        )
+
+        exc = RuntimeError("rate limited")
+        exc.response = type("R", (), {"headers": {"Retry-After": "-5"}})()
+        result = _opencode_zen_direct_safe_retry_after(exc)
+        assert result is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw_retry_after",
+        ["NaN", "Infinity", "-Infinity"],
+    )
+    async def test_retry_after_non_finite_omitted(self, raw_retry_after):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _opencode_zen_direct_safe_retry_after,
+        )
+
+        exc = RuntimeError("rate limited")
+        exc.response = type(
+            "R",
+            (),
+            {"headers": {"Retry-After": raw_retry_after}},
+        )()
+        assert _opencode_zen_direct_safe_retry_after(exc) is None
+
+    @pytest.mark.asyncio
+    async def test_direct_stream_peeks_and_replays_first_event_once(self):
+        request = _build_codex_auto_agent_request()
+        body = {
+            "model": "opencode/deepseek-v4-flash",
+            "input": "hello",
+            "stream": True,
+        }
+        iterator_instances = []
+
+        class FakeIterator:
+            def __init__(self, **kwargs):
+                _ = kwargs
+                self.step = 0
+                self.close_calls = 0
+                iterator_instances.append(self)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.step == 0:
+                    self.step += 1
+                    return {"type": "response.created", "response": {"id": "resp_1"}}
+                raise StopAsyncIteration
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_opencode_zen_api_key_for_candidate",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.acompletion",
+            new=AsyncMock(return_value=object()),
+        ), patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            FakeIterator,
+        ):
+            response = await _handle_codex_opencode_zen_adapter_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="deepseek-v4-flash",
+                use_alias_candidate_probe=False,
+            )
+
+        chunks = [chunk async for chunk in response.body_iterator]
+        rendered = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            for chunk in chunks
+        )
+        assert rendered.count("event: response.created") == 1
+        assert rendered.count("data: [DONE]") == 1
+        assert iterator_instances[0].close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_direct_pre_event_capacity_peek_consumes_and_closes_once(self):
+        request = _build_codex_auto_agent_request()
+        body = {
+            "model": "opencode/deepseek-v4-flash",
+            "input": "hello",
+            "stream": True,
+        }
+        capacity_error = _build_opencode_zen_high_demand_error()
+        iterator_instances = []
+
+        class FakeIterator:
+            def __init__(self, **kwargs):
+                _ = kwargs
+                self.next_calls = 0
+                self.close_calls = 0
+                self.litellm_custom_stream_wrapper = self
+                iterator_instances.append(self)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.next_calls += 1
+                raise capacity_error
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_opencode_zen_api_key_for_candidate",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.acompletion",
+            new=AsyncMock(return_value=object()),
+        ), patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            FakeIterator,
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await _handle_codex_opencode_zen_adapter_route(
+                    endpoint="/v1/responses",
+                    request=request,
+                    fastapi_response=MagicMock(spec=Response),
+                    user_api_key_dict=MagicMock(),
+                    prepared_request_body=body,
+                    adapter_model="deepseek-v4-flash",
+                    use_alias_candidate_probe=False,
+                )
+
+        assert exc_info.value.code == "429"
+        assert exc_info.value is not capacity_error
+        assert iterator_instances[0].next_calls == 1
+        assert iterator_instances[0].close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_direct_post_event_capacity_emits_one_terminal_without_retry(self):
+        request = _build_codex_auto_agent_request()
+        body = {
+            "model": "opencode/deepseek-v4-flash",
+            "input": "hello",
+            "stream": True,
+        }
+        capacity_error = _build_opencode_zen_high_demand_error()
+        completion_mock = AsyncMock(return_value=object())
+        iterator_instances = []
+
+        class FakeIterator:
+            def __init__(self, **kwargs):
+                _ = kwargs
+                self.step = 0
+                self.next_calls = 0
+                self.close_calls = 0
+                self.litellm_custom_stream_wrapper = self
+                iterator_instances.append(self)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.next_calls += 1
+                if self.step == 0:
+                    self.step += 1
+                    return {
+                        "type": "response.output_text.delta",
+                        "delta": "first",
+                    }
+                raise capacity_error
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_opencode_zen_api_key_for_candidate",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.acompletion",
+            new=completion_mock,
+        ), patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            FakeIterator,
+        ):
+            response = await _handle_codex_opencode_zen_adapter_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="deepseek-v4-flash",
+                use_alias_candidate_probe=False,
+            )
+
+        chunks = [chunk async for chunk in response.body_iterator]
+        rendered = "".join(
+            chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            for chunk in chunks
+        )
+        assert rendered.count("event: response.output_text.delta") == 1
+        assert rendered.count("event: response.failed") == 1
+        assert rendered.count('"type":"response.failed"') == 1
+        assert "opencode_zen_capacity_exhausted" in rendered
+        assert "data: [DONE]" not in rendered
+        assert capacity_error.message not in rendered
+        assert completion_mock.await_count == 1
+        assert iterator_instances[0].next_calls == 2
+        assert iterator_instances[0].close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_alias_stream_bypasses_direct_peek_and_capacity_callback(self):
+        request = _build_codex_auto_agent_request()
+        body = {
+            "model": "opencode/deepseek-v4-flash",
+            "input": "hello",
+            "stream": True,
+        }
+        capacity_error = _build_opencode_zen_high_demand_error()
+        iterator_instances = []
+
+        class FakeIterator:
+            def __init__(self, **kwargs):
+                _ = kwargs
+                self.close_calls = 0
+                iterator_instances.append(self)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise capacity_error
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_opencode_zen_api_key_for_candidate",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.acompletion",
+            new=AsyncMock(return_value=object()),
+        ), patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            FakeIterator,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._aawm_alias_streaming.peek_streaming_response",
+            new=AsyncMock(),
+        ) as peek_mock, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._opencode_zen_direct_stream_terminal_error"
+        ) as terminal_mock:
+            response = await _handle_codex_opencode_zen_adapter_route(
+                endpoint="/v1/responses",
+                request=request,
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                adapter_model="deepseek-v4-flash",
+                use_alias_candidate_probe=True,
+            )
+            with pytest.raises(ProxyException) as exc_info:
+                await response.body_iterator.__anext__()
+
+        assert exc_info.value is capacity_error
+        assert _classify_codex_auto_agent_retryable_exhaustion(exc_info.value) == (
+            "capacity_exhausted"
+        )
+        peek_mock.assert_not_awaited()
+        terminal_mock.assert_not_called()
+        assert iterator_instances[0].close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_no_raw_payload_leakage_in_429(self):
+        """429 error message does not contain raw exception details."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _maybe_raise_opencode_zen_direct_rate_limit,
+        )
+        from litellm.proxy._types import ProxyException
+
+        secret_detail = "sk-secret-key-12345 account=user@example.com"
+        exc = RuntimeError(f"rate limit {secret_detail}")
+        exc.status_code = 429
+        with pytest.raises(ProxyException) as exc_info:
+            _maybe_raise_opencode_zen_direct_rate_limit(exc)
+        assert secret_detail not in exc_info.value.message
+        assert "sk-secret" not in exc_info.value.message
+        assert "user@example.com" not in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_failed_access_records_visible_at_429(self, monkeypatch):
+        """D1-573: failed direct access records remain visible at 429."""
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
+        request = _build_codex_auto_agent_request()
+        request.scope.update(
+            {
+                "client": ("172.19.0.1", 52834),
+                "method": "POST",
+                "http_version": "1.1",
+                "path": "/openai_passthrough/v1/responses",
+                "query_string": b"",
+            }
+        )
+        body = {
+            "model": "opencode/deepseek-v4-flash",
+            "input": "hello",
+            "stream": False,
+        }
+        capacity_error = _build_opencode_zen_high_demand_error()
+        clear_aawm_route_access_log_replacements()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_opencode_zen_api_key_for_candidate",
+            new=AsyncMock(return_value="opencode-test-key"),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.HttpPassThroughEndpointHelpers.validate_outgoing_egress"
+        ), patch(
+            "litellm.acompletion",
+            new=AsyncMock(side_effect=capacity_error),
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await _handle_codex_opencode_zen_adapter_route(
+                    endpoint="/v1/responses",
+                    request=request,
+                    fastapi_response=MagicMock(spec=Response),
+                    user_api_key_dict=MagicMock(),
+                    prepared_request_body=body,
+                    adapter_model="deepseek-v4-flash",
+                    use_alias_candidate_probe=False,
+                )
+
+        assert exc_info.value.code == "429"
+        access_record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=(
+                "172.19.0.1:52834",
+                "POST",
+                "/openai_passthrough/v1/responses",
+                "1.1",
+                429,
+            ),
+            exc_info=None,
+        )
+        assert AawmRouteAccessLogReplacementFilter().filter(access_record) is True
+        clear_aawm_route_access_log_replacements()

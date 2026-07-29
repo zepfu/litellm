@@ -361,6 +361,126 @@ class TestResponsesSSEFromIterator:
         _run(_collect_agen(sse_mod._responses_sse_from_iterator(FakeIter())))
         assert closed == [True]
 
+    def test_pre_event_error_reraises_and_closes_once(self):
+        capacity_error = RuntimeError("provider capacity")
+        callback_calls = []
+
+        class FakeIter:
+            def __init__(self):
+                self.close_calls = 0
+                self.litellm_custom_stream_wrapper = self
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise capacity_error
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        iterator = FakeIter()
+
+        async def collect():
+            return await _collect_agen(
+                sse_mod._responses_sse_from_iterator(
+                    iterator,
+                    on_stream_error=lambda exc: callback_calls.append(exc),
+                )
+            )
+
+        try:
+            _run(collect())
+        except RuntimeError as exc:
+            assert exc is capacity_error
+        else:
+            raise AssertionError("pre-event capacity error did not propagate")
+        assert callback_calls == []
+        assert iterator.close_calls == 1
+
+    def test_post_event_capacity_emits_terminal_once_without_replay(self):
+        capacity_error = RuntimeError("provider capacity")
+        callback_calls = []
+
+        class FakeIter:
+            def __init__(self):
+                self.step = 0
+                self.close_calls = 0
+                self.litellm_custom_stream_wrapper = self
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.step == 0:
+                    self.step += 1
+                    return {"type": "response.created", "response": {"id": "resp_1"}}
+                raise capacity_error
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        iterator = FakeIter()
+
+        def on_stream_error(exc):
+            callback_calls.append(exc)
+            return (
+                "event: response.failed\n"
+                'data: {"type":"response.failed"}\n\n'
+            )
+
+        chunks = _run(
+            _collect_agen(
+                sse_mod._responses_sse_from_iterator(
+                    iterator,
+                    on_stream_error=on_stream_error,
+                )
+            )
+        )
+        rendered = "".join(chunks)
+        assert rendered.count("event: response.created") == 1
+        assert rendered.count("event: response.failed") == 1
+        assert "data: [DONE]" not in rendered
+        assert callback_calls == [capacity_error]
+        assert iterator.close_calls == 1
+
+    def test_post_event_error_without_callback_retains_prior_behavior(self):
+        provider_error = RuntimeError("unrelated provider failure")
+
+        class FakeIter:
+            def __init__(self):
+                self.step = 0
+                self.close_calls = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.step == 0:
+                    self.step += 1
+                    return {"type": "response.created"}
+                raise provider_error
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        iterator = FakeIter()
+
+        async def exercise():
+            stream = sse_mod._responses_sse_from_iterator(iterator)
+            first = await stream.__anext__()
+            try:
+                await stream.__anext__()
+            except RuntimeError as exc:
+                assert exc is provider_error
+            else:
+                raise AssertionError("unrelated provider error did not propagate")
+            return first
+
+        first = _run(exercise())
+        assert first.startswith("event: response.created")
+        assert iterator.close_calls == 1
+
 
 # ===========================================================================
 # SECTION 8: Behavior tests - _responses_event_text_key
