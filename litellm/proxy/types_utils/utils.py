@@ -2,12 +2,49 @@ import asyncio
 import importlib
 import importlib.util
 import os
+import sys
 from typing import Any, Callable, Literal, Optional, get_type_hints
+
+
+def _restore_pkg_sys_modules(module_name: str, snapshot: Optional[dict]) -> None:
+    """Restore sys.modules to pre-load state for a package and its children.
+
+    Removes newly introduced partial entries and restores prior entries so a
+    failed package load leaves no side-effects in the module cache.
+    """
+    if snapshot is None:
+        return
+    child_prefix = module_name + "."
+    for key in list(sys.modules):
+        if key == module_name or key.startswith(child_prefix):
+            if key not in snapshot:
+                del sys.modules[key]
+    for key, mod in snapshot.items():
+        sys.modules[key] = mod
+
+
+def _snapshot_and_clear_pkg_children(module_name: str) -> dict:
+    """Snapshot sys.modules entries for *module_name* and its dot-children,
+    then remove stale children so a fresh exec re-imports from current files.
+
+    Returns the snapshot dict for later restoration via
+    :func:`_restore_pkg_sys_modules`.
+    """
+    child_prefix = module_name + "."
+    snapshot: dict = {}
+    for key in list(sys.modules):
+        if key == module_name or key.startswith(child_prefix):
+            snapshot[key] = sys.modules[key]
+    for key in list(sys.modules):
+        if key.startswith(child_prefix):
+            del sys.modules[key]
+    return snapshot
 
 
 def get_instance_fn(value: str, config_file_path: Optional[str] = None) -> Any:
     module_name = value
     instance_name = None
+    _pkg_snapshot: Optional[dict] = None
     try:
         # Check if value starts with s3:// or gcs://
         if value.startswith("s3://") or value.startswith("gcs://"):
@@ -26,21 +63,45 @@ def get_instance_fn(value: str, config_file_path: Optional[str] = None) -> Any:
             module_file_path = os.path.join(directory, *module_name.split("."))
             module_file_path += ".py"
 
-            # Check if the file exists before trying to load it
-            if not os.path.exists(module_file_path):
-                raise ImportError(f"Could not find module file {module_file_path}")
-
-            spec = importlib.util.spec_from_file_location(module_name, module_file_path)  # type: ignore
-            if spec is None:
-                raise ImportError(
-                    f"Could not find a module specification for {module_file_path}"
-                )
-            module = importlib.util.module_from_spec(spec)  # type: ignore
-            if spec.loader is None:
-                raise ImportError(
-                    f"Could not find a module loader for {module_file_path}"
-                )
-            spec.loader.exec_module(module)  # type: ignore
+            # Check if the file exists; if not, try package resolution
+            if os.path.exists(module_file_path):
+                spec = importlib.util.spec_from_file_location(module_name, module_file_path)  # type: ignore
+                if spec is None:
+                    raise ImportError(
+                        f"Could not find a module specification for {module_file_path}"
+                    )
+                module = importlib.util.module_from_spec(spec)  # type: ignore
+                if spec.loader is None:
+                    raise ImportError(
+                        f"Could not find a module loader for {module_file_path}"
+                    )
+                spec.loader.exec_module(module)  # type: ignore
+            else:
+                # Try package-style resolution: <module>/__init__.py
+                package_dir = os.path.join(directory, *module_name.split("."))
+                package_init = os.path.join(package_dir, "__init__.py")
+                if os.path.isfile(package_init):
+                    spec = importlib.util.spec_from_file_location(  # type: ignore
+                        module_name,
+                        package_init,
+                        submodule_search_locations=[package_dir],
+                    )
+                    if spec is None:
+                        raise ImportError(
+                            f"Could not find a module specification for {package_init}"
+                        )
+                    module = importlib.util.module_from_spec(spec)  # type: ignore
+                    if spec.loader is None:
+                        raise ImportError(
+                            f"Could not find a module loader for {package_init}"
+                        )
+                    # Snapshot and clear stale children; register before exec
+                    # so relative imports resolve against the new module.
+                    _pkg_snapshot = _snapshot_and_clear_pkg_children(module_name)
+                    sys.modules[module_name] = module
+                    spec.loader.exec_module(module)  # type: ignore
+                else:
+                    raise ImportError(f"Could not find module file {module_file_path}")
         else:
             # Dynamically import the module
             module = importlib.import_module(module_name)
@@ -50,6 +111,7 @@ def get_instance_fn(value: str, config_file_path: Optional[str] = None) -> Any:
 
         return instance
     except ImportError as e:
+        _restore_pkg_sys_modules(module_name, _pkg_snapshot)
         # Re-raise the exception with a user-friendly message
         if instance_name and module_name:
             raise ImportError(
@@ -58,6 +120,7 @@ def get_instance_fn(value: str, config_file_path: Optional[str] = None) -> Any:
         else:
             raise e
     except Exception as e:
+        _restore_pkg_sys_modules(module_name, _pkg_snapshot)
         raise e
 
 
