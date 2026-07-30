@@ -45,6 +45,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     selection,
     snapshot_select,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+    codex_auto_agent_route,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
     CooldownPublicationPlan,
@@ -327,6 +330,46 @@ _CALLBACK_COROUTINE_STATUS = {
     "raise_redispatch_fn": False,
 }
 
+# ---------------------------------------------------------------------------
+# Explicit field-to-production-target mapping for DI forwarding validation.
+#
+# The god module builds each runtime bundle with forwarding lambdas of the
+# form ``lambda *args, **kwargs: <lpe_global>(*args, **kwargs)``.  These
+# erase the typed signature and coroutine flag of the real target.  The
+# maps below name the ``lpe`` module global each DI-wrapped field delegates
+# to, so the test can (a) behaviorally prove forwarding with a sentinel and
+# (b) validate the real target's signature directly.
+#
+# Fields absent from these maps (``perform_candidate_request_fn``) are typed
+# closures built inside the handler and are validated on the captured
+# callback itself.
+# ---------------------------------------------------------------------------
+
+_CODEX_DI_FORWARDING_TARGETS: dict[str, str] = {
+    "select_candidate_fn": "_select_codex_auto_agent_candidate",
+    "resolve_cooldown_publication_fn": "_resolve_auto_agent_cooldown_publication_plan",
+    "publish_cooldown_memory_fn": "_publish_codex_cooldown_memory",
+    "persist_cooldown_fn": "_persist_codex_cooldown_durable",
+    "set_session_affinity_fn": "_set_codex_auto_agent_session_affinity",
+    "add_alias_metadata_fn": "_add_codex_auto_agent_alias_metadata",
+    "raise_redispatch_fn": "_raise_codex_auto_agent_redispatch_required",
+}
+
+_ANTHROPIC_DI_FORWARDING_TARGETS: dict[str, str] = {
+    "select_candidate_fn": "_select_anthropic_auto_agent_candidate",
+    "resolve_cooldown_publication_fn": "_resolve_auto_agent_cooldown_publication_plan",
+    "publish_cooldown_memory_fn": "_publish_anthropic_cooldown_memory",
+    "persist_cooldown_fn": "_persist_anthropic_cooldown_durable",
+    "set_session_affinity_fn": "_set_anthropic_auto_agent_session_affinity",
+    "add_alias_metadata_fn": "_add_anthropic_auto_agent_alias_metadata",
+    "raise_redispatch_fn": "_raise_anthropic_auto_agent_redispatch_required",
+}
+
+_DI_FORWARDING_TARGETS_BY_FAMILY: dict[str, dict[str, str]] = {
+    "codex_auto_agent": _CODEX_DI_FORWARDING_TARGETS,
+    "anthropic_auto_agent": _ANTHROPIC_DI_FORWARDING_TARGETS,
+}
+
 
 def _signature_contract_request() -> MagicMock:
     request = MagicMock(spec=Request)
@@ -374,6 +417,13 @@ async def test_alias_route_services_signature_contracts(
         "handle_alias_route",
         _capture_services,
     )
+    # The Codex facade calls handle_alias_route via a from-import in
+    # codex_auto_agent_route, so patch that module's local binding too.
+    monkeypatch.setattr(
+        codex_auto_agent_route,
+        "handle_alias_route",
+        _capture_services,
+    )
     # The facade wrappers resolve these globals at call time.
     monkeypatch.setattr(
         lpe,
@@ -415,9 +465,98 @@ async def test_alias_route_services_signature_contracts(
     assert not missing_fields, f"AliasRouteServices is missing typed callback fields: {missing_fields}"
     assert set(captured) == {"codex_auto_agent", "anthropic_auto_agent"}
     for alias_family, services in captured.items():
+        di_targets = _DI_FORWARDING_TARGETS_BY_FAMILY[alias_family]
+        # Capture every real production target up front, before any
+        # monkeypatching, so Phase 2 always validates the genuine callable
+        # even when a prior Phase 1 sentinel replaced the lpe global.
+        real_targets: dict[str, object] = {}
+        for fn_name in _CALLBACK_PARAMETER_KINDS:
+            if fn_name in di_targets:
+                real_targets[fn_name] = getattr(lpe, di_targets[fn_name])
+            else:
+                real_targets[fn_name] = getattr(services, fn_name)
         for field_name, expected_parameters in _CALLBACK_PARAMETER_KINDS.items():
             callback = getattr(services, field_name)
-            signature = inspect.signature(callback)
+            is_async = _CALLBACK_COROUTINE_STATUS[field_name]
+
+            # --- Phase 1: behavioral DI forwarding validation ----------
+            # Replace the underlying lpe global with a recording sentinel,
+            # then invoke the captured DI wrapper and assert it forwards
+            # positional/keyword args exactly and propagates the return
+            # value (or awaitable for async targets).  A synchronous
+            # black-hole ``(*args, **kwargs)`` wrapper that swallows the
+            # call will fail here because the sentinel is never invoked.
+            if field_name in di_targets:
+                lpe_attr = di_targets[field_name]
+                original_target = getattr(lpe, lpe_attr)
+                sentinel_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+                sentinel_return = object()
+
+                if is_async:
+
+                    async def _async_sentinel(
+                        *args: Any,
+                        _calls: list = sentinel_calls,
+                        _ret: object = sentinel_return,
+                        **kwargs: Any,
+                    ) -> object:
+                        _calls.append((args, kwargs))
+                        return _ret
+
+                    monkeypatch.setattr(lpe, lpe_attr, _async_sentinel)
+                else:
+
+                    def _sync_sentinel(
+                        *args: Any,
+                        _calls: list = sentinel_calls,
+                        _ret: object = sentinel_return,
+                        **kwargs: Any,
+                    ) -> object:
+                        _calls.append((args, kwargs))
+                        return _ret
+
+                    monkeypatch.setattr(lpe, lpe_attr, _sync_sentinel)
+
+                pos_a, pos_b = object(), object()
+                kw_a, kw_b = object(), object()
+                result = callback(pos_a, pos_b, _fwd_a=kw_a, _fwd_b=kw_b)
+
+                if is_async:
+                    assert inspect.isawaitable(result), (
+                        f"{alias_family}.{field_name}: DI wrapper did not "
+                        f"return an awaitable for async target {lpe_attr!r}"
+                    )
+                    result = await result
+
+                assert result is sentinel_return, (
+                    f"{alias_family}.{field_name}: DI wrapper did not "
+                    f"propagate the return value of {lpe_attr!r}"
+                )
+                assert len(sentinel_calls) == 1, (
+                    f"{alias_family}.{field_name}: DI wrapper did not "
+                    f"forward to {lpe_attr!r} "
+                    f"(sentinel called {len(sentinel_calls)} times)"
+                )
+                forwarded_args, forwarded_kwargs = sentinel_calls[0]
+                assert forwarded_args == (pos_a, pos_b), (
+                    f"{alias_family}.{field_name}: positional args not "
+                    f"forwarded exactly: {forwarded_args!r}"
+                )
+                assert forwarded_kwargs == {"_fwd_a": kw_a, "_fwd_b": kw_b}, (
+                    f"{alias_family}.{field_name}: keyword args not "
+                    f"forwarded exactly: {forwarded_kwargs!r}"
+                )
+
+                # Restore the original target so subsequent iterations
+                # and Phase 2 validation see the genuine callable.
+                monkeypatch.setattr(lpe, lpe_attr, original_target)
+
+            # --- Phase 2: real-target signature validation -------------
+            # Validate the actual production target (not the DI wrapper)
+            # against the expected parameter names, kinds, and coroutine
+            # status.  An incompatible target (e.g. one requiring
+            # ``wrong_required_name``) fails here.
+            signature = inspect.signature(real_targets[field_name])
             actual_parameters = signature.parameters
             variadic_parameters = [
                 parameter.name
@@ -458,8 +597,7 @@ async def test_alias_route_services_signature_contracts(
                     f"{parameter.kind}, expected {expected_kind}"
                 )
             assert (
-                inspect.iscoroutinefunction(callback)
-                is _CALLBACK_COROUTINE_STATUS[field_name]
+                inspect.iscoroutinefunction(real_targets[field_name]) is is_async
             ), (
                 f"{alias_family}.{field_name} coroutine status does not match "
                 f"the production contract"
