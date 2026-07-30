@@ -83,7 +83,9 @@
     "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools",
     "native_openai_passthrough_responses_codex_aawm_low_tool_activity",
     "claude_adapter_openrouter_north_mini_completion_adapter_smoke",
-    "claude_adapter_openrouter_owl_alpha_completion_adapter_smoke"
+    "claude_adapter_openrouter_owl_alpha_completion_adapter_smoke",
+    "native_openai_passthrough_responses_codex_read_alias_collaboration",
+    "claude_adapter_read_alias_child_parallel_read_tools"
   ],
   "cases": {
     "native_anthropic_passthrough_claude": {
@@ -9018,6 +9020,569 @@
       "timeout_seconds": 180,
       "langfuse_poll_timeout_seconds": 60,
       "allow_zero_cost": true
+    },
+    "native_openai_passthrough_responses_codex_read_alias_collaboration": {
+      "verification_alias": "read",
+      "verification_ingress": "codex_responses",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "alias-replay",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "alibaba_token_plan",
+          "model": "alibaba_token_plan/qwen3.8-max-preview",
+          "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "openrouter",
+          "model": "openrouter/cohere/north-mini-code:free",
+          "route_family": "codex_openrouter_completion_adapter"
+        },
+        {
+          "candidate_order": 2,
+          "provider": "openrouter",
+          "model": "openrouter/owl-alpha",
+          "route_family": "codex_openrouter_completion_adapter"
+        },
+        {
+          "candidate_order": 3,
+          "provider": "opencode_zen",
+          "model": "deepseek-v4-flash",
+          "route_family": "codex_opencode_zen_adapter"
+        },
+        {
+          "candidate_order": 4,
+          "provider": "opencode_zen",
+          "model": "big-pickle",
+          "route_family": "codex_opencode_zen_adapter"
+        },
+        {
+          "candidate_order": 5,
+          "provider": "openai",
+          "model": "gpt-5.6-luna",
+          "route_family": "codex_responses"
+        },
+        {
+          "candidate_order": 6,
+          "provider": "alibaba_token_plan",
+          "model": "alibaba_token_plan/qwen3.6-flash",
+          "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 7,
+          "provider": "kimi_code",
+          "model": "kimi_code/kimi-for-coding",
+          "route_family": "codex_kimi_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 8,
+          "provider": "openai",
+          "model": "gpt-5.4-mini",
+          "route_family": "codex_responses"
+        }
+      ],
+      "cli_passthrough": "codex",
+      "command": [
+        "codex",
+        "exec",
+        "-p",
+        "{codex_profile}",
+        "-m",
+        "read",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.x-litellm-end-user-id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_user_id=\"{harness_user_id}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.langfuse_trace_name=\"{case_name}\"",
+        "-c",
+        "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "Read alias collaboration acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first tool response call spawn_agent exactly once with agent_type=\"opencode\", model=\"read\", and fork_turns=\"none\". Supply a complete self-contained plaintext child message and do not include the legacy fork_context field. The child message must prohibit further agent spawning and require its first tool response to contain exactly three exec_command calls in one parallel batch with no text: pwd; git rev-parse --show-toplevel; git status --short. All commands must run in {repository_root}; the child must not wait for one result before issuing the other calls. After all three results succeed, the child must use no more tools and return exactly READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED. Wait for the child to terminate, verify that exact marker and all three successful command results, then return exactly CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED with no Markdown, explanation, or additional text. If spawning, any command, waiting, or child termination fails, report the exact blocker and do not emit the success marker."
+      ],
+      "required_trace_names": [
+        "{case_name}"
+      ],
+      "expected_user_ids": [
+        "{harness_user_id}"
+      ],
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": false,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/openai_passthrough/v1/responses",
+        "/openai_passthrough/responses"
+      ],
+      "required_trace_tags": [
+        "model-alias:read",
+        "codex-auto-agent-alias:read"
+      ],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family"
+      ],
+      "codex_collaboration_validation": {
+        "minimum_tool_counts": {
+          "spawn_agent": 1,
+          "wait": 1
+        },
+        "required_successful_tools": [
+          "spawn_agent",
+          "wait"
+        ],
+        "require_wait_for_spawned_agents": true,
+        "command_execution_validation": {
+          "exact_commands": [
+            "pwd",
+            "git rev-parse --show-toplevel",
+            "git status --short"
+          ],
+          "required_status": "completed",
+          "required_exit_code": 0,
+          "require_same_turn": true,
+          "minimum_parallel_count": 3
+        }
+      },
+      "command_output_text_checks": {
+        "required_prefix": "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+        "required_suffix": "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+        "minimum_chars": 38,
+        "maximum_chars": 38
+      },
+      "command_stderr_text_checks": {
+        "forbidden_substrings": [
+          "Traceback",
+          "sk-",
+          "Bearer ",
+          "Authorization:",
+          "api_key",
+          "raw_provider_body",
+          "provider_response_body"
+        ]
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 90,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "alibaba_token_plan",
+                "openrouter",
+                "opencode_zen",
+                "openai",
+                "kimi_code"
+              ],
+              "model": [
+                "alibaba_token_plan/qwen3.8-max-preview",
+                "openrouter/cohere/north-mini-code:free",
+                "openrouter/owl-alpha",
+                "deepseek-v4-flash",
+                "big-pickle",
+                "gpt-5.6-luna",
+                "alibaba_token_plan/qwen3.6-flash",
+                "kimi_code/kimi-for-coding",
+                "gpt-5.4-mini"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "read",
+              "requested_model_alias": "read",
+              "codex_auto_agent_alias": "read"
+            },
+            "metadata_required_truthy": [
+              "codex_auto_agent_selected_provider",
+              "codex_auto_agent_selected_model",
+              "codex_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "required_contains": {
+              "repository": "litellm"
+            },
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            },
+            "correlated_candidate_triples": [
+              {
+                "provider": "alibaba_token_plan",
+                "model": "alibaba_token_plan/qwen3.8-max-preview",
+                "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
+              },
+              {
+                "provider": "openrouter",
+                "model": "openrouter/cohere/north-mini-code:free",
+                "route_family": "codex_openrouter_completion_adapter"
+              },
+              {
+                "provider": "openrouter",
+                "model": "openrouter/owl-alpha",
+                "route_family": "codex_openrouter_completion_adapter"
+              },
+              {
+                "provider": "opencode_zen",
+                "model": "deepseek-v4-flash",
+                "route_family": "codex_opencode_zen_adapter"
+              },
+              {
+                "provider": "opencode_zen",
+                "model": "big-pickle",
+                "route_family": "codex_opencode_zen_adapter"
+              },
+              {
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "route_family": "codex_responses"
+              },
+              {
+                "provider": "alibaba_token_plan",
+                "model": "alibaba_token_plan/qwen3.6-flash",
+                "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
+              },
+              {
+                "provider": "kimi_code",
+                "model": "kimi_code/kimi-for-coding",
+                "route_family": "codex_kimi_chat_completions_adapter"
+              },
+              {
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "route_family": "codex_responses"
+              }
+            ]
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 90,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "spawn_agent",
+            "tool_kind": "other",
+            "minimum_count": 1,
+            "maximum_count": 1
+          },
+          {
+            "tool_name": "exec_command",
+            "tool_kind": "command",
+            "minimum_count": 3,
+            "maximum_count": 3,
+            "exact_command_texts": [
+              "pwd",
+              "git rev-parse --show-toplevel",
+              "git status --short"
+            ],
+            "require_single_litellm_call_id": true
+          }
+        ]
+      },
+      "runtime_log_checks": {
+        "forbidden_substrings": [
+          "Exception in ASGI application",
+          "Traceback (most recent call last)",
+          "sk-",
+          "api_key",
+          "raw_body",
+          "raw_response_body",
+          "raw_provider_body",
+          "provider_response_body"
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 600,
+      "langfuse_poll_timeout_seconds": 120,
+      "allow_zero_cost": true
+    },
+    "claude_adapter_read_alias_child_parallel_read_tools": {
+      "verification_alias": "read",
+      "verification_ingress": "anthropic_messages",
+      "verification_candidate_order": -1,
+      "verification_candidate_label": "alias-replay",
+      "verification_declared_candidates": [
+        {
+          "candidate_order": 0,
+          "provider": "alibaba_token_plan",
+          "model": "alibaba_token_plan/qwen3.8-max-preview",
+          "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 1,
+          "provider": "openrouter",
+          "model": "openrouter/cohere/north-mini-code:free",
+          "route_family": "anthropic_openrouter_completion_adapter"
+        },
+        {
+          "candidate_order": 2,
+          "provider": "openrouter",
+          "model": "openrouter/owl-alpha",
+          "route_family": "anthropic_openrouter_completion_adapter"
+        },
+        {
+          "candidate_order": 3,
+          "provider": "opencode_zen",
+          "model": "deepseek-v4-flash",
+          "route_family": "anthropic_opencode_zen_responses_adapter"
+        },
+        {
+          "candidate_order": 4,
+          "provider": "opencode_zen",
+          "model": "big-pickle",
+          "route_family": "anthropic_opencode_zen_completion_adapter"
+        },
+        {
+          "candidate_order": 5,
+          "provider": "openai",
+          "model": "gpt-5.6-luna",
+          "route_family": "anthropic_openai_responses_adapter"
+        },
+        {
+          "candidate_order": 6,
+          "provider": "alibaba_token_plan",
+          "model": "alibaba_token_plan/qwen3.6-flash",
+          "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 7,
+          "provider": "kimi_code",
+          "model": "kimi_code/kimi-for-coding",
+          "route_family": "anthropic_kimi_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 8,
+          "provider": "openai",
+          "model": "gpt-5.4-mini",
+          "route_family": "anthropic_openai_responses_adapter"
+        }
+      ],
+      "command": [
+        "claude",
+        "-p",
+        "Dispatch to the harness-read-alias-parallel-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must emit exactly one assistant message containing exactly three tool calls, with no text: Read scripts/local-ci/sequential_core_tools_fixture.txt, Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from ., and Grep pattern exactly `sequential-core-tools-grep` with path exactly `scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. The child must not wait for any tool result before emitting all three tool calls. After all three tool results return, stop using tools and return exactly one line with no markdown, no explanation, no bullets, and no surrounding quotes: READ_ALIAS_PARALLEL_TOOLS_PASSED",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Agent"
+      ],
+      "claude_agents": {
+        "harness-read-alias-parallel-read-tools": {
+          "description": "Acceptance harness child for read alias parallel read-tool proof.",
+          "model": "read",
+          "effort": "high",
+          "background": true,
+          "permissionMode": "auto",
+          "tools": [
+            "Read",
+            "Glob",
+            "Grep"
+          ],
+          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's parallel tool script. This is not a repository investigation. Your first assistant message must contain exactly three tool_use blocks and no text: one Read, one Glob, and one Grep. Do not wait for any tool result before emitting all three tool calls. After all three tool results return, return only the caller's exact final line."
+        }
+      },
+      "env": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4001/anthropic"
+      },
+      "required_trace_names": [
+        "claude-code.orchestrator",
+        "claude-code.harness-read-alias-parallel-read-tools"
+      ],
+      "expected_user_ids": [
+        "adapter-harness-tenant"
+      ],
+      "expected_trace_user_ids_by_name": {
+        "claude-code.orchestrator": "adapter-harness-tenant",
+        "claude-code.harness-read-alias-parallel-read-tools": "adapter-harness-tenant"
+      },
+      "expected_trace_environment": "default",
+      "require_trace_session_id": true,
+      "match_trace_session_id_from_stdout": true,
+      "require_trace_ids_distinct_from_session_ids": true,
+      "post_run_wait_seconds": 2,
+      "allowed_generation_routes": [
+        "/anthropic/v1/messages"
+      ],
+      "command_json_checks": {
+        "required_equals": {
+          "is_error": false,
+          "result": "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        }
+      },
+      "session_history_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "required_one_of": {
+              "provider": [
+                "alibaba_token_plan",
+                "openrouter",
+                "opencode_zen",
+                "openai",
+                "kimi_code"
+              ],
+              "model": [
+                "alibaba_token_plan/qwen3.8-max-preview",
+                "openrouter/cohere/north-mini-code:free",
+                "openrouter/owl-alpha",
+                "deepseek-v4-flash",
+                "big-pickle",
+                "gpt-5.6-luna",
+                "alibaba_token_plan/qwen3.6-flash",
+                "kimi_code/kimi-for-coding",
+                "gpt-5.4-mini"
+              ]
+            },
+            "metadata_required_equals": {
+              "model_alias_label": "read",
+              "requested_model_alias": "read",
+              "anthropic_auto_agent_alias": "read"
+            },
+            "metadata_required_truthy": [
+              "anthropic_auto_agent_selected_provider",
+              "anthropic_auto_agent_selected_model",
+              "anthropic_auto_agent_selected_route_family",
+              "aawm_alias_routing_audit_events"
+            ],
+            "minimums": {
+              "input_tokens": 1,
+              "output_tokens": 1,
+              "total_tokens": 1
+            },
+            "correlated_candidate_triples": [
+              {
+                "provider": "alibaba_token_plan",
+                "model": "alibaba_token_plan/qwen3.8-max-preview",
+                "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
+              },
+              {
+                "provider": "openrouter",
+                "model": "openrouter/cohere/north-mini-code:free",
+                "route_family": "anthropic_openrouter_completion_adapter"
+              },
+              {
+                "provider": "openrouter",
+                "model": "openrouter/owl-alpha",
+                "route_family": "anthropic_openrouter_completion_adapter"
+              },
+              {
+                "provider": "opencode_zen",
+                "model": "deepseek-v4-flash",
+                "route_family": "anthropic_opencode_zen_responses_adapter"
+              },
+              {
+                "provider": "opencode_zen",
+                "model": "big-pickle",
+                "route_family": "anthropic_opencode_zen_completion_adapter"
+              },
+              {
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "route_family": "anthropic_openai_responses_adapter"
+              },
+              {
+                "provider": "alibaba_token_plan",
+                "model": "alibaba_token_plan/qwen3.6-flash",
+                "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
+              },
+              {
+                "provider": "kimi_code",
+                "model": "kimi_code/kimi-for-coding",
+                "route_family": "anthropic_kimi_chat_completions_adapter"
+              },
+              {
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "route_family": "anthropic_openai_responses_adapter"
+              }
+            ]
+          }
+        ]
+      },
+      "tool_activity_validation": {
+        "db_host": "127.0.0.1",
+        "db_port": 5434,
+        "db_name": "aawm_tristore",
+        "db_user": "aawm",
+        "db_password_env": "AAWM_DB_PASSWORD",
+        "poll_timeout_seconds": 60,
+        "poll_interval_seconds": 1,
+        "expected_rows": [
+          {
+            "tool_name": "Agent",
+            "tool_kind": "other",
+            "minimum_count": 1
+          }
+        ]
+      },
+      "transcript_tool_use_validation": {
+        "poll_timeout_seconds": 20,
+        "poll_interval_seconds": 1,
+        "expected_agents": [
+          {
+            "agent_type": "harness-read-alias-parallel-read-tools",
+            "expected_tool_counts": {
+              "Read": 1,
+              "Glob": 1,
+              "Grep": 1
+            },
+            "minimum_total_tool_uses": 3,
+            "maximum_total_tool_uses": 3,
+            "minimum_tools_in_single_assistant_message": 3,
+            "maximum_tool_uses_per_assistant_message": 3,
+            "forbid_tool_result_errors": true,
+            "require_all_tool_results": true,
+            "require_child_terminal_response": "READ_ALIAS_PARALLEL_TOOLS_PASSED",
+            "require_explicit_completion": true,
+            "child_output_max_chars": 4096
+          }
+        ]
+      },
+      "runtime_postconditions": {
+        "healthcheck_url": "http://127.0.0.1:4001/health/liveliness",
+        "docker_container_name": "litellm-dev"
+      },
+      "timeout_seconds": 300,
+      "langfuse_poll_timeout_seconds": 90,
+      "allow_zero_cost": true,
+      "required_trace_tags": [
+        "route:anthropic_messages",
+        "model-alias:read",
+        "anthropic-auto-agent-alias:read"
+      ],
+      "required_generation_metadata_truthy": [
+        "passthrough_route_family"
+      ],
+      "request_payload_checks": {
+        "required_paths": [
+          "model",
+          "messages",
+          "max_tokens",
+          "tools"
+        ]
+      }
     }
   }
 }

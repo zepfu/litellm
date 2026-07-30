@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import datetime as dt
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -2284,7 +2286,7 @@ def _read_runtime_logs_since(
         'docker_logs_exit_code': None,
         'docker_logs_since': None,
         'docker_logs_until': None,
-        'log_excerpt': '',
+        'log_structural': {'line_count': 0, 'char_count': 0, 'sha256': ''},
     }
     if not container_name:
         return summary, ''
@@ -2318,7 +2320,11 @@ def _read_runtime_logs_since(
         )
     summary['docker_logs_since'] = since_value
     summary['docker_logs_until'] = until_value
-    summary['log_excerpt'] = log_text[-4000:] if log_text else ''
+    summary['log_structural'] = {
+        'line_count': log_text.count('\n') + (1 if log_text and not log_text.endswith('\n') else 0) if log_text else 0,
+        'char_count': len(log_text),
+        'sha256': hashlib.sha256(log_text.encode()).hexdigest()[:16] if log_text else '',
+    }
     return summary, log_text
 
 
@@ -2340,6 +2346,21 @@ def _runtime_log_match_contexts(
         )
         contexts[substring] = log_text[start_index:end_index]
     return contexts
+
+
+
+def _digest_log_context(context: str) -> dict[str, Any]:
+    """Return structural/digest-only evidence for a runtime log context.
+
+    Never persists raw runtime text.  The sha256 digest plus bounded
+    structural counts prove that a specific context was captured for the
+    matched substring without leaking prompt/tool/log text into artifacts.
+    """
+    return {
+        'sha256': hashlib.sha256(context.encode('utf-8', errors='replace')).hexdigest(),
+        'char_count': len(context),
+        'line_count': context.count('\n') + (1 if context else 0),
+    }
 
 
 def _command_model_name(config: dict[str, Any]) -> str | None:
@@ -2464,6 +2485,7 @@ def _validate_runtime_logs(
     checks: dict[str, Any],
     runtime_postconditions: dict[str, Any],
     attribution_substrings: list[str] | None = None,
+    require_evidence: bool = False,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     container_name = (
         checks.get('docker_container_name')
@@ -2518,12 +2540,22 @@ def _validate_runtime_logs(
     summary['docker_logs_exit_code'] = log_summary.get('docker_logs_exit_code')
     summary['docker_logs_since'] = log_summary.get('docker_logs_since')
     summary['docker_logs_until'] = log_summary.get('docker_logs_until')
-    summary['log_excerpt'] = log_summary.get('log_excerpt', '')
+    summary['log_structural'] = log_summary.get(
+        'log_structural', {'line_count': 0, 'char_count': 0, 'sha256': ''}
+    )
+    summary['log_evidence_read'] = bool(log_text)
+    # Private key for in-process soft-fail matching; redacted by _write_artifact.
+    summary['_log_text'] = log_text
 
     if summary['docker_logs_exit_code'] != 0:
-        warnings.append(
-            f'{family} runtime log check could not read docker logs for `{container_name}` (exit {summary["docker_logs_exit_code"]})'
-        )
+        if require_evidence:
+            failures.append(
+                f'{family} runtime log evidence mandatory but docker logs unreadable for `{container_name}` (exit {summary["docker_logs_exit_code"]})'
+            )
+        else:
+            warnings.append(
+                f'{family} runtime log check could not read docker logs for `{container_name}` (exit {summary["docker_logs_exit_code"]})'
+            )
         return summary, failures, warnings
 
     matched = [
@@ -2556,12 +2588,15 @@ def _validate_runtime_logs(
 
     summary['matched_forbidden_substrings'] = failing_matches
     summary['matched_forbidden_contexts'] = {
-        substring: match_contexts[substring]
+        substring: _digest_log_context(match_contexts[substring])
         for substring in failing_matches
         if substring in match_contexts
     }
     summary['ignored_unattributed_forbidden_substrings'] = ignored_matches
-    summary['ignored_unattributed_forbidden_contexts'] = ignored_contexts
+    summary['ignored_unattributed_forbidden_contexts'] = {
+        substring: _digest_log_context(context)
+        for substring, context in ignored_contexts.items()
+    }
 
     return summary, failures, warnings
 
@@ -2584,6 +2619,16 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
     expected_rows = checks.get('expected_rows') or []
     expected_litellm_environment = checks.get('expected_litellm_environment')
     require_runtime_identity = checks.get('require_runtime_identity', True) is not False
+
+    # Finding 1 (round 7): phase_start_time freshness enforcement.
+    # When injected via checks, historical rows older than the phase start
+    # are excluded even if session_id/provider/model match.
+    phase_start_time = checks.get('phase_start_time')
+    phase_start_clause = ""
+    query_params: list[Any] = [session_id]
+    if isinstance(phase_start_time, str) and phase_start_time.strip():
+        phase_start_clause = " AND start_time >= %s"
+        query_params.append(phase_start_time.strip())
 
     query = """
         select provider, model, session_id, tenant_id, repository,
@@ -2612,16 +2657,16 @@ def _validate_session_history(*, family: str, session_id: str | None, checks: di
                system_unclassified_tokens_estimated,
                metadata, start_time, end_time
         from public.session_history
-        where session_id = %s
+        where session_id = %s{phase_start_clause}
         order by start_time desc
-    """
+    """.format(phase_start_clause=phase_start_clause)
     conn = _validation_db_connection(db_settings)
     poll_timeout_seconds = max(0.0, float(checks.get('poll_timeout_seconds') or 0))
     poll_interval_seconds = max(0.1, float(checks.get('poll_interval_seconds') or 1))
     poll_deadline = time.monotonic() + poll_timeout_seconds
     while True:
         with conn.cursor() as cur:
-            cur.execute(query, (session_id,))
+            cur.execute(query, tuple(query_params))
             records = cur.fetchall()
 
         if records:
@@ -2918,6 +2963,34 @@ def _session_history_record_matches_expected(
     for key, allowed_values in (expected_row.get('required_one_of') or {}).items():
         if row.get(key) not in set(allowed_values or []):
             return False
+    # Correlated candidate triples: the row's provider+model+route_family must
+    # match one of the allowed triples (same-row correlation, not independent
+    # allowlists).  route_family is read from metadata selected_route_family /
+    # passthrough_route_family.
+    correlated_triples = expected_row.get('correlated_candidate_triples')
+    if isinstance(correlated_triples, list) and correlated_triples:
+        row_metadata = row.get('metadata')
+        if not isinstance(row_metadata, dict):
+            row_metadata = {}
+        row_route_family = None
+        for rf_key in (
+            'codex_auto_agent_selected_route_family',
+            'anthropic_auto_agent_selected_route_family',
+            'passthrough_route_family',
+        ):
+            rf_val = row_metadata.get(rf_key)
+            if isinstance(rf_val, str) and rf_val.strip():
+                row_route_family = rf_val.strip()
+                break
+        triple_matched = any(
+            isinstance(triple, dict)
+            and row.get('provider') == triple.get('provider')
+            and row.get('model') == triple.get('model')
+            and row_route_family == triple.get('route_family')
+            for triple in correlated_triples
+        )
+        if not triple_matched:
+            return False
     for key in expected_row.get('required_truthy') or []:
         if not row.get(key):
             return False
@@ -3096,6 +3169,34 @@ def _rate_limit_observation_record_matches_expected(
             return False
     for key, allowed_values in (expected_row.get('required_one_of') or {}).items():
         if row.get(key) not in set(allowed_values or []):
+            return False
+    # Correlated candidate triples: the row's provider+model+route_family must
+    # match one of the allowed triples (same-row correlation, not independent
+    # allowlists).  route_family is read from metadata selected_route_family /
+    # passthrough_route_family.
+    correlated_triples = expected_row.get('correlated_candidate_triples')
+    if isinstance(correlated_triples, list) and correlated_triples:
+        row_metadata = row.get('metadata')
+        if not isinstance(row_metadata, dict):
+            row_metadata = {}
+        row_route_family = None
+        for rf_key in (
+            'codex_auto_agent_selected_route_family',
+            'anthropic_auto_agent_selected_route_family',
+            'passthrough_route_family',
+        ):
+            rf_val = row_metadata.get(rf_key)
+            if isinstance(rf_val, str) and rf_val.strip():
+                row_route_family = rf_val.strip()
+                break
+        triple_matched = any(
+            isinstance(triple, dict)
+            and row.get('provider') == triple.get('provider')
+            and row.get('model') == triple.get('model')
+            and row_route_family == triple.get('route_family')
+            for triple in correlated_triples
+        )
+        if not triple_matched:
             return False
     for key in expected_row.get('required_truthy') or []:
         if not row.get(key):
@@ -3536,13 +3637,22 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
     if db_settings is None:
         return {'record': None, 'records': []}, db_failures
 
+    # Finding 1 (round 7): phase_start_time freshness enforcement for
+    # tool_activity.  Correlate to the current phase via created_at lower bound.
+    phase_start_time = checks.get('phase_start_time')
+    ta_phase_clause = ""
+    ta_query_params: list[Any] = [session_id]
+    if isinstance(phase_start_time, str) and phase_start_time.strip():
+        ta_phase_clause = " AND created_at >= %s"
+        ta_query_params.append(phase_start_time.strip())
+
     query = '''
         select litellm_call_id, tool_call_id, provider, model, tool_index,
                tool_name, tool_kind, command_text, arguments, metadata, created_at
         from public.session_history_tool_activity
-        where session_id = %s
+        where session_id = %s{ta_phase_clause}
         order by created_at asc, tool_index asc
-    '''
+    '''.format(ta_phase_clause=ta_phase_clause)
     conn = _validation_db_connection(db_settings)
     expected_rows = checks.get('expected_rows') or []
     poll_timeout_seconds = max(0.0, float(checks.get('poll_timeout_seconds') or 0))
@@ -3550,7 +3660,7 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
     poll_deadline = time.monotonic() + poll_timeout_seconds
     while True:
         with conn.cursor() as cur:
-            cur.execute(query, (session_id,))
+            cur.execute(query, tuple(ta_query_params))
             records = cur.fetchall()
 
         missing_expected_rows = False
@@ -4032,6 +4142,12 @@ def _normalize_transcript_agent_checks(checks: dict[str, Any]) -> list[dict[str,
         'require_tool_result_before_next_tool_use': checks.get(
             'require_tool_result_before_next_tool_use'
         ),
+        'require_all_tool_results': checks.get('require_all_tool_results'),
+        'require_child_terminal_response': checks.get(
+            'require_child_terminal_response'
+        ),
+        'require_explicit_completion': checks.get('require_explicit_completion'),
+        'child_output_max_chars': checks.get('child_output_max_chars'),
     }]
 
 
@@ -4211,6 +4327,86 @@ def _validate_transcript_agent_tool_uses(  # noqa: PLR0915
             ]
             failures.append(
                 f'{family} transcript for agent={expected_agent_text!r} had tool_result errors: {json.dumps(previews, sort_keys=True)}'
+            )
+
+    # Child proof: every tool_use must have a corresponding successful tool_result.
+    if agent_checks.get('require_all_tool_results') is True:
+        records = summary.get('records') or []
+        missing_results: list[str] = []
+        errored_results: list[str] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            tool_use_id = str(record.get('tool_use_id') or '')
+            tool_name = str(record.get('tool_name') or '')
+            if not record.get('tool_result_line'):
+                missing_results.append(f'{tool_name}(id={tool_use_id})')
+            elif record.get('tool_result_is_error') is True:
+                errored_results.append(f'{tool_name}(id={tool_use_id})')
+        if missing_results:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} tool_use without tool_result: {", ".join(missing_results[:10])}'
+            )
+        if errored_results:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} tool_use with failed tool_result: {", ".join(errored_results[:10])}'
+            )
+
+    # Child proof: child must emit a required exact terminal response.
+    required_terminal = agent_checks.get('require_child_terminal_response')
+    if isinstance(required_terminal, str) and required_terminal:
+        assistant_texts = summary.get('assistant_texts') or []
+        final_text = ''
+        for item in reversed(assistant_texts):
+            if isinstance(item, dict) and isinstance(item.get('text'), str):
+                final_text = item['text'].strip()
+                break
+        if not final_text:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} missing child terminal response text'
+            )
+        elif final_text != required_terminal:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} child terminal response mismatch: expected {required_terminal!r}, got {final_text[:200]!r}'
+            )
+
+    # Child proof: child must explicitly complete/terminate (at least one
+    # assistant text after all tool_use blocks).
+    if agent_checks.get('require_explicit_completion') is True:
+        assistant_texts = summary.get('assistant_texts') or []
+        records = summary.get('records') or []
+        last_tool_line = 0
+        for record in records:
+            if isinstance(record, dict):
+                try:
+                    last_tool_line = max(last_tool_line, int(record.get('line') or 0))
+                except (TypeError, ValueError):
+                    pass
+        has_terminal_text = any(
+            isinstance(item, dict)
+            and isinstance(item.get('text'), str)
+            and item['text'].strip()
+            and int(item.get('line') or 0) > last_tool_line
+            for item in assistant_texts
+        )
+        if not has_terminal_text:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} no explicit completion text after final tool_use'
+            )
+
+    # Child proof: child output must remain bounded.
+    child_output_max = agent_checks.get('child_output_max_chars')
+    if child_output_max is not None:
+        max_chars = int(child_output_max)
+        assistant_texts = summary.get('assistant_texts') or []
+        total_chars = sum(
+            len(item.get('text') or '')
+            for item in assistant_texts
+            if isinstance(item, dict)
+        )
+        if total_chars > max_chars:
+            failures.append(
+                f'{family} transcript for agent={expected_agent_text!r} child output {total_chars} chars exceeds bound {max_chars}'
             )
 
     return summary, failures
@@ -4775,7 +4971,7 @@ def _command_api_error_status(
     return None
 
 
-def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_key: str, secret_key: str, litellm_base_url: str) -> dict[str, Any]:  # noqa: PLR0915
+def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_key: str, secret_key: str, litellm_base_url: str, cfg003_transactional: bool = False) -> dict[str, Any]:  # noqa: PLR0915
     started, run, command_attempts = _run_command_with_retry(config=config)
     observed_api_error_status = _command_api_error_status(
         run=run,
@@ -5424,6 +5620,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             config=config,
             session_id=command_session_id,
         ),
+        require_evidence=cfg003_transactional,
     )
     failures.extend(runtime_log_failures)
     warnings.extend(runtime_log_warnings)
@@ -6481,12 +6678,12 @@ def _provider_unavailable_failure_soft_fail_result(
     if not required_substrings:
         return failures, [], warnings, runtime_logs
 
-    log_excerpt = runtime_logs.get('log_excerpt')
-    if not isinstance(log_excerpt, str) or not log_excerpt:
+    log_text = runtime_logs.get('_log_text')
+    if not isinstance(log_text, str) or not log_text:
         return failures, [], warnings, runtime_logs
 
     matched_substrings = [
-        substring for substring in required_substrings if substring in log_excerpt
+        substring for substring in required_substrings if substring in log_text
     ]
     runtime_logs = {
         **runtime_logs,
@@ -6518,7 +6715,8 @@ def _provider_unavailable_failure_soft_fail_result(
 
 
 def _write_artifact(path: pathlib.Path, artifact: dict[str, Any]) -> None:
-    path.write_text(json.dumps(artifact, indent=2) + '\n', encoding='utf-8')
+    sanitized = RA._redact_sensitive_artifact_fields(artifact)
+    path.write_text(json.dumps(sanitized, indent=2) + '\n', encoding='utf-8')
 
 
 def _parse_selected_cases(
@@ -6713,6 +6911,7 @@ def _run_selected_case(
     public_key: str,
     secret_key: str,
     litellm_base_url: str,
+    cfg003_transactional: bool = False,
 ) -> dict[str, Any]:
     agentic_contract, contract_failures = (
         _validate_moonshot_anthropic_agentic_contract(
@@ -6746,6 +6945,10 @@ def _run_selected_case(
             public_key=public_key,
             secret_key=secret_key,
             litellm_base_url=litellm_base_url,
+            cfg003_transactional=(
+                cfg003_transactional
+                and _cfg003_case_requires_runtime_evidence(case_name, case_config)
+            ),
         )
         result['agentic_contract'] = agentic_contract
         return result
@@ -6763,7 +6966,1587 @@ def _run_selected_case(
         return RA._family_error_result(case_name, exc)
 
 
-def main() -> int:
+# ---------------------------------------------------------------------------
+# CFG-003: Transactional live priority-swap refresh orchestration
+# ---------------------------------------------------------------------------
+
+_CFG003_INVALID_YAML = "aliases:\n  - name: read\n    candidates: not_a_list\n"
+
+_CFG003_CODEX_PROOF_CASE = (
+    "native_openai_passthrough_responses_codex_read_alias_collaboration"
+)
+_CFG003_CLAUDE_PROOF_CASE = (
+    "claude_adapter_read_alias_child_parallel_read_tools"
+)
+
+# Targets that may run the transactional refresh test (dev only).
+_CFG003_ALLOWED_TARGETS = frozenset({"dev"})
+
+# Canonical dev profile values that MUST all match for CFG-003 to proceed.
+_CFG003_CANONICAL_DEV_PROFILE = {
+    "litellm_base_url": "http://127.0.0.1:4001",
+    "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+    "docker_container_name": "litellm-dev",
+    "expected_trace_environment": "dev",
+}
+
+
+def _cfg003_validate_canonical_dev_profile(
+    *,
+    target: str,
+    profile: dict[str, str],
+) -> tuple[bool, list[str]]:
+    """Validate that the resolved target is EXACTLY the canonical checked-in
+    dev profile.  CLI overrides or a dev-labelled profile pointing at prod,
+    port 4000, or aawm-litellm must fail closed.
+
+    Returns (valid, failures).
+    """
+    failures: list[str] = []
+    if target != "dev":
+        failures.append(
+            f"cfg003 canonical dev gate: target must be 'dev', got {target!r}"
+        )
+    for key, expected in sorted(_CFG003_CANONICAL_DEV_PROFILE.items()):
+        actual = str(profile.get(key, "")).rstrip("/")
+        if actual != expected:
+            failures.append(
+                f"cfg003 canonical dev gate: {key} must be {expected!r}, "
+                f"got {actual!r}"
+            )
+    # Explicit rejection of known production signatures even if target is dev.
+    litellm_url = str(profile.get("litellm_base_url", "")).rstrip("/")
+    if ":4000" in litellm_url:
+        failures.append(
+            "cfg003 canonical dev gate: litellm_base_url contains port 4000 "
+            "(production signature)"
+        )
+    container = str(profile.get("docker_container_name", ""))
+    if container == "aawm-litellm":
+        failures.append(
+            "cfg003 canonical dev gate: docker_container_name is 'aawm-litellm' "
+            "(production container)"
+        )
+    return not failures, failures
+
+
+
+
+def _cfg003_raw_config_canonical_preflight(
+    *,
+    config_path: pathlib.Path,
+    target_override: str | None,
+    litellm_base_url_override: str | None,
+    anthropic_base_url_override: str | None,
+    docker_container_name_override: str | None,
+    expected_trace_environment_override: str | None,
+) -> tuple[bool, list[str]]:
+    """Finding 3 (round 8): Canonical transactional target rejection BEFORE
+    dotenv loading.  Reads only the raw config JSON and CLI overrides to build
+    the target profile, then validates it against the canonical dev profile.
+
+    This prevents an invalid transactional target from triggering dotenv
+    loading or credential resolution.  The resolved-profile validation after
+    profile resolution is retained as a second gate.
+
+    Returns (valid, failures).
+    """
+    try:
+        raw_config = RA._load_json(config_path)
+    except Exception as exc:  # noqa: BLE001
+        return False, [f"cfg003 raw preflight: cannot load config: {exc}"]
+    target = target_override or str(raw_config.get("default_target_profile") or "dev")
+    profile = _target_profile_settings(
+        config=raw_config,
+        target=target,
+        litellm_base_url=litellm_base_url_override,
+        anthropic_base_url=anthropic_base_url_override,
+        docker_container_name=docker_container_name_override,
+        expected_trace_environment=expected_trace_environment_override,
+    )
+    return _cfg003_validate_canonical_dev_profile(target=target, profile=profile)
+
+def _cfg003_readiness_check(
+    litellm_base_url: str,
+    *,
+    expected_hash: str,
+    expected_version: str,
+    phase_label: str,
+) -> tuple[bool, list[str]]:
+    """Finding 2 (round 7): Authoritative readiness hash/version check.
+
+    Queries /health/readiness and requires the active config_hash and
+    config_version to match the expected values exactly.  Returns
+    (ok, failures).
+    """
+    readiness_url = f"{litellm_base_url}{RA._HEALTH_READINESS_PATH}"
+    try:
+        status, body = RA._http_get_json_plain(readiness_url, timeout=15.0)
+    except Exception as exc:  # noqa: BLE001
+        return False, [f"{phase_label} readiness check exception: {exc}"]
+    if status != 200:
+        return False, [f"{phase_label} readiness unavailable: status={status}"]
+    alias_section = {}
+    if isinstance(body, dict):
+        alias_section = body.get("aawm_alias_config") or {}
+    actual_hash = str(alias_section.get("config_hash", ""))
+    actual_version = str(alias_section.get("config_version", ""))
+    failures: list[str] = []
+    if actual_hash != expected_hash:
+        failures.append(
+            f"{phase_label} readiness hash mismatch: expected {expected_hash!r}, "
+            f"got {actual_hash!r}"
+        )
+    if actual_version != expected_version:
+        failures.append(
+            f"{phase_label} readiness version mismatch: expected {expected_version!r}, "
+            f"got {actual_version!r}"
+        )
+    return not failures, failures
+
+
+class _Cfg003InsufficientCandidates(Exception):
+    """Internal control-flow signal: not enough eligible candidates."""
+
+
+def _cfg003_query_active_inventory(  # noqa: PLR0915
+    litellm_base_url: str,
+) -> dict[str, Any]:
+    """Query readiness and build the authoritative alias inventory using
+    CFG-002 compile_directory.
+
+    Fail-closed: readiness unavailable, non-active, missing hash, source-file
+    mismatch, alias mismatch (readiness vs compiled), zero candidates/ingresses,
+    or missing local alias all produce healthy=False with inventory_failures.
+    """
+    readiness_url = f"{litellm_base_url}{RA._HEALTH_READINESS_PATH}"
+    status, body = RA._http_get_json_plain(readiness_url, timeout=15.0)
+
+    alias_config_section = {}
+    if isinstance(body, dict):
+        alias_config_section = body.get("aawm_alias_config") or {}
+
+    config_hash = str(alias_config_section.get("config_hash", ""))
+    config_version = str(alias_config_section.get("config_version", ""))
+    source_files = sorted(alias_config_section.get("files", []))
+    active_aliases = sorted(alias_config_section.get("aliases", []))
+    state = str(alias_config_section.get("state", "unknown"))
+
+    result: dict[str, Any] = {
+        "readiness_status": status,
+        "readiness_state": state,
+        "config_hash": config_hash,
+        "config_version": config_version,
+        "source_files": source_files,
+        "active_aliases": active_aliases,
+        "alias_inventory": [],
+        "healthy": False,
+        "inventory_failures": [],
+    }
+
+    if status != 200:
+        result["inventory_failures"].append(f"readiness unavailable: status={status}")
+        return result
+    if state != "active":
+        result["inventory_failures"].append(f"alias config not active: state={state!r}")
+        return result
+    if not config_hash or not config_version:
+        result["inventory_failures"].append("readiness missing semantic config_hash/config_version")
+        return result
+
+    # Use CFG-002 authoritative compile_directory.
+    try:
+        auth = RA._load_authoritative_startup_config()
+    except Exception as exc:  # noqa: BLE001
+        result["inventory_failures"].append(f"CFG-002 compile_directory failed: {exc}")
+        return result
+
+    compiled_hash = auth["config_hash"]
+    compiled_aliases = auth["aliases"]
+    compiled_files = auth["file_names"]
+
+    # Source files must match.
+    if compiled_files != source_files:
+        result["inventory_failures"].append(
+            f"source file mismatch: readiness={source_files} compiled={compiled_files}"
+        )
+        return result
+
+    # Active aliases must exactly equal compiled aliases.
+    if compiled_aliases != active_aliases:
+        result["inventory_failures"].append(
+            f"alias mismatch: readiness={active_aliases} compiled={compiled_aliases}"
+        )
+        return result
+
+    # Semantic hash must match.
+    if compiled_hash != config_hash:
+        result["inventory_failures"].append(
+            f"semantic hash mismatch: readiness={config_hash} compiled={compiled_hash}"
+        )
+        return result
+
+    snapshot = auth["snapshot"]
+    alias_inventory: list[dict[str, Any]] = []
+    for alias_name in compiled_aliases:
+        ingresses = RA._derive_ingresses_from_snapshot(snapshot, alias_name)
+        eligible = RA._derive_eligible_candidates_from_snapshot(
+            snapshot, alias_name=alias_name, excluded_providers=frozenset()
+        )
+        if not ingresses:
+            result["inventory_failures"].append(
+                f"alias {alias_name!r} has zero supported ingresses"
+            )
+            return result
+        if not eligible:
+            result["inventory_failures"].append(
+                f"alias {alias_name!r} has zero candidates"
+            )
+            return result
+        alias_inventory.append({
+            "alias": alias_name,
+            "config_hash": config_hash,
+            "config_version": config_version,
+            "source_files": source_files,
+            "supported_ingresses": ingresses,
+            "candidate_count": len(eligible),
+        })
+
+    if not alias_inventory:
+        result["inventory_failures"].append("no active aliases after compilation")
+        return result
+
+    result["alias_inventory"] = alias_inventory
+    result["healthy"] = True
+    return result
+
+
+def _cfg003_extract_observed_selection(
+    case_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract the OBSERVED selected provider/model/route from a case result's
+    session-history record.  Based on observed correlation, not configured
+    independent allowlists.
+    """
+    record = _case_result_session_history_record(case_result)
+    provider = record.get("provider")
+    model = record.get("model")
+    metadata = record.get("metadata")
+    route_family = None
+    if isinstance(metadata, dict):
+        for key in (
+            "codex_auto_agent_selected_route_family",
+            "anthropic_auto_agent_selected_route_family",
+            "passthrough_route_family",
+        ):
+            val = metadata.get(key)
+            if isinstance(val, str) and val.strip():
+                route_family = val.strip()
+                break
+    return {
+        "provider": provider if isinstance(provider, str) and provider else None,
+        "model": model if isinstance(model, str) and model else None,
+        "route_family": route_family,
+    }
+
+
+def _cfg003_run_proof_case(
+    *,
+    case_name: str,
+    case_config_key: str,
+    cases: dict[str, dict[str, Any]],
+    suite_config: dict[str, Any],
+    query_url: str,
+    public_key: str,
+    secret_key: str,
+    litellm_base_url: str,
+) -> dict[str, Any]:
+    """Run one real TUI proof case with a FRESH phase-specific session identity.
+
+    Finding 4: each proof phase receives a unique session ID so selection
+    evidence is attributable to that exact phase, not a reused session.
+    """
+    phase_session_id = str(uuid.uuid4())
+    phase_start_time = dt.datetime.now(dt.timezone.utc)
+    # Create a phase-specific copy of the case config with a fresh session.
+    case_config = dict(cases[case_config_key])
+    case_config["expected_trace_session_id"] = phase_session_id
+    # Finding 1 (round 8): inject phase_start_time into nested validation
+    # dicts so historical DB rows cannot satisfy a new proof phase.
+    phase_start_iso = phase_start_time.isoformat()
+    shv = case_config.get("session_history_validation")
+    if isinstance(shv, dict):
+        shv = dict(shv)
+        shv["phase_start_time"] = phase_start_iso
+        case_config["session_history_validation"] = shv
+    tav = case_config.get("tool_activity_validation")
+    if isinstance(tav, dict):
+        tav = dict(tav)
+        tav["phase_start_time"] = phase_start_iso
+        case_config["tool_activity_validation"] = tav
+    result = _run_selected_case(
+        case_name=case_name,
+        case_config=case_config,
+        suite_config=suite_config,
+        query_url=query_url,
+        public_key=public_key,
+        secret_key=secret_key,
+        litellm_base_url=litellm_base_url,
+        cfg003_transactional=True,
+    )
+    selection = _cfg003_extract_observed_selection(result)
+    return {
+        "result": result,
+        "selection": selection,
+        "phase_session_id": phase_session_id,
+        "phase_start_time": phase_start_time.isoformat(),
+    }
+
+
+def _cfg003_proof_correlation_ids(proof: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Extract (session_id, trace_id) correlation ids from a proof result for
+    error-intake attribution.  Reads the Langfuse section of the case result."""
+    result = proof.get("result") if isinstance(proof, dict) else None
+    if not isinstance(result, dict):
+        return None, None
+    langfuse = result.get("langfuse")
+    if not isinstance(langfuse, dict):
+        return None, None
+    session_id = langfuse.get("command_session_id")
+    trace_ids = langfuse.get("trace_ids") or langfuse.get("filtered_trace_ids") or []
+    trace_id = trace_ids[0] if isinstance(trace_ids, list) and trace_ids else None
+    return (
+        str(session_id) if session_id else None,
+        str(trace_id) if trace_id else None,
+    )
+
+
+
+
+def _cfg003_case_requires_runtime_evidence(
+    case_name: str, case_config: dict[str, Any]
+) -> bool:
+    """Derive whether runtime-log evidence is mandatory for this case.
+
+    Required only for transactional alias/TUI coverage cases (those with
+    verification_alias) and exact CFG-003 proof case identities.
+    Ordinary non-alias cases never require runtime-log evidence, even when
+    the global --cfg003-transactional-refresh flag is active.
+    """
+    if case_config.get("verification_alias"):
+        return True
+    # Proof cases use suffixed names (e.g. ...__cfg003_baseline).
+    for proof_id in (_CFG003_CODEX_PROOF_CASE, _CFG003_CLAUDE_PROOF_CASE):
+        if case_name == proof_id or case_name.startswith(proof_id + "__"):
+            return True
+    return False
+
+
+def _cfg003_case_correlation_ids(case_result: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Extract (session_id, trace_id) correlation ids from a plain case result
+    for per-case error-intake attribution (finding 2, round 9)."""
+    if not isinstance(case_result, dict):
+        return None, None
+    langfuse = case_result.get("langfuse")
+    if not isinstance(langfuse, dict):
+        return None, None
+    session_id = langfuse.get("command_session_id")
+    trace_ids = langfuse.get("trace_ids") or langfuse.get("filtered_trace_ids") or []
+    trace_id = trace_ids[0] if isinstance(trace_ids, list) and trace_ids else None
+    return (
+        str(session_id) if session_id else None,
+        str(trace_id) if trace_id else None,
+    )
+
+def _cfg003_derive_terminal_marker(case_config: dict[str, Any]) -> str:
+    """Finding 5 (round 7): Derive the exact validated terminal marker from
+    the case's configured exact-output contract.
+
+    For Codex: command_output_text_checks.required_prefix/suffix exact marker.
+    For Claude: command_json_checks.required_equals.result required result.
+
+    Returns the expected marker string, or empty string if contract cannot
+    derive it (fail closed).
+    """
+    # Codex: exact prefix/suffix from command_output_text_checks.
+    text_checks = case_config.get("command_output_text_checks")
+    if isinstance(text_checks, dict):
+        prefix = text_checks.get("required_prefix")
+        suffix = text_checks.get("required_suffix")
+        if isinstance(prefix, str) and prefix.strip():
+            return prefix.strip()
+        if isinstance(suffix, str) and suffix.strip():
+            return suffix.strip()
+
+    # Claude: required result from command_json_checks.
+    json_checks = case_config.get("command_json_checks")
+    if isinstance(json_checks, dict):
+        required_equals = json_checks.get("required_equals")
+        if isinstance(required_equals, dict):
+            result = required_equals.get("result")
+            if isinstance(result, str) and result.strip():
+                return result.strip()
+
+    return ""
+
+
+def _cfg003_build_phase_evidence(
+    *,
+    phase_name: str,
+    case_name: str,
+    proof: dict[str, Any],
+    case_config: dict[str, Any],
+    active_hash: str | None = None,
+    active_version: str | None = None,
+    active_order: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build a sanitized evidence record for one proof phase.
+
+    Finding 5: includes case name, TUI executable/ingress, phase-specific
+    session/trace, selected provider/model/route, active hash/version/order,
+    terminal success marker, configured agent names/profiles, prompt identity
+    as SHA-256+length (never raw), and bounded tool/child outcome summaries.
+    Never persists raw prompts, authorization values, command/tool arguments,
+    stdout/stderr, or raw provider bodies.
+    """
+    result = proof.get("result", {})
+    selection = proof.get("selection", {})
+    session_id = proof.get("phase_session_id")
+    phase_start = proof.get("phase_start_time")
+
+    # Extract correlation IDs.
+    corr_session, corr_trace = _cfg003_proof_correlation_ids(proof)
+
+    # Finding 4 (round 7): Executable-aware prompt identity extraction.
+    # For Claude, -p is the prompt.  For Codex `codex exec`, -p is the
+    # provider/profile and the actual prompt is the final positional argument.
+    # Hash the actual prompt and length, never raw prompt.
+    raw_prompt = ""
+    command = case_config.get("command")
+    if isinstance(command, list) and command:
+        executable = str(command[0])
+        if "codex" in executable:
+            # Codex: final positional argument is the prompt.
+            # Skip flags and their values; the last non-flag argument is prompt.
+            positional_args: list[str] = []
+            skip_next = False
+            for arg in command[1:]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg.startswith("-"):
+                    # Flags that take a value argument.
+                    if arg in ("-p", "-m", "-c", "--model", "--profile"):
+                        skip_next = True
+                    continue
+                positional_args.append(str(arg))
+            if positional_args:
+                raw_prompt = positional_args[-1]
+        else:
+            # Claude and others: -p is the prompt.
+            for i, arg in enumerate(command):
+                if arg == "-p" and i + 1 < len(command):
+                    raw_prompt = str(command[i + 1])
+                    break
+    prompt_sha256 = hashlib.sha256(raw_prompt.encode()).hexdigest() if raw_prompt else ""
+    prompt_length = len(raw_prompt)
+
+    # TUI executable.
+    tui_executable = ""
+    if isinstance(command, list) and command:
+        tui_executable = str(command[0])
+
+    # Bounded tool/child outcome summaries from session history.
+    record = _case_result_session_history_record(result)
+    metadata = record.get("metadata") if isinstance(record, dict) else None
+    tool_summary = None
+    child_summary = None
+    if isinstance(metadata, dict):
+        tool_count = metadata.get("tool_call_count")
+        if tool_count is not None:
+            tool_summary = {"tool_call_count": tool_count}
+        child_agent = metadata.get("child_agent_name")
+        if child_agent:
+            child_summary = {"child_agent_name": str(child_agent)}
+
+    return {
+        "phase": phase_name,
+        "case_name": case_name,
+        "tui_executable": tui_executable,
+        "verification_ingress": case_config.get("verification_ingress", ""),
+        "phase_session_id": session_id,
+        "phase_start_time": phase_start,
+        "correlated_session_id": corr_session,
+        "correlated_trace_id": corr_trace,
+        "selected_provider": selection.get("provider"),
+        "selected_model": selection.get("model"),
+        "selected_route_family": selection.get("route_family"),
+        "active_config_hash": active_hash,
+        "active_config_version": active_version,
+        "active_candidate_order": active_order,
+        "passed": bool(result.get("passed")),
+        "terminal_marker": _cfg003_derive_terminal_marker(case_config) or result.get("terminal_marker", ""),
+        "terminal_marker_source": "derived_from_contract" if _cfg003_derive_terminal_marker(case_config) else "result_fallback",
+        "expected_parent_agent_name": case_config.get("expected_parent_agent_name", ""),
+        "expected_child_agent_name": case_config.get("expected_child_agent_name", ""),
+        "agent_profile": case_config.get("agent_profile", ""),
+        "prompt_sha256": prompt_sha256,
+        "prompt_length": prompt_length,
+        "tool_summary": tool_summary,
+        "child_summary": child_summary,
+    }
+
+
+def _cfg003_selection_matches_candidate(
+    selection: dict[str, Any], candidate: dict[str, Any]
+) -> bool:
+    """Require observed provider, model, AND route_family all match."""
+    return (
+        selection.get("provider") == candidate["provider"]
+        and selection.get("model") == candidate["model"]
+        and selection.get("route_family") == candidate["route_family"]
+    )
+
+
+def _cfg003_collect_availability_evidence(
+    candidates: list[dict[str, Any]],
+    *,
+    db_settings: dict[str, Any] | None = None,
+    environment: str = "dev",
+) -> dict[str, Any]:
+    """Collect POSITIVE availability evidence from rate_limit_observations DB.
+
+    Requires an explicit fresh non-exhausted quota row (remaining_pct > 0)
+    for each candidate (provider, model) identity.  Missing/unknown/stale/
+    exhausted evidence does NOT count as available.
+
+    Returns {evidence: {(provider, model): {available, evidence, observed_at,
+             environment, environment_binding}},
+             available_identities: [{provider, model}],
+             evidence_records: [sanitized JSON-safe list],
+             source: "rate_limit_observations"}.
+    """
+    if db_settings is None:
+        # No DB available -- no positive evidence possible.
+        return {
+            "evidence": {},
+            "available_identities": [],
+            "evidence_records": [],
+            "source": "none",
+            "note": "no DB settings; positive availability cannot be established",
+        }
+
+    availability = RA._query_positive_availability_evidence(
+        db_settings=db_settings,
+        candidates=candidates,
+        environment=environment,
+    )
+    available_identities = sorted(
+        ({"provider": key[0], "model": key[1]}
+         for key, info in availability.items()
+         if info.get("available") is True),
+        key=lambda d: (d["provider"], d["model"]),
+    )
+    evidence_records = RA._serialize_availability_evidence(availability)
+    return {
+        "evidence": availability,
+        "available_identities": available_identities,
+        "evidence_records": evidence_records,
+        "source": "rate_limit_observations",
+    }
+
+
+def _cfg003_db_settings(
+    config: dict[str, Any],
+    *,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build DB settings for rate_limit_observations from config/env.
+
+    Resolution order for the password (finding 7):
+    1. Container-owned credential via ``validation_db_password_container_env``
+       resolved through ``_resolve_container_env_value`` (target profile).
+    2. Local environment variable from ``db_password_env``.
+
+    The password value is never logged.  Returns None when no password can be
+    resolved (positive availability then cannot be established and the
+    transaction fails closed on < 2 candidates).
+    """
+    checks: dict[str, Any] = {}
+    for section in ("session_history_validation", "transcript_tool_use_validation"):
+        candidate = config.get(section)
+        if isinstance(candidate, dict) and (
+            candidate.get("db_password_env") or candidate.get("db_password_container_env")
+        ):
+            checks = candidate
+            break
+    if not checks:
+        for case_cfg in (config.get("cases") or {}).values():
+            if not isinstance(case_cfg, dict):
+                continue
+            for sub in case_cfg.values():
+                if isinstance(sub, dict) and (
+                    sub.get("db_password_env") or sub.get("db_password_container_env")
+                ):
+                    checks = sub
+                    break
+            if checks:
+                break
+
+    # Profile-level container-owned credential (finding 7).
+    if profile is None:
+        profile = {}
+    container_env_name = str(
+        checks.get("db_password_container_env")
+        or profile.get("validation_db_password_container_env")
+        or ""
+    ).strip()
+    container_name = str(
+        checks.get("db_password_container")
+        or profile.get("docker_container_name")
+        or ""
+    ).strip()
+
+    db_host = str(checks.get("db_host") or profile.get("validation_db_host") or os.environ.get("AAWM_DB_HOST") or "127.0.0.1")
+    db_port = int(checks.get("db_port") or profile.get("validation_db_port") or os.environ.get("AAWM_DB_PORT") or 5434)
+    db_name = str(checks.get("db_name") or profile.get("validation_db_name") or os.environ.get("AAWM_DB_NAME") or "aawm_tristore")
+    db_user = str(checks.get("db_user") or profile.get("validation_db_user") or os.environ.get("AAWM_DB_USER") or "aawm")
+
+    db_password: str | None = None
+    # 1. Container-owned credential (preferred).
+    if container_env_name and container_name:
+        db_password = _resolve_container_env_value(container_name, container_env_name)
+    # 2. Local environment fallback.
+    if db_password is None:
+        password_env = str(checks.get("db_password_env") or "AAWM_DB_PASSWORD")
+        db_password = os.environ.get(password_env)
+    if db_password is None:
+        return None
+    return {
+        "host": db_host,
+        "port": db_port,
+        "dbname": db_name,
+        "user": db_user,
+        "password": db_password,
+    }
+
+
+def _cfg003_verify_source_files_unchanged(
+    original_per_file_hashes: dict[str, str],
+) -> tuple[bool, list[str]]:
+    """Prove the checked-in source files remain byte-identical."""
+    failures: list[str] = []
+    config_dir = RA._AAWM_ALIAS_CONFIG_DIR
+    for filename, expected_hash in sorted(original_per_file_hashes.items()):
+        filepath = config_dir / filename
+        try:
+            actual_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
+        except OSError as exc:
+            failures.append(f"cannot read {filename}: {exc}")
+            continue
+        if actual_hash != expected_hash:
+            failures.append(
+                f"source file {filename} changed: expected={expected_hash[:12]} "
+                f"actual={actual_hash[:12]}"
+            )
+    return not failures, failures
+
+
+def _cfg003_phase_error_intake(
+    phase_baseline: dict[str, dict[str, Any]],
+    *,
+    initiation_time: dt.datetime,
+    environment: str,
+    container: str,
+    case_name: str | None = None,
+    session_id: str | None = None,
+    trace_id: str | None = None,
+    strict_correlation: bool = False,
+    analysis_dir: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    """Collect one phase's error-intake delta against a per-phase baseline.
+
+    Returns a sanitized record containing baseline/current/delta snapshot
+    summaries plus attributed events and failures, and the advanced baseline
+    (current snapshot) for the next phase.  Finding 4: each phase uses a fresh
+    baseline advanced from the prior phase so attribution is scoped to the
+    phase's own window.
+
+    Finding 3: a single authoritative current snapshot is taken once and reused
+    for both delta collection and baseline advancement, eliminating the prior
+    two-snapshot race.  Finding 2/9: ``strict_correlation`` requires exact
+    session/trace identity for transactional alias/TUI cases.
+    """
+    # Strict correlation requires BOTH session_id and trace_id.  Missing
+    # either is a hard failure: the caller cannot attribute events and the
+    # phase must not silently pass with unverifiable evidence.
+    if strict_correlation and (not session_id or not trace_id):
+        current = RA._snapshot_error_intake(analysis_dir)
+        return {
+            "baseline_summary": RA._summarize_error_intake_snapshot(phase_baseline),
+            "current_summary": RA._summarize_error_intake_snapshot(current),
+            "delta_summary": RA._delta_error_intake_summary(phase_baseline, current),
+            "attributed_events": [],
+            "attributed_count": 0,
+            "failures": [
+                f"strict correlation: missing required correlation IDs "
+                f"(session={session_id!r}, trace={trace_id!r})"
+            ],
+            "advanced_baseline": current,
+        }
+    # Finding 3: one authoritative current snapshot reused below.
+    current = RA._snapshot_error_intake(analysis_dir)
+    events, failures = RA._collect_error_intake_delta(
+        phase_baseline,
+        initiation_time=initiation_time,
+        environment=environment,
+        container=container,
+        case_name=case_name,
+        session_id=session_id,
+        trace_id=trace_id,
+        strict_correlation=strict_correlation,
+        current_snapshot=current,
+        analysis_dir=analysis_dir,
+    )
+    return {
+        "baseline_summary": RA._summarize_error_intake_snapshot(phase_baseline),
+        "current_summary": RA._summarize_error_intake_snapshot(current),
+        "delta_summary": RA._delta_error_intake_summary(phase_baseline, current),
+        "attributed_events": events,
+        "attributed_count": len(events),
+        "failures": failures,
+        "advanced_baseline": current,
+    }
+
+
+def _cfg003_transactional_refresh_test(  # noqa: PLR0915
+    *,
+    litellm_base_url: str,
+    cases: dict[str, dict[str, Any]],
+    suite_config: dict[str, Any],
+    query_url: str,
+    public_key: str,
+    secret_key: str,
+    db_settings: dict[str, Any] | None = None,
+    environment: str = "dev",
+    container_name: str = "litellm-dev",
+) -> dict[str, Any]:
+    """Execute the full CFG-003 transactional priority-swap refresh test.
+
+    Uses CFG-002 compile_directory for authoritative startup config.
+    Requires two POSITIVELY evidenced-available candidates (rate_limit_observations).
+    All proofs require observed provider+model+route_family match.
+    Restoration is unconditional and always promoted to primary failure.
+    """
+    refresh_url = f"{litellm_base_url}{RA._AAWM_ALIAS_CONFIG_REFRESH_PATH}"
+    evidence: dict[str, Any] = {
+        "test_name": "cfg003_transactional_priority_swap",
+        "phases": {},
+        "passed": False,
+        "failures": [],
+    }
+    raw_source_text: str | None = None
+    original_per_file_hashes: dict[str, str] = {}
+    original_semantic_hash: str | None = None
+    original_semantic_version: str | None = None
+    source_inventory_before: dict[str, str] | None = None
+    error_intake_baseline: dict[str, dict[str, Any]] | None = None
+    restoration_intake_baseline: dict[str, dict[str, Any]] | None = None
+    initiation_time: dt.datetime | None = None
+    original_eligible: list[dict[str, Any]] = []
+    original_full_order: list[dict[str, Any]] = []
+    original_first: dict[str, Any] | None = None
+    original_second: dict[str, Any] | None = None
+    restoration_error: str | None = None
+    restore_proof_session: str | None = None
+    restore_proof_trace: str | None = None
+    mutation_attempted: bool = False
+    expected_swapped_hash: str = ""
+    expected_swapped_version: str = ""
+    expected_swapped_full_order: list[dict[str, Any]] = []
+    proof_case = _CFG003_CODEX_PROOF_CASE
+    have_proof_case = proof_case in cases
+
+    try:
+        # Error intake baseline snapshot (finding 1).
+        error_intake_baseline = RA._snapshot_error_intake()
+        initiation_time = dt.datetime.now(dt.timezone.utc)
+
+        # Phase load: CFG-002 authoritative startup config.
+        auth = RA._load_authoritative_startup_config()
+        original_per_file_hashes = auth["per_file_hashes"]
+        original_semantic_hash = auth["config_hash"]
+        original_semantic_version = auth["config_version"]
+        snapshot = auth["snapshot"]
+
+        # Finding 1: Derive the authoritative RECURSIVE YAML source inventory
+        # from the CFG-002 discovery path and require exactly one supported
+        # source before any transaction/proof/POST.  Nested or multi-file
+        # source sets hard-fail before egress.
+        recursive_source_inventory = RA._recursive_yaml_source_inventory()
+        if len(recursive_source_inventory) != 1:
+            evidence["failures"].append(
+                f"require exactly one recursive YAML source for raw-byte restore, "
+                f"got {len(recursive_source_inventory)}: {sorted(recursive_source_inventory)}"
+            )
+            raise _Cfg003InsufficientCandidates()
+        single_filename = next(iter(recursive_source_inventory))
+        single_filepath = RA._AAWM_ALIAS_CONFIG_DIR / single_filename
+        raw_source_text = single_filepath.read_bytes().decode("utf-8")
+
+        # Source inventory snapshot for post-run verification.
+        source_inventory_before = RA._snapshot_source_inventory()
+
+        # Capture the COMPLETE compiled candidate order directly from the
+        # snapshot, independent of provider exclusions, availability, and
+        # schedule windows (finding 3 round 5).
+        original_full_order = RA._derive_full_order_from_snapshot(
+            snapshot, alias_name="read"
+        )
+
+        # Collect POSITIVE availability evidence from rate_limit_observations.
+        all_eligible = RA._derive_eligible_candidates_from_snapshot(
+            snapshot, alias_name="read"
+        )
+        avail = _cfg003_collect_availability_evidence(
+            all_eligible, db_settings=db_settings, environment=environment
+        )
+        availability_evidence = avail["evidence"]
+
+        # Filter to positively-available candidates only.
+        original_eligible = RA._filter_candidates_by_positive_availability(
+            all_eligible, availability_evidence
+        )
+        evidence["phases"]["load"] = {
+            "original_semantic_hash": original_semantic_hash,
+            "original_semantic_version": original_semantic_version,
+            "per_file_hashes": original_per_file_hashes,
+            "single_source_file": single_filename,
+            "recursive_source_inventory": recursive_source_inventory,
+            "availability_evidence": avail["evidence_records"],
+            "available_identities": avail["available_identities"],
+            "availability_source": avail["source"],
+            "eligible_count": len(original_eligible),
+            "eligible_order": [
+                {
+                    "provider": c["provider"],
+                    "model": c["model"],
+                    "route_family": c["route_family"],
+                    "priority": c["priority"],
+                }
+                for c in original_eligible
+            ],
+        }
+
+        if len(original_eligible) < 2:
+            evidence["failures"].append(
+                f"need >= 2 evidenced-available eligible candidates, "
+                f"got {len(original_eligible)}"
+            )
+            raise _Cfg003InsufficientCandidates()
+
+        original_first = original_eligible[0]
+        original_second = original_eligible[1]
+        evidence["phases"]["load"]["original_first"] = {
+            "provider": original_first["provider"],
+            "model": original_first["model"],
+            "route_family": original_first["route_family"],
+            "priority": original_first["priority"],
+        }
+        evidence["phases"]["load"]["original_second"] = {
+            "provider": original_second["provider"],
+            "model": original_second["model"],
+            "route_family": original_second["route_family"],
+            "priority": original_second["priority"],
+        }
+
+        # Finding 2 (round 7): Authoritative readiness check BEFORE baseline proof.
+        # Require the active runtime hash/version to match the locally compiled
+        # original state exactly.
+        pre_baseline_ok, pre_baseline_failures = _cfg003_readiness_check(
+            litellm_base_url,
+            expected_hash=original_semantic_hash,
+            expected_version=original_semantic_version,
+            phase_label="pre_baseline",
+        )
+        evidence["phases"]["pre_baseline_readiness"] = {
+            "passed": pre_baseline_ok,
+            "expected_hash": original_semantic_hash,
+            "expected_version": original_semantic_version,
+            "failures": pre_baseline_failures,
+        }
+        if not pre_baseline_ok:
+            evidence["failures"].extend(pre_baseline_failures)
+            # Finding 2 (round 8): fail closed before baseline proof and all
+            # later swap work.  No TUI/POST calls may proceed.
+            raise _Cfg003InsufficientCandidates()
+
+        # Phase baseline: real TUI proof selecting original first.
+        if not have_proof_case:
+            evidence["failures"].append(f"missing real TUI proof case {proof_case!r}")
+        else:
+            baseline = _cfg003_run_proof_case(
+                case_name=f"{proof_case}__cfg003_baseline",
+                case_config_key=proof_case,
+                cases=cases,
+                suite_config=suite_config,
+                query_url=query_url,
+                public_key=public_key,
+                secret_key=secret_key,
+                litellm_base_url=litellm_base_url,
+            )
+            baseline_sel = baseline["selection"]
+            baseline_ok = (
+                bool(baseline["result"].get("passed"))
+                and _cfg003_selection_matches_candidate(baseline_sel, original_first)
+            )
+            evidence["phases"]["baseline"] = {
+                "case": f"{proof_case}__cfg003_baseline",
+                "passed": bool(baseline["result"].get("passed")),
+                "selection": baseline_sel,
+                "selected_original_first": baseline_ok,
+                "phase_evidence": _cfg003_build_phase_evidence(
+                    phase_name="baseline",
+                    case_name=f"{proof_case}__cfg003_baseline",
+                    proof=baseline,
+                    case_config=cases[proof_case],
+                    active_hash=original_semantic_hash,
+                    active_version=original_semantic_version,
+                    active_order=original_full_order,
+                ),
+            }
+            if not baseline_ok:
+                evidence["failures"].append(
+                    f"baseline did not select original first "
+                    f"{original_first['provider']}/{original_first['model']}"
+                    f"/{original_first['route_family']}: got {baseline_sel}"
+                )
+
+            # Error intake delta after baseline (finding 4: per-phase baseline,
+            # case/session/trace context, persisted summaries).
+            if error_intake_baseline is not None and initiation_time is not None:
+                b_session, b_trace = _cfg003_proof_correlation_ids(baseline)
+                intake = _cfg003_phase_error_intake(
+                    error_intake_baseline,
+                    initiation_time=initiation_time,
+                    environment=environment,
+                    container=container_name,
+                    case_name=f"{proof_case}__cfg003_baseline",
+                    session_id=b_session,
+                    trace_id=b_trace,
+                    strict_correlation=True,
+                )
+                evidence["phases"]["baseline"]["error_intake"] = {
+                    "baseline_summary": intake["baseline_summary"],
+                    "current_summary": intake["current_summary"],
+                    "delta_summary": intake["delta_summary"],
+                    "attributed_events": intake["attributed_events"],
+                    "attributed_count": intake["attributed_count"],
+                }
+                # Advance the phase baseline for the next phase.
+                error_intake_baseline = intake["advanced_baseline"]
+                if intake["failures"]:
+                    evidence["failures"].extend(intake["failures"])
+                if intake["attributed_events"]:
+                    evidence["failures"].append(
+                        f"error intake: {intake['attributed_count']} new attributable "
+                        f"error(s) after baseline"
+                    )
+
+        # Finding 2 (round 7): Authoritative readiness check AFTER baseline proof.
+        post_baseline_ok, post_baseline_failures = _cfg003_readiness_check(
+            litellm_base_url,
+            expected_hash=original_semantic_hash,
+            expected_version=original_semantic_version,
+            phase_label="post_baseline",
+        )
+        evidence["phases"]["post_baseline_readiness"] = {
+            "passed": post_baseline_ok,
+            "failures": post_baseline_failures,
+        }
+        if not post_baseline_ok:
+            evidence["failures"].extend(post_baseline_failures)
+
+        # Phase unchanged_control (pre-swap, original-active).
+        # Finding 2: controls run while original config is active, BEFORE any
+        # swap mutation, so restore remains the last config mutation.
+        # Finding 1 (round 9): mark mutation_attempted BEFORE the first POST
+        # so restoration fires unconditionally after any refresh attempt.
+        mutation_attempted = True
+        try:
+            unchanged_status, unchanged_response = RA._http_post_json(
+                refresh_url, {"yaml": raw_source_text}
+            )
+            unchanged_changed = bool(unchanged_response.get("changed"))
+            unchanged_hash = RA._extract_refresh_response_hash(unchanged_response)
+            unchanged_version = RA._extract_refresh_response_version(unchanged_response)
+            evidence["phases"]["unchanged_control"] = {
+                "status_code": unchanged_status,
+                "changed": unchanged_changed,
+                "semantic_hash": unchanged_hash,
+                "version": unchanged_version,
+                "hash_matches_original": unchanged_hash == original_semantic_hash,
+                "version_matches_original": unchanged_version == original_semantic_version,
+            }
+            if unchanged_status != 200 or unchanged_changed:
+                evidence["failures"].append(
+                    f"unchanged control: expected 200/changed=false, "
+                    f"got status={unchanged_status} changed={unchanged_changed}"
+                )
+            if unchanged_hash != original_semantic_hash:
+                evidence["failures"].append(
+                    f"unchanged control: hash mismatch: {unchanged_hash} "
+                    f"!= {original_semantic_hash}"
+                )
+            if unchanged_version != original_semantic_version:
+                evidence["failures"].append(
+                    f"unchanged control: version mismatch: {unchanged_version} "
+                    f"!= {original_semantic_version}"
+                )
+        except Exception as uc_exc:  # noqa: BLE001
+            evidence["phases"]["unchanged_control"] = {"error": str(uc_exc)}
+            evidence["failures"].append(f"unchanged control exception: {uc_exc}")
+
+        # Phase invalid_control (pre-swap, original-active).
+        # Finding 2: invalid YAML rejected while original config is active.
+        try:
+            invalid_status, invalid_response = RA._http_post_json(
+                refresh_url, {"yaml": _CFG003_INVALID_YAML}
+            )
+            invalid_hash = RA._extract_refresh_response_hash(invalid_response)
+            evidence["phases"]["invalid_control"] = {
+                "status_code": invalid_status,
+                "lkg_semantic_hash": invalid_hash,
+                "lkg_preserved": invalid_hash == original_semantic_hash,
+                "rejected": invalid_status == 400,
+            }
+            if invalid_status != 400:
+                evidence["failures"].append(
+                    f"invalid control: expected 400, got {invalid_status}"
+                )
+            if invalid_hash != original_semantic_hash:
+                evidence["failures"].append(
+                    "invalid control: LKG semantic hash changed after invalid refresh"
+                )
+        except Exception as inv_exc:  # noqa: BLE001
+            evidence["phases"]["invalid_control"] = {"error": str(inv_exc)}
+            evidence["failures"].append(f"invalid control exception: {inv_exc}")
+
+        # Phase swap_build: use the EXACT evidenced pair, not first-two raw.
+        # Finding 3: wire _build_exact_pair_priority_swap_yaml with the two
+        # availability-evidenced (provider, model) identities.  Any helper
+        # error, identity mismatch, or returned order mismatch fails BEFORE
+        # the swap POST.
+        evidenced_pair = (
+            (original_first["provider"], original_first["model"]),
+            (original_second["provider"], original_second["model"]),
+        )
+        try:
+            swapped_yaml, _orig, swapped_eligible = (
+                RA._build_exact_pair_priority_swap_yaml(
+                    raw_source_text, pair=evidenced_pair, alias_name="read"
+                )
+            )
+        except (ValueError, KeyError) as swap_build_exc:
+            evidence["failures"].append(
+                f"exact-pair swap build failed before POST: {swap_build_exc}"
+            )
+            raise _Cfg003InsufficientCandidates() from swap_build_exc
+
+        # Finding 5: validate the swap by identities and relative positions,
+        # NOT by requiring the pair to occupy positions zero and one.  When
+        # unavailable candidates sit between the two available ones in the
+        # full order, the swapped eligible list may have other candidates
+        # around the pair.  Prove: (a) A and C priorities exchanged,
+        # (b) C now precedes A in the eligible order, (c) all other
+        # candidates unchanged.
+        _orig_by_id = {
+            (c["provider"], c["model"]): c for c in _orig
+        }
+        _swap_by_id = {
+            (c["provider"], c["model"]): c for c in swapped_eligible
+        }
+        _id_a = (original_first["provider"], original_first["model"])
+        _id_c = (original_second["provider"], original_second["model"])
+        _swap_a = _swap_by_id.get(_id_a)
+        _swap_c = _swap_by_id.get(_id_c)
+        _orig_a = _orig_by_id.get(_id_a)
+        _orig_c = _orig_by_id.get(_id_c)
+        # (a) Priorities exchanged.
+        _priorities_swapped = (
+            _swap_a is not None and _swap_c is not None
+            and _orig_a is not None and _orig_c is not None
+            and _swap_a["priority"] == _orig_c["priority"]
+            and _swap_c["priority"] == _orig_a["priority"]
+        )
+        # (b) Relative position: C now before A in the eligible order.
+        _swap_eligible_ids = [
+            (c["provider"], c["model"]) for c in swapped_eligible
+        ]
+        _pos_a = _swap_eligible_ids.index(_id_a) if _id_a in _swap_eligible_ids else -1
+        _pos_c = _swap_eligible_ids.index(_id_c) if _id_c in _swap_eligible_ids else -1
+        _relative_swapped = _pos_c >= 0 and _pos_a >= 0 and _pos_c < _pos_a
+        # (c) All other candidates unchanged.
+        _others_unchanged = all(
+            _swap_by_id.get((_o["provider"], _o["model"]), {}).get("priority") == _o["priority"]
+            for _o in _orig
+            if (_o["provider"], _o["model"]) not in (_id_a, _id_c)
+        )
+        swap_exact = _priorities_swapped and _relative_swapped and _others_unchanged
+        evidence["phases"]["swap_build"] = {
+            "evidenced_pair": [
+                {"provider": p, "model": m} for p, m in evidenced_pair
+            ],
+            "swapped_first": (
+                {
+                    "provider": swapped_eligible[0]["provider"],
+                    "model": swapped_eligible[0]["model"],
+                    "route_family": swapped_eligible[0]["route_family"],
+                    "priority": swapped_eligible[0]["priority"],
+                }
+                if swapped_eligible
+                else None
+            ),
+            "swap_is_exact": swap_exact,
+            "priorities_swapped": _priorities_swapped,
+            "relative_position_swapped": _relative_swapped,
+            "other_candidates_unchanged": _others_unchanged,
+        }
+        if not swap_exact:
+            evidence["failures"].append(
+                "exact-pair swap returned order mismatch vs evidenced pair"
+            )
+            raise _Cfg003InsufficientCandidates()
+
+        # Finding 2 (round 7): Locally compile the exact-pair swapped YAML to
+        # obtain expected semantic hash/version/full complete order.
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
+            compile_yaml as _compile_yaml_for_swap,
+        )
+        swapped_snapshot = _compile_yaml_for_swap(swapped_yaml)
+        expected_swapped_hash = swapped_snapshot.config_hash
+        expected_swapped_version = swapped_snapshot.config_version
+        expected_swapped_full_order = RA._derive_full_order_from_snapshot(
+            swapped_snapshot, alias_name="read"
+        )
+        evidence["phases"]["swap_build"]["expected_swapped_hash"] = expected_swapped_hash
+        evidence["phases"]["swap_build"]["expected_swapped_version"] = expected_swapped_version
+
+        # Phase swap_refresh.
+        swap_status, swap_response = RA._http_post_json(
+            refresh_url, {"yaml": swapped_yaml}
+        )
+        swap_changed = bool(swap_response.get("changed"))
+        swap_new_hash = RA._extract_refresh_response_hash(swap_response)
+        swap_new_version = RA._extract_refresh_response_version(swap_response)
+        swap_active_order = swap_response.get("active_candidate_order")
+        swap_read_order = None
+        if isinstance(swap_active_order, dict):
+            swap_read_order = swap_active_order.get("read")
+        # Finding 2 (round 7): require exact hash, version, and full order match.
+        swap_hash_matches = swap_new_hash == expected_swapped_hash
+        swap_version_matches = swap_new_version == expected_swapped_version
+        swap_order_matches = RA._candidate_order_matches(
+            swap_read_order, expected_swapped_full_order
+        )
+        evidence["phases"]["swap_refresh"] = {
+            "status_code": swap_status,
+            "changed": swap_changed,
+            "new_semantic_hash": swap_new_hash,
+            "expected_swapped_hash": expected_swapped_hash,
+            "hash_matches_expected": swap_hash_matches,
+            "new_version": swap_new_version,
+            "expected_swapped_version": expected_swapped_version,
+            "version_matches_expected": swap_version_matches,
+            "hash_differs_from_original": (
+                bool(swap_new_hash) and swap_new_hash != original_semantic_hash
+            ),
+            "active_candidate_order": swap_read_order,
+            "order_matches_expected": swap_order_matches,
+        }
+        if swap_status != 200 or not swap_changed:
+            evidence["failures"].append(
+                f"swap refresh failed: status={swap_status} changed={swap_changed}"
+            )
+        elif not swap_new_hash:
+            evidence["failures"].append("swap refresh returned empty semantic hash")
+        elif swap_new_hash == original_semantic_hash:
+            evidence["failures"].append("swap refresh did not change semantic config_hash")
+        if swap_status == 200 and swap_changed:
+            if not swap_hash_matches:
+                evidence["failures"].append(
+                    f"swap refresh hash mismatch: expected {expected_swapped_hash!r}, "
+                    f"got {swap_new_hash!r}"
+                )
+            if not swap_version_matches:
+                evidence["failures"].append(
+                    f"swap refresh version mismatch: expected {expected_swapped_version!r}, "
+                    f"got {swap_new_version!r}"
+                )
+            if not swap_order_matches:
+                evidence["failures"].append(
+                    "swap refresh active_candidate_order does not match "
+                    "locally compiled swapped full order"
+                )
+
+        # Finding 2 (round 7): Readiness check BEFORE swap_proof.
+        pre_swap_proof_ok = False
+        if swap_status == 200 and swap_changed:
+            pre_swap_proof_ok, pre_swap_proof_failures = _cfg003_readiness_check(
+                litellm_base_url,
+                expected_hash=expected_swapped_hash,
+                expected_version=expected_swapped_version,
+                phase_label="pre_swap_proof",
+            )
+            evidence["phases"]["pre_swap_proof_readiness"] = {
+                "passed": pre_swap_proof_ok,
+                "expected_hash": expected_swapped_hash,
+                "expected_version": expected_swapped_version,
+                "failures": pre_swap_proof_failures,
+            }
+            if not pre_swap_proof_ok:
+                evidence["failures"].extend(pre_swap_proof_failures)
+            # Finding 2 (round 8): preserve the actually observed order in
+            # readiness evidence for diagnostic clarity.
+            evidence["phases"]["pre_swap_proof_readiness"]["observed_active_order"] = swap_read_order
+
+        # Phase swap_proof.
+        # Finding 2 (round 8): swap_proof runs ONLY when readiness, hash,
+        # version, and full order all match.  Wrong observed state prevents
+        # the proof TUI call while restoration remains unconditional.
+        swap_proof_gate = (
+            swap_status == 200 and swap_changed
+            and swap_hash_matches and swap_version_matches and swap_order_matches
+            and pre_swap_proof_ok
+        )
+        if have_proof_case and swap_proof_gate:
+            swap_proof = _cfg003_run_proof_case(
+                case_name=f"{proof_case}__cfg003_swap_proof",
+                case_config_key=proof_case,
+                cases=cases,
+                suite_config=suite_config,
+                query_url=query_url,
+                public_key=public_key,
+                secret_key=secret_key,
+                litellm_base_url=litellm_base_url,
+            )
+            swap_sel = swap_proof["selection"]
+            swap_proof_ok = (
+                bool(swap_proof["result"].get("passed"))
+                and _cfg003_selection_matches_candidate(swap_sel, original_second)
+            )
+            evidence["phases"]["swap_proof"] = {
+                "case": f"{proof_case}__cfg003_swap_proof",
+                "passed": bool(swap_proof["result"].get("passed")),
+                "selection": swap_sel,
+                "selected_original_second": swap_proof_ok,
+                "phase_evidence": _cfg003_build_phase_evidence(
+                    phase_name="swap_proof",
+                    case_name=f"{proof_case}__cfg003_swap_proof",
+                    proof=swap_proof,
+                    case_config=cases[proof_case],
+                    active_hash=swap_new_hash,
+                    active_version=expected_swapped_version,
+                    active_order=expected_swapped_full_order,
+                ),
+            }
+            if not swap_proof_ok:
+                evidence["failures"].append(
+                    f"swap proof did not select original second "
+                    f"{original_second['provider']}/{original_second['model']}"
+                    f"/{original_second['route_family']}: got {swap_sel}"
+                )
+
+            # Error intake delta after swap proof (finding 4: per-phase baseline).
+            if error_intake_baseline is not None and initiation_time is not None:
+                s_session, s_trace = _cfg003_proof_correlation_ids(swap_proof)
+                intake = _cfg003_phase_error_intake(
+                    error_intake_baseline,
+                    initiation_time=initiation_time,
+                    environment=environment,
+                    container=container_name,
+                    case_name=f"{proof_case}__cfg003_swap_proof",
+                    session_id=s_session,
+                    trace_id=s_trace,
+                    strict_correlation=True,
+                )
+                evidence["phases"]["swap_proof"]["error_intake"] = {
+                    "baseline_summary": intake["baseline_summary"],
+                    "current_summary": intake["current_summary"],
+                    "delta_summary": intake["delta_summary"],
+                    "attributed_events": intake["attributed_events"],
+                    "attributed_count": intake["attributed_count"],
+                }
+                error_intake_baseline = intake["advanced_baseline"]
+                if intake["failures"]:
+                    evidence["failures"].extend(intake["failures"])
+                if intake["attributed_events"]:
+                    evidence["failures"].append(
+                        f"error intake: {intake['attributed_count']} new attributable "
+                        f"error(s) after swap proof"
+                    )
+
+        # Finding 2: distinct restoration baseline advanced after swap so the
+        # restoration-phase attribution is scoped to the restoration window.
+        restoration_intake_baseline = RA._snapshot_error_intake()
+
+    except _Cfg003InsufficientCandidates:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        evidence["failures"].append(f"pre-restoration exception: {exc}")
+
+    finally:
+        # Phase restoration: UNCONDITIONAL repost of exact original raw bytes.
+        # Finding 1 (round 9): restoration fires only after a mutation/refresh
+        # POST was attempted.  Pre-baseline readiness rejection (before any
+        # POST) must cause exactly zero POSTs and zero TUI calls.
+        if raw_source_text is not None and mutation_attempted:
+            try:
+                restore_status, restore_response = RA._http_post_json(
+                    refresh_url, {"yaml": raw_source_text}
+                )
+                restore_hash = RA._extract_refresh_response_hash(restore_response)
+                restore_version = RA._extract_refresh_response_version(restore_response)
+                restore_ok = (
+                    restore_status == 200
+                    and bool(restore_hash)
+                    and restore_hash == original_semantic_hash
+                    and restore_version == original_semantic_version
+                )
+                # Finding 3: Prove active restored full candidate order from the
+                # authoritative refresh response (not a locally inferred order).
+                restored_order = restore_response.get("active_candidate_order")
+                restored_read_order = None
+                if isinstance(restored_order, dict):
+                    restored_read_order = restored_order.get("read")
+                # Finding 5: compare the EXACT complete ordered list against the
+                # full compiled candidate order -- no prefix acceptance, no
+                # extra tail, including anthropic_route_family and last_resort.
+                order_matches = RA._candidate_order_matches(
+                    restored_read_order, original_full_order
+                )
+                restore_ok = restore_ok and order_matches
+                evidence["phases"]["restoration"] = {
+                    "status_code": restore_status,
+                    "restored_semantic_hash": restore_hash,
+                    "restored_version": restore_version,
+                    "hash_matches_original": restore_hash == original_semantic_hash,
+                    "version_matches_original": restore_version == original_semantic_version,
+                    "restored_candidate_order": restored_read_order,
+                    "expected_full_order": [
+                        {
+                            "provider": c["provider"],
+                            "model": c["model"],
+                            "route_family": c["route_family"],
+                            "anthropic_route_family": c.get("anthropic_route_family", ""),
+                            "priority": c["priority"],
+                        }
+                        for c in original_full_order
+                    ],
+                    "order_matches_original": order_matches,
+                }
+                if not restore_ok:
+                    restoration_error = (
+                        f"RESTORATION FAILED: status={restore_status} "
+                        f"hash={restore_hash} version={restore_version} "
+                        f"expected_hash={original_semantic_hash} "
+                        f"expected_version={original_semantic_version} "
+                        f"order_matches={order_matches}"
+                    )
+            except Exception as restore_exc:  # noqa: BLE001
+                restoration_error = f"RESTORATION EXCEPTION: {restore_exc}"
+                evidence["phases"]["restoration"] = {"error": str(restore_exc)}
+
+            # Finding 1 (item 7): each cleanup verifier is wrapped so its
+            # exception can never escape or mask the restoration failure.
+            # Failures are recorded as redacted evidence; restoration_error
+            # remains primary.
+            try:
+                src_ok, src_failures = _cfg003_verify_source_files_unchanged(
+                    original_per_file_hashes
+                )
+                evidence["phases"]["source_files_unchanged"] = {
+                    "passed": src_ok,
+                    "failures": src_failures,
+                }
+                if not src_ok:
+                    if restoration_error is None:
+                        restoration_error = f"SOURCE FILES CHANGED: {src_failures}"
+                    evidence["failures"].extend(src_failures)
+            except Exception as src_exc:  # noqa: BLE001
+                evidence["phases"]["source_files_unchanged"] = {
+                    "passed": False,
+                    "failures": [f"source file verifier exception: {src_exc}"],
+                }
+                evidence["failures"].append(f"source file verifier exception: {src_exc}")
+
+            try:
+                if source_inventory_before is not None:
+                    source_inventory_after = RA._snapshot_source_inventory()
+                    inventory_ok = source_inventory_before == source_inventory_after
+                    evidence["phases"]["source_inventory_unchanged"] = {
+                        "passed": inventory_ok,
+                        "before_count": len(source_inventory_before),
+                        "after_count": len(source_inventory_after),
+                    }
+                    if not inventory_ok:
+                        if restoration_error is None:
+                            restoration_error = "SOURCE INVENTORY CHANGED: path set or raw hashes differ"
+                        evidence["failures"].append("source inventory changed after run")
+            except Exception as inv_exc:  # noqa: BLE001
+                evidence["phases"]["source_inventory_unchanged"] = {
+                    "passed": False,
+                    "failures": [f"source inventory verifier exception: {inv_exc}"],
+                }
+                evidence["failures"].append(f"source inventory verifier exception: {inv_exc}")
+
+            try:
+                if restoration_error is None:
+                    post_restore_ok, post_restore_failures = _cfg003_readiness_check(
+                        litellm_base_url,
+                        expected_hash=original_semantic_hash,
+                        expected_version=original_semantic_version,
+                        phase_label="post_restoration",
+                    )
+                    evidence["phases"]["post_restoration_readiness"] = {
+                        "passed": post_restore_ok,
+                        "expected_hash": original_semantic_hash,
+                        "expected_version": original_semantic_version,
+                        "failures": post_restore_failures,
+                    }
+                    if not post_restore_ok:
+                        evidence["failures"].extend(post_restore_failures)
+                        if restoration_error is None:
+                            restoration_error = (
+                                f"POST-RESTORATION READINESS FAILED: {post_restore_failures}"
+                            )
+            except Exception as ready_exc:  # noqa: BLE001
+                evidence["phases"]["post_restoration_readiness"] = {
+                    "passed": False,
+                    "failures": [f"post-restoration readiness exception: {ready_exc}"],
+                }
+                evidence["failures"].append(f"post-restoration readiness exception: {ready_exc}")
+
+            # Phase restore_proof.
+            if restoration_error is None and have_proof_case and original_first is not None:
+                try:
+                    restore_proof = _cfg003_run_proof_case(
+                        case_name=f"{proof_case}__cfg003_restore_proof",
+                        case_config_key=proof_case,
+                        cases=cases,
+                        suite_config=suite_config,
+                        query_url=query_url,
+                        public_key=public_key,
+                        secret_key=secret_key,
+                        litellm_base_url=litellm_base_url,
+                    )
+                    restore_sel = restore_proof["selection"]
+                    restore_proof_ok = (
+                        bool(restore_proof["result"].get("passed"))
+                        and _cfg003_selection_matches_candidate(restore_sel, original_first)
+                    )
+                    # Finding 2: capture restore-proof correlation IDs for final
+                    # phase attribution.
+                    restore_proof_session, restore_proof_trace = _cfg003_proof_correlation_ids(restore_proof)
+                    evidence["phases"]["restore_proof"] = {
+                        "case": f"{proof_case}__cfg003_restore_proof",
+                        "passed": bool(restore_proof["result"].get("passed")),
+                        "selection": restore_sel,
+                        "selected_original_first": restore_proof_ok,
+                        "session_id": restore_proof_session,
+                        "trace_id": restore_proof_trace,
+                        "phase_evidence": _cfg003_build_phase_evidence(
+                            phase_name="restore_proof",
+                            case_name=f"{proof_case}__cfg003_restore_proof",
+                            proof=restore_proof,
+                            case_config=cases[proof_case],
+                            active_hash=original_semantic_hash,
+                            active_version=original_semantic_version,
+                            active_order=original_full_order,
+                        ),
+                    }
+                    if not restore_proof_ok:
+                        evidence["failures"].append(
+                            f"restore proof did not reselect original first: got {restore_sel}"
+                        )
+                        # Finding 4: restore_proof failure IS a restoration failure.
+                        restoration_error = (
+                            f"RESTORATION PROOF FAILED: did not reselect original first "
+                            f"{original_first['provider']}/{original_first['model']}"
+                            f"/{original_first['route_family']}: got {restore_sel}"
+                        )
+                except Exception as proof_exc:  # noqa: BLE001
+                    evidence["phases"]["restore_proof"] = {"error": str(proof_exc)}
+                    evidence["failures"].append(f"restore proof exception: {proof_exc}")
+                    # Finding 4: exceptional restore proof IS a restoration failure.
+                    restoration_error = f"RESTORATION PROOF EXCEPTION: {proof_exc}"
+
+            # Finding 2: unchanged_control and invalid_control moved to
+            # pre-swap phase (original-active).  No config mutation POST
+            # occurs after the unconditional restoration.
+
+            try:
+                if restoration_intake_baseline is not None and initiation_time is not None:
+                    intake = _cfg003_phase_error_intake(
+                        restoration_intake_baseline,
+                        initiation_time=initiation_time,
+                        environment=environment,
+                        container=container_name,
+                        case_name=f"{proof_case}__cfg003_restore_proof",
+                        session_id=restore_proof_session,
+                        trace_id=restore_proof_trace,
+                        strict_correlation=True,
+                    )
+                    evidence["phases"]["error_intake_final"] = {
+                        "baseline_summary": intake["baseline_summary"],
+                        "current_summary": intake["current_summary"],
+                        "delta_summary": intake["delta_summary"],
+                        "attributed_events": intake["attributed_events"],
+                        "attributed_count": intake["attributed_count"],
+                        "failures": intake["failures"],
+                    }
+                    if intake["failures"]:
+                        evidence["failures"].extend(intake["failures"])
+                    if intake["attributed_events"]:
+                        evidence["failures"].append(
+                            f"error intake: {intake['attributed_count']} new attributable "
+                            f"error(s) after restoration"
+                        )
+            except Exception as intake_exc:  # noqa: BLE001
+                evidence["phases"]["error_intake_final"] = {
+                    "passed": False,
+                    "failures": [f"error intake verifier exception: {intake_exc}"],
+                }
+                evidence["failures"].append(f"error intake verifier exception: {intake_exc}")
+
+    # Restoration failure is ALWAYS the primary hard failure.
+    if restoration_error is not None:
+        evidence["restoration_failure"] = restoration_error
+        evidence["failures"] = [f for f in evidence["failures"] if f != restoration_error]
+        evidence["failures"].insert(0, restoration_error)
+    # Finding 1 (item 7): ALWAYS emit the recovery artifact so operators can
+    # manually restore original state even when a cleanup verifier exception
+    # was swallowed and no explicit restoration_error was recorded.
+    evidence["recovery_artifact"] = RA._redact_sensitive_artifact_fields({
+        "original_semantic_hash": original_semantic_hash,
+        "original_semantic_version": original_semantic_version,
+        "per_file_hashes": original_per_file_hashes,
+        "original_eligible_order": [
+            {"provider": c["provider"], "model": c["model"]}
+            for c in original_eligible
+        ],
+        "original_full_order": [
+            {"provider": c["provider"], "model": c["model"],
+             "route_family": c["route_family"], "priority": c["priority"]}
+            for c in original_full_order
+        ],
+        "phases": evidence.get("phases", {}),
+    })
+
+    evidence["passed"] = not evidence["failures"]
+    return RA._redact_sensitive_artifact_fields(evidence)
+
+def main() -> int:  # noqa: PLR0915
     parser = argparse.ArgumentParser(
         description="Run real-Claude Anthropic adapter acceptance checks through a target LiteLLM instance."
     )
@@ -6780,11 +8563,58 @@ def main() -> int:
     parser.add_argument('--anthropic-base-url', default=None, help='Override ANTHROPIC_BASE_URL passed to Claude CLI.')
     parser.add_argument('--docker-container-name', default=None, help='Override the Docker container used for health/log checks.')
     parser.add_argument('--expected-trace-environment', default=None, help='Override expected Langfuse trace environment.')
+    parser.add_argument(
+        '--cfg003-transactional-refresh',
+        action='store_true',
+        default=False,
+        help='Run the CFG-003 transactional priority-swap refresh test (dev only).',
+    )
     args = parser.parse_args()
 
     config_path = pathlib.Path(args.config)
     artifact_path = pathlib.Path(args.write_artifact)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    # Finding 3 (round 8): raw-config canonical preflight BEFORE dotenv.
+    # An invalid transactional target must not trigger dotenv loading or
+    # credential resolution.  The resolved-profile gate after profile
+    # resolution is retained as a second check.
+    if args.cfg003_transactional_refresh:
+        _raw_ok, _raw_failures = _cfg003_raw_config_canonical_preflight(
+            config_path=config_path,
+            target_override=args.target,
+            litellm_base_url_override=args.litellm_base_url,
+            anthropic_base_url_override=args.anthropic_base_url,
+            docker_container_name_override=args.docker_container_name,
+            expected_trace_environment_override=args.expected_trace_environment,
+        )
+        if not _raw_ok:
+            _emit_stderr(
+                f"[cfg003] raw-config canonical preflight FAILED (before dotenv): "
+                f"{_raw_failures}",
+                flush=True,
+            )
+            _raw_target = args.target or "dev"
+            gate_artifact: dict[str, Any] = {
+                "suite_version": 1,
+                "timestamp": RA._isoformat(RA._utcnow()),
+                "git_commit": RA._git_value("rev-parse", "HEAD"),
+                "git_branch": RA._git_value("branch", "--show-current"),
+                "environment": {"target_profile": _raw_target},
+                "results": {
+                    "cfg003_raw_config_gate": {
+                        "passed": False,
+                        "skipped": False,
+                        "failures": _raw_failures,
+                        "warnings": [],
+                    },
+                },
+                "verification_matrix": [],
+                "summary": {},
+            }
+            gate_artifact["summary"] = _build_summary(gate_artifact["results"])
+            _write_artifact(artifact_path, gate_artifact)
+            _emit_stdout(json.dumps(gate_artifact["summary"], indent=2))
+            return 1
     _load_dotenv_into_environment(ROOT / '.env')
     config = _resolve_env_placeholders(RA._load_json(config_path))
     target = args.target or str(config.get('default_target_profile') or 'dev')
@@ -6801,6 +8631,45 @@ def main() -> int:
         target=target,
         profile=profile,
     )
+
+    # Finding 3 (round 7): Canonical dev isolation gate BEFORE credential
+    # resolution.  A dev-labelled prod/aawm-litellm override must not trigger
+    # docker exec or read target-owned credentials.
+    if args.cfg003_transactional_refresh:
+        _cfg003_canonical_ok, _cfg003_canonical_failures = (
+            _cfg003_validate_canonical_dev_profile(target=target, profile=profile)
+        )
+        if not _cfg003_canonical_ok:
+            _emit_stderr(
+                f"[cfg003] canonical dev gate FAILED: {_cfg003_canonical_failures}",
+                flush=True,
+            )
+            # Build a minimal artifact for the gate failure without credentials.
+            litellm_base_url = config.get('litellm_base_url', profile['litellm_base_url'])
+            gate_artifact: dict[str, Any] = {
+                'suite_version': config.get('suite_version', 1),
+                'timestamp': RA._isoformat(RA._utcnow()),
+                'git_commit': RA._git_value('rev-parse', 'HEAD'),
+                'git_branch': RA._git_value('branch', '--show-current'),
+                'environment': {
+                    'target_profile': target,
+                    'litellm_base_url': litellm_base_url,
+                },
+                'results': {
+                    'cfg003_target_gate': {
+                        'passed': False,
+                        'skipped': False,
+                        'failures': _cfg003_canonical_failures,
+                        'warnings': [],
+                    },
+                },
+                'verification_matrix': [],
+                'summary': {},
+            }
+            gate_artifact['summary'] = _build_summary(gate_artifact['results'])
+            _write_artifact(artifact_path, gate_artifact)
+            _emit_stdout(json.dumps(gate_artifact['summary'], indent=2))
+            return 1
 
     credentials = _resolve_main_credentials(config=config, args=args, profile=profile)
     if isinstance(credentials, int):
@@ -6827,6 +8696,133 @@ def main() -> int:
     )
     _write_artifact(artifact_path, artifact)
 
+    # CFG-003: Active alias/ingress inventory (always captured for artifact).
+    cfg003_inventory = _cfg003_query_active_inventory(litellm_base_url)
+    artifact['cfg003_alias_inventory'] = RA._redact_sensitive_artifact_fields(
+        cfg003_inventory
+    )
+    _write_artifact(artifact_path, artifact)
+
+    # CFG-003: Validate the complete configured case map for every active
+    # alias/ingress during ALL runs (ordinary and transactional).  This
+    # ensures the configured map is coherent without requiring every case
+    # to be selected.
+    # Finding 4: complete-coverage enforcement is gated to transactional mode
+    # so ordinary non-CFG003 runs retain prior behavior.
+    if args.cfg003_transactional_refresh and cfg003_inventory.get('healthy'):
+        cfg003_map_passed, cfg003_map_failures = RA._validate_complete_coverage_map(
+            alias_inventory=cfg003_inventory.get('alias_inventory', []),
+            cases=cases,
+        )
+        artifact['cfg003_coverage_map'] = {
+            'passed': cfg003_map_passed,
+            'failures': cfg003_map_failures,
+        }
+        if not cfg003_map_passed:
+            _emit_stderr(
+                f"[cfg003] configured coverage map INVALID: {cfg003_map_failures}",
+                flush=True,
+            )
+            artifact['results']['cfg003_coverage_map'] = {
+                'passed': False,
+                'skipped': False,
+                'failures': cfg003_map_failures,
+                'warnings': [],
+            }
+            artifact['summary'] = _build_summary(artifact['results'])
+            _write_artifact(artifact_path, artifact)
+            _emit_stdout(json.dumps(artifact['summary'], indent=2))
+            return 1
+        _write_artifact(artifact_path, artifact)
+
+    # Finding 3/6: Unhealthy inventory blocks ALL selected egress cases before
+    # execution -- real TUI commands, http_request, cli_passthrough, and any
+    # other provider path -- not only Codex/Claude commands.  Ordinary and
+    # transactional runs fail before _run_selected_case.
+    # Finding 4: fail-closed inventory/egress enforcement is gated to
+    # transactional mode so ordinary non-CFG003 runs retain prior behavior.
+    if args.cfg003_transactional_refresh:
+        _selected_egress = [
+            c for c in selected_cases
+            if isinstance(cases.get(c), dict) and RA._is_egress_case(cases[c])
+        ]
+        if _selected_egress and not cfg003_inventory.get('healthy'):
+            _inv_failures = cfg003_inventory.get('inventory_failures', []) or ['inventory not healthy']
+            _emit_stderr(
+                f"[cfg003] inventory FAILED (fail-closed before egress): {_inv_failures}",
+                flush=True,
+            )
+            artifact['results']['cfg003_inventory_gate'] = {
+                'passed': False,
+                'skipped': False,
+                'failures': _inv_failures,
+                'warnings': [],
+            }
+            artifact['summary'] = _build_summary(artifact['results'])
+            _write_artifact(artifact_path, artifact)
+            _emit_stdout(json.dumps(artifact['summary'], indent=2))
+            return 1
+
+    # Coverage gate: enforced ONLY when --cfg003-transactional-refresh is
+    # active.  When the transactional test IS selected, fail-closed: readiness
+    # must be healthy and every active alias/ingress must have exactly one
+    # real TUI case among the selected cases.
+    if args.cfg003_transactional_refresh:
+        cfg003_inventory_failures = cfg003_inventory.get('inventory_failures', [])
+        if cfg003_inventory_failures or not cfg003_inventory.get('healthy'):
+            _emit_stderr(
+                f"[cfg003] inventory FAILED (fail-closed before egress): "
+                f"{cfg003_inventory_failures}",
+                flush=True,
+            )
+            artifact['results']['cfg003_inventory_gate'] = {
+                'passed': False,
+                'skipped': False,
+                'failures': cfg003_inventory_failures or ['inventory not healthy'],
+                'warnings': [],
+            }
+            artifact['summary'] = _build_summary(artifact['results'])
+            _write_artifact(artifact_path, artifact)
+            _emit_stdout(json.dumps(artifact['summary'], indent=2))
+            return 1
+
+        cfg003_coverage_passed, cfg003_coverage_failures = (
+            RA._validate_alias_ingress_coverage(
+                alias_inventory=cfg003_inventory.get('alias_inventory', []),
+                cases=cases,
+                selected_cases=selected_cases,
+            )
+        )
+        artifact['cfg003_coverage_gate'] = {
+            'passed': cfg003_coverage_passed,
+            'failures': cfg003_coverage_failures,
+        }
+        if not cfg003_coverage_passed:
+            _emit_stderr(
+                f"[cfg003] coverage gate FAILED: {cfg003_coverage_failures}",
+                flush=True,
+            )
+            artifact['results']['cfg003_coverage_gate'] = {
+                'passed': False,
+                'skipped': False,
+                'failures': cfg003_coverage_failures,
+                'warnings': [],
+            }
+            artifact['summary'] = _build_summary(artifact['results'])
+            _write_artifact(artifact_path, artifact)
+            _emit_stdout(json.dumps(artifact['summary'], indent=2))
+            return 1
+        _write_artifact(artifact_path, artifact)
+
+    # Finding 2 (round 9): per-case error-intake validation during CFG-003.
+    # Snapshot before the first selected alias case; collect and advance a
+    # per-case delta after each case using case/session/trace correlation.
+    # Ordinary non-CFG003 runs are unaffected.
+    _cfg003_case_intake_baseline: dict[str, dict[str, Any]] | None = None
+    _cfg003_case_intake_initiation: dt.datetime | None = None
+    if args.cfg003_transactional_refresh:
+        _cfg003_case_intake_baseline = RA._snapshot_error_intake()
+        _cfg003_case_intake_initiation = dt.datetime.now(dt.timezone.utc)
     for selected_case_order, case_name in enumerate(selected_cases):
         _emit_stderr(f'[start] {case_name}', flush=True)
         case_result = _run_selected_case(
@@ -6837,7 +8833,63 @@ def main() -> int:
             public_key=public_key,
             secret_key=secret_key,
             litellm_base_url=litellm_base_url,
+            cfg003_transactional=args.cfg003_transactional_refresh,
         )
+        # Finding 2 (round 9): per-case error-intake delta (CFG-003 only).
+        if (
+            _cfg003_case_intake_baseline is not None
+            and _cfg003_case_intake_initiation is not None
+        ):
+            _case_session, _case_trace = _cfg003_case_correlation_ids(case_result)
+            _case_environment = profile.get("expected_trace_environment", "dev")
+            _case_container = profile.get("docker_container_name", "litellm-dev")
+            # Finding 2/9: strict correlation for transactional alias/TUI
+            # cases.  Missing required session/trace IDs must fail the case;
+            # events cannot qualify only by environment/container/time.
+            _is_alias_tui = bool(cases[case_name].get("verification_alias"))
+            if _is_alias_tui and (not _case_session or not _case_trace):
+                case_result.setdefault("failures", []).append(
+                    f"strict correlation: transactional alias/TUI case missing "
+                    f"required correlation IDs "
+                    f"(session={_case_session!r}, trace={_case_trace!r})"
+                )
+                case_result["passed"] = False
+            try:
+                _case_intake = _cfg003_phase_error_intake(
+                    _cfg003_case_intake_baseline,
+                    initiation_time=_cfg003_case_intake_initiation,
+                    environment=_case_environment,
+                    container=_case_container,
+                    case_name=case_name,
+                    session_id=_case_session,
+                    trace_id=_case_trace,
+                    strict_correlation=True,
+                )
+                case_result["error_intake"] = RA._redact_sensitive_artifact_fields({
+                    "baseline_summary": _case_intake["baseline_summary"],
+                    "current_summary": _case_intake["current_summary"],
+                    "delta_summary": _case_intake["delta_summary"],
+                    "attributed_events": _case_intake["attributed_events"],
+                    "attributed_count": _case_intake["attributed_count"],
+                })
+                _cfg003_case_intake_baseline = _case_intake["advanced_baseline"]
+                if _case_intake["failures"]:
+                    case_result.setdefault("failures", []).extend(
+                        _case_intake["failures"]
+                    )
+                    case_result["passed"] = False
+                if _case_intake["attributed_events"]:
+                    case_result.setdefault("failures", []).append(
+                        f"error intake: {_case_intake['attributed_count']} "
+                        f"new attributable error(s) during case"
+                    )
+                    case_result["passed"] = False
+            except Exception as _intake_exc:  # noqa: BLE001
+                case_result.setdefault("failures", []).append(
+                    f"error intake collection failure: {_intake_exc}"
+                )
+                case_result["passed"] = False
+                _cfg003_case_intake_baseline = RA._snapshot_error_intake()
         _record_case_artifact_result(
             artifact=artifact,
             artifact_path=artifact_path,
@@ -6845,6 +8897,33 @@ def main() -> int:
             case_config=cases[case_name],
             case_result=case_result,
             selected_case_order=selected_case_order,
+        )
+
+    # CFG-003: Transactional priority-swap refresh test (opt-in, dev only).
+    if args.cfg003_transactional_refresh:
+        _emit_stderr('[cfg003] starting transactional priority-swap refresh test', flush=True)
+        cfg003_result = _cfg003_transactional_refresh_test(
+            litellm_base_url=litellm_base_url,
+            cases=cases,
+            suite_config=config,
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+            db_settings=_cfg003_db_settings(config, profile=profile),
+            environment=profile.get('expected_trace_environment', 'dev'),
+            container_name=profile.get('docker_container_name', 'litellm-dev'),
+        )
+        artifact['cfg003_transactional_refresh'] = cfg003_result
+        artifact['results']['cfg003_transactional_refresh'] = {
+            'passed': cfg003_result.get('passed', False),
+            'skipped': False,
+            'failures': cfg003_result.get('failures', []),
+            'warnings': [],
+        }
+        _write_artifact(artifact_path, artifact)
+        _emit_stderr(
+            f"[cfg003] transactional refresh passed={cfg003_result.get('passed')}",
+            flush=True,
         )
 
     artifact['summary'] = _build_summary(artifact['results'])

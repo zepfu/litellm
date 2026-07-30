@@ -870,7 +870,7 @@ def test_provider_unavailable_timeout_can_soft_fail_with_exact_log_signature(mon
 
     def fake_read_runtime_logs_since(**kwargs):
         return (
-            {"docker_logs_exit_code": 0, "log_excerpt": "provider unavailable"},
+            {"docker_logs_exit_code": 0, "log_structural": {"line_count": 1, "char_count": 20, "sha256": "abc"}},
             (
                 "OpenRouter adapter upstream attempt 1/4\n"
                 "failed with 503 (ProxyException, provider=OpenInference, "
@@ -981,7 +981,7 @@ def test_provider_unavailable_timeout_stays_hard_without_exact_log_signature(mon
         harness,
         "_read_runtime_logs_since",
         lambda **kwargs: (
-            {"docker_logs_exit_code": 0, "log_excerpt": "adapter traceback"},
+            {"docker_logs_exit_code": 0, "log_structural": {"line_count": 1, "char_count": 18, "sha256": "def"}},
             "OpenRouter adapter upstream attempt but local adapter failed",
         ),
     )
@@ -1611,7 +1611,7 @@ def test_provider_unavailable_command_failure_can_soft_fail_with_exact_log_signa
                 }
             },
             runtime_logs={
-                "log_excerpt": (
+                "_log_text": (
                     "OpenRouter adapter upstream attempt 1/4\n"
                     "failed with 503 (ProxyException, provider=OpenInference, "
                     "raw=no healthy upstream)"
@@ -1657,7 +1657,7 @@ def test_provider_unavailable_command_failure_does_not_mask_runtime_log_failures
                 }
             },
             runtime_logs={
-                "log_excerpt": (
+                "_log_text": (
                     "OpenRouter adapter upstream attempt 1/4\n"
                     "failed with 503 (ProxyException, provider=OpenInference, "
                     "raw=no healthy upstream)"
@@ -1720,9 +1720,10 @@ def test_runtime_log_defaults_catch_async_and_content_length_errors(monkeypatch)
         in summary["matched_forbidden_substrings"]
     )
     assert "KeyError: 'choices'" in summary["matched_forbidden_contexts"]
-    assert "KeyError: 'choices'" in summary["matched_forbidden_contexts"][
-        "KeyError: 'choices'"
-    ]
+    ctx_digest = summary["matched_forbidden_contexts"]["KeyError: 'choices'"]
+    assert isinstance(ctx_digest, dict)
+    assert "sha256" in ctx_digest
+    assert ctx_digest["char_count"] > 0
 
 
 def test_runtime_log_read_is_bounded_by_until(monkeypatch):
@@ -1820,12 +1821,12 @@ def test_runtime_log_ignores_unattributed_concurrent_auto_agent_traceback(monkey
     assert "Exception in ASGI application" in summary[
         "ignored_unattributed_forbidden_contexts"
     ]
-    assert (
-        "_perform_codex_auto_agent_openrouter_completion_request"
-        in summary["ignored_unattributed_forbidden_contexts"][
-            "Exception in ASGI application"
-        ]
-    )
+    ignored_digest = summary["ignored_unattributed_forbidden_contexts"][
+        "Exception in ASGI application"
+    ]
+    assert isinstance(ignored_digest, dict)
+    assert "sha256" in ignored_digest
+    assert ignored_digest["char_count"] > 0
 
 
 def test_runtime_log_keeps_attributed_exception_hard(monkeypatch):
@@ -7194,7 +7195,7 @@ def test_main_writes_verification_matrix_and_outcome_records_by_candidate_order(
         encoding="utf-8",
     )
 
-    def fake_validate_case(name, config, query_url, public_key, secret_key, litellm_base_url):
+    def fake_validate_case(name, config, query_url, public_key, secret_key, litellm_base_url, **kwargs):
         if name == "aawm_code_anthropic_candidate_openai":
             return {
                 "passed": True,
@@ -7309,6 +7310,13 @@ def test_main_writes_verification_matrix_and_outcome_records_by_candidate_order(
         "_git_value",
         lambda *args: "test",
     )
+    # CFG-003 finding-6 gate: provide a healthy inventory so ordinary TUI runs
+    # are not blocked by the fail-closed inventory check in this unit test.
+    monkeypatch.setattr(
+        harness,
+        "_cfg003_query_active_inventory",
+        lambda url: {"healthy": True, "inventory_failures": [], "alias_inventory": []},
+    )
     monkeypatch.setattr(
         harness.sys,
         "argv",
@@ -7348,3 +7356,231 @@ def test_main_writes_verification_matrix_and_outcome_records_by_candidate_order(
     assert anthropic_result["command_attempts"][1]["attempt"] == 2
     assert anthropic_result["session_history"]["record"]["model"] == "claude-opus-4-6"
     assert artifact["summary"]["passed"] is False
+
+
+class TestForbiddenContextPrivacySentinels:
+    """Sentinel tests: raw runtime text must never persist through _write_artifact."""
+
+    def test_write_artifact_redacts_matched_forbidden_contexts(self, tmp_path):
+        """Valid digest records survive; injected raw text sentinel is redacted."""
+        harness = _load_harness_module()
+        raw_text = "SECRET_PROMPT_CONTENT tool_call_args={'key': 'value'}"
+        artifact = {
+            "runtime_logs": {
+                "matched_forbidden_contexts": {
+                    "SomeError": {
+                        "sha256": "abc123",
+                        "char_count": 42,
+                        "line_count": 3,
+                    },
+                    # Malformed: raw string value instead of digest dict
+                    "InjectedRaw": raw_text,
+                },
+                "ignored_unattributed_forbidden_contexts": {
+                    "OtherError": {
+                        "sha256": "def456",
+                        "char_count": 99,
+                        "line_count": 7,
+                    },
+                    # Malformed: nested raw dict with prompt text
+                    "InjectedDict": {"raw_prompt": raw_text, "extra": True},
+                },
+            },
+        }
+        out = tmp_path / "artifact.json"
+        harness._write_artifact(out, artifact)
+        written = json.loads(out.read_text(encoding="utf-8"))
+        text_blob = out.read_text(encoding="utf-8")
+        assert raw_text not in text_blob
+        assert "SECRET_PROMPT_CONTENT" not in text_blob
+        # Valid digest structure preserved
+        ctx = written["runtime_logs"]["matched_forbidden_contexts"]["SomeError"]
+        assert ctx["sha256"] == "abc123"
+        assert ctx["char_count"] == 42
+        assert ctx["line_count"] == 3
+        # Malformed entries redacted
+        assert written["runtime_logs"]["matched_forbidden_contexts"]["InjectedRaw"] == "[REDACTED]"
+        assert written["runtime_logs"]["ignored_unattributed_forbidden_contexts"]["InjectedDict"] == "[REDACTED]"
+        # Valid digest in ignored_unattributed preserved
+        other = written["runtime_logs"]["ignored_unattributed_forbidden_contexts"]["OtherError"]
+        assert other["sha256"] == "def456"
+
+    def test_write_artifact_redacts_raw_context_if_injected(self, tmp_path):
+        """Even if a raw string context sneaks in, _write_artifact must not
+        persist prompt/tool text via the _log_text exact-redact key."""
+        harness = _load_harness_module()
+        artifact = {
+            "runtime_logs": {
+                "_log_text": "RAW LOG WITH SECRET PROMPT DATA",
+                "matched_forbidden_contexts": {
+                    "Err": {"sha256": "aaa", "char_count": 10, "line_count": 1},
+                },
+            },
+        }
+        out = tmp_path / "artifact.json"
+        harness._write_artifact(out, artifact)
+        text_blob = out.read_text(encoding="utf-8")
+        assert "RAW LOG WITH SECRET PROMPT DATA" not in text_blob
+        assert "[REDACTED]" in text_blob
+
+    def test_write_artifact_nested_list_forbidden_contexts(self, tmp_path):
+        """Nested and list-wrapped forbidden context structures must also
+        contain only digest evidence, never raw text."""
+        harness = _load_harness_module()
+        artifact = {
+            "cases": [
+                {
+                    "name": "case_a",
+                    "runtime_logs": {
+                        "matched_forbidden_contexts": {
+                            "KeyError": {"sha256": "bbb", "char_count": 50, "line_count": 2},
+                        },
+                        "ignored_unattributed_forbidden_contexts": {
+                            "Timeout": {"sha256": "ccc", "char_count": 30, "line_count": 1},
+                        },
+                    },
+                },
+                {
+                    "name": "case_b",
+                    "runtime_logs": {
+                        "matched_forbidden_contexts": {},
+                        "ignored_unattributed_forbidden_contexts": {},
+                    },
+                },
+            ],
+        }
+        out = tmp_path / "artifact.json"
+        harness._write_artifact(out, artifact)
+        written = json.loads(out.read_text(encoding="utf-8"))
+        # Digest structure preserved in nested list form
+        case_a = written["cases"][0]
+        assert case_a["runtime_logs"]["matched_forbidden_contexts"]["KeyError"]["sha256"] == "bbb"
+        assert case_a["runtime_logs"]["ignored_unattributed_forbidden_contexts"]["Timeout"]["char_count"] == 30
+
+    def test_write_artifact_malformed_digest_records_redacted(self, tmp_path):
+        """Malformed digest records (extra fields, wrong types, legacy entries)
+        are replaced with [REDACTED] at any nesting depth."""
+        harness = _load_harness_module()
+        artifact = {
+            "results": {
+                "case_x": {
+                    "runtime_logs": {
+                        "matched_forbidden_contexts": {
+                            # Extra field beyond approved structural set
+                            "ExtraField": {
+                                "sha256": "aaa",
+                                "char_count": 1,
+                                "line_count": 1,
+                                "raw_text": "LEAKED PROMPT DATA",
+                            },
+                            # Wrong type: char_count is string
+                            "WrongType": {
+                                "sha256": "bbb",
+                                "char_count": "not_an_int",
+                                "line_count": 1,
+                            },
+                            # Bool masquerading as int
+                            "BoolType": {
+                                "sha256": "ccc",
+                                "char_count": True,
+                                "line_count": False,
+                            },
+                            # Legacy: list value
+                            "LegacyList": ["raw", "log", "lines"],
+                            # Valid record
+                            "Valid": {"sha256": "ddd", "char_count": 5, "line_count": 1},
+                        },
+                        "ignored_unattributed_forbidden_contexts": {
+                            # Non-dict top-level value (string)
+                            "RawString": "FULL RAW LOG TEXT WITH SECRETS",
+                            # Valid
+                            "Good": {"sha256": "eee", "char_count": 10, "line_count": 2},
+                        },
+                    },
+                },
+            },
+        }
+        out = tmp_path / "artifact.json"
+        harness._write_artifact(out, artifact)
+        written = json.loads(out.read_text(encoding="utf-8"))
+        text_blob = out.read_text(encoding="utf-8")
+        mfc = written["results"]["case_x"]["runtime_logs"]["matched_forbidden_contexts"]
+        ifc = written["results"]["case_x"]["runtime_logs"]["ignored_unattributed_forbidden_contexts"]
+        # Malformed entries redacted
+        assert mfc["ExtraField"] == "[REDACTED]"
+        assert mfc["WrongType"] == "[REDACTED]"
+        assert mfc["BoolType"] == "[REDACTED]"
+        assert mfc["LegacyList"] == "[REDACTED]"
+        assert ifc["RawString"] == "[REDACTED]"
+        # No leaked content
+        assert "LEAKED PROMPT DATA" not in text_blob
+        assert "FULL RAW LOG TEXT WITH SECRETS" not in text_blob
+        # Valid records preserved
+        assert mfc["Valid"] == {"sha256": "ddd", "char_count": 5, "line_count": 1}
+        assert ifc["Good"] == {"sha256": "eee", "char_count": 10, "line_count": 2}
+
+    def test_write_artifact_deeply_nested_forbidden_contexts(self, tmp_path):
+        """Forbidden context keys buried in deep list/dict nesting are still
+        sanitized by the recursive writer."""
+        harness = _load_harness_module()
+        artifact = {
+            "level1": [
+                {
+                    "level2": {
+                        "level3": [
+                            {
+                                "runtime_logs": {
+                                    "matched_forbidden_contexts": {
+                                        "Deep": {"sha256": "fff", "char_count": 7, "line_count": 1},
+                                        "DeepBad": "DEEP RAW PROMPT LEAK",
+                                    },
+                                    "ignored_unattributed_forbidden_contexts": {
+                                        "DeepIgnored": {"sha256": "ggg", "char_count": 3, "line_count": 1},
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+        }
+        out = tmp_path / "artifact.json"
+        harness._write_artifact(out, artifact)
+        written = json.loads(out.read_text(encoding="utf-8"))
+        text_blob = out.read_text(encoding="utf-8")
+        deep = written["level1"][0]["level2"]["level3"][0]["runtime_logs"]
+        assert deep["matched_forbidden_contexts"]["Deep"]["sha256"] == "fff"
+        assert deep["matched_forbidden_contexts"]["DeepBad"] == "[REDACTED]"
+        assert deep["ignored_unattributed_forbidden_contexts"]["DeepIgnored"]["char_count"] == 3
+        assert "DEEP RAW PROMPT LEAK" not in text_blob
+
+    def test_validate_runtime_logs_produces_digest_not_raw(self, monkeypatch):
+        """End-to-end: _validate_runtime_logs summary contexts are digests."""
+        harness = _load_harness_module()
+
+        class Completed:
+            returncode = 0
+            stdout = (
+                "claude_adapter_gpt54 some log line\n"
+                "ERROR: Task exception was never retrieved\n"
+                "claude_adapter_gpt54 more context here\n"
+            )
+            stderr = ""
+
+        monkeypatch.setattr(harness.subprocess, "run", lambda *a, **kw: Completed())
+
+        summary, failures, warnings = harness._validate_runtime_logs(
+            family="claude_adapter_gpt54",
+            started="2026-06-06T21:04:15+00:00",
+            checks={},
+            runtime_postconditions={"docker_container_name": "litellm-dev"},
+            attribution_substrings=["claude_adapter_gpt54"],
+        )
+        for key in ("matched_forbidden_contexts", "ignored_unattributed_forbidden_contexts"):
+            for substring, ctx in summary[key].items():
+                assert isinstance(ctx, dict), f"{key}[{substring}] must be a digest dict"
+                assert "sha256" in ctx
+                assert "char_count" in ctx
+                assert "line_count" in ctx
+                # Must NOT be a raw string
+                assert not isinstance(ctx, str)

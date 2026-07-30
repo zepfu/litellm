@@ -3127,6 +3127,1540 @@ def _record_family_run_evidence(run: dict[str, Any]) -> None:
         invocation["run_evidence"] = run
 
 
+# ---------------------------------------------------------------------------
+# CFG-003: Alias-config inventory, coverage gate, and transactional refresh
+# ---------------------------------------------------------------------------
+
+_AAWM_ALIAS_CONFIG_DIR = ROOT / "litellm" / "proxy" / "aawm_alias_config"
+_AAWM_ALIAS_CONFIG_REFRESH_PATH = "/aawm/alias-config/refresh"
+_HEALTH_READINESS_PATH = "/health/readiness"
+
+# Providers excluded from eligibility for the transactional swap test.
+_TRANSACTIONAL_SWAP_EXCLUDED_PROVIDERS = frozenset(
+    {"anthropic", "xai", "google", "gemini"}
+)
+
+# Fields that must never appear in persisted artifacts.
+# Substring-matched keys (any key containing these is redacted).
+_ARTIFACT_REDACTED_SUBSTRINGS = frozenset(
+    {
+        "authorization",
+        "api_key",
+        "secret_key",
+        "password",
+        "credential",
+        "raw_yaml",
+        "tool_arguments",
+        "tool_argument",
+        "tool_input",
+        "tool_call_arg",
+        "tool_summary",
+        "raw_prompt",
+        "prompt_text",
+        "prompt_body",
+        "raw_output",
+        "_preview",
+    }
+)
+# Exact-matched keys (only these exact key names are redacted).
+_ARTIFACT_REDACTED_EXACT = frozenset(
+    {
+        "yaml",
+        "log_excerpt",
+        "_log_text",
+        "prompt",
+        "command",
+        "command_string",
+        "stdout",
+        "stderr",
+        "token",
+        "arguments",
+        "raw_prompt",
+        "prompt_text",
+        "raw_text",
+        "traceback_text",
+        "raw_output",
+        "tool_input",
+        "tool_output",
+        "tool_result",
+        "input_preview",
+        "output_preview",
+    }
+)
+
+# Defect 3: principled content-key classifier for tool_result/tool_output fields.
+_TOOL_CONTENT_PREFIXES = ("tool_result", "tool_output")
+_TOOL_CONTENT_SEMANTICS = frozenset(
+    {
+        "text", "body", "preview", "raw", "output", "result",
+        "content", "data", "payload", "message", "response", "value",
+    }
+)
+_TOOL_STRUCTURED_SEMANTICS = frozenset(
+    {
+        "is_error", "count", "status", "line", "number", "bool",
+        "passed", "failed", "success", "code", "type", "name", "id",
+    }
+)
+
+
+def _is_tool_content_key(key: str) -> bool:
+    """Classify whether a key is a tool content field that should be redacted.
+
+    Returns True if the key begins with tool_result or tool_output AND contains
+    content semantics but NOT structured semantics.
+    """
+    key_lower = key.lower()
+    if not any(key_lower.startswith(prefix) for prefix in _TOOL_CONTENT_PREFIXES):
+        return False
+    if any(sem in key_lower for sem in _TOOL_STRUCTURED_SEMANTICS):
+        return False
+    return any(sem in key_lower for sem in _TOOL_CONTENT_SEMANTICS)
+
+
+# TUI executables that qualify a case as a real functional case.
+_REAL_TUI_EXECUTABLES = frozenset({"codex", "claude"})
+
+# Route rollup statuses that indicate a candidate is NOT currently available.
+_UNAVAILABLE_ROUTE_STATUSES = frozenset(
+    {"Cooling Down", "Failed", "Exhausted"}
+)
+
+
+def _http_post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float = 30.0,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """POST JSON to *url*, returning (status_code, parsed_response_body).
+
+    Never raises on HTTP errors; returns the status and parsed body.
+    """
+    data = json.dumps(payload).encode("utf-8")
+    merged_headers = {"Content-Type": "application/json"}
+    if headers:
+        merged_headers.update(headers)
+    request = urllib.request.Request(
+        url, data=data, headers=merged_headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            status = int(response.status)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        status = int(exc.code)
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"raw_excerpt": body[:500]}
+    return status, parsed
+
+
+def _http_get_json_plain(url: str, *, timeout: float = 20.0) -> tuple[int, dict[str, Any]]:
+    """GET *url* returning (status_code, parsed_json). Never raises on HTTP errors."""
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            status = int(response.status)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        status = int(exc.code)
+    except (urllib.error.URLError, OSError) as exc:
+        return 0, {"error": str(exc)}
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"raw_excerpt": body[:500]}
+    return status, parsed
+
+
+def _extract_refresh_response_hash(response: dict[str, Any]) -> str:
+    """Extract the active config hash from a refresh response.
+
+    Handles both top-level (200 success) and nested detail (400 error) shapes.
+    """
+    if "active_config_hash" in response:
+        return str(response["active_config_hash"])
+    detail = response.get("detail")
+    if isinstance(detail, dict) and "active_config_hash" in detail:
+        return str(detail["active_config_hash"])
+    return ""
+
+
+def _extract_refresh_response_version(response: dict[str, Any]) -> str:
+    """Extract config_version from a refresh response (top-level or nested)."""
+    if "config_version" in response:
+        return str(response["config_version"])
+    detail = response.get("detail")
+    if isinstance(detail, dict) and "config_version" in detail:
+        return str(detail["config_version"])
+    return ""
+
+
+def _load_checked_in_alias_config_yaml(
+    alias_name: str = "read",
+) -> tuple[str, str]:
+    """Load the exact checked-in YAML bytes for *alias_name*.
+
+    Returns (raw_yaml_text, sha256_hex_of_raw_bytes).
+    The returned hash is the SOURCE hash (raw bytes), NOT the semantic
+    config_hash used by the runtime.
+    """
+    config_path = _AAWM_ALIAS_CONFIG_DIR / f"{alias_name}.yaml"
+    raw_bytes = config_path.read_bytes()
+    return raw_bytes.decode("utf-8"), hashlib.sha256(raw_bytes).hexdigest()
+
+
+def _load_authoritative_startup_config() -> dict[str, Any]:
+    """Load the complete startup alias config using the CFG-002 authoritative
+    directory discovery/validation/merge/compile APIs.
+
+    Uses ``config_startup.compile_directory`` which performs O_NOFOLLOW
+    descriptor-anchored scanning, fail-closed validation (symlinks, duplicates,
+    default conflicts, invalid files), and deterministic merge.
+
+    Returns a dict with:
+      - snapshot: the compiled RoutingSnapshot (semantic hash/version/aliases)
+      - merged_yaml: YAML text suitable for POST /aawm/alias-config/refresh
+      - per_file_hashes: {filename: sha256_of_raw_bytes}
+      - file_names: sorted list of source file names
+      - config_hash: semantic config_hash from the snapshot
+      - config_version: semantic config_version from the snapshot
+      - aliases: sorted alias names from the snapshot
+
+    Raises on any CFG-002 validation failure (fail-closed).
+    """
+    import yaml as _yaml
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        compile_directory,
+        _scan_inventory,
+    )
+
+    config_dir = _AAWM_ALIAS_CONFIG_DIR
+    snapshot = compile_directory(config_dir)
+
+    # Capture per-file raw bytes hashes for restoration proof using the
+    # AUTHORITATIVE recursive CFG-002 discovery path (_scan_inventory), not a
+    # top-level iterdir.  This sees nested files too, so a nested/multi-file
+    # source set is detected and can be failed closed by callers.
+    per_file_hashes: dict[str, str] = {}
+    inventory = _scan_inventory(config_dir)
+    # inventory.files already excludes __init__.py and non-YAML, and captures
+    # raw bytes + content_digest deterministically (recursive).
+    yaml_files: list[tuple[str, bytes]] = []
+    for inv_file in inventory.files:
+        per_file_hashes[inv_file.relative_name] = inv_file.content_digest
+        yaml_files.append((inv_file.relative_name, inv_file.raw_bytes))
+    yaml_files.sort(key=lambda item: item[0])
+
+    # Produce merged YAML for refresh posting.  This is a reserialized merge,
+    # NOT raw-YAML-equal to any single source file.
+    all_aliases: list[Any] = []
+    merged_defaults: dict[str, Any] | None = None
+    for _rel_name, raw_bytes in yaml_files:
+        doc = _yaml.safe_load(raw_bytes.decode("utf-8"))
+        if not isinstance(doc, dict):
+            continue
+        defaults = doc.get("defaults")
+        if isinstance(defaults, dict) and defaults:
+            if merged_defaults is None:
+                merged_defaults = defaults
+        aliases = doc.get("aliases")
+        if isinstance(aliases, list):
+            all_aliases.extend(aliases)
+
+    merged: dict[str, Any] = {}
+    if merged_defaults is not None:
+        merged["defaults"] = merged_defaults
+    merged["aliases"] = all_aliases
+    merged_yaml = _yaml.dump(
+        merged, default_flow_style=False, sort_keys=True, allow_unicode=False
+    )
+
+    return {
+        "snapshot": snapshot,
+        "merged_yaml": merged_yaml,
+        "per_file_hashes": per_file_hashes,
+        "file_names": sorted(per_file_hashes.keys()),
+        "config_hash": snapshot.config_hash,
+        "config_version": snapshot.config_version,
+        "aliases": sorted(snapshot.aliases.keys()),
+    }
+
+
+def _recursive_yaml_source_inventory(
+    config_dir: pathlib.Path | None = None,
+) -> dict[str, str]:
+    """Return the authoritative recursive YAML source inventory.
+
+    Uses the CFG-002 ``_scan_inventory`` discovery path (O_NOFOLLOW,
+    descriptor-anchored, recursive) so nested files are included.  Returns
+    {relative_name: content_digest} for every accepted YAML source file.
+    """
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        _scan_inventory,
+    )
+
+    base = config_dir or _AAWM_ALIAS_CONFIG_DIR
+    inventory = _scan_inventory(base)
+    return {inv_file.relative_name: inv_file.content_digest for inv_file in inventory.files}
+
+
+# Maximum age for fresh availability evidence (used as default parameter).
+_AVAILABILITY_FRESHNESS_SECONDS = 3600.0
+
+
+def _derive_ingresses_from_snapshot(
+    snapshot: Any, alias_name: str
+) -> list[str]:
+    """Derive supported ingresses for *alias_name* from a compiled
+    RoutingSnapshot, using compiler-projected route families including
+    anthropic_route_family.
+    """
+    alias = snapshot.aliases.get(alias_name)
+    if alias is None:
+        return []
+    ingresses: set[str] = set()
+    for cand in alias.candidates:
+        rf = cand.route_family or ""
+        if rf.startswith("codex_") or rf == "codex_responses":
+            ingresses.add("codex_responses")
+        if rf.startswith("anthropic_"):
+            ingresses.add("anthropic_messages")
+        arf = cand.anthropic_route_family or ""
+        if arf:
+            ingresses.add("anthropic_messages")
+    return sorted(ingresses)
+
+
+def _derive_eligible_candidates_from_snapshot(
+    snapshot: Any,
+    *,
+    alias_name: str = "read",
+    excluded_providers: frozenset[str] | None = None,
+    availability_evidence: dict[str, str] | None = None,
+    positive_availability: dict[Any, Any] | None = None,
+    require_availability: bool = False,
+    environment: str = "dev",
+    now: dt.datetime | None = None,
+    freshness_seconds: float = _AVAILABILITY_FRESHNESS_SECONDS,
+) -> list[dict[str, Any]]:
+    """Derive ordered eligible candidates from a compiled RoutingSnapshot.
+
+    Filters by excluded_providers, schedule windows, and (when provided)
+    runtime availability evidence.
+
+    When ``require_availability`` is True, a candidate is eligible ONLY if
+    ``positive_availability`` contains a boundary-valid record for the EXACT
+    ``(provider, model)`` identity (validated by ``_availability_record_is_valid``);
+    missing/unknown/stale/future-skewed/wrong-env/wrong-provider/wrong-model
+    evidence cannot pass.  This is the transactional-refresh path.
+
+    Otherwise, when ``availability_evidence`` (legacy model->status map) is
+    provided, a candidate is excluded only if its model is in
+    _UNAVAILABLE_ROUTE_STATUSES.
+
+    Returns list of dicts: provider, model, route_family,
+    anthropic_route_family, priority, original_index.
+    """
+    if excluded_providers is None:
+        excluded_providers = _TRANSACTIONAL_SWAP_EXCLUDED_PROVIDERS
+
+    alias = snapshot.aliases.get(alias_name)
+    if alias is None:
+        raise ValueError(f"alias {alias_name!r} not found in snapshot")
+
+    now_utc = now if now is not None else dt.datetime.now(dt.timezone.utc)
+    eligible: list[dict[str, Any]] = []
+    for idx, cand in enumerate(alias.candidates):
+        if cand.provider in excluded_providers:
+            continue
+        # Schedule window check.
+        if cand.schedule is not None:
+            if not (cand.schedule.start <= now_utc <= cand.schedule.end):
+                continue
+        # Positive availability requirement (strict boundary validation).
+        if require_availability:
+            info = (positive_availability or {}).get(
+                _availability_key(cand.provider, cand.model)
+            )
+            if not _availability_record_is_valid(
+                info,
+                provider=cand.provider,
+                model=cand.model,
+                environment=environment,
+                now=now_utc,
+                freshness_seconds=freshness_seconds,
+            ):
+                continue
+        elif availability_evidence is not None:
+            # Legacy negative-filter: exclude only explicit unavailable statuses.
+            status = availability_evidence.get(cand.model, "")
+            if status in _UNAVAILABLE_ROUTE_STATUSES:
+                continue
+        eligible.append(
+            {
+                "provider": cand.provider,
+                "model": cand.model,
+                "route_family": cand.route_family or "",
+                "anthropic_route_family": cand.anthropic_route_family or "",
+                "priority": cand.priority,
+                "original_index": idx,
+            }
+        )
+
+    eligible.sort(key=lambda c: c["priority"], reverse=True)
+    return eligible
+
+
+def _derive_eligible_candidates_from_yaml(
+    raw_yaml: str,
+    *,
+    alias_name: str = "read",
+    excluded_providers: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse YAML and derive ordered currently-eligible candidates.
+
+    Legacy helper for tests that do not have a compiled snapshot.
+    Returns a list of dicts with keys: provider, model, route_family, priority,
+    original_index.
+    """
+    import yaml as _yaml
+
+    if excluded_providers is None:
+        excluded_providers = _TRANSACTIONAL_SWAP_EXCLUDED_PROVIDERS
+
+    doc = _yaml.safe_load(raw_yaml)
+    if not isinstance(doc, dict):
+        raise ValueError("alias config YAML must be a mapping")
+    aliases = doc.get("aliases")
+    if not isinstance(aliases, list):
+        raise ValueError("alias config YAML must contain an 'aliases' list")
+
+    target_alias: dict[str, Any] | None = None
+    for alias in aliases:
+        if isinstance(alias, dict) and alias.get("name") == alias_name:
+            target_alias = alias
+            break
+    if target_alias is None:
+        raise ValueError(f"alias {alias_name!r} not found in config YAML")
+
+    candidates_raw = target_alias.get("candidates")
+    if not isinstance(candidates_raw, list):
+        raise ValueError(f"alias {alias_name!r} has no candidates list")
+
+    now = dt.datetime.now(dt.timezone.utc)
+    eligible: list[dict[str, Any]] = []
+    for idx, cand in enumerate(candidates_raw):
+        if not isinstance(cand, dict):
+            continue
+        provider = str(cand.get("provider", ""))
+        if provider in excluded_providers:
+            continue
+        schedule = cand.get("schedule")
+        if isinstance(schedule, dict):
+            start_str = schedule.get("start", "")
+            end_str = schedule.get("end", "")
+            try:
+                start = dt.datetime.fromisoformat(str(start_str).replace("Z", "+00:00"))
+                end = dt.datetime.fromisoformat(str(end_str).replace("Z", "+00:00"))
+                if not (start <= now <= end):
+                    continue
+            except (ValueError, TypeError):
+                continue
+        eligible.append(
+            {
+                "provider": provider,
+                "model": str(cand.get("model", "")),
+                "route_family": str(cand.get("route_family", "")),
+                "anthropic_route_family": str(cand.get("anthropic_route_family", "")),
+                "priority": int(cand.get("priority", 0)),
+                "original_index": idx,
+            }
+        )
+
+    eligible.sort(key=lambda c: c["priority"], reverse=True)
+    return eligible
+
+
+def _build_priority_swap_yaml(
+    raw_yaml: str,
+    *,
+    alias_name: str = "read",
+    excluded_providers: frozenset[str] | None = None,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build an in-memory YAML copy swapping only the first two eligible
+    candidates' effective priorities.
+
+    Returns (swapped_yaml_text, original_eligible, swapped_eligible).
+    Never modifies the source file.
+    """
+    import yaml as _yaml
+
+    original_eligible = _derive_eligible_candidates_from_yaml(
+        raw_yaml, alias_name=alias_name, excluded_providers=excluded_providers
+    )
+    if len(original_eligible) < 2:
+        raise ValueError(
+            f"need at least 2 eligible candidates for priority swap, "
+            f"got {len(original_eligible)}"
+        )
+
+    first = original_eligible[0]
+    second = original_eligible[1]
+
+    doc = _yaml.safe_load(raw_yaml)
+    aliases = doc.get("aliases", [])
+    target_alias: dict[str, Any] | None = None
+    for alias in aliases:
+        if isinstance(alias, dict) and alias.get("name") == alias_name:
+            target_alias = alias
+            break
+    if target_alias is None:
+        raise ValueError(f"alias {alias_name!r} not found")
+
+    candidates_raw = target_alias.get("candidates", [])
+    first_idx = first["original_index"]
+    second_idx = second["original_index"]
+    candidates_raw[first_idx]["priority"] = second["priority"]
+    candidates_raw[second_idx]["priority"] = first["priority"]
+
+    swapped_yaml = _yaml.dump(
+        doc, default_flow_style=False, sort_keys=False, allow_unicode=False
+    )
+    swapped_eligible = _derive_eligible_candidates_from_yaml(
+        swapped_yaml, alias_name=alias_name, excluded_providers=excluded_providers
+    )
+    return swapped_yaml, original_eligible, swapped_eligible
+
+
+def _build_exact_pair_priority_swap_yaml(
+    raw_yaml: str,
+    *,
+    pair: tuple[tuple[str, str], tuple[str, str]],
+    alias_name: str = "read",
+    excluded_providers: frozenset[str] | None = None,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build a YAML copy swapping priorities of an EXACT (provider, model) pair.
+
+    Contract (CFG-003 body B finding c):
+    - ``pair`` is ``((provider_a, model_a), (provider_b, model_b))`` -- the two
+      availability-evidenced identities to swap.
+    - Fails closed (raises ValueError) BEFORE producing YAML when:
+      * either identity is absent from the eligible candidate list;
+      * either identity is ambiguous (appears more than once);
+      * the two identities are not distinct;
+      * fewer than 2 eligible candidates exist.
+    - The swap targets the EXACT requested pair, never the positional first-two
+      raw candidates.  If the first two raw candidates differ from the requested
+      pair, only the requested pair is swapped.
+    - Returns (swapped_yaml, original_eligible, swapped_eligible).
+    - Never modifies the source file.
+
+    Existing callers using ``_build_priority_swap_yaml`` are unaffected.
+    """
+    import yaml as _yaml
+
+    (provider_a, model_a), (provider_b, model_b) = pair
+    if (provider_a, model_a) == (provider_b, model_b):
+        raise ValueError(
+            f"exact-pair swap requires two distinct identities, got duplicate: "
+            f"({provider_a}, {model_a})"
+        )
+
+    original_eligible = _derive_eligible_candidates_from_yaml(
+        raw_yaml, alias_name=alias_name, excluded_providers=excluded_providers
+    )
+    if len(original_eligible) < 2:
+        raise ValueError(
+            f"need at least 2 eligible candidates for exact-pair swap, "
+            f"got {len(original_eligible)}"
+        )
+
+    # Locate each identity in the eligible list -- must be present exactly once.
+    def _find_unique(provider: str, model: str) -> dict[str, Any]:
+        matches = [
+            c for c in original_eligible
+            if c["provider"] == provider and c["model"] == model
+        ]
+        if len(matches) == 0:
+            raise ValueError(
+                f"exact-pair identity ({provider}, {model}) not found among "
+                f"eligible candidates; refusing to produce swap YAML"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"exact-pair identity ({provider}, {model}) is ambiguous "
+                f"({len(matches)} matches); refusing to produce swap YAML"
+            )
+        return matches[0]
+
+    cand_a = _find_unique(provider_a, model_a)
+    cand_b = _find_unique(provider_b, model_b)
+
+    doc = _yaml.safe_load(raw_yaml)
+    aliases = doc.get("aliases", [])
+    target_alias: dict[str, Any] | None = None
+    for alias in aliases:
+        if isinstance(alias, dict) and alias.get("name") == alias_name:
+            target_alias = alias
+            break
+    if target_alias is None:
+        raise ValueError(f"alias {alias_name!r} not found")
+
+    candidates_raw = target_alias.get("candidates", [])
+    idx_a = cand_a["original_index"]
+    idx_b = cand_b["original_index"]
+    candidates_raw[idx_a]["priority"] = cand_b["priority"]
+    candidates_raw[idx_b]["priority"] = cand_a["priority"]
+
+    swapped_yaml = _yaml.dump(
+        doc, default_flow_style=False, sort_keys=False, allow_unicode=False
+    )
+    swapped_eligible = _derive_eligible_candidates_from_yaml(
+        swapped_yaml, alias_name=alias_name, excluded_providers=excluded_providers
+    )
+    return swapped_yaml, original_eligible, swapped_eligible
+
+
+def _parse_route_availability_evidence(
+    log_text: str, alias_name: str
+) -> dict[str, str]:
+    """Parse runtime route rollup log lines for *alias_name* and return
+    a map of model -> latest status.
+
+    Route rollup lines have the shape:
+      `` - {model}({alias}) - Turns: N [{message}] [{status}] -> {route}``
+
+    Only the latest status per model is retained.  Models not mentioned
+    in the logs are absent from the result (treated as unknown/available
+    by callers that use this as a filter).
+    """
+    evidence: dict[str, str] = {}
+    marker = f"({alias_name})"
+    for line in log_text.splitlines():
+        if marker not in line:
+            continue
+        # Extract model: between " - " and "("
+        stripped = line.strip()
+        if not stripped.startswith("- "):
+            continue
+        rest = stripped[2:]
+        paren_idx = rest.find("(")
+        if paren_idx < 0:
+            continue
+        model = rest[:paren_idx].strip()
+        if not model:
+            continue
+        # Extract status: last bracketed token before optional " -> "
+        arrow_idx = rest.rfind(" -> ")
+        segment = rest[:arrow_idx] if arrow_idx > 0 else rest
+        # Find all [status] tokens
+        import re as _re
+        statuses = _re.findall(r"\[([^\]]+)\]", segment)
+        if statuses:
+            evidence[model] = statuses[-1]
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# Value-level secret sanitization (CFG-003 body B finding b).
+#
+# Key-based redaction (below) catches sensitive *keys*, but free-text string
+# values (JSONL ``message`` fields, malformed ``raw_excerpt`` blobs, legacy
+# ``.log`` lines, error tracebacks) can embed credentials inline.  These
+# patterns scrub embedded secrets while preserving bounded diagnostic context
+# (the surrounding text and the secret *class* label are retained).
+# ---------------------------------------------------------------------------
+_SENSITIVE_VALUE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Authorization / Bearer header forms: "Authorization: Bearer sk-...",
+    # "bearer <token>", '"authorization": "..."' -- redact the credential run.
+    (
+        re.compile(
+            r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=_-]{8,}"
+        ),
+        r"\1 [REDACTED]",
+    ),
+    # Scheme-bearing Authorization forms: "Authorization: Basic <base64>",
+    # "Authorization: Token <token>" -- redact the credential after the scheme
+    # label while retaining the scheme name for diagnostics.
+    (
+        re.compile(
+            r"(?i)\b(authorization)\b[\s\"':=]+(basic|token|digest|hmac)\s+[A-Za-z0-9._~+/=_-]{6,}"
+        ),
+        r"\1: \2 [REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(authorization)\b[\s\"':=]+[A-Za-z0-9._~+/=_-]{12,}"
+        ),
+        r"\1=[REDACTED]",
+    ),
+    # sk-style API tokens (OpenAI/Anthropic style): sk-..., sk-ant-..., sk-proj-...
+    (
+        re.compile(r"\bsk-[A-Za-z0-9_-]{10,}"),
+        "sk-[REDACTED]",
+    ),
+    # Generic long high-entropy token assigned to a credential-class name:
+    # api_key=..., password: ..., credential = ..., secret_key: ..., token=...
+    (
+        re.compile(
+            r"(?i)(?:\b|(?<=_))(api[_-]?key|password|passwd|credential|secret[_-]?key|"
+            r"access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|"
+            r"master[_-]?key|salt[_-]?key)\b\s*[=:]\s*[\"']?[^\s\"',}{)\]]{6,}"
+        ),
+        r"\1=[REDACTED]",
+    ),
+)
+
+
+def _sanitize_sensitive_string_value(text: str) -> str:
+    """Scrub embedded secrets from a free-text string value.
+
+    Covers Bearer/Authorization forms, sk-style tokens, and
+    api_key/password/credential assignments wherever they appear (including
+    inside malformed JSONL excerpts, JSONL ``message`` values, and legacy log
+    lines).  Surrounding diagnostic text and the secret class label are
+    preserved; only the credential run is replaced with ``[REDACTED]``.
+    Strings without embedded secrets are returned unchanged.
+    """
+    result = text
+    for pattern, replacement in _SENSITIVE_VALUE_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+# Keys whose values must contain ONLY bounded digest records at any nesting
+# depth.  Arbitrary strings, nested raw dicts/lists, legacy entries, and
+# malformed digest records are replaced with a redaction marker.
+_FORBIDDEN_CONTEXT_DIGEST_KEYS = frozenset(
+    {
+        "matched_forbidden_contexts",
+        "ignored_unattributed_forbidden_contexts",
+    }
+)
+_DIGEST_APPROVED_FIELDS = frozenset({"sha256", "char_count", "line_count"})
+
+
+def _sanitize_forbidden_context_value(value: Any) -> Any:
+    """Validate and sanitize a forbidden-context map value.
+
+    A valid value is a dict mapping substring keys to bounded digest records
+    with exactly the approved structural fields (sha256: str, char_count: int,
+    line_count: int).  Anything else -- raw strings, nested dicts/lists,
+    legacy entries, extra fields, wrong types -- is replaced with
+    ``"[REDACTED]"`` so prompt/tool/log text can never survive at any depth.
+    """
+    if not isinstance(value, dict):
+        return "[REDACTED]"
+    result: dict[str, Any] = {}
+    for key, val in value.items():
+        if not isinstance(val, dict):
+            result[str(key)] = "[REDACTED]"
+            continue
+        if set(val.keys()) != _DIGEST_APPROVED_FIELDS:
+            result[str(key)] = "[REDACTED]"
+            continue
+        sha = val.get("sha256")
+        chars = val.get("char_count")
+        lines = val.get("line_count")
+        if not isinstance(sha, str) or isinstance(chars, bool) or isinstance(lines, bool):
+            result[str(key)] = "[REDACTED]"
+            continue
+        if not isinstance(chars, int) or not isinstance(lines, int):
+            result[str(key)] = "[REDACTED]"
+            continue
+        result[str(key)] = {"sha256": sha, "char_count": chars, "line_count": lines}
+    return result
+
+
+
+def _redact_sensitive_artifact_fields(value: Any) -> Any:
+    """Recursively redact sensitive keys from an artifact structure.
+
+    Uses substring matching for credential-class keys and exact matching
+    for structured fields (command, stdout, stderr, yaml, prompt, token).
+    String values are additionally sanitized to redact embedded secrets
+    (Bearer tokens, sk-style keys, api_key/password/credential assignments)
+    while preserving useful bounded diagnostic context.
+    Never persists credentials, authorization headers, raw prompts, tool
+    arguments, raw YAML, commands, or workstation identity.
+    """
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, val in value.items():
+            key_lower = str(key).lower()
+            if key_lower in _ARTIFACT_REDACTED_EXACT:
+                result[key] = "[REDACTED]"
+            elif any(sub in key_lower for sub in _ARTIFACT_REDACTED_SUBSTRINGS):
+                result[key] = "[REDACTED]"
+            elif key_lower in _FORBIDDEN_CONTEXT_DIGEST_KEYS:
+                result[key] = _sanitize_forbidden_context_value(val)
+            elif _is_tool_content_key(key_lower):
+                result[key] = "[REDACTED]"
+            else:
+                result[key] = _redact_sensitive_artifact_fields(val)
+        return result
+    if isinstance(value, list):
+        return [_redact_sensitive_artifact_fields(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_sensitive_string_value(value)
+    return value
+
+
+def _is_real_tui_case(case_config: dict[str, Any]) -> bool:
+    """Return True only if the case has an actual command list whose first
+    element is a codex or claude executable.  cli_passthrough alone does NOT
+    qualify; HTTP-only or synthetic cases are rejected.
+    """
+    cmd = case_config.get("command")
+    if isinstance(cmd, list) and cmd:
+        executable = str(cmd[0]).rsplit("/", 1)[-1]
+        if executable in _REAL_TUI_EXECUTABLES:
+            return True
+    return False
+
+
+def _is_egress_case(case_config: dict[str, Any]) -> bool:
+    """Return True if the case would perform provider egress of any kind.
+
+    Covers real TUI commands (codex/claude), arbitrary command lists,
+    http_request cases, and cli_passthrough cases.  Pure env-gate/skip cases
+    (only ``required_env`` etc.) are NOT egress and are not blocked by the
+    inventory gate.  Finding 3: unhealthy inventory must block ALL selected
+    egress cases before execution, not only Codex/Claude commands.
+    """
+    if not isinstance(case_config, dict):
+        return False
+    cmd = case_config.get("command")
+    if isinstance(cmd, list) and cmd:
+        return True
+    if case_config.get("http_request"):
+        return True
+    if case_config.get("cli_passthrough"):
+        return True
+    return False
+
+
+def _validate_alias_ingress_coverage(
+    *,
+    alias_inventory: list[dict[str, Any]],
+    cases: dict[str, dict[str, Any]],
+    selected_cases: list[str],
+) -> tuple[bool, list[str]]:
+    """Require exactly one named real-TUI functional case for each
+    alias/ingress pair among the selected cases.
+
+    Coverage must be declared in case metadata (verification_alias +
+    verification_ingress) and tied to an actual Codex/Claude command
+    executable, not inferred from case names.  HTTP-only or synthetic
+    cases are rejected.
+
+    Returns (passed, failures).
+    """
+    failures: list[str] = []
+
+    required_pairs: set[tuple[str, str]] = set()
+    for alias_entry in alias_inventory:
+        alias_name = str(alias_entry.get("alias", ""))
+        for ingress in alias_entry.get("supported_ingresses", []):
+            required_pairs.add((alias_name, str(ingress)))
+
+    declared_pairs: dict[tuple[str, str], list[str]] = {}
+    for case_name in selected_cases:
+        case_config = cases.get(case_name)
+        if not isinstance(case_config, dict):
+            continue
+        v_alias = case_config.get("verification_alias")
+        v_ingress = case_config.get("verification_ingress")
+        if not v_alias or not v_ingress:
+            continue
+        if not _is_real_tui_case(case_config):
+            failures.append(
+                f"case {case_name!r} declares coverage for "
+                f"{v_alias}/{v_ingress} but is not a real TUI case "
+                f"(requires codex or claude command list)"
+            )
+            continue
+        pair = (str(v_alias), str(v_ingress))
+        declared_pairs.setdefault(pair, []).append(case_name)
+
+    for pair in sorted(required_pairs):
+        if pair not in declared_pairs:
+            failures.append(
+                f"missing real-TUI functional case for alias={pair[0]!r} "
+                f"ingress={pair[1]!r}"
+            )
+
+    for pair, case_names in sorted(declared_pairs.items()):
+        if len(case_names) > 1:
+            failures.append(
+                f"duplicate coverage for alias={pair[0]!r} ingress={pair[1]!r}: "
+                f"cases={case_names}"
+            )
+
+    return not failures, failures
+
+
+def _validate_complete_coverage_map(
+    *,
+    alias_inventory: list[dict[str, Any]],
+    cases: dict[str, dict[str, Any]],
+) -> tuple[bool, list[str]]:
+    """Validate that the COMPLETE configured case map (all cases, not just
+    selected) covers every active alias/ingress pair with exactly one real
+    TUI case.  Used during ordinary runs to ensure the configured map is
+    coherent without requiring every case to be selected.
+
+    Returns (passed, failures).
+    """
+    failures: list[str] = []
+
+    required_pairs: set[tuple[str, str]] = set()
+    for alias_entry in alias_inventory:
+        alias_name = str(alias_entry.get("alias", ""))
+        for ingress in alias_entry.get("supported_ingresses", []):
+            required_pairs.add((alias_name, str(ingress)))
+
+    declared_pairs: dict[tuple[str, str], list[str]] = {}
+    for case_name, case_config in cases.items():
+        if not isinstance(case_config, dict):
+            continue
+        v_alias = case_config.get("verification_alias")
+        v_ingress = case_config.get("verification_ingress")
+        if not v_alias or not v_ingress:
+            continue
+        if not _is_real_tui_case(case_config):
+            continue
+        pair = (str(v_alias), str(v_ingress))
+        declared_pairs.setdefault(pair, []).append(case_name)
+
+    for pair in sorted(required_pairs):
+        if pair not in declared_pairs:
+            failures.append(
+                f"configured case map missing real-TUI case for "
+                f"alias={pair[0]!r} ingress={pair[1]!r}"
+            )
+
+    for pair, case_names in sorted(declared_pairs.items()):
+        if len(case_names) > 1:
+            failures.append(
+                f"configured case map has duplicate coverage for "
+                f"alias={pair[0]!r} ingress={pair[1]!r}: cases={case_names}"
+            )
+
+    return not failures, failures
+
+
+# ---------------------------------------------------------------------------
+# CFG-003: Active error-intake baseline/delta collector (finding 1)
+# ---------------------------------------------------------------------------
+
+_ANALYSIS_DIR = ROOT / ".analysis"
+
+
+def _snapshot_source_inventory(
+    config_dir: pathlib.Path | None = None,
+) -> dict[str, str]:
+    """Snapshot the full recursive source inventory of the alias config dir.
+
+    Returns {relative_path: sha256_hex} for every file (recursive).
+    Used to prove no checked-in file was mutated during a run.
+    """
+    base = config_dir or _AAWM_ALIAS_CONFIG_DIR
+    inventory: dict[str, str] = {}
+    if not base.is_dir():
+        return inventory
+    for filepath in sorted(base.rglob("*")):
+        if filepath.is_file():
+            try:
+                inventory[str(filepath.relative_to(base))] = hashlib.sha256(
+                    filepath.read_bytes()
+                ).hexdigest()
+            except OSError:
+                inventory[str(filepath.relative_to(base))] = "unreadable"
+    return inventory
+
+
+def _discover_error_intake_files(analysis_dir: pathlib.Path | None = None) -> list[pathlib.Path]:
+    """Discover all *-error.jsonl and *-error.log files in root and nested
+    .analysis directories (recursive)."""
+    base = analysis_dir or _ANALYSIS_DIR
+    if not base.is_dir():
+        return []
+    files: list[pathlib.Path] = []
+    for pattern in ("*-error.jsonl", "*-error.log"):
+        files.extend(base.rglob(pattern))
+    return sorted(files)
+
+
+def _snapshot_error_intake(
+    analysis_dir: pathlib.Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Snapshot file identity/size/line count for all error intake files.
+
+    Returns {relative_path: {size, line_count, inode}} for each discovered file.
+    """
+    base = analysis_dir or _ANALYSIS_DIR
+    snapshot: dict[str, dict[str, Any]] = {}
+    for filepath in _discover_error_intake_files(base):
+        try:
+            stat = filepath.stat()
+            raw = filepath.read_bytes()
+            line_count = raw.count(b"\n")
+            snapshot[str(filepath.relative_to(base))] = {
+                "size": stat.st_size,
+                "line_count": line_count,
+                "inode": stat.st_ino,
+            }
+        except OSError:
+            snapshot[str(filepath.relative_to(base))] = {
+                "size": 0,
+                "line_count": 0,
+                "inode": 0,
+                "error": "unreadable",
+            }
+    return snapshot
+
+
+def _collect_error_intake_delta(  # noqa: PLR0915
+    baseline: dict[str, dict[str, Any]],
+    *,
+    initiation_time: dt.datetime,
+    environment: str = "dev",
+    container: str = "litellm-dev",
+    case_name: str | None = None,
+    session_id: str | None = None,
+    trace_id: str | None = None,
+    strict_correlation: bool = False,
+    current_snapshot: dict[str, dict[str, Any]] | None = None,
+    analysis_dir: pathlib.Path | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Compare current error intake files against baseline and collect new
+    events attributable to this run.
+
+    Attribution rules:
+    - JSONL: observed_at >= initiation_time AND environment matches AND
+      (container matches if present) AND (case/session/trace match if present)
+    - Legacy .log: appended lines (line_count > baseline) are attributed
+      if they contain the environment string.
+    - Truncation/rotation (size decreased or inode changed) fails closed.
+    - Malformed JSONL lines are recorded but do not fail.
+
+    When ``strict_correlation`` is True, an event qualifies ONLY by an exact
+    matching session_id AND trace_id in its context; the sparse temporal/
+    environment/container fallback is disabled so events cannot qualify on
+    environment/container/time alone.
+
+    When ``current_snapshot`` is provided, it is reused as the authoritative
+    current state instead of taking a second snapshot, eliminating the
+    two-snapshot race between collection and baseline advancement.
+
+    Returns (attributed_events, failures).
+    """
+    base = analysis_dir or _ANALYSIS_DIR
+    current = (
+        current_snapshot
+        if current_snapshot is not None
+        else _snapshot_error_intake(base)
+    )
+    failures: list[str] = []
+    attributed: list[dict[str, Any]] = []
+
+    for rel_path, cur_info in sorted(current.items()):
+        # Fail closed on unreadable intake files.
+        if cur_info.get("error") == "unreadable":
+            failures.append(
+                f"error intake file unreadable (fail closed): {rel_path}"
+            )
+            continue
+        base_info = baseline.get(rel_path)
+        if base_info is None:
+            # New file appeared -- fail closed.
+            failures.append(f"new error intake file appeared: {rel_path}")
+            continue
+
+        # Truncation/rotation detection.
+        if cur_info.get("inode") != base_info.get("inode"):
+            failures.append(f"error intake file rotated (inode changed): {rel_path}")
+            continue
+        if cur_info["size"] < base_info["size"]:
+            failures.append(f"error intake file truncated: {rel_path}")
+            continue
+
+        if cur_info["line_count"] <= base_info["line_count"]:
+            continue  # No new lines.
+
+        # Read new lines.
+        filepath = base / rel_path
+        try:
+            raw_lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            failures.append(f"cannot read error intake file {rel_path}: {exc}")
+            continue
+
+        new_lines = raw_lines[base_info["line_count"]:]
+
+        if rel_path.endswith(".jsonl"):
+            for line in new_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    # Malformed append -- record but do not fail.
+                    attributed.append({
+                        "file": rel_path,
+                        "malformed": True,
+                        "excerpt": line[:200],
+                    })
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                # Attribution.
+                observed_at_str = str(event.get("observed_at", ""))
+                try:
+                    observed_at = dt.datetime.fromisoformat(observed_at_str)
+                    if observed_at.tzinfo is None:
+                        observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
+                except (ValueError, TypeError):
+                    continue
+                if observed_at < initiation_time:
+                    continue
+                if str(event.get("environment", "")) != environment:
+                    continue
+                ctx = event.get("context")
+                if not isinstance(ctx, dict):
+                    ctx = {}
+                # Identity attribution: for each of container/session/trace/case,
+                # an EXPLICITLY present differing value rejects the event; a
+                # sparse (absent/empty) value falls through to the conservative
+                # temporal+environment+target-container fallback.
+                ev_container = ctx.get("container")
+                if ev_container and str(ev_container) != container:
+                    continue
+                ev_session = ctx.get("session_id")
+                if session_id and ev_session and str(ev_session) != session_id:
+                    continue
+                ev_trace = ctx.get("trace_id")
+                if trace_id and ev_trace and str(ev_trace) != trace_id:
+                    continue
+                ev_case = ctx.get("case") or ctx.get("case_name")
+                if case_name and ev_case and str(ev_case) != case_name:
+                    continue
+                # Strict correlation: require an exact matching session_id AND
+                # trace_id; the sparse fallback above is not sufficient.
+                if strict_correlation:
+                    if not (
+                        session_id
+                        and trace_id
+                        and str(ev_session or "") == session_id
+                        and str(ev_trace or "") == trace_id
+                    ):
+                        continue
+                attributed.append({
+                    "file": rel_path,
+                    "observed_at": observed_at_str,
+                    "environment": event.get("environment"),
+                    "level": event.get("level"),
+                    "message": str(event.get("message", ""))[:300],
+                    "fingerprint": event.get("fingerprint"),
+                    "attributed_container": str(ev_container) if ev_container else None,
+                    "attributed_session": str(ev_session) if ev_session else None,
+                    "attributed_trace": str(ev_trace) if ev_trace else None,
+                    "attributed_case": str(ev_case) if ev_case else None,
+                    "sparse_fallback": not (ev_container or ev_session or ev_trace or ev_case),
+                })
+        else:
+            # Legacy .log: in strict correlation mode, unstructured lines can
+            # never satisfy exact session+trace identity and must NOT be
+            # attributed as correlated evidence.  They are skipped entirely so
+            # they cannot satisfy or fail a case.  In non-strict mode they
+            # remain attributed by environment substring (diagnostic only).
+            if not strict_correlation:
+                for line in new_lines:
+                    if environment in line:
+                        attributed.append({
+                            "file": rel_path,
+                            "legacy_line": line[:300],
+                        })
+
+    # Check for files that disappeared.
+    for rel_path in baseline:
+        if rel_path not in current:
+            failures.append(f"error intake file disappeared: {rel_path}")
+
+    return attributed, failures
+
+
+def _summarize_error_intake_snapshot(
+    snapshot: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Sanitized summary of an error-intake snapshot for artifact persistence.
+
+    Records only file identity/size/line-count metadata -- never file content.
+    """
+    return {
+        "file_count": len(snapshot),
+        "files": {
+            rel: {
+                "size": info.get("size"),
+                "line_count": info.get("line_count"),
+                "inode": info.get("inode"),
+            }
+            for rel, info in sorted(snapshot.items())
+        },
+    }
+
+
+def _delta_error_intake_summary(
+    baseline: dict[str, dict[str, Any]],
+    current: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Sanitized per-file delta (line-count / size growth) between two
+    error-intake snapshots.  Records only metadata deltas -- never content.
+    """
+    delta: dict[str, dict[str, Any]] = {}
+    all_paths = sorted(set(baseline) | set(current))
+    for rel in all_paths:
+        base_info = baseline.get(rel, {})
+        cur_info = current.get(rel, {})
+        base_lines = int(base_info.get("line_count") or 0)
+        cur_lines = int(cur_info.get("line_count") or 0)
+        base_size = int(base_info.get("size") or 0)
+        cur_size = int(cur_info.get("size") or 0)
+        delta[rel] = {
+            "line_count_delta": cur_lines - base_lines,
+            "size_delta": cur_size - base_size,
+            "status": (
+                "added" if rel not in baseline
+                else "removed" if rel not in current
+                else "unchanged" if (cur_lines == base_lines and cur_size == base_size)
+                else "grown"
+            ),
+        }
+    return {
+        "file_count": len(delta),
+        "total_line_count_delta": sum(d["line_count_delta"] for d in delta.values()),
+        "files": delta,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CFG-003: Positive availability evidence (finding 2)
+# ---------------------------------------------------------------------------
+
+# Statuses that positively prove availability.
+_POSITIVE_AVAILABILITY_STATUSES = frozenset(
+    {"available", "selected", "healthy", "success", "active"}
+)
+# Statuses that prove unavailability.
+_NEGATIVE_AVAILABILITY_STATUSES = frozenset(
+    {"at capacity", "unavailable", "cooling down", "failed", "exhausted", "cooldown"}
+)
+# Maximum age for fresh availability evidence.
+_AVAILABILITY_FRESHNESS_SECONDS = 3600.0
+
+
+def _query_positive_availability_evidence(
+    *,
+    db_settings: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    environment: str = "dev",
+    freshness_seconds: float = _AVAILABILITY_FRESHNESS_SECONDS,
+) -> dict[str, Any]:
+    """Query rate_limit_observations for positive availability evidence.
+
+    Evidence is keyed by the EXACT ``(provider, model)`` identity (never model
+    alone), so two providers sharing a model name are distinguished.  For each
+    candidate, looks for a fresh (within freshness_seconds) row with
+    remaining_pct > 0 (non-exhausted quota).  Missing/stale/exhausted rows do
+    NOT count as available.
+
+    The ``rate_limit_observations`` table has no environment column, so the
+    selected target database/profile is bound as the environment and recorded
+    explicitly on every record (``environment`` + ``environment_binding``).
+
+    Returns {(provider, model): {available, evidence, observed_at,
+             environment, environment_binding}}.
+    """
+    import psycopg
+
+    result: dict[str, Any] = {}
+    try:
+        conn = psycopg.connect(
+            host=db_settings["host"],
+            port=db_settings["port"],
+            dbname=db_settings["dbname"],
+            user=db_settings["user"],
+            password=db_settings["password"],
+            connect_timeout=10,
+            autocommit=True,
+            row_factory=psycopg.rows.dict_row,
+        )
+    except Exception:  # noqa: BLE001
+        return result
+
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=freshness_seconds)
+    try:
+        with conn.cursor() as cur:
+            for cand in candidates:
+                provider = cand["provider"]
+                model = cand["model"]
+                key = (provider, model)
+                cur.execute(
+                    """
+                    SELECT observed_at, provider, model, remaining_pct,
+                           quota_remaining, source, evidence
+                    FROM public.rate_limit_observations
+                    WHERE provider = %s AND model = %s
+                      AND observed_at >= %s
+                    ORDER BY observed_at DESC
+                    LIMIT 1
+                    """,
+                    (provider, model, cutoff),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    result[key] = {
+                        "available": False,
+                        "provider": provider,
+                        "model": model,
+                        "evidence": "no_fresh_row",
+                        "observed_at": None,
+                        "environment": environment,
+                        "environment_binding": "target_db_profile",
+                    }
+                    continue
+                remaining_pct = row.get("remaining_pct")
+                observed_at = row.get("observed_at")
+                if isinstance(remaining_pct, (int, float)) and remaining_pct > 0:
+                    result[key] = {
+                        "available": True,
+                        "provider": provider,
+                        "model": model,
+                        "evidence": f"remaining_pct={remaining_pct}",
+                        "observed_at": str(observed_at),
+                        "environment": environment,
+                        "environment_binding": "target_db_profile",
+                    }
+                else:
+                    result[key] = {
+                        "available": False,
+                        "provider": provider,
+                        "model": model,
+                        "evidence": f"remaining_pct={remaining_pct}",
+                        "observed_at": str(observed_at),
+                        "environment": environment,
+                        "environment_binding": "target_db_profile",
+                    }
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return result
+
+
+def _availability_key(provider: str, model: str) -> tuple[str, str]:
+    """Composite identity key for positive availability evidence."""
+    return (provider, model)
+
+
+def _parse_observed_at(value: Any) -> dt.datetime | None:
+    """Parse an ``observed_at`` value into a timezone-aware UTC datetime.
+
+    Returns None for missing/malformed values (fail-closed).  Naive
+    datetimes are assumed UTC.
+    """
+    if isinstance(value, dt.datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _availability_record_is_valid(
+    record: Any,
+    *,
+    provider: str,
+    model: str,
+    environment: str,
+    now: dt.datetime | None = None,
+    freshness_seconds: float = _AVAILABILITY_FRESHNESS_SECONDS,
+    clock_skew_tolerance_seconds: float = 60.0,
+) -> bool:
+    """Validate a positive-availability record at the boundary (defect 1).
+
+    Requires ALL of:
+    - record is a dict with ``available is True`` (not merely truthy);
+    - the record's provider, model, environment, and environment_binding
+      fields are ALL present and match the expected exact values;
+    - a parseable ``observed_at`` within ``freshness_seconds`` of ``now``
+      (injected or current UTC); future-skewed beyond the clock-skew
+      tolerance fails closed;
+
+    Missing ANY required field, or a stale/future-skewed/absent/wrong-env/
+    wrong-provider/wrong-model/malformed-timestamp value, fails closed.  This
+    does NOT rely only on the SQL cutoff or stamped labels.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get("available") is not True:
+        return False
+    # Required identity fields must be present AND match exactly.
+    rec_provider = record.get("provider")
+    if rec_provider is None or str(rec_provider) != provider:
+        return False
+    rec_model = record.get("model")
+    if rec_model is None or str(rec_model) != model:
+        return False
+    rec_env = record.get("environment")
+    if rec_env is None or str(rec_env) != environment:
+        return False
+    rec_binding = record.get("environment_binding")
+    if rec_binding is None or str(rec_binding) != "target_db_profile":
+        return False
+    # observed_at must be present and parseable within the freshness window.
+    observed_at = _parse_observed_at(record.get("observed_at"))
+    if observed_at is None:
+        return False
+    now_utc = now if now is not None else dt.datetime.now(dt.timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
+    age = (now_utc - observed_at).total_seconds()
+    if age > freshness_seconds:
+        return False  # stale
+    if age < -clock_skew_tolerance_seconds:
+        return False  # future-skewed beyond tolerance
+    return True
+
+
+def _candidate_order_matches(
+    observed_order: Any,
+    expected_candidates: list[dict[str, Any]],
+) -> bool:
+    """Compare the EXACT complete ordered candidate identity lists.
+
+    Requires the observed ``active_candidate_order`` list to match the
+    expected eligible candidates element-for-element with NO prefix
+    acceptance and NO extra tail.  Each element must match provider, model,
+    route_family, anthropic_route_family, priority, and last_resort.
+    The last_resort key must be present in BOTH observed and expected;
+    missing key on either side fails the match.
+    """
+    if not isinstance(observed_order, list):
+        return False
+    if len(observed_order) != len(expected_candidates):
+        return False
+    for obs, exp in zip(observed_order, expected_candidates):
+        if not isinstance(obs, dict):
+            return False
+        if obs.get("provider") != exp["provider"]:
+            return False
+        if obs.get("model") != exp["model"]:
+            return False
+        if obs.get("route_family") != exp["route_family"]:
+            return False
+        if obs.get("anthropic_route_family") != exp.get("anthropic_route_family", ""):
+            return False
+        if obs.get("priority") != exp["priority"]:
+            return False
+        # Defect 2: last_resort key must be present in BOTH and values must match.
+        if "last_resort" not in obs or "last_resort" not in exp:
+            return False
+        if bool(obs["last_resort"]) != bool(exp["last_resort"]):
+            return False
+    return True
+
+
+def _derive_full_order_from_snapshot(
+    snapshot: Any,
+    alias_name: str = "read",
+) -> list[dict[str, Any]]:
+    """Derive the COMPLETE candidate order directly from the snapshot.
+
+    Independent of provider exclusions, availability, and schedule windows.
+    Returns all candidates in their original snapshot order with normalized
+    last_resort bool (finding 3).
+    """
+    alias = snapshot.aliases.get(alias_name)
+    if alias is None:
+        return []
+    return [
+        {
+            "provider": cand.provider,
+            "model": cand.model,
+            "route_family": cand.route_family or "",
+            "anthropic_route_family": cand.anthropic_route_family or "",
+            "priority": cand.priority,
+            "last_resort": cand.priority == 0,
+        }
+        for cand in alias.candidates
+    ]
+
+
+def _serialize_availability_evidence(
+    evidence: dict[Any, Any],
+) -> list[dict[str, Any]]:
+    """Convert tuple-keyed availability evidence into a JSON-safe, sanitized
+    list of records preserving the exact (provider, model) identity."""
+    records: list[dict[str, Any]] = []
+    for key, info in sorted(evidence.items(), key=lambda kv: tuple(map(str, kv[0]))):
+        if isinstance(key, tuple) and len(key) == 2:
+            provider, model = key
+        else:
+            provider, model = "", str(key)
+        record = {"provider": provider, "model": model}
+        if isinstance(info, dict):
+            record.update(info)
+        records.append(record)
+    return records
+
+
+def _filter_candidates_by_positive_availability(
+    candidates: list[dict[str, Any]],
+    availability: dict[str, Any],
+    *,
+    environment: str = "dev",
+    now: dt.datetime | None = None,
+    freshness_seconds: float = _AVAILABILITY_FRESHNESS_SECONDS,
+) -> list[dict[str, Any]]:
+    """Filter candidates to only those with a boundary-valid positive
+    availability record for the EXACT (provider, model) identity (finding 1).
+
+    A record must have ``available is True``, a parseable ``observed_at``
+    within the freshness window relative to ``now``, and matching
+    environment/binding.  Missing/unknown/stale/future-skewed/wrong-env/
+    malformed evidence cannot pass."""
+    return [
+        c for c in candidates
+        if _availability_record_is_valid(
+            availability.get(_availability_key(c["provider"], c["model"])),
+            provider=c["provider"],
+            model=c["model"],
+            environment=environment,
+            now=now,
+            freshness_seconds=freshness_seconds,
+        )
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run local CLI acceptance checks through litellm-dev.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to suite config JSON.")

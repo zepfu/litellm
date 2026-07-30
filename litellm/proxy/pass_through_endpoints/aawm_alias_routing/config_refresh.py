@@ -41,6 +41,44 @@ _DEFAULT_AAWM_ALIAS_CONFIG_PATH = (
 )
 
 
+def _snapshot_candidate_order(snapshot: Any) -> dict[str, list[dict[str, Any]]]:
+    """Return sanitized, authoritative per-alias ordered candidate identities.
+
+    Exposes the COMPLETE sanitized identity of each candidate in the
+    snapshot's compiled order: provider, model, route_family,
+    anthropic_route_family, priority, and last_resort (when the compiled
+    candidate exposes it).  Alias names are emitted in sorted order for
+    deterministic output.  Never exposes secrets, raw YAML, weights, or
+    schedule internals.  Used by the refresh response so callers (e.g. the
+    CFG-003 transactional harness) can prove the active restored full
+    candidate order from an authoritative runtime surface rather than a
+    locally inferred order.  Callers MUST compare the exact complete ordered
+    list (no prefix acceptance, no extra tail).
+    """
+    order: dict[str, list[dict[str, Any]]] = {}
+    try:
+        aliases = snapshot.aliases
+    except AttributeError:
+        return order
+    for alias_name in sorted(dict(aliases).keys()):
+        alias = aliases[alias_name]
+        candidates: list[dict[str, Any]] = []
+        for cand in alias.candidates:
+            identity: dict[str, Any] = {
+                "provider": cand.provider,
+                "model": cand.model,
+                "route_family": cand.route_family,
+                "anthropic_route_family": cand.anthropic_route_family,
+                "priority": cand.priority,
+            }
+            # Derive last_resort from the real compiled rule: priority == 0
+            # is reserved for last-resort candidates (config_compiler contract).
+            identity["last_resort"] = cand.priority == 0
+            candidates.append(identity)
+        order[str(alias_name)] = candidates
+    return order
+
+
 # ---------------------------------------------------------------------------
 # Injected runtime seams (Wave 7 DI)
 # ---------------------------------------------------------------------------
@@ -169,6 +207,7 @@ async def _refresh_via_runtime(
         "active_config_hash": active_snapshot.config_hash,
         "config_version": active_snapshot.config_version,
         "activated_at": datetime.now(timezone.utc).isoformat(),
+        "active_candidate_order": _snapshot_candidate_order(active_snapshot),
     }
 
 
@@ -208,4 +247,5 @@ async def _refresh_via_direct_imports(source_yaml: str) -> dict[str, Any]:
         "active_config_hash": active_snapshot.config_hash,
         "config_version": active_snapshot.config_version,
         "activated_at": datetime.now(timezone.utc).isoformat(),
+        "active_candidate_order": _snapshot_candidate_order(active_snapshot),
     }
