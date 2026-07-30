@@ -687,7 +687,7 @@ class TestPreAliasHeaderTranslation:
         import asyncio
 
         try:
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 codex_candidate_calls._handle_codex_opencode_zen_adapter_route(
                     endpoint="/v1/responses",
                     request=request,
@@ -698,8 +698,9 @@ class TestPreAliasHeaderTranslation:
                     use_alias_candidate_probe=True,
                 )
             )
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            if "stop-after-normalization" not in str(exc):
+                raise
         call_body = mock_norm.normalize_codex_request.call_args[0][1]
         assert "litellm_metadata" not in call_body or (
             "opencode_zen_unsupported_tools_mode"
