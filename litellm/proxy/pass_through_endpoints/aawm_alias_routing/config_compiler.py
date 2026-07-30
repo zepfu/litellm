@@ -47,6 +47,34 @@ def _next_epoch() -> int:
         return next(_epoch_counter)
 
 
+# Provider / route-family credential compatibility.  A candidate whose
+# route_family implies a specific credential domain MUST NOT be paired
+# with a provider from an incompatible domain.  This prevents e.g.
+# routing an Anthropic/Claude model through Codex/OpenAI credentials
+# (a TOS violation) or an OpenAI model through Anthropic Messages
+# credentials.
+_CODEX_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "codex_responses",
+    }
+)
+_ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "anthropic_messages",
+    }
+)
+_ANTHROPIC_NATIVE_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "anthropic",
+    }
+)
+_OPENAI_NATIVE_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "openai",
+    }
+)
+
+
 def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> RoutingCandidate:
     schedule = (
         ScheduleWindow(start=candidate.schedule.start, end=candidate.schedule.end)
@@ -54,6 +82,39 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         else None
     )
     error_rules = tuple(ErrorRule(class_name=rule.class_name, cools=rule.cools) for rule in candidate.error_rules)
+    anthropic_rf = schema.resolve_anthropic_route_family(
+        candidate.route_family,
+        candidate.anthropic_route_family,
+    )
+    # Ambiguous route families (e.g. codex_opencode_zen_adapter) may compile
+    # with anthropic_route_family=None; the Anthropic ingress dispatch path
+    # fails closed when shaping such candidates.  Non-ambiguous, unmapped
+    # families with no explicit override are a compile-time error.
+    if anthropic_rf is None and (
+        candidate.route_family is None
+        or candidate.route_family not in schema.AMBIGUOUS_CODEX_ROUTE_FAMILIES
+    ):
+        raise ConfigCompileError(
+            f"candidate model {candidate.model!r} has no resolvable Anthropic-ingress "
+            f"route family: codex route_family {candidate.route_family!r} is not in the "
+            f"closed projection and no explicit anthropic_route_family override was provided"
+        )
+    # Credential-domain compatibility: reject provider/route pairings that
+    # would require cross-provider credentials at dispatch time.
+    if candidate.route_family in _CODEX_CREDENTIAL_ROUTE_FAMILIES and (
+        candidate.provider in _ANTHROPIC_NATIVE_PROVIDERS
+    ):
+        raise ConfigCompileError(
+            f"candidate model {candidate.model!r}: provider {candidate.provider!r} "
+            f"is incompatible with codex-credential route_family {candidate.route_family!r}"
+        )
+    if anthropic_rf in _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES and (
+        candidate.provider in _OPENAI_NATIVE_PROVIDERS
+    ):
+        raise ConfigCompileError(
+            f"candidate model {candidate.model!r}: provider {candidate.provider!r} "
+            f"is incompatible with anthropic-credential route_family {anthropic_rf!r}"
+        )
     return RoutingCandidate(
         provider=candidate.provider,
         model=candidate.model,
@@ -63,6 +124,7 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         tui_attached=candidate.tui_attached,
         schedule=schedule,
         error_rules=error_rules,
+        anthropic_route_family=anthropic_rf,
     )
 
 
@@ -105,6 +167,7 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
                     "model": candidate.model,
                     "priority": candidate.priority,
                     "provider": candidate.provider,
+                    "anthropic_route_family": candidate.anthropic_route_family,
                     "route_family": candidate.route_family,
                     "schedule": (
                         {

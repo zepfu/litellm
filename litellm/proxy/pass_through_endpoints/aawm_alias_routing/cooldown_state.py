@@ -377,26 +377,36 @@ async def _set_anthropic_auto_agent_session_affinity(
         return
     mgr = _require_manager()
     family = mgr.anthropic
+    # CFG-001: carry the semantic config digest observed when affinity
+    # was established, mirroring the Codex setter.  Without this the
+    # snapshot-membership check in _find_anthropic_auto_agent_affinity_candidate
+    # is bypassed (config_hash is None) and affinity silently falls through
+    # to the eligibility-filtered candidate list.
+    config_hash = candidate.get("config_epoch_tag")
     async with family.lock:
         family.session_affinity_by_key[session_key] = {
             "provider": candidate["provider"],
             "model": candidate["model"],
             "route_family": candidate["route_family"],
             "last_resort": bool(candidate.get("last_resort")),
+            "config_hash": config_hash,
             "expires_at_monotonic": (time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS),
             "affinity_state_source": "memory",
         }
         bound_memory_map(family.session_affinity_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+    durable_payload: dict[str, Any] = {
+        "provider": candidate["provider"],
+        "model": candidate["model"],
+        "route_family": candidate["route_family"],
+        "last_resort": bool(candidate.get("last_resort")),
+    }
+    if config_hash is not None:
+        durable_payload["config_hash"] = config_hash
     await write_aawm_alias_routing_durable_payload(
         alias_family="anthropic",
         state_kind="affinity",
         state_key=session_key,
-        payload={
-            "provider": candidate["provider"],
-            "model": candidate["model"],
-            "route_family": candidate["route_family"],
-            "last_resort": bool(candidate.get("last_resort")),
-        },
+        payload=durable_payload,
         ttl_seconds=_CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS,
     )
 

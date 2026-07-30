@@ -310,10 +310,16 @@ def _select_read_pilot_snapshot_candidates(
         now_utc=resolved_now,
     )
     if eligible is None:
-        return _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-            _READ_PILOT_ALIAS_NAME,
-            _CODEX_AUTO_AGENT_CANDIDATES,
-        )
+        # No snapshot at all: degrade to the static table.
+        if get_active_routing_snapshot() is None:
+            return _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
+                _READ_PILOT_ALIAS_NAME,
+                _CODEX_AUTO_AGENT_CANDIDATES,
+            )
+        # Snapshot active but has no read alias: fail closed, no generic
+        # static fallback.  Prevents arbitrary normalized aliases from
+        # silently receiving the static OpenAI candidate set.
+        return ()
     # Fail closed: if every candidate is currently ineligible (TUI-gated out
     # of window, etc), do NOT silently fall back to the unfiltered ordered
     # list -- that would dispatch to a candidate the eligibility gates just
@@ -334,6 +340,81 @@ def _select_read_pilot_snapshot_candidates(
         epoch_tag=epoch_tag,
     )
     return tuple(_routing_candidate_to_public_dict(c, epoch_tag=epoch_tag) for c in distributed)
+
+
+def _select_read_pilot_snapshot_candidates_anthropic(
+    *,
+    client_product_label: Optional[str] = None,
+    now_utc: Optional[datetime] = None,
+) -> Optional[tuple[dict[str, Any], ...]]:
+    """Resolve the ordered ``read`` alias candidates for Anthropic Messages ingress.
+
+    Returns the same snapshot-resolved, priority-ordered, eligibility-filtered
+    candidate set as the Codex ingress path, but with each candidate's
+    ``route_family`` replaced by its ``anthropic_route_family`` projection.
+
+    Returns `None` when there is no active snapshot ``read`` alias (callers
+    fall back to the static table). Returns an empty tuple when every
+    candidate is gated out (fail closed, same as Codex ingress).
+
+    Ingress isolation: Codex and Anthropic ingress each see only their own
+    route-family projection. No cross-provider fallback is introduced.
+    """
+    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+    eligible = _resolve_read_pilot_eligible_candidates(
+        client_product_label=client_product_label,
+        now_utc=resolved_now,
+    )
+    if eligible is None:
+        # No snapshot at all: callers fall back to the static table.
+        if get_active_routing_snapshot() is None:
+            return None
+        # Snapshot active but has no read alias: fail closed.
+        return ()
+    if not eligible:
+        return ()
+    snapshot = get_active_routing_snapshot()
+    assert snapshot is not None
+    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    epoch_tag = snapshot.config_hash
+    distributed = _apply_snapshot_alias_distribution_strategy(
+        eligible,
+        distribution_strategy=alias.distribution_strategy,
+        rng=random.Random(),
+        alias_name=_READ_PILOT_ALIAS_NAME,
+        epoch_tag=epoch_tag,
+    )
+    return tuple(
+        _routing_candidate_to_anthropic_public_dict(c, epoch_tag=epoch_tag)
+        for c in distributed
+    )
+
+
+def _routing_candidate_to_anthropic_public_dict(
+    candidate: _RoutingSnapshotCandidate,
+    *,
+    epoch_tag: Optional[str] = None,
+) -> dict[str, Any]:
+    """Shape a compiled candidate for Anthropic ingress using its anthropic_route_family.
+
+    Fail closed: if the candidate has no resolved anthropic_route_family
+    (should not happen after compile-time validation), raise ValueError.
+    """
+    anthropic_rf = candidate.anthropic_route_family
+    if anthropic_rf is None:
+        raise ValueError(
+            f"candidate model {candidate.model!r} has no anthropic_route_family; "
+            f"this indicates a compile-time validation gap"
+        )
+    shaped: dict[str, Any] = {
+        "provider": candidate.provider,
+        "model": candidate.model,
+        "route_family": anthropic_rf,
+        "last_resort": candidate.priority == 0,
+    }
+    if epoch_tag:
+        shaped["config_epoch_tag"] = epoch_tag
+    return shaped
 
 
 def _derive_round_robin_commit_token(
@@ -444,6 +525,15 @@ def _get_codex_auto_agent_candidates_for_alias(
 ) -> tuple[dict[str, Any], ...]:
     if alias_model == _READ_PILOT_ALIAS_NAME:
         return _select_read_pilot_snapshot_candidates(client_product_label=client_product_label)
+    # When a snapshot is active, only config-defined aliases (read) and
+    # explicitly registered legacy aliases are supported.  Arbitrary
+    # normalized aliases fail closed rather than receiving the generic
+    # static OpenAI fallback.
+    if get_active_routing_snapshot() is not None:
+        candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(alias_model)
+        if candidates is not None:
+            return candidates
+        return ()
     candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
         alias_model,
         _CODEX_AUTO_AGENT_CANDIDATES,

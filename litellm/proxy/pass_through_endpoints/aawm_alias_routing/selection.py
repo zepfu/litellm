@@ -45,7 +45,9 @@ from .snapshot_select import (
     _get_codex_auto_agent_candidates_for_alias,
     _READ_PILOT_ALIAS_NAME,
     _resolve_aawm_alias_selection_enumeration,
+    _routing_candidate_to_anthropic_public_dict,
     _routing_candidate_to_public_dict,
+    _select_read_pilot_snapshot_candidates_anthropic,
     get_active_routing_snapshot,
 )
 
@@ -174,6 +176,13 @@ def _normalize_anthropic_auto_agent_alias_model(model: Any) -> Optional[str]:
     for alias in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS:
         if normalized == alias.lower():
             return alias
+    # CFG-001: recognize config-driven aliases from the active snapshot so
+    # the logical `read` alias resolves on Anthropic ingress too.
+    snapshot = get_active_routing_snapshot()
+    if snapshot is not None:
+        for alias_name in snapshot.aliases:
+            if normalized == alias_name.lower():
+                return alias_name
     return None
 
 
@@ -552,17 +561,93 @@ def _find_codex_auto_agent_affinity_candidate(
     )
 
 
+def _get_anthropic_candidates_for_alias_snapshot_aware(
+    alias_model: str,
+    *,
+    client_product_label: Optional[str] = None,
+) -> tuple[dict[str, Any], ...]:
+    """Resolve Anthropic-ingress candidates, preferring the active snapshot for `read`.
+
+    CFG-001: when the alias is the config-driven `read` pilot and a snapshot
+    is active, return the snapshot's anthropic-projected candidates. Falls
+    back to the injected static-table seam for all other aliases or when no
+    snapshot is active.
+
+    When a snapshot is active, arbitrary aliases that are neither the
+    config-driven pilot nor explicitly registered legacy aliases fail
+    closed (empty tuple) rather than delegating to the generic static
+    table.  This mirrors the Codex-side ``_get_codex_auto_agent_candidates_for_alias``
+    behavior.
+    """
+    if alias_model == _READ_PILOT_ALIAS_NAME:
+        snapshot_candidates = _select_read_pilot_snapshot_candidates_anthropic(
+            client_product_label=client_product_label,
+        )
+        if snapshot_candidates is not None:
+            return snapshot_candidates
+    # CFG-001: fail closed for unsupported aliases when a snapshot is active.
+    if get_active_routing_snapshot() is not None:
+        candidates = _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(alias_model)
+        if candidates is not None:
+            return candidates
+        return ()
+    assert _get_anthropic_candidates_for_alias is not None
+    return _get_anthropic_candidates_for_alias(alias_model)
+
+
 def _find_anthropic_auto_agent_candidate(
     provider: Any,
     model: Any,
     *,
     alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+    client_product_label: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    assert _get_anthropic_candidates_for_alias is not None
-    for candidate in _get_anthropic_candidates_for_alias(alias_model):
+    for candidate in _get_anthropic_candidates_for_alias_snapshot_aware(
+        alias_model, client_product_label=client_product_label,
+    ):
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
+
+
+def _find_anthropic_auto_agent_affinity_candidate(
+    affinity: dict[str, Any],
+    *,
+    alias_model: str,
+    client_product_label: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Resolve a pinned Anthropic candidate without applying new-request eligibility gates.
+
+    Mirrors _find_codex_auto_agent_affinity_candidate: snapshot-established
+    affinity is checked against the active snapshot's full alias membership so
+    schedule/TUI-only changes do not evict an in-flight continuation.
+    """
+    if (
+        alias_model == _READ_PILOT_ALIAS_NAME
+        and affinity.get("config_hash") is not None
+    ):
+        snapshot = get_active_routing_snapshot()
+        if snapshot is None:
+            return None
+        alias = snapshot.aliases.get(alias_model)
+        if alias is None:
+            return None
+        for candidate in alias.candidates:
+            if (
+                candidate.provider == affinity.get("provider")
+                and candidate.model == affinity.get("model")
+            ):
+                return _routing_candidate_to_anthropic_public_dict(
+                    candidate,
+                    epoch_tag=snapshot.config_hash,
+                )
+        return None
+    return _find_anthropic_auto_agent_candidate(
+        affinity.get("provider"),
+        affinity.get("model"),
+        alias_model=alias_model,
+        client_product_label=client_product_label,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -866,12 +951,14 @@ async def _build_anthropic_auto_agent_candidate_states(
     request: Request,
     *,
     alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+    client_product_label: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    assert _get_anthropic_candidates_for_alias is not None
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
     states: list[dict[str, Any]] = []
-    for candidate_template in _get_anthropic_candidates_for_alias(alias_model):
+    for candidate_template in _get_anthropic_candidates_for_alias_snapshot_aware(
+        alias_model, client_product_label=client_product_label,
+    ):
         states.append(
             await _build_anthropic_auto_agent_candidate_state(
                 request,
@@ -1355,9 +1442,11 @@ async def _select_anthropic_auto_agent_candidate(
     assert _resolve_anthropic_session_key is not None
     assert _has_continuation_state is not None
     assert _get_anthropic_session_affinity is not None
+    assert _extract_client_product_label is not None
     alias_model = (
         _normalize_anthropic_auto_agent_alias_model(request_body.get("model")) or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
     )
+    client_product_label = _extract_client_product_label(request, request_body)
     session_key = _resolve_anthropic_session_key(
         request,
         request_body,
@@ -1369,11 +1458,33 @@ async def _select_anthropic_auto_agent_candidate(
     if affinity is not None and not has_continuation_state:
         affinity = None
     if affinity is not None and has_continuation_state:
-        affinity_candidate = _find_anthropic_auto_agent_candidate(
-            affinity.get("provider"),
-            affinity.get("model"),
+        affinity_candidate = _find_anthropic_auto_agent_affinity_candidate(
+            affinity,
             alias_model=alias_model,
+            client_product_label=client_product_label,
         )
+        # CFG-001: continuation-safe affinity.  If the pinned candidate
+        # was removed from the active enumeration or its route_family changed
+        # (route-incompatible), fail closed with redispatch-required BEFORE
+        # any alternate upstream call.  Mirrors the Codex selector guard.
+        if affinity_candidate is None or (
+            affinity_candidate.get("route_family") != affinity.get("route_family")
+        ):
+            _pinned_candidate_shape = {
+                "provider": affinity.get("provider"),
+                "model": affinity.get("model"),
+                "route_family": affinity.get("route_family"),
+                "last_resort": bool(affinity.get("last_resort")),
+            }
+            _raise_anthropic_auto_agent_redispatch_required(
+                candidate=_pinned_candidate_shape,
+                lane_key=None,
+                cooldown_seconds=0.0,
+                error_tokens=set(),
+                alias_model=alias_model,
+                failure_phase="affinity_continuation_removed",
+                attempted_provider_call=False,
+            )
         if affinity_candidate is not None:
             affinity_state = await _build_anthropic_auto_agent_candidate_state(
                 request,
@@ -1403,6 +1514,7 @@ async def _select_anthropic_auto_agent_candidate(
     states = await _build_anthropic_auto_agent_candidate_states(
         request,
         alias_model=alias_model,
+        client_product_label=client_product_label,
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
 
@@ -1411,6 +1523,7 @@ async def _select_anthropic_auto_agent_candidate(
             affinity.get("provider"),
             affinity.get("model"),
             alias_model=alias_model,
+            client_product_label=client_product_label,
         )
         if affinity_candidate is not None:
             matched_affinity_state: Optional[dict[str, Any]] = None
@@ -1528,6 +1641,7 @@ _HOST_FUNCTION_NAMES = (
     "_find_codex_auto_agent_candidate",
     "_find_codex_auto_agent_affinity_candidate",
     "_find_anthropic_auto_agent_candidate",
+    "_find_anthropic_auto_agent_affinity_candidate",
     "_get_anthropic_auto_agent_candidate_cooldown_state",
     "_build_codex_auto_agent_candidate_state",
     "_build_anthropic_auto_agent_candidate_state",
@@ -1590,6 +1704,9 @@ def install(host_globals: dict) -> None:
         "_resolve_anthropic_session_key": _resolve_anthropic_session_key,
         "_has_continuation_state": _has_continuation_state,
         "_get_anthropic_candidates_for_alias": _get_anthropic_candidates_for_alias,
+        "_get_anthropic_candidates_for_alias_snapshot_aware": _get_anthropic_candidates_for_alias_snapshot_aware,
+        "_find_anthropic_auto_agent_affinity_candidate": _find_anthropic_auto_agent_affinity_candidate,
+        "_routing_candidate_to_anthropic_public_dict": _routing_candidate_to_anthropic_public_dict,
         "_is_grok_account_quota_candidate": _is_grok_account_quota_candidate,
         "_get_grok_account_quota_lane_cooldown_key": _get_grok_account_quota_lane_cooldown_key,
         "_is_kimi_code_candidate": _is_kimi_code_candidate,

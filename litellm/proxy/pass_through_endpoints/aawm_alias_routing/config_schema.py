@@ -62,6 +62,45 @@ REGISTERED_ROUTE_FAMILIES: frozenset[str] = frozenset(
     }
 )
 
+
+# Closed ingress-specific route-family projection: maps each Codex/OpenAI
+# Responses ingress route_family to its Anthropic Messages ingress equivalent.
+# Candidates whose codex route_family is NOT in this mapping MUST carry an
+# explicit ``anthropic_route_family`` override or compilation fails closed.
+CODEX_TO_ANTHROPIC_ROUTE_FAMILY: dict[str, str] = {
+    "codex_responses": "anthropic_openai_responses_adapter",
+    "codex_openrouter_completion_adapter": "anthropic_openrouter_completion_adapter",
+    "codex_grok_native_responses_adapter": "anthropic_grok_native_responses_adapter",
+    "codex_xai_oauth_responses_adapter": "anthropic_xai_oauth_responses_adapter",
+    "codex_kimi_chat_completions_adapter": "anthropic_kimi_chat_completions_adapter",
+    "codex_alibaba_token_plan_chat_completions_adapter": "anthropic_alibaba_token_plan_chat_completions_adapter",
+}
+
+# Route families that are ambiguous across ingress (one codex family maps to
+# multiple possible anthropic families depending on the specific model/candidate).
+# These REQUIRE an explicit ``anthropic_route_family`` per candidate.
+AMBIGUOUS_CODEX_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "codex_opencode_zen_adapter",
+    }
+)
+
+
+def resolve_anthropic_route_family(
+    codex_route_family: Optional[str],
+    explicit_override: Optional[str],
+) -> Optional[str]:
+    """Resolve the effective Anthropic-ingress route family for a candidate.
+
+    Priority: explicit override > closed mapping > None (fail closed at compile).
+    """
+    if explicit_override is not None:
+        return explicit_override
+    if codex_route_family is not None:
+        return CODEX_TO_ANTHROPIC_ROUTE_FAMILY.get(codex_route_family)
+    return None
+
+
 DistributionStrategy = Literal["proportional", "round_robin"]
 
 
@@ -116,6 +155,7 @@ class CandidateConfig(BaseModel):
     provider: str
     model: str
     route_family: Optional[str] = None
+    anthropic_route_family: Optional[str] = None
     priority: int
     weight: float = 1.0
     tui_attached: Optional[str] = None
@@ -130,6 +170,11 @@ class CandidateConfig(BaseModel):
     @field_validator("route_family")
     @classmethod
     def _validate_route_family(cls, value: Optional[str]) -> Optional[str]:
+        return _require_registered_route_family(value)
+
+    @field_validator("anthropic_route_family")
+    @classmethod
+    def _validate_anthropic_route_family(cls, value: Optional[str]) -> Optional[str]:
         return _require_registered_route_family(value)
 
     @field_validator("weight")

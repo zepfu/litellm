@@ -47,6 +47,7 @@ class RoutingCandidate:
     tui_attached: Optional[str]
     schedule: Optional[ScheduleWindow]
     error_rules: tuple[ErrorRule, ...] = field(default_factory=tuple)
+    anthropic_route_family: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)

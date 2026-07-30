@@ -38,11 +38,13 @@ aliases:
       - provider: opencode_zen
         model: deepseek-v4-flash
         route_family: codex_opencode_zen_adapter
+        anthropic_route_family: anthropic_opencode_zen_responses_adapter
         priority: 60
 
       - provider: opencode_zen
         model: big-pickle
         route_family: codex_opencode_zen_adapter
+        anthropic_route_family: anthropic_opencode_zen_completion_adapter
         priority: 50
 
       - provider: openai

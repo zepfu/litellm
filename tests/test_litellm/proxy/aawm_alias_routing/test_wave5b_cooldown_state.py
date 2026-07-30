@@ -315,11 +315,11 @@ class TestAnthropicAffinity:
     async def test_no_config_hash_in_anthropic_affinity(
         self, fresh_manager: AliasRoutingStateManager
     ) -> None:
-        """Anthropic affinity does not carry config_hash (baseline behavior)."""
+        """Anthropic affinity carries config_hash=None when candidate lacks config_epoch_tag."""
         await _set_anthropic_auto_agent_session_affinity("sess-a2", _ANTHROPIC_CANDIDATE)
         affinity = await _get_anthropic_auto_agent_session_affinity("sess-a2")
         assert affinity is not None
-        assert "config_hash" not in affinity
+        assert affinity["config_hash"] is None
 
 
 # ---------------------------------------------------------------------------
