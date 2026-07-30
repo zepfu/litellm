@@ -1336,6 +1336,25 @@ async def health_readiness():
     """
     from litellm.proxy.proxy_server import prisma_client, version
 
+    # CFG-002: fail-closed readiness gate -- readiness requires startup
+    # state=active.  Both ``failed`` and ``not_loaded`` return 503 so
+    # orchestrators do not route traffic to a worker without a valid
+    # routing snapshot.
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        get_startup_status as _get_aawm_alias_config_startup_status,
+        is_startup_healthy as _aawm_alias_config_startup_healthy,
+    )
+
+    if not _aawm_alias_config_startup_healthy():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "reason": "aawm_alias_config_not_active",
+                "aawm_alias_config": _get_aawm_alias_config_startup_status(),
+            },
+        )
+
     try:
         # get success callback
         success_callback_names = []
@@ -1378,6 +1397,7 @@ async def health_readiness():
                 "db": db_health_status["status"],
                 "cache": cache_type,
                 "litellm_version": version,
+                "aawm_alias_config": _get_aawm_alias_config_startup_status(),
                 "aawm_alias_routing_cache": _get_aawm_alias_routing_cache_status(),
                 "success_callbacks": success_callback_names,
                 "use_aiohttp_transport": AsyncHTTPHandler._should_use_aiohttp_transport(),
@@ -1390,6 +1410,7 @@ async def health_readiness():
                 "db": "Not connected",
                 "cache": cache_type,
                 "litellm_version": version,
+                "aawm_alias_config": _get_aawm_alias_config_startup_status(),
                 "aawm_alias_routing_cache": _get_aawm_alias_routing_cache_status(),
                 "success_callbacks": success_callback_names,
                 "use_aiohttp_transport": AsyncHTTPHandler._should_use_aiohttp_transport(),

@@ -342,6 +342,9 @@ from litellm.proxy.aawm_alias_routing_redis import (
     initialize as initialize_aawm_alias_routing_redis,
     shutdown as shutdown_aawm_alias_routing_redis,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+    activate_alias_config_directory as activate_aawm_alias_config_directory,
+)
 from litellm.proxy.hooks.prompt_injection_detection import (
     _OPTIONAL_PromptInjectionDetection,
 )
@@ -993,6 +996,9 @@ async def proxy_startup_event(app: FastAPI):  # noqa: PLR0915
     )
 
     await initialize_aawm_alias_routing_redis()
+
+    ## AAWM alias-config directory startup load (CFG-002, fail-closed) ##
+    activate_aawm_alias_config_directory()
 
     ## Validate use_redis_transaction_buffer requires Redis cache ##
     ProxyStartupEvent._validate_redis_transaction_buffer_config(

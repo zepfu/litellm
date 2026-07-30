@@ -550,6 +550,28 @@ def reset_alias_routing_state_for_tests() -> None:
 def _get_anthropic_auto_agent_candidates_for_alias(
     alias_model: str,
 ) -> tuple[dict[str, Any], ...]:
+    # CFG-002 Finding 2: check failure state FIRST, before any snapshot or
+    # static branch.  Once failure is published, all aliases return empty.
+    if _aawm_snapshot_select._is_alias_config_startup_failed():
+        return ()
+    # CFG-002 Finding 1: delegate `read` to the snapshot-aware Anthropic
+    # selector so the wrapper derives the same nonzero snapshot-projected
+    # candidate enumeration/order as the Anthropic selector, not legacy
+    # table zero.  Returns None in legacy mode (no snapshot read alias),
+    # falling through to the static table below.
+    if alias_model == _aawm_snapshot_select._READ_PILOT_ALIAS_NAME:
+        snapshot_candidates = (
+            _aawm_snapshot_select._select_read_pilot_snapshot_candidates_anthropic()
+        )
+        if snapshot_candidates is not None:
+            return snapshot_candidates
+    # When a snapshot is active, only config-defined aliases and explicitly
+    # registered legacy aliases are supported.
+    if get_active_routing_snapshot() is not None:
+        candidates = _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(alias_model)
+        if candidates is not None:
+            return candidates
+        return ()
     candidates = _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
         alias_model,
         _ANTHROPIC_AUTO_AGENT_CANDIDATES,

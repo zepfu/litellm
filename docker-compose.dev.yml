@@ -79,6 +79,9 @@ services:
       - ./litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py:/app/litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/aawm_alias_routing:/app/litellm/proxy/pass_through_endpoints/aawm_alias_routing:ro
+      # CFG-002: complete alias-config directory, read-only, for deterministic
+      # startup directory loading.
+      - ./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/openai_passthrough_logging_handler.py
       - ./litellm/proxy/response_api_endpoints/endpoints.py:/app/litellm/proxy/response_api_endpoints/endpoints.py
       - ./litellm/proxy/route_llm_request.py:/app/litellm/proxy/route_llm_request.py

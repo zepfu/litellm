@@ -43,6 +43,7 @@ from .policy import (
 from .snapshot_select import (
     _commit_round_robin_selection,
     _get_codex_auto_agent_candidates_for_alias,
+    _is_alias_config_startup_failed,
     _READ_PILOT_ALIAS_NAME,
     _resolve_aawm_alias_selection_enumeration,
     _routing_candidate_to_anthropic_public_dict,
@@ -578,7 +579,13 @@ def _get_anthropic_candidates_for_alias_snapshot_aware(
     closed (empty tuple) rather than delegating to the generic static
     table.  This mirrors the Codex-side ``_get_codex_auto_agent_candidates_for_alias``
     behavior.
+
+    CFG-002 Finding 2: failure state is checked FIRST, before any snapshot
+    or static branch.  Once failure is published, all paths return empty.
     """
+    # CFG-002 Finding 2: check failure state FIRST.
+    if _is_alias_config_startup_failed():
+        return ()
     if alias_model == _READ_PILOT_ALIAS_NAME:
         snapshot_candidates = _select_read_pilot_snapshot_candidates_anthropic(
             client_product_label=client_product_label,

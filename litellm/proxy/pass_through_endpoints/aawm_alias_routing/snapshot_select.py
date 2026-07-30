@@ -67,6 +67,17 @@ def set_active_routing_snapshot(
     return _active_routing_snapshot_holder.swap(snapshot)
 
 
+def _is_alias_config_startup_failed() -> bool:
+    """Return ``True`` if alias-config startup was attempted and failed.
+
+    Lazy import avoids the ``config_startup -> snapshot_select`` circular
+    dependency at module-load time.
+    """
+    from .config_startup import is_startup_failed
+
+    return is_startup_failed()
+
+
 # ---------------------------------------------------------------------------
 # Public shaping
 # ---------------------------------------------------------------------------
@@ -271,6 +282,7 @@ def _resolve_read_pilot_eligible_candidates(
     *,
     client_product_label: Optional[str],
     now_utc: datetime,
+    snapshot: Optional[_RoutingSnapshot] = None,
 ) -> Optional[list[_RoutingSnapshotCandidate]]:
     """Return the eligibility-filtered, priority-ordered ``read`` alias candidates.
 
@@ -279,8 +291,12 @@ def _resolve_read_pilot_eligible_candidates(
     (TUI/schedule) -- callers fail closed rather than dispatching a rejected
     candidate. Shared by the enumeration getter and the round-robin commit-token
     derivation so both observe the identical tied top-tier ordering.
+
+    When ``snapshot`` is provided, it is used directly instead of fetching
+    the global holder (Finding 5: single-capture coherence).
     """
-    snapshot = get_active_routing_snapshot()
+    if snapshot is None:
+        snapshot = get_active_routing_snapshot()
     if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
         return None
     alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
@@ -303,32 +319,34 @@ def _select_read_pilot_snapshot_candidates(
     Falls back to the hard-coded ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS`` table
     when no snapshot has been activated (or the snapshot has no ``read`` alias),
     so the pilot degrades gracefully instead of raising.
+
+    CFG-002 Finding 2: failure state is checked FIRST, before any snapshot
+    or static branch.  Once failure is published, all paths return empty.
+    CFG-002 Finding 5: exactly one snapshot reference is captured and used
+    for eligibility, distribution, hash, and shaping.
     """
+    # Finding 2: fail-closed check before any snapshot/static branch.
+    if _is_alias_config_startup_failed():
+        return ()
+    # Finding 5: capture exactly one snapshot reference.
+    snapshot = get_active_routing_snapshot()
     resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
     eligible = _resolve_read_pilot_eligible_candidates(
         client_product_label=client_product_label,
         now_utc=resolved_now,
+        snapshot=snapshot,
     )
     if eligible is None:
-        # No snapshot at all: degrade to the static table.
-        if get_active_routing_snapshot() is None:
+        if snapshot is None:
+            # Genuine legacy / no-config state: degrade to the static table.
             return _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
                 _READ_PILOT_ALIAS_NAME,
                 _CODEX_AUTO_AGENT_CANDIDATES,
             )
-        # Snapshot active but has no read alias: fail closed, no generic
-        # static fallback.  Prevents arbitrary normalized aliases from
-        # silently receiving the static OpenAI candidate set.
+        # Snapshot active but has no read alias: fail closed.
         return ()
-    # Fail closed: if every candidate is currently ineligible (TUI-gated out
-    # of window, etc), do NOT silently fall back to the unfiltered ordered
-    # list -- that would dispatch to a candidate the eligibility gates just
-    # rejected. Returning empty here means the caller sees "no candidates
-    # available" for this attempt, matching every other alias-routing lane's
-    # fail-closed behavior on exhaustion.
     if not eligible:
         return ()
-    snapshot = get_active_routing_snapshot()
     assert snapshot is not None
     alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
     epoch_tag = snapshot.config_hash
@@ -359,21 +377,29 @@ def _select_read_pilot_snapshot_candidates_anthropic(
 
     Ingress isolation: Codex and Anthropic ingress each see only their own
     route-family projection. No cross-provider fallback is introduced.
+
+    CFG-002 Finding 2: failure state is checked FIRST.
+    CFG-002 Finding 5: exactly one snapshot reference captured per call.
     """
+    # Finding 2: fail-closed check before any snapshot/static branch.
+    if _is_alias_config_startup_failed():
+        return ()
+    # Finding 5: capture exactly one snapshot reference.
+    snapshot = get_active_routing_snapshot()
     resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
     eligible = _resolve_read_pilot_eligible_candidates(
         client_product_label=client_product_label,
         now_utc=resolved_now,
+        snapshot=snapshot,
     )
     if eligible is None:
-        # No snapshot at all: callers fall back to the static table.
-        if get_active_routing_snapshot() is None:
+        if snapshot is None:
+            # Genuine legacy / no-config state: callers fall back to static table.
             return None
         # Snapshot active but has no read alias: fail closed.
         return ()
     if not eligible:
         return ()
-    snapshot = get_active_routing_snapshot()
     assert snapshot is not None
     alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
     epoch_tag = snapshot.config_hash
@@ -523,6 +549,10 @@ def _get_codex_auto_agent_candidates_for_alias(
     *,
     client_product_label: Optional[str] = None,
 ) -> tuple[dict[str, Any], ...]:
+    # CFG-002 Finding 2: check failure state FIRST, before any snapshot or
+    # static branch.  Once failure is published, all aliases return empty.
+    if _is_alias_config_startup_failed():
+        return ()
     if alias_model == _READ_PILOT_ALIAS_NAME:
         return _select_read_pilot_snapshot_candidates(client_product_label=client_product_label)
     # When a snapshot is active, only config-defined aliases (read) and
