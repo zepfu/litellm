@@ -244,8 +244,8 @@ def test_target_profile_applies_db_settings_to_all_db_validators(harness):
         assert block["db_port"] == 6433
         assert block["db_name"] == "litellm_dev"
         assert block["db_user"] == "litellm_dev"
-        assert block["db_password_container"] == "litellm-dev"
-        assert block["db_password_container_env"] == "AAWM_DB_PASSWORD"
+        assert block["db_password_container"] == "thoth-litellm-dev-pgbouncer"
+        assert block["db_password_container_env"] == "PGBOUNCER_AUTH_PASSWORD"
 
 
 def test_db_container_credential_wins_over_stale_host(harness, monkeypatch):
@@ -575,10 +575,95 @@ def test_config_dev_profile_declares_container_owned_credentials():
     assert dev["validation_db_port"] == "6433"
     assert dev["validation_db_name"] == "litellm_dev"
     assert dev["validation_db_user"] == "litellm_dev"
-    assert dev["validation_db_password_container_env"] == "AAWM_DB_PASSWORD"
+    assert dev["validation_db_password_container"] == "thoth-litellm-dev-pgbouncer"
+    assert dev["validation_db_password_container_env"] == "PGBOUNCER_AUTH_PASSWORD"
     assert dev["langfuse_public_key_container_env"] == "LANGFUSE_PUBLIC_KEY"
     assert dev["langfuse_secret_key_container_env"] == "LANGFUSE_SECRET_KEY"
     assert "validation_db_host" not in _config()["target_profiles"]["prod"]
+
+
+def test_validation_db_password_container_separation(harness):
+    """Explicit validation_db_password_container takes precedence over
+    docker_container_name for credential resolution."""
+    profile = {
+        "validation_db_host": "127.0.0.1",
+        "validation_db_port": "6433",
+        "validation_db_name": "litellm_dev",
+        "validation_db_user": "litellm_dev",
+        "docker_container_name": "litellm-dev",
+        "validation_db_password_container": "thoth-litellm-dev-pgbouncer",
+        "validation_db_password_container_env": "PGBOUNCER_AUTH_PASSWORD",
+    }
+    case = {"session_history_validation": {"db_port": 5434}}
+    harness._apply_profile_validation_db_overrides(case, profile)
+    block = case["session_history_validation"]
+    assert block["db_password_container"] == "thoth-litellm-dev-pgbouncer"
+    assert block["db_password_container_env"] == "PGBOUNCER_AUTH_PASSWORD"
+
+
+def test_validation_db_password_container_fallback_to_docker_container(harness):
+    """When validation_db_password_container is absent, falls back to
+    docker_container_name for backward compatibility."""
+    profile = {
+        "validation_db_host": "127.0.0.1",
+        "validation_db_port": "6433",
+        "validation_db_name": "litellm_dev",
+        "validation_db_user": "litellm_dev",
+        "docker_container_name": "litellm-dev",
+        "validation_db_password_container_env": "AAWM_DB_PASSWORD",
+    }
+    case = {"session_history_validation": {"db_port": 5434}}
+    harness._apply_profile_validation_db_overrides(case, profile)
+    block = case["session_history_validation"]
+    assert block["db_password_container"] == "litellm-dev"
+    assert block["db_password_container_env"] == "AAWM_DB_PASSWORD"
+
+
+def test_cfg003_db_settings_uses_explicit_validation_container(harness, monkeypatch):
+    """_cfg003_db_settings resolves credentials from the explicit
+    validation_db_password_container, not docker_container_name."""
+    calls = []
+    monkeypatch.setattr(
+        harness,
+        "_resolve_container_env_value",
+        lambda container, env: calls.append((container, env)) or "pgb-secret",
+    )
+    profile = {
+        "validation_db_host": "127.0.0.1",
+        "validation_db_port": "6433",
+        "validation_db_name": "litellm_dev",
+        "validation_db_user": "litellm_dev",
+        "docker_container_name": "litellm-dev",
+        "validation_db_password_container": "thoth-litellm-dev-pgbouncer",
+        "validation_db_password_container_env": "PGBOUNCER_AUTH_PASSWORD",
+    }
+    settings = harness._cfg003_db_settings({}, profile=profile)
+    assert settings is not None
+    assert settings["password"] == "pgb-secret"
+    assert calls == [("thoth-litellm-dev-pgbouncer", "PGBOUNCER_AUTH_PASSWORD")]
+
+
+def test_cfg003_db_settings_fallback_without_explicit_container(harness, monkeypatch):
+    """_cfg003_db_settings falls back to docker_container_name when
+    validation_db_password_container is absent."""
+    calls = []
+    monkeypatch.setattr(
+        harness,
+        "_resolve_container_env_value",
+        lambda container, env: calls.append((container, env)) or "legacy-secret",
+    )
+    profile = {
+        "validation_db_host": "127.0.0.1",
+        "validation_db_port": "6433",
+        "validation_db_name": "litellm_dev",
+        "validation_db_user": "litellm_dev",
+        "docker_container_name": "litellm-dev",
+        "validation_db_password_container_env": "AAWM_DB_PASSWORD",
+    }
+    settings = harness._cfg003_db_settings({}, profile=profile)
+    assert settings is not None
+    assert settings["password"] == "legacy-secret"
+    assert calls == [("litellm-dev", "AAWM_DB_PASSWORD")]
 
 
 def test_failure_observability_with_session_history_calls_validator(

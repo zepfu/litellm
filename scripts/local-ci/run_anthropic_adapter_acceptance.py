@@ -1250,7 +1250,11 @@ def _apply_profile_validation_db_overrides(
     db_host = profile.get('validation_db_host')
     if not db_host:
         return
-    container_name = profile.get('docker_container_name', '')
+    container_name = str(
+        profile.get('validation_db_password_container')
+        or profile.get('docker_container_name')
+        or ''
+    )
     password_container_env = profile.get('validation_db_password_container_env', '')
     for key in _DB_VALIDATION_KEYS:
         block = case_config.get(key)
@@ -7603,6 +7607,7 @@ def _cfg003_db_settings(
     ).strip()
     container_name = str(
         checks.get("db_password_container")
+        or profile.get("validation_db_password_container")
         or profile.get("docker_container_name")
         or ""
     ).strip()

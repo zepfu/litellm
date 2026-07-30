@@ -16,7 +16,8 @@
       "validation_db_port": "6433",
       "validation_db_name": "litellm_dev",
       "validation_db_user": "litellm_dev",
-      "validation_db_password_container_env": "AAWM_DB_PASSWORD",
+      "validation_db_password_container": "thoth-litellm-dev-pgbouncer",
+      "validation_db_password_container_env": "PGBOUNCER_AUTH_PASSWORD",
       "langfuse_public_key_container_env": "LANGFUSE_PUBLIC_KEY",
       "langfuse_secret_key_container_env": "LANGFUSE_SECRET_KEY"
     },
