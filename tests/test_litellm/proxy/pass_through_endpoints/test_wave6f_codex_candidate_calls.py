@@ -39,6 +39,11 @@ EXPECTED_PUBLIC_SYMBOLS = frozenset(
         "_handle_codex_alibaba_token_plan_adapter_route",
         "_handle_codex_opencode_zen_adapter_route",
         "_consume_opencode_zen_tools_mode_header",
+        "_build_opencode_zen_completion_call_kwargs",
+        "_perform_opencode_zen_completion_call",
+        "_prepare_opencode_zen_direct_observability_metadata",
+        "_prepare_opencode_zen_known_free_logging",
+        "_opencode_zen_callback_headers",
         # D1-574 OpenCode direct 429
         "_opencode_zen_direct_safe_retry_after",
         "_maybe_raise_opencode_zen_direct_rate_limit",
@@ -61,6 +66,13 @@ class TestSymbolInventory:
         """_HOST_FUNCTION_NAMES must match the extractable function symbols."""
         expected_fns = EXPECTED_PUBLIC_SYMBOLS - {"install", "_HOST_FUNCTION_NAMES"}
         assert set(codex_candidate_calls._HOST_FUNCTION_NAMES) == expected_fns
+        assert (
+            sum(
+                callable(getattr(codex_candidate_calls, name))
+                for name in codex_candidate_calls._HOST_FUNCTION_NAMES
+            )
+            == 23
+        )
 
 
 # ── Signatures and async parity ─────────────────────────────────────
@@ -81,6 +93,7 @@ ASYNC_FUNCTIONS = frozenset(
         "_perform_codex_alibaba_token_plan_adapter_call",
         "_handle_codex_alibaba_token_plan_adapter_route",
         "_handle_codex_opencode_zen_adapter_route",
+        "_perform_opencode_zen_completion_call",
     }
 )
 

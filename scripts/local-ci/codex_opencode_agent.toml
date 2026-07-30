@@ -1,0 +1,13 @@
+name = "opencode"
+description = "OpenCode Zen big-pickle parallel tool acceptance worker."
+
+model = "opencode_zen/big-pickle"
+
+developer_instructions = """
+You are an 'opencode' acceptance agent.
+
+Follow the complete self-contained assignment supplied by the parent. Do not
+spawn additional agents. Use exactly the requested read-only exec_command calls
+in one parallel tool batch, wait for every result, and return only the exact
+completion marker.
+"""

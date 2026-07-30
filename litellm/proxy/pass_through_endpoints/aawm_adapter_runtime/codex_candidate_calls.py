@@ -142,6 +142,11 @@ _HOST_FUNCTION_NAMES = (
     # OpenCode
     "_handle_codex_opencode_zen_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
+    "_build_opencode_zen_completion_call_kwargs",
+    "_perform_opencode_zen_completion_call",
+    "_prepare_opencode_zen_direct_observability_metadata",
+    "_prepare_opencode_zen_known_free_logging",
+    "_opencode_zen_callback_headers",
     # D1-574 OpenCode direct 429
     "_opencode_zen_direct_safe_retry_after",
     "_maybe_raise_opencode_zen_direct_rate_limit",
@@ -1069,20 +1074,14 @@ def _consume_opencode_zen_tools_mode_header(
     prepared_request_body: dict[str, Any],
     use_alias_candidate_probe: bool,
 ) -> dict[str, Any]:
-    """D1-574/MS-033: consume case-local unsupported-tools-mode header.
+    """D1-574/MS-033: resolve direct-route unsupported-tools mode.
 
-    Direct mode only. Body litellm_metadata wins if already present.
+    Direct mode defaults to ``drop`` immediately before normalization. Body
+    litellm_metadata wins if already present. Alias probes remain strict.
     """
     if use_alias_candidate_probe:
         return prepared_request_body
 
-    _header_mode_raw = request.headers.get(
-        "x-aawm-opencode-zen-unsupported-tools-mode"
-    )
-    if _header_mode_raw is None:
-        return prepared_request_body
-
-    _header_mode = _header_mode_raw.strip()
     _existing_metadata = prepared_request_body.get("litellm_metadata")
     _existing_mode = (
         _existing_metadata.get("opencode_zen_unsupported_tools_mode")
@@ -1092,7 +1091,10 @@ def _consume_opencode_zen_tools_mode_header(
     if _existing_mode is not None:
         return prepared_request_body
 
-    if _header_mode != "drop":
+    _header_mode_raw = request.headers.get(
+        "x-aawm-opencode-zen-unsupported-tools-mode"
+    )
+    if _header_mode_raw is not None and _header_mode_raw.strip() != "drop":
         raise ProxyException(
             message=(
                 "x-aawm-opencode-zen-unsupported-tools-mode must be "
@@ -1110,6 +1112,155 @@ def _consume_opencode_zen_tools_mode_header(
     return prepared_request_body
 
 
+def _opencode_zen_callback_headers(request: Request) -> dict[str, Any]:
+    """Copy headers without raw Langfuse trace identity overrides."""
+    return {
+        raw_name: raw_value
+        for raw_name, raw_value in request.headers.items()
+        if raw_name.strip().lower().replace("-", "_")
+        not in {"langfuse_trace_name", "langfuse_trace_user_id"}
+    }
+
+
+def _prepare_opencode_zen_direct_observability_metadata(
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    use_alias_candidate_probe: bool,
+    user_api_key_dict: Any = None,
+) -> tuple[dict[str, Any], Optional[str]]:
+    """Import bounded trusted identity only for direct Codex/OpenCode."""
+    if use_alias_candidate_probe:
+        return prepared_request_body, None
+
+    trace_identity: dict[str, str] = {}
+    bounded_end_user_header: Optional[str] = None
+    for raw_name, raw_value in request.headers.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            continue
+        normalized_name = raw_name.strip().lower()
+        cleaned_value = raw_value.strip()
+        if not cleaned_value or len(cleaned_value) > 512:
+            continue
+        if normalized_name.replace("-", "_") == "langfuse_trace_name":
+            trace_identity["trace_name"] = cleaned_value
+        elif normalized_name == "x-litellm-end-user-id":
+            bounded_end_user_header = cleaned_value
+
+    raw_end_user_id = getattr(user_api_key_dict, "end_user_id", None)
+    bounded_authenticated_end_user_id = (
+        raw_end_user_id.strip()
+        if isinstance(raw_end_user_id, str)
+        and raw_end_user_id.strip()
+        and len(raw_end_user_id.strip()) <= 512
+        else None
+    )
+    accepted_trace_user_id = (
+        bounded_end_user_header
+        if bounded_end_user_header is not None
+        and bounded_authenticated_end_user_id == bounded_end_user_header
+        else None
+    )
+    if accepted_trace_user_id is not None:
+        trace_identity["trace_user_id"] = accepted_trace_user_id
+    if not trace_identity:
+        return prepared_request_body, None
+
+    existing_metadata = prepared_request_body.get("litellm_metadata")
+    litellm_metadata = (
+        dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+    )
+    changed = False
+    for metadata_name, explicit_value in trace_identity.items():
+        existing_value = litellm_metadata.get(metadata_name)
+        if existing_value == explicit_value:
+            continue
+        source_name = f"source_{metadata_name}"
+        if existing_value and not litellm_metadata.get(source_name):
+            litellm_metadata[source_name] = existing_value
+        litellm_metadata[metadata_name] = explicit_value
+        changed = True
+
+    if not changed:
+        return prepared_request_body, accepted_trace_user_id
+
+    updated_body = dict(prepared_request_body)
+    updated_body["litellm_metadata"] = litellm_metadata
+    return updated_body, accepted_trace_user_id
+
+
+def _build_opencode_zen_completion_call_kwargs(
+    *,
+    completion_kwargs: dict[str, Any],
+    api_key: str,
+    target_base_url: str,
+    litellm_metadata: dict[str, Any],
+    request: Request,
+    use_alias_candidate_probe: bool,
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        **completion_kwargs,
+        "api_key": api_key,
+        "api_base": f"{target_base_url.rstrip('/')}/v1",
+        "litellm_metadata": litellm_metadata,
+        "proxy_server_request": {
+            "headers": (
+                dict(request.headers)
+                if use_alias_candidate_probe
+                else _opencode_zen_callback_headers(request)
+            ),
+            "body": request_body,
+        },
+        "shared_session": _get_proxy_shared_aiohttp_session(),
+    }
+
+
+def _prepare_opencode_zen_known_free_logging(
+    *,
+    completion_call_kwargs: dict[str, Any],
+    is_known_free_direct: bool,
+) -> dict[str, Any]:
+    if not is_known_free_direct:
+        return completion_call_kwargs
+
+    import datetime
+    import uuid
+
+    completion_call_kwargs.setdefault(
+        "litellm_call_id",
+        str(uuid.uuid4()),
+    )
+    logging_obj, completion_call_kwargs = litellm.utils.function_setup(
+        original_function="acompletion",
+        rules_obj=litellm.utils.Rules(),
+        start_time=datetime.datetime.now(),
+        **completion_call_kwargs,
+    )
+    logging_obj.model_call_details["response_cost"] = 0.0
+    completion_call_kwargs["litellm_logging_obj"] = logging_obj
+    return completion_call_kwargs
+
+
+async def _perform_opencode_zen_completion_call(
+    *,
+    completion_call_kwargs: dict[str, Any],
+    litellm_metadata: dict[str, Any],
+    accepted_trace_user_id: Optional[str],
+    is_known_free_direct: bool,
+) -> Any:
+    if accepted_trace_user_id is not None:
+        # Promote only the bounded identity accepted from the direct route
+        # header, without changing the normalized top-level client user.
+        litellm_metadata["user_api_key_end_user_id"] = accepted_trace_user_id
+        completion_call_kwargs["metadata"] = litellm_metadata
+
+    completion_call_kwargs = _prepare_opencode_zen_known_free_logging(
+        completion_call_kwargs=completion_call_kwargs,
+        is_known_free_direct=is_known_free_direct,
+    )
+    return await litellm.acompletion(**completion_call_kwargs)
+
+
 async def _handle_codex_opencode_zen_adapter_route(
     *,
     endpoint: str,
@@ -1123,10 +1274,26 @@ async def _handle_codex_opencode_zen_adapter_route(
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
+    from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+        _OPENCODE_ZEN_FREE_MODELS,
+    )
 
     _ = fastapi_response
+    is_known_free_direct = (
+        not use_alias_candidate_probe
+        and adapter_model in _OPENCODE_ZEN_FREE_MODELS
+    )
     prepared_request_body = _consume_opencode_zen_tools_mode_header(
         request, prepared_request_body, use_alias_candidate_probe
+    )
+    (
+        prepared_request_body,
+        accepted_trace_user_id,
+    ) = _prepare_opencode_zen_direct_observability_metadata(
+        request,
+        prepared_request_body,
+        use_alias_candidate_probe,
+        user_api_key_dict,
     )
     normalized_request = await _anthropic_opencode_zen_normalization.normalize_codex_request(
         _get_anthropic_opencode_zen_normalization_runtime(),
@@ -1169,17 +1336,21 @@ async def _handle_codex_opencode_zen_adapter_route(
         rollup_kwargs=rollup_kwargs,
         adapter_label="OpenCode Zen",
     )
+    completion_call_kwargs = _build_opencode_zen_completion_call_kwargs(
+        completion_kwargs=completion_kwargs,
+        api_key=api_key,
+        target_base_url=target_base_url,
+        litellm_metadata=litellm_metadata,
+        request=request,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+        request_body=request_body,
+    )
     try:
-        completion_response = await litellm.acompletion(
-            **completion_kwargs,
-            api_key=api_key,
-            api_base=f"{target_base_url.rstrip('/')}/v1",
+        completion_response = await _perform_opencode_zen_completion_call(
+            completion_call_kwargs=completion_call_kwargs,
             litellm_metadata=litellm_metadata,
-            proxy_server_request={
-                "headers": dict(request.headers),
-                "body": request_body,
-            },
-            shared_session=_get_proxy_shared_aiohttp_session(),
+            accepted_trace_user_id=accepted_trace_user_id,
+            is_known_free_direct=is_known_free_direct,
         )
     except Exception as exc:
         if use_alias_candidate_probe and _opencode_zen_candidate_unavailable_detail(exc) is not None:
@@ -1188,6 +1359,14 @@ async def _handle_codex_opencode_zen_adapter_route(
         if not use_alias_candidate_probe:
             _maybe_raise_opencode_zen_direct_rate_limit(exc)
         raise
+    # D1-574: known-free OpenCode models have zero cost; supply explicit
+    # response_cost so the Logging -> Langfuse path records 0.0 instead of
+    # null (the generic cost lookup cannot resolve openai/<model> to the
+    # opencode/<model> zero-price entry).
+    if is_known_free_direct:
+        _hidden = getattr(completion_response, "_hidden_params", None)
+        if isinstance(_hidden, dict):
+            _hidden["response_cost"] = 0.0
     if bool(request_body.get("stream")):
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
             LiteLLMCompletionStreamingIterator,

@@ -613,17 +613,35 @@ under `aawm_adapter_runtime/`:
 | Concern | Module | Callable surface |
 |---------|--------|------------------|
 | Shared Anthropic adapter request policies, execution, streaming, response finalization, and route logging support | `anthropic_adapter_calls.py` | 46 |
-| Codex auto-agent candidate execution plus Kimi, Alibaba, OpenCode, and OpenRouter candidate calls | `codex_candidate_calls.py` | 14 |
-| Codex Responses adapter recognition and optional dispatch | `codex_dispatch.py` | 1 |
+| Codex auto-agent candidate execution plus Kimi, Alibaba, OpenCode, and OpenRouter candidate calls, including direct OpenCode completion-call, tools-mode, and bounded observability preparation | `codex_candidate_calls.py` | 23 |
+| Codex Responses adapter recognition, direct OpenCode tools-mode preparation, and optional dispatch | `codex_dispatch.py` | 2 |
 | Anthropic-shaped adapter recognition and optional dispatch through an explicit runtime | `anthropic_dispatch.py` | 1 |
 
-The authored surface is 62 callables. Exactly 55 former god-module
-`FunctionDef`s move to the first two modules: 41 Anthropic adapter-call
+The authored surface is 72 callables. Exactly 55 former god-module
+`FunctionDef`s moved during Wave 6F extraction: 41 Anthropic adapter-call
 definitions and 14 Codex candidate-call definitions. Five Anthropic-call names
-were already compatibility assignments rather than definitions.
+were already compatibility assignments rather than definitions. Nine Codex
+candidate-call helpers (`_consume_opencode_zen_tools_mode_header`,
+`_build_opencode_zen_completion_call_kwargs`,
+`_perform_opencode_zen_completion_call`,
+`_prepare_opencode_zen_direct_observability_metadata`,
+`_prepare_opencode_zen_known_free_logging`,
+`_opencode_zen_callback_headers`,
+`_opencode_zen_direct_safe_retry_after`,
+`_maybe_raise_opencode_zen_direct_rate_limit`,
+`_opencode_zen_direct_stream_terminal_error`) were authored after Wave 6F
+extraction and were never god-module `FunctionDef`s; they are part of the
+current 72-callable owned surface but not part of the historical extraction
+count.
 `_add_route_family_logging_metadata` remains canonically owned by Wave 6D
 `observability_metadata.py`; Wave 6F installation restores that same object on
 both the god module and `anthropic_adapter_calls.py`.
+
+The Codex dispatch surface owns `try_dispatch_codex_request` and
+`_prepare_opencode_zen_direct_tools_mode`. The candidate-call surface owns the
+last-mile direct OpenCode completion-call, known-free logging, tools-mode,
+observability, callback-header, retry-after, rate-limit, and terminal-stream
+helpers listed above.
 
 `aawm_adapter_runtime.install_wave6f()` runs only after the Wave 6D and Wave 6E
 runtime callbacks are configured. It installs Anthropic adapter calls first,
@@ -667,8 +685,8 @@ authoritative reference for the pass-through subsystem.
 | `codex_tool_policy.py` | `aawm_request_policy/` | Codex spawn-agent / core-tool description patches, model-capability policy, custom-tool-to-function and namespace-tool adaptation, unsupported-field drops, tool-choice cleanup, Grok-native input-item policy |
 | `anthropic_adapter_calls.py` | `aawm_adapter_runtime/` | Shared Anthropic adapter request policies, execution, streaming, response finalization, route logging support |
 | `anthropic_dispatch.py` | `aawm_adapter_runtime/` | Anthropic-shaped adapter recognition and optional dispatch through explicit `AnthropicDispatchRuntime` |
-| `codex_candidate_calls.py` | `aawm_adapter_runtime/` | Codex auto-agent candidate execution plus Kimi, Alibaba, OpenCode, and OpenRouter candidate calls |
-| `codex_dispatch.py` | `aawm_adapter_runtime/` | Codex Responses adapter recognition and optional dispatch |
+| `codex_candidate_calls.py` | `aawm_adapter_runtime/` | Codex auto-agent candidate execution plus Kimi, Alibaba, OpenCode, and OpenRouter candidate calls, including direct OpenCode last-mile tools and observability preparation |
+| `codex_dispatch.py` | `aawm_adapter_runtime/` | Codex Responses adapter recognition, `_prepare_opencode_zen_direct_tools_mode`, and optional dispatch |
 
 ##### Residual god-module responsibilities
 

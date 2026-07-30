@@ -767,7 +767,14 @@ def _ensure_claude_harness_headers(
     return updated
 
 
-def _http_get_json(url: str, public_key: str, secret_key: str, timeout: float = 20.0) -> dict[str, Any]:
+def _http_get_json(
+    url: str,
+    public_key: str,
+    secret_key: str,
+    timeout: float = 20.0,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     credentials = base64.b64encode(f"{public_key}:{secret_key}".encode("utf-8")).decode("ascii")
     request = urllib.request.Request(
         url,
@@ -778,9 +785,21 @@ def _http_get_json(url: str, public_key: str, secret_key: str, timeout: float = 
         method="GET",
     )
     last_error: Exception | None = None
+
+    def bounded_timeout() -> float:
+        if deadline is None:
+            return timeout
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            raise TimeoutError("Langfuse lookup deadline exceeded")
+        return min(timeout, remaining_seconds)
+
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(
+                request,
+                timeout=bounded_timeout(),
+            ) as response:
                 payload = response.read().decode("utf-8")
             return json.loads(payload)
         except (
@@ -792,7 +811,16 @@ def _http_get_json(url: str, public_key: str, secret_key: str, timeout: float = 
         ) as exc:
             last_error = exc
             if attempt < 2:
-                time.sleep(1.0 + attempt)
+                retry_delay = 1.0 + attempt
+                if deadline is not None:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        raise TimeoutError(
+                            "Langfuse lookup deadline exceeded"
+                        ) from exc
+                    retry_delay = min(retry_delay, remaining_seconds)
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
                 continue
             raise
         except urllib.error.HTTPError as exc:
@@ -857,6 +885,7 @@ def _recent_langfuse_all_traces(
     start_time: dt.datetime,
     session_id: str | None = None,
     limit: int = 100,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     params = {
         "limit": str(limit),
@@ -869,7 +898,12 @@ def _recent_langfuse_all_traces(
     if session_id:
         params["sessionId"] = session_id
     url = f"{query_url.rstrip('/')}/api/public/traces?{urllib.parse.urlencode(params)}"
-    payload = _http_get_json(url, public_key, secret_key)
+    payload = _http_get_json(
+        url,
+        public_key,
+        secret_key,
+        deadline=deadline,
+    )
     traces = payload.get("data", [])
     recent: list[dict[str, Any]] = []
     floor = start_time - dt.timedelta(seconds=5)
@@ -933,13 +967,19 @@ def _recent_langfuse_generation_observations_for_trace_ids(
     trace_ids: list[str],
     start_time: dt.datetime,
     limit_per_trace: int = 10,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     floor = start_time - dt.timedelta(seconds=5)
     observations: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for trace_id in trace_ids:
         url = f"{query_url.rstrip('/')}/api/public/traces/{urllib.parse.quote(trace_id, safe='')}"
-        payload = _http_get_json(url, public_key, secret_key)
+        payload = _http_get_json(
+            url,
+            public_key,
+            secret_key,
+            deadline=deadline,
+        )
         trace_observations = payload.get("observations", [])
         if not isinstance(trace_observations, list):
             continue
@@ -1108,7 +1148,7 @@ def _generation_observation_matches_allowed_route(
     return False
 
 
-def _validate_generation_observations(
+def _validate_generation_observations(  # noqa: PLR0915
     *,
     family: str,
     query_url: str,
@@ -1121,54 +1161,69 @@ def _validate_generation_observations(
     allow_zero_cost: bool = False,
     allow_reference_cost_when_invoice_unknown: bool = False,
     allow_unknown_cost_when_invoice_unknown: bool = False,
+    preloaded_observations: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     failures: list[str] = []
     if not trace_ids:
         return [], [], [f"{family} missing trace ids for generation validation"]
 
     allowed_request_routes = allowed_request_routes or []
-    observations: list[dict[str, Any]] = []
+    observations: list[dict[str, Any]] = list(preloaded_observations or [])
     route_filtered_observations: list[dict[str, Any]] = []
-    deadline = time.time() + 45
     last_error: Exception | None = None
 
-    while True:
-        try:
-            observations = _recent_langfuse_generation_observations_for_trace_ids(
-                query_url=query_url,
-                public_key=public_key,
-                secret_key=secret_key,
-                trace_ids=trace_ids,
-                start_time=start_time,
-            )
-            last_error = None
-        except (
-            urllib.error.HTTPError,
-            urllib.error.URLError,
-            http.client.RemoteDisconnected,
-            ConnectionResetError,
-            TimeoutError,
-        ) as exc:
-            observations = []
-            route_filtered_observations = []
-            last_error = exc
-        else:
-            route_filtered_observations = observations
-            if allowed_request_routes:
-                route_filtered_observations = [
-                    observation
-                    for observation in observations
-                    if _generation_observation_matches_allowed_route(
-                        observation,
-                        allowed_request_routes,
+    if preloaded_observations is not None:
+        route_filtered_observations = observations
+        if allowed_request_routes:
+            route_filtered_observations = [
+                observation
+                for observation in observations
+                if _generation_observation_matches_allowed_route(
+                    observation,
+                    allowed_request_routes,
+                )
+            ]
+    else:
+        deadline = time.time() + 45
+        while True:
+            try:
+                observations = (
+                    _recent_langfuse_generation_observations_for_trace_ids(
+                        query_url=query_url,
+                        public_key=public_key,
+                        secret_key=secret_key,
+                        trace_ids=trace_ids,
+                        start_time=start_time,
                     )
-                ]
-            if route_filtered_observations:
-                break
+                )
+                last_error = None
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                http.client.RemoteDisconnected,
+                ConnectionResetError,
+                TimeoutError,
+            ) as exc:
+                observations = []
+                route_filtered_observations = []
+                last_error = exc
+            else:
+                route_filtered_observations = observations
+                if allowed_request_routes:
+                    route_filtered_observations = [
+                        observation
+                        for observation in observations
+                        if _generation_observation_matches_allowed_route(
+                            observation,
+                            allowed_request_routes,
+                        )
+                    ]
+                if route_filtered_observations:
+                    break
 
-        if time.time() >= deadline:
-            break
-        time.sleep(3.0)
+            if time.time() >= deadline:
+                break
+            time.sleep(3.0)
 
     if last_error is not None and not observations:
         return [], [], [f"{family} generation lookup failed: {last_error}"]
@@ -1789,7 +1844,7 @@ def _validate_logged_request_payload_checks(
     return summary, failures, warnings
 
 
-def _validate_aawm_dynamic_injection(
+def _validate_aawm_dynamic_injection(  # noqa: PLR0915 - Bounded procedural validator.
     *,
     family: str,
     observations: list[dict[str, Any]],
@@ -1921,7 +1976,7 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _validate_logged_request_source_files(
+def _validate_logged_request_source_files(  # noqa: PLR0915 - Bounded procedural validator.
     *,
     family: str,
     observations: list[dict[str, Any]],
@@ -2057,6 +2112,7 @@ def _recent_langfuse_required_name_traces(
     user_id: str | None,
     start_time: dt.datetime,
     limit: int = 50,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     recent_by_id: dict[str, dict[str, Any]] = {}
     for name in names:
@@ -2071,7 +2127,12 @@ def _recent_langfuse_required_name_traces(
             params["userId"] = user_id
         url = f"{query_url.rstrip('/')}/api/public/traces?{urllib.parse.urlencode(params)}"
         try:
-            payload = _http_get_json(url, public_key, secret_key)
+            payload = _http_get_json(
+                url,
+                public_key,
+                secret_key,
+                deadline=deadline,
+            )
             traces = payload.get("data", [])
         except (urllib.error.HTTPError, urllib.error.URLError, http.client.RemoteDisconnected):
             traces = _recent_langfuse_all_traces(
@@ -2081,14 +2142,12 @@ def _recent_langfuse_required_name_traces(
                 user_id=user_id,
                 start_time=start_time,
                 limit=max(limit, 100),
+                deadline=deadline,
             )
         for trace in traces:
             trace_name = trace.get("name")
             if trace_name != name:
                 continue
-            timestamp = _parse_langfuse_timestamp(
-                trace.get("timestamp") or trace.get("createdAt") or trace.get("updatedAt")
-            )
             trace_id = trace.get("id")
             if isinstance(trace_id, str):
                 recent_by_id[trace_id] = trace
@@ -2690,7 +2749,7 @@ def _validate_gemini(
     }
 
 
-def _validate_claude(
+def _validate_claude(  # noqa: PLR0915 - Bounded family acceptance validator.
     config: dict[str, Any],
     *,
     query_url: str,
@@ -3161,7 +3220,9 @@ def main() -> int:
 
     artifact["summary"] = _build_summary(artifact["results"])
     artifact_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(artifact["summary"], indent=2))
+    print(  # noqa: T201 - CLI emits the final machine-readable summary.
+        json.dumps(artifact["summary"], indent=2)
+    )
     return 0 if artifact["summary"]["passed"] else 1
 
 

@@ -543,6 +543,34 @@ def test_prepare_request_body_for_passthrough_observability() -> None:
     assert "aawm_tool_definition_count" in lm
 
 
+def test_shared_observability_does_not_import_langfuse_identity_headers() -> None:
+    request = _FakeRequest(
+        {
+            "x-session-id": "sess-99",
+            "langfuse_trace_name": "direct-only-name",
+            "Langfuse-Trace-User-Id": "direct-only-user",
+        }
+    )
+    body: dict[str, Any] = {
+        "repository": "/home/user/projects/litellm",
+        "litellm_metadata": {
+            "trace_name": "orchestrator",
+            "trace_user_id": "existing-user",
+        },
+    }
+
+    result = metadata._prepare_request_body_for_passthrough_observability(
+        request, body
+    )
+
+    assert result["litellm_metadata"] == {
+        "trace_name": "orchestrator",
+        "trace_user_id": "existing-user",
+        "session_id": "sess-99",
+        "repository": "litellm",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Claude breakout extraction / logging
 # ---------------------------------------------------------------------------

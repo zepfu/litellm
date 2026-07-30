@@ -697,10 +697,11 @@ class CustomStreamWrapper:
             model_response._hidden_params = hidden_params
         model_response._hidden_params["custom_llm_provider"] = _logging_obj_llm_provider
         model_response._hidden_params["created_at"] = time.time()
+        response_cost = self._hidden_params.get("response_cost")
         model_response._hidden_params = {
             **model_response._hidden_params,
             **self._hidden_params,
-            "response_cost": None,
+            "response_cost": response_cost,
         }
 
         if (

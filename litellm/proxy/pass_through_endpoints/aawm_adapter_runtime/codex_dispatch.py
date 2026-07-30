@@ -92,6 +92,7 @@ from types import FunctionType
 
 _HOST_FUNCTION_NAMES = (
     "try_dispatch_codex_request",
+    "_prepare_opencode_zen_direct_tools_mode",
 )
 
 
@@ -136,6 +137,60 @@ def install(
 # ── Extracted function ──────────────────────────────────────────────
 
 
+def _prepare_opencode_zen_direct_tools_mode(
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    *,
+    direct_adapter_model: Optional[str],
+) -> dict[str, Any]:
+    """D1-574: pre-alias tools-mode defaulting for direct OpenCode Zen models.
+
+    Ensures litellm_metadata.opencode_zen_unsupported_tools_mode='drop' is
+    set for supported direct OpenCode Zen models before the auto-agent alias
+    route.  Only applies when the request body directly selects a supported
+    OpenCode Zen model (not arbitrary aliases/candidates).  Explicit body
+    metadata wins; absent header and no explicit mode injects 'drop' by
+    default so supported direct dispatch no longer depends on the run-scoped
+    x-aawm-opencode-zen-unsupported-tools-mode header; an explicitly supplied
+    invalid/empty header value raises bounded 400.
+    """
+    if direct_adapter_model is None:
+        return prepared_request_body
+
+    header_value = request.headers.get(
+        "x-aawm-opencode-zen-unsupported-tools-mode"
+    )
+    mode = header_value.strip() if isinstance(header_value, str) else "drop"
+
+    existing_metadata = prepared_request_body.get("litellm_metadata")
+    existing_mode = (
+        existing_metadata.get("opencode_zen_unsupported_tools_mode")
+        if isinstance(existing_metadata, dict)
+        else None
+    )
+    if existing_mode is not None:
+        return prepared_request_body
+
+    if mode != "drop":
+        from litellm.proxy._types import ProxyException
+
+        raise ProxyException(
+            message=(
+                "x-aawm-opencode-zen-unsupported-tools-mode must be "
+                "'drop' when set."
+            ),
+            type="invalid_request_error",
+            param="x-aawm-opencode-zen-unsupported-tools-mode",
+            code=400,
+        )
+
+    prepared_request_body = dict(prepared_request_body)
+    meta = dict(prepared_request_body.get("litellm_metadata") or {})
+    meta["opencode_zen_unsupported_tools_mode"] = "drop"
+    prepared_request_body["litellm_metadata"] = meta
+    return prepared_request_body
+
+
 async def try_dispatch_codex_request(
     *,
     endpoint: str,
@@ -159,6 +214,16 @@ async def try_dispatch_codex_request(
     ``BaseOpenAIPassThroughHandler._base_openai_pass_through_handler``.
     """
     import litellm
+
+    opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
+        prepared_request_body,
+        endpoint=endpoint,
+    )
+    prepared_request_body = _prepare_opencode_zen_direct_tools_mode(
+        request,
+        prepared_request_body,
+        direct_adapter_model=opencode_zen_adapter_model,
+    )
 
     codex_auto_agent_alias = _resolve_codex_auto_agent_alias_model(
         prepared_request_body,
@@ -194,10 +259,6 @@ async def try_dispatch_codex_request(
             forward_headers=forward_headers,
         )
 
-    opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
-        prepared_request_body,
-        endpoint=endpoint,
-    )
     if opencode_zen_adapter_model is not None:
         prepared_request_body = _prepare_request_body_for_passthrough_observability(
             request=request,

@@ -4,6 +4,7 @@ import json
 import pathlib
 import re
 import subprocess
+import time
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -216,6 +217,15 @@ ALIBABA_MODEL_CATALOG_PATH = (
 ALIBABA_AGENT_CONFIG_PATH = (
     ROOT / "scripts" / "local-ci" / "codex_alibaba_agent.toml"
 )
+OPENCODE_CODEX_COLLABORATION_CASE = (
+    "native_openai_passthrough_responses_codex_opencode_zen_big_pickle_collaboration"
+)
+OPENCODE_MODEL_CATALOG_PATH = (
+    ROOT / "scripts" / "local-ci" / "codex_opencode_model_catalog.json"
+)
+OPENCODE_AGENT_CONFIG_PATH = (
+    ROOT / "scripts" / "local-ci" / "codex_opencode_agent.toml"
+)
 
 D1322_LOW_ALIAS_REPLAY_CASES = (
     "claude_adapter_aawm_low_anthropic_alias_child_parallel_read_tools",
@@ -311,6 +321,475 @@ def _load_harness_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _expected_error_generation_observation(
+    *,
+    include_cost: bool = True,
+) -> dict[str, object]:
+    observation: dict[str, object] = {
+        "id": "generation-expected-error",
+        "traceId": "trace-expected-error",
+        "type": "GENERATION",
+        "startTime": "2026-07-29T12:00:00Z",
+        "model": "big-pickle",
+        "promptTokens": 10,
+        "completionTokens": 2,
+        "totalTokens": 12,
+        "costDetails": {},
+        "metadata": {},
+    }
+    if include_cost:
+        observation["costDetails"] = {"total": 0.01}
+        observation["calculatedTotalCost"] = 0.01
+    return observation
+
+
+def _run_expected_error_conditional_validation(
+    monkeypatch,
+    *,
+    exit_code: int,
+    status_code: int | None,
+    is_error: bool,
+    generation_observations: list[dict[str, object]],
+    provider_error_failures: list[str] | None = None,
+    forbid_generation_validation: bool = False,
+    generation_probe_empty_attempts: int = 0,
+    expected_error_poll_timeout_seconds: float = 0,
+    expected_error_poll_interval_seconds: float = 0,
+    include_lookup_context: bool = True,
+    generation_probe_error: Exception | None = None,
+):
+    harness = _load_harness_module()
+    started = dt.datetime(2026, 7, 29, 12, 0, tzinfo=dt.timezone.utc)
+    stdout_payload: dict[str, object] = {
+        "type": "result",
+        "is_error": is_error,
+        "session_id": "session-expected-error",
+    }
+    if status_code is not None:
+        stdout_payload["status_code"] = status_code
+    if not is_error:
+        stdout_payload["result"] = "unexpected success"
+    run = {
+        "exit_code": exit_code,
+        "stdout": json.dumps(stdout_payload),
+        "stderr": "",
+    }
+    attempts = [
+        {
+            "attempt": 1,
+            "exit_code": exit_code,
+            "api_error_status": status_code if is_error else None,
+            "is_error": is_error,
+        }
+    ]
+    monkeypatch.setattr(
+        harness,
+        "_run_command_with_retry",
+        lambda **_kwargs: (started, run, attempts),
+    )
+    monkeypatch.setattr(
+        harness.RA,
+        "_recent_langfuse_required_name_traces",
+        lambda **_kwargs: [
+            {
+                "id": "trace-expected-error",
+                "name": "expected-error-trace",
+                "userId": "expected-error-user",
+            }
+        ],
+    )
+    generation_probe_calls: list[dict[str, object]] = []
+
+    def recent_generations(**kwargs):
+        generation_probe_calls.append(kwargs)
+        if generation_probe_error is not None:
+            raise generation_probe_error
+        if len(generation_probe_calls) <= generation_probe_empty_attempts:
+            return []
+        return generation_observations
+
+    monkeypatch.setattr(
+        harness.RA,
+        "_recent_langfuse_generation_observations_for_trace_ids",
+        recent_generations,
+    )
+    if forbid_generation_validation:
+        monkeypatch.setattr(
+            harness.RA,
+            "_validate_generation_observations",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("generation validation must be skipped")
+            ),
+        )
+    monkeypatch.setattr(
+        harness.RA,
+        "_validate_trace_enrichment",
+        lambda **_kwargs: ({}, [], []),
+    )
+    monkeypatch.setattr(
+        harness.RA,
+        "_validate_trace_context",
+        lambda **_kwargs: ({}, []),
+    )
+    monkeypatch.setattr(
+        harness.RA,
+        "_validate_generation_metadata",
+        lambda **_kwargs: ({}, []),
+    )
+    monkeypatch.setattr(
+        harness.RA,
+        "_validate_span_observations",
+        lambda **_kwargs: ([], [], []),
+    )
+    monkeypatch.setattr(
+        harness,
+        "_validate_session_history",
+        lambda **_kwargs: ({"record": None, "records": []}, []),
+    )
+    monkeypatch.setattr(
+        harness,
+        "_validate_rate_limit_observations",
+        lambda **_kwargs: ({"record": None, "records": []}, [], []),
+    )
+    provider_error_calls: list[dict[str, object]] = []
+
+    def validate_provider_error(**kwargs):
+        provider_error_calls.append(kwargs)
+        return (
+            {
+                "record": {"status_code": 429},
+                "records": [{"status_code": 429}],
+            },
+            list(provider_error_failures or []),
+        )
+
+    monkeypatch.setattr(
+        harness,
+        "_validate_provider_error_observations",
+        validate_provider_error,
+    )
+    monkeypatch.setattr(
+        harness,
+        "_validate_runtime_postcondition",
+        lambda **_kwargs: ({}, []),
+    )
+    monkeypatch.setattr(
+        harness,
+        "_validate_runtime_logs",
+        lambda **_kwargs: ({}, [], []),
+    )
+
+    case_config = {
+        "expected_api_error_status": 429,
+        "provider_error_observations_validation": {
+            "required_equals": {"status_code": 429},
+        },
+        "langfuse_poll_timeout_seconds": 0,
+        "expected_api_error_langfuse_poll_timeout_seconds": (
+            expected_error_poll_timeout_seconds
+        ),
+        "expected_api_error_langfuse_poll_interval_seconds": (
+            expected_error_poll_interval_seconds
+        ),
+        "command_json_checks": {
+            "required_equals": {"is_error": True},
+        },
+    }
+    if include_lookup_context:
+        case_config["required_trace_names"] = ["expected-error-trace"]
+        case_config["expected_user_ids"] = ["expected-error-user"]
+    else:
+        case_config["use_session_trace_lookup"] = False
+
+    result = harness._validate_case(
+        "expected_error_case",
+        case_config,
+        query_url="http://127.0.0.1:3000",
+        public_key="pk",
+        secret_key="sk",
+        litellm_base_url="http://127.0.0.1:4001",
+    )
+    return result, provider_error_calls, generation_probe_calls
+
+
+def test_matching_expected_429_without_generation_skips_generation_quality(
+    monkeypatch,
+):
+    result, provider_calls, generation_probe_calls = (
+        _run_expected_error_conditional_validation(
+            monkeypatch,
+            exit_code=1,
+            status_code=429,
+            is_error=True,
+            generation_observations=[],
+            forbid_generation_validation=True,
+            expected_error_poll_timeout_seconds=0.01,
+            expected_error_poll_interval_seconds=0.01,
+        )
+    )
+
+    assert result["passed"] is True
+    assert len(provider_calls) == 1
+    assert len(generation_probe_calls) == 1
+    assert result["langfuse"]["generation_observations"] == []
+    assert result["langfuse"]["generation_validation"] == {
+        "skipped": "expected_api_error",
+        "poll_attempts": 1,
+        "poll_timeout_seconds": 0.01,
+    }
+
+
+def test_matching_expected_429_zero_deadline_fails_without_lookup_attempt(
+    monkeypatch,
+):
+    result, provider_calls, generation_probe_calls = (
+        _run_expected_error_conditional_validation(
+            monkeypatch,
+            exit_code=1,
+            status_code=429,
+            is_error=True,
+            generation_observations=[],
+            forbid_generation_validation=True,
+            expected_error_poll_timeout_seconds=0,
+        )
+    )
+
+    assert len(provider_calls) == 1
+    assert generation_probe_calls == []
+    assert result["passed"] is False
+    assert result["langfuse"]["generation_validation"] == {
+        "failed": "no_lookup_attempts",
+        "poll_attempts": 0,
+        "poll_timeout_seconds": 0.0,
+    }
+    assert "skipped" not in result["langfuse"]["generation_validation"]
+    assert result["failures"] == [
+        "expected_error_case expected API error generation validation "
+        "completed without a Langfuse lookup attempt"
+    ]
+
+
+def test_matching_expected_429_with_generation_validates_quality_and_cost(
+    monkeypatch,
+):
+    result, provider_calls, generation_probe_calls = (
+        _run_expected_error_conditional_validation(
+            monkeypatch,
+            exit_code=1,
+            status_code=429,
+            is_error=True,
+            generation_observations=[
+                _expected_error_generation_observation(),
+            ],
+            generation_probe_empty_attempts=2,
+            expected_error_poll_timeout_seconds=1,
+        )
+    )
+
+    assert result["passed"] is True
+    assert len(provider_calls) == 1
+    assert len(generation_probe_calls) == 3
+    assert result["langfuse"]["generation_validation"] == {
+        "validated": "expected_api_error",
+        "poll_attempts": 3,
+        "poll_timeout_seconds": 1.0,
+    }
+    assert result["langfuse"]["generation_observations"][0]["model"] == (
+        "big-pickle"
+    )
+    assert (
+        result["langfuse"]["generation_observations"][0][
+            "calculatedTotalCost"
+        ]
+        == 0.01
+    )
+
+
+def test_unexpected_success_keeps_generation_cost_validation_and_skips_provider_error(
+    monkeypatch,
+):
+    result, provider_calls, generation_probe_calls = (
+        _run_expected_error_conditional_validation(
+            monkeypatch,
+            exit_code=0,
+            status_code=None,
+            is_error=False,
+            generation_observations=[
+                _expected_error_generation_observation(include_cost=False),
+            ],
+        )
+    )
+
+    assert provider_calls == []
+    assert len(generation_probe_calls) == 1
+    assert result["provider_error_observations"]["skipped"] == (
+        "expected_api_error_not_matched"
+    )
+    assert (
+        "expected_error_case command succeeded but expected API error status 429"
+        in result["failures"]
+    )
+    assert any(
+        "command JSON mismatch for `is_error`" in failure
+        for failure in result["failures"]
+    )
+    assert (
+        "expected_error_case generation missing calculatedTotalCost"
+        in result["failures"]
+    )
+    assert (
+        "expected_error_case generation missing costDetails.total"
+        in result["failures"]
+    )
+    assert not any(
+        "provider_error_observations" in failure
+        for failure in result["failures"]
+    )
+
+
+def test_nonmatching_error_keeps_generation_validation_without_provider_error(
+    monkeypatch,
+):
+    result, provider_calls, generation_probe_calls = (
+        _run_expected_error_conditional_validation(
+            monkeypatch,
+            exit_code=1,
+            status_code=500,
+            is_error=True,
+            generation_observations=[
+                _expected_error_generation_observation(),
+            ],
+        )
+    )
+
+    assert provider_calls == []
+    assert len(generation_probe_calls) == 1
+    assert result["failures"] == ["expected_error_case command failed"]
+    assert result["langfuse"]["generation_validation"] == {"validated": True}
+
+
+def test_matching_expected_429_keeps_provider_error_validation_strict(
+    monkeypatch,
+):
+    missing_provider_row = (
+        "expected_error_case missing correlated provider_error_observations row"
+    )
+    result, provider_calls, _generation_probe_calls = (
+        _run_expected_error_conditional_validation(
+            monkeypatch,
+            exit_code=1,
+            status_code=429,
+            is_error=True,
+            generation_observations=[],
+            provider_error_failures=[missing_provider_row],
+            forbid_generation_validation=True,
+            expected_error_poll_timeout_seconds=0.01,
+            expected_error_poll_interval_seconds=0.01,
+        )
+    )
+
+    assert len(provider_calls) == 1
+    assert result["passed"] is False
+    assert result["failures"] == [missing_provider_row]
+
+
+def test_matching_expected_429_without_lookup_context_fails_explicitly(
+    monkeypatch,
+):
+    result, provider_calls, generation_probe_calls = (
+        _run_expected_error_conditional_validation(
+            monkeypatch,
+            exit_code=1,
+            status_code=429,
+            is_error=True,
+            generation_observations=[],
+            forbid_generation_validation=True,
+            expected_error_poll_timeout_seconds=0.01,
+            include_lookup_context=False,
+        )
+    )
+
+    assert len(provider_calls) == 1
+    assert generation_probe_calls == []
+    assert result["langfuse"]["generation_validation"] == {
+        "failed": "missing_lookup_context",
+        "poll_attempts": 0,
+        "poll_timeout_seconds": 0.01,
+    }
+    assert result["failures"] == [
+        "expected_error_case missing Langfuse trace or session lookup context "
+        "for expected API error generation validation"
+    ]
+
+
+def test_matching_expected_429_generation_lookup_error_remains_strict(
+    monkeypatch,
+):
+    result, provider_calls, generation_probe_calls = (
+        _run_expected_error_conditional_validation(
+            monkeypatch,
+            exit_code=1,
+            status_code=429,
+            is_error=True,
+            generation_observations=[],
+            forbid_generation_validation=True,
+            generation_probe_error=TimeoutError("bounded lookup failed"),
+            expected_error_poll_timeout_seconds=0.01,
+            expected_error_poll_interval_seconds=0.01,
+        )
+    )
+
+    assert len(provider_calls) == 1
+    assert len(generation_probe_calls) == 1
+    assert result["langfuse"]["generation_validation"]["failed"] == (
+        "langfuse_lookup"
+    )
+    assert result["failures"] == [
+        "expected_error_case expected API error generation absence could not "
+        "be established after Langfuse lookup failure"
+    ]
+
+
+def test_langfuse_http_deadline_bounds_retrying_probe(monkeypatch):
+    harness = _load_harness_module()
+    observed_timeouts: list[float] = []
+
+    def slow_timeout(_request, *, timeout):
+        observed_timeouts.append(timeout)
+        time.sleep(timeout)
+        raise TimeoutError("simulated slow lookup")
+
+    monkeypatch.setattr(harness.RA.urllib.request, "urlopen", slow_timeout)
+    started = time.monotonic()
+    deadline = started + 0.05
+    try:
+        harness.RA._http_get_json(
+            "http://127.0.0.1:3000/api/public/traces",
+            "pk",
+            "sk",
+            deadline=deadline,
+        )
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("bounded Langfuse lookup did not time out")
+    elapsed = time.monotonic() - started
+
+    assert observed_timeouts
+    assert max(observed_timeouts) <= 0.05
+    assert elapsed < 0.15
+
+
+def test_d1574_opencode_known_free_case_allows_explicit_zero_cost_only():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][
+        "native_openai_passthrough_responses_codex_opencode_zen_big_pickle"
+    ]
+
+    assert case_config["allow_zero_cost"] is True
+    assert "allow_unknown_cost_when_invoice_unknown" not in case_config
 
 
 def test_warning_only_timeout_is_soft_by_default():
@@ -2117,6 +2596,185 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
         assert session_history_validation["minimums"][column_name] == 1
 
 
+def test_opencode_codex_collaboration_case_uses_real_bounded_child_contract():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][OPENCODE_CODEX_COLLABORATION_CASE]
+    strict_case = config["cases"][
+        "native_openai_passthrough_responses_codex_opencode_zen_big_pickle"
+    ]
+
+    assert OPENCODE_CODEX_COLLABORATION_CASE in config["default_excluded_cases"]
+    assert case_config["cli_passthrough"] == "codex"
+    assert "expected_api_error_status" not in case_config
+    assert strict_case["expected_api_error_status"] == 429
+    assert strict_case["command_json_checks"]["required_equals"]["is_error"] is True
+
+    command = case_config["command"]
+    assert command[:2] == ["codex", "exec"]
+    assert "--ignore-user-config" in command
+    assert command.count("--enable") == 2
+    assert "multi_agent" in command
+    assert "multi_agent_v2" in command
+    assert command[command.index("-m") + 1] == "opencode_zen/big-pickle"
+    assert (
+        'model_catalog_json="{repository_root}/scripts/local-ci/'
+        'codex_opencode_model_catalog.json"'
+    ) in command
+    assert (
+        'agents.opencode.config_file="{repository_root}/scripts/local-ci/'
+        'codex_opencode_agent.toml"'
+    ) in command
+
+    prompt = command[-1]
+    assert 'agent_type="opencode"' in prompt
+    assert 'model="opencode_zen/big-pickle"' in prompt
+    assert 'fork_turns="none"' in prompt
+    assert "spawn_agent exactly once" in prompt
+    assert "exactly three exec_command calls in one parallel batch" in prompt
+    assert "pwd; git rev-parse --show-toplevel; git status --short" in prompt
+    assert "all three successful command results" in prompt
+    assert "Wait for the child to terminate" in prompt
+    assert "CODEX_OPENCODE_PARALLEL_TOOLS_PASSED" in prompt
+
+    assert case_config["required_trace_names"] == ["{case_name}"]
+    assert case_config["expected_user_ids"] == ["{harness_user_id}"]
+    assert case_config["required_trace_tags"] == [
+        "route:codex_opencode_zen_adapter"
+    ]
+    assert case_config["required_generation_metadata_truthy"] == [
+        "passthrough_route_family",
+        "opencode_zen",
+        "opencode_zen_adapter_model",
+    ]
+    assert case_config["allowed_generation_routes"] == [
+        "/openai_passthrough/v1/responses",
+        "/openai_passthrough/responses",
+    ]
+
+    assert case_config["command_output_text_checks"] == {
+        "required_prefix": "CODEX_OPENCODE_PARALLEL_TOOLS_PASSED",
+        "required_suffix": "CODEX_OPENCODE_PARALLEL_TOOLS_PASSED",
+        "minimum_chars": 36,
+        "maximum_chars": 36,
+    }
+    collaboration_checks = case_config["codex_collaboration_validation"]
+    assert collaboration_checks["minimum_tool_counts"] == {
+        "spawn_agent": 1,
+        "wait": 1,
+    }
+    assert collaboration_checks["required_successful_tools"] == [
+        "spawn_agent",
+        "wait",
+    ]
+    assert collaboration_checks["require_wait_for_spawned_agents"] is True
+    assert collaboration_checks["command_execution_validation"] == {
+        "exact_commands": [
+            "pwd",
+            "git rev-parse --show-toplevel",
+            "git status --short",
+        ],
+        "required_status": "completed",
+        "required_exit_code": 0,
+        "require_same_turn": True,
+        "minimum_parallel_count": 3,
+    }
+
+    [session_row] = case_config["session_history_validation"]["expected_rows"]
+    assert session_row == {
+        "required_equals": {
+            "provider": "opencode_zen",
+            "model": "big-pickle",
+        },
+        "metadata_required_equals": {
+            "passthrough_route_family": "codex_opencode_zen_adapter",
+        },
+        "required_contains": {"repository": "litellm"},
+        "minimums": {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 1,
+        },
+    }
+
+    spawn_row, command_row = case_config["tool_activity_validation"][
+        "expected_rows"
+    ]
+    assert spawn_row == {
+        "provider": "opencode_zen",
+        "model": "big-pickle",
+        "tool_name": "spawn_agent",
+        "tool_kind": "other",
+        "minimum_count": 1,
+        "maximum_count": 1,
+        "each_arguments_required_substrings": [
+            '"agent_type": "opencode"',
+            '"model": "opencode_zen/big-pickle"',
+            '"fork_turns": "none"',
+            '"message": "',
+        ],
+    }
+    assert command_row == {
+        "provider": "opencode_zen",
+        "model": "big-pickle",
+        "tool_name": "exec_command",
+        "tool_kind": "command",
+        "minimum_count": 3,
+        "maximum_count": 3,
+        "exact_command_texts": [
+            "pwd",
+            "git rev-parse --show-toplevel",
+            "git status --short",
+        ],
+        "expected_tool_indexes": [0, 1, 2],
+        "require_single_litellm_call_id": True,
+    }
+    assert "Traceback (most recent call last)" in case_config[
+        "runtime_log_checks"
+    ]["forbidden_substrings"]
+    assert case_config["runtime_postconditions"]["healthcheck_url"].endswith(
+        "/health/liveliness"
+    )
+    assert case_config["allow_zero_cost"] is True
+
+
+def test_opencode_codex_fixtures_select_only_direct_big_pickle():
+    catalog = json.loads(OPENCODE_MODEL_CATALOG_PATH.read_text(encoding="utf-8"))
+    assert [model["slug"] for model in catalog["models"]] == [
+        "opencode_zen/big-pickle"
+    ]
+    [model] = catalog["models"]
+    assert model["supports_parallel_tool_calls"] is True
+    assert model["multi_agent_version"] == "v2"
+
+    agent_config = OPENCODE_AGENT_CONFIG_PATH.read_text(encoding="utf-8")
+    assert 'name = "opencode"' in agent_config
+    assert 'model = "opencode_zen/big-pickle"' in agent_config
+    assert "Do not\nspawn additional agents." in agent_config
+    assert "in one parallel tool batch" in agent_config
+    assert "return only the exact\ncompletion marker" in agent_config
+
+
+def test_claude_opencode_big_pickle_case_requires_exact_bounded_output():
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case_config = config["cases"][
+        "claude_adapter_opencode_zen_big_pickle_child_parallel_read_tools"
+    ]
+    marker = "OPENCODE ZEN BIG PICKLE PARALLEL TOOLS PASSED"
+
+    assert case_config["command_json_checks"] == {
+        "required_equals": {
+            "is_error": False,
+            "result": marker,
+        }
+    }
+    assert case_config["command_output_text_checks"] == {
+        "required_prefix": marker,
+        "required_suffix": marker,
+        "minimum_chars": 45,
+        "maximum_chars": 45,
+    }
+
+
 def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
     case_config = config["cases"][MOONSHOT_CODEX_COLLABORATION_CASE]
@@ -2502,7 +3160,7 @@ def test_command_text_checks_validate_codex_agent_message_and_stderr():
     ]
 
 
-def test_codex_collaboration_validation_counts_completed_calls_only():
+def test_codex_collaboration_validation_requires_successful_clean_lifecycle():
     harness = _load_harness_module()
     stdout = "\n".join(
         [
@@ -2515,19 +3173,25 @@ def test_codex_collaboration_validation_counts_completed_calls_only():
             json.dumps(
                 {
                     "type": "item.completed",
-                    "item": {"type": "collab_tool_call", "tool": "spawn_agent"},
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "spawn_agent",
+                        "status": "completed",
+                        "receiver_agent_ids": ["child-1"],
+                    },
                 }
             ),
             json.dumps(
                 {
                     "type": "item.completed",
-                    "item": {"type": "collab_tool_call", "tool": "spawn_agent"},
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {"type": "collab_tool_call", "tool": "wait"},
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "wait",
+                        "status": "completed",
+                        "agents_states": {
+                            "child-1": {"status": "completed"},
+                        },
+                    },
                 }
             ),
         ]
@@ -2536,11 +3200,316 @@ def test_codex_collaboration_validation_counts_completed_calls_only():
     summary, failures = harness._validate_codex_collaboration_events(
         family="moonshot",
         stdout=stdout,
-        checks={"minimum_tool_counts": {"spawn_agent": 2, "wait": 1}},
+        checks={
+            "minimum_tool_counts": {"spawn_agent": 1, "wait": 1},
+            "required_successful_tools": ["spawn_agent", "wait"],
+            "require_wait_for_spawned_agents": True,
+        },
     )
 
     assert failures == []
-    assert summary["tool_counts"] == {"spawn_agent": 2, "wait": 1}
+    assert summary["tool_counts"] == {"spawn_agent": 1, "wait": 1}
+    assert summary["spawned_agent_ids"] == ["child-1"]
+    assert summary["waited_agent_statuses"] == {"child-1": "completed"}
+
+
+def test_codex_collaboration_validation_rejects_failed_spawn_and_timed_out_wait():
+    harness = _load_harness_module()
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "spawn_agent",
+                        "status": "failed",
+                        "error": "spawn rejected",
+                        "receiver_agent_ids": ["child-1"],
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "wait",
+                        "status": "completed",
+                        "agents_states": {
+                            "child-1": {"status": "timed_out"},
+                        },
+                    },
+                }
+            ),
+        ]
+    )
+
+    _, failures = harness._validate_codex_collaboration_events(
+        family="opencode",
+        stdout=stdout,
+        checks={
+            "minimum_tool_counts": {"spawn_agent": 1, "wait": 1},
+            "required_successful_tools": ["spawn_agent", "wait"],
+            "require_wait_for_spawned_agents": True,
+        },
+    )
+
+    assert any("spawn_agent' did not complete successfully" in failure for failure in failures)
+    assert any("spawn_agent' recorded an error" in failure for failure in failures)
+    assert any(
+        "wait agent 'child-1' did not terminate cleanly: status='timed_out'"
+        in failure
+        for failure in failures
+    )
+
+
+def test_codex_command_execution_validation_proves_parallel_successful_batch():
+    harness = _load_harness_module()
+    commands = [
+        "pwd",
+        "git rev-parse --show-toplevel",
+        "git status --short",
+    ]
+    events = [{"type": "turn.started"}]
+    events.extend(
+        {
+            "type": "item.started",
+            "item": {
+                "id": f"command-{index}",
+                "type": "command_execution",
+                "command": command,
+                "status": "in_progress",
+                "exit_code": None,
+            },
+        }
+        for index, command in enumerate(commands)
+    )
+    events.extend(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": f"command-{index}",
+                "type": "command_execution",
+                "command": command,
+                "status": "completed",
+                "exit_code": 0,
+            },
+        }
+        for index, command in enumerate(commands)
+    )
+
+    summary, failures = harness._validate_codex_collaboration_events(
+        family="opencode",
+        stdout="\n".join(json.dumps(event) for event in events),
+        checks={
+            "command_execution_validation": {
+                "exact_commands": commands,
+                "required_status": "completed",
+                "required_exit_code": 0,
+                "require_same_turn": True,
+                "minimum_parallel_count": 3,
+            }
+        },
+    )
+
+    assert failures == []
+    assert summary["command_execution"]["maximum_parallel_expected_commands"] == 3
+
+
+def test_codex_command_execution_validation_rejects_compound_substitutes_and_failure():
+    harness = _load_harness_module()
+    actual_commands = [
+        "pwd; git rev-parse --show-toplevel; git status --short",
+        "echo substitute-one",
+        "echo substitute-two",
+    ]
+    events = [{"type": "turn.started"}]
+    for index, command in enumerate(actual_commands):
+        events.append(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": f"command-{index}",
+                    "type": "command_execution",
+                    "command": command,
+                    "status": "in_progress",
+                    "exit_code": None,
+                },
+            }
+        )
+        events.append(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": f"command-{index}",
+                    "type": "command_execution",
+                    "command": command,
+                    "status": "failed" if index == 0 else "completed",
+                    "exit_code": 1 if index == 0 else 0,
+                },
+            }
+        )
+
+    _, failures = harness._validate_codex_collaboration_events(
+        family="opencode",
+        stdout="\n".join(json.dumps(event) for event in events),
+        checks={
+            "command_execution_validation": {
+                "exact_commands": [
+                    "pwd",
+                    "git rev-parse --show-toplevel",
+                    "git status --short",
+                ],
+                "required_status": "completed",
+                "required_exit_code": 0,
+                "require_same_turn": True,
+                "minimum_parallel_count": 3,
+            }
+        },
+    )
+
+    assert any("started unexpected commands" in failure for failure in failures)
+    assert any("completed unexpected commands" in failure for failure in failures)
+    assert any("status was 'failed'" in failure for failure in failures)
+    assert any("exit_code was 1" in failure for failure in failures)
+    assert any("did not overlap as one parallel batch" in failure for failure in failures)
+
+
+def test_codex_command_execution_validation_rejects_swapped_completion_ids():
+    harness = _load_harness_module()
+    commands = [
+        "pwd",
+        "git rev-parse --show-toplevel",
+        "git status --short",
+    ]
+    events = [{"type": "turn.started"}]
+    events.extend(
+        {
+            "type": "item.started",
+            "item": {
+                "id": f"command-{index}",
+                "type": "command_execution",
+                "command": command,
+                "status": "in_progress",
+                "exit_code": None,
+            },
+        }
+        for index, command in enumerate(commands)
+    )
+    swapped_completion_ids = ["command-1", "command-0", "command-2"]
+    events.extend(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": swapped_completion_ids[index],
+                "type": "command_execution",
+                "command": command,
+                "status": "completed",
+                "exit_code": 0,
+            },
+        }
+        for index, command in enumerate(commands)
+    )
+
+    _, failures = harness._validate_codex_collaboration_events(
+        family="opencode",
+        stdout="\n".join(json.dumps(event) for event in events),
+        checks={
+            "command_execution_validation": {
+                "exact_commands": commands,
+                "required_status": "completed",
+                "required_exit_code": 0,
+                "require_same_turn": True,
+                "minimum_parallel_count": 3,
+            }
+        },
+    )
+
+    assert failures == [
+        "opencode Codex command execution start/completion ID-to-command pairs did not match exactly"
+    ]
+
+
+def test_tool_activity_validation_rejects_compound_rows_and_split_turns(monkeypatch):
+    harness = _load_harness_module()
+    records = [
+        {
+            "litellm_call_id": f"call-{index}",
+            "tool_call_id": f"tool-{index}",
+            "provider": "opencode_zen",
+            "model": "big-pickle",
+            "tool_index": 0,
+            "tool_name": "exec_command",
+            "tool_kind": "command",
+            "command_text": command,
+            "arguments": {"cmd": command},
+            "metadata": {},
+            "created_at": None,
+        }
+        for index, command in enumerate(
+            [
+                "pwd; git rev-parse --show-toplevel; git status --short",
+                "echo substitute-one",
+                "echo substitute-two",
+            ]
+        )
+    ]
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params):
+            pass
+
+        def fetchall(self):
+            return records
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+    monkeypatch.setattr(
+        harness,
+        "_validation_db_connection",
+        lambda _settings: FakeConnection(),
+    )
+
+    _, failures = harness._validate_tool_activity(
+        family="opencode",
+        session_id="session-1",
+        checks={
+            "db_password": "pw",
+            "expected_rows": [
+                {
+                    "provider": "opencode_zen",
+                    "model": "big-pickle",
+                    "tool_name": "exec_command",
+                    "tool_kind": "command",
+                    "minimum_count": 3,
+                    "maximum_count": 3,
+                    "exact_command_texts": [
+                        "pwd",
+                        "git rev-parse --show-toplevel",
+                        "git status --short",
+                    ],
+                    "expected_tool_indexes": [0, 1, 2],
+                    "require_single_litellm_call_id": True,
+                }
+            ],
+        },
+    )
+
+    assert any("did not match exact commands" in failure for failure in failures)
+    assert any("had unexpected tool indexes" in failure for failure in failures)
+    assert any(
+        "did not share one nonempty litellm_call_id" in failure
+        for failure in failures
+    )
 
 
 def test_default_suite_keeps_peeromega_fanout_and_native_anthropic_rate_limit_gate_opt_in():
@@ -3092,10 +4061,17 @@ def test_d1251_parallel_read_cases_cover_expected_aawm_anthropic_target_matrix()
             child_model_selector
         )
         command_json_checks = case_config["command_json_checks"]
-        assert command_json_checks["required_equals"] == {"is_error": False}
-        expected_result_substring = command_json_checks["required_contains"][
-            "result"
-        ]
+        expected_required_equals = {"is_error": False}
+        if case_name in D1251_OPENCODE_COMPLETION_CASES:
+            expected_required_equals["result"] = (
+                "OPENCODE ZEN BIG PICKLE PARALLEL TOOLS PASSED"
+            )
+        assert command_json_checks["required_equals"] == expected_required_equals
+        expected_result_substring = (
+            command_json_checks["required_equals"]["result"]
+            if case_name in D1251_OPENCODE_COMPLETION_CASES
+            else command_json_checks["required_contains"]["result"]
+        )
         assert expected_result_substring in case_config["command"][2]
         if provider == "xai":
             required_trace_tags = D1251_REQUIRED_TRACE_TAGS_BY_CASE.get(

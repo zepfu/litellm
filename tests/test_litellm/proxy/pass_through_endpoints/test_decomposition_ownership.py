@@ -1667,8 +1667,8 @@ WAVE6F_MODULE_IMPORT_PATHS: dict[str, str] = {
 }
 WAVE6F_EXPECTED_COUNTS: dict[str, int] = {
     "anthropic_adapter_calls": 46,
-    "codex_candidate_calls": 14,
-    "codex_dispatch": 1,
+    "codex_candidate_calls": 23,
+    "codex_dispatch": 2,
     "anthropic_dispatch": 1,
 }
 
@@ -1736,17 +1736,30 @@ WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS: set[str] = {
     "_perform_codex_alibaba_token_plan_adapter_call",
     "_handle_codex_alibaba_token_plan_adapter_route",
     "_handle_codex_opencode_zen_adapter_route",
+    "_consume_opencode_zen_tools_mode_header",
+    "_build_opencode_zen_completion_call_kwargs",
+    "_perform_opencode_zen_completion_call",
+    "_prepare_opencode_zen_direct_observability_metadata",
+    "_prepare_opencode_zen_known_free_logging",
+    "_opencode_zen_callback_headers",
+    "_opencode_zen_direct_safe_retry_after",
+    "_maybe_raise_opencode_zen_direct_rate_limit",
+    "_opencode_zen_direct_stream_terminal_error",
 }
 
 WAVE6F_DISPATCH_SYMBOLS: set[str] = {
     "try_dispatch_codex_request",
+    "_prepare_opencode_zen_direct_tools_mode",
     "try_dispatch_anthropic_adapter",
 }
 
 WAVE6F_SYMBOL_INVENTORY: dict[str, set[str]] = {
     "anthropic_adapter_calls": WAVE6F_ANTHROPIC_ADAPTER_CALL_SYMBOLS,
     "codex_candidate_calls": WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS,
-    "codex_dispatch": {"try_dispatch_codex_request"},
+    "codex_dispatch": {
+        "try_dispatch_codex_request",
+        "_prepare_opencode_zen_direct_tools_mode",
+    },
     "anthropic_dispatch": {"try_dispatch_anthropic_adapter"},
 }
 
@@ -1758,10 +1771,27 @@ WAVE6F_ANTHROPIC_ALREADY_FACADE_SYMBOLS: set[str] = {
     "_add_route_family_logging_metadata",
 }
 
+# Nine Codex candidate-call helpers authored after Wave 6F extraction.
+# They are part of the current 72-callable owned surface but were never
+# god-module FunctionDefs, so they are excluded from the historical
+# extraction count.
+WAVE6F_POST_EXTRACTION_CODEX_HELPERS: set[str] = {
+    "_consume_opencode_zen_tools_mode_header",
+    "_build_opencode_zen_completion_call_kwargs",
+    "_perform_opencode_zen_completion_call",
+    "_prepare_opencode_zen_direct_observability_metadata",
+    "_prepare_opencode_zen_known_free_logging",
+    "_opencode_zen_callback_headers",
+    "_opencode_zen_direct_safe_retry_after",
+    "_maybe_raise_opencode_zen_direct_rate_limit",
+    "_opencode_zen_direct_stream_terminal_error",
+}
+
+# Historical extraction: former god-module FunctionDefs that moved (55 total).
 WAVE6F_REMOVED_GOD_FUNCTIONS: set[str] = (
     WAVE6F_ANTHROPIC_ADAPTER_CALL_SYMBOLS
     - WAVE6F_ANTHROPIC_ALREADY_FACADE_SYMBOLS
-) | WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS
+) | (WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS - WAVE6F_POST_EXTRACTION_CODEX_HELPERS)
 
 ALL_WAVE6F_FACADES: set[str] = set().union(
     *WAVE6F_SYMBOL_INVENTORY.values()
@@ -1825,7 +1855,7 @@ class TestWave6FAdapterRuntimeOwnership:
             for name, import_path in WAVE6F_MODULE_IMPORT_PATHS.items()
         }
 
-    def test_exact_62_callable_inventory_without_duplicate_ownership(self):
+    def test_exact_72_callable_inventory_without_duplicate_ownership(self):
         seen: dict[str, str] = {}
         duplicates: list[str] = []
         for module_name in WAVE6F_MODULE_ORDER:
@@ -1838,7 +1868,7 @@ class TestWave6FAdapterRuntimeOwnership:
                     )
                 seen[symbol] = module_name
 
-        assert len(seen) == 62
+        assert len(seen) == 72
         assert not duplicates
 
     def test_authored_module_inventories_match_shared_inventory(self):
@@ -1849,15 +1879,18 @@ class TestWave6FAdapterRuntimeOwnership:
                 "_EXTRACTED_FUNCTION_NAMES",
             )
         ) == WAVE6F_ANTHROPIC_ADAPTER_CALL_SYMBOLS
-        assert set(
-            getattr(
-                modules["codex_candidate_calls"],
+        codex_candidate_module = modules["codex_candidate_calls"]
+        assert {
+            name
+            for name in getattr(
+                codex_candidate_module,
                 "_HOST_FUNCTION_NAMES",
             )
-        ) == WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS
-        assert callable(
-            getattr(modules["codex_dispatch"], "try_dispatch_codex_request")
-        )
+            if callable(getattr(codex_candidate_module, name))
+        } == WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS
+        assert set(
+            getattr(modules["codex_dispatch"], "_HOST_FUNCTION_NAMES")
+        ) == WAVE6F_SYMBOL_INVENTORY["codex_dispatch"]
         assert callable(
             getattr(
                 modules["anthropic_dispatch"],
@@ -1865,7 +1898,7 @@ class TestWave6FAdapterRuntimeOwnership:
             )
         )
 
-    def test_exact_55_owned_function_defs_removed_from_god_module(self):
+    def test_exact_55_former_god_module_defs_removed(self):
         assert len(WAVE6F_REMOVED_GOD_FUNCTIONS) == 55
         func_defs = _top_level_function_defs(_parse_god_module())
         violations = WAVE6F_REMOVED_GOD_FUNCTIONS & func_defs
@@ -1890,7 +1923,7 @@ class TestWave6FAdapterRuntimeOwnership:
             "try_dispatch_anthropic_adapter",
         )
 
-    def test_all_62_facades_are_accessible(self):
+    def test_all_72_facades_are_accessible(self):
         for symbol in ALL_WAVE6F_FACADES:
             assert callable(getattr(lpe, symbol, None)), symbol
 
@@ -1906,10 +1939,11 @@ class TestWave6FAdapterRuntimeOwnership:
                 modules["codex_candidate_calls"],
                 symbol,
             )
-        assert lpe.try_dispatch_codex_request is getattr(
-            modules["codex_dispatch"],
-            "try_dispatch_codex_request",
-        )
+        for symbol in WAVE6F_SYMBOL_INVENTORY["codex_dispatch"]:
+            assert getattr(lpe, symbol) is getattr(
+                modules["codex_dispatch"],
+                symbol,
+            )
         assert isinstance(lpe.try_dispatch_anthropic_adapter, partial)
         assert lpe.try_dispatch_anthropic_adapter.func is getattr(
             modules["anthropic_dispatch"],

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import http.client
 import importlib.util
 import json
 import os
@@ -201,7 +202,127 @@ def _parse_command_output_json(stdout: str) -> dict[str, Any] | None:
     for obj in reversed(objects):
         if obj.get('type') == 'result':
             return obj
-    return objects[-1]
+    return _sanitize_turn_failed_output(objects[-1])
+
+
+_TURN_FAILED_MAX_MESSAGE_CHARS = 4096
+_TURN_FAILED_SECRET_PATTERNS = (
+    'sk-', 'Bearer ', 'Authorization:', 'api-key', 'api_key',
+    'raw_body', 'raw_response_body', 'raw_provider_body',
+    'provider_response_body', 'account_id', 'account_identifier',
+    'account_email',
+)
+_TURN_FAILED_EMAIL_PATTERN = re.compile(
+    r'(?i)(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}'
+    r'(?![A-Z0-9._%+-])'
+)
+
+
+def _turn_failed_value_contains_secret(value: Any) -> bool:
+    if isinstance(value, str):
+        value_lower = value.lower()
+        return (
+            any(
+                pattern.lower() in value_lower
+                for pattern in _TURN_FAILED_SECRET_PATTERNS
+            )
+            or _TURN_FAILED_EMAIL_PATTERN.search(value) is not None
+        )
+    if isinstance(value, dict):
+        return any(
+            _turn_failed_value_contains_secret(key)
+            or _turn_failed_value_contains_secret(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_turn_failed_value_contains_secret(item) for item in value)
+    return False
+
+
+def _extract_turn_failed_code(obj: dict[str, Any]) -> int | None:
+    """Extract a valid 400/429 status code from a parsed error object."""
+    error = obj.get('error')
+    if not isinstance(error, dict):
+        return None
+    code = error.get('code')
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, int) and code in (400, 429):
+        return code
+    if isinstance(code, str) and code in ('400', '429'):
+        return int(code)
+    return None
+
+
+def _sanitize_turn_failed_output(
+    parsed: dict[str, Any],
+) -> dict[str, Any]:
+    """D1-574: sanitize a turn.failed command output object.
+
+    Parses error.message nested JSON at most two layers, accepts only
+    error.code integer/string 400 or 429 (not bool/float/other), rejects
+    malformed/unexpected/oversized or secret-bearing content, and returns
+    sanitized is_error=True, api_error_status, status_code without copying
+    raw message/body/secrets.
+    """
+    if not isinstance(parsed, dict) or parsed.get('type') != 'turn.failed':
+        return parsed
+
+    sanitized: dict[str, Any] = {'type': 'turn.failed', 'is_error': True}
+
+    error = parsed.get('error')
+    if not isinstance(error, dict):
+        return sanitized
+
+    message = error.get('message')
+    if not isinstance(message, str):
+        return sanitized
+
+    if len(message) > _TURN_FAILED_MAX_MESSAGE_CHARS:
+        return sanitized
+
+    if _turn_failed_value_contains_secret(message):
+        return sanitized
+
+    # Layer 1: parse error.message as JSON
+    try:
+        layer1 = json.loads(message)
+    except (json.JSONDecodeError, ValueError):
+        return sanitized
+
+    if not isinstance(layer1, dict):
+        return sanitized
+    if _turn_failed_value_contains_secret(layer1):
+        return sanitized
+
+    code = _extract_turn_failed_code(layer1)
+    if code is not None:
+        sanitized['api_error_status'] = code
+        sanitized['status_code'] = code
+        return sanitized
+
+    # Layer 2: if layer1 has error.message as string, parse again
+    inner_error = layer1.get('error')
+    if isinstance(inner_error, dict):
+        inner_message = inner_error.get('message')
+        if (
+            isinstance(inner_message, str)
+            and len(inner_message) <= _TURN_FAILED_MAX_MESSAGE_CHARS
+        ):
+            if not _turn_failed_value_contains_secret(inner_message):
+                try:
+                    layer2 = json.loads(inner_message)
+                except (json.JSONDecodeError, ValueError):
+                    return sanitized
+                if isinstance(layer2, dict):
+                    if _turn_failed_value_contains_secret(layer2):
+                        return sanitized
+                    code = _extract_turn_failed_code(layer2)
+                    if code is not None:
+                        sanitized['api_error_status'] = code
+                        sanitized['status_code'] = code
+
+    return sanitized
 
 
 def _extract_command_output_text(stdout: str) -> str:
@@ -341,7 +462,7 @@ def _validate_command_text_checks(
     }, failures
 
 
-def _validate_codex_collaboration_events(
+def _validate_codex_collaboration_events(  # noqa: PLR0915
     *,
     family: str,
     stdout: str,
@@ -350,17 +471,65 @@ def _validate_codex_collaboration_events(
     if not checks:
         return {"enabled": False}, []
 
+    command_execution_checks = checks.get("command_execution_validation") or {}
+    expected_commands = [
+        str(command)
+        for command in command_execution_checks.get("exact_commands") or []
+        if isinstance(command, str) and command
+    ]
+    expected_command_set = set(expected_commands)
     tool_counts: dict[str, int] = {}
+    completed_tool_items: dict[str, list[dict[str, Any]]] = {}
+    command_starts: list[dict[str, Any]] = []
+    command_completions: list[dict[str, Any]] = []
+    active_expected_command_ids: set[str] = set()
+    maximum_parallel_expected_commands = 0
+    turn_index = -1
     for obj in RA._parse_stdout_json_objects(stdout):
+        if obj.get("type") == "turn.started":
+            turn_index += 1
+            continue
         if obj.get("type") not in {"item.started", "item.completed"}:
             continue
         item = obj.get("item")
-        if not isinstance(item, dict) or item.get("type") != "collab_tool_call":
+        if not isinstance(item, dict):
             continue
-        if obj.get("type") == "item.completed":
+        if item.get("type") == "collab_tool_call" and obj.get("type") == "item.completed":
             tool = item.get("tool")
             if isinstance(tool, str) and tool:
                 tool_counts[tool] = tool_counts.get(tool, 0) + 1
+                completed_tool_items.setdefault(tool, []).append(item)
+            continue
+        if (
+            item.get("type") != "command_execution"
+            or not command_execution_checks
+        ):
+            continue
+        command = item.get("command")
+        if not isinstance(command, str) or not command.strip():
+            continue
+        command = command.strip()
+        item_id = item.get("id")
+        record = {
+            "id": item_id,
+            "command": command,
+            "status": item.get("status"),
+            "exit_code": item.get("exit_code"),
+            "error": item.get("error"),
+            "turn_index": turn_index,
+        }
+        if obj.get("type") == "item.started":
+            command_starts.append(record)
+            if command in expected_command_set and isinstance(item_id, str) and item_id:
+                active_expected_command_ids.add(item_id)
+                maximum_parallel_expected_commands = max(
+                    maximum_parallel_expected_commands,
+                    len(active_expected_command_ids),
+                )
+        else:
+            command_completions.append(record)
+            if isinstance(item_id, str):
+                active_expected_command_ids.discard(item_id)
 
     failures: list[str] = []
     minimum_tool_counts = checks.get("minimum_tool_counts") or {}
@@ -371,10 +540,152 @@ def _validate_codex_collaboration_events(
                 f"{family} missing completed Codex collaboration calls for {tool!r}: expected >= {int(minimum)}, got {actual}"
             )
 
+    required_successful_tools = {
+        str(tool) for tool in checks.get("required_successful_tools") or []
+    }
+    spawned_agent_ids: set[str] = set()
+    waited_agent_statuses: dict[str, Any] = {}
+    for tool in required_successful_tools:
+        for item in completed_tool_items.get(tool, []):
+            if item.get("status") != "completed":
+                failures.append(
+                    f"{family} Codex collaboration {tool!r} did not complete successfully: status={item.get('status')!r}"
+                )
+            if item.get("error") not in (None, "", False, {}):
+                failures.append(
+                    f"{family} Codex collaboration {tool!r} recorded an error"
+                )
+            result = item.get("result")
+            if not isinstance(result, dict):
+                result = {}
+            if tool == "spawn_agent":
+                receiver_agent_ids = item.get("receiver_agent_ids")
+                if not isinstance(receiver_agent_ids, list):
+                    receiver_agent_ids = result.get("receiver_agent_ids")
+                valid_receiver_agent_ids = {
+                    agent_id
+                    for agent_id in receiver_agent_ids or []
+                    if isinstance(agent_id, str) and agent_id
+                }
+                if not valid_receiver_agent_ids:
+                    failures.append(
+                        f"{family} successful Codex spawn_agent did not record receiver_agent_ids"
+                    )
+                spawned_agent_ids.update(valid_receiver_agent_ids)
+            elif tool == "wait":
+                agents_states = item.get("agents_states")
+                if not isinstance(agents_states, dict):
+                    agents_states = result.get("agents_states")
+                if not isinstance(agents_states, dict) or not agents_states:
+                    failures.append(
+                        f"{family} successful Codex wait did not record agents_states"
+                    )
+                    continue
+                for agent_id, state in agents_states.items():
+                    status = state.get("status") if isinstance(state, dict) else state
+                    waited_agent_statuses[str(agent_id)] = status
+                    if status != "completed":
+                        failures.append(
+                            f"{family} Codex wait agent {agent_id!r} did not terminate cleanly: status={status!r}"
+                        )
+
+    if checks.get("require_wait_for_spawned_agents"):
+        missing_wait_agent_ids = sorted(
+            spawned_agent_ids - set(waited_agent_statuses)
+        )
+        if missing_wait_agent_ids:
+            failures.append(
+                f"{family} Codex wait did not report spawned agents: {missing_wait_agent_ids!r}"
+            )
+
+    command_execution_summary: dict[str, Any] = {"enabled": False}
+    if command_execution_checks:
+        started_commands = [record["command"] for record in command_starts]
+        completed_commands = [record["command"] for record in command_completions]
+        if sorted(started_commands) != sorted(expected_commands):
+            failures.append(
+                f"{family} Codex command executions started unexpected commands: expected {sorted(expected_commands)!r}, got {sorted(started_commands)!r}"
+            )
+        if sorted(completed_commands) != sorted(expected_commands):
+            failures.append(
+                f"{family} Codex command executions completed unexpected commands: expected {sorted(expected_commands)!r}, got {sorted(completed_commands)!r}"
+            )
+
+        started_commands_by_id = {
+            record["id"]: record["command"]
+            for record in command_starts
+            if isinstance(record.get("id"), str) and record["id"]
+        }
+        completed_commands_by_id = {
+            record["id"]: record["command"]
+            for record in command_completions
+            if isinstance(record.get("id"), str) and record["id"]
+        }
+        if (
+            len(started_commands_by_id) != len(command_starts)
+            or len(completed_commands_by_id) != len(command_completions)
+            or completed_commands_by_id != started_commands_by_id
+        ):
+            failures.append(
+                f"{family} Codex command execution start/completion ID-to-command pairs did not match exactly"
+            )
+
+        required_status = command_execution_checks.get(
+            "required_status", "completed"
+        )
+        required_exit_code = command_execution_checks.get("required_exit_code", 0)
+        for record in command_completions:
+            if record["status"] != required_status:
+                failures.append(
+                    f"{family} Codex command {record['command']!r} status was {record['status']!r}, expected {required_status!r}"
+                )
+            if (
+                isinstance(record["exit_code"], bool)
+                or record["exit_code"] != required_exit_code
+            ):
+                failures.append(
+                    f"{family} Codex command {record['command']!r} exit_code was {record['exit_code']!r}, expected {required_exit_code!r}"
+                )
+            if record["error"] not in (None, "", False, {}):
+                failures.append(
+                    f"{family} Codex command {record['command']!r} recorded an error"
+                )
+
+        if command_execution_checks.get("require_same_turn"):
+            command_turn_indexes = {
+                record["turn_index"] for record in command_starts
+            }
+            if len(command_turn_indexes) != 1 or -1 in command_turn_indexes:
+                failures.append(
+                    f"{family} Codex command executions were not recorded in one turn: {sorted(command_turn_indexes)!r}"
+                )
+
+        minimum_parallel_count = int(
+            command_execution_checks.get("minimum_parallel_count") or 0
+        )
+        if maximum_parallel_expected_commands < minimum_parallel_count:
+            failures.append(
+                f"{family} Codex command executions did not overlap as one parallel batch: expected >= {minimum_parallel_count}, got {maximum_parallel_expected_commands}"
+            )
+
+        command_execution_summary = {
+            "enabled": True,
+            "expected_commands": expected_commands,
+            "started": command_starts,
+            "completed": command_completions,
+            "maximum_parallel_expected_commands": (
+                maximum_parallel_expected_commands
+            ),
+        }
+
     return {
         "enabled": True,
         "tool_counts": tool_counts,
         "minimum_tool_counts": minimum_tool_counts,
+        "required_successful_tools": sorted(required_successful_tools),
+        "spawned_agent_ids": sorted(spawned_agent_ids),
+        "waited_agent_statuses": waited_agent_statuses,
+        "command_execution": command_execution_summary,
     }, failures
 
 
@@ -3226,8 +3537,8 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
         return {'record': None, 'records': []}, db_failures
 
     query = '''
-        select provider, model, tool_index, tool_name, tool_kind, command_text,
-               arguments, metadata, created_at
+        select litellm_call_id, tool_call_id, provider, model, tool_index,
+               tool_name, tool_kind, command_text, arguments, metadata, created_at
         from public.session_history_tool_activity
         where session_id = %s
         order by created_at asc, tool_index asc
@@ -3300,6 +3611,42 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
             if len(matches) > maximum_count_int:
                 failures.append(
                     f'{family} too many tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} tool_kind={row_tool_kind!r}; expected <= {maximum_count_int}, got {len(matches)}'
+                )
+        exact_command_texts = expected_row.get('exact_command_texts')
+        if isinstance(exact_command_texts, list):
+            expected_command_texts = sorted(
+                value
+                for value in exact_command_texts
+                if isinstance(value, str)
+            )
+            actual_command_texts = sorted(
+                str(row.get('command_text') or '') for row in matches
+            )
+            if actual_command_texts != expected_command_texts:
+                failures.append(
+                    f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} did not match exact commands; expected {expected_command_texts!r}, got {actual_command_texts!r}'
+                )
+        expected_tool_indexes = expected_row.get('expected_tool_indexes')
+        if isinstance(expected_tool_indexes, list):
+            actual_tool_indexes = sorted(row.get('tool_index') for row in matches)
+            if actual_tool_indexes != sorted(expected_tool_indexes):
+                failures.append(
+                    f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} had unexpected tool indexes; expected {sorted(expected_tool_indexes)!r}, got {actual_tool_indexes!r}'
+                )
+        if expected_row.get('require_single_litellm_call_id'):
+            litellm_call_ids = {
+                row.get('litellm_call_id')
+                for row in matches
+                if isinstance(row.get('litellm_call_id'), str)
+                and row.get('litellm_call_id')
+            }
+            if len(litellm_call_ids) != 1 or any(
+                not isinstance(row.get('litellm_call_id'), str)
+                or not row.get('litellm_call_id')
+                for row in matches
+            ):
+                failures.append(
+                    f'{family} tool_activity rows for provider={row_provider!r} model={row_model!r} tool_name={row_tool_name!r} did not share one nonempty litellm_call_id'
                 )
         command_text_contains = expected_row.get('command_text_contains')
         if isinstance(command_text_contains, str) and command_text_contains:
@@ -4444,6 +4791,10 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         expected_api_error_matched
         and bool(config.get('provider_error_observations_validation'))
     )
+    use_expected_429_generation_policy = (
+        use_failure_observability
+        and expected_api_error_status == 429
+    )
     command_session_id = _extract_command_session_id(run['stdout'])
     command_thread_id = _extract_command_thread_id(run['stdout'])
     if (
@@ -4471,8 +4822,131 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         and isinstance(command_session_id, str)
         and command_session_id.strip()
     )
-    if use_failure_observability:
+    expected_error_generation_poll_timeout_seconds = max(
+        float(
+            config.get(
+                'expected_api_error_langfuse_poll_timeout_seconds',
+                10,
+            )
+            or 0
+        ),
+        0.0,
+    )
+    expected_error_generation_poll_interval_seconds = max(
+        float(
+            config.get(
+                'expected_api_error_langfuse_poll_interval_seconds',
+                1,
+            )
+            or 0
+        ),
+        0.0,
+    )
+    observed_error_generations: list[dict[str, Any]] = []
+    expected_error_generation_poll_attempts = 0
+    expected_error_generation_lookup_error: str | None = None
+    expected_error_generation_missing_context = False
+    if use_failure_observability and not use_expected_429_generation_policy:
         traces, lookup_error = [], None
+    elif use_expected_429_generation_policy:
+        traces, lookup_error = [], None
+        poll_deadline = (
+            time.monotonic() + expected_error_generation_poll_timeout_seconds
+        )
+        expected_error_generation_missing_context = not (
+            expected_trace_names or can_session_trace_lookup
+        )
+        while True:
+            remaining_seconds = poll_deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                break
+            if expected_trace_names:
+                try:
+                    traces = RA._recent_langfuse_required_name_traces(
+                        query_url=query_url,
+                        public_key=public_key,
+                        secret_key=secret_key,
+                        names=expected_trace_names,
+                        user_id=lookup_user_id,
+                        start_time=started,
+                        limit=100,
+                        deadline=poll_deadline,
+                    )
+                    lookup_error = None
+                except (
+                    urllib.error.HTTPError,
+                    urllib.error.URLError,
+                    http.client.RemoteDisconnected,
+                    ConnectionResetError,
+                    TimeoutError,
+                ) as exc:
+                    traces = []
+                    lookup_error = str(exc)
+            elif can_session_trace_lookup:
+                try:
+                    traces = RA._recent_langfuse_all_traces(
+                        query_url=query_url,
+                        public_key=public_key,
+                        secret_key=secret_key,
+                        user_id=lookup_user_id,
+                        start_time=started,
+                        session_id=command_session_id.strip(),
+                        limit=100,
+                        deadline=poll_deadline,
+                    )
+                    lookup_error = None
+                except (
+                    urllib.error.HTTPError,
+                    urllib.error.URLError,
+                    http.client.RemoteDisconnected,
+                    ConnectionResetError,
+                    TimeoutError,
+                ) as exc:
+                    traces = []
+                    lookup_error = str(exc)
+            else:
+                break
+
+            expected_error_generation_poll_attempts += 1
+            trace_ids_for_probe = [
+                trace.get('id')
+                for trace in traces
+                if isinstance(trace.get('id'), str)
+            ]
+            if trace_ids_for_probe:
+                try:
+                    observed_error_generations = (
+                        RA._recent_langfuse_generation_observations_for_trace_ids(
+                            query_url=query_url,
+                            public_key=public_key,
+                            secret_key=secret_key,
+                            trace_ids=trace_ids_for_probe,
+                            start_time=started,
+                            deadline=poll_deadline,
+                        )
+                    )
+                    expected_error_generation_lookup_error = None
+                except (
+                    urllib.error.HTTPError,
+                    urllib.error.URLError,
+                    http.client.RemoteDisconnected,
+                    ConnectionResetError,
+                    TimeoutError,
+                ) as exc:
+                    observed_error_generations = []
+                    expected_error_generation_lookup_error = str(exc)
+            if observed_error_generations:
+                break
+
+            remaining_seconds = poll_deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                break
+            sleep_seconds = min(
+                expected_error_generation_poll_interval_seconds,
+                remaining_seconds,
+            )
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
     elif expected_trace_names:
         # Prefer name-based lookup when the suite already knows which traces should exist.
         # This avoids spending the full session lookup timeout on providers that log a
@@ -4515,8 +4989,17 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             )
         else:
             failures.append(f'{name} command failed')
+    elif isinstance(expected_api_error_status, int):
+        failures.append(
+            f'{name} command succeeded but expected API error status {expected_api_error_status}'
+        )
     if lookup_error:
         warnings.append(f'{name} Langfuse lookup warning: {lookup_error}')
+    if expected_error_generation_lookup_error:
+        warnings.append(
+            f'{name} expected API error generation lookup warning: '
+            f'{expected_error_generation_lookup_error}'
+        )
     if use_failure_observability:
         trace_user_ids_by_name_summary = {
             'skipped': 'expected_api_error',
@@ -4545,10 +5028,96 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     ):
         failures.append(f'{name} traces did not include a Langfuse userId')
 
-    if use_failure_observability:
+    if use_failure_observability and not use_expected_429_generation_policy:
         raw_generation_observations = []
         generation_observations = []
         generation_failures = []
+        generation_validation_summary = {'skipped': 'expected_api_error'}
+    elif use_expected_429_generation_policy:
+        if expected_error_generation_missing_context:
+            raw_generation_observations = []
+            generation_observations = []
+            generation_failures = [
+                f'{name} missing Langfuse trace or session lookup context for '
+                'expected API error generation validation'
+            ]
+            generation_validation_summary = {
+                'failed': 'missing_lookup_context',
+                'poll_attempts': 0,
+                'poll_timeout_seconds': (
+                    expected_error_generation_poll_timeout_seconds
+                ),
+            }
+        elif expected_error_generation_poll_attempts == 0:
+            raw_generation_observations = []
+            generation_observations = []
+            generation_failures = [
+                f'{name} expected API error generation validation completed '
+                'without a Langfuse lookup attempt'
+            ]
+            generation_validation_summary = {
+                'failed': 'no_lookup_attempts',
+                'poll_attempts': 0,
+                'poll_timeout_seconds': (
+                    expected_error_generation_poll_timeout_seconds
+                ),
+            }
+        elif observed_error_generations:
+            (
+                raw_generation_observations,
+                generation_observations,
+                generation_failures,
+            ) = RA._validate_generation_observations(
+                family=name,
+                query_url=query_url,
+                public_key=public_key,
+                secret_key=secret_key,
+                trace_ids=trace_ids,
+                start_time=started,
+                allowed_request_routes=config.get('allowed_generation_routes'),
+                skip_quality_checks=bool(
+                    config.get('skip_generation_quality_checks')
+                ),
+                allow_zero_cost=bool(config.get('allow_zero_cost')),
+                allow_reference_cost_when_invoice_unknown=bool(
+                    config.get('allow_reference_cost_when_invoice_unknown')
+                ),
+                allow_unknown_cost_when_invoice_unknown=bool(
+                    config.get('allow_unknown_cost_when_invoice_unknown')
+                ),
+                preloaded_observations=observed_error_generations,
+            )
+            generation_validation_summary = {
+                'validated': 'expected_api_error',
+                'poll_attempts': expected_error_generation_poll_attempts,
+                'poll_timeout_seconds': (
+                    expected_error_generation_poll_timeout_seconds
+                ),
+            }
+        else:
+            raw_generation_observations = []
+            generation_observations = []
+            generation_failures = []
+            if lookup_error or expected_error_generation_lookup_error:
+                generation_failures.append(
+                    f'{name} expected API error generation absence could not '
+                    'be established after Langfuse lookup failure'
+                )
+                generation_validation_summary = {
+                    'failed': 'langfuse_lookup',
+                    'poll_attempts': expected_error_generation_poll_attempts,
+                    'poll_timeout_seconds': (
+                        expected_error_generation_poll_timeout_seconds
+                    ),
+                }
+            else:
+                generation_validation_summary = {
+                    'skipped': 'expected_api_error',
+                    'poll_attempts': expected_error_generation_poll_attempts,
+                    'poll_timeout_seconds': (
+                        expected_error_generation_poll_timeout_seconds
+                    ),
+                }
     else:
         (
             raw_generation_observations,
@@ -4571,6 +5140,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
                 config.get('allow_unknown_cost_when_invoice_unknown')
             ),
         )
+        generation_validation_summary = {'validated': True}
     failures.extend(generation_failures)
 
     filtered_trace_ids = sorted(
@@ -4790,14 +5360,25 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     )
     failures.extend(rate_limit_observations_failures)
     warnings.extend(rate_limit_observations_warnings)
-    (
-        provider_error_observations_summary,
-        provider_error_observations_failures,
-    ) = _validate_provider_error_observations(
-        family=name,
-        session_id=command_session_id,
-        checks=config.get('provider_error_observations_validation') or {},
-    )
+    if use_failure_observability:
+        (
+            provider_error_observations_summary,
+            provider_error_observations_failures,
+        ) = _validate_provider_error_observations(
+            family=name,
+            session_id=command_session_id,
+            checks=config.get('provider_error_observations_validation') or {},
+        )
+    else:
+        provider_error_observations_summary = {
+            'record': None,
+            'records': [],
+        }
+        if config.get('provider_error_observations_validation'):
+            provider_error_observations_summary['skipped'] = (
+                'expected_api_error_not_matched'
+            )
+        provider_error_observations_failures = []
     failures.extend(provider_error_observations_failures)
     tool_activity_summary, tool_activity_failures = _validate_tool_activity(
         family=name,
@@ -4905,6 +5486,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             "command_thread_id": command_thread_id,
             "trace_context": trace_context_summary,
             "trace_enrichment": trace_enrichment_summary,
+            "generation_validation": generation_validation_summary,
             "generation_metadata": generation_metadata_summary,
             "request_payload_checks": request_payload_summary,
             "request_text_checks": request_text_summary,

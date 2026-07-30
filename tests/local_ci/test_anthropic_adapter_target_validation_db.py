@@ -51,7 +51,19 @@ def _neutralize_case_dependencies(
     provider_error_failures: list[str] | None = None,
 ) -> None:
     monkeypatch.setattr(
-        harness.RA, "_poll_langfuse_session_traces", lambda **kw: ([], None)
+        harness.RA,
+        "_recent_langfuse_all_traces",
+        lambda **kw: [
+            {
+                "id": "trace-expected-error",
+                "sessionId": "test-session",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        harness.RA,
+        "_recent_langfuse_generation_observations_for_trace_ids",
+        lambda **kw: [],
     )
     monkeypatch.setattr(
         harness.RA,
@@ -133,6 +145,8 @@ def _run_expected_error_case(
         "expected_api_error_status": 429,
         "match_trace_session_id_from_stdout": False,
         "expected_trace_session_id": "test-session",
+        "expected_api_error_langfuse_poll_timeout_seconds": 0.001,
+        "expected_api_error_langfuse_poll_interval_seconds": 0.001,
         "provider_error_observations_validation": {
             "expected_rows": [{"required_equals": {"status_code": 429}}]
         },
