@@ -386,6 +386,7 @@ services:
 networks:
   aawm_default:
     external: true
+    name: ${AAWM_INFRASTRUCTURE_NETWORK_NAME:-aawm-infrastructure_default}
 
 volumes:
   aawm_alias_routing_redis_data:

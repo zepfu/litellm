@@ -1314,6 +1314,93 @@ def test_provider_status_compose_wires_managed_xai_oauth_sidecar_refresh() -> No
     ) in dockerfile_text
 
 
+def test_provider_status_compose_aawm_network_external_name_contract() -> None:
+    """Both services reference the logical ``aawm_default`` network, which is
+    declared external with a configurable rendered name defaulting to the
+    live ``aawm-infrastructure_default`` network."""
+    import yaml
+
+    repo_root = Path(__file__).resolve().parents[2]
+    compose_text = (repo_root / "docker-compose.dev.yml").read_text()
+
+    # Logical key and external declaration are present in raw text.
+    assert "  aawm_default:" in compose_text
+    assert "external: true" in compose_text
+    assert (
+        "name: ${AAWM_INFRASTRUCTURE_NETWORK_NAME:-aawm-infrastructure_default}"
+        in compose_text
+    )
+
+    # Parse the YAML (substitution syntax is a plain scalar here) and assert
+    # the global network contract plus both service references.
+    doc = yaml.safe_load(compose_text)
+    net = doc["networks"]["aawm_default"]
+    assert net["external"] is True
+    assert (
+        net["name"]
+        == "${AAWM_INFRASTRUCTURE_NETWORK_NAME:-aawm-infrastructure_default}"
+    )
+
+    services = doc["services"]
+    referencing = [
+        name
+        for name, svc in services.items()
+        if "aawm_default" in (svc.get("networks") or [])
+    ]
+    # Both the litellm-dev proxy and the provider-status sidecar must attach.
+    assert "litellm-dev" in referencing
+    assert "provider-status-observations" in referencing
+
+
+def test_provider_status_compose_aawm_network_rendered_default_name() -> None:
+    """`docker compose config` with an empty env renders the default external
+    network name ``aawm-infrastructure_default`` and keeps it external.
+
+    Skipped when the docker CLI is unavailable so the focused suite stays
+    hermetic; the raw-text contract above still guards the declaration.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI unavailable")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "-f",
+            "docker-compose.dev.yml",
+            "config",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"docker compose config unavailable: {proc.stderr.strip()}")
+
+    import yaml
+
+    rendered = yaml.safe_load(proc.stdout)
+    net = rendered["networks"]["aawm_default"]
+    assert net["external"] is True
+    assert net["name"] == "aawm-infrastructure_default"
+
+
+def test_env_example_documents_aawm_infrastructure_network_name() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    env_text = (repo_root / ".env.example").read_text()
+    assert (
+        "AAWM_INFRASTRUCTURE_NETWORK_NAME = aawm-infrastructure_default"
+        in env_text
+    )
+
+
 def test_run_cycle_inserts_rows_and_returns_summary(monkeypatch) -> None:
     config = loop.ProviderStatusLoopConfig(
         apply=True,
