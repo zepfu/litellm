@@ -248,8 +248,8 @@ async def test_rr054_31_candidate_probe_lock_is_shared_per_family_and_cooldown_k
     assert lock_a1 is lock_a2
     assert lock_a1 is not lock_b
     assert lock_a1 is not lock_other_family
-    assert "codex_auto_agent:openrouter:model-a:openrouter" in manager.candidate_probe_locks
-    assert "anthropic_auto_agent:openrouter:model-a:openrouter" in manager.candidate_probe_locks
+    assert "codex:openrouter:model-a:openrouter" in manager.candidate_probe_locks
+    assert "anthropic:openrouter:model-a:openrouter" in manager.candidate_probe_locks
 
 
 @pytest.mark.asyncio

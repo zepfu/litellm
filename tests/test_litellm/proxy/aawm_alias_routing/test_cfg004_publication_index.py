@@ -38,6 +38,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     CooldownPublicationPlan,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    ClearReservationStatus,
     AliasRoutingStateManager,
     LaneIdentityIndex,
     PublicationIntentRegistry,
@@ -524,33 +525,53 @@ async def test_atomic_capacity_rejection_leaves_no_state() -> None:
 
 @pytest.mark.asyncio
 async def test_commit_then_raise_reconciliation() -> None:
-    """After EVAL exception, reconciliation checks receipt presence.
-    Receipt present -> exactly one commit occurred."""
+    """After EVAL exception, reconciliation requires receipt AND full
+    published post-image.  Receipt present + every cooldown key present +
+    every lane member registered -> exactly one commit occurred (True)."""
     dual_cache, client = _make_strict_dual_cache()
-    # Simulate receipt present (commit occurred)
+    # Receipt present (commit occurred); cooldown postcondition keys present.
     client.get = AsyncMock(return_value=b'{"txn_id":"abc"}')
+    # Lane-membership postcondition: every member registered in identity set.
+    client.sismember = AsyncMock(return_value=True)
+
+    cooldown_cache_keys = ["cd-key-1", "cd-key-2"]
+    identity_cache_key = "identity-key-1"
+    lane_members = ["lane-1", "lane-2"]
 
     with patch(f"{_DURABLE_MOD}.get_aawm_alias_routing_dual_cache", return_value=dual_cache):
         committed = await reconcile_cooldown_transaction(
             alias_family="codex",
             transaction_id="abc123def456",
+            cooldown_cache_keys=cooldown_cache_keys,
+            identity_cache_key=identity_cache_key,
+            lane_members=lane_members,
         )
     assert committed is True
-    client.get.assert_called_once()
+    # Receipt check + one get per cooldown postcondition key.
+    assert client.get.call_count == 1 + len(cooldown_cache_keys)
+    # One membership check per lane member.
+    assert client.sismember.call_count == len(lane_members)
 
 
 @pytest.mark.asyncio
 async def test_reconciliation_absent_receipt() -> None:
-    """Receipt absent -> no commit occurred."""
+    """Receipt absent -> no commit occurred (False), no postcondition checks."""
     dual_cache, client = _make_strict_dual_cache()
     client.get = AsyncMock(return_value=None)
+    client.sismember = AsyncMock(return_value=True)
 
     with patch(f"{_DURABLE_MOD}.get_aawm_alias_routing_dual_cache", return_value=dual_cache):
         committed = await reconcile_cooldown_transaction(
             alias_family="codex",
             transaction_id="abc123def456",
+            cooldown_cache_keys=["cd-key-1"],
+            identity_cache_key="identity-key-1",
+            lane_members=["lane-1"],
         )
     assert committed is False
+    # Receipt absent short-circuits: only the receipt get ran, no postconditions.
+    client.get.assert_called_once()
+    client.sismember.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -605,8 +626,8 @@ async def test_local_commit_failure_restores_all() -> None:
 @pytest.mark.asyncio
 async def test_rollback_failure_sanitized_error() -> None:
     """Rollback failure raises RollbackFailedError with sanitized context:
-    phase, family, txn prefix, identity prefix, key count, exception classes.
-    No lane key, Redis key, credentials, or raw error."""
+    phase, family, txn prefix, key count, exception classes.
+    No identity prefix/hash, lane key, Redis key, credentials, or raw error."""
     journal = CooldownTransactionJournal(
         transaction_id="abc123def456789",
         phase=PHASE_DURABLE_COMMITTED,
@@ -633,11 +654,12 @@ async def test_rollback_failure_sanitized_error() -> None:
 
     err = exc_info.value
     msg = str(err)
-    # Sanitized: contains phase, family, txn prefix, identity prefix, key count
+    # Sanitized: contains phase, family, txn prefix, key count.
+    # CFG-004 redaction contract: NO identity prefix/hash in error messages.
     assert "phase=" in msg
     assert "family=codex" in msg
     assert "txn=abc123def456" in msg
-    assert "identity=identity_h" in msg
+    assert "identity=" not in msg
     assert "keys=1" in msg
     assert "ConnectionError" in msg
     # NOT leaked: full lane key, full Redis key, credentials
@@ -804,7 +826,8 @@ def test_sanitized_error_structure() -> None:
     assert "phase=PREPARED" in msg
     assert "family=codex" in msg
     assert "txn=abc123" in msg
-    assert "identity=def456" in msg
+    # CFG-004 redaction contract: NO identity prefix/hash in error messages.
+    assert "identity=" not in msg
     assert "keys=3" in msg
     assert "ConnectionError" in msg
     assert "TimeoutError" in msg
@@ -2327,3 +2350,215 @@ async def test_identity_ttl_positive_uses_monotonic_max_executable() -> None:
     assert ttl >= 598, (
         f"identity key must keep monotonic max TTL >= 598, got {ttl}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: overlapping clear reservations merge (no overwrite/orphan)
+# ---------------------------------------------------------------------------
+
+
+def test_overlapping_clear_reservation_merges_not_overwrites() -> None:
+    """Creating a second clear reservation that overlaps an active one
+    MERGES with it (same object returned, unioned keys/identities) rather
+    than blindly overwriting (Defect 2)."""
+    registry = PublicationIntentRegistry()
+
+    res1 = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h1"}),
+        cooldown_keys=frozenset({"key-a", "key-b"}),
+    )
+
+    # Overlapping reservation: shares key-b.
+    res2 = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h2"}),
+        cooldown_keys=frozenset({"key-b", "key-c"}),
+    )
+
+    # Same object (merged, not overwritten).
+    assert res2 is res1
+    # Unioned coverage.
+    assert res2.identity_hashes == frozenset({"h1", "h2"})
+    assert res2.cooldown_keys == frozenset({"key-a", "key-b", "key-c"})
+
+    # All keys resolve to the same reservation.
+    assert registry.get_clear_reservation("codex", "key-a") is res1
+    assert registry.get_clear_reservation("codex", "key-b") is res1
+    assert registry.get_clear_reservation("codex", "key-c") is res1
+
+
+def test_overlapping_clear_reservation_no_orphaned_waiters() -> None:
+    """A waiter on the first reservation is NOT orphaned when a second
+    overlapping reservation is created (Defect 2): completing the merged
+    reservation signals all waiters."""
+
+    registry = PublicationIntentRegistry()
+
+    res1 = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h1"}),
+        cooldown_keys=frozenset({"key-a"}),
+    )
+
+    # Second overlapping reservation merges.
+    res2 = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h2"}),
+        cooldown_keys=frozenset({"key-a", "key-b"}),
+    )
+    assert res2 is res1
+
+    # Completing the merged reservation signals waiters on both keys.
+    registry.complete_clear_reservation(res2)
+    assert res1.done.is_set()
+    assert registry.get_clear_reservation("codex", "key-a") is None
+    assert registry.get_clear_reservation("codex", "key-b") is None
+
+
+def test_non_overlapping_clear_reservations_independent() -> None:
+    """Non-overlapping clear reservations remain independent objects
+    (Defect 2 merge only applies to overlapping keys)."""
+    registry = PublicationIntentRegistry()
+
+    res1 = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h1"}),
+        cooldown_keys=frozenset({"key-a"}),
+    )
+    res2 = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h2"}),
+        cooldown_keys=frozenset({"key-b"}),
+    )
+
+    assert res1 is not res2
+    assert registry.get_clear_reservation("codex", "key-a") is res1
+    assert registry.get_clear_reservation("codex", "key-b") is res2
+
+    # Completing one does not affect the other.
+    registry.complete_clear_reservation(res1)
+    assert registry.get_clear_reservation("codex", "key-a") is None
+    assert registry.get_clear_reservation("codex", "key-b") is res2
+
+
+def test_completed_reservation_not_merged() -> None:
+    """A completed reservation is NOT merged with a new one (Defect 2:
+    only ACTIVE reservations participate in merge)."""
+    registry = PublicationIntentRegistry()
+
+    res1 = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h1"}),
+        cooldown_keys=frozenset({"key-a"}),
+    )
+    registry.complete_clear_reservation(res1)
+
+    # New reservation for the same key: should be a fresh object.
+    res2 = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h2"}),
+        cooldown_keys=frozenset({"key-a"}),
+    )
+    assert res2 is not res1
+    assert res2.status is ClearReservationStatus.ACTIVE
+    assert registry.get_clear_reservation("codex", "key-a") is res2
+
+
+def test_overlapping_reservation_different_family_independent() -> None:
+    """Overlapping keys in different canonical families do NOT merge
+    (Defect 2: merge is per-family)."""
+    registry = PublicationIntentRegistry()
+
+    res_codex = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h1"}),
+        cooldown_keys=frozenset({"key-a"}),
+    )
+    res_anth = registry.create_clear_reservation(
+        alias_family="anthropic",
+        identity_hashes=frozenset({"h2"}),
+        cooldown_keys=frozenset({"key-a"}),
+    )
+
+    assert res_codex is not res_anth
+    assert registry.get_clear_reservation("codex", "key-a") is res_codex
+    assert registry.get_clear_reservation("anthropic", "key-a") is res_anth
+
+
+# ---------------------------------------------------------------------------
+# Defect 1: claim_publication_or_wait atomicity (registry-level)
+# ---------------------------------------------------------------------------
+
+
+def test_claim_publication_or_wait_clear_blocks_before_intent() -> None:
+    """When a clear reservation exists, claim_publication_or_wait returns
+    BLOCKED_BY_CLEAR without creating an intent (Defect 1)."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    ClaimOutcome,
+    )
+
+    registry = PublicationIntentRegistry()
+    registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h1"}),
+        cooldown_keys=frozenset({"key-a"}),
+    )
+
+    result = registry.claim_publication_or_wait(
+        alias_family="codex",
+        cooldown_keys=frozenset({"key-a"}),
+        identity_hash="h2",
+    )
+    assert result.outcome is ClaimOutcome.BLOCKED_BY_CLEAR
+    assert result.intent is None
+    # No orphaned intent in the registry.
+    assert registry.get("codex", "key-a") is None
+
+
+def test_claim_publication_or_wait_multi_key_clear_blocks() -> None:
+    """A clear reservation on ANY key in the set blocks the entire claim
+    (Defect 1: multi-key atomicity)."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    ClaimOutcome,
+    )
+
+    registry = PublicationIntentRegistry()
+    # Reservation only on key-b.
+    registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({"h1"}),
+        cooldown_keys=frozenset({"key-b"}),
+    )
+
+    # Claim for key-a + key-b: blocked because key-b has a reservation.
+    result = registry.claim_publication_or_wait(
+        alias_family="codex",
+        cooldown_keys=frozenset({"key-a", "key-b"}),
+        identity_hash="h2",
+    )
+    assert result.outcome is ClaimOutcome.BLOCKED_BY_CLEAR
+    # No intent created for key-a either.
+    assert registry.get("codex", "key-a") is None
+
+
+def test_release_claim_completes_and_removes() -> None:
+    """release_claim completes the intent and removes it from the registry."""
+    registry = PublicationIntentRegistry()
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    ClaimOutcome,
+    )
+
+    result = registry.claim_publication_or_wait(
+        alias_family="codex",
+        cooldown_keys=frozenset({"key-a"}),
+        identity_hash="h1",
+    )
+    assert result.outcome is ClaimOutcome.LEADER
+    intent = result.intent
+    assert intent is not None
+
+    registry.release_claim(intent)
+    assert intent.done.is_set()
+    assert registry.get("codex", "key-a") is None

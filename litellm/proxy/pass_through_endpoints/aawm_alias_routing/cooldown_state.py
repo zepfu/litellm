@@ -27,7 +27,7 @@ from .memory import (
     hydrate_affinity_memory,
     hydrate_cooldown_memory,
 )
-from .state import AliasRoutingStateManager
+from .state import AliasRoutingStateManager, validate_alias_family
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -82,36 +82,56 @@ async def _get_codex_auto_agent_active_cooldown_state(
     dual_cache = get_aawm_alias_routing_dual_cache()
     if dual_cache is None:
         return 0.0, "local_fallback"
-    durable_payload = await read_aawm_alias_routing_durable_payload(
-        alias_family="codex",
-        state_kind="cooldown",
-        state_key=cooldown_key,
-    )
-    if durable_payload is None:
-        async with family.lock:
-            family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+    # CFG-004 Defect 3: per-key read/clear barrier.  The barrier lock is
+    # acquired BEFORE capturing the generation and held through the durable
+    # read and hydration.  A clear (via clear_alias_family_cooldown_state)
+    # acquires the same barrier lock before bumping the generation and
+    # deleting the durable key.  This guarantees that a read which started
+    # before a clear cannot capture the new generation and hydrate the old
+    # durable value, while unrelated keys remain fully concurrent.
+    _barrier = await mgr.key_barrier_lock(cooldown_key)
+    async with _barrier:
+        gen_before = family.get_generation(cooldown_key)
+        async with mgr.lane_state_cache_lock:
+            durable_payload = await read_aawm_alias_routing_durable_payload(
+                alias_family="codex",
+                state_kind="cooldown",
+                state_key=cooldown_key,
             )
-            bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-        return 0.0, "local_fallback"
-    expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
-    if expires_at_epoch is None:
-        async with family.lock:
-            family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
-            )
-            bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-        return 0.0, "local_fallback"
-    async with family.lock:
-        family.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
-        hydrate_cooldown_memory(
-            memory_map=family.cooldown_until_monotonic_by_key,
-            cooldown_key=cooldown_key,
-            expires_at_epoch=expires_at_epoch,
-            max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
-        )
-        until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        return max(0.0, until - time.monotonic()), "durable_cache"
+            if durable_payload is None:
+                async with family.lock:
+                    if family.get_generation(cooldown_key) != gen_before:
+                        return 0.0, "local_fallback"
+                    family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                        time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                    )
+                    bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+                return 0.0, "local_fallback"
+            expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
+            if expires_at_epoch is None:
+                async with family.lock:
+                    if family.get_generation(cooldown_key) != gen_before:
+                        return 0.0, "local_fallback"
+                    family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                        time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                    )
+                    bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+                return 0.0, "local_fallback"
+            # Generation guard + hydrate atomically under the family lock so a
+            # concurrent clear (which advances generation) cannot interleave
+            # between the check and the hydration write.
+            async with family.lock:
+                if family.get_generation(cooldown_key) != gen_before:
+                    return 0.0, "local_fallback"
+                family.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
+                hydrate_cooldown_memory(
+                    memory_map=family.cooldown_until_monotonic_by_key,
+                    cooldown_key=cooldown_key,
+                    expires_at_epoch=expires_at_epoch,
+                    max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
+                )
+                until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
+                return max(0.0, until - time.monotonic()), "durable_cache"
 
 
 async def _get_codex_auto_agent_active_cooldown_seconds(
@@ -144,6 +164,61 @@ async def _set_codex_auto_agent_cooldown(
         payload={"cooldown_key": cooldown_key},
         ttl_seconds=ttl_seconds,
     )
+
+
+# ---------------------------------------------------------------------------
+# Barrier-protected clear (CFG-004 Defect 3)
+# ---------------------------------------------------------------------------
+
+
+async def clear_alias_family_cooldown_state(
+    *,
+    alias_family: str,
+    cooldown_keys: "Sequence[str]",
+    delete_durable: bool = True,
+) -> "Any":
+    """Clear cooldown state under per-key barrier locks (Defect 3).
+
+    Acquires the per-key barrier lock for each key (sorted to prevent
+    deadlock), then performs the memory clear (generation bump) and
+    optionally deletes the durable keys.  Holding the barrier locks
+    guarantees that no concurrent durable read can capture the new
+    generation and hydrate the old durable value.
+
+    Returns the ``CooldownClearResult`` from the manager's sync clear.
+    """
+    from .durable import delete_aawm_alias_routing_durable_key
+
+    mgr = _require_manager()
+    canonical = validate_alias_family(alias_family)
+    sorted_keys = sorted(set(cooldown_keys))
+
+    # Acquire per-key barrier locks in sorted order (deadlock-free).
+    barriers = [await mgr.key_barrier_lock(k) for k in sorted_keys]
+    for b in barriers:
+        await b.acquire()
+    try:
+        result = mgr.clear_cooldown_state(
+            alias_family=canonical,
+            cooldown_keys=sorted_keys,
+        )
+        if delete_durable:
+            for key in sorted_keys:
+                try:
+                    await delete_aawm_alias_routing_durable_key(
+                        alias_family=canonical,
+                        state_kind="cooldown",
+                        state_key=key,
+                    )
+                except Exception:
+                    # Durable deletion failure is non-fatal: the generation
+                    # bump already invalidates in-flight reads.  The durable
+                    # key will expire via TTL or be cleaned up on next clear.
+                    pass
+        return result
+    finally:
+        for b in reversed(barriers):
+            b.release()
 
 
 # ---------------------------------------------------------------------------
@@ -257,36 +332,47 @@ async def _get_anthropic_auto_agent_active_cooldown_state(
     dual_cache = get_aawm_alias_routing_dual_cache()
     if dual_cache is None:
         return 0.0, "local_fallback"
-    durable_payload = await read_aawm_alias_routing_durable_payload(
-        alias_family="anthropic",
-        state_kind="cooldown",
-        state_key=cooldown_key,
-    )
-    if durable_payload is None:
-        async with family.lock:
-            family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+    # CFG-004 Defect 3: per-key read/clear barrier (mirrors codex path).
+    _barrier = await mgr.key_barrier_lock(cooldown_key)
+    async with _barrier:
+        gen_before = family.get_generation(cooldown_key)
+        async with mgr.lane_state_cache_lock:
+            durable_payload = await read_aawm_alias_routing_durable_payload(
+                alias_family="anthropic",
+                state_kind="cooldown",
+                state_key=cooldown_key,
             )
-            bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-        return 0.0, "local_fallback"
-    expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
-    if expires_at_epoch is None:
-        async with family.lock:
-            family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
-                time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
-            )
-            bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-        return 0.0, "local_fallback"
-    async with family.lock:
-        family.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
-        hydrate_cooldown_memory(
-            memory_map=family.cooldown_until_monotonic_by_key,
-            cooldown_key=cooldown_key,
-            expires_at_epoch=expires_at_epoch,
-            max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
-        )
-        until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        return max(0.0, until - time.monotonic()), "durable_cache"
+            if durable_payload is None:
+                async with family.lock:
+                    if family.get_generation(cooldown_key) != gen_before:
+                        return 0.0, "local_fallback"
+                    family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                        time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                    )
+                    bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+                return 0.0, "local_fallback"
+            expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
+            if expires_at_epoch is None:
+                async with family.lock:
+                    if family.get_generation(cooldown_key) != gen_before:
+                        return 0.0, "local_fallback"
+                    family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
+                        time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
+                    )
+                    bound_memory_map(family.cooldown_negative_until_monotonic_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+                return 0.0, "local_fallback"
+            async with family.lock:
+                if family.get_generation(cooldown_key) != gen_before:
+                    return 0.0, "local_fallback"
+                family.cooldown_negative_until_monotonic_by_key.pop(cooldown_key, None)
+                hydrate_cooldown_memory(
+                    memory_map=family.cooldown_until_monotonic_by_key,
+                    cooldown_key=cooldown_key,
+                    expires_at_epoch=expires_at_epoch,
+                    max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
+                )
+                until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
+                return max(0.0, until - time.monotonic()), "durable_cache"
 
 
 async def _get_anthropic_auto_agent_active_cooldown_seconds(

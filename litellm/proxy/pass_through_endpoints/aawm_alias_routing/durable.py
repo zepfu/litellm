@@ -503,6 +503,13 @@ async def write_aawm_alias_routing_durable_payload(  # noqa: PLR0915
 
 _VALID_ALIAS_FAMILIES = frozenset({"codex", "anthropic"})
 
+# Production family labels accepted by durable clear/publish APIs.
+# Canonicalized to the internal short form before any key construction.
+_FAMILY_LABEL_ALIASES: dict[str, str] = {
+    "codex_auto_agent": "codex",
+    "anthropic_auto_agent": "anthropic",
+}
+
 
 @dataclass
 class DurableKeyInspection:
@@ -518,9 +525,13 @@ class DurableKeyInspection:
 def _validate_alias_family(alias_family: str, context: str) -> str:
     """Normalize and validate ``alias_family``; unknown families raise.
 
-    Never defaults an unknown family to codex.
+    Accepts production family labels (``codex_auto_agent``,
+    ``anthropic_auto_agent``) and canonicalizes them to the internal short
+    form.  Never defaults an unknown family to codex.
     """
     normalized = (alias_family or "").strip().lower()
+    if normalized in _FAMILY_LABEL_ALIASES:
+        normalized = _FAMILY_LABEL_ALIASES[normalized]
     if normalized not in _VALID_ALIAS_FAMILIES:
         raise ValueError(
             f"{context}: unknown alias_family {alias_family!r}; "
@@ -911,7 +922,6 @@ class PublicationTransactionError(RuntimeError):
             f"publication transaction {detail}".strip()
             + f" [phase={phase} family={family}"
             + f" txn={transaction_id_prefix}"
-            + f" identity={identity_prefix}"
             + f" keys={key_count}"
             + f" errors={','.join(exception_classes) or "none"}]"
         )
@@ -1086,10 +1096,26 @@ for i = 1, num_cd do
     end
 end
 
--- Phase 5: Write receipt with exact pre-images for rollback.
--- Pre-images are stored as a cjson array so rollback can restore
--- exact values and TTLs (including -1 persistent and -2 absent).
--- Identity pre-images record prior set membership and key TTL.
+-- Phase 5: Journal post-images (state after mutation) for rollback drift check.
+local postimages = {}
+for i = 1, num_cd do
+    local cd_key = KEYS[1 + i]
+    local pval = redis.call('GET', cd_key)
+    local pttl = redis.call('TTL', cd_key)
+    postimages[i] = {pval, pttl}
+end
+local id_post_members = {}
+local id_post_ttl = -2
+if num_id > 0 then
+    local id_key = KEYS[1 + num_cd + 1]
+    local id_post_card = redis.call('SCARD', id_key)
+    if id_post_card > 0 then
+        id_post_members = redis.call('SMEMBERS', id_key)
+    end
+    id_post_ttl = redis.call('TTL', id_key)
+end
+
+-- Phase 6: Write receipt with exact pre-images and post-images for rollback.
 local preimage_arr = {}
 for i = 1, num_cd do
     local entry = {}
@@ -1097,14 +1123,27 @@ for i = 1, num_cd do
     entry['t'] = preimages[i][2]
     preimage_arr[i] = entry
 end
+local postimage_arr = {}
+for i = 1, num_cd do
+    local entry = {}
+    entry['v'] = postimages[i][1]
+    entry['t'] = postimages[i][2]
+    postimage_arr[i] = entry
+end
 local receipt = cjson.decode(receipt_json)
 receipt['preimages'] = preimage_arr
+receipt['postimages'] = postimage_arr
 if num_id > 0 then
     local id_entry = {}
     id_entry['members'] = id_preimages[1]
     id_entry['ttl'] = id_preimages[2]
     id_entry['key'] = KEYS[1 + num_cd + 1]
     receipt['identity_preimage'] = id_entry
+    local id_post_entry = {}
+    id_post_entry['members'] = id_post_members
+    id_post_entry['ttl'] = id_post_ttl
+    id_post_entry['key'] = KEYS[1 + num_cd + 1]
+    receipt['identity_postimage'] = id_post_entry
 end
 redis.call('SET', receipt_key, cjson.encode(receipt))
 if req_ttl > 0 then
@@ -1179,7 +1218,7 @@ async def publish_cooldown_transaction(  # noqa: PLR0915
 
     Returns CooldownTransactionResult with phase=DURABLE_COMMITTED.
     """
-    context = f"publish-txn family={alias_family} identity={identity_hash[:12]}"
+    context = f"publish-txn family={alias_family}"
     family = _validate_alias_family(alias_family, context)
     transaction_id = _uuid.uuid4().hex
 
@@ -1260,7 +1299,6 @@ async def publish_cooldown_transaction(  # noqa: PLR0915
     receipt = {
         "txn_id": transaction_id,
         "family": family,
-        "identity": identity_hash[:12],
         "num_keys": num_cd,
         "ttl": req_ttl,
     }
@@ -1293,6 +1331,9 @@ async def publish_cooldown_transaction(  # noqa: PLR0915
             committed = await reconcile_cooldown_transaction(
                 alias_family=family,
                 transaction_id=transaction_id,
+                cooldown_cache_keys=ns_cd_keys,
+                identity_cache_key=ns_id_keys[0] if ns_id_keys else None,
+                lane_members=list(lane_members),
             )
             if committed:
                 journal = CooldownTransactionJournal(
@@ -1361,12 +1402,19 @@ async def reconcile_cooldown_transaction(
     *,
     alias_family: str,
     transaction_id: str,
+    cooldown_cache_keys: list[str],
+    identity_cache_key: str,
+    lane_members: list[str],
 ) -> bool:
-    """Reconcile after EVAL exception or commit-then-raise.
+    """Reconcile after EVAL exception or commit-then-raise for publication.
 
-    Checks whether the receipt key exists (proving the Lua script committed).
-    Returns True if the transaction committed (receipt present), False if
-    absent (no commit occurred).  Fails closed on Redis errors.
+    Checks whether the receipt key exists (commit evidence only).  When the
+    receipt is present, verifies the full published post-image: every
+    cooldown key must be present and every lane member must be registered
+    in the identity set.  Receipt existence alone never authorizes success.
+    Returns True only when receipt AND all postconditions hold.
+    Returns False if the receipt is absent (no commit occurred).
+    Fails closed on Redis errors or postcondition violations.
     """
     context = f"reconcile-txn family={alias_family} txn={transaction_id[:12]}"
     family = _validate_alias_family(alias_family, context)
@@ -1412,7 +1460,45 @@ async def reconcile_cooldown_transaction(
         raise RuntimeError(
             f"AAWM alias routing durable {context}: receipt check failed"
         ) from exc
-    return raw is not None
+    if raw is None:
+        return False
+
+    # Strict postcondition: verify published post-image.
+    # Receipt is commit evidence only; success requires full post-image.
+    for cd_key in cooldown_cache_keys:
+        try:
+            cd_raw = await get_fn(cd_key)
+        except Exception as exc:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "publication postcondition check failed"
+            ) from exc
+        if cd_raw is None:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "cooldown key absent after reconciled publication"
+            )
+    sismember_fn = getattr(client, "sismember", None)
+    if not callable(sismember_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: "
+            "postcondition check unavailable (missing sismember)"
+        )
+    for member in lane_members:
+        try:
+            is_member = await sismember_fn(identity_cache_key, member)
+        except Exception as exc:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "publication membership postcondition failed"
+            ) from exc
+        if not is_member:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "lane member absent from identity set after "
+                "reconciled publication"
+            )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1458,7 +1544,66 @@ if not preimages then
     return -2
 end
 
--- Phase 2: Restore cooldown key pre-images
+-- Phase 2: Drift check -- compare exact current state to post-image.
+local postimages = receipt['postimages']
+if postimages then
+    for i = 1, num_cd do
+        local cd_key = KEYS[1 + i]
+        local cur_val = redis.call('GET', cd_key)
+        local cur_ttl = redis.call('TTL', cd_key)
+        local post = postimages[i]
+        if post then
+            local post_val = post['v']
+            local post_ttl = tonumber(post['t'])
+            local cur_absent = (cur_val == false or cur_val == nil)
+            local post_absent = (post_val == false or post_val == nil)
+            if cur_absent ~= post_absent then
+                return -3
+            end
+            if not cur_absent and cur_val ~= post_val then
+                return -3
+            end
+            if post_ttl >= 0 and cur_ttl >= 0 then
+                if math.abs(cur_ttl - post_ttl) > 1 then
+                    return -3
+                end
+            elseif post_ttl ~= cur_ttl then
+                if not (post_ttl < 0 and cur_ttl < 0) then
+                    return -3
+                end
+            end
+        end
+    end
+end
+
+-- Phase 2b: Identity set drift check against post-image.
+local id_postimage = receipt['identity_postimage']
+if id_postimage and id_postimage['key'] then
+    local id_key = id_postimage['key']
+    local post_members = id_postimage['members']
+    local post_set = {}
+    local post_count = 0
+    if post_members then
+        for _, m in ipairs(post_members) do
+            post_set[m] = true
+            post_count = post_count + 1
+        end
+    end
+    local cur_card = redis.call('SCARD', id_key)
+    if cur_card ~= post_count then
+        return -3
+    end
+    if cur_card > 0 then
+        local cur_members = redis.call('SMEMBERS', id_key)
+        for _, m in ipairs(cur_members) do
+            if not post_set[m] then
+                return -3
+            end
+        end
+    end
+end
+
+-- Phase 3: Restore cooldown key pre-images
 for i = 1, num_cd do
     local cd_key = KEYS[1 + i]
     local entry = preimages[i]
@@ -1480,8 +1625,7 @@ for i = 1, num_cd do
     end
 end
 
--- Phase 3: Restore prior identity membership (differential SREM).
--- Only remove members that were NOT in the prior set (from receipt pre-image).
+-- Phase 4: Restore prior identity membership (differential SREM).
 local id_preimage = receipt['identity_preimage']
 if id_preimage and id_preimage['key'] then
     local id_key = id_preimage['key']
@@ -1498,7 +1642,6 @@ if id_preimage and id_preimage['key'] then
             redis.call('SREM', id_key, member)
         end
     end
-    -- Restore identity-key TTL from pre-image
     local id_ttl = tonumber(id_preimage['ttl'])
     if id_ttl == -2 then
         redis.call('DEL', id_key)
@@ -1509,7 +1652,7 @@ if id_preimage and id_preimage['key'] then
     end
 end
 
--- Phase 4: Delete receipt (only on full success)
+-- Phase 5: Delete receipt (only on full success)
 redis.call('DEL', receipt_key)
 
 return 1
@@ -1644,9 +1787,1084 @@ async def rollback_cooldown_transaction(
 
     code = int(result)
     if code == -1:
-        # Receipt missing: transaction may not have committed, or receipt
-        # already expired.  Not an error -- nothing to restore.
+        raise RollbackReceiptMissingError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=num_cd,
+            exception_classes=(),
+        )
+    if code == -3:
+        raise RollbackDriftError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=num_cd,
+            exception_classes=(),
+        )
+    if code != 1:
+        raise RollbackFailedError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=num_cd,
+            exception_classes=("LuaRollbackError",),
+        )
+
+
+# ---------------------------------------------------------------------------
+# CFG-004 Wave B: Bounded identity-set inspection and atomic compare-and-clear
+# ---------------------------------------------------------------------------
+#
+# Strict identity-set inspection (bounded SMEMBERS, no SCAN/KEYS), atomic
+# Lua compare-and-clear with exact expected membership verification, pre-image
+# journaling, DualCache invalidation, postcondition verification, and
+# reconciliation for lost EVAL responses.
+
+
+class MembershipDriftError(PublicationTransactionError):
+    """Identity set membership drifted from expected; no mutations applied."""
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("detail", "membership drift detected")
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+
+class ClearIndeterminateError(PublicationTransactionError):
+    """Clear transaction outcome is indeterminate after lost EVAL response."""
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("detail", "clear outcome indeterminate")
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+
+class RollbackDriftError(PublicationTransactionError):
+    """Rollback rejected: current state drifted from receipt post-image."""
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("detail", "rollback drift detected; state modified since commit")
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+
+class RollbackReceiptMissingError(PublicationTransactionError):
+    """Rollback cannot proceed: receipt missing or expired (indeterminate)."""
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("detail", "receipt missing or expired; outcome indeterminate")
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+
+class IdentitySetOverBoundError(RuntimeError):
+    """Identity set cardinality exceeds the inspection bound."""
+
+    def __init__(self, *, cardinality: int, bound: int, context: str) -> None:
+        self.cardinality = cardinality
+        self.bound = bound
+        super().__init__(
+            f"AAWM alias routing durable {context}: "
+            f"identity set cardinality {cardinality} exceeds bound {bound}"
+        )
+
+
+PHASE_CLEAR_COMMITTED = "CLEAR_COMMITTED"
+
+_DEFAULT_CLEAR_RECEIPT_TTL = 300
+
+
+@dataclass
+class IdentitySetInspection:
+    """Result of bounded identity-set inspection (CFG-004 Wave B)."""
+
+    identity_key: str
+    exists: bool
+    members: frozenset
+    cardinality: int
+    ttl_remaining_seconds: Union[float, UnboundedExpiry, None] = None
+
+
+@dataclass
+class ClearTransactionJournal:
+    """Journal for a committed clear transaction."""
+
+    transaction_id: str
+    phase: str
+    alias_family: str
+    identity_hash: str
+    cooldown_keys: list
+    lane_members: list
+    expected_members: list
+    identity_key: str
+    receipt_key: str
+    receipt_ttl: int
+
+
+@dataclass
+class ClearTransactionResult:
+    """Result of a successful clear_cooldown_transaction."""
+
+    transaction_id: str
+    phase: str
+    journal: ClearTransactionJournal
+    keys_deleted: int
+    members_removed: int
+
+
+def _invalidate_in_memory_keys(
+    dual_cache: object,
+    cache_keys: list,
+    context: str,
+) -> None:
+    """Delete each cache key from the DualCache in-memory tier (strict)."""
+    in_memory_cache = getattr(dual_cache, "in_memory_cache", None)
+    if in_memory_cache is None:
         return
+    mem_delete = getattr(in_memory_cache, "delete_cache", None)
+    if not callable(mem_delete):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: "
+            "in_memory_cache missing delete_cache"
+        )
+    for key in cache_keys:
+        try:
+            mem_delete(key)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                f"in-memory invalidation failed: {exc}"
+            ) from exc
+
+
+_LUA_INSPECT_IDENTITY_SET = """
+local id_key = KEYS[1]
+local max_members = tonumber(ARGV[1])
+
+-- Atomic bound check: SCARD before SMEMBERS.
+local card = redis.call('SCARD', id_key)
+if card > max_members then
+    return {-1, card, -2}
+end
+
+local members = {}
+if card > 0 then
+    members = redis.call('SMEMBERS', id_key)
+end
+local ttl = redis.call('TTL', id_key)
+
+-- Return: {1, cardinality, ttl, member1, member2, ...}
+local result = {1, card, ttl}
+for i, m in ipairs(members) do
+    result[3 + i] = m
+end
+return result
+"""
+
+
+async def inspect_identity_set(
+    *,
+    alias_family: str,
+    identity_hash: str,
+    max_members: int = 1024,
+) -> IdentitySetInspection:
+    """Bounded strict inspection of an identity set via one atomic Lua EVAL.
+
+    A single Lua operation checks SCARD before SMEMBERS and returns no
+    oversized member list.  Raises IdentitySetOverBoundError if the set
+    exceeds ``max_members``, RuntimeError on any Redis error, ValueError
+    on unknown ``alias_family``.
+    """
+    context = f"inspect-identity family={alias_family}"
+    family = _validate_alias_family(alias_family, context)
+    dual_cache = get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: no Redis cache available"
+        )
+    identity_cache_key = build_aawm_alias_routing_durable_cache_key(
+        alias_family=family, state_kind="lane_identity", state_key=identity_hash
+    )
+    redis_cache = getattr(dual_cache, "redis_cache", None)
+    if redis_cache is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: dual cache has no redis_cache"
+        )
+    init_fn = getattr(redis_cache, "init_async_client", None)
+    if not callable(init_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: missing init_async_client"
+        )
+    try:
+        client = init_fn()
+    except Exception as exc:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: failed to init redis client"
+        ) from exc
+    if client is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: redis client unavailable"
+        )
+    eval_fn = getattr(client, "eval", None)
+    if not callable(eval_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: "
+            "redis client missing eval (atomic inspection unavailable)"
+        )
+    fix_ns = getattr(redis_cache, "check_and_fix_namespace", None)
+    ns_key = fix_ns(key=identity_cache_key) if callable(fix_ns) else identity_cache_key
+
+    bound = max(1, int(max_members))
+
+    try:
+        result = await eval_fn(_LUA_INSPECT_IDENTITY_SET, 1, ns_key, str(bound))
+    except Exception as exc:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: lua inspection failed"
+        ) from exc
+
+    if not isinstance(result, (list, tuple)) or len(result) < 3:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: unexpected lua result format"
+        )
+
+    status = int(result[0])
+    cardinality = int(result[1])
+    ttl_int = int(result[2])
+
+    if status == -1:
+        raise IdentitySetOverBoundError(
+            cardinality=cardinality, bound=bound, context=context
+        )
+    if status != 1:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: unexpected lua status {status}"
+        )
+
+    raw_members = result[3:]
+    members = frozenset(
+        m.decode("utf-8") if isinstance(m, bytes) else str(m)
+        for m in raw_members
+    )
+
+    exists = cardinality > 0 or ttl_int != -2
+
+    ttl_remaining: Union[float, UnboundedExpiry, None]
+    if ttl_int == -2:
+        ttl_remaining = None
+    elif ttl_int == -1:
+        ttl_remaining = UNBOUNDED_EXPIRY
+    else:
+        ttl_remaining = float(ttl_int)
+
+    return IdentitySetInspection(
+        identity_key=identity_cache_key,
+        exists=exists,
+        members=members,
+        cardinality=cardinality,
+        ttl_remaining_seconds=ttl_remaining,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lua script: atomic compare-and-clear
+# ---------------------------------------------------------------------------
+#
+# KEYS layout:
+#   KEYS[1]              = receipt key
+#   KEYS[2..N+1]         = cooldown keys (N = num_cd)
+#   KEYS[N+2]            = identity set key
+#
+# ARGV layout:
+#   ARGV[1]  = num_cd (N)
+#   ARGV[2]  = num_expected (E)
+#   ARGV[3]  = num_remove (R)
+#   ARGV[4]  = receipt_ttl_seconds
+#   ARGV[5]  = receipt_json
+#   ARGV[6..5+E]         = expected members (drift check)
+#   ARGV[6+E..5+E+R]     = members to SREM
+#
+# Returns:
+#   1  -> success (all mutations applied)
+#   -1 -> membership drift detected (no mutations applied)
+
+_LUA_CLEAR_COOLDOWN_TRANSACTION = """
+local receipt_key = KEYS[1]
+local num_cd = tonumber(ARGV[1])
+local num_expected = tonumber(ARGV[2])
+local num_remove = tonumber(ARGV[3])
+local receipt_ttl = tonumber(ARGV[4])
+local receipt_json = ARGV[5]
+
+local id_key = KEYS[2 + num_cd]
+
+-- Phase 1: Drift check -- verify exact membership.
+local actual_members = redis.call('SMEMBERS', id_key)
+local actual_set = {}
+for _, m in ipairs(actual_members) do
+    actual_set[m] = true
+end
+local expected_set = {}
+for i = 1, num_expected do
+    local member = ARGV[5 + i]
+    expected_set[member] = true
+    if not actual_set[member] then
+        return -1
+    end
+end
+for _, m in ipairs(actual_members) do
+    if not expected_set[m] then
+        return -1
+    end
+end
+
+-- Phase 2: Journal pre-images (value + TTL) for cooldown keys.
+local preimages = {}
+for i = 1, num_cd do
+    local cd_key = KEYS[1 + i]
+    local val = redis.call('GET', cd_key)
+    local ttl = redis.call('TTL', cd_key)
+    preimages[i] = {val, ttl}
+end
+
+-- Phase 2b: Journal identity-set TTL before mutation.
+local id_ttl = redis.call('TTL', id_key)
+
+-- Phase 3: Delete selected cooldown keys.
+for i = 1, num_cd do
+    redis.call('DEL', KEYS[1 + i])
+end
+
+-- Phase 4: Remove selected members from identity set.
+for i = 1, num_remove do
+    local member = ARGV[5 + num_expected + i]
+    redis.call('SREM', id_key, member)
+end
+
+-- Phase 5: Delete identity set if now empty.
+if redis.call('SCARD', id_key) == 0 then
+    redis.call('DEL', id_key)
+end
+
+-- Phase 6: Journal post-images (state after mutation) for rollback drift check.
+local postimages = {}
+for i = 1, num_cd do
+    local cd_key = KEYS[1 + i]
+    local pval = redis.call('GET', cd_key)
+    local pttl = redis.call('TTL', cd_key)
+    postimages[i] = {pval, pttl}
+end
+local id_post_members = {}
+local id_post_card = redis.call('SCARD', id_key)
+if id_post_card > 0 then
+    id_post_members = redis.call('SMEMBERS', id_key)
+end
+local id_post_ttl = redis.call('TTL', id_key)
+
+-- Phase 7: Write receipt with exact pre-images and post-images for rollback.
+local preimage_arr = {}
+for i = 1, num_cd do
+    local entry = {}
+    entry['v'] = preimages[i][1]
+    entry['t'] = preimages[i][2]
+    preimage_arr[i] = entry
+end
+local postimage_arr = {}
+for i = 1, num_cd do
+    local entry = {}
+    entry['v'] = postimages[i][1]
+    entry['t'] = postimages[i][2]
+    postimage_arr[i] = entry
+end
+local receipt = cjson.decode(receipt_json)
+receipt['preimages'] = preimage_arr
+receipt['postimages'] = postimage_arr
+local id_entry = {}
+id_entry['members'] = actual_members
+id_entry['ttl'] = id_ttl
+id_entry['key'] = id_key
+receipt['identity_preimage'] = id_entry
+local id_post_entry = {}
+id_post_entry['members'] = id_post_members
+id_post_entry['ttl'] = id_post_ttl
+id_post_entry['key'] = id_key
+receipt['identity_postimage'] = id_post_entry
+local removed_arr = {}
+for i = 1, num_remove do
+    removed_arr[i] = ARGV[5 + num_expected + i]
+end
+receipt['removed_members'] = removed_arr
+redis.call('SET', receipt_key, cjson.encode(receipt))
+if receipt_ttl > 0 then
+    redis.call('EXPIRE', receipt_key, receipt_ttl)
+end
+
+return 1
+"""
+
+
+async def clear_cooldown_transaction(  # noqa: PLR0915
+    *,
+    alias_family: str,
+    identity_hash: str,
+    cooldown_keys: list,
+    expected_members: list,
+    lane_members: Optional[list] = None,
+    receipt_ttl_seconds: int = _DEFAULT_CLEAR_RECEIPT_TTL,
+) -> ClearTransactionResult:
+    """Atomic compare-and-clear: verify identity membership, delete cooldown
+    keys, remove selected members, delete empty sets.
+
+    One Lua EVAL: drift check, journal pre-images, DEL cooldown keys, SREM
+    members, DEL empty identity set, write receipt.
+
+    Fails closed: no Redis backend, missing EVAL, or Redis error raises
+    RuntimeError.  Membership drift raises MembershipDriftError.  Lost EVAL
+    response triggers reconciliation; indeterminate outcome raises
+    ClearIndeterminateError.
+
+    On success: strict postcondition verification, then DualCache in-memory
+    invalidation for each cooldown cache key.
+    """
+    if lane_members is None:
+        lane_members = list(expected_members)
+    context = f"clear-txn family={alias_family}"
+    family = _validate_alias_family(alias_family, context)
+    transaction_id = _uuid.uuid4().hex
+
+    dual_cache = get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: no Redis cache available"
+        )
+
+    # Build namespaced keys.
+    receipt_state_key = f"clear-receipt:{transaction_id}"
+    receipt_cache_key = build_aawm_alias_routing_durable_cache_key(
+        alias_family=family, state_kind="txn_receipt", state_key=receipt_state_key
+    )
+    cd_cache_keys = [
+        build_aawm_alias_routing_durable_cache_key(
+            alias_family=family, state_kind="cooldown", state_key=k
+        )
+        for k in cooldown_keys
+    ]
+    identity_cache_key = build_aawm_alias_routing_durable_cache_key(
+        alias_family=family, state_kind="lane_identity", state_key=identity_hash
+    )
+
+    redis_cache = getattr(dual_cache, "redis_cache", None)
+    if redis_cache is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: dual cache has no redis_cache"
+        )
+    init_fn = getattr(redis_cache, "init_async_client", None)
+    if not callable(init_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: missing init_async_client"
+        )
+    try:
+        client = init_fn()
+    except Exception as exc:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: failed to init redis client"
+        ) from exc
+    if client is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: redis client unavailable"
+        )
+    eval_fn = getattr(client, "eval", None)
+    if not callable(eval_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: "
+            "redis client missing eval (atomic transaction unavailable)"
+        )
+
+    fix_ns = getattr(redis_cache, "check_and_fix_namespace", None)
+
+    def _ns(key: str) -> str:
+        return fix_ns(key=key) if callable(fix_ns) else key
+
+    ns_receipt = _ns(receipt_cache_key)
+    ns_cd_keys = [_ns(k) for k in cd_cache_keys]
+    ns_id_key = _ns(identity_cache_key)
+
+    num_cd = len(cooldown_keys)
+    num_expected = len(expected_members)
+    num_remove = len(lane_members)
+    rcpt_ttl = max(1, int(receipt_ttl_seconds))
+
+    receipt = {
+        "txn_id": transaction_id,
+        "family": family,
+        "num_keys": num_cd,
+        "operation": "clear",
+    }
+    receipt_json = _json.dumps(receipt, separators=(",", ":"))
+
+    # KEYS: [receipt, cd_keys..., id_key]
+    keys = [ns_receipt] + ns_cd_keys + [ns_id_key]
+    # ARGV: [num_cd, num_expected, num_remove, receipt_ttl, receipt_json,
+    #         expected_members..., lane_members...]
+    argv = (
+        [str(num_cd), str(num_expected), str(num_remove), str(rcpt_ttl), receipt_json]
+        + list(expected_members)
+        + list(lane_members)
+    )
+
+    try:
+        result = await eval_fn(
+            _LUA_CLEAR_COOLDOWN_TRANSACTION,
+            len(keys),
+            *keys,
+            *argv,
+        )
+    except Exception as exc:
+        # Lost EVAL response: reconcile via receipt presence.
+        try:
+            committed = await reconcile_clear_transaction(
+                alias_family=family,
+                transaction_id=transaction_id,
+                cooldown_cache_keys=ns_cd_keys,
+                identity_cache_key=ns_id_key,
+                lane_members=list(lane_members),
+            )
+            if committed:
+                # Run ALL strict Redis postconditions (never skip on
+                # reconciled commit).
+                get_fn_r = getattr(client, "get", None)
+                if not callable(get_fn_r):
+                    raise RuntimeError(
+                        f"AAWM alias routing durable {context}: "
+                        "postcondition check unavailable (missing get)"
+                    )
+                for ns_key_r in ns_cd_keys:
+                    raw_r = await get_fn_r(ns_key_r)
+                    if raw_r is not None:
+                        raise RuntimeError(
+                            f"AAWM alias routing durable {context}: "
+                            "cooldown key still present after reconciled clear"
+                        )
+                sismember_fn_r = getattr(client, "sismember", None)
+                if not callable(sismember_fn_r):
+                    raise RuntimeError(
+                        f"AAWM alias routing durable {context}: "
+                        "postcondition check unavailable (missing sismember)"
+                    )
+                for member_r in lane_members:
+                    still_r = await sismember_fn_r(ns_id_key, member_r)
+                    if still_r:
+                        raise RuntimeError(
+                            f"AAWM alias routing durable {context}: "
+                            "member still in identity set after reconciled clear"
+                        )
+                # Mandatory DualCache invalidation (never swallow errors).
+                _invalidate_in_memory_keys(dual_cache, cd_cache_keys, context)
+                journal = ClearTransactionJournal(
+                    transaction_id=transaction_id,
+                    phase=PHASE_CLEAR_COMMITTED,
+                    alias_family=family,
+                    identity_hash=identity_hash,
+                    cooldown_keys=list(cooldown_keys),
+                    lane_members=list(lane_members),
+                    expected_members=list(expected_members),
+                    identity_key=identity_cache_key,
+                    receipt_key=receipt_cache_key,
+                    receipt_ttl=rcpt_ttl,
+                )
+                return ClearTransactionResult(
+                    transaction_id=transaction_id,
+                    phase=PHASE_CLEAR_COMMITTED,
+                    journal=journal,
+                    keys_deleted=num_cd,
+                    members_removed=num_remove,
+                )
+        except (ClearIndeterminateError, RollbackFailedError, RuntimeError):
+            raise
+        except Exception:
+            pass
+        raise ClearIndeterminateError(
+            phase=PHASE_PREPARED,
+            family=family,
+            transaction_id_prefix=transaction_id[:12],
+            identity_prefix=identity_hash[:12],
+            key_count=num_cd,
+            exception_classes=_sanitize_exception_classes(exc),
+        ) from None
+
+    code = int(result)
+    if code == -1:
+        raise MembershipDriftError(
+            phase=PHASE_PREPARED,
+            family=family,
+            transaction_id_prefix=transaction_id[:12],
+            identity_prefix=identity_hash[:12],
+            key_count=num_cd,
+            exception_classes=(),
+        )
+    if code != 1:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: unexpected lua result {code}"
+        )
+
+    # Strict postcondition verification.
+    get_fn = getattr(client, "get", None)
+    if not callable(get_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: "
+            "postcondition check unavailable (missing get)"
+        )
+    for ns_key in ns_cd_keys:
+        try:
+            raw = await get_fn(ns_key)
+        except Exception as exc:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "postcondition check failed"
+            ) from exc
+        if raw is not None:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "cooldown key still present after clear"
+            )
+    sismember_fn = getattr(client, "sismember", None)
+    if not callable(sismember_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: "
+            "postcondition check unavailable (missing sismember)"
+        )
+    for member in lane_members:
+        try:
+            still = await sismember_fn(ns_id_key, member)
+        except Exception as exc:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "postcondition membership check failed"
+            ) from exc
+        if still:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "member still in identity set after clear"
+            )
+
+    # DualCache in-memory invalidation.
+    _invalidate_in_memory_keys(dual_cache, cd_cache_keys, context)
+
+    journal = ClearTransactionJournal(
+        transaction_id=transaction_id,
+        phase=PHASE_CLEAR_COMMITTED,
+        alias_family=family,
+        identity_hash=identity_hash,
+        cooldown_keys=list(cooldown_keys),
+        lane_members=list(lane_members),
+        expected_members=list(expected_members),
+        identity_key=identity_cache_key,
+        receipt_key=receipt_cache_key,
+        receipt_ttl=rcpt_ttl,
+    )
+    return ClearTransactionResult(
+        transaction_id=transaction_id,
+        phase=PHASE_CLEAR_COMMITTED,
+        journal=journal,
+        keys_deleted=num_cd,
+        members_removed=num_remove,
+    )
+
+
+async def reconcile_clear_transaction(
+    *,
+    alias_family: str,
+    transaction_id: str,
+    cooldown_cache_keys: list[str],
+    identity_cache_key: str,
+    lane_members: list[str],
+) -> bool:
+    """Reconcile after lost EVAL response for a clear transaction.
+
+    Checks whether the clear receipt key exists (commit evidence only).
+    When the receipt is present, verifies the full clear post-image:
+    every cooldown key must be absent and every lane member must be
+    absent from the identity set.  Receipt existence alone never
+    authorizes success.
+    Returns True only when receipt AND all postconditions hold.
+    Returns False if the receipt is absent (no commit occurred).
+    Fails closed on Redis errors or postcondition violations.
+    """
+    context = f"reconcile-clear family={alias_family} txn={transaction_id[:12]}"
+    family = _validate_alias_family(alias_family, context)
+    dual_cache = get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: no Redis cache available"
+        )
+    receipt_state_key = f"clear-receipt:{transaction_id}"
+    receipt_cache_key = build_aawm_alias_routing_durable_cache_key(
+        alias_family=family, state_kind="txn_receipt", state_key=receipt_state_key
+    )
+    redis_cache = getattr(dual_cache, "redis_cache", None)
+    if redis_cache is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: dual cache has no redis_cache"
+        )
+    init_fn = getattr(redis_cache, "init_async_client", None)
+    if not callable(init_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: missing init_async_client"
+        )
+    try:
+        client = init_fn()
+    except Exception as exc:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: client init failed"
+        ) from exc
+    if client is None:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: client unavailable"
+        )
+    fix_ns = getattr(redis_cache, "check_and_fix_namespace", None)
+    ns_key = fix_ns(key=receipt_cache_key) if callable(fix_ns) else receipt_cache_key
+    get_fn = getattr(client, "get", None)
+    if not callable(get_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: client missing get"
+        )
+    try:
+        raw = await get_fn(ns_key)
+    except Exception as exc:
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: receipt check failed"
+        ) from exc
+    if raw is None:
+        return False
+
+    # Strict postcondition: verify clear post-image.
+    # Receipt is commit evidence only; success requires full post-image.
+    for cd_key in cooldown_cache_keys:
+        try:
+            cd_raw = await get_fn(cd_key)
+        except Exception as exc:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "clear postcondition check failed"
+            ) from exc
+        if cd_raw is not None:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "cooldown key still present after reconciled clear"
+            )
+    sismember_fn = getattr(client, "sismember", None)
+    if not callable(sismember_fn):
+        raise RuntimeError(
+            f"AAWM alias routing durable {context}: "
+            "postcondition check unavailable (missing sismember)"
+        )
+    for member in lane_members:
+        try:
+            still = await sismember_fn(identity_cache_key, member)
+        except Exception as exc:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "clear membership postcondition failed"
+            ) from exc
+        if still:
+            raise RuntimeError(
+                f"AAWM alias routing durable {context}: "
+                "member still in identity set after reconciled clear"
+            )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Lua script: rollback clear transaction
+# ---------------------------------------------------------------------------
+#
+# Restores exact pre-images from the clear receipt: cooldown key values
+# and TTLs (including -1 persistent and -2 absent), identity set members,
+# and identity key TTL.  Deletes the receipt on full success.
+#
+# KEYS layout:
+#   KEYS[1]           = receipt key
+#   KEYS[2..N+1]      = cooldown keys (N = num_cd)
+#   KEYS[N+2]         = identity set key
+#
+# ARGV layout:
+#   ARGV[1]  = num_cd (N)
+#
+# Returns:
+#   1  -> success
+#   -1 -> receipt missing (nothing to restore)
+#   -2 -> parse/partial error (receipt RETAINED for forensics)
+
+_LUA_ROLLBACK_CLEAR_TRANSACTION = """
+local receipt_key = KEYS[1]
+local num_cd = tonumber(ARGV[1])
+
+local receipt_raw = redis.call('GET', receipt_key)
+if not receipt_raw then
+    return -1
+end
+
+local ok, receipt = pcall(cjson.decode, receipt_raw)
+if not ok then
+    return -2
+end
+
+local preimages = receipt['preimages']
+if not preimages then
+    return -2
+end
+
+-- Phase 1: Drift check -- compare exact current state to post-image.
+-- If current state does not match the recorded post-image, another writer
+-- modified state after the commit; rollback must reject.
+local postimages = receipt['postimages']
+if postimages then
+    for i = 1, num_cd do
+        local cd_key = KEYS[1 + i]
+        local cur_val = redis.call('GET', cd_key)
+        local cur_ttl = redis.call('TTL', cd_key)
+        local post = postimages[i]
+        if post then
+            local post_val = post['v']
+            local post_ttl = tonumber(post['t'])
+            -- Compare values (nil/false equivalence for absent keys)
+            local cur_absent = (cur_val == false or cur_val == nil)
+            local post_absent = (post_val == false or post_val == nil)
+            if cur_absent ~= post_absent then
+                return -3
+            end
+            if not cur_absent and cur_val ~= post_val then
+                return -3
+            end
+            -- TTL comparison: allow 1-second tolerance for elapsed time
+            if post_ttl >= 0 and cur_ttl >= 0 then
+                if math.abs(cur_ttl - post_ttl) > 1 then
+                    return -3
+                end
+            elseif post_ttl ~= cur_ttl then
+                -- -1 vs -2 or -1 vs positive: drift
+                if not (post_ttl < 0 and cur_ttl < 0) then
+                    return -3
+                end
+            end
+        end
+    end
+end
+
+-- Phase 1b: Identity set drift check against post-image.
+local id_postimage = receipt['identity_postimage']
+if id_postimage and id_postimage['key'] then
+    local id_key = id_postimage['key']
+    local post_members = id_postimage['members']
+    local post_set = {}
+    local post_count = 0
+    if post_members then
+        for _, m in ipairs(post_members) do
+            post_set[m] = true
+            post_count = post_count + 1
+        end
+    end
+    local cur_card = redis.call('SCARD', id_key)
+    if cur_card ~= post_count then
+        return -3
+    end
+    if cur_card > 0 then
+        local cur_members = redis.call('SMEMBERS', id_key)
+        for _, m in ipairs(cur_members) do
+            if not post_set[m] then
+                return -3
+            end
+        end
+    end
+end
+
+-- Phase 2: Restore cooldown key pre-images.
+for i = 1, num_cd do
+    local cd_key = KEYS[1 + i]
+    local entry = preimages[i]
+    if entry then
+        local val = entry['v']
+        local ttl = tonumber(entry['t'])
+        if ttl == -2 or val == false or val == nil then
+            redis.call('DEL', cd_key)
+        else
+            redis.call('SET', cd_key, val)
+            if ttl == -1 then
+                redis.call('PERSIST', cd_key)
+            elseif ttl > 0 then
+                redis.call('EXPIRE', cd_key, ttl)
+            end
+        end
+    else
+        redis.call('DEL', cd_key)
+    end
+end
+
+-- Phase 3: Restore identity set from pre-image.
+local id_preimage = receipt['identity_preimage']
+if id_preimage and id_preimage['key'] then
+    local id_key = id_preimage['key']
+    -- Clear current membership and restore exact pre-image.
+    redis.call('DEL', id_key)
+    local prior_members = id_preimage['members']
+    if prior_members then
+        for _, m in ipairs(prior_members) do
+            redis.call('SADD', id_key, m)
+        end
+    end
+    local id_ttl = tonumber(id_preimage['ttl'])
+    if id_ttl == -2 then
+        redis.call('DEL', id_key)
+    elseif id_ttl == -1 then
+        redis.call('PERSIST', id_key)
+    elseif id_ttl and id_ttl > 0 then
+        redis.call('EXPIRE', id_key, id_ttl)
+    end
+end
+
+-- Phase 4: Delete receipt (only on full success).
+redis.call('DEL', receipt_key)
+
+return 1
+"""
+
+
+async def rollback_clear_transaction(
+    *,
+    alias_family: str,
+    journal: ClearTransactionJournal,
+) -> None:
+    """Restore exact pre-images from a committed clear transaction atomically.
+
+    Executes a single Lua EVAL that reads the receipt, restores cooldown
+    key pre-images (including TTL -1 persistent and -2 absent semantics),
+    restores identity set members and TTL, and deletes the receipt.
+
+    On restoration error the receipt is RETAINED (not deleted) so operators
+    can inspect the failure.  Any failure raises RollbackFailedError with
+    sanitized context.
+    """
+    context = (
+        f"rollback-clear family={alias_family} txn={journal.transaction_id[:12]}"
+    )
+    family = _validate_alias_family(alias_family, context)
+    dual_cache = get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        raise RollbackFailedError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=len(journal.cooldown_keys),
+            exception_classes=("RuntimeError",),
+        )
+    redis_cache = getattr(dual_cache, "redis_cache", None)
+    if redis_cache is None:
+        raise RollbackFailedError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=len(journal.cooldown_keys),
+            exception_classes=("RuntimeError",),
+        )
+    init_fn = getattr(redis_cache, "init_async_client", None)
+    if not callable(init_fn):
+        raise RollbackFailedError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=len(journal.cooldown_keys),
+            exception_classes=("RuntimeError",),
+        )
+    try:
+        client = init_fn()
+    except Exception as exc:
+        raise RollbackFailedError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=len(journal.cooldown_keys),
+            exception_classes=_sanitize_exception_classes(exc),
+        ) from None
+    if client is None:
+        raise RollbackFailedError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=len(journal.cooldown_keys),
+            exception_classes=("RuntimeError",),
+        )
+    eval_fn = getattr(client, "eval", None)
+    if not callable(eval_fn):
+        raise RollbackFailedError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=len(journal.cooldown_keys),
+            exception_classes=("RuntimeError",),
+        )
+
+    fix_ns = getattr(redis_cache, "check_and_fix_namespace", None)
+
+    def _ns(key: str) -> str:
+        return fix_ns(key=key) if callable(fix_ns) else key
+
+    num_cd = len(journal.cooldown_keys)
+    ns_receipt = _ns(journal.receipt_key)
+    ns_cd_keys = [
+        _ns(
+            build_aawm_alias_routing_durable_cache_key(
+                alias_family=family, state_kind="cooldown", state_key=k
+            )
+        )
+        for k in journal.cooldown_keys
+    ]
+    ns_id_key = _ns(journal.identity_key)
+
+    keys = [ns_receipt] + ns_cd_keys + [ns_id_key]
+    argv = [str(num_cd)]
+
+    try:
+        result = await eval_fn(
+            _LUA_ROLLBACK_CLEAR_TRANSACTION,
+            len(keys),
+            *keys,
+            *argv,
+        )
+    except Exception as exc:
+        raise RollbackFailedError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=num_cd,
+            exception_classes=_sanitize_exception_classes(exc),
+        ) from None
+
+    code = int(result)
+    if code == -1:
+        raise RollbackReceiptMissingError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=num_cd,
+            exception_classes=(),
+        )
+    if code == -3:
+        raise RollbackDriftError(
+            phase=journal.phase,
+            family=family,
+            transaction_id_prefix=journal.transaction_id[:12],
+            identity_prefix=journal.identity_hash[:12],
+            key_count=num_cd,
+            exception_classes=(),
+        )
     if code != 1:
         raise RollbackFailedError(
             phase=journal.phase,

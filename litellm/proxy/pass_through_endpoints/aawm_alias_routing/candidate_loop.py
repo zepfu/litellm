@@ -29,6 +29,7 @@ otherwise depends only on the typed :class:`AliasRouteServices` seams.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import TYPE_CHECKING, Any, Optional
 
 from litellm.proxy.aawm_route_logging import (
@@ -54,6 +55,58 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from starlette.responses import Response
 
     from .types import Payload
+
+
+# ---------------------------------------------------------------------------
+# Injected lane-identity calculator (CFG-004 Wave A facade boundary)
+# ---------------------------------------------------------------------------
+#
+# The candidate loop must NOT import ``cooldown_apply`` directly: that module
+# owns the publication transaction and is a sibling owner.  The identity
+# calculator is injected through this seam during god-module facade setup
+# (``configure_candidate_loop_runtime``); the fallback below reproduces the
+# canonical public-identity hash so the loop stays correct standalone and in
+# tests that do not wire the integrator.
+
+
+def _default_lane_identity_hash(*, candidate: dict[str, Any]) -> str:
+    """Secret-safe identity hash from public candidate identity (fallback).
+
+    Mirrors ``cooldown_apply.resolve_lane_identity_hash``: identity is derived
+    from ``provider:model:route_family`` ONLY -- never from lane_key or
+    credentials -- so one identity maps to many credential-derived lane keys.
+    """
+    provider = str(candidate.get("provider") or "")
+    model = str(candidate.get("model") or "")
+    route_family = str(candidate.get("route_family") or "")
+    identity_input = f"{provider}:{model}:{route_family}"
+    return hashlib.sha256(identity_input.encode("utf-8")).hexdigest()
+
+
+_resolve_lane_identity_hash_fn = _default_lane_identity_hash
+
+
+def configure_candidate_loop_runtime(
+    *,
+    resolve_lane_identity_hash_fn: Optional[Any] = None,
+) -> None:
+    """Inject the canonical lane-identity calculator (facade boundary).
+
+    The integrator wires ``cooldown_apply.resolve_lane_identity_hash`` here
+    during god-module facade setup so the loop uses the single canonical
+    implementation without importing ``cooldown_apply``.  Passing ``None``
+    restores the built-in fallback.
+    """
+    global _resolve_lane_identity_hash_fn
+    _resolve_lane_identity_hash_fn = (
+        resolve_lane_identity_hash_fn
+        if resolve_lane_identity_hash_fn is not None
+        else _default_lane_identity_hash
+    )
+
+
+def _active_lane_identity_hash(*, candidate: dict[str, Any]) -> str:
+    return _resolve_lane_identity_hash_fn(candidate=candidate)
 
 
 async def handle_alias_route(  # noqa: PLR0915
@@ -254,15 +307,34 @@ async def handle_alias_route(  # noqa: PLR0915
 
             # Follower path: an active intent means a leader is probing or
             # publishing for this key.  Await completion, then re-select.
-            existing_intent = alias_routing_state.publication_intents.get(
-                alias_family,
-                selection["cooldown_key"],
+            # CFG-004 Defect 1 fix: atomic claim_publication_or_wait checks
+            # clear reservations AND active intents AND claims a leader intent
+            # in ONE registry-lock critical section.  This closes the race
+            # where a clear reservation could be created between the intent
+            # claim and a separate get_clear_reservation check.
+            from .state import ClaimOutcome
+
+            _claim = alias_routing_state.publication_intents.claim_publication_or_wait(
+                alias_family=alias_family,
+                cooldown_keys=frozenset({selection["cooldown_key"]}),
+                identity_hash=_active_lane_identity_hash(candidate=candidate),
             )
-            if existing_intent is not None and not existing_intent.done.is_set():
+            if _claim.outcome is ClaimOutcome.BLOCKED_BY_CLEAR:
+                # Clear reservation covers this key: wait, then reselect
+                # without provider I/O.
                 probe_lock.release()
-                await existing_intent.done.wait()
+                assert _claim.clear_reservation is not None
+                await _claim.clear_reservation.done.wait()
                 skip_after_probe_wait = True
                 break
+            if _claim.outcome is ClaimOutcome.FOLLOWER:
+                probe_lock.release()
+                assert _claim.intent is not None
+                await _claim.intent.done.wait()
+                skip_after_probe_wait = True
+                break
+            assert _claim.intent is not None
+            intent = _claim.intent
 
             # TOCTOU guard: the pre-check ran BEFORE probe lock acquisition.
             # A concurrent leader may have completed publication (cooldown
@@ -285,22 +357,12 @@ async def handle_alias_route(  # noqa: PLR0915
             # If the pre-check found an active cooldown or raised, we still
             # need to create + complete the intent so followers are notified.
             if skip_after_probe_wait or probe_failure_exc is not None:
-                intent = alias_routing_state.publication_intents.create(
-                    alias_family=alias_family,
-                    cooldown_keys=frozenset({selection["cooldown_key"]}),
-                )
                 probe_lock.release()
                 intent.complete(error=probe_failure_exc)
                 alias_routing_state.publication_intents.remove(intent)
                 if probe_failure_exc is not None:
                     raise probe_failure_exc
                 break
-
-            # Leader path: create intent BEFORE provider I/O.
-            intent = alias_routing_state.publication_intents.create(
-                alias_family=alias_family,
-                cooldown_keys=frozenset({selection["cooldown_key"]}),
-            )
 
             # BaseException-safe: intent is ALWAYS completed and removed,
             # probe lock is ALWAYS released, regardless of exception type

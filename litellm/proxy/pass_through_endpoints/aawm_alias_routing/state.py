@@ -13,7 +13,7 @@ import threading
 import uuid
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, auto
 from typing import Optional, Sequence, Tuple
 
 from .memory import (
@@ -49,6 +49,24 @@ _ALIAS_FAMILY_CANONICAL_MAP: dict[str, str] = {
 _DEFAULT_CANONICAL_FAMILY = "codex"
 
 
+def validate_alias_family(alias_family: str) -> str:
+    """Strictly validate and canonicalize an alias_family label.
+
+    Accepts only canonical ``codex``/``anthropic`` and production aliases
+    ``codex_auto_agent``/``anthropic_auto_agent`` (case/whitespace-insensitive).
+    Raises ``ValueError`` for unknown labels BEFORE any state lookup, lock
+    acquisition, generation bump, or clear can occur.
+    """
+    stripped = alias_family.strip().lower()
+    canonical = _ALIAS_FAMILY_CANONICAL_MAP.get(stripped)
+    if canonical is None:
+        raise ValueError(
+            f"Unknown alias_family {alias_family!r}; "
+            f"expected one of {sorted(_ALIAS_FAMILY_CANONICAL_MAP)}"
+        )
+    return canonical
+
+
 def canonicalize_alias_family(alias_family: str) -> str:
     """Resolve an alias_family label to its canonical family name.
 
@@ -74,6 +92,36 @@ class RegisterBatchOutcome(Enum):
     CAPACITY_REJECTED = "capacity_rejected"
 
 
+class ClearReservationStatus(Enum):
+    """Lifecycle status of a clear reservation (CFG-004 Wave A)."""
+
+    ACTIVE = auto()
+    COMPLETED = auto()
+
+
+@dataclass
+class ClearReservation:
+    """Atomic multi-identity clear reservation blocking first-ever publication.
+
+    Created when an operator or automated process clears cooldown state for
+    one or more identities.  While ACTIVE, any candidate loop that encounters
+    a cooldown_key covered by this reservation must wait/reselect WITHOUT
+    performing provider I/O.  This prevents a race where a first-ever lane
+    publication succeeds between the clear request and the clear execution.
+    """
+
+    reservation_id: str
+    alias_family: str
+    identity_hashes: frozenset[str]
+    cooldown_keys: frozenset[str]
+    status: ClearReservationStatus = ClearReservationStatus.ACTIVE
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def complete(self) -> None:
+        self.status = ClearReservationStatus.COMPLETED
+        self.done.set()
+
+
 @dataclass
 class AliasFamilyState:
     """Cooldown + affinity state for one auto-agent alias family (codex/anthropic)."""
@@ -83,6 +131,27 @@ class AliasFamilyState:
     cooldown_negative_until_monotonic_by_key: dict[str, float] = field(default_factory=dict)
     session_affinity_by_key: dict[str, Payload] = field(default_factory=dict)
     evidence_events_by_key: dict[str, list[float]] = field(default_factory=dict)
+    # CFG-004 Wave A: monotonic generation counter incremented on every clear.
+    # Durable reads capture the generation before I/O and discard/retry if it
+    # changes before hydration, preventing stale rehydration after a clear.
+    # Per-key generation: each key tracks its own clear count so an unrelated
+    # clear of key A cannot discard a valid in-flight read for key B.
+    cooldown_generation_by_key: dict[str, int] = field(default_factory=dict)
+
+    def get_generation(self, cooldown_key: str) -> int:
+        """Return the per-key generation counter (0 for never-cleared keys)."""
+        return self.cooldown_generation_by_key.get(cooldown_key, 0)
+
+    def bump_generation(self, keys: Sequence[str]) -> None:
+        """Increment per-key generation counters for the given keys.
+
+        Called by ``clear_cooldown_state`` so stale durable reads that
+        captured a prior generation detect the intervening clear.
+        """
+        for key in keys:
+            self.cooldown_generation_by_key[key] = (
+                self.cooldown_generation_by_key.get(key, 0) + 1
+            )
 
     def get_memory_cooldown_remaining(self, cooldown_key: str) -> float:
         now = time.monotonic()
@@ -216,6 +285,8 @@ class AliasFamilyState:
                 negative_cleared.append(key)
             if self.evidence_events_by_key.pop(key, None) is not None:
                 evidence_cleared.append(key)
+        # Advance per-key generation so stale durable reads are detected.
+        self.bump_generation(cooldown_keys)
         return positive_cleared, negative_cleared, evidence_cleared
 
     def get_affinity_memory(self, session_key: str) -> Optional[Payload]:
@@ -275,6 +346,9 @@ class AliasFamilyState:
         self.cooldown_negative_until_monotonic_by_key.clear()
         self.session_affinity_by_key.clear()
         self.evidence_events_by_key.clear()
+        # Bump generation for every tracked key so any in-flight durable read
+        # (which captured a prior generation) is invalidated.
+        self.bump_generation(list(self.cooldown_generation_by_key))
 
 
 @dataclass
@@ -305,6 +379,7 @@ class PublicationIntent:
     transaction_id: str
     alias_family: str
     cooldown_keys: frozenset[str]
+    identity_hash: str = ""
     done: asyncio.Event = field(default_factory=asyncio.Event)
     error: Optional[BaseException] = None
     plan: Optional[object] = None  # CooldownPublicationPlan, set on failure
@@ -312,6 +387,42 @@ class PublicationIntent:
     def complete(self, *, error: Optional[BaseException] = None) -> None:
         self.error = error
         self.done.set()
+
+
+@dataclass
+class ReserveOrClaimResult:
+    """Result of PublicationIntentRegistry.reserve_or_claim (CFG-004 Wave A).
+
+    ``is_leader`` is True when this call created the intent; False when an
+    existing active intent was found (follower path).
+    """
+
+    intent: PublicationIntent
+    is_leader: bool
+
+
+class ClaimOutcome(Enum):
+    """Outcome of PublicationIntentRegistry.claim_publication_or_wait (CFG-004)."""
+
+    LEADER = auto()
+    FOLLOWER = auto()
+    BLOCKED_BY_CLEAR = auto()
+
+
+@dataclass
+class ClaimPublicationResult:
+    """Result of atomic publication-claim vs clear-reservation check.
+
+    Closes the race where a clear reservation can be created between the
+    intent claim and the separate clear-reservation check (Defect 1).
+    Under the registry threading lock, this atomically checks for active
+    clear reservations AND active intents, then claims a new leader intent
+    only if neither blocks the publication.
+    """
+
+    outcome: ClaimOutcome
+    intent: Optional[PublicationIntent] = None
+    clear_reservation: Optional[ClearReservation] = None
 
 
 def _new_transaction_id() -> str:
@@ -327,27 +438,136 @@ class PublicationIntentRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._intents: dict[str, PublicationIntent] = {}
+        self._intents: dict[tuple[str, str], PublicationIntent] = {}
+        self._clear_reservations: dict[tuple[str, str], ClearReservation] = {}
 
     def create(
         self,
         *,
         alias_family: str,
         cooldown_keys: frozenset[str],
+        identity_hash: str = "",
     ) -> PublicationIntent:
+        canonical = validate_alias_family(alias_family)
         intent = PublicationIntent(
             transaction_id=_new_transaction_id(),
-            alias_family=alias_family,
+            alias_family=canonical,
             cooldown_keys=cooldown_keys,
+            identity_hash=identity_hash,
         )
         with self._lock:
             for key in cooldown_keys:
-                self._intents[(alias_family, key)] = intent
+                self._intents[(canonical, key)] = intent
         return intent
 
-    def get(self, alias_family: str, cooldown_key: str) -> Optional[PublicationIntent]:
+    def reserve_or_claim(
+        self,
+        *,
+        alias_family: str,
+        cooldown_keys: frozenset[str],
+        identity_hash: str = "",
+    ) -> ReserveOrClaimResult:
+        """Atomically check for existing intents and claim if none exist.
+
+        Closes the lookup/create race: under the threading lock, checks all
+        ``cooldown_keys`` for active (not done) intents.  If any key has an
+        active intent, returns that intent as a follower (``is_leader=False``).
+        Otherwise creates a new intent, registers it for all keys, and returns
+        it as the leader (``is_leader=True``).
+
+        Overlapping multi-identity reservations: keys that already have a
+        *completed* intent are simply overwritten.  Keys with *active* intents
+        cause a follower return, preventing overwrite of a concurrent leader.
+        Thread-safe.
+        """
+        canonical = validate_alias_family(alias_family)
         with self._lock:
-            return self._intents.get((alias_family, cooldown_key))
+            for key in cooldown_keys:
+                existing = self._intents.get((canonical, key))
+                if existing is not None and not existing.done.is_set():
+                    return ReserveOrClaimResult(intent=existing, is_leader=False)
+            intent = PublicationIntent(
+                transaction_id=_new_transaction_id(),
+                alias_family=canonical,
+                cooldown_keys=cooldown_keys,
+                identity_hash=identity_hash,
+            )
+            for key in cooldown_keys:
+                self._intents[(canonical, key)] = intent
+            return ReserveOrClaimResult(intent=intent, is_leader=True)
+
+    def claim_publication_or_wait(
+        self,
+        *,
+        alias_family: str,
+        cooldown_keys: frozenset[str],
+        identity_hash: str = "",
+    ) -> ClaimPublicationResult:
+        """Atomically check clear reservations AND active intents, then claim.
+
+        Under the registry threading lock this performs THREE checks in one
+        critical section, closing the Defect-1 race where a clear reservation
+        could be created between the intent claim and the separate
+        ``get_clear_reservation`` check:
+
+        1. If any ``cooldown_key`` has an ACTIVE clear reservation, return
+           ``BLOCKED_BY_CLEAR`` with that reservation (caller awaits its
+           ``done`` event, then reselects -- no provider I/O).
+        2. If any ``cooldown_key`` has an active (not-done) publication
+           intent, return ``FOLLOWER`` with that intent (caller awaits
+           ``done``, then reselects).
+        3. Otherwise, create a new leader intent registered for all keys
+           and return ``LEADER``.
+
+        Thread-safe.  The caller must hold the probe lock for the primary
+        cooldown_key before calling this (single-flight serialization).
+        """
+        canonical = validate_alias_family(alias_family)
+        with self._lock:
+            # 1. Check clear reservations first (higher priority block).
+            for key in cooldown_keys:
+                res = self._clear_reservations.get((canonical, key))
+                if res is not None and res.status is ClearReservationStatus.ACTIVE:
+                    return ClaimPublicationResult(
+                        outcome=ClaimOutcome.BLOCKED_BY_CLEAR,
+                        clear_reservation=res,
+                    )
+            # 2. Check active publication intents.
+            for key in cooldown_keys:
+                existing = self._intents.get((canonical, key))
+                if existing is not None and not existing.done.is_set():
+                    return ClaimPublicationResult(
+                        outcome=ClaimOutcome.FOLLOWER,
+                        intent=existing,
+                    )
+            # 3. Claim leader.
+            intent = PublicationIntent(
+                transaction_id=_new_transaction_id(),
+                alias_family=canonical,
+                cooldown_keys=cooldown_keys,
+                identity_hash=identity_hash,
+            )
+            for key in cooldown_keys:
+                self._intents[(canonical, key)] = intent
+            return ClaimPublicationResult(
+                outcome=ClaimOutcome.LEADER,
+                intent=intent,
+            )
+
+    def release_claim(self, intent: PublicationIntent) -> None:
+        """Complete and remove a leader intent that will not probe.
+
+        Convenience wrapper for the blocked/skip paths: signals followers
+        and removes the intent from the registry in one call.
+        """
+        if not intent.done.is_set():
+            intent.complete()
+        self.remove(intent)
+
+    def get(self, alias_family: str, cooldown_key: str) -> Optional[PublicationIntent]:
+        canonical = validate_alias_family(alias_family)
+        with self._lock:
+            return self._intents.get((canonical, cooldown_key))
 
     def remove(self, intent: PublicationIntent) -> None:
         with self._lock:
@@ -356,9 +576,101 @@ class PublicationIntentRegistry:
                 if self._intents.get(composite) is intent:
                     self._intents.pop(composite, None)
 
+    # ------------------------------------------------------------------
+    # Clear reservations (CFG-004 Wave A)
+    # ------------------------------------------------------------------
+
+    def create_clear_reservation(
+        self,
+        *,
+        alias_family: str,
+        identity_hashes: frozenset[str],
+        cooldown_keys: frozenset[str],
+    ) -> ClearReservation:
+        """Atomically create a clear reservation with transitive coalescing.
+
+        Blocks first-ever lane publication for all cooldown_keys until
+        the reservation is completed.
+
+        Transitive all-or-none coalescing: if the new keys overlap TWO or
+        more existing ACTIVE reservations (bridge topology), ALL overlapping
+        reservations are merged into a single survivor.  Non-survivor
+        reservations are completed (their ``done`` events fire) so their
+        waiters wake and reselect, converging on the survivor.  This prevents
+        split objects, orphaned waiters, and deadlocks.
+
+        Thread-safe.
+        """
+        canonical = validate_alias_family(alias_family)
+        with self._lock:
+            # Find ALL distinct ACTIVE reservations overlapping any of our keys.
+            overlapping: list[ClearReservation] = []
+            seen_ids: set[int] = set()
+            for key in cooldown_keys:
+                res = self._clear_reservations.get((canonical, key))
+                if res is not None and res.status is ClearReservationStatus.ACTIVE:
+                    if id(res) not in seen_ids:
+                        seen_ids.add(id(res))
+                        overlapping.append(res)
+
+            if overlapping:
+                # Deterministic survivor: lowest reservation_id.
+                survivor = min(overlapping, key=lambda r: r.reservation_id)
+                merged_identities: frozenset[str] = identity_hashes
+                merged_keys: set[str] = set(cooldown_keys)
+                for res in overlapping:
+                    merged_identities = merged_identities | res.identity_hashes
+                    merged_keys = merged_keys | set(res.cooldown_keys)
+
+                object.__setattr__(survivor, "identity_hashes", merged_identities)
+                object.__setattr__(survivor, "cooldown_keys", frozenset(merged_keys))
+
+                # Point ALL merged keys to the survivor.
+                for key in merged_keys:
+                    self._clear_reservations[(canonical, key)] = survivor
+
+                # Complete non-survivors so their waiters wake and reselect.
+                for res in overlapping:
+                    if res is not survivor:
+                        res.complete()
+
+                return survivor
+
+            # No overlap: create fresh reservation.
+            reservation = ClearReservation(
+                reservation_id=_new_transaction_id(),
+                alias_family=canonical,
+                identity_hashes=identity_hashes,
+                cooldown_keys=cooldown_keys,
+            )
+            for key in cooldown_keys:
+                self._clear_reservations[(canonical, key)] = reservation
+            return reservation
+
+    def get_clear_reservation(
+        self, alias_family: str, cooldown_key: str
+    ) -> Optional[ClearReservation]:
+        """Return the ACTIVE clear reservation for a key, or None."""
+        canonical = validate_alias_family(alias_family)
+        with self._lock:
+            res = self._clear_reservations.get((canonical, cooldown_key))
+            if res is not None and res.status is ClearReservationStatus.ACTIVE:
+                return res
+            return None
+
+    def complete_clear_reservation(self, reservation: ClearReservation) -> None:
+        """Mark reservation completed and remove its key mappings."""
+        reservation.complete()
+        with self._lock:
+            for key in reservation.cooldown_keys:
+                composite = (reservation.alias_family, key)
+                if self._clear_reservations.get(composite) is reservation:
+                    self._clear_reservations.pop(composite, None)
+
     def clear(self) -> None:
         with self._lock:
             self._intents.clear()
+            self._clear_reservations.clear()
 
 
 class LaneIdentityIndex:
@@ -553,6 +865,39 @@ class MonotonicCooldownMap:
         self.until_monotonic_by_key.clear()
 
 
+@dataclass
+class CooldownInspectionResult:
+    """Result of local cooldown inspection/absence verification (CFG-004 Wave A)."""
+
+    alias_family: str
+    cooldown_key: str
+    exists: bool
+    remaining_seconds: float
+    generation: int
+
+
+def inspect_cooldown_absence(
+    mgr: "AliasRoutingStateManager",
+    *,
+    alias_family: str,
+    cooldown_key: str,
+) -> CooldownInspectionResult:
+    """Verify local cooldown absence for a key (lock-free peek, no mutation).
+
+    Returns the current generation so callers can detect concurrent clears.
+    Does NOT acquire the family lock (safe under probe lock).
+    """
+    family = mgr.family(alias_family)
+    remaining = family.peek_cooldown_remaining(cooldown_key)
+    return CooldownInspectionResult(
+        alias_family=canonicalize_alias_family(alias_family),
+        cooldown_key=cooldown_key,
+        exists=remaining > 0,
+        remaining_seconds=remaining,
+        generation=family.get_generation(cooldown_key),
+    )
+
+
 class AliasRoutingStateManager:
     """Single owner of alias-routing process-local maps + locks (RR-054 #1)."""
 
@@ -567,6 +912,15 @@ class AliasRoutingStateManager:
         self.log_until_monotonic_by_key: dict[str, float] = {}
         self.candidate_probe_locks: dict[str, asyncio.Lock] = {}
         self.candidate_probe_locks_guard = asyncio.Lock()
+        # CFG-004 Defect 3: per-key read/clear barrier locks.  A durable read
+        # acquires the barrier lock for its key BEFORE capturing the generation
+        # and holds it through hydration.  A clear acquires the same barrier
+        # lock for each key BEFORE bumping the generation.  This guarantees
+        # that a read which started before a clear cannot capture the new
+        # generation and hydrate the old durable value, while unrelated keys
+        # remain fully concurrent (each key has its own barrier lock).
+        self._key_barrier_locks: dict[str, asyncio.Lock] = {}
+        self._key_barrier_locks_guard = asyncio.Lock()
         self.openrouter_rate_limit = MonotonicCooldownMap()
         self.openrouter_failure_circuit = MonotonicCooldownMap()
         # Wave 5B: read-pilot evidence gate with its own separate AliasFamilyState
@@ -576,6 +930,16 @@ class AliasRoutingStateManager:
         # Wave 5B: OpenRouter free-daily-quota cache (immutable tuple) + lock
         self._openrouter_free_quota_cache: Tuple[Optional[float], float] = (None, 0.0)
         self.openrouter_free_quota_lock = asyncio.Lock()
+
+    async def key_barrier_lock(self, cooldown_key: str) -> asyncio.Lock:
+        """Return the per-key barrier lock for read/clear serialization (Defect 3)."""
+        async with self._key_barrier_locks_guard:
+            lock = self._key_barrier_locks.get(cooldown_key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._key_barrier_locks[cooldown_key] = lock
+                bound_memory_map(self._key_barrier_locks, max_size=self.max_size)
+            return lock
 
     @staticmethod
     def _resolve_family_name(alias_family: str) -> str:
@@ -600,14 +964,11 @@ class AliasRoutingStateManager:
         touched here; callers use ``durable.delete_aawm_alias_routing_durable_key``
         for that.
 
-        Raises ``ValueError`` for unknown ``alias_family``.
+        Accepts production family labels (``codex_auto_agent``,
+        ``anthropic_auto_agent``) via canonicalization (Defect 4).
+        Raises ``ValueError`` for labels not in the canonical map.
         """
-        normalized = alias_family.strip().lower()
-        if normalized not in _VALID_ALIAS_FAMILIES:
-            raise ValueError(
-                f"Unknown alias_family {alias_family!r}; "
-                f"expected one of {sorted(_VALID_ALIAS_FAMILIES)}"
-            )
+        normalized = validate_alias_family(alias_family)
         family = self.family(normalized)
         positive, negative, evidence = family.clear_cooldown_state(
             cooldown_keys=cooldown_keys,
@@ -656,6 +1017,7 @@ class AliasRoutingStateManager:
         self.round_robin_cursor.clear()
         self.lane_identity_index.clear()
         self.publication_intents.clear()
+        self._key_barrier_locks.clear()
         self._openrouter_free_quota_cache = (None, 0.0)
 
     async def candidate_probe_lock(
@@ -664,8 +1026,14 @@ class AliasRoutingStateManager:
         alias_family: str,
         cooldown_key: str,
     ) -> asyncio.Lock:
-        """Return one bounded process-local single-flight lock per candidate lane."""
-        key = f"{alias_family}:{cooldown_key}"
+        """Return one bounded process-local single-flight lock per candidate lane.
+
+        The lock key uses the CANONICAL family name so production labels
+        (``codex_auto_agent``, ``anthropic_auto_agent``) and bare labels
+        (``codex``, ``anthropic``) share the same lock identity (Defect 4).
+        """
+        canonical = validate_alias_family(alias_family)
+        key = f"{canonical}:{cooldown_key}"
         async with self.candidate_probe_locks_guard:
             lock = self.candidate_probe_locks.get(key)
             if lock is None:
