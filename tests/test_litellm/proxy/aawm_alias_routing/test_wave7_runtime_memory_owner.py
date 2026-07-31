@@ -29,13 +29,14 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.runtime_memory impo
 
 @pytest.fixture()
 def runtime() -> RuntimeMemoryRuntime:
+    previous = runtime_memory._runtime
     log_map: dict[str, float] = {}
     rt = RuntimeMemoryRuntime(log_until_map=log_map, max_size=8)
     configure_runtime_memory(runtime=rt)
     try:
         yield rt
     finally:
-        runtime_memory._runtime = None
+        runtime_memory._runtime = previous
 
 
 # ---------------------------------------------------------------------------

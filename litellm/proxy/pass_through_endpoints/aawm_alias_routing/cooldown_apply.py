@@ -18,6 +18,7 @@ and state.py are injected via :func:`configure_cooldown_apply_runtime`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from fastapi import Request
@@ -484,6 +485,259 @@ async def _set_codex_auto_agent_candidate_cooldowns(
 
 
 # ---------------------------------------------------------------------------
+# CFG-004: Lane identity resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_lane_identity_hash(
+    *,
+    candidate: dict[str, Any],
+) -> str:
+    """Compute a secret-safe identity hash from public candidate identity.
+
+    Identity is derived from provider:model:route_family ONLY -- never from
+    lane_key or credentials.  One identity maps to multiple credential-derived
+    lane keys.  Reconstructible after process restart from the active candidate
+    enumeration without knowing any lane_key.
+    """
+    provider = str(candidate.get("provider") or "")
+    model = str(candidate.get("model") or "")
+    route_family = str(candidate.get("route_family") or "")
+    identity_input = f"{provider}:{model}:{route_family}"
+    return hashlib.sha256(identity_input.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# CFG-004: Cooldown publication transaction orchestrator
+# ---------------------------------------------------------------------------
+
+
+async def execute_cooldown_publication_transaction(  # noqa: PLR0915
+    *,
+    alias_family: str,
+    candidate: dict[str, Any],
+    plan: "CooldownPublicationPlan",
+    publish_cooldown_memory_fn: Any,
+    persist_cooldown_fn: Any,
+) -> Optional[object]:
+    """Execute the cooldown publication under canonical lock ordering.
+
+    Canonical order:
+      1. Normalize family
+      2. Acquire family mutation lock
+      3. Acquire all affected probe locks in sorted canonical-key order
+      4. Mutate: memory publish + durable transaction + local index
+      5. Release in reverse order
+
+    Never enters the family lock while retaining a pre-acquired probe lock.
+
+    When Redis is configured: executes the atomic durable transaction
+    BEFORE local mutation.  If local commit fails, restores durable
+    pre-images and local snapshots.
+
+    When Redis is unconfigured: retains legacy memory-only behavior.
+    Does NOT claim or index CFG-004 durable clear support.
+
+    State phases: PREPARED -> DURABLE_COMMITTED -> LOCAL_COMMITTED.
+    """
+    from .durable import (
+        get_aawm_alias_routing_dual_cache,
+        publish_cooldown_transaction,
+        rollback_cooldown_transaction,
+    )
+    from .state import alias_routing_state as _default_state, canonicalize_alias_family
+
+    state_mgr = _state_manager if _state_manager is not None else _default_state
+
+    index_family = canonicalize_alias_family(alias_family)
+
+    all_keys = sorted(set(plan.memory_keys) | set(plan.durable_keys))
+    if not all_keys:
+        return None
+
+    family_state = state_mgr.family(index_family)
+    identity_hash = resolve_lane_identity_hash(candidate=candidate)
+
+    # Step 1: Acquire family mutation lock (outer boundary).
+    async with family_state.lock:
+        # Step 2: Acquire all affected probe locks in sorted canonical order.
+        unique_locks: list[asyncio.Lock] = []
+        seen_ids: set[int] = set()
+        for key in all_keys:
+            lock = await state_mgr.candidate_probe_lock(
+                alias_family=alias_family,
+                cooldown_key=key,
+            )
+            if id(lock) not in seen_ids:
+                seen_ids.add(id(lock))
+                unique_locks.append(lock)
+
+        acquired: list[asyncio.Lock] = []
+        txn_result = None
+        local_snapshots: dict[str, float] = {}
+        try:
+            for lock in unique_locks:
+                await lock.acquire()
+                acquired.append(lock)
+
+            # Step 3: Mutation under complete lock set.
+            #
+            # Canonical order: snapshot -> preflight -> durable commit ->
+            # memory publish -> local index.  Local snapshot is taken
+            # BEFORE any mutation so rollback can restore exact values.
+
+            # 3a. Snapshot local state BEFORE any mutation.
+            for key in plan.memory_keys:
+                local_snapshots[key] = (
+                    family_state.cooldown_until_monotonic_by_key.get(key, 0.0)
+                )
+
+            # 3b. Durable transaction.
+            #
+            # Distinguish Redis UNCONFIGURED from CONFIGURED-BUT-UNHEALTHY:
+            # - Unconfigured: fall back to legacy memory-only + best-effort
+            #   persist path (no durable guarantees claimed).
+            # - Configured-but-unhealthy: FAIL CLOSED before any local
+            #   mutation or legacy persistence seam.  A configured Redis
+            #   that is unreachable means the system cannot guarantee the
+            #   durability contract; proceeding with local-only state would
+            #   create a silent split-brain.
+            from .durable import RollbackFailedError as _RollbackFailedError
+
+            dual_cache = get_aawm_alias_routing_dual_cache()
+            _has_strict_redis = False
+            _redis_configured = False
+            if dual_cache is not None:
+                _rc = getattr(dual_cache, "redis_cache", None)
+                if _rc is not None and callable(getattr(_rc, "init_async_client", None)):
+                    _has_strict_redis = True
+            else:
+                # No dual cache returned.  Check whether Redis IS configured
+                # but unhealthy (as opposed to simply unconfigured).
+                try:
+                    from litellm.proxy.aawm_alias_routing_redis import (
+                        get_status as _redis_get_status,
+                    )
+                    _status = _redis_get_status()
+                    if isinstance(_status, dict) and _status.get("configured") is True:
+                        _redis_configured = True
+                except Exception:
+                    pass
+                if _redis_configured and plan.durable_keys:
+                    # Configured but unhealthy: fail closed BEFORE any local
+                    # mutation or legacy persistence.
+                    raise RuntimeError(
+                        "AAWM alias routing durable publish: Redis is configured "
+                        "but unhealthy; failing closed before local mutation"
+                    )
+
+            if _has_strict_redis and plan.durable_keys:
+                # Preflight local index capacity (reject before mutation).
+                if not state_mgr.lane_identity_index.preflight_capacity(
+                    identity_hash=identity_hash,
+                    lane_keys=list(plan.durable_keys),
+                ):
+                    from .durable import CapacityRejectedError
+                    raise CapacityRejectedError(
+                        phase="PREPARED",
+                        family=index_family,
+                        transaction_id_prefix="preflight",
+                        identity_prefix=identity_hash[:12],
+                        key_count=len(plan.durable_keys),
+                        exception_classes=(),
+                    )
+
+                # Execute atomic durable transaction BEFORE local mutation.
+                txn_result = await publish_cooldown_transaction(
+                    alias_family=index_family,
+                    identity_hash=identity_hash,
+                    cooldown_keys=list(plan.durable_keys),
+                    lane_members=list(plan.durable_keys),
+                    ttl_seconds=plan.duration_seconds,
+                )
+
+                # 3c+3d. Memory publish + local commit under rollback
+                # protection.  Any exception from either step restores
+                # durable pre-images and local snapshots.
+                from .state import RegisterBatchOutcome as _RBOutcome
+                try:
+                    # Memory publish (after durable commit succeeds).
+                    if plan.memory_keys:
+                        publish_cooldown_memory_fn(
+                            keys=plan.memory_keys,
+                            seconds=plan.duration_seconds,
+                        )
+
+                    # Local commit: update index under the same mutation lease.
+                    outcome = state_mgr.lane_identity_index.register_batch(
+                        identity_hash=identity_hash,
+                        lane_keys=list(plan.durable_keys),
+                    )
+                    if outcome is _RBOutcome.CAPACITY_REJECTED:
+                        raise RuntimeError(
+                            "local index register_batch rejected (capacity)"
+                        )
+                    # IDEMPOTENT is safe: repeated publication of the same
+                    # lane keys is a no-op, not a rejection.
+                except Exception as local_exc:
+                    # Memory publish or local commit failed: restore durable
+                    # pre-images + local snapshots.
+                    # NEVER suppress RollbackFailedError: if rollback itself
+                    # fails, propagate the sanitized indeterminate-state error
+                    # over the earlier local exception.
+                    try:
+                        await rollback_cooldown_transaction(
+                            alias_family=index_family,
+                            journal=txn_result.journal,
+                        )
+                    except _RollbackFailedError:
+                        # Restore local snapshots before propagating.
+                        for key in plan.memory_keys:
+                            snap = local_snapshots.get(key, 0.0)
+                            if snap > 0:
+                                family_state.cooldown_until_monotonic_by_key[key] = snap
+                            else:
+                                family_state.cooldown_until_monotonic_by_key.pop(key, None)
+                        raise  # propagate RollbackFailedError, NOT local_exc
+                    for key in plan.memory_keys:
+                        snap = local_snapshots.get(key, 0.0)
+                        if snap > 0:
+                            family_state.cooldown_until_monotonic_by_key[key] = snap
+                        else:
+                            family_state.cooldown_until_monotonic_by_key.pop(key, None)
+                    raise local_exc
+
+                # Local commit succeeded: advance phase to LOCAL_COMMITTED.
+                # The journal is immutable evidence and is NOT modified.
+                from .durable import PHASE_LOCAL_COMMITTED as _PHASE_LOCAL
+
+                txn_result.phase = _PHASE_LOCAL
+
+            else:
+                # 3e. Memory publish (Redis unconfigured or no durable keys).
+                if plan.memory_keys:
+                    publish_cooldown_memory_fn(
+                        keys=plan.memory_keys,
+                        seconds=plan.duration_seconds,
+                    )
+
+                # Legacy persist (only when Redis is unconfigured, NOT when
+                # configured-but-unhealthy -- that case already failed closed).
+                if not _has_strict_redis and not _redis_configured and plan.durable_keys:
+                    await persist_cooldown_fn(
+                        keys=plan.durable_keys,
+                        seconds=plan.duration_seconds,
+                    )
+
+        finally:
+            # Step 4: Release in reverse order.
+            for lock in reversed(acquired):
+                lock.release()
+
+    return txn_result
+
+
+# ---------------------------------------------------------------------------
 # God-module facade installation (Wave 5C)
 # ---------------------------------------------------------------------------
 
@@ -496,6 +750,8 @@ _HOST_FUNCTION_NAMES = (
     "_apply_read_pilot_gated_cooldown",
     "_apply_anthropic_auto_agent_alias_cooldown",
     "_set_codex_auto_agent_candidate_cooldowns",
+    "resolve_lane_identity_hash",
+    "execute_cooldown_publication_transaction",
 )
 
 

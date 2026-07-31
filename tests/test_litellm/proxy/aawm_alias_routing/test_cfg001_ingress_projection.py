@@ -342,16 +342,32 @@ class TestIngressIsolation:
 
 
 class TestInstallHostGlobals:
+    @pytest.fixture(autouse=True)
+    def _restore_selection_identity(self):
+        """Restore selection module function identities after install() rebinds them."""
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.selection import (
+            _HOST_FUNCTION_NAMES,
+        )
+
+        saved = {name: vars(selection)[name] for name in _HOST_FUNCTION_NAMES}
+        saved["_attach_aawm_alias_routing_state_sources"] = vars(selection).get(
+            "_attach_aawm_alias_routing_state_sources"
+        )
+        yield
+        for name, fn in saved.items():
+            if fn is not None:
+                vars(selection)[name] = fn
+
     def test_snapshot_aware_getter_published_to_host_globals(self):
         """install() publishes the snapshot-aware getter to host_globals.
 
-        Uses the module's own globals() as the host dict so the rebind
-        is idempotent and does not corrupt the module namespace for
-        subsequent tests.
+        Uses a separate dict as the host so the selection module namespace
+        is not polluted with seam-variable copies.
         """
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
 
-        host_globals = vars(selection)
+        host_globals: dict = {}
         selection.install(host_globals)
         assert "_get_anthropic_candidates_for_alias_snapshot_aware" in host_globals
         assert callable(host_globals["_get_anthropic_candidates_for_alias_snapshot_aware"])
@@ -359,14 +375,14 @@ class TestInstallHostGlobals:
     def test_install_publishes_anthropic_affinity_candidate(self):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
 
-        host_globals = vars(selection)
+        host_globals: dict = {}
         selection.install(host_globals)
         assert "_find_anthropic_auto_agent_affinity_candidate" in host_globals
 
     def test_install_publishes_anthropic_public_dict_shaper(self):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
 
-        host_globals = vars(selection)
+        host_globals: dict = {}
         selection.install(host_globals)
         assert "_routing_candidate_to_anthropic_public_dict" in host_globals
 
@@ -772,8 +788,33 @@ class TestAnthropicAffinityProductionFacade:
             is_kimi_code_candidate=lambda c: False,
             get_kimi_managed_account_cooldown_key=lambda: "kimi:__managed__",
         )
+        # Propagate runtime stubs into the function's actual __globals__ so
+        # they take effect even when lpe has rebound selection functions to
+        # resolve through vars(lpe) instead of vars(selection).
+        runtime_globals = selection._select_anthropic_auto_agent_candidate.__globals__
+        runtime_stub_names = {
+            "_get_codex_active_cooldown_state": _zero_cooldown_state,
+            "_get_anthropic_active_cooldown_state": _zero_cooldown_state,
+            "_get_anthropic_merged_codex_openai_cooldown_state": _zero_cooldown_state,
+            "_set_codex_cooldown": _noop_cooldown,
+            "_set_anthropic_cooldown": _noop_cooldown,
+            "_get_codex_session_affinity": AsyncMock(return_value=None),
+            "_get_anthropic_session_affinity": _get_anthropic_auto_agent_session_affinity,
+            "_get_openrouter_adapter_active_cooldown_seconds": _zero_adapter,
+            "_normalize_codex_alias_model": lambda m: None,
+            "_extract_client_product_label": lambda r, b: None,
+            "_resolve_codex_session_key": lambda r, b, **kw: None,
+            "_resolve_anthropic_session_key": lambda r, b, **kw: "test-session",
+            "_has_continuation_state": lambda v: True,
+            "_get_anthropic_candidates_for_alias": lambda alias: (),
+            "_is_grok_account_quota_candidate": lambda c: False,
+            "_get_grok_account_quota_lane_cooldown_key": lambda c, lk: None,
+            "_is_kimi_code_candidate": lambda c: False,
+            "_get_kimi_managed_account_cooldown_key": lambda: "kimi:__managed__",
+        }
+        previous_runtime_globals = {k: runtime_globals.get(k) for k in runtime_stub_names}
+        runtime_globals.update(runtime_stub_names)
         # Patch lane-key resolvers in function globals to avoid god-module dependency
-        runtime_globals = selection._build_anthropic_auto_agent_candidate_state.__globals__
         lane_stubs = {
             "_resolve_codex_auto_agent_openai_cooldown_lane_key": (
                 lambda request: "openai:primary"
@@ -803,6 +844,11 @@ class TestAnthropicAffinityProductionFacade:
             for name, value in previous.items():
                 setattr(selection, name, value)
             for k, v in previous_globals.items():
+                if v is None:
+                    runtime_globals.pop(k, None)
+                else:
+                    runtime_globals[k] = v
+            for k, v in previous_runtime_globals.items():
                 if v is None:
                     runtime_globals.pop(k, None)
                 else:

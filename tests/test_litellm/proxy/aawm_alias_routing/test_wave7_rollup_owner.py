@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import rollup as rollup_mod
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup import (
     _auto_agent_alias_model_rollup_label,
     _auto_agent_alias_route_rollup_status,
@@ -34,10 +35,40 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup import (
 
 @pytest.fixture(autouse=True)
 def _inject_runtime():
-    """Provide the cross-module seam for every test."""
+    """Provide the cross-module seam and an isolated owner runtime.
+
+    Importing ``llm_passthrough_endpoints`` calls ``rollup.install(lpe_globals)``,
+    which rebinds each rollup function's ``__globals__`` to the LPE namespace.
+    When that import happens before this module is collected, the names imported
+    above reference LPE-globals functions, so ``@patch("...rollup.X")`` and
+    ``configure_rollup_runtime`` (which mutate ``rollup``'s namespace) no longer
+    affect the functions under test.
+
+    Re-install the functions into ``rollup``'s own namespace so the owner tests
+    exercise rollup-owned globals regardless of import order, refresh this
+    module's imported references to the rebound objects, then restore the prior
+    bindings on teardown so unrelated tests are unaffected.
+    """
+    host_fn_names = rollup_mod._HOST_FUNCTION_NAMES
+    test_ns = globals()
+
+    saved_rollup_fns = {name: rollup_mod.__dict__[name] for name in host_fn_names}
+    saved_test_fns = {name: test_ns[name] for name in host_fn_names}
+    saved_seam = rollup_mod._get_anthropic_adapter_access_log_target_label
+    saved_host_globals = rollup_mod._host_globals
+
+    rollup_mod.install(rollup_mod.__dict__)
+    for name in host_fn_names:
+        test_ns[name] = rollup_mod.__dict__[name]
+
     fake_label = MagicMock(return_value="fake.host/v1/path")
     configure_rollup_runtime(get_access_log_target_label=fake_label)
     yield fake_label
+
+    rollup_mod.__dict__.update(saved_rollup_fns)
+    test_ns.update(saved_test_fns)
+    rollup_mod._get_anthropic_adapter_access_log_target_label = saved_seam
+    rollup_mod._host_globals = saved_host_globals
 
 
 # ---------------------------------------------------------------------------

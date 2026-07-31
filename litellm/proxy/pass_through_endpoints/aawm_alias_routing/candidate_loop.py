@@ -1,28 +1,25 @@
-"""Shared auto-agent alias candidate retry loop (Wave 2 extraction + R3-1).
+"""Shared auto-agent alias candidate retry loop (Wave 2 extraction + R3-1 + CFG-004).
 
 This is the moved body of ``llm_passthrough_endpoints._handle_auto_agent_alias_route``
-restructured for R3-1 exact-key single-flight publication:
+restructured for R3-1 exact-key single-flight publication and CFG-004
+intent-based probing:
 
-- The locked region is WIDENED. The exception from the upstream ``perform`` is
-  caught INSIDE the ``try`` that still holds the per-candidate ``probe_lock``.
-  While holding the lock, the loop runs the pure publication-plan resolver to
-  classify the failure, record read-pilot evidence, and produce ONE immutable
-  :class:`CooldownPublicationPlan`, then publishes every ``plan.memory_keys``
-  (direct ``state.py`` writes for the production seams) BEFORE releasing the
-  probe lock. A follower queued on the same probe lock therefore cannot acquire
-  it until the cooldown is already visible, so it never re-probes (single-flight).
-- AFTER releasing the lock, the loop persists exactly ``plan.durable_keys`` to
-  Redis, applies ``plan.request_local_action``, updates the attempt record with
-  ``plan.applied_scope``, signals redispatch, and runs the native-grok backoff
-  ``asyncio.sleep`` (never inside the lock).
+- Single-flight is enforced via manager-owned PublicationIntents.  The leader
+  creates an intent under the selected probe lock BEFORE provider I/O.
+  Followers that acquire the same probe lock while the intent is active await
+  its completion and retry selection (no second provider call).
+- On failure the leader resolves the immutable publication plan, attaches it
+  to the intent, RELEASES the probe lock, then enters cooldown mutation with
+  NO pre-held lock.  The mutation acquires the family lock + sorted probe
+  locks internally (canonical order: never enter family lock while retaining
+  a pre-acquired probe lock).
+- AFTER the mutation, the loop applies ``plan.request_local_action``, updates
+  the attempt record with ``plan.applied_scope``, signals redispatch, and runs
+  the native-grok backoff ``asyncio.sleep`` (never inside any lock).
 
 Memory and durable targets are derived once from the same plan so telemetry,
 waiter visibility, and Redis state cannot disagree, and no target-key logic is
 duplicated between the in-lock and post-release paths.
-
-The production memory publish writes ``state.py`` directly with no awaitable
-lock. Durable Redis writes and the legacy async applicator are post-release, so
-the probe lock is never held across network I/O.
 
 The god-module is imported lazily inside :func:`handle_alias_route` to avoid a
 module-scope import cycle (the god-module imports this package); the loop
@@ -47,7 +44,6 @@ from .interfaces import (
     GetActiveCooldownStateFn,
     GetKimiFailureMetadataFn,
     IsGrokAccountQuotaFailureFn,
-    PublishCooldownMemoryFn,
     RecordReadPilotEvidenceFn,
     ResolveCooldownPublicationFn,
 )
@@ -212,71 +208,172 @@ async def handle_alias_route(  # noqa: PLR0915
             add_alias_metadata_fn=add_alias_metadata_fn,
         )
         while True:
-            # R3-1: the locked region is widened. ``perform`` runs inside the
-            # ``try`` that holds ``probe_lock``; on failure the publication plan
-            # is resolved and its memory keys are published while still holding
-            # the lock, so a queued follower observes the cooldown before it can
-            # acquire the lock and re-probe.
+            # CFG-004: ProbeLease / publication-intent single-flight design.
+            #
+            # 1. Check active cooldown BEFORE acquiring the probe lock.
+            #    The cooldown reader acquires the family lock internally;
+            #    calling it outside the probe lock prevents lock inversion
+            #    with execute_cooldown_publication_transaction (which
+            #    acquires family lock -> sorted probe locks).
+            # 2. Acquire the selected probe lock.
+            # 3. Check for an active PublicationIntent on this cooldown_key.
+            #    If found (follower path): release probe lock, await intent
+            #    completion, then break to re-select (no second provider call).
+            # 4. Leader path: create intent, perform provider I/O under the
+            #    probe lock.
+            # 5. On failure: resolve plan, attach to intent, RELEASE probe
+            #    lock, then enter cooldown mutation with NO pre-held lock
+            #    (execute_cooldown_publication_transaction acquires the
+            #    family lock + sorted probe locks internally).
+            # 6. Signal intent complete, remove from registry.
             probe_failure_exc: Optional[Exception] = None
             probe_failure_plan: Optional[CooldownPublicationPlan] = None
             skip_after_probe_wait = False
             response: Optional[Response] = None
+            intent = None
+
+            # Pre-check active cooldown OUTSIDE the probe lock.  The
+            # cooldown reader acquires the family lock; holding the probe
+            # lock here would invert the canonical lock order (family ->
+            # probe) used by execute_cooldown_publication_transaction.
+            try:
+                active_seconds, _active_source = await get_active_cooldown_state_fn(selection["cooldown_key"])
+            except Exception as pre_exc:  # noqa: PERF203
+                probe_failure_exc = pre_exc
+                active_seconds = 0.0
+            if probe_failure_exc is None and active_seconds > 0:
+                skip_after_probe_wait = True
+                attempt_record["status"] = "skipped_single_flight_cooldown"
+                attempt_record["cooldown_seconds"] = active_seconds
+
             probe_lock = await alias_routing_state.candidate_probe_lock(
                 alias_family=alias_family,
                 cooldown_key=selection["cooldown_key"],
             )
             await probe_lock.acquire()
-            try:
-                active_seconds, _active_source = await get_active_cooldown_state_fn(selection["cooldown_key"])
-                if active_seconds > 0:
+
+            # Follower path: an active intent means a leader is probing or
+            # publishing for this key.  Await completion, then re-select.
+            existing_intent = alias_routing_state.publication_intents.get(
+                alias_family,
+                selection["cooldown_key"],
+            )
+            if existing_intent is not None and not existing_intent.done.is_set():
+                probe_lock.release()
+                await existing_intent.done.wait()
+                skip_after_probe_wait = True
+                break
+
+            # TOCTOU guard: the pre-check ran BEFORE probe lock acquisition.
+            # A concurrent leader may have completed publication (cooldown
+            # committed, intent removed) between our pre-check and probe lock
+            # acquisition.  The publication transaction holds this same probe
+            # lock while mutating cooldown memory, so a lock-free peek here
+            # (no family lock, no mutation) sees a consistent snapshot.
+            # This closes the final singleflight TOCTOU window without
+            # introducing a family-locking read under the probe lock.
+            if not skip_after_probe_wait and probe_failure_exc is None:
+                _toctou_remaining = (
+                    alias_routing_state.family(alias_family)
+                    .peek_cooldown_remaining(selection["cooldown_key"])
+                )
+                if _toctou_remaining > 0:
                     skip_after_probe_wait = True
                     attempt_record["status"] = "skipped_single_flight_cooldown"
-                    attempt_record["cooldown_seconds"] = active_seconds
-                else:
+                    attempt_record["cooldown_seconds"] = _toctou_remaining
+
+            # If the pre-check found an active cooldown or raised, we still
+            # need to create + complete the intent so followers are notified.
+            if skip_after_probe_wait or probe_failure_exc is not None:
+                intent = alias_routing_state.publication_intents.create(
+                    alias_family=alias_family,
+                    cooldown_keys=frozenset({selection["cooldown_key"]}),
+                )
+                probe_lock.release()
+                intent.complete(error=probe_failure_exc)
+                alias_routing_state.publication_intents.remove(intent)
+                if probe_failure_exc is not None:
+                    raise probe_failure_exc
+                break
+
+            # Leader path: create intent BEFORE provider I/O.
+            intent = alias_routing_state.publication_intents.create(
+                alias_family=alias_family,
+                cooldown_keys=frozenset({selection["cooldown_key"]}),
+            )
+
+            # BaseException-safe: intent is ALWAYS completed and removed,
+            # probe lock is ALWAYS released, regardless of exception type
+            # (Exception, CancelledError, KeyboardInterrupt, etc.).
+            try:
+                try:
                     response = await perform_candidate_request_fn(
                         candidate=candidate,
                         candidate_body=candidate_body,
                     )
-            except Exception as probe_exc:  # noqa: PERF203
-                probe_failure_exc = probe_exc
-            finally:
-                # Resolve the publication plan + publish its memory keys
-                # BEFORE releasing the lock so the single-flight invariant
-                # holds when the synchronous publisher returns.
-                # The nested try/finally guarantees the lock is released
-                # even if the resolver or publisher raises or is cancelled,
-                # preventing a permanent lock leak that would hang all
-                # subsequent same-key requests.
-                try:
-                    if probe_failure_exc is not None:
-                        probe_failure_plan = _resolve_and_publish_failure_memory(
-                            resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
-                            publish_cooldown_memory_fn=publish_cooldown_memory_fn,
-                            record_read_pilot_evidence_fn=_record_read_pilot_cooldown_evidence,
-                            request=request,
-                            candidate=candidate,
-                            selection=selection,
-                            alias_model=alias_model,
-                            attempt_record=attempt_record,
-                            exc=probe_failure_exc,
-                            is_read_pilot_lane=(alias_model == _READ_PILOT_ALIAS_NAME),
-                            kimi_failure_metadata_fn=_get_safe_kimi_code_probe_failure_metadata,
-                            classify_kimi_fn=_classify_kimi_code_auto_agent_probe_failure,
-                            classify_retryable_fn=_classify_codex_auto_agent_retryable_exhaustion,
-                            grok_quota_fn=_is_codex_auto_agent_grok_account_quota_exhaustion,
-                            cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
-                        )
+                except Exception as probe_exc:  # noqa: PERF203
+                    probe_failure_exc = probe_exc
                 finally:
+                    # Release probe lock FIRST (unconditional, before any
+                    # resolver call that might raise).
                     probe_lock.release()
-            if skip_after_probe_wait:
-                break
-            if probe_failure_exc is None:
-                await set_session_affinity_fn(
-                    selection.get("session_key"),
-                    candidate,
-                )
-                assert response is not None
-                return response
+
+                # Resolve the plan AFTER lock release.  If the resolver
+                # raises, the outer BaseException handler cleans up the
+                # intent.  No lock is held here (canonical order: no family
+                # lock entry while retaining a pre-acquired probe lock).
+                if probe_failure_exc is not None:
+                    probe_failure_plan = _resolve_failure_plan(
+                        resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
+                        record_read_pilot_evidence_fn=_record_read_pilot_cooldown_evidence,
+                        request=request,
+                        candidate=candidate,
+                        selection=selection,
+                        alias_model=alias_model,
+                        attempt_record=attempt_record,
+                        exc=probe_failure_exc,
+                        is_read_pilot_lane=(alias_model == _READ_PILOT_ALIAS_NAME),
+                        kimi_failure_metadata_fn=_get_safe_kimi_code_probe_failure_metadata,
+                        classify_kimi_fn=_classify_kimi_code_auto_agent_probe_failure,
+                        classify_retryable_fn=_classify_codex_auto_agent_retryable_exhaustion,
+                        grok_quota_fn=_is_codex_auto_agent_grok_account_quota_exhaustion,
+                        cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
+                    )
+                    intent.plan = probe_failure_plan
+
+                if skip_after_probe_wait:
+                    intent.complete()
+                    alias_routing_state.publication_intents.remove(intent)
+                    break
+                if probe_failure_exc is None:
+                    intent.complete()
+                    alias_routing_state.publication_intents.remove(intent)
+                    await set_session_affinity_fn(
+                        selection.get("session_key"),
+                        candidate,
+                    )
+                    assert response is not None
+                    return response
+
+                # --- Cooldown mutation: NO pre-held probe lock ------------
+                if probe_failure_plan is not None:
+                    await _lpe.execute_cooldown_publication_transaction(
+                        alias_family=alias_family,
+                        candidate=candidate,
+                        plan=probe_failure_plan,
+                        publish_cooldown_memory_fn=publish_cooldown_memory_fn,
+                        persist_cooldown_fn=persist_cooldown_fn,
+                    )
+                # Mutation complete (or no plan): signal intent.
+                intent.complete(error=probe_failure_exc)
+                alias_routing_state.publication_intents.remove(intent)
+            except BaseException as cleanup_exc:
+                # BaseException-safe: covers CancelledError, KeyboardInterrupt,
+                # SystemExit, and any exception from cooldown mutation.
+                if not intent.done.is_set():
+                    intent.complete(error=cleanup_exc)
+                    alias_routing_state.publication_intents.remove(intent)
+                raise
 
             # --- failure handling (post-release) ---------------------------
             failure_exc = probe_failure_exc
@@ -295,14 +392,13 @@ async def handle_alias_route(  # noqa: PLR0915
                 failure_exc,
                 candidate=candidate,
             )
-            # R3-1: the plan was resolved + memory-published inside the probe
-            # lock above. Post-release we persist the durable keys, apply the
-            # request-local action, and report the applied scope. No target-key
-            # logic is recomputed here.
+            # The plan was resolved inside the probe lock above.  After probe
+            # lock release, execute_cooldown_publication_transaction performed
+            # the atomic memory publish + durable commit + local index update
+            # under the family lock + sorted probe locks (canonical order).
+            # Post-release only the request-local action remains.
             plan = probe_failure_plan
             assert plan is not None
-            if plan.durable_keys:
-                await persist_cooldown_fn(keys=plan.durable_keys, seconds=plan.duration_seconds)
             if plan.request_local_action == "request_local_cooldown":
                 _apply_request_local_cooldown_from_plan(
                     request,
@@ -455,10 +551,9 @@ async def handle_alias_route(  # noqa: PLR0915
     )
 
 
-def _resolve_and_publish_failure_memory(
+def _resolve_failure_plan(
     *,
     resolve_cooldown_publication_fn: ResolveCooldownPublicationFn,
-    publish_cooldown_memory_fn: PublishCooldownMemoryFn,
     record_read_pilot_evidence_fn: RecordReadPilotEvidenceFn,
     request: "Request",
     candidate: dict[str, Any],
@@ -473,14 +568,12 @@ def _resolve_and_publish_failure_memory(
     grok_quota_fn: IsGrokAccountQuotaFailureFn,
     cooldown_seconds_fn: GetCooldownSecondsFn,
 ) -> CooldownPublicationPlan:
-    """Resolve ONE publication plan for ``exc`` and publish its memory keys.
+    """Resolve ONE publication plan for ``exc`` (pure, no I/O).
 
-    Called while the probe lock is held. The resolver is pure (it records
-    read-pilot evidence and resolves scope/target keys but performs no I/O);
-    this helper then publishes every ``plan.memory_keys`` so a queued follower
-    observes the cooldown before the lock is released. The publisher is
-    strictly synchronous; durable I/O remains post-release. The plan's
-    ``applied_scope`` is authoritative.
+    Called while the probe lock is held. The resolver records read-pilot
+    evidence and resolves scope/target keys but performs NO memory or durable
+    writes. Memory publication is deferred to
+    :func:`_publish_plan_transactional` which holds the complete lock set.
     """
     kimi_failure_metadata = kimi_failure_metadata_fn(exc, candidate=candidate)
     error_class = classify_kimi_fn(kimi_failure_metadata)
@@ -488,17 +581,13 @@ def _resolve_and_publish_failure_memory(
         error_class = classify_retryable_fn(exc)
     grok_account_quota_exhausted = grok_quota_fn(exc, candidate=candidate)
     cooldown_seconds = cooldown_seconds_fn(exc, candidate=candidate)
-    # For the read lane only, record this attempt's failure evidence into the
-    # N-of-M gate BEFORE resolving the plan, keyed on the live
-    # ``provider:model:lane`` key, so the gate's decision drives the applied
-    # cooldown for the same attempt.
     if is_read_pilot_lane:
         record_read_pilot_evidence_fn(
             cooldown_key=selection["cooldown_key"],
             exc=exc,
             attempt_record=attempt_record,
         )
-    plan = resolve_cooldown_publication_fn(
+    return resolve_cooldown_publication_fn(
         request=request,
         candidate=candidate,
         lane_key=selection.get("lane_key"),
@@ -509,9 +598,3 @@ def _resolve_and_publish_failure_memory(
         kimi_failure_metadata=kimi_failure_metadata,
         is_read_pilot_lane=is_read_pilot_lane,
     )
-    if plan.memory_keys:
-        publish_cooldown_memory_fn(
-            keys=plan.memory_keys,
-            seconds=plan.duration_seconds,
-        )
-    return plan

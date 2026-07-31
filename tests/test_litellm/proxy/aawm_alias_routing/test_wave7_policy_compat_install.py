@@ -109,13 +109,20 @@ class TestCompatAliasInventory:
 
     def test_deterministic_order(self) -> None:
         """Map iteration order is stable across re-imports."""
+        # Snapshot the original module namespace so we can restore exact
+        # object identities after the reload (avoids polluting downstream
+        # tests that rely on `is` identity with previously-imported refs).
+        original_dict = dict(vars(policy))
         fresh = importlib.reload(policy)
         try:
             assert list(fresh.COMPAT_ALIAS_MAP.keys()) == list(
                 EXPECTED_INVENTORY.keys()
             )
         finally:
-            importlib.reload(policy)
+            # Restore original objects in-place to preserve identity for
+            # any module that previously imported from policy.
+            vars(policy).clear()
+            vars(policy).update(original_dict)
 
 
 class TestInstallSameObjectIdentity:

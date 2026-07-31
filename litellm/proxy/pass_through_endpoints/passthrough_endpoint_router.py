@@ -210,3 +210,6 @@ class PassthroughEndpointRouter:
         custom_llm_provider: str,
     ) -> str:
         return f"{custom_llm_provider.upper()}_API_KEY"
+
+
+passthrough_endpoint_router = PassthroughEndpointRouter()

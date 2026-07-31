@@ -1,16 +1,19 @@
 """Process-local alias-routing state manager (RR-054 #1).
 
 Owns cooldown and affinity maps, their asyncio.Locks, probe-lock state, the
-read-pilot evidence gate, round-robin cursor, and OpenRouter caches so the
-pass-through god-module does not declare the state maps itself.
+read-pilot evidence gate, round-robin cursor, OpenRouter caches, and
+CFG-004 publication-intent tracking so the pass-through god-module does not
+declare the state maps itself.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
+import uuid
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional, Sequence, Tuple
 
 from .memory import (
@@ -23,7 +26,52 @@ from .memory import (
 )
 from .types import Payload
 
+# Canonical family names accepted by validation paths (e.g. clear_cooldown_state).
 _VALID_ALIAS_FAMILIES = frozenset({"codex", "anthropic"})
+
+# ---------------------------------------------------------------------------
+# Shared exact alias-family canonicalization (single source of truth)
+# ---------------------------------------------------------------------------
+#
+# Every known alias_family label maps to exactly one canonical family name.
+# Substring matching is intentionally NOT used: labels such as
+# ``not_anthropic``, ``xanthropicx``, or ``codex_anthropic`` must NOT
+# resolve to the Anthropic family.  Unknown labels default to ``"codex"``
+# per the established default-family contract.
+
+_ALIAS_FAMILY_CANONICAL_MAP: dict[str, str] = {
+    "codex": "codex",
+    "codex_auto_agent": "codex",
+    "anthropic": "anthropic",
+    "anthropic_auto_agent": "anthropic",
+}
+
+_DEFAULT_CANONICAL_FAMILY = "codex"
+
+
+def canonicalize_alias_family(alias_family: str) -> str:
+    """Resolve an alias_family label to its canonical family name.
+
+    Uses exact matching against ``_ALIAS_FAMILY_CANONICAL_MAP``.  Unknown
+    labels default to ``"codex"`` (established default-family contract).
+    """
+    return _ALIAS_FAMILY_CANONICAL_MAP.get(
+        alias_family.strip().lower(),
+        _DEFAULT_CANONICAL_FAMILY,
+    )
+
+
+class RegisterBatchOutcome(Enum):
+    """Result of LaneIdentityIndex.register_batch (CFG-004).
+
+    ADDED: at least one new lane mapping was created.
+    IDEMPOTENT: all lane_keys were already registered (repeated publication).
+    CAPACITY_REJECTED: capacity limit exceeded; no mutation performed.
+    """
+
+    ADDED = "added"
+    IDEMPOTENT = "idempotent"
+    CAPACITY_REJECTED = "capacity_rejected"
 
 
 @dataclass
@@ -43,6 +91,19 @@ class AliasFamilyState:
             return max(0.0, until - now)
         self.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
         return 0.0
+
+    def peek_cooldown_remaining(self, cooldown_key: str) -> float:
+        """Non-mutating, lock-free cooldown remaining check (TOCTOU guard).
+
+        Safe to call while holding the probe lock: the publication
+        transaction also holds this probe lock while mutating, so the
+        read sees a consistent snapshot.  Does NOT acquire the family
+        lock (preserving canonical family->probe ordering) and does NOT
+        pop expired entries (no mutation).
+        """
+        until = self.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
+        now = time.monotonic()
+        return max(0.0, until - now) if until > now else 0.0
 
     def is_negative_cached(self, cooldown_key: str) -> bool:
         now = time.monotonic()
@@ -228,6 +289,78 @@ class CooldownClearResult:
     affinity_keys_preserved: int = 0
 
 
+
+@dataclass
+class PublicationIntent:
+    """Manager-owned publication intent for CFG-004 single-flight probing.
+
+    Created under the selected probe lock BEFORE provider I/O.  Followers
+    that acquire the same probe lock while the intent is active await
+    done and retry selection instead of re-probing.  The leader
+    attaches the immutable plan on failure, releases the probe lock,
+    performs the cooldown mutation with NO pre-held lock, then signals
+    done.
+    """
+
+    transaction_id: str
+    alias_family: str
+    cooldown_keys: frozenset[str]
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    error: Optional[BaseException] = None
+    plan: Optional[object] = None  # CooldownPublicationPlan, set on failure
+
+    def complete(self, *, error: Optional[BaseException] = None) -> None:
+        self.error = error
+        self.done.set()
+
+
+def _new_transaction_id() -> str:
+    return uuid.uuid4().hex
+
+
+class PublicationIntentRegistry:
+    """Tracks active publication intents keyed by cooldown_key.
+
+    Thread-safe for the check/register/remove operations.  The asyncio
+    Event inside each intent is used for coroutine-level coordination.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._intents: dict[str, PublicationIntent] = {}
+
+    def create(
+        self,
+        *,
+        alias_family: str,
+        cooldown_keys: frozenset[str],
+    ) -> PublicationIntent:
+        intent = PublicationIntent(
+            transaction_id=_new_transaction_id(),
+            alias_family=alias_family,
+            cooldown_keys=cooldown_keys,
+        )
+        with self._lock:
+            for key in cooldown_keys:
+                self._intents[(alias_family, key)] = intent
+        return intent
+
+    def get(self, alias_family: str, cooldown_key: str) -> Optional[PublicationIntent]:
+        with self._lock:
+            return self._intents.get((alias_family, cooldown_key))
+
+    def remove(self, intent: PublicationIntent) -> None:
+        with self._lock:
+            for key in intent.cooldown_keys:
+                composite = (intent.alias_family, key)
+                if self._intents.get(composite) is intent:
+                    self._intents.pop(composite, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._intents.clear()
+
+
 class LaneIdentityIndex:
     """Bounded reverse index from opaque identity hash to lane keys (CFG-004).
 
@@ -237,8 +370,8 @@ class LaneIdentityIndex:
     methods; raw identity hashes and lane keys are never leaked outside the
     index boundary.
 
-    Bounded by max_identities (FIFO eviction of oldest identity) and
-    max_lanes_per_identity (arbitrary lane evicted within an identity).
+    Bounded by max_identities and max_lanes_per_identity.  Capacity
+    violations REJECT the registration (no silent eviction).
     """
 
     def __init__(
@@ -253,33 +386,96 @@ class LaneIdentityIndex:
         self._index: dict[str, set[str]] = {}
 
     def register(self, *, identity_hash: str, lane_key: str) -> bool:
-        """Associate lane_key with identity_hash.
+        """Associate lane_key with identity_hash (no eviction).
 
         Returns True if a new mapping was added, False if the lane was
-        already present (no-op).  Thread-safe: the whole read-modify-write
-        (including bounds eviction) runs under ``self._lock``.
+        already present (no-op) or capacity is exhausted (reject).
+        Thread-safe.
         """
         with self._lock:
             lanes = self._index.get(identity_hash)
             if lanes is None:
                 if len(self._index) >= self._max_identities:
-                    try:
-                        oldest = next(iter(self._index))
-                        self._index.pop(oldest, None)
-                    except StopIteration:
-                        pass
+                    return False  # reject: identity capacity full
                 lanes = set()
                 self._index[identity_hash] = lanes
             if lane_key in lanes:
                 return False
             if len(lanes) >= self._max_lanes_per_identity:
-                try:
-                    evict = next(iter(lanes))
-                    lanes.discard(evict)
-                except StopIteration:
-                    pass
+                return False  # reject: lane capacity full
             lanes.add(lane_key)
             return True
+
+    def preflight_capacity(
+        self,
+        *,
+        identity_hash: str,
+        lane_keys: Sequence[str],
+    ) -> bool:
+        """Return True if registering lane_keys under identity_hash
+        would fit within capacity.  Does NOT mutate.  Thread-safe."""
+        with self._lock:
+            lanes = self._index.get(identity_hash)
+            if lanes is None:
+                if len(self._index) >= self._max_identities:
+                    return False
+                new_count = len(set(lane_keys))
+                return new_count <= self._max_lanes_per_identity
+            new_keys = set(lane_keys) - lanes
+            return (len(lanes) + len(new_keys)) <= self._max_lanes_per_identity
+
+    def register_batch(
+        self,
+        *,
+        identity_hash: str,
+        lane_keys: Sequence[str],
+    ) -> RegisterBatchOutcome:
+        """Atomically register multiple lane_keys under identity_hash.
+
+        Preflights capacity; rejects the ENTIRE batch if any key would
+        exceed capacity (no partial mutation, no eviction).  Returns
+        ADDED if at least one new mapping was created, IDEMPOTENT if all
+        keys were already present (repeated publication is safe), or
+        CAPACITY_REJECTED if capacity is exhausted.  Thread-safe.
+        """
+        with self._lock:
+            lanes = self._index.get(identity_hash)
+            if lanes is None:
+                if len(self._index) >= self._max_identities:
+                    return RegisterBatchOutcome.CAPACITY_REJECTED
+                unique = set(lane_keys)
+                if len(unique) > self._max_lanes_per_identity:
+                    return RegisterBatchOutcome.CAPACITY_REJECTED
+                self._index[identity_hash] = unique
+                return RegisterBatchOutcome.ADDED
+            new_keys = set(lane_keys) - lanes
+            if not new_keys:
+                return RegisterBatchOutcome.IDEMPOTENT
+            if (len(lanes) + len(new_keys)) > self._max_lanes_per_identity:
+                return RegisterBatchOutcome.CAPACITY_REJECTED
+            lanes.update(new_keys)
+            return RegisterBatchOutcome.ADDED
+
+    def unregister_batch(
+        self,
+        *,
+        identity_hash: str,
+        lane_keys: Sequence[str],
+    ) -> int:
+        """Remove multiple lane_keys from an identity.  Returns count removed.
+        Thread-safe."""
+        with self._lock:
+            lanes = self._index.get(identity_hash)
+            if lanes is None:
+                return 0
+            removed = 0
+            for key in lane_keys:
+                if key in lanes:
+                    lanes.discard(key)
+                    removed += 1
+            if not lanes:
+                self._index.pop(identity_hash, None)
+            return removed
 
     def lanes_for(self, identity_hash: str) -> frozenset[str]:
         """Return the lane keys registered for identity_hash.  Thread-safe."""
@@ -366,6 +562,7 @@ class AliasRoutingStateManager:
         self.codex = AliasFamilyState()
         self.anthropic = AliasFamilyState()
         self.lane_identity_index = LaneIdentityIndex()
+        self.publication_intents = PublicationIntentRegistry()
         self.lane_state_cache_lock = asyncio.Lock()
         self.log_until_monotonic_by_key: dict[str, float] = {}
         self.candidate_probe_locks: dict[str, asyncio.Lock] = {}
@@ -380,10 +577,14 @@ class AliasRoutingStateManager:
         self._openrouter_free_quota_cache: Tuple[Optional[float], float] = (None, 0.0)
         self.openrouter_free_quota_lock = asyncio.Lock()
 
+    @staticmethod
+    def _resolve_family_name(alias_family: str) -> str:
+        """Canonical family resolution via the shared exact mapping."""
+        return canonicalize_alias_family(alias_family)
+
     def family(self, alias_family: str) -> AliasFamilyState:
-        if alias_family == "anthropic":
-            return self.anthropic
-        return self.codex
+        resolved = self._resolve_family_name(alias_family)
+        return self.anthropic if resolved == "anthropic" else self.codex
 
     def clear_cooldown_state(
         self,
@@ -454,6 +655,7 @@ class AliasRoutingStateManager:
         self.read_pilot_gate._family_state.evidence_events_by_key.clear()
         self.round_robin_cursor.clear()
         self.lane_identity_index.clear()
+        self.publication_intents.clear()
         self._openrouter_free_quota_cache = (None, 0.0)
 
     async def candidate_probe_lock(

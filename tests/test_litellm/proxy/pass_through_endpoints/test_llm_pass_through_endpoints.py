@@ -16523,12 +16523,11 @@ async def test_anthropic_xai_oauth_completion_adapter_uses_managed_oauth(
     assert "api_base" not in proxy_body
     assert "custom_llm_provider" not in proxy_body
     metadata = kwargs["litellm_metadata"]
-    assert metadata["passthrough_route_family"] == ("anthropic_xai_oauth_completion_adapter")
+    assert metadata["passthrough_route_family"] == "xai_oauth_api"
     assert metadata["xai_oauth_public_model"] == "oa_xai/grok-4.3"
     assert metadata["xai_oauth_upstream_model"] == "xai/grok-4.3"
     assert metadata["shared_quota_family"] == "xai_grok_subscription"
     assert "route:xai_oauth_api" in metadata["tags"]
-    assert "route:anthropic_xai_oauth_completion_adapter" in metadata["tags"]
 
 
 @pytest.mark.asyncio
@@ -16607,12 +16606,11 @@ async def test_anthropic_xai_oauth_responses_adapter_uses_managed_oauth(
     metadata = custom_body["litellm_metadata"]
     assert metadata["codex_unsupported_request_param_removed_count"] == 1
     assert metadata["codex_unsupported_request_params_removed"] == ["reasoning"]
-    assert metadata["passthrough_route_family"] == ("anthropic_xai_oauth_responses_adapter")
+    assert metadata["passthrough_route_family"] == "xai_oauth_api"
     assert metadata["xai_oauth_public_model"] == public_model
     assert metadata["xai_oauth_upstream_model"] == f"xai/{upstream_model}"
     assert metadata["shared_quota_family"] == "xai_grok_subscription"
     assert "route:xai_oauth_api" in metadata["tags"]
-    assert "route:anthropic_xai_oauth_responses_adapter" in metadata["tags"]
 
 
 @pytest.mark.asyncio
@@ -16796,7 +16794,7 @@ async def test_anthropic_xai_oauth_responses_adapter_sanitizes_xai_unsupported_f
     _assert_xai_responses_top_level_fields_sanitized(custom_body)
     metadata = custom_body["litellm_metadata"]
     assert metadata["session_id"] == "claude-session"
-    assert metadata["passthrough_route_family"] == ("anthropic_xai_oauth_responses_adapter")
+    assert metadata["passthrough_route_family"] == "xai_oauth_api"
     assert metadata["xai_oauth_public_model"] == "oa_xai/grok-4.3"
 
 
@@ -22059,7 +22057,7 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(monkeyp
     body = {'model': 'aawm-code', 'input': 'hello', 'stream': False, 'tools': [_codex_apply_patch_custom_tool_definition(), {'type': 'custom', 'name': 'exec_command'}, {'type': 'function', 'name': 'read_file', 'parameters': {'type': 'object', 'properties': {}}}], 'tool_choice': {'type': 'custom', 'name': 'apply_patch'}, 'litellm_metadata': {'session_id': 'codex-session'}}
     spark_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     grok_success = Response(content='{"ok": true}', media_type='application/json')
-    with patch.dict(os.environ, {'GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL': 'https://api.x.ai/v1'}), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=[spark_error, grok_success])) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token', new=AsyncMock(return_value='grok-oidc-token')):
+    with patch.dict(os.environ, {'GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL': 'https://api.x.ai/v1', 'LITELLM_XAI_GROK_CLIENT_VERSION': '0.1.211'}), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=[spark_error, grok_success])) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token', new=AsyncMock(return_value='grok-oidc-token')):
         response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert response is grok_success
     assert mock_pass_through.await_count == 2

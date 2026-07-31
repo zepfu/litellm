@@ -110,7 +110,17 @@ def _has_continuation_state_stub(value: Any, _seen: Optional[set[int]] = None) -
 
 @pytest.fixture(autouse=True)
 def _configure_audit_context():
-    """Configure audit_context runtime with fresh stubs before each test."""
+    """Configure audit_context runtime with fresh stubs before each test.
+
+    Saves both module-level seam attributes AND _host_globals entries.
+    After install(), _SeamPropagatingModule.__setattr__ propagates every
+    setattr into _host_globals.  If we only restore module attributes, the
+    propagated value (e.g. a late-binding lambda wrapping
+    _clean_secret_string) replaces the real function in the god-module
+    namespace and recurses infinitely.  We therefore snapshot _host_globals
+    entries before configure and overwrite them after the setattr restore.
+    """
+    _MISSING = object()
     seam_names = (
         "_clean_secret_string",
         "_extract_auto_agent_alias_metadata_value",
@@ -121,6 +131,12 @@ def _configure_audit_context():
         "_codex_auto_agent_request_has_continuation_state",
     )
     previous = {name: getattr(audit_context, name) for name in seam_names}
+    host_globals = audit_context._host_globals
+    previous_host = (
+        {name: host_globals.get(name, _MISSING) for name in seam_names}
+        if host_globals is not None
+        else {}
+    )
 
     audit_context.configure_audit_context_runtime(
         clean_secret_string=_clean_secret_string_stub,
@@ -132,8 +148,19 @@ def _configure_audit_context():
         has_continuation_state=_has_continuation_state_stub,
     )
     yield
+    # Restore module-level seam attributes (propagates to _host_globals
+    # via _SeamPropagatingModule.__setattr__).
     for name, value in previous.items():
         setattr(audit_context, name, value)
+    # Overwrite _host_globals with the exact prior values, undoing any
+    # lambda/stub that setattr propagation wrote.
+    if host_globals is not None:
+        for name in seam_names:
+            prior = previous_host[name]
+            if prior is _MISSING:
+                host_globals.pop(name, None)
+            else:
+                host_globals[name] = prior
 
 
 # ---------------------------------------------------------------------------

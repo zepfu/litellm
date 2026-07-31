@@ -5,7 +5,7 @@ Write scope: this file only.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Generator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -67,6 +67,14 @@ def _install_runtime(rt: AliasCandidateDispatchRuntime) -> None:
 
 def _clear_runtime() -> None:
     _mod._runtime = None
+
+
+@pytest.fixture(autouse=True)
+def _restore_alias_candidate_dispatch_runtime() -> Generator[None, None, None]:
+    saved = _mod._runtime
+    _mod._runtime = None
+    yield
+    _mod._runtime = saved
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +179,6 @@ class TestDispatchAutoAgentAliasCandidateRequest:
 
 
 class TestPerformAnthropicAutoAgentAliasCandidateRequest:
-    def setup_method(self):
-        _clear_runtime()
-
-    def teardown_method(self):
-        _clear_runtime()
-
     @pytest.mark.asyncio
     async def test_fails_closed_without_runtime(self):
         with pytest.raises(RuntimeError, match="runtime not installed"):
@@ -415,9 +417,6 @@ class TestPerformAnthropicAutoAgentAliasCandidateRequest:
 
 
 class TestInstall:
-    def teardown_method(self):
-        _clear_runtime()
-
     def test_install_publishes_owned_symbols(self):
         host: dict[str, Any] = {}
         install(host)

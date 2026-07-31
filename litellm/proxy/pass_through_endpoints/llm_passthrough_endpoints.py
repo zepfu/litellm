@@ -202,7 +202,7 @@ from litellm.types.llms.openai import (
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
 
-from .passthrough_endpoint_router import PassthroughEndpointRouter
+from .passthrough_endpoint_router import passthrough_endpoint_router
 
 from .aawm_alias_routing import adapter_config as _aawm_adapter_config  # noqa: F401 - Wave 6F facade host binding
 from .aawm_alias_routing import adapter_driver as _aawm_adapter_driver
@@ -751,7 +751,7 @@ vertex_llm_base = VertexBase()
 router = APIRouter()
 default_vertex_config = None
 
-passthrough_endpoint_router = PassthroughEndpointRouter()
+# Singleton imported from .passthrough_endpoint_router (line 205)
 
 
 # ---------------------------------------------------------------------------

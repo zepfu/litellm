@@ -282,24 +282,28 @@ def test_lane_identity_index_remove_identity() -> None:
     assert len(index) == 0
 
 
-def test_lane_identity_index_max_identities_eviction() -> None:
+def test_lane_identity_index_max_identities_capacity_rejection() -> None:
+    """Fail-closed: identity capacity rejects new registrations without eviction."""
     index = LaneIdentityIndex(max_identities=2)
-    index.register(identity_hash="hash1", lane_key="lane1")
-    index.register(identity_hash="hash2", lane_key="lane2")
-    index.register(identity_hash="hash3", lane_key="lane3")
-    assert index.lanes_for("hash1") == frozenset()
+    assert index.register(identity_hash="hash1", lane_key="lane1") is True
+    assert index.register(identity_hash="hash2", lane_key="lane2") is True
+    # At capacity: reject, no eviction
+    assert index.register(identity_hash="hash3", lane_key="lane3") is False
+    # All original entries preserved
+    assert index.lanes_for("hash1") == frozenset({"lane1"})
     assert index.lanes_for("hash2") == frozenset({"lane2"})
-    assert index.lanes_for("hash3") == frozenset({"lane3"})
+    assert index.lanes_for("hash3") == frozenset()
 
 
-def test_lane_identity_index_max_lanes_per_identity_eviction() -> None:
+def test_lane_identity_index_max_lanes_per_identity_capacity_rejection() -> None:
+    """Fail-closed: lane capacity rejects new lanes without eviction."""
     index = LaneIdentityIndex(max_lanes_per_identity=2)
-    index.register(identity_hash="hash1", lane_key="lane1")
-    index.register(identity_hash="hash1", lane_key="lane2")
-    index.register(identity_hash="hash1", lane_key="lane3")
+    assert index.register(identity_hash="hash1", lane_key="lane1") is True
+    assert index.register(identity_hash="hash1", lane_key="lane2") is True
+    # At capacity: reject, no eviction
+    assert index.register(identity_hash="hash1", lane_key="lane3") is False
     lanes = index.lanes_for("hash1")
-    assert len(lanes) == 2
-    assert "lane3" in lanes
+    assert lanes == frozenset({"lane1", "lane2"})
 
 
 def test_lane_identity_index_clear() -> None:
@@ -823,3 +827,194 @@ def test_anthropic_clear_does_not_touch_codex_state(
     assert result.positive_keys_cleared == ["shared-key"]
     assert "shared-key" in mgr.codex.cooldown_until_monotonic_by_key
     assert "shared-key" not in mgr.anthropic.cooldown_until_monotonic_by_key
+
+
+# ---------------------------------------------------------------------------
+# Persistent hydration end-to-end (no float TypeError)
+# ---------------------------------------------------------------------------
+
+
+def test_hydrate_cooldown_memory_persistent_no_type_error() -> None:
+    """hydrate_cooldown_memory accepts UNBOUNDED_EXPIRY without TypeError."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+        UNBOUNDED_EXPIRY,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.memory import (
+        hydrate_cooldown_memory,
+    )
+
+    memory_map: dict[str, float] = {}
+    hydrate_cooldown_memory(
+        memory_map=memory_map,
+        cooldown_key="persistent-key",
+        expires_at_epoch=UNBOUNDED_EXPIRY,
+    )
+    assert "persistent-key" in memory_map
+    assert memory_map["persistent-key"] == float("inf")
+
+
+def test_hydrate_affinity_memory_persistent_no_type_error() -> None:
+    """hydrate_affinity_memory accepts UNBOUNDED_EXPIRY without TypeError."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+        UNBOUNDED_EXPIRY,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.memory import (
+        hydrate_affinity_memory,
+    )
+
+    memory_map: dict[str, dict] = {}
+    result = hydrate_affinity_memory(
+        memory_map=memory_map,
+        session_key="persistent-session",
+        payload={
+            "provider": "openai",
+            "model": "gpt-4.1",
+            "route_family": "codex_openai_responses_adapter",
+            "last_resort": False,
+        },
+        expires_at_epoch=UNBOUNDED_EXPIRY,
+    )
+    assert result["provider"] == "openai"
+    assert result["expires_at_monotonic"] == float("inf")
+    assert "persistent-session" in memory_map
+
+
+def test_hydrate_cooldown_memory_finite_still_works() -> None:
+    """Finite epoch hydration still works after persistent support."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.memory import (
+        hydrate_cooldown_memory,
+    )
+
+    memory_map: dict[str, float] = {}
+    future_epoch = time.time() + 300
+    hydrate_cooldown_memory(
+        memory_map=memory_map,
+        cooldown_key="finite-key",
+        expires_at_epoch=future_epoch,
+    )
+    assert "finite-key" in memory_map
+    assert memory_map["finite-key"] > time.monotonic()
+    assert memory_map["finite-key"] < float("inf")
+
+
+def test_hydrate_affinity_memory_finite_still_works() -> None:
+    """Finite epoch affinity hydration still works after persistent support."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.memory import (
+        hydrate_affinity_memory,
+    )
+
+    memory_map: dict[str, dict] = {}
+    future_epoch = time.time() + 300
+    result = hydrate_affinity_memory(
+        memory_map=memory_map,
+        session_key="finite-session",
+        payload={
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-20250514",
+            "route_family": "anthropic_native_adapter",
+            "last_resort": True,
+        },
+        expires_at_epoch=future_epoch,
+    )
+    assert result["provider"] == "anthropic"
+    assert result["last_resort"] is True
+    assert result["expires_at_monotonic"] < float("inf")
+    assert result["expires_at_monotonic"] > time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Legacy 10-year sentinel removal regression
+# ---------------------------------------------------------------------------
+
+
+def test_far_future_finite_expiry_not_treated_as_persistent() -> None:
+    """A far-future finite epoch (>10 years) must remain finite, not persistent."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+        UNBOUNDED_EXPIRY,
+        parse_aawm_alias_routing_durable_expiry,
+    )
+
+    far_future = time.time() + 400_000_000  # ~12.7 years
+    payload = {"expires_at_epoch": far_future}
+    result = parse_aawm_alias_routing_durable_expiry(payload)
+    assert result is not UNBOUNDED_EXPIRY
+    assert isinstance(result, float)
+    assert result == far_future
+
+
+def test_explicit_persistent_marker_still_works() -> None:
+    """Explicit persistent:true marker must return UNBOUNDED_EXPIRY."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+        UNBOUNDED_EXPIRY,
+        parse_aawm_alias_routing_durable_expiry,
+    )
+
+    payload = {"persistent": True, "cooldown_key": "k1"}
+    result = parse_aawm_alias_routing_durable_expiry(payload)
+    assert result is UNBOUNDED_EXPIRY
+
+
+def test_persistent_false_not_treated_as_persistent() -> None:
+    """persistent:false must NOT return UNBOUNDED_EXPIRY."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+        UNBOUNDED_EXPIRY,
+        parse_aawm_alias_routing_durable_expiry,
+    )
+
+    payload = {"persistent": False, "expires_at_epoch": time.time() + 300}
+    result = parse_aawm_alias_routing_durable_expiry(payload)
+    assert result is not UNBOUNDED_EXPIRY
+    assert isinstance(result, float)
+
+
+# ---------------------------------------------------------------------------
+# Persistent raw Redis write must not forward ttl=-1 to local write-through
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persistent_write_does_not_forward_negative_ttl_to_local() -> None:
+    """Persistent write-through must skip local cache (ttl=-1 would expire)."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+        write_aawm_alias_routing_durable_payload,
+    )
+
+    existing_persistent = {"persistent": True, "cooldown_key": "k1"}
+
+    redis_client = MagicMock()
+    redis_client.set = AsyncMock(return_value=True)
+    redis_client.persist = AsyncMock(return_value=True)
+
+    redis_cache = MagicMock()
+    redis_cache.init_async_client = MagicMock(return_value=redis_client)
+    redis_cache.check_and_fix_namespace = MagicMock(side_effect=lambda key: key)
+    redis_cache.async_set_cache = AsyncMock(return_value=True)
+    redis_cache.async_get_cache = AsyncMock(return_value=existing_persistent)
+
+    local_set_cache = AsyncMock(return_value=True)
+
+    dual_cache = MagicMock()
+    dual_cache.redis_cache = redis_cache
+    dual_cache.async_get_cache = AsyncMock(return_value=existing_persistent)
+    dual_cache.async_set_cache = local_set_cache
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable.get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ):
+        result = await write_aawm_alias_routing_durable_payload(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key="k1",
+            payload={"cooldown_key": "k1"},
+            ttl_seconds=300.0,
+        )
+
+    assert result is True
+    # Raw Redis SET + PERSIST must have been called (persistent path).
+    redis_client.set.assert_called_once()
+    redis_client.persist.assert_called_once()
+    # Local write-through must NOT have been called with ttl=-1.
+    for call in local_set_cache.call_args_list:
+        ttl_arg = call.kwargs.get("ttl", call[1].get("ttl") if len(call) > 1 else None)
+        assert ttl_arg != -1.0, "ttl=-1 must not be forwarded to local write-through"

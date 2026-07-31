@@ -30,10 +30,21 @@ def hydrate_cooldown_memory(
     *,
     memory_map: MutableMapping[str, float],
     cooldown_key: str,
-    expires_at_epoch: float,
+    expires_at_epoch: object,
     max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
 ) -> None:
-    remaining = max(0.0, float(expires_at_epoch) - time.time())
+    from .durable import UnboundedExpiry
+
+    if isinstance(expires_at_epoch, UnboundedExpiry):
+        # Persistent cooldown: represent as infinite monotonic so it never
+        # expires from the in-memory perspective.
+        until = float("inf")
+        current_until = float(memory_map.get(cooldown_key, 0.0) or 0.0)
+        if until > current_until:
+            memory_map[cooldown_key] = until
+            bound_memory_map(memory_map, max_size=max_size)
+        return
+    remaining = max(0.0, float(expires_at_epoch) - time.time())  # type: ignore[arg-type]
     if remaining <= 0:
         return
     until = time.monotonic() + remaining
@@ -48,10 +59,24 @@ def hydrate_affinity_memory(
     memory_map: MutableMapping[str, Payload],
     session_key: str,
     payload: Payload,
-    expires_at_epoch: float,
+    expires_at_epoch: object,
     max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
 ) -> Payload:
-    remaining = max(0.0, float(expires_at_epoch) - time.time())
+    from .durable import UnboundedExpiry
+
+    if isinstance(expires_at_epoch, UnboundedExpiry):
+        # Persistent affinity: use infinite monotonic expiry.
+        affinity: Payload = {
+            "provider": payload.get("provider"),
+            "model": payload.get("model"),
+            "route_family": payload.get("route_family"),
+            "last_resort": bool(payload.get("last_resort")),
+            "expires_at_monotonic": float("inf"),
+        }
+        memory_map[session_key] = affinity
+        bound_memory_map(memory_map, max_size=max_size)
+        return dict(affinity)
+    remaining = max(0.0, float(expires_at_epoch) - time.time())  # type: ignore[arg-type]
     if remaining <= 0:
         return {}
     affinity: Payload = {

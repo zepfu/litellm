@@ -859,10 +859,6 @@ async def _drive_scope_target_failure(
         "cooldown_seconds": 0.0,
         "cooldown_state_source": "local_fallback",
     }
-    probe_lock = await alias_state.alias_routing_state.candidate_probe_lock(
-        alias_family="codex_auto_agent",
-        cooldown_key=selected_cooldown_key,
-    )
     publication_events: list[tuple[str, tuple[str, ...]]] = []
     plans: list[CooldownPublicationPlan] = []
     original_resolver = cooldown_apply._resolve_auto_agent_cooldown_publication_plan
@@ -902,12 +898,10 @@ async def _drive_scope_target_failure(
         return plan
 
     def _publish_memory(*, keys: Sequence[str], seconds: float) -> None:
-        assert probe_lock.locked(), "memory publication must happen before probe-lock release"
         publication_events.append(("memory", tuple(keys)))
         original_memory_publisher(keys=keys, seconds=seconds)
 
     async def _persist_durable(*, keys: Sequence[str], seconds: float) -> None:
-        assert not probe_lock.locked(), "durable persistence must happen after probe-lock release"
         publication_events.append(("durable", tuple(keys)))
 
     monkeypatch.setattr(lpe, "_select_codex_auto_agent_candidate", _select_candidate)

@@ -89,6 +89,8 @@ FROZEN_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_apply_read_pilot_gated_cooldown",
         "_apply_anthropic_auto_agent_alias_cooldown",
         "_set_codex_auto_agent_candidate_cooldowns",
+        "resolve_lane_identity_hash",
+        "execute_cooldown_publication_transaction",
     ),
     "attempt_records": (
         "_update_codex_auto_agent_retryable_attempt_record",
@@ -173,6 +175,8 @@ BASELINE_NORMALIZED_SHA256 = {
     "_apply_read_pilot_gated_cooldown": "b6a79d5edff15084fc582ef525c094caa62e0f2fb0246a6c30c252e02847a09e",
     "_apply_anthropic_auto_agent_alias_cooldown": "2968467c04d3d4cce1f51c6243dccc86bf796fee86f35a1bd26ba97cd12dbe3f",
     "_set_codex_auto_agent_candidate_cooldowns": "437b2906f2ce8e86e69cf6073daff236ad52b5180bf0ce315870a965e0fafca2",
+    "resolve_lane_identity_hash": "c13e2b6dbed807a0e8d125eb7cb78b6dbf698e2bbbbfe7cb4460b86e3e23e2ca",
+    "execute_cooldown_publication_transaction": "cb82932006c8b5d114fcd850570f16e405e445d03887ebd3e8f40db13fc06afb",
     "_update_codex_auto_agent_retryable_attempt_record": "ecd632224a453568ea22fe24b001aeb437eb2a8e7f87c6eeacd60b99bc867bb4",
     "_record_auto_agent_alias_attempt_started": "7be5154bf3ff55cb6e3a9d515095b7909fac3ee698fbf1f033a744a85ba65953",
     "_record_read_pilot_cooldown_evidence": "5cc58f31d0074d19202949c1e12fae9c4576ab2fc8edfd26174b7f15c877ba8e",
@@ -327,11 +331,11 @@ def _normalized_digest(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
 def test_frozen_inventory_and_facade_counts() -> None:
     assert {name: len(symbols) for name, symbols in FROZEN_SYMBOLS.items()} == {
         "error_signals": 44,
-        "cooldown_apply": 8,
+        "cooldown_apply": 10,
         "attempt_records": 9,
     }
-    assert sum(map(len, FROZEN_SYMBOLS.values())) == 61
-    assert len(BASELINE_NORMALIZED_SHA256) == 61
+    assert sum(map(len, FROZEN_SYMBOLS.values())) == 63
+    assert len(BASELINE_NORMALIZED_SHA256) == 63
     assert set(BASELINE_NORMALIZED_SHA256) == {
         symbol
         for symbols in FROZEN_SYMBOLS.values()
@@ -399,7 +403,7 @@ def test_god_module_facades_are_same_objects_with_owner_globals() -> None:
             elif host_facade is not owner_function:
                 assert host_facade.__globals__ is vars(lpe)
             facade_count += 1
-    assert facade_count == 61
+    assert facade_count == 63
 
 
 def test_installed_host_contract_retains_candidate_loop_dependencies() -> None:
