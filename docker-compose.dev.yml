@@ -143,7 +143,7 @@ services:
       - AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR=${AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR:-/home/zepfu/.analysis/full-payload-captures/runtime}
       # AAWM runtime database access goes through shared PgBouncer. Keep
       # AAWM_DIRECT_DATABASE_URL on direct Postgres for admin/backfill paths.
-      - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}
+      - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer-aawm-dev}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}
       - AAWM_DB_NAME=${LITELLM_AAWM_DB_NAME:-aawm_tristore}
       - AAWM_DB_USER=${LITELLM_AAWM_DB_USER:-aawm}
@@ -152,7 +152,7 @@ services:
       - AAWM_DB_SSLMODE=${LITELLM_AAWM_DB_SSLMODE:-disable}
       - AAWM_DB_SSL=${LITELLM_AAWM_DB_SSL:-}
       - AAWM_DB_URL=${LITELLM_AAWM_DB_URL:-}
-      - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore?application_name=aawm-litellm-session-history}
+      - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer-aawm-dev:6432/aawm_tristore?application_name=aawm-litellm-session-history}
       - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
       - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=${LITELLM_AAWM_SESSION_HISTORY_DB_APPLICATION_NAME:-aawm-litellm-session-history}
       - AAWM_SESSION_HISTORY_SPOOL_DIR=${AAWM_SESSION_HISTORY_SPOOL_DIR:-/mnt/e/litellm/session_history}
@@ -265,7 +265,7 @@ services:
       # Alibaba Token Plan sidecar session file source for quota polling.
       - /home/zepfu/.alibaba:/home/zepfu/.alibaba:ro
     environment:
-      - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}
+      - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer-aawm-dev}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}
       - AAWM_DB_NAME=${LITELLM_AAWM_DB_NAME:-aawm_tristore}
       - AAWM_DB_USER=${LITELLM_AAWM_DB_USER:-aawm}
@@ -274,7 +274,7 @@ services:
       - AAWM_DB_SSLMODE=${LITELLM_AAWM_DB_SSLMODE:-disable}
       - AAWM_DB_SSL=${LITELLM_AAWM_DB_SSL:-}
       - AAWM_DB_URL=${LITELLM_AAWM_DB_URL:-}
-      - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore?application_name=aawm-provider-status-observations}
+      - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer-aawm-dev:6432/aawm_tristore?application_name=aawm-provider-status-observations}
       - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
       - AAWM_PROVIDER_STATUS_SCHEMA_DSN=${AAWM_PROVIDER_STATUS_SCHEMA_DSN:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore?application_name=aawm-provider-status-observations-schema}
       - AAWM_PROVIDER_STATUS_DB_APPLICATION_NAME=${LITELLM_AAWM_PROVIDER_STATUS_DB_APPLICATION_NAME:-aawm-provider-status-observations}

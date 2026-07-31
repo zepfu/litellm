@@ -248,6 +248,14 @@ ALIBABA_TOKEN_PLAN_USER_INFO_URL = (
 ALIBABA_TOKEN_PLAN_CLIENT = "qwen-cloud-console"
 ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba_token_plan"
 ALIBABA_TOKEN_PLAN_MODEL = "qwen-token-plan"
+# Active read-alias Alibaba Token Plan candidates.  The plan quota is
+# account-wide (single consumed-percentage, no per-model dimension); both
+# models share the same 5h/7d Credit windows.  Rows are emitted for each
+# exact model identity so the availability query can match alias candidates.
+ALIBABA_TOKEN_PLAN_ACTIVE_MODELS = (
+    "alibaba_token_plan/qwen3.8-max-preview",
+    "alibaba_token_plan/qwen3.6-flash",
+)
 ALIBABA_TOKEN_PLAN_SOURCE = "alibaba_token_plan_usage"
 ALIBABA_TOKEN_PLAN_PARSER_VERSION = "alibaba_token_plan_usage_v2"
 ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY = "alibaba_token_plan_5h:credits"
@@ -5436,6 +5444,176 @@ def _alibaba_quota_response_requires_sec_token(
     )
 
 
+def _alibaba_console_envelope_is_auth_failure(
+    response: Mapping[str, Any],
+) -> bool:
+    """Detect a known application-level auth/session-expired envelope.
+
+    The Alibaba console gateway returns HTTP 200 with top-level
+    ``successResponse=true`` (gateway transport success) but
+    ``success=false`` carrying ``errorCode``/``errorMsg`` when the web
+    session has expired or the credential is invalid.  The live envelope
+    places these fields directly under top-level ``data`` (no DataV2
+    wrapper); a nested DataV2 envelope is also possible.  This is a
+    structured auth envelope, not contract drift.
+
+    Classification is deliberately NARROW: not every ``success=false`` +
+    error field is auth.  Quota/capacity and internal/server error envelopes
+    must NOT be classified as auth (they remain fail-closed under
+    ``contract_drift``).  Only a secret-safe allowlist of known
+    login/session/auth-expiry signals qualifies.
+
+    Detection requires ALL of:
+    - ``response`` is a Mapping with ``success`` explicitly ``False``;
+    - at least one of ``errorCode`` or ``errorMsg`` is present; AND
+    - the lowercased ``errorCode``/``errorMsg`` text matches a known
+      login/session/auth-expiry allowlist pattern.
+
+    Raw errorCode/errorMsg values are never logged or stored.
+    """
+    if not isinstance(response, Mapping):
+        return False
+    if response.get("success") is not False:
+        return False
+    if "errorCode" not in response and "errorMsg" not in response:
+        return False
+    return _alibaba_error_text_matches_auth_allowlist(response)
+
+
+# Secret-safe keyword classification for Alibaba application-level auth/
+# session-expiry envelopes (Finding 3).  Matched case-insensitively against
+# ALPHANUMERIC WORD TOKENS extracted from errorCode/errorMsg, so natural
+# language such as "The login session has expired" is recognized while raw
+# secret values are never logged, stored, or returned (only a boolean match
+# escapes).
+#
+# Classification is deliberately NARROW and fail-closed:
+# - A NON_AUTH keyword (quota/capacity/throttle/internal/server) anywhere in
+#   the text forces a non-auth verdict, even if an auth keyword also appears.
+# - Otherwise, a STRONG_AUTH keyword alone qualifies (e.g. "unauthorized",
+#   "needlogin", "permissiondenied").
+# - A WEAK_AUTH keyword (e.g. "session", "token", "credential") qualifies only
+#   when paired with an EXPIRY/INVALID keyword, so a bare "session" mention in
+#   a quota/server message is not auth.
+_ALIBABA_AUTH_STRONG_KEYWORDS = frozenset(
+    {
+        "needlogin",
+        "notlogin",
+        "unlogin",
+        "unauthorized",
+        "unauthenticated",
+        "loginrequired",
+        "authenticationfailed",
+        "authfailure",
+        "forbidden",
+        "nopermission",
+        "permissiondenied",
+        "accessdenied",
+    }
+)
+_ALIBABA_AUTH_WEAK_KEYWORDS = frozenset(
+    {
+        "session",
+        "token",
+        "accesstoken",
+        "credential",
+        "credentials",
+        "auth",
+        "authentication",
+        "login",
+        "signin",
+    }
+)
+_ALIBABA_AUTH_EXPIRY_KEYWORDS = frozenset(
+    {
+        "expired",
+        "expiry",
+        "expire",
+        "invalid",
+        "revoked",
+        "rejected",
+        "timeout",
+        "timedout",
+    }
+)
+_ALIBABA_NON_AUTH_KEYWORDS = frozenset(
+    {
+        "quota",
+        "quotas",
+        "capacity",
+        "throttle",
+        "throttled",
+        "throttling",
+        "ratelimit",
+        "ratelimited",
+        "toomanyrequests",
+        "internal",
+        "internalerror",
+        "server",
+        "servererror",
+        "serviceunavailable",
+        "badgateway",
+        "gateway",
+        "upstream",
+        "overloaded",
+        "exhausted",
+        "limitexceeded",
+        "insufficient",
+        "balance",
+    }
+)
+
+
+def _alibaba_error_text_matches_auth_allowlist(response: Mapping[str, Any]) -> bool:
+    """Return True only if the errorCode/errorMsg text matches a known
+    login/session/auth-expiry signal.
+
+    Text is normalized by splitting camelCase and separators into alphanumeric
+    WORD tokens, and also into a separator-stripped ``joined`` form for
+    multi-word identifiers (e.g. ``ConsoleNeedLogin`` -> ``needlogin``).
+    Classification against secret-safe keyword sets:
+
+    - A NON_AUTH keyword (quota/capacity/throttle/internal/server) present as a
+      word forces False, even if an auth keyword also appears (fail-closed).
+    - A STRONG_AUTH keyword (as a word, or as a substring of the joined form)
+      alone qualifies.
+    - A WEAK_AUTH keyword (session/token/credential/login) qualifies only when
+      paired with an EXPIRY/INVALID keyword, so a bare "session" mention in a
+      quota/server message is not auth.
+
+    Raw values are read in memory for classification only and are never logged,
+    stored, or returned; only a boolean match escapes.
+    """
+    haystack_parts: list[str] = []
+    for field in ("errorCode", "errorMsg"):
+        value = response.get(field)
+        if isinstance(value, str):
+            haystack_parts.append(value)
+    if not haystack_parts:
+        return False
+    raw = " ".join(haystack_parts)
+    # Split camelCase boundaries (lowercase/digit -> uppercase) before tokenizing.
+    split_text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw)
+    word_list = re.findall(r"[a-z0-9]+", split_text.lower())
+    if not word_list:
+        return False
+    words = set(word_list)
+    # Build the joined form from the ORDERED token list (not the set) so
+    # multi-word strong keywords such as "needlogin" remain contiguous.
+    joined = "".join(word_list)
+    # Fail-closed guard: quota/capacity/internal/server envelopes are never
+    # auth, even if an auth keyword also appears.
+    if words & _ALIBABA_NON_AUTH_KEYWORDS:
+        return False
+    if words & _ALIBABA_AUTH_STRONG_KEYWORDS:
+        return True
+    if any(keyword in joined for keyword in _ALIBABA_AUTH_STRONG_KEYWORDS):
+        return True
+    if words & _ALIBABA_AUTH_WEAK_KEYWORDS and words & _ALIBABA_AUTH_EXPIRY_KEYWORDS:
+        return True
+    return False
+
+
 def _extract_alibaba_console_data(
     payload: Mapping[str, Any],
     *,
@@ -5451,13 +5629,34 @@ def _extract_alibaba_console_data(
         or response.get("success") is not True
         or not isinstance(provider_data, Mapping)
     ):
+        # Classify known application-level auth envelopes as "auth" rather
+        # than "contract_drift".  The envelope structure is well-known; the
+        # session simply expired.  Fail closed either way.
+        # The live console gateway places the auth envelope directly under
+        # top-level ``data`` (``payload.data.success=false`` + errorCode/
+        # errorMsg, no DataV2 wrapper).  A nested DataV2 envelope is also
+        # recognized for forward compatibility.  Check both key paths.
+        if _alibaba_console_envelope_is_auth_failure(
+            outer_data
+        ) or _alibaba_console_envelope_is_auth_failure(response):
+            telemetry_class = "auth"
+            message = (
+                f"Alibaba Token Plan {endpoint} endpoint returned an "
+                "application-level authentication failure envelope."
+            )
+        else:
+            telemetry_class = "contract_drift"
+            message = (
+                f"Alibaba Token Plan {endpoint} endpoint returned an "
+                "unrecognized response contract."
+            )
         raise _alibaba_quota_poll_error(
             endpoint=endpoint,
             status_code=200,
-            telemetry_class="contract_drift",
+            telemetry_class=telemetry_class,
             attempt_count=1,
             retry_count=0,
-            message=(f"Alibaba Token Plan {endpoint} endpoint returned an " "unrecognized response contract."),
+            message=message,
         )
     return provider_data
 
@@ -5833,33 +6032,38 @@ def _build_alibaba_quota_rate_limit_payloads(
                 "Alibaba reports a consumed Credit fraction; absolute Credit "
                 "limits are not present in this console response."
             ),
+            "quota_scope": (
+                "account-wide; shared across all Token Plan models including "
+                "qwen3.8-max-preview and qwen3.6-flash"
+            ),
         }
-        payloads.append(
-            (
-                observed_at,
-                ALIBABA_TOKEN_PLAN_CLIENT,
-                None,
-                subscription["account_hash"],
-                ALIBABA_TOKEN_PLAN_PROVIDER,
-                ALIBABA_TOKEN_PLAN_MODEL,
-                quota_key,
-                window,
-                "credits",
-                reset_at,
-                remaining_pct,
-                None,
-                None,
-                None,
-                subscription["start_at"],
-                subscription["end_at"],
-                json.dumps(raw_provider_fields, sort_keys=True),
-                json.dumps(evidence, sort_keys=True),
-                ALIBABA_TOKEN_PLAN_SOURCE,
-                None,
-                None,
-                f"alibaba-quota-poll-{observed_at.strftime('%Y%m%d%H%M%S')}",
+        for model_identity in ALIBABA_TOKEN_PLAN_ACTIVE_MODELS:
+            payloads.append(
+                (
+                    observed_at,
+                    ALIBABA_TOKEN_PLAN_CLIENT,
+                    None,
+                    subscription["account_hash"],
+                    ALIBABA_TOKEN_PLAN_PROVIDER,
+                    model_identity,
+                    quota_key,
+                    window,
+                    "credits",
+                    reset_at,
+                    remaining_pct,
+                    None,
+                    None,
+                    None,
+                    subscription["start_at"],
+                    subscription["end_at"],
+                    json.dumps(raw_provider_fields, sort_keys=True),
+                    json.dumps(evidence, sort_keys=True),
+                    ALIBABA_TOKEN_PLAN_SOURCE,
+                    None,
+                    None,
+                    f"alibaba-quota-poll-{observed_at.strftime('%Y%m%d%H%M%S')}",
+                )
             )
-        )
     return payloads
 
 

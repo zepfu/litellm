@@ -786,6 +786,27 @@ def _format_harness_template(value: Any, context: dict[str, str]) -> Any:
     return value
 
 
+_UNRESOLVED_PLACEHOLDER_RE = re.compile(r'\{[a-z_][a-z0-9_]*\}')
+
+
+def _contains_unresolved_placeholder(value: Any) -> bool:
+    """Return True if a string value contains an unresolved {placeholder}."""
+    if isinstance(value, str):
+        return bool(_UNRESOLVED_PLACEHOLDER_RE.search(value))
+    if isinstance(value, list):
+        return any(_contains_unresolved_placeholder(item) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _contains_unresolved_placeholder(k) or _contains_unresolved_placeholder(v)
+            for k, v in value.items()
+        )
+    return False
+
+
+def _is_template_placeholder(value: str) -> bool:
+    """Return True if a string is entirely an unresolved template placeholder."""
+    return bool(re.fullmatch(r'\{[a-z_][a-z0-9_]*\}', value.strip()))
+
 def _append_claude_agents_arg(command: list[Any], agents: Any) -> list[Any]:
     if not isinstance(agents, dict) or not agents:
         return command
@@ -1387,23 +1408,43 @@ def _ensure_http_harness_context(
         for value in (updated.get('expected_user_ids') or [])
         if isinstance(value, (str, int, float)) and str(value).strip()
     ]
+    # Fix 1: template placeholders like {harness_user_id} must not become the
+    # effective ID.  Only concrete (non-placeholder) values are preserved.
+    concrete_user_ids = [
+        uid for uid in expected_user_ids if not _is_template_placeholder(uid)
+    ]
     harness_user_id = (
-        expected_user_ids[0]
-        if expected_user_ids
+        concrete_user_ids[0]
+        if concrete_user_ids
         else RA._build_claude_harness_user_id(target=target, case_name=case_name)
     )
-    session_id = str(
-        request_config.get('session_id')
-        or updated.get('expected_trace_session_id')
-        or f'{harness_user_id}.session'
-    )
+    # Resolve session ID with cross-field fallback: prefer a concrete
+    # request session_id, then a concrete expected_trace_session_id, and
+    # only derive <user>.session when neither provides a concrete value.
+    _req_sid = str(request_config.get('session_id') or '').strip()
+    _exp_sid = str(updated.get('expected_trace_session_id') or '').strip()
+    if _req_sid and not _is_template_placeholder(_req_sid):
+        session_id = _req_sid
+    elif _exp_sid and not _is_template_placeholder(_exp_sid):
+        session_id = _exp_sid
+    else:
+        session_id = f'{harness_user_id}.session'
     if request_config.get('add_default_authorization') is not False:
         headers.setdefault('authorization', 'Bearer sk-1234')
-    headers.setdefault('x-litellm-end-user-id', harness_user_id)
-    headers.setdefault('langfuse_trace_user_id', harness_user_id)
-    headers.setdefault('langfuse_trace_name', case_name)
-    headers.setdefault('session_id', session_id)
-    headers.setdefault('x-aawm-tenant-id', tenant_id)
+    # Controlled headers: replace unresolved placeholder values rather than
+    # preserving them via setdefault.  Concrete explicit values remain
+    # authoritative.
+    _controlled_http = {
+        'x-litellm-end-user-id': harness_user_id,
+        'langfuse_trace_user_id': harness_user_id,
+        'langfuse_trace_name': case_name,
+        'session_id': session_id,
+        'x-aawm-tenant-id': tenant_id,
+    }
+    for hdr_name, hdr_value in _controlled_http.items():
+        existing = headers.get(hdr_name)
+        if existing is None or _contains_unresolved_placeholder(existing):
+            headers[hdr_name] = hdr_value
     headers.setdefault('user-agent', 'AAWMNativePassthroughHarness/0.1')
 
     request_config['headers'] = headers
@@ -1435,13 +1476,24 @@ def _ensure_cli_harness_context(
         for value in (updated.get('expected_user_ids') or [])
         if isinstance(value, (str, int, float)) and str(value).strip()
     ]
+    # Fix 1: template placeholders like {harness_user_id} must not become the
+    # effective ID.  Only concrete (non-placeholder) values are preserved.
+    concrete_user_ids = [
+        uid for uid in expected_user_ids if not _is_template_placeholder(uid)
+    ]
     harness_user_id = (
-        expected_user_ids[0]
-        if expected_user_ids
+        concrete_user_ids[0]
+        if concrete_user_ids
         else RA._build_claude_harness_user_id(target=target, case_name=case_name)
     )
-    session_id = str(
-        updated.get('expected_trace_session_id') or f'{harness_user_id}.session'
+    raw_session_id = str(
+        updated.get('expected_trace_session_id') or ''
+    ).strip()
+    # Derive a concrete session ID when the configured value is a placeholder.
+    session_id = (
+        raw_session_id
+        if raw_session_id and not _is_template_placeholder(raw_session_id)
+        else f'{harness_user_id}.session'
     )
     repository = _resolve_harness_repository()
     codex_profile = 'litellm' if target == 'prod' else 'litellm-dev'
@@ -6841,7 +6893,13 @@ def _resolve_main_credentials(
     secret_key_env = config.get('langfuse_secret_key_env', 'LANGFUSE_SECRET_KEY')
     public_key = ''
     secret_key = ''
-    container_name = (profile or {}).get('docker_container_name', '')
+    # Fix 6: explicit langfuse_credential_container takes precedence over
+    # docker_container_name, preserving backward-compatible fallback.
+    container_name = str(
+        (profile or {}).get('langfuse_credential_container')
+        or (profile or {}).get('docker_container_name')
+        or ''
+    )
     pk_container_env = (profile or {}).get('langfuse_public_key_container_env', '')
     sk_container_env = (profile or {}).get('langfuse_secret_key_container_env', '')
     container_owned_credentials = bool(pk_container_env or sk_container_env)

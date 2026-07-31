@@ -241,10 +241,10 @@ def test_target_profile_applies_db_settings_to_all_db_validators(harness):
     }
     harness._apply_profile_validation_db_overrides(case, _dev_profile())
     for block in case.values():
-        assert block["db_port"] == 6433
-        assert block["db_name"] == "litellm_dev"
-        assert block["db_user"] == "litellm_dev"
-        assert block["db_password_container"] == "thoth-litellm-dev-pgbouncer"
+        assert block["db_port"] == 6435
+        assert block["db_name"] == "aawm_tristore"
+        assert block["db_user"] == "aawm"
+        assert block["db_password_container"] == "thoth-aawm-dev-pgbouncer"
         assert block["db_password_container_env"] == "PGBOUNCER_AUTH_PASSWORD"
 
 
@@ -305,13 +305,14 @@ def test_langfuse_container_credentials_win_over_stale_host(harness, monkeypatch
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "stale-pk")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "stale-sk")
     values = {
-        "LANGFUSE_PUBLIC_KEY": "container-pk",
-        "LANGFUSE_SECRET_KEY": "container-sk",
+        "LANGFUSE_INIT_PROJECT_PUBLIC_KEY": "container-pk",
+        "LANGFUSE_INIT_PROJECT_SECRET_KEY": "container-sk",
     }
+    seen_containers = []
     monkeypatch.setattr(
         harness,
         "_resolve_container_env_value",
-        lambda container, name: values[name],
+        lambda container, name: seen_containers.append(container) or values[name],
     )
 
     class Args:
@@ -325,6 +326,9 @@ def test_langfuse_container_credentials_win_over_stale_host(harness, monkeypatch
         "container-sk",
         "http://127.0.0.1:3000",
     )
+    # CFG-003 item 6: credentials resolved from the dedicated Langfuse
+    # container, never the target litellm-dev container.
+    assert seen_containers == ["aawm-langfuse-web", "aawm-langfuse-web"]
 
 
 def test_langfuse_container_credential_failure_is_fail_closed_and_redacted(
@@ -572,13 +576,18 @@ def test_config_case_uses_failure_observability_and_read_only_codex():
 
 def test_config_dev_profile_declares_container_owned_credentials():
     dev = _config()["target_profiles"]["dev"]
-    assert dev["validation_db_port"] == "6433"
-    assert dev["validation_db_name"] == "litellm_dev"
-    assert dev["validation_db_user"] == "litellm_dev"
-    assert dev["validation_db_password_container"] == "thoth-litellm-dev-pgbouncer"
+    # CFG-003 Initiation 2 item 4: dev evidence DB is aawm_tristore on 6435.
+    assert dev["validation_db_host"] == "127.0.0.1"
+    assert dev["validation_db_port"] == "6435"
+    assert dev["validation_db_name"] == "aawm_tristore"
+    assert dev["validation_db_user"] == "aawm"
+    assert dev["validation_db_password_container"] == "thoth-aawm-dev-pgbouncer"
     assert dev["validation_db_password_container_env"] == "PGBOUNCER_AUTH_PASSWORD"
-    assert dev["langfuse_public_key_container_env"] == "LANGFUSE_PUBLIC_KEY"
-    assert dev["langfuse_secret_key_container_env"] == "LANGFUSE_SECRET_KEY"
+    # CFG-003 Initiation 2 item 6: Langfuse credentials are owned by a
+    # dedicated container distinct from the target litellm-dev container.
+    assert dev["langfuse_credential_container"] == "aawm-langfuse-web"
+    assert dev["langfuse_public_key_container_env"] == "LANGFUSE_INIT_PROJECT_PUBLIC_KEY"
+    assert dev["langfuse_secret_key_container_env"] == "LANGFUSE_INIT_PROJECT_SECRET_KEY"
     assert "validation_db_host" not in _config()["target_profiles"]["prod"]
 
 
@@ -750,3 +759,521 @@ def test_validate_case_records_command_thread_id(harness, monkeypatch):
     assert result["langfuse"]["command_thread_id"] == "thr-abc"
     assert result["langfuse"]["command_session_id"] == "test-session"
     assert result["langfuse"]["command_thread_id"] != result["langfuse"]["command_session_id"]
+
+
+# ---------------------------------------------------------------------------
+# CFG-003 Initiation 2: Fix 1 - CLI template placeholder resolution
+# ---------------------------------------------------------------------------
+
+
+class TestTemplatePlaceholderResolution:
+    """Unresolved {placeholder} values must not become effective IDs."""
+
+    def test_is_template_placeholder_detects_placeholders(self, harness):
+        assert harness._is_template_placeholder("{harness_user_id}") is True
+        assert harness._is_template_placeholder("{session_id}") is True
+        assert harness._is_template_placeholder("{case_name}") is True
+        assert harness._is_template_placeholder("adapter-harness-tenant") is False
+        assert harness._is_template_placeholder("litellm-harness.dev.case.123") is False
+        assert harness._is_template_placeholder("") is False
+
+    def test_contains_unresolved_placeholder(self, harness):
+        assert harness._contains_unresolved_placeholder("{harness_user_id}") is True
+        assert harness._contains_unresolved_placeholder(
+            ["codex", "-c", "x={session_id}"]
+        ) is True
+        assert harness._contains_unresolved_placeholder(
+            {"key": "{case_name}"}
+        ) is True
+        assert harness._contains_unresolved_placeholder("concrete-value") is False
+        assert harness._contains_unresolved_placeholder(
+            ["codex", "-m", "read"]
+        ) is False
+
+    def test_cli_harness_context_resolves_placeholder_user_ids(self, harness):
+        """Config with expected_user_ids=['{harness_user_id}'] must derive a
+        concrete ID, not pass the placeholder through."""
+        config = {
+            "cli_passthrough": "codex",
+            "command": ["codex", "exec", "-m", "read"],
+            "expected_user_ids": ["{harness_user_id}"],
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_cli_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        # The effective user ID must be concrete, not a placeholder.
+        for uid in result["expected_user_ids"]:
+            assert not harness._is_template_placeholder(uid)
+            assert "{" not in uid
+
+    def test_cli_harness_context_preserves_concrete_user_ids(self, harness):
+        """Explicit concrete IDs must be preserved."""
+        config = {
+            "cli_passthrough": "codex",
+            "command": ["codex", "exec", "-m", "read"],
+            "expected_user_ids": ["adapter-harness-tenant"],
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_cli_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        assert result["expected_user_ids"] == ["adapter-harness-tenant"]
+
+    def test_read_alias_codex_case_no_unresolved_placeholders_after_resolution(
+        self, harness
+    ):
+        """The real read-alias Codex collaboration case must have no unresolved
+        placeholders after _ensure_cli_harness_context."""
+        cfg = _config()
+        case = dict(
+            cfg["cases"]["native_openai_passthrough_responses_codex_read_alias_collaboration"]
+        )
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_cli_harness_context(
+            case,
+            profile=profile,
+            target="dev",
+            case_name="native_openai_passthrough_responses_codex_read_alias_collaboration",
+        )
+        assert not harness._contains_unresolved_placeholder(result["command"])
+        assert not harness._contains_unresolved_placeholder(result["expected_user_ids"])
+
+
+# ---------------------------------------------------------------------------
+# CFG-003 Initiation 2: Fix 2 - Codex read-alias collaboration command shape
+# ---------------------------------------------------------------------------
+
+
+class TestCodexReadAliasCollaborationCommandShape:
+    """The read-alias Codex collaboration case must follow the proven alibaba
+    collaboration command shape with multi_agent, opencode child, catalog,
+    read-only sandbox, and repository context."""
+
+    def _case(self):
+        return _config()["cases"][
+            "native_openai_passthrough_responses_codex_read_alias_collaboration"
+        ]
+
+    def test_multi_agent_enabled(self):
+        cmd = self._case()["command"]
+        assert "--enable" in cmd
+        enable_indices = [i for i, v in enumerate(cmd) if v == "--enable"]
+        enabled_features = {cmd[i + 1] for i in enable_indices}
+        assert "multi_agent" in enabled_features
+        assert "multi_agent_v2" in enabled_features
+
+    def test_opencode_child_agent_configured(self):
+        cmd = self._case()["command"]
+        cmd_str = " ".join(str(v) for v in cmd)
+        assert "agents.opencode.config_file=" in cmd_str
+        assert "codex_opencode_agent.toml" in cmd_str
+
+    def test_model_catalog_configured(self):
+        cmd = self._case()["command"]
+        cmd_str = " ".join(str(v) for v in cmd)
+        assert "model_catalog_json=" in cmd_str
+        assert "codex_read_alias_model_catalog.json" in cmd_str
+
+    def test_read_only_sandbox_and_repository_context(self):
+        cmd = self._case()["command"]
+        assert "-s" in cmd
+        s_idx = cmd.index("-s")
+        assert cmd[s_idx + 1] == "read-only"
+        assert "-C" in cmd
+        c_idx = cmd.index("-C")
+        assert cmd[c_idx + 1] == "{repository_root}"
+
+    def test_model_is_read_alias(self):
+        cmd = self._case()["command"]
+        assert "-m" in cmd
+        m_idx = cmd.index("-m")
+        assert cmd[m_idx + 1] == "read"
+
+    def test_uses_litellm_dev_egress(self):
+        cmd = self._case()["command"]
+        cmd_str = " ".join(str(v) for v in cmd)
+        assert "model_provider=" in cmd_str
+        assert "{codex_profile}" in cmd_str
+        assert "model_providers.{codex_profile}.base_url=" in cmd_str
+
+    def test_no_dangerously_bypass_flag(self):
+        cmd = self._case()["command"]
+        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+
+    def test_spawn_agent_prompt_present(self):
+        cmd = self._case()["command"]
+        prompt = cmd[-1]
+        assert "spawn_agent" in prompt
+        assert 'agent_type="opencode"' in prompt
+        assert 'model="read"' in prompt
+
+    def test_codex_read_alias_model_catalog_parses(self):
+        catalog_path = (
+            ROOT / "scripts" / "local-ci" / "codex_read_alias_model_catalog.json"
+        )
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        assert "models" in catalog
+        assert len(catalog["models"]) == 1
+        model = catalog["models"][0]
+        assert model["slug"] == "read"
+        assert model["multi_agent_version"] == "v2"
+        assert model["supports_parallel_tool_calls"] is True
+
+    def test_opencode_agent_toml_exists(self):
+        agent_path = ROOT / "scripts" / "local-ci" / "codex_opencode_agent.toml"
+        assert agent_path.exists()
+        content = agent_path.read_text(encoding="utf-8")
+        assert 'name = "opencode"' in content
+
+
+# ---------------------------------------------------------------------------
+# CFG-003 Initiation 2: Fix 3 - Claude parent contract prompt
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeReadAliasParentContract:
+    """The Claude read-alias parent prompt must treat the child marker as
+    opaque and emit exactly READ_ALIAS_PARALLEL_TOOLS_PASSED."""
+
+    def _case(self):
+        return _config()["cases"][
+            "claude_adapter_read_alias_child_parallel_read_tools"
+        ]
+
+    def test_parent_prompt_requires_opaque_marker(self):
+        cmd = self._case()["command"]
+        prompt = cmd[2]  # -p argument
+        assert "Treat that marker as opaque" in prompt
+        assert "READ_ALIAS_PARALLEL_TOOLS_PASSED" in prompt
+
+    def test_parent_prompt_forbids_surrounding_text(self):
+        cmd = self._case()["command"]
+        prompt = cmd[2]
+        assert "do not summarize it" in prompt
+        assert "Markdown" in prompt
+        assert "nothing before or after" in prompt
+
+    def test_parent_prompt_has_bounded_blocker_fallback(self):
+        cmd = self._case()["command"]
+        prompt = cmd[2]
+        assert "exact bounded blocker" in prompt
+
+    def test_command_json_checks_require_exact_marker(self):
+        checks = self._case()["command_json_checks"]
+        assert checks["required_equals"]["result"] == "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+
+    def test_child_parallel_read_tools_preserved(self):
+        """The child agent contract must still require parallel Read/Glob/Grep."""
+        agents = self._case()["claude_agents"]
+        child = agents["harness-read-alias-parallel-read-tools"]
+        assert set(child["tools"]) == {"Read", "Glob", "Grep"}
+        assert child["model"] == "read"
+
+
+# ---------------------------------------------------------------------------
+# CFG-003 Initiation 2: Fix 6 - Langfuse credential container separation
+# ---------------------------------------------------------------------------
+
+
+class TestLangfuseCredentialContainerSeparation:
+    """Dev profile must use a dedicated Langfuse credential container."""
+
+    def test_langfuse_credential_container_in_dev_profile(self):
+        dev = _config()["target_profiles"]["dev"]
+        assert dev["langfuse_credential_container"] == "aawm-langfuse-web"
+        assert dev["langfuse_public_key_container_env"] == "LANGFUSE_INIT_PROJECT_PUBLIC_KEY"
+        assert dev["langfuse_secret_key_container_env"] == "LANGFUSE_INIT_PROJECT_SECRET_KEY"
+
+    def test_backward_compat_fallback_to_docker_container(self, harness, monkeypatch):
+        """Profile without langfuse_credential_container falls back to
+        docker_container_name."""
+        calls = []
+        monkeypatch.setattr(
+            harness,
+            "_resolve_container_env_value",
+            lambda container, name: calls.append((container, name)) or "val",
+        )
+        profile = {
+            "docker_container_name": "litellm-dev",
+            "langfuse_public_key_container_env": "LANGFUSE_PUBLIC_KEY",
+            "langfuse_secret_key_container_env": "LANGFUSE_SECRET_KEY",
+        }
+
+        class Args:
+            langfuse_query_url = None
+
+        result = harness._resolve_main_credentials(
+            config={}, args=Args(), profile=profile
+        )
+        assert result != 2
+        assert all(c[0] == "litellm-dev" for c in calls)
+
+    def test_credential_values_never_logged(self, harness, monkeypatch):
+        """Credential values must never appear in stderr output."""
+        errors = []
+        monkeypatch.setattr(harness, "_emit_stderr", errors.append)
+        monkeypatch.setattr(harness, "_resolve_container_env_value", lambda *a: None)
+        profile = {
+            "langfuse_credential_container": "aawm-langfuse-web",
+            "langfuse_public_key_container_env": "LANGFUSE_INIT_PROJECT_PUBLIC_KEY",
+            "langfuse_secret_key_container_env": "LANGFUSE_INIT_PROJECT_SECRET_KEY",
+        }
+
+        class Args:
+            langfuse_query_url = None
+
+        result = harness._resolve_main_credentials(
+            config={}, args=Args(), profile=profile
+        )
+        assert result == 2
+        for err in errors:
+            assert "LANGFUSE_INIT_PROJECT" not in err or "credential" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Validator 019fb548 item 2: session ID + controlled header placeholder
+# ---------------------------------------------------------------------------
+
+
+class TestSessionIdAndHeaderPlaceholderResolution:
+    """Unresolved {session_id} and controlled header placeholders must be
+    replaced with concrete values; concrete explicit values stay authoritative."""
+
+    def test_http_session_id_placeholder_derived(self, harness):
+        """An http_request session_id of '{session_id}' must be replaced with
+        a concrete derived session ID."""
+        config = {
+            "http_request": {
+                "method": "POST",
+                "path": "/chat/completions",
+                "session_id": "{session_id}",
+            },
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_http_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        sid = result["http_request"]["session_id"]
+        assert not harness._is_template_placeholder(sid)
+        assert "{" not in sid
+        assert result["expected_trace_session_id"] == sid
+
+    def test_http_concrete_session_id_preserved(self, harness):
+        """A concrete explicit session_id must remain authoritative."""
+        config = {
+            "http_request": {
+                "method": "POST",
+                "path": "/chat/completions",
+                "session_id": "my-explicit-session",
+            },
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_http_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        assert result["http_request"]["session_id"] == "my-explicit-session"
+
+    def test_http_controlled_header_placeholder_replaced(self, harness):
+        """A controlled header carrying an unresolved placeholder must be
+        replaced, not preserved by setdefault."""
+        config = {
+            "http_request": {
+                "method": "POST",
+                "path": "/chat/completions",
+                "headers": {
+                    "x-litellm-end-user-id": "{harness_user_id}",
+                    "session_id": "{session_id}",
+                },
+            },
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_http_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        headers = result["http_request"]["headers"]
+        assert not harness._contains_unresolved_placeholder(headers)
+        assert "{" not in headers["x-litellm-end-user-id"]
+        assert "{" not in headers["session_id"]
+
+    def test_http_concrete_header_preserved(self, harness):
+        """A concrete explicit controlled header value remains authoritative."""
+        config = {
+            "http_request": {
+                "method": "POST",
+                "path": "/chat/completions",
+                "headers": {
+                    "x-litellm-end-user-id": "explicit-user-42",
+                },
+            },
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_http_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        # Concrete explicit value preserved (authoritative).
+        assert result["http_request"]["headers"]["x-litellm-end-user-id"] == "explicit-user-42"
+
+    def test_cli_session_id_placeholder_derived(self, harness):
+        """A CLI expected_trace_session_id of '{session_id}' must be replaced
+        with a concrete derived session ID."""
+        config = {
+            "cli_passthrough": "codex",
+            "command": ["codex", "exec", "-m", "read"],
+            "expected_trace_session_id": "{session_id}",
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_cli_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        sid = result["expected_trace_session_id"]
+        assert not harness._is_template_placeholder(sid)
+        assert "{" not in sid
+
+    def test_cli_concrete_session_id_preserved(self, harness):
+        """A concrete explicit CLI session ID remains authoritative."""
+        config = {
+            "cli_passthrough": "codex",
+            "command": ["codex", "exec", "-m", "read"],
+            "expected_trace_session_id": "explicit-cli-session",
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_cli_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        assert result["expected_trace_session_id"] == "explicit-cli-session"
+
+    def test_read_alias_cases_fully_resolved_after_context(self, harness):
+        """Both read-alias cases must have no unresolved placeholders in
+        command, expected_user_ids, session, and headers after resolution."""
+        cfg = _config()
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        codex_case = dict(cfg["cases"][
+            "native_openai_passthrough_responses_codex_read_alias_collaboration"
+        ])
+        codex_result = harness._ensure_cli_harness_context(
+            codex_case, profile=profile, target="dev",
+            case_name="native_openai_passthrough_responses_codex_read_alias_collaboration",
+        )
+        assert not harness._contains_unresolved_placeholder(codex_result["command"])
+        assert not harness._contains_unresolved_placeholder(codex_result["expected_user_ids"])
+        assert not harness._contains_unresolved_placeholder(
+            codex_result["expected_trace_session_id"]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Validator cross-field session resolution: concrete expected_trace_session_id
+# wins over an unresolved request session placeholder.
+# ---------------------------------------------------------------------------
+
+
+class TestCrossFieldSessionResolution:
+    """When http_request.session_id is unresolved but expected_trace_session_id
+    is concrete, the concrete expected ID must be used everywhere."""
+
+    def test_concrete_expected_session_wins_over_request_placeholder(self, harness):
+        """Validator finding: expected_trace_session_id='explicit-session-id',
+        request session placeholder, placeholder headers -> all resolve to
+        'explicit-session-id', not a derived <user>.session."""
+        config = {
+            "expected_trace_session_id": "explicit-session-id",
+            "http_request": {
+                "method": "POST",
+                "path": "/chat/completions",
+                "session_id": "{session_id}",
+                "headers": {
+                    "session_id": "{session_id}",
+                    "x-litellm-end-user-id": "{harness_user_id}",
+                },
+            },
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_http_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        # Request session, controlled header, and expected all use the
+        # concrete explicit ID, not a derived user session.
+        assert result["http_request"]["session_id"] == "explicit-session-id"
+        assert result["expected_trace_session_id"] == "explicit-session-id"
+        assert result["http_request"]["headers"]["session_id"] == "explicit-session-id"
+        assert not harness._contains_unresolved_placeholder(
+            result["http_request"]["headers"]
+        )
+        # Must NOT be a derived <user>.session value.
+        assert not result["http_request"]["session_id"].endswith(".session")
+
+    def test_concrete_request_session_precedence_preserved(self, harness):
+        """When both request session and expected are concrete, the request
+        session wins (existing contract)."""
+        config = {
+            "expected_trace_session_id": "expected-concrete",
+            "http_request": {
+                "method": "POST",
+                "path": "/chat/completions",
+                "session_id": "request-concrete",
+            },
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_http_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        assert result["http_request"]["session_id"] == "request-concrete"
+
+    def test_both_placeholder_derives_user_session(self, harness):
+        """When neither field is concrete, derive <user>.session."""
+        config = {
+            "expected_trace_session_id": "{session_id}",
+            "http_request": {
+                "method": "POST",
+                "path": "/chat/completions",
+                "session_id": "{session_id}",
+            },
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_http_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        sid = result["http_request"]["session_id"]
+        assert sid.endswith(".session")
+        assert not harness._is_template_placeholder(sid)
+        assert result["expected_trace_session_id"] == sid

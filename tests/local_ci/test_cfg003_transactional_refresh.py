@@ -2036,7 +2036,8 @@ def _fake_psycopg_module(row_for_candidate):
     """Build a fake ``psycopg`` module whose cursor returns ``row_for_candidate``.
 
     ``row_for_candidate`` is a callable ``(provider, model) -> dict | None``
-    mimicking a real DB row producer.
+    mimicking a real DB row producer.  For multi-window tests it may also
+    return a ``list[dict]`` of rows (already ordered observed_at DESC).
     """
     import types
 
@@ -2049,7 +2050,19 @@ def _fake_psycopg_module(row_for_candidate):
 
         def fetchone(self):
             provider, model = self._last_params[0], self._last_params[1]
-            return row_for_candidate(provider, model)
+            produced = row_for_candidate(provider, model)
+            if isinstance(produced, list):
+                return produced[0] if produced else None
+            return produced
+
+        def fetchall(self):
+            provider, model = self._last_params[0], self._last_params[1]
+            produced = row_for_candidate(provider, model)
+            if produced is None:
+                return []
+            if isinstance(produced, list):
+                return produced
+            return [produced]
 
         def __enter__(self):
             return self
@@ -2080,14 +2093,19 @@ class TestAvailabilityProducerConsumerContract:
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
         eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        first = eligible[0]
+        # Prefer a candidate without a required-window contract so a single
+        # positive row qualifies; fall back to the first eligible and provide
+        # both windows for alibaba_token_plan models.
+        non_alibaba = [c for c in eligible if c["provider"] != "alibaba_token_plan"]
+        first = non_alibaba[0] if non_alibaba else eligible[0]
         provider, model = first["provider"], first["model"]
 
         def row_for_candidate(p, m):
             if (p, m) != (provider, model):
                 return None
-            return {
-                "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            now = dt.datetime.now(dt.timezone.utc)
+            base_row = {
+                "observed_at": now.isoformat(),
                 "provider": p,
                 "model": m,
                 "remaining_pct": 90,
@@ -2095,6 +2113,12 @@ class TestAvailabilityProducerConsumerContract:
                 "source": "rate_limit_observations",
                 "evidence": "live",
             }
+            if p == "alibaba_token_plan":
+                return [
+                    {**base_row, "quota_key": "alibaba_token_plan_5h:credits"},
+                    {**base_row, "quota_key": "alibaba_token_plan_7d:credits"},
+                ]
+            return base_row
 
         monkeypatch.setitem(
             sys.modules, "psycopg", _fake_psycopg_module(row_for_candidate)
@@ -2230,6 +2254,297 @@ class TestAvailabilityProducerConsumerContract:
             snap, alias_name="read", positive_availability=bad, require_availability=True
         )
         assert qualified == []
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: multi-window quota aggregation (tied observed_at, e.g. Alibaba
+# Token Plan 5h + 7d).  A candidate is positive ONLY when ALL current windows
+# are fresh, valid, and remaining > 0.  Any exhausted/stale/invalid window
+# fails closed.  Single-window providers degrade to prior one-row behavior.
+# ---------------------------------------------------------------------------
+
+
+class TestMultiWindowAvailabilityAggregation:
+    PROVIDER = "alibaba_token_plan"
+    MODEL = "alibaba_token_plan/qwen3.8-max-preview"
+    QK_5H = "alibaba_token_plan_5h:credits"
+    QK_7D = "alibaba_token_plan_7d:credits"
+
+    def _row(self, *, quota_key, remaining_pct, observed_at):
+        return {
+            "observed_at": observed_at,
+            "provider": self.PROVIDER,
+            "model": self.MODEL,
+            "quota_key": quota_key,
+            "remaining_pct": remaining_pct,
+            "quota_remaining": None,
+            "source": "rate_limit_observations",
+            "evidence": "live",
+        }
+
+    def _query(self, ra, monkeypatch, rows):
+        def row_for_candidate(p, m):
+            if (p, m) != (self.PROVIDER, self.MODEL):
+                return None
+            return rows
+
+        monkeypatch.setitem(
+            sys.modules, "psycopg", _fake_psycopg_module(row_for_candidate)
+        )
+        return ra._query_positive_availability_evidence(
+            db_settings={"host": "h", "port": 5432, "dbname": "d", "user": "u", "password": "p"},
+            candidates=[{"provider": self.PROVIDER, "model": self.MODEL}],
+            environment="dev",
+        )
+
+    def test_both_windows_positive_qualifies(self, ra, monkeypatch):
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            self._row(quota_key=self.QK_5H, remaining_pct=80, observed_at=now),
+            self._row(quota_key=self.QK_7D, remaining_pct=60, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is True
+        assert self.QK_5H in rec["evidence"]
+        assert self.QK_7D in rec["evidence"]
+
+    def test_one_exhausted_window_fails_closed(self, ra, monkeypatch):
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            self._row(quota_key=self.QK_5H, remaining_pct=90, observed_at=now),
+            self._row(quota_key=self.QK_7D, remaining_pct=0, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is False
+        # The exhausted window must be named in the evidence.
+        assert self.QK_7D in rec["evidence"]
+
+    def test_stale_window_filtered_by_sql_cutoff_fails_closed(self, ra, monkeypatch):
+        """A window whose only row is stale is excluded by the SQL freshness
+        cutoff, so the candidate sees a missing window -> no_fresh_row/fail."""
+        # Only the 5h window is fresh; the 7d row is stale and would be
+        # filtered out by the observed_at >= cutoff clause upstream.  We model
+        # the post-cutoff result set: only the fresh 5h row remains, so the
+        # candidate has a single observed window that is positive.  To prove
+        # fail-closed on a genuinely missing required window, pass NO rows.
+        produced = self._query(ra, monkeypatch, [])
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is False
+        assert rec["evidence"] == "no_fresh_row"
+
+    def test_invalid_remaining_pct_window_fails_closed(self, ra, monkeypatch):
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            self._row(quota_key=self.QK_5H, remaining_pct=70, observed_at=now),
+            self._row(quota_key=self.QK_7D, remaining_pct=None, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is False
+
+    def test_deterministic_ordering_of_window_evidence(self, ra, monkeypatch):
+        """Window verdicts are emitted in sorted quota_key order regardless of
+        row arrival order."""
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        # Deliberately reverse arrival order.
+        rows = [
+            self._row(quota_key=self.QK_7D, remaining_pct=50, observed_at=now),
+            self._row(quota_key=self.QK_5H, remaining_pct=40, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is True
+        # 5h sorts before 7d.
+        assert rec["evidence"].index(self.QK_5H) < rec["evidence"].index(self.QK_7D)
+
+    def test_latest_row_per_window_wins(self, ra, monkeypatch):
+        """When a window has multiple rows, only the latest (first in DESC
+        order) is evaluated."""
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        older = now - dt.timedelta(minutes=10)
+        rows = [
+            # Latest 5h row: positive.
+            self._row(quota_key=self.QK_5H, remaining_pct=80, observed_at=now),
+            # Older 5h row: exhausted (must be ignored).
+            self._row(quota_key=self.QK_5H, remaining_pct=0, observed_at=older),
+            self._row(quota_key=self.QK_7D, remaining_pct=60, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is True
+
+    def test_single_window_provider_preserves_prior_format(self, ra, monkeypatch):
+        """A provider with one quota row degrades to the prior evidence format
+        (``remaining_pct=N``) without window prefixes.  Uses a non-alibaba
+        provider/model so the required-window contract does not apply."""
+        import datetime as dt
+
+        provider = "openrouter"
+        model = "openrouter/some-model"
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            {
+                "observed_at": now,
+                "provider": provider,
+                "model": model,
+                "quota_key": "openrouter_free_daily_requests:requests",
+                "remaining_pct": 90,
+                "quota_remaining": None,
+                "source": "rate_limit_observations",
+                "evidence": "live",
+            },
+        ]
+
+        def row_for_candidate(p, m):
+            if (p, m) != (provider, model):
+                return None
+            return rows
+
+        monkeypatch.setitem(
+            sys.modules, "psycopg", _fake_psycopg_module(row_for_candidate)
+        )
+        produced = ra._query_positive_availability_evidence(
+            db_settings={"host": "h", "port": 5432, "dbname": "d", "user": "u", "password": "p"},
+            candidates=[{"provider": provider, "model": model}],
+            environment="dev",
+        )
+        rec = produced[(provider, model)]
+        assert rec["available"] is True
+        assert rec["evidence"] == "remaining_pct=90"
+
+    def test_no_rows_yields_no_fresh_row(self, ra, monkeypatch):
+        produced = self._query(ra, monkeypatch, [])
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is False
+        assert rec["evidence"] == "no_fresh_row"
+        assert rec["observed_at"] is None
+
+    def test_producer_consumer_contract_multi_window(self, ra, monkeypatch):
+        """End-to-end: a multi-window positive producer record qualifies the
+        exact candidate through the strict consumer unmodified."""
+        import datetime as dt
+
+        auth = ra._load_authoritative_startup_config()
+        snap = auth["snapshot"]
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        # Find an alibaba candidate if present; else use the first eligible.
+        target = next(
+            (c for c in eligible if c["provider"] == self.PROVIDER),
+            eligible[0],
+        )
+        provider, model = target["provider"], target["model"]
+        now = dt.datetime.now(dt.timezone.utc)
+
+        def row_for_candidate(p, m):
+            if (p, m) != (provider, model):
+                return None
+            return [
+                self._row(quota_key=self.QK_5H, remaining_pct=80, observed_at=now)
+                | {"provider": p, "model": m},
+                self._row(quota_key=self.QK_7D, remaining_pct=60, observed_at=now)
+                | {"provider": p, "model": m},
+            ]
+
+        monkeypatch.setitem(
+            sys.modules, "psycopg", _fake_psycopg_module(row_for_candidate)
+        )
+        produced = ra._query_positive_availability_evidence(
+            db_settings={"host": "h", "port": 5432, "dbname": "d", "user": "u", "password": "p"},
+            candidates=[{"provider": provider, "model": model}],
+            environment="dev",
+        )
+        assert produced[(provider, model)]["available"] is True
+        qualified = ra._derive_eligible_candidates_from_snapshot(
+            snap, alias_name="read", positive_availability=produced, require_availability=True
+        )
+        assert any(
+            c["provider"] == provider and c["model"] == model for c in qualified
+        )
+
+    # ------------------------------------------------------------------
+    # Finding 1: required-window contract (both 5h and 7d must be fresh)
+    # ------------------------------------------------------------------
+
+    def test_fresh_5h_plus_stale_7d_fails_closed(self, ra, monkeypatch):
+        """One fresh 5h row with a stale 7d row (filtered by SQL cutoff) must
+        fail closed because the required 7d window is absent from the fresh
+        result set."""
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        # Only the 5h row is fresh; the 7d row would be filtered by the SQL
+        # freshness cutoff upstream, so it never appears in the result set.
+        # Model the post-cutoff state: only the 5h row remains.
+        rows = [
+            self._row(quota_key=self.QK_5H, remaining_pct=80, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is False
+        # The missing required window must be named in evidence.
+        assert self.QK_7D in rec["evidence"]
+        assert "missing" in rec["evidence"]
+
+    def test_fresh_5h_only_no_7d_fails_closed(self, ra, monkeypatch):
+        """A single fresh 5h row with no 7d row at all must fail closed for
+        Alibaba Token Plan models that require both windows."""
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            self._row(quota_key=self.QK_5H, remaining_pct=95, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is False
+        assert self.QK_7D in rec["evidence"]
+
+    # ------------------------------------------------------------------
+    # Finding 2: tied-latest determinism (reversed order same verdict)
+    # ------------------------------------------------------------------
+
+    def test_tied_latest_positive_and_exhausted_fails_closed_order_a(self, ra, monkeypatch):
+        """Two rows tied at the same observed_at for the same quota_key: one
+        positive, one exhausted.  Must fail closed regardless of arrival
+        order (order A: positive first)."""
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            self._row(quota_key=self.QK_5H, remaining_pct=80, observed_at=now),
+            self._row(quota_key=self.QK_5H, remaining_pct=0, observed_at=now),
+            self._row(quota_key=self.QK_7D, remaining_pct=60, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is False
+
+    def test_tied_latest_positive_and_exhausted_fails_closed_order_b(self, ra, monkeypatch):
+        """Same tied-latest scenario with reversed arrival order (exhausted
+        first).  Verdict must be identical to order A."""
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = [
+            self._row(quota_key=self.QK_5H, remaining_pct=0, observed_at=now),
+            self._row(quota_key=self.QK_5H, remaining_pct=80, observed_at=now),
+            self._row(quota_key=self.QK_7D, remaining_pct=60, observed_at=now),
+        ]
+        produced = self._query(ra, monkeypatch, rows)
+        rec = produced[(self.PROVIDER, self.MODEL)]
+        assert rec["available"] is False
 
 
 # ---------------------------------------------------------------------------

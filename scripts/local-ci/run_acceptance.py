@@ -4368,6 +4368,25 @@ _NEGATIVE_AVAILABILITY_STATUSES = frozenset(
 _AVAILABILITY_FRESHNESS_SECONDS = 3600.0
 
 
+# Required quota windows per exact (provider, model) identity (Finding 1).
+# When a candidate appears here, EVERY listed quota_key must be present in the
+# fresh result set and positive for the candidate to qualify.  A required
+# window that is missing or stale fails the candidate closed.  Providers/models
+# absent from this map preserve single-window compatibility (any observed
+# window must be positive, but no specific window is mandated).
+_REQUIRED_AVAILABILITY_WINDOWS: dict[tuple[str, str], frozenset[str]] = {
+    # Alibaba Token Plan emits an account-wide quota shared across its models,
+    # written as paired 5h and 7d windows with a tied observed_at.  Both must
+    # be fresh and positive.
+    ("alibaba_token_plan", "alibaba_token_plan/qwen3.8-max-preview"): frozenset(
+        {"alibaba_token_plan_5h:credits", "alibaba_token_plan_7d:credits"}
+    ),
+    ("alibaba_token_plan", "alibaba_token_plan/qwen3.6-flash"): frozenset(
+        {"alibaba_token_plan_5h:credits", "alibaba_token_plan_7d:credits"}
+    ),
+}
+
+
 def _query_positive_availability_evidence(
     *,
     db_settings: dict[str, Any],
@@ -4378,10 +4397,20 @@ def _query_positive_availability_evidence(
     """Query rate_limit_observations for positive availability evidence.
 
     Evidence is keyed by the EXACT ``(provider, model)`` identity (never model
-    alone), so two providers sharing a model name are distinguished.  For each
-    candidate, looks for a fresh (within freshness_seconds) row with
-    remaining_pct > 0 (non-exhausted quota).  Missing/stale/exhausted rows do
-    NOT count as available.
+    alone), so two providers sharing a model name are distinguished.
+
+    A provider/model may emit MULTIPLE quota rows sharing the same
+    ``observed_at`` (e.g. Alibaba Token Plan writes 5h and 7d windows with a
+    tied timestamp).  ``ORDER BY observed_at DESC LIMIT 1`` would arbitrarily
+    observe only one window and could miss an exhausted sibling.  This reader
+    therefore evaluates the latest fresh evidence for EVERY distinct
+    ``quota_key`` relevant to the exact provider/model, and the candidate is
+    positive ONLY when all observed windows are fresh, valid, and
+    ``remaining_pct > 0``.  Any exhausted/invalid window fails the candidate
+    closed.  Providers that emit a single quota row degrade to the prior
+    one-window behavior.  Missing/stale/exhausted evidence does NOT count as
+    available.  Generic provider reachability is never used and no evidence is
+    fabricated.
 
     The ``rate_limit_observations`` table has no environment column, so the
     selected target database/profile is bound as the environment and recorded
@@ -4416,50 +4445,23 @@ def _query_positive_availability_evidence(
                 key = (provider, model)
                 cur.execute(
                     """
-                    SELECT observed_at, provider, model, remaining_pct,
+                    SELECT observed_at, provider, model, quota_key,
+                           remaining_pct,
                            quota_remaining, source, evidence
                     FROM public.rate_limit_observations
                     WHERE provider = %s AND model = %s
                       AND observed_at >= %s
                     ORDER BY observed_at DESC
-                    LIMIT 1
                     """,
                     (provider, model, cutoff),
                 )
-                row = cur.fetchone()
-                if row is None:
-                    result[key] = {
-                        "available": False,
-                        "provider": provider,
-                        "model": model,
-                        "evidence": "no_fresh_row",
-                        "observed_at": None,
-                        "environment": environment,
-                        "environment_binding": "target_db_profile",
-                    }
-                    continue
-                remaining_pct = row.get("remaining_pct")
-                observed_at = row.get("observed_at")
-                if isinstance(remaining_pct, (int, float)) and remaining_pct > 0:
-                    result[key] = {
-                        "available": True,
-                        "provider": provider,
-                        "model": model,
-                        "evidence": f"remaining_pct={remaining_pct}",
-                        "observed_at": str(observed_at),
-                        "environment": environment,
-                        "environment_binding": "target_db_profile",
-                    }
-                else:
-                    result[key] = {
-                        "available": False,
-                        "provider": provider,
-                        "model": model,
-                        "evidence": f"remaining_pct={remaining_pct}",
-                        "observed_at": str(observed_at),
-                        "environment": environment,
-                        "environment_binding": "target_db_profile",
-                    }
+                rows = cur.fetchall()
+                result[key] = _aggregate_quota_window_availability(
+                    rows,
+                    provider=provider,
+                    model=model,
+                    environment=environment,
+                )
     except Exception:  # noqa: BLE001
         pass
     finally:
@@ -4468,6 +4470,157 @@ def _query_positive_availability_evidence(
         except Exception:  # noqa: BLE001
             pass
     return result
+
+
+def _availability_timestamp_sort_key(value: dt.datetime | None) -> tuple[int, float]:
+    """Stable, overflow-safe sort key for an optional aware datetime.
+
+    Missing/unparseable timestamps sort BEFORE any real timestamp so a
+    deterministic maximum prefers genuine observed_at values.  Uses an epoch
+    timestamp (float) to avoid ``datetime.min`` tz-offset overflow during
+    comparison.
+    """
+    if value is None:
+        return (0, 0.0)
+    return (1, value.timestamp())
+
+
+def _remaining_pct_is_positive(value: Any) -> bool:
+    """True only for a real numeric ``remaining_pct`` strictly greater than 0.
+
+    Booleans are rejected (``isinstance(True, int)`` is True) so a malformed
+    ``True`` cannot masquerade as positive quota.  Fail-closed on any other
+    type.
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
+def _remaining_pct_sort_key(value: Any) -> tuple[int, float]:
+    """Stable sort key for ``remaining_pct``: valid numerics sort by value and
+    precede invalid/missing values, giving a deterministic minimum."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (0, float(value))
+    return (1, 0.0)
+
+
+def _aggregate_quota_window_availability(
+    rows: list[dict[str, Any]],
+    *,
+    provider: str,
+    model: str,
+    environment: str,
+) -> dict[str, Any]:
+    """Aggregate multi-window quota rows into a single availability verdict.
+
+    Groups rows by ``quota_key`` and, for each window, evaluates ALL rows tied
+    at the maximum ``observed_at`` (Finding 2).  Tied-latest handling is
+    deterministic and fail-closed: the window is positive only if EVERY
+    tied-latest row is valid and ``remaining_pct > 0``; a single exhausted or
+    invalid tied row fails the window.  Reversing row order never changes the
+    verdict because the maximum is computed by value and ties are required to
+    be unanimously positive.
+
+    The candidate is positive ONLY when every observed window is positive AND
+    every required window for the exact provider/model is present (Finding 1).
+    A required window that is missing or stale (filtered upstream by the
+    freshness cutoff) fails the candidate closed.  Providers/models without an
+    explicit required-window contract preserve single-window compatibility.
+
+    No evidence is fabricated; missing rows yield ``no_fresh_row``.
+    """
+    base = {
+        "provider": provider,
+        "model": model,
+        "environment": environment,
+        "environment_binding": "target_db_profile",
+    }
+    if not rows:
+        return {
+            **base,
+            "available": False,
+            "evidence": "no_fresh_row",
+            "observed_at": None,
+        }
+
+    # Group rows by distinct quota_key.
+    rows_by_window: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        qk = str(row.get("quota_key") or "")
+        rows_by_window.setdefault(qk, []).append(row)
+
+    # Evaluate every window; ALL tied-latest rows must be positive.
+    window_verdicts: list[tuple[str, bool, str]] = []
+    all_positive = True
+    for qk in sorted(rows_by_window):
+        window_rows = rows_by_window[qk]
+        # Deterministic maximum observed_at by parsed value (string fallback).
+        max_obs = max(
+            (_parse_observed_at(r.get("observed_at")) for r in window_rows),
+            key=_availability_timestamp_sort_key,
+        )
+        tied_latest = [
+            r for r in window_rows
+            if _parse_observed_at(r.get("observed_at")) == max_obs
+        ]
+        # Fail-closed: EVERY tied-latest row must be valid and positive.
+        tied_positive = all(
+            _remaining_pct_is_positive(r.get("remaining_pct"))
+            for r in tied_latest
+        )
+        # Deterministic evidence: minimum remaining_pct among tied-latest rows
+        # surfaces an exhausted sibling regardless of arrival order.
+        min_remaining = min(
+            (r.get("remaining_pct") for r in tied_latest),
+            key=_remaining_pct_sort_key,
+        )
+        if tied_positive:
+            window_verdicts.append((qk, True, f"remaining_pct={min_remaining}"))
+        else:
+            all_positive = False
+            window_verdicts.append((qk, False, f"remaining_pct={min_remaining}"))
+
+    # Finding 1: enforce the required-window contract for the exact
+    # provider/model.  A required window absent from the fresh result set
+    # (missing or stale) fails the candidate closed.
+    required_windows = _REQUIRED_AVAILABILITY_WINDOWS.get((provider, model))
+    missing_windows: list[str] = []
+    if required_windows:
+        present = set(rows_by_window)
+        for rq in sorted(required_windows):
+            if rq not in present:
+                all_positive = False
+                missing_windows.append(rq)
+
+    # Use the most recent observed_at across all rows for the record.
+    latest_observed_at = max(
+        (r.get("observed_at") for r in rows),
+        key=lambda v: _availability_timestamp_sort_key(_parse_observed_at(v)),
+    )
+
+    if len(window_verdicts) == 1 and not missing_windows:
+        # Single-window provider without a forced contract: preserve the prior
+        # evidence format exactly.
+        _, positive, evidence_str = window_verdicts[0]
+        return {
+            **base,
+            "available": positive,
+            "evidence": evidence_str,
+            "observed_at": str(latest_observed_at),
+        }
+
+    # Multi-window provider: report per-window verdicts deterministically.
+    evidence_parts = [f"{qk}={verdict}" for qk, positive, verdict in window_verdicts]
+    evidence_parts.extend(f"{rq}=missing" for rq in missing_windows)
+    return {
+        **base,
+        "available": all_positive,
+        "evidence": "; ".join(evidence_parts),
+        "observed_at": str(latest_observed_at),
+    }
 
 
 def _availability_key(provider: str, model: str) -> tuple[str, str]:

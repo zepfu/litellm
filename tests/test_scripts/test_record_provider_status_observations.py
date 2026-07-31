@@ -1122,10 +1122,10 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     ).read_text()
 
     assert "container_name: aawm-provider-status-observations" in compose_text
-    assert "AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer}" in compose_text
+    assert "AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer-aawm-dev}" in compose_text
     assert "AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}" in compose_text
     assert (
-        "AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer:6432/aawm_tristore?application_name=aawm-provider-status-observations}"
+        "AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer-aawm-dev:6432/aawm_tristore?application_name=aawm-provider-status-observations}"
         in compose_text
     )
     assert (
@@ -2061,12 +2061,16 @@ def test_alibaba_quota_payloads_map_consumed_fractions_and_hash_identity() -> No
         subscription=subscription,
     )
 
-    assert len(payloads) == 2
+    # 2 windows x 2 active models = 4 rows.  The account-wide quota is shared,
+    # so both models carry identical remaining_pct per window.
+    assert len(payloads) == 4
     assert [payload[6] for payload in payloads] == [
         loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
     ]
-    assert [payload[10] for payload in payloads] == [75.0, 50.0]
+    assert [payload[10] for payload in payloads] == [75.0, 75.0, 50.0, 50.0]
     assert all(payload[11:14] == (None, None, None) for payload in payloads)
     assert all(payload[4] == loop.ALIBABA_TOKEN_PLAN_PROVIDER for payload in payloads)
     assert all(payload[18] == loop.ALIBABA_TOKEN_PLAN_SOURCE for payload in payloads)
@@ -2077,6 +2081,268 @@ def test_alibaba_quota_payloads_map_consumed_fractions_and_hash_identity() -> No
     assert "instance-secret-identifier" not in persisted_json
     assert "login-ticket-secret" not in persisted_json
     assert "security-token-secret" not in persisted_json
+
+
+def _alibaba_auth_envelope(
+    *,
+    error_code: str = "ConsoleNeedLogin",
+    error_msg: str = "session-expired-secret-detail",
+) -> dict:
+    """HTTP 200 application-level auth envelope (nested DataV2 shape).
+
+    Gateway transport success (top-level successResponse) but inner
+    data.DataV2.data.success=false with errorCode/errorMsg.
+    """
+    return {
+        "successResponse": True,
+        "data": {
+            "DataV2": {
+                "data": {
+                    "code": "SUCCESS",
+                    "success": False,
+                    "errorCode": error_code,
+                    "errorMsg": error_msg,
+                }
+            }
+        },
+    }
+
+
+def _alibaba_auth_envelope_live(
+    *,
+    error_code: str = "ConsoleNeedLogin",
+    error_msg: str = "session-expired-secret-detail",
+) -> dict:
+    """HTTP 200 application-level auth envelope (exact live shape).
+
+    The live console gateway places success=false + errorCode/errorMsg
+    directly under top-level ``data`` with NO DataV2 wrapper.  This is the
+    exact key path observed in production.
+    """
+    return {
+        "successResponse": True,
+        "data": {
+            "success": False,
+            "errorCode": error_code,
+            "errorMsg": error_msg,
+        },
+    }
+
+
+def test_alibaba_console_envelope_auth_detection_unit() -> None:
+    # Known auth envelope: success False + a known login/session signal.
+    assert loop._alibaba_console_envelope_is_auth_failure(
+        {"success": False, "errorCode": "ConsoleNeedLogin", "errorMsg": "x"}
+    ) is True
+    # Session-expired signal in errorMsg qualifies.
+    assert loop._alibaba_console_envelope_is_auth_failure(
+        {"success": False, "errorMsg": "SessionExpired"}
+    ) is True
+    # Narrow classifier: quota/capacity signals are NOT auth.
+    assert loop._alibaba_console_envelope_is_auth_failure(
+        {"success": False, "errorCode": "QuotaExceeded", "errorMsg": "capacity"}
+    ) is False
+    # Internal/server error signals are NOT auth.
+    assert loop._alibaba_console_envelope_is_auth_failure(
+        {"success": False, "errorCode": "InternalError", "errorMsg": "boom"}
+    ) is False
+    # Generic error fields with no known auth signal are NOT auth.
+    assert loop._alibaba_console_envelope_is_auth_failure(
+        {"success": False, "errorCode": "SomeRandomCode", "errorMsg": "whatever"}
+    ) is False
+    # success True is never an auth failure.
+    assert loop._alibaba_console_envelope_is_auth_failure(
+        {"success": True, "errorCode": "x"}
+    ) is False
+    # success False but no errorCode/errorMsg -> not the known auth envelope.
+    assert loop._alibaba_console_envelope_is_auth_failure(
+        {"success": False}
+    ) is False
+    # Non-mapping -> False.
+    assert loop._alibaba_console_envelope_is_auth_failure(None) is False
+
+
+def test_extract_alibaba_console_data_classifies_auth_envelope_as_auth() -> None:
+    payload = _alibaba_auth_envelope(
+        error_code="ConsoleNeedLogin",
+        error_msg="login-aliyunid-ticket-expired-secret",
+    )
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="usage")
+    assert exc_info.value.telemetry_class == "auth"
+    assert exc_info.value.status_code == 200
+    # Fail-closed: no provider data returned.
+
+
+def test_extract_alibaba_console_data_classifies_live_auth_envelope_as_auth() -> None:
+    """Exact live key path: payload.data.success=false + errorCode/errorMsg
+    directly under top-level data, no DataV2 wrapper."""
+    payload = _alibaba_auth_envelope_live(
+        error_code="ConsoleNeedLogin",
+        error_msg="login-aliyunid-ticket-expired-secret",
+    )
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="usage")
+    assert exc_info.value.telemetry_class == "auth"
+    assert exc_info.value.status_code == 200
+
+
+def test_extract_alibaba_console_data_live_auth_envelope_never_logs_raw_error() -> None:
+    """Live-shape auth envelope must never expose raw errorCode/errorMsg."""
+    # Auth-matching code so the auth path is exercised; secret-looking msg.
+    secret_code = "ConsoleNeedLogin"
+    secret_msg = "SECRET_LIVE_login_ticket_value_xyz"
+    payload = _alibaba_auth_envelope_live(error_code=secret_code, error_msg=secret_msg)
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="subscription")
+    assert exc_info.value.telemetry_class == "auth"
+    rendered = str(exc_info.value)
+    assert secret_code not in rendered
+    assert secret_msg not in rendered
+
+
+def test_extract_alibaba_console_data_auth_envelope_never_logs_raw_error() -> None:
+    # Auth-matching code so the auth path is exercised; secret-looking msg.
+    secret_code = "SessionExpired"
+    secret_msg = "SECRET_login_ticket_value_xyz"
+    payload = _alibaba_auth_envelope(error_code=secret_code, error_msg=secret_msg)
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="subscription")
+    assert exc_info.value.telemetry_class == "auth"
+    rendered = str(exc_info.value)
+    assert secret_code not in rendered
+    assert secret_msg not in rendered
+
+
+def test_extract_alibaba_console_data_quota_exceeded_is_not_auth() -> None:
+    """A quota/capacity envelope must remain fail-closed under contract_drift,
+    never auth."""
+    payload = _alibaba_auth_envelope_live(
+        error_code="QuotaExceeded",
+        error_msg="plan-capacity-exhausted",
+    )
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="usage")
+    assert exc_info.value.telemetry_class == "contract_drift"
+
+
+def test_extract_alibaba_console_data_internal_error_is_not_auth() -> None:
+    """An internal/server error envelope must remain fail-closed under
+    contract_drift, never auth."""
+    payload = _alibaba_auth_envelope_live(
+        error_code="InternalError",
+        error_msg="upstream-blew-up",
+    )
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="usage")
+    assert exc_info.value.telemetry_class == "contract_drift"
+
+
+def test_alibaba_auth_allowlist_natural_language_session_expired_is_auth() -> None:
+    """Finding 3: a natural-language errorMsg such as
+    'The login session has expired' (no errorCode) must be classified as
+    auth via weak+expiry keyword pairing, while raw text is never exposed."""
+    assert loop._alibaba_error_text_matches_auth_allowlist(
+        {"errorMsg": "The login session has expired"}
+    ) is True
+    # Full envelope path: live shape, message-only, classified auth.
+    payload = _alibaba_auth_envelope_live(
+        error_code="",
+        error_msg="The login session has expired",
+    )
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="usage")
+    assert exc_info.value.telemetry_class == "auth"
+    rendered = str(exc_info.value)
+    assert "The login session has expired" not in rendered
+
+
+def test_alibaba_auth_allowlist_console_need_login_is_auth() -> None:
+    """ConsoleNeedLogin is a strong auth signal regardless of message."""
+    assert loop._alibaba_error_text_matches_auth_allowlist(
+        {"errorCode": "ConsoleNeedLogin", "errorMsg": "please sign in"}
+    ) is True
+
+
+def test_alibaba_auth_allowlist_quota_exceeded_is_not_auth() -> None:
+    """QuotaExceeded must remain non-auth even with a session word present."""
+    assert loop._alibaba_error_text_matches_auth_allowlist(
+        {"errorCode": "QuotaExceeded", "errorMsg": "session quota exhausted"}
+    ) is False
+
+
+def test_alibaba_auth_allowlist_internal_error_is_not_auth() -> None:
+    """InternalError / server envelopes must remain non-auth."""
+    assert loop._alibaba_error_text_matches_auth_allowlist(
+        {"errorCode": "InternalError", "errorMsg": "upstream server failure"}
+    ) is False
+    assert loop._alibaba_error_text_matches_auth_allowlist(
+        {"errorMsg": "ServiceUnavailable"}
+    ) is False
+
+
+def test_alibaba_auth_allowlist_bare_session_word_is_not_auth() -> None:
+    """A bare weak keyword (session) without an expiry/invalid keyword must
+    NOT be auth, so quota/server messages mentioning a session stay fail-closed."""
+    assert loop._alibaba_error_text_matches_auth_allowlist(
+        {"errorMsg": "session quota usage report"}
+    ) is False
+
+def test_extract_alibaba_console_data_genuine_contract_drift_still_drift() -> None:
+    # success False but NO errorCode/errorMsg -> genuine contract drift, not auth.
+    payload = {
+        "data": {
+            "DataV2": {
+                "data": {"code": "SUCCESS", "success": False}
+            }
+        }
+    }
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="usage")
+    assert exc_info.value.telemetry_class == "contract_drift"
+
+
+def test_extract_alibaba_console_data_unrecognized_shape_is_contract_drift() -> None:
+    # Missing inner structure entirely -> contract drift (fail closed).
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data({"data": {}}, endpoint="usage")
+    assert exc_info.value.telemetry_class == "contract_drift"
+
+
+def test_extract_alibaba_console_data_success_returns_provider_data() -> None:
+    payload = _alibaba_console_envelope(_alibaba_usage_payload())
+    provider_data = loop._extract_alibaba_console_data(payload, endpoint="usage")
+    assert provider_data["per5HourPercentage"] == 0.25
+
+
+def test_alibaba_quota_payloads_emit_exact_active_model_identities() -> None:
+    subscription = loop._parse_alibaba_subscription_payload(_alibaba_subscription_payload())
+    payloads = loop._build_alibaba_quota_rate_limit_payloads(
+        _alibaba_quota_poll_config(),
+        observed_at=datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc),
+        usage_payload=_alibaba_usage_payload(),
+        subscription=subscription,
+    )
+    # Exact truthful model identities for both active read-alias candidates.
+    models = [payload[5] for payload in payloads]
+    assert models == [
+        "alibaba_token_plan/qwen3.8-max-preview",
+        "alibaba_token_plan/qwen3.6-flash",
+        "alibaba_token_plan/qwen3.8-max-preview",
+        "alibaba_token_plan/qwen3.6-flash",
+    ]
+    # Shared account-wide quota: identical remaining_pct per window across models.
+    by_window = {}
+    for payload in payloads:
+        by_window.setdefault(payload[6], []).append(payload[10])
+    assert by_window[loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY] == [75.0, 75.0]
+    assert by_window[loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY] == [50.0, 50.0]
+    # Shared-quota scope recorded in evidence.
+    for payload in payloads:
+        evidence = json.loads(payload[17])
+        assert "account-wide" in evidence["quota_scope"]
+        assert "qwen3.8-max-preview" in evidence["quota_scope"]
+        assert "qwen3.6-flash" in evidence["quota_scope"]
 
 
 def test_alibaba_quota_payloads_allow_absent_reset_for_unused_window() -> None:
@@ -2412,8 +2678,8 @@ def test_run_due_sidecar_tasks_schedules_alibaba_usage_and_subscription(
     assert throttled == []
     assert first[0]["event"] == "alibaba_quota_poll"
     assert first[0]["subscription_refreshed"] is True
-    assert first[0]["observation_count"] == 2
-    assert first[0]["inserted_count"] == 2
+    assert first[0]["observation_count"] == 4
+    assert first[0]["inserted_count"] == 4
     assert first[0]["persisted"] is True
     assert first[0]["telemetry_status"] == "valid"
     assert first[0]["auth_source"] == "ALIBABA_WEB_KEY"
@@ -2580,7 +2846,7 @@ def test_persist_alibaba_quota_observations_uses_sidecar_db_path(
 
     inserted_count = loop._persist_alibaba_quota_observations(config, payloads)
 
-    assert inserted_count == 2
+    assert inserted_count == 4
     assert fake_conn.cursor_instance.execute_calls[:3] == [
         (
             "SELECT set_config('application_name', %s, false)",
@@ -2591,6 +2857,8 @@ def test_persist_alibaba_quota_observations_uses_sidecar_db_path(
     ]
     assert [params[6] for _statement, params in fake_conn.cursor_instance.execute_calls[3:]] == [
         loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
     ]
 
