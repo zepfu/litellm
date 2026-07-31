@@ -588,6 +588,8 @@ _read_aawm_alias_routing_durable_payload = _aawm_alias_durable.read_aawm_alias_r
 _write_aawm_alias_routing_durable_payload = _aawm_alias_durable.write_aawm_alias_routing_durable_payload
 _AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX = _aawm_alias_durable.AAWM_ALIAS_ROUTING_STATE_KEY_PREFIX
 _AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT = _aawm_alias_durable.AAWM_ALIAS_ROUTING_STATE_NAMESPACE_DEFAULT
+_is_aawm_alias_routing_retryable_redis_error = _aawm_alias_durable.is_retryable_redis_error
+_get_aawm_alias_routing_durable_write_retry_backoff_seconds = _aawm_alias_durable.get_durable_write_retry_backoff_seconds
 
 # --- restored missing constants from HEAD (ordered) ---
 

@@ -8,9 +8,10 @@ pass-through god-module does not declare the state maps itself.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 from .memory import (
     DEFAULT_MEMORY_STATE_MAX_SIZE,
@@ -21,6 +22,8 @@ from .memory import (
     remaining_cooldown_seconds,
 )
 from .types import Payload
+
+_VALID_ALIAS_FAMILIES = frozenset({"codex", "anthropic"})
 
 
 @dataclass
@@ -131,6 +134,29 @@ class AliasFamilyState:
     def evidence_map_size(self) -> int:
         return len(self.evidence_events_by_key)
 
+    def clear_cooldown_state(
+        self,
+        *,
+        cooldown_keys: Sequence[str],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Remove positive/negative cooldown and evidence for specific keys.
+
+        Preserves session affinity and all unrelated keys.  Returns
+        (positive_cleared, negative_cleared, evidence_cleared) lists
+        naming the keys actually removed from each map.
+        """
+        positive_cleared: list[str] = []
+        negative_cleared: list[str] = []
+        evidence_cleared: list[str] = []
+        for key in cooldown_keys:
+            if self.cooldown_until_monotonic_by_key.pop(key, None) is not None:
+                positive_cleared.append(key)
+            if self.cooldown_negative_until_monotonic_by_key.pop(key, None) is not None:
+                negative_cleared.append(key)
+            if self.evidence_events_by_key.pop(key, None) is not None:
+                evidence_cleared.append(key)
+        return positive_cleared, negative_cleared, evidence_cleared
+
     def get_affinity_memory(self, session_key: str) -> Optional[Payload]:
         affinity = self.session_affinity_by_key.get(session_key)
         if not isinstance(affinity, dict):
@@ -191,6 +217,109 @@ class AliasFamilyState:
 
 
 @dataclass
+class CooldownClearResult:
+    """Typed result of a targeted cooldown-state clear operation (CFG-004)."""
+
+    alias_family: str
+    positive_keys_cleared: list[str] = field(default_factory=list)
+    negative_keys_cleared: list[str] = field(default_factory=list)
+    evidence_keys_cleared: list[str] = field(default_factory=list)
+    read_pilot_keys_cleared: list[str] = field(default_factory=list)
+    affinity_keys_preserved: int = 0
+
+
+class LaneIdentityIndex:
+    """Bounded reverse index from opaque identity hash to lane keys (CFG-004).
+
+    Maps credential-derived identity hashes to the set of cooldown/lane keys
+    that reference them, enabling targeted cleanup without exposing raw
+    credentials or hashes to external callers.  All access is through internal
+    methods; raw identity hashes and lane keys are never leaked outside the
+    index boundary.
+
+    Bounded by max_identities (FIFO eviction of oldest identity) and
+    max_lanes_per_identity (arbitrary lane evicted within an identity).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_identities: int = 4096,
+        max_lanes_per_identity: int = 64,
+    ) -> None:
+        self._max_identities = max(1, int(max_identities))
+        self._max_lanes_per_identity = max(1, int(max_lanes_per_identity))
+        self._lock = threading.Lock()
+        self._index: dict[str, set[str]] = {}
+
+    def register(self, *, identity_hash: str, lane_key: str) -> bool:
+        """Associate lane_key with identity_hash.
+
+        Returns True if a new mapping was added, False if the lane was
+        already present (no-op).  Thread-safe: the whole read-modify-write
+        (including bounds eviction) runs under ``self._lock``.
+        """
+        with self._lock:
+            lanes = self._index.get(identity_hash)
+            if lanes is None:
+                if len(self._index) >= self._max_identities:
+                    try:
+                        oldest = next(iter(self._index))
+                        self._index.pop(oldest, None)
+                    except StopIteration:
+                        pass
+                lanes = set()
+                self._index[identity_hash] = lanes
+            if lane_key in lanes:
+                return False
+            if len(lanes) >= self._max_lanes_per_identity:
+                try:
+                    evict = next(iter(lanes))
+                    lanes.discard(evict)
+                except StopIteration:
+                    pass
+            lanes.add(lane_key)
+            return True
+
+    def lanes_for(self, identity_hash: str) -> frozenset[str]:
+        """Return the lane keys registered for identity_hash.  Thread-safe."""
+        with self._lock:
+            lanes = self._index.get(identity_hash)
+            if lanes is None:
+                return frozenset()
+            return frozenset(lanes)
+
+    def unregister_lane(self, *, identity_hash: str, lane_key: str) -> bool:
+        """Remove one lane from an identity.  Returns True if removed.  Thread-safe."""
+        with self._lock:
+            lanes = self._index.get(identity_hash)
+            if lanes is None:
+                return False
+            removed = lane_key in lanes
+            lanes.discard(lane_key)
+            if not lanes:
+                self._index.pop(identity_hash, None)
+            return removed
+
+    def remove_identity(self, identity_hash: str) -> frozenset[str]:
+        """Remove an identity entirely, returning all its lane keys.  Thread-safe."""
+        with self._lock:
+            lanes = self._index.pop(identity_hash, None)
+            if lanes is None:
+                return frozenset()
+            return frozenset(lanes)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._index)
+
+    def clear(self) -> None:
+        """Remove all identities (test-support / reset).  Thread-safe."""
+        with self._lock:
+            self._index.clear()
+
+
+@dataclass
 class MonotonicCooldownMap:
     """Generic process-local cooldown map and lock."""
 
@@ -236,6 +365,7 @@ class AliasRoutingStateManager:
         self.max_size = max_size
         self.codex = AliasFamilyState()
         self.anthropic = AliasFamilyState()
+        self.lane_identity_index = LaneIdentityIndex()
         self.lane_state_cache_lock = asyncio.Lock()
         self.log_until_monotonic_by_key: dict[str, float] = {}
         self.candidate_probe_locks: dict[str, asyncio.Lock] = {}
@@ -254,6 +384,48 @@ class AliasRoutingStateManager:
         if alias_family == "anthropic":
             return self.anthropic
         return self.codex
+
+    def clear_cooldown_state(
+        self,
+        *,
+        alias_family: str,
+        cooldown_keys: Sequence[str],
+    ) -> CooldownClearResult:
+        """Targeted removal of cooldown-derived state for named keys (CFG-004).
+
+        Removes positive cooldown, negative cache, evidence events, and
+        read-pilot gate state (codex only) for the given keys.  Preserves
+        session affinity and all unrelated keys.  Durable/Redis state is NOT
+        touched here; callers use ``durable.delete_aawm_alias_routing_durable_key``
+        for that.
+
+        Raises ``ValueError`` for unknown ``alias_family``.
+        """
+        normalized = alias_family.strip().lower()
+        if normalized not in _VALID_ALIAS_FAMILIES:
+            raise ValueError(
+                f"Unknown alias_family {alias_family!r}; "
+                f"expected one of {sorted(_VALID_ALIAS_FAMILIES)}"
+            )
+        family = self.family(normalized)
+        positive, negative, evidence = family.clear_cooldown_state(
+            cooldown_keys=cooldown_keys,
+        )
+        read_pilot_cleared: list[str] = []
+        # Read-pilot gate is codex-owned; never clear it for anthropic.
+        if normalized == "codex":
+            for key in cooldown_keys:
+                if self.read_pilot_gate._key_state.pop(key, None) is not None:
+                    read_pilot_cleared.append(key)
+                self.read_pilot_gate._family_state.evidence_events_by_key.pop(key, None)
+        return CooldownClearResult(
+            alias_family=normalized,
+            positive_keys_cleared=positive,
+            negative_keys_cleared=negative,
+            evidence_keys_cleared=evidence,
+            read_pilot_keys_cleared=read_pilot_cleared,
+            affinity_keys_preserved=len(family.session_affinity_by_key),
+        )
 
     def get_openrouter_free_quota_cache(self) -> Tuple[Optional[float], float]:
         """Return the current OpenRouter free-daily-quota cache tuple."""
@@ -281,6 +453,7 @@ class AliasRoutingStateManager:
         self.read_pilot_gate._key_state.clear()
         self.read_pilot_gate._family_state.evidence_events_by_key.clear()
         self.round_robin_cursor.clear()
+        self.lane_identity_index.clear()
         self._openrouter_free_quota_cache = (None, 0.0)
 
     async def candidate_probe_lock(
