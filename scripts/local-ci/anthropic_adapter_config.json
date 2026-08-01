@@ -9436,6 +9436,12 @@
         "claude-code.orchestrator",
         "claude-code.harness-read-alias-parallel-read-tools"
       ],
+      "generation_trace_names": [
+        "claude-code.harness-read-alias-parallel-read-tools"
+      ],
+      "session_history_identity": {
+        "expected_metadata_trace_name": "orchestrator"
+      },
       "expected_user_ids": [
         "adapter-harness-tenant"
       ],

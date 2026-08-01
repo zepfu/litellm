@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 import litellm
 from litellm.integrations.langfuse.langfuse import LangFuseLogger
@@ -1998,6 +1998,8 @@ class TestKnownFreeCostLifecycle:
         assert "litellm_logging_obj" not in captured
         assert "response_cost" not in response._hidden_params
 
+
+
     @pytest.mark.asyncio
     async def test_known_free_stream_preserves_zero_in_chunks_and_callback(
         self, monkeypatch
@@ -2079,3 +2081,356 @@ class TestKnownFreeCostLifecycle:
 
         assert "litellm_logging_obj" not in captured
         assert "response_cost" not in response._hidden_params
+
+
+class TestOpenRouterCompletionNamespaceRestore:
+    """OpenRouter completion responses restore canonical namespace identity."""
+
+    _MODEL = "test-model"
+    _NAMESPACE = "collaboration"
+    _FLAT_NAME = "spawn_agent"
+    _CALL_ID = "call_abc123"
+    _ARGS = '{"task":"do stuff"}'
+
+    @classmethod
+    def _namespace_tool(cls) -> dict[str, Any]:
+        return {
+            "type": "namespace",
+            "name": cls._NAMESPACE,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": cls._FLAT_NAME,
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+
+    @classmethod
+    def _request_body(cls, *, stream: bool = False) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": cls._MODEL,
+            "input": "test input",
+            "tools": [cls._namespace_tool()],
+        }
+        if stream:
+            body["stream"] = True
+        return body
+
+    @classmethod
+    def _flat_tool(cls) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "name": cls._FLAT_NAME,
+            "parameters": {"type": "object", "properties": {}},
+        }
+
+    @classmethod
+    def _flat_response_body(cls) -> dict[str, Any]:
+        return {
+            "id": "resp-test",
+            "model": "openrouter/upstream",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": cls._FLAT_NAME,
+                    "call_id": cls._CALL_ID,
+                    "arguments": cls._ARGS,
+                }
+            ],
+        }
+
+    def _install_route_isolation(
+        self,
+        monkeypatch,
+        *,
+        stream: bool,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        from dataclasses import replace
+
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as lpe,
+        )
+        from litellm.responses.litellm_completion_transformation import (
+            streaming_iterator as stream_transform,
+        )
+        from litellm.responses.litellm_completion_transformation import (
+            transformation as response_transform,
+        )
+
+        model_catalog = {
+            self._MODEL: {
+                "namespace_tool_function_adapters": {
+                    self._NAMESPACE: [self._FLAT_NAME],
+                }
+            }
+        }
+        monkeypatch.setattr(
+            lpe,
+            "_CODEX_TOOL_POLICY_CALLBACKS",
+            replace(
+                lpe._CODEX_TOOL_POLICY_CALLBACKS,
+                get_model_cost_map=lambda: model_catalog,
+            ),
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_get_namespace_tool_function_adapter_names_for_model",
+            lambda model: (
+                {self._NAMESPACE: {self._FLAT_NAME}}
+                if model == self._MODEL
+                else {}
+            ),
+        )
+
+        flat_json = json.dumps(self._flat_response_body())
+        transform_calls: list[dict[str, Any]] = []
+        upstream_calls: list[dict[str, Any]] = []
+
+        class FakeResponsesConfig:
+            @staticmethod
+            def transform_responses_api_request_to_chat_completion_request(
+                **kwargs,
+            ):
+                transform_calls.append(kwargs)
+                return {
+                    "model": kwargs["model"],
+                    "messages": [{"role": "user", "content": kwargs["input"]}],
+                    "stream": kwargs["stream"],
+                    "tools": kwargs["responses_api_request"]["tools"],
+                }
+
+            @staticmethod
+            def transform_chat_completion_response_to_responses_api_response(
+                **_kwargs,
+            ):
+                return object()
+
+        async def fake_acompletion(**kwargs):
+            upstream_calls.append(kwargs)
+            return object()
+
+        async def run_operation(*, operation, **_kwargs):
+            return await operation()
+
+        async def flat_sse_generator():
+            event = {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": self._flat_response_body()["output"][0],
+            }
+            yield (
+                "event: response.output_item.done\n"
+                f"data: {json.dumps(event)}\n\n"
+            ).encode()
+
+        async def pending_stream(response, **_kwargs):
+            return SimpleNamespace(
+                exhausted=False,
+                response=response,
+                stop_reason="pending_stream",
+                buffered_chunks=[],
+                buffered_bytes=0,
+            )
+
+        monkeypatch.setattr(
+            response_transform,
+            "LiteLLMCompletionResponsesConfig",
+            FakeResponsesConfig,
+        )
+        monkeypatch.setattr(
+            stream_transform,
+            "LiteLLMCompletionStreamingIterator",
+            lambda **_kwargs: object(),
+        )
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+        monkeypatch.setattr(lpe, "_get_openrouter_api_key", lambda: "test-key")
+        monkeypatch.setattr(
+            lpe,
+            "_get_openrouter_completion_adapter_upstream_model",
+            lambda _model: None,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_merge_litellm_metadata",
+            lambda body, **_kwargs: body,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_add_route_family_logging_metadata",
+            lambda body, _family: body,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_build_langfuse_span_descriptor",
+            lambda **_kwargs: {},
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_apply_openrouter_completion_message_sanitization",
+            lambda **kwargs: (
+                kwargs["request_body"],
+                kwargs["completion_kwargs"],
+                kwargs["litellm_metadata"],
+            ),
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_get_openrouter_target_base",
+            lambda: "https://openrouter.ai",
+        )
+        monkeypatch.setattr(lpe, "_build_openrouter_default_headers", lambda: {})
+        monkeypatch.setattr(
+            lpe,
+            "HttpPassThroughEndpointHelpers",
+            SimpleNamespace(validate_outgoing_egress=lambda **_kwargs: None),
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_annotate_request_scope_for_adapted_access_log",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_build_adapted_route_rollup_kwargs",
+            lambda _metadata: {},
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_emit_adapted_route_access_log",
+            lambda **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_perform_openrouter_completion_adapter_operation",
+            run_operation,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_get_proxy_shared_aiohttp_session",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_responses_sse_from_iterator",
+            lambda _iterator: flat_sse_generator(),
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_record_adapted_completed_route_rollup_turn",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_record_adapted_completed_route_rollup_after_stream",
+            lambda response, *_args, **_kwargs: response,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_serialize_responses_adapter_response",
+            lambda _response: flat_json,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_build_responses_response_from_adapter_response",
+            lambda _response: Response(
+                content=flat_json,
+                media_type="application/json",
+                status_code=200,
+            ),
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_build_malformed_tool_call_intake_context",
+            lambda *_args, **_kwargs: {},
+        )
+        if stream:
+            monkeypatch.setattr(
+                lpe._aawm_alias_streaming,
+                "peek_streaming_response",
+                pending_stream,
+            )
+
+        return transform_calls, upstream_calls
+
+    @pytest.mark.asyncio
+    async def test_nonstreaming_restores_namespace_on_function_call(
+        self, monkeypatch
+    ):
+        transform_calls, upstream_calls = self._install_route_isolation(
+            monkeypatch,
+            stream=False,
+        )
+        request_body = self._request_body()
+
+        result = await codex_candidate_calls._perform_codex_auto_agent_openrouter_completion_request(
+            request=_make_request({}),
+            adapter_model=self._MODEL,
+            request_body=request_body,
+        )
+
+        assert transform_calls[0]["responses_api_request"]["tools"] == [
+            self._flat_tool()
+        ]
+        assert upstream_calls[0]["tools"] == [self._flat_tool()]
+        assert upstream_calls[0]["proxy_server_request"]["body"]["tools"] == [
+            self._flat_tool()
+        ]
+        assert request_body["tools"] == [self._namespace_tool()]
+
+        result_body = json.loads(result.body)
+        function_call = result_body["output"][0]
+        assert function_call["type"] == "function_call"
+        assert function_call["name"] == self._FLAT_NAME
+        assert function_call["namespace"] == self._NAMESPACE
+        assert function_call["call_id"] == self._CALL_ID
+        assert function_call["arguments"] == self._ARGS
+
+    @pytest.mark.asyncio
+    async def test_streaming_restores_namespace_on_function_call(
+        self, monkeypatch
+    ):
+        transform_calls, upstream_calls = self._install_route_isolation(
+            monkeypatch,
+            stream=True,
+        )
+        request_body = self._request_body(stream=True)
+
+        result = await codex_candidate_calls._perform_codex_auto_agent_openrouter_completion_request(
+            request=_make_request({}),
+            adapter_model=self._MODEL,
+            request_body=request_body,
+        )
+
+        assert transform_calls[0]["responses_api_request"]["tools"] == [
+            self._flat_tool()
+        ]
+        assert upstream_calls[0]["tools"] == [self._flat_tool()]
+        assert upstream_calls[0]["proxy_server_request"]["body"]["tools"] == [
+            self._flat_tool()
+        ]
+        assert request_body["tools"] == [self._namespace_tool()]
+        assert isinstance(result, StreamingResponse)
+
+        chunks = [chunk async for chunk in result.body_iterator]
+        rendered = "".join(
+            chunk.decode() if isinstance(chunk, bytes) else str(chunk)
+            for chunk in chunks
+        )
+        payloads = [
+            json.loads(line.removeprefix("data: "))
+            for line in rendered.splitlines()
+            if line.startswith("data: {")
+        ]
+        output_item_done = next(
+            payload
+            for payload in payloads
+            if payload["type"] == "response.output_item.done"
+        )
+        function_call = output_item_done["item"]
+        assert function_call["type"] == "function_call"
+        assert function_call["name"] == self._FLAT_NAME
+        assert function_call["namespace"] == self._NAMESPACE
+        assert function_call["call_id"] == self._CALL_ID
+        assert function_call["arguments"] == self._ARGS

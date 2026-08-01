@@ -3711,6 +3711,20 @@ def _validate_provider_error_observations(
     }, failures
 
 
+def _tool_activity_name_matches(actual: Any, expected: str | None) -> bool:
+    """Compare tool_activity tool_name, canonicalizing namespaced Codex names.
+
+    The DB may store fully-qualified names like
+    ``functions.collaboration.spawn_agent`` while the harness config uses
+    canonical short names like ``spawn_agent``.  Canonicalize the DB value
+    before comparing so both forms match.
+    """
+    if expected is None:
+        return True
+    actual_str = str(actual or '')
+    return _normalize_codex_tool_name(actual_str) == expected
+
+
 def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:  # noqa: PLR0915
     if not session_id:
         return {'record': None, 'records': []}, [f'{family} missing command session_id for tool_activity validation']
@@ -3760,7 +3774,7 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
                 for row in records
                 if (row_provider is None or row.get("provider") == row_provider)
                 and (row_model is None or row.get("model") == row_model)
-                and (row_tool_name is None or row.get("tool_name") == row_tool_name)
+                and _tool_activity_name_matches(row.get("tool_name"), row_tool_name)
                 and (row_tool_kind is None or row.get("tool_kind") == row_tool_kind)
             ]
             minimum_count = int(expected_row.get('minimum_count') or 1)
@@ -3792,7 +3806,7 @@ def _validate_tool_activity(*, family: str, session_id: str | None, checks: dict
             for row in records
             if (row_provider is None or row.get('provider') == row_provider)
             and (row_model is None or row.get('model') == row_model)
-            and (row_tool_name is None or row.get('tool_name') == row_tool_name)
+            and _tool_activity_name_matches(row.get('tool_name'), row_tool_name)
             and (row_tool_kind is None or row.get('tool_kind') == row_tool_kind)
         ]
         minimum_count = int(expected_row.get('minimum_count') or 1)
@@ -4083,7 +4097,7 @@ def _find_claude_subagent_transcripts(
     return matches, candidates
 
 
-def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]:
+def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]:  # noqa: PLR0915
     by_tool_name: dict[str, int] = {}
     by_assistant_message_id: dict[str, dict[str, int]] = {}
     assistant_texts: list[dict[str, Any]] = []
@@ -4093,6 +4107,13 @@ def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]
     transcript_summaries: list[dict[str, Any]] = []
     for path in paths:
         transcript_tool_count = 0
+        # Turn index increments on each user record so that genuinely
+        # separate assistant messages reusing the same message.id (with
+        # tool_results between them) are NOT merged, while fragmented
+        # JSONL lines from one logical assistant message (consecutive
+        # assistant records, same message.id, no intervening user record)
+        # ARE grouped together.
+        turn_index = 0
         for line_number, record in _iter_claude_jsonl(path):
             message = record.get('message')
             if not isinstance(message, dict):
@@ -4101,6 +4122,7 @@ def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]
             if not isinstance(content, list):
                 continue
             if message.get('role') == 'user':
+                turn_index += 1
                 for block in content:
                     if not isinstance(block, dict) or block.get('type') != 'tool_result':
                         continue
@@ -4135,6 +4157,11 @@ def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]
             if message.get('role') != 'assistant':
                 continue
             message_id = str(message.get('id') or '')
+            # Grouping key: message identity + path + turn discriminator.
+            # This merges fragmented JSONL lines from one logical assistant
+            # message while keeping separate messages (separated by user
+            # tool_result records) distinct even if they reuse an ID.
+            logical_message_key = f"{path}:{message_id}:turn{turn_index}" if message_id else f"{path}:{line_number}"
             _append_assistant_text(
                 assistant_texts,
                 path=path,
@@ -4149,8 +4176,7 @@ def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]
                 if not tool_name:
                     continue
                 by_tool_name[tool_name] = by_tool_name.get(tool_name, 0) + 1
-                record_key = f"{path}:{line_number}"
-                message_counts = by_assistant_message_id.setdefault(record_key, {})
+                message_counts = by_assistant_message_id.setdefault(logical_message_key, {})
                 message_counts[tool_name] = message_counts.get(tool_name, 0) + 1
                 transcript_tool_count += 1
                 tool_use_id = str(block.get('id') or '')
@@ -5276,6 +5302,30 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     actual_user_ids = sorted({trace.get('userId') for trace in traces if trace.get('userId')})
     trace_ids = [trace.get('id') for trace in traces if trace.get('id')]
 
+    # Fix 2: When generation_trace_names is configured, scope generation,
+    # request-payload, and alias-route checks to only those trace rows
+    # (typically alias-child traces), excluding native parent traffic.
+    generation_trace_names = config.get('generation_trace_names')
+    if isinstance(generation_trace_names, list) and generation_trace_names:
+        generation_trace_name_set = set(generation_trace_names)
+        generation_trace_ids = [
+            trace.get('id')
+            for trace in traces
+            if trace.get('id') and trace.get('name') in generation_trace_name_set
+        ]
+    else:
+        generation_trace_ids = trace_ids
+
+    # Fix 5: When Langfuse returns zero traces without a query error, emit
+    # one explicit required observability/correlation failure and skip
+    # dependent payload/tag/selection assertions.  Do not substitute
+    # session_history for required Langfuse proof or fabricate trace IDs.
+    langfuse_zero_trace_correlation_failure = (
+        not traces
+        and not lookup_error
+        and not use_failure_observability
+    )
+
     failures: list[str] = []
     warnings: list[str] = []
     if run['exit_code'] != 0:
@@ -5299,6 +5349,17 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     if use_failure_observability:
         trace_user_ids_by_name_summary = {
             'skipped': 'expected_api_error',
+        }
+        trace_user_ids_by_name_failures = []
+    elif langfuse_zero_trace_correlation_failure:
+        failures.append(
+            f'{name} required Langfuse observability correlation failed: zero '
+            'traces returned without a lookup error; dependent payload/tag/'
+            'selection assertions skipped (session_history is not a substitute '
+            'for required Langfuse proof)'
+        )
+        trace_user_ids_by_name_summary = {
+            'skipped': 'langfuse_zero_trace_correlation',
         }
         trace_user_ids_by_name_failures = []
     else:
@@ -5414,6 +5475,13 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
                         expected_error_generation_poll_timeout_seconds
                     ),
                 }
+    elif langfuse_zero_trace_correlation_failure:
+        raw_generation_observations = []
+        generation_observations = []
+        generation_failures = []
+        generation_validation_summary = {
+            'skipped': 'langfuse_zero_trace_correlation',
+        }
     else:
         (
             raw_generation_observations,
@@ -5424,7 +5492,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             query_url=query_url,
             public_key=public_key,
             secret_key=secret_key,
-            trace_ids=trace_ids,
+            trace_ids=generation_trace_ids,
             start_time=started,
             allowed_request_routes=config.get('allowed_generation_routes'),
             skip_quality_checks=bool(config.get('skip_generation_quality_checks')),
@@ -5452,6 +5520,10 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         trace_enrichment_summary = {'skipped': 'expected_api_error'}
         trace_enrichment_failures = []
         trace_enrichment_warnings = []
+    elif langfuse_zero_trace_correlation_failure:
+        trace_enrichment_summary = {'skipped': 'langfuse_zero_trace_correlation'}
+        trace_enrichment_failures = []
+        trace_enrichment_warnings = []
     else:
         (
             trace_enrichment_summary,
@@ -5470,6 +5542,9 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     if use_failure_observability:
         trace_context_summary = {'skipped': 'expected_api_error'}
         trace_context_failures = []
+    elif langfuse_zero_trace_correlation_failure:
+        trace_context_summary = {'skipped': 'langfuse_zero_trace_correlation'}
+        trace_context_failures = []
     else:
         trace_context_summary, trace_context_failures = RA._validate_trace_context(
             family=name,
@@ -5484,6 +5559,9 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
     if use_failure_observability:
         generation_metadata_summary = {'skipped': 'expected_api_error'}
         generation_metadata_failures = []
+    elif langfuse_zero_trace_correlation_failure:
+        generation_metadata_summary = {'skipped': 'langfuse_zero_trace_correlation'}
+        generation_metadata_failures = []
     else:
         (
             generation_metadata_summary,
@@ -5496,30 +5574,38 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         )
     failures.extend(generation_metadata_failures)
 
-    request_payload_summary, request_payload_failures, request_payload_warnings = _validate_logged_request_payload_checks(
-        family=name,
-        observations=raw_generation_observations,
-        checks=config.get('request_payload_checks') or {},
-    )
+    if langfuse_zero_trace_correlation_failure:
+        request_payload_summary = {'skipped': 'langfuse_zero_trace_correlation'}
+        request_payload_failures: list[str] = []
+        request_payload_warnings: list[str] = []
+        request_text_summary = {'skipped': 'langfuse_zero_trace_correlation'}
+        request_text_failures: list[str] = []
+        request_text_warnings: list[str] = []
+        stream_tool_call_state_summary = {'skipped': 'langfuse_zero_trace_correlation'}
+        stream_tool_call_state_failures: list[str] = []
+    else:
+        request_payload_summary, request_payload_failures, request_payload_warnings = _validate_logged_request_payload_checks(
+            family=name,
+            observations=raw_generation_observations,
+            checks=config.get('request_payload_checks') or {},
+        )
+        request_text_summary, request_text_failures, request_text_warnings = RA._validate_logged_request_text_checks(
+            family=name,
+            observations=raw_generation_observations,
+            required_substrings=(config.get('request_text_checks') or {}).get('required_substrings'),
+            forbidden_substrings=(config.get('request_text_checks') or {}).get('forbidden_substrings'),
+            warning_required_substrings=(config.get('request_text_checks') or {}).get('warning_required_substrings'),
+        )
+        stream_tool_call_state_summary, stream_tool_call_state_failures = _validate_stream_tool_call_state(
+            family=name,
+            observations=raw_generation_observations,
+            checks=config.get('stream_tool_call_state_validation') or {},
+            command_stdout=run.get('stdout', ''),
+        )
     failures.extend(request_payload_failures)
     warnings.extend(request_payload_warnings)
-
-    request_text_summary, request_text_failures, request_text_warnings = RA._validate_logged_request_text_checks(
-        family=name,
-        observations=raw_generation_observations,
-        required_substrings=(config.get('request_text_checks') or {}).get('required_substrings'),
-        forbidden_substrings=(config.get('request_text_checks') or {}).get('forbidden_substrings'),
-        warning_required_substrings=(config.get('request_text_checks') or {}).get('warning_required_substrings'),
-    )
     failures.extend(request_text_failures)
     warnings.extend(request_text_warnings)
-
-    stream_tool_call_state_summary, stream_tool_call_state_failures = _validate_stream_tool_call_state(
-        family=name,
-        observations=raw_generation_observations,
-        checks=config.get('stream_tool_call_state_validation') or {},
-        command_stdout=run.get('stdout', ''),
-    )
     failures.extend(stream_tool_call_state_failures)
     stream_tool_call_state_passed = (
         not bool(stream_tool_call_state_failures)
@@ -5529,7 +5615,9 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
 
     aawm_dynamic_injection_summary = None
     aawm_dynamic_injection_config = config.get('aawm_dynamic_injection')
-    if isinstance(aawm_dynamic_injection_config, dict):
+    if langfuse_zero_trace_correlation_failure:
+        aawm_dynamic_injection_summary = {'skipped': 'langfuse_zero_trace_correlation'}
+    elif isinstance(aawm_dynamic_injection_config, dict):
         (
             aawm_dynamic_injection_summary,
             aawm_dynamic_injection_failures,
@@ -5556,6 +5644,8 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
 
     if use_failure_observability:
         span_observations, span_failures = {'skipped': 'expected_api_error'}, []
+    elif langfuse_zero_trace_correlation_failure:
+        span_observations, span_failures = {'skipped': 'langfuse_zero_trace_correlation'}, []
     else:
         _, span_observations, span_failures = RA._validate_span_observations(
             family=name,
@@ -5645,6 +5735,20 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         if config.get('session_history_validation')
         else True
     )
+
+    # Fix 1: validate the normalized session-history identity independently
+    # from raw Langfuse trace names.
+    session_history_identity_summary, session_history_identity_failures = (
+        _validate_session_history_identity(
+            family=name,
+            session_history_summary=session_history_summary,
+            checks=config.get('session_history_identity') or {},
+        )
+    )
+    failures.extend(session_history_identity_failures)
+    if session_history_identity_failures:
+        session_history_passed = False
+
     (
         rate_limit_observations_summary,
         rate_limit_observations_failures,
@@ -5800,6 +5904,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
         "empty_success": empty_success_summary,
         "session_history": session_history_summary,
         "session_history_passed": session_history_passed,
+        "session_history_identity": session_history_identity_summary,
         "rate_limit_observations": rate_limit_observations_summary,
         "provider_error_observations": provider_error_observations_summary,
         "tool_activity": tool_activity_summary,
@@ -6293,6 +6398,56 @@ def _case_result_session_history_record(
             if isinstance(candidate, dict):
                 return candidate
     return {}
+
+
+def _validate_session_history_identity(
+    *,
+    family: str,
+    session_history_summary: dict[str, Any],
+    checks: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate the normalized session-history identity from the DB row's own
+    metadata.trace_name field.
+
+    Fix 1: This is independent from raw Langfuse trace names
+    (required_trace_names validates those separately).  The observed alias
+    session_history record carries metadata.trace_name == "orchestrator"
+    regardless of which raw Langfuse trace name the row correlates with.
+    """
+    if not isinstance(checks, dict) or not checks:
+        return {'skipped': 'not_configured'}, []
+
+    expected_trace_name = checks.get('expected_metadata_trace_name')
+    if not isinstance(expected_trace_name, str) or not expected_trace_name.strip():
+        return {'skipped': 'no_expected_metadata_trace_name'}, []
+
+    expected_trace_name = expected_trace_name.strip()
+    sh_record = _case_result_session_history_record(
+        {'session_history': session_history_summary}
+    )
+    sh_metadata = sh_record.get('metadata')
+    actual_trace_name = (
+        sh_metadata.get('trace_name')
+        if isinstance(sh_metadata, dict)
+        else None
+    )
+
+    if actual_trace_name == expected_trace_name:
+        return {
+            'validated': True,
+            'expected_metadata_trace_name': expected_trace_name,
+            'actual_metadata_trace_name': actual_trace_name,
+        }, []
+
+    return {
+        'validated': False,
+        'expected_metadata_trace_name': expected_trace_name,
+        'actual_metadata_trace_name': actual_trace_name,
+    }, [
+        f'{family} session_history_identity: metadata.trace_name '
+        f'mismatch: expected {expected_trace_name!r}, '
+        f'got {actual_trace_name!r}'
+    ]
 
 
 def _candidate_provider_model_from_case_result(
@@ -7333,8 +7488,12 @@ def _cfg003_extract_observed_selection(
     """Extract the OBSERVED selected provider/model/route from a case result's
     session-history record.  Based on observed correlation, not configured
     independent allowlists.
+
+    Fix 3: When multiple session_history records exist, prefer alias-child
+    records (those carrying alias metadata) over native parent rows so that
+    selection evidence reflects the scoped alias route, not parent traffic.
     """
-    record = _case_result_session_history_record(case_result)
+    record = _cfg003_prefer_alias_child_session_record(case_result)
     provider = record.get("provider")
     model = record.get("model")
     metadata = record.get("metadata")
@@ -7354,6 +7513,40 @@ def _cfg003_extract_observed_selection(
         "model": model if isinstance(model, str) and model else None,
         "route_family": route_family,
     }
+
+
+def _cfg003_prefer_alias_child_session_record(
+    case_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the best session_history record for selection extraction.
+
+    Prefers records whose metadata contains alias-child markers
+    (model_alias_label, anthropic_auto_agent_alias, or
+    requested_model_alias).  Falls back to the default first-record
+    behavior when no alias-child record is found.
+    """
+    _ALIAS_METADATA_KEYS = (
+        "model_alias_label",
+        "anthropic_auto_agent_alias",
+        "requested_model_alias",
+    )
+    session_history = case_result.get("session_history")
+    if not isinstance(session_history, dict):
+        return {}
+    records = session_history.get("records")
+    if isinstance(records, list) and len(records) > 1:
+        for candidate in records:
+            if not isinstance(candidate, dict):
+                continue
+            metadata = candidate.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            if any(
+                isinstance(metadata.get(k), str) and metadata[k].strip()
+                for k in _ALIAS_METADATA_KEYS
+            ):
+                return candidate
+    return _case_result_session_history_record(case_result)
 
 
 def _cfg003_run_proof_case(

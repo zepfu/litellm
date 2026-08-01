@@ -1495,6 +1495,9 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     # function tools before the chat-completion transformation so upstream
     # sees spawn_agent / exec_command, not functions.collaboration.spawn_agent
     # / functions.exec.  Tool call/result IDs are preserved by the adapter.
+    # Retain the canonical (namespaced) body for response validation so
+    # tool_call_restore can reconstruct the original namespace map.
+    canonical_request_body = request_body
     (
         request_body,
         _adapted_namespace_tools,
@@ -1565,12 +1568,19 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         log_warnings=not use_alias_candidate_probe,
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
+    intake_context = _build_malformed_tool_call_intake_context(
+        request,
+        request_body,
+        adapter="codex_auto_agent_openrouter_completion_adapter",
+        upstream_url=target_url,
+        provider="openrouter",
+    )
     if bool(request_body.get("stream")):
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
             LiteLLMCompletionStreamingIterator,
         )
 
-        return StreamingResponse(
+        stream_response = StreamingResponse(
             _responses_sse_from_iterator(
                 LiteLLMCompletionStreamingIterator(
                     model=upstream_adapter_model,
@@ -1580,13 +1590,28 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
                     custom_llm_provider=litellm.LlmProviders.OPENROUTER.value,
                     litellm_metadata=litellm_metadata,
                 ),
-                on_complete=lambda: _record_adapted_completed_route_rollup_turn(
-                    rollup_kwargs,
-                    adapter_label="OpenRouter chat-completions",
-                ),
             ),
             media_type="text/event-stream",
         )
+        validated_response = await _validate_codex_auto_agent_responses_payload(
+            stream_response,
+            adapter_model=adapter_model,
+            adapter="codex_auto_agent_openrouter_completion_adapter",
+            adapter_label="OpenRouter chat-completions",
+            intake_context=intake_context,
+            request_body=canonical_request_body,
+        )
+        if isinstance(validated_response, StreamingResponse):
+            return _record_adapted_completed_route_rollup_after_stream(
+                validated_response,
+                rollup_kwargs,
+                adapter_label="OpenRouter chat-completions",
+            )
+        _record_adapted_completed_route_rollup_turn(
+            rollup_kwargs,
+            adapter_label="OpenRouter chat-completions",
+        )
+        return validated_response
 
     responses_api_response = (
         LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
@@ -1596,20 +1621,6 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         )
     )
     response_body = json.loads(_serialize_responses_adapter_response(responses_api_response))
-    if _is_codex_auto_agent_malformed_tool_call_text_output(response_body):
-        _raise_codex_auto_agent_malformed_tool_call_text_payload(
-            response_body=response_body,
-            adapter_model=adapter_model,
-            adapter="codex_auto_agent_openrouter_completion_adapter",
-            adapter_label="OpenRouter chat-completions",
-            intake_context=_build_malformed_tool_call_intake_context(
-                request,
-                request_body,
-                adapter="codex_auto_agent_openrouter_completion_adapter",
-                upstream_url=target_url,
-                provider="openrouter",
-            ),
-        )
     if _is_codex_auto_agent_empty_success_responses_body(response_body):
         _raise_codex_auto_agent_empty_success_response(
             response_body=response_body,
@@ -1617,8 +1628,17 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             adapter="codex_auto_agent_openrouter_completion_adapter",
             adapter_label="OpenRouter chat-completions",
         )
+    built_response = _build_responses_response_from_adapter_response(responses_api_response)
+    validated_response = await _validate_codex_auto_agent_responses_payload(
+        built_response,
+        adapter_model=adapter_model,
+        adapter="codex_auto_agent_openrouter_completion_adapter",
+        adapter_label="OpenRouter chat-completions",
+        intake_context=intake_context,
+        request_body=canonical_request_body,
+    )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
         adapter_label="OpenRouter chat-completions",
     )
-    return _build_responses_response_from_adapter_response(responses_api_response)
+    return validated_response

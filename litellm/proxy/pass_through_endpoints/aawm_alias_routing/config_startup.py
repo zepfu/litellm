@@ -44,7 +44,10 @@ import yaml
 
 from .config_compiler import compile_yaml
 from .config_snapshot import RoutingSnapshot
-from .snapshot_select import set_active_routing_snapshot
+from .snapshot_select import (
+    get_active_routing_snapshot,
+    set_active_routing_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -638,6 +641,12 @@ def get_startup_status() -> dict[str, Any]:
     file names, alias names, alias_count, activation result.
     Failed state exposes only the error class name.
     Never exposes secrets, raw YAML, or absolute paths.
+
+    Active config identity fields (config_hash, config_version, config_epoch,
+    aliases) are read from the live active routing snapshot holder so that
+    readiness reflects post-refresh state, not just the startup snapshot.
+    File/source metadata and startup health gates remain owned by
+    ``_startup_state``.
     """
     with _state_lock:
         st = _startup_state
@@ -648,18 +657,27 @@ def get_startup_status() -> dict[str, Any]:
             }
         if not st.activated:
             return {"state": "not_loaded"}
-        snapshot = st.snapshot
-        assert snapshot is not None
-        return {
-            "state": "active",
-            "config_hash": snapshot.config_hash,
-            "config_version": snapshot.config_version,
-            "config_epoch": snapshot.config_epoch,
-            "files": list(st.files_loaded),
-            "aliases": sorted(snapshot.aliases.keys()),
-            "alias_count": len(snapshot.aliases),
-            "activation_result": "success",
-        }
+        startup_snapshot = st.snapshot
+        assert startup_snapshot is not None
+        files_loaded = st.files_loaded
+
+    # Outside _state_lock: read the live active snapshot from the routing
+    # holder (which has its own lock) to avoid nested-lock ordering issues.
+    active_snapshot = get_active_routing_snapshot()
+    identity_snapshot = (
+        active_snapshot if active_snapshot is not None else startup_snapshot
+    )
+
+    return {
+        "state": "active",
+        "config_hash": identity_snapshot.config_hash,
+        "config_version": identity_snapshot.config_version,
+        "config_epoch": identity_snapshot.config_epoch,
+        "files": list(files_loaded),
+        "aliases": sorted(identity_snapshot.aliases.keys()),
+        "alias_count": len(identity_snapshot.aliases),
+        "activation_result": "success",
+    }
 
 
 def reset_startup_state() -> None:

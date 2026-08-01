@@ -7969,3 +7969,242 @@ def test_validate_case_session_fallback_does_not_filter_by_user_id(monkeypatch):
     assert captured_session_kwargs[0]["user_id"] is None, (
         "session discovery must not retain expected user_id as a lookup filter"
     )
+
+
+# ---------------------------------------------------------------------------
+# Pass 3 Fix 1+2: generation_trace_names scoping and session_history identity
+# ---------------------------------------------------------------------------
+
+
+def test_read_alias_config_declares_normalized_session_history_identity():
+    """Fix 1 (config contract): the read-alias case declares a normalized
+    session_history_identity keyed off the DB row's own metadata.trace_name,
+    NOT a raw Langfuse trace name. required_trace_names still carries the raw
+    parent+child Langfuse names; generation_trace_names scopes generation to
+    the child. These three must be distinct concepts."""
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+
+    # Raw Langfuse expectations: parent + child.
+    assert "claude-code.orchestrator" in case["required_trace_names"]
+    assert "claude-code.harness-read-alias-parallel-read-tools" in case["required_trace_names"]
+
+    # Generation scoping: child Langfuse name only.
+    assert case["generation_trace_names"] == [
+        "claude-code.harness-read-alias-parallel-read-tools"
+    ]
+
+    # Normalized session-history identity: a metadata.trace_name value, which
+    # is NOT a raw Langfuse trace name (no "claude-code." prefix).
+    shi = case["session_history_identity"]
+    assert isinstance(shi, dict)
+    expected_trace_name = shi["expected_metadata_trace_name"]
+    assert expected_trace_name == "orchestrator"
+    assert not expected_trace_name.startswith("claude-code."), (
+        "session_history_identity must be a normalized DB metadata.trace_name, "
+        "not a raw Langfuse trace name"
+    )
+    assert expected_trace_name not in case["required_trace_names"]
+
+
+def test_session_history_identity_consumer_rejects_mismatched_metadata_trace_name():
+    """Fix 1 (behavioral): _validate_session_history_identity must FAIL when
+    the session_history record's metadata.trace_name does not match the
+    configured expected_metadata_trace_name. This test fails if the
+    session_history_identity key is ignored (dead config). It exercises the
+    extracted consumer directly with the observed alias record shape
+    (openrouter/cohere, alias metadata, metadata.trace_name == "orchestrator")."""
+    harness = _load_harness_module()
+
+    alias_record = {
+        "provider": "openrouter",
+        "model": "openrouter/cohere/north-mini-code:free",
+        "metadata": {
+            "trace_name": "orchestrator",
+            "model_alias_label": "read",
+            "requested_model_alias": "read",
+        },
+    }
+    session_history_summary = {"record": alias_record, "records": [alias_record]}
+
+    # Not configured -> skipped, no failures.
+    summary_skip, failures_skip = harness._validate_session_history_identity(
+        family="case", session_history_summary=session_history_summary, checks={},
+    )
+    assert failures_skip == []
+    assert summary_skip.get("skipped") == "not_configured"
+
+    # Matching normalized identity -> validated, no failures.
+    summary_ok, failures_ok = harness._validate_session_history_identity(
+        family="case",
+        session_history_summary=session_history_summary,
+        checks={"expected_metadata_trace_name": "orchestrator"},
+    )
+    assert failures_ok == []
+    assert summary_ok["validated"] is True
+    assert summary_ok["actual_metadata_trace_name"] == "orchestrator"
+
+    # Mismatched normalized identity -> consumer must fail. If the key were
+    # dead config, this assertion would fail (no failure produced).
+    summary_bad, failures_bad = harness._validate_session_history_identity(
+        family="case",
+        session_history_summary=session_history_summary,
+        checks={"expected_metadata_trace_name": "child-agent"},
+    )
+    assert summary_bad["validated"] is False
+    assert len(failures_bad) == 1
+    assert "session_history_identity" in failures_bad[0]
+    assert "child-agent" in failures_bad[0]
+    assert "orchestrator" in failures_bad[0]
+
+    # The normalized identity is independent from raw Langfuse trace names:
+    # a raw Langfuse name must NOT accidentally satisfy the normalized check.
+    summary_raw, failures_raw = harness._validate_session_history_identity(
+        family="case",
+        session_history_summary=session_history_summary,
+        checks={"expected_metadata_trace_name": "claude-code.orchestrator"},
+    )
+    assert failures_raw, (
+        "a raw Langfuse trace name must not match the normalized "
+        "metadata.trace_name identity"
+    )
+
+
+def test_session_history_identity_missing_metadata_trace_name_fails():
+    """Fix 1 (behavioral): a record lacking metadata.trace_name must fail a
+    configured identity check rather than silently passing."""
+    harness = _load_harness_module()
+    record = {"provider": "openrouter", "model": "m", "metadata": {"model_alias_label": "read"}}
+    summary, failures = harness._validate_session_history_identity(
+        family="case",
+        session_history_summary={"record": record, "records": [record]},
+        checks={"expected_metadata_trace_name": "orchestrator"},
+    )
+    assert summary["validated"] is False
+    assert summary["actual_metadata_trace_name"] is None
+    assert len(failures) == 1
+
+
+
+def test_generation_trace_ids_scoped_to_alias_child(monkeypatch):
+    """Fix 2: when generation_trace_names is set, generation validation
+    receives only the child trace IDs, not the parent orchestrator."""
+    harness = _load_harness_module()
+
+    captured_trace_ids = []
+
+    def fake_validate_generation_observations(**kwargs):
+        captured_trace_ids.extend(kwargs.get("trace_ids", []))
+        return [], [], []
+
+    def fake_poll_name_traces(**kwargs):
+        return [
+            {"id": "parent-trace", "name": "claude-code.orchestrator", "userId": "u1"},
+            {"id": "child-trace", "name": "claude-code.harness-read-alias-parallel-read-tools", "userId": "u1"},
+        ], None
+
+    monkeypatch.setattr(harness.RA, "_validate_generation_observations", fake_validate_generation_observations)
+    monkeypatch.setattr(harness.RA, "_poll_langfuse_required_name_traces", fake_poll_name_traces)
+    monkeypatch.setattr(harness.RA, "_validate_trace_enrichment", lambda **kw: ({}, [], []))
+    monkeypatch.setattr(harness.RA, "_validate_trace_context", lambda **kw: ({}, []))
+    monkeypatch.setattr(harness.RA, "_validate_generation_metadata", lambda **kw: ({}, []))
+    monkeypatch.setattr(harness.RA, "_validate_span_observations", lambda **kw: ({}, {}, []))
+    monkeypatch.setattr(harness.RA, "_validate_logged_request_text_checks", lambda **kw: ({}, [], []))
+
+    config = {
+        "command": ["echo", "test"],
+        "required_trace_names": [
+            "claude-code.orchestrator",
+            "claude-code.harness-read-alias-parallel-read-tools",
+        ],
+        "generation_trace_names": [
+            "claude-code.harness-read-alias-parallel-read-tools",
+        ],
+        "expected_user_ids": ["u1"],
+        "match_trace_session_id_from_stdout": True,
+        "langfuse_poll_timeout_seconds": 1,
+        "allowed_generation_routes": ["/anthropic/v1/messages"],
+    }
+
+    import datetime as dt
+
+    monkeypatch.setattr(
+        harness, "_run_command_with_retry",
+        lambda config: (
+            dt.datetime.now(dt.timezone.utc),
+            {"exit_code": 0, "stdout": '{"session_id":"sess-abc"}', "stderr": "", "attempts": []},
+            [],
+        ),
+    )
+    monkeypatch.setattr(harness, "_extract_command_session_id", lambda stdout: "sess-abc")
+    monkeypatch.setattr(harness, "_extract_command_thread_id", lambda stdout: None)
+
+    harness._validate_case(
+        "test_scoped",
+        config,
+        query_url="http://localhost:3000",
+        public_key="pk",
+        secret_key="sk",
+        litellm_base_url="http://localhost:4001",
+    )
+
+    assert captured_trace_ids == ["child-trace"], (
+        f"generation validation must receive only alias-child trace IDs, got {captured_trace_ids}"
+    )
+
+
+def test_generation_trace_ids_defaults_to_all_when_unconfigured(monkeypatch):
+    """Without generation_trace_names, all trace IDs pass through."""
+    harness = _load_harness_module()
+
+    captured_trace_ids = []
+
+    def fake_validate_generation_observations(**kwargs):
+        captured_trace_ids.extend(kwargs.get("trace_ids", []))
+        return [], [], []
+
+    def fake_poll_name_traces(**kwargs):
+        return [
+            {"id": "trace-a", "name": "name-a", "userId": "u1"},
+            {"id": "trace-b", "name": "name-b", "userId": "u1"},
+        ], None
+
+    monkeypatch.setattr(harness.RA, "_validate_generation_observations", fake_validate_generation_observations)
+    monkeypatch.setattr(harness.RA, "_poll_langfuse_required_name_traces", fake_poll_name_traces)
+    monkeypatch.setattr(harness.RA, "_validate_trace_enrichment", lambda **kw: ({}, [], []))
+    monkeypatch.setattr(harness.RA, "_validate_trace_context", lambda **kw: ({}, []))
+    monkeypatch.setattr(harness.RA, "_validate_generation_metadata", lambda **kw: ({}, []))
+    monkeypatch.setattr(harness.RA, "_validate_span_observations", lambda **kw: ({}, {}, []))
+    monkeypatch.setattr(harness.RA, "_validate_logged_request_text_checks", lambda **kw: ({}, [], []))
+
+    config = {
+        "command": ["echo", "test"],
+        "required_trace_names": ["name-a", "name-b"],
+        "expected_user_ids": ["u1"],
+        "match_trace_session_id_from_stdout": True,
+        "langfuse_poll_timeout_seconds": 1,
+    }
+
+    import datetime as dt
+
+    monkeypatch.setattr(
+        harness, "_run_command_with_retry",
+        lambda config: (
+            dt.datetime.now(dt.timezone.utc),
+            {"exit_code": 0, "stdout": '{"session_id":"s1"}', "stderr": "", "attempts": []},
+            [],
+        ),
+    )
+    monkeypatch.setattr(harness, "_extract_command_session_id", lambda stdout: "s1")
+    monkeypatch.setattr(harness, "_extract_command_thread_id", lambda stdout: None)
+
+    harness._validate_case(
+        "test_unscoped",
+        config,
+        query_url="http://localhost:3000",
+        public_key="pk",
+        secret_key="sk",
+        litellm_base_url="http://localhost:4001",
+    )
+
+    assert sorted(captured_trace_ids) == ["trace-a", "trace-b"]

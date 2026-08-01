@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lp
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (  # type: ignore[import-not-found]
     config_refresh,
     config_snapshot,
+    config_startup,
 )
 
 REFRESH_PATH = "/aawm/alias-config/refresh"
@@ -165,3 +167,161 @@ def test_response_omits_secrets() -> None:
     response = client.post(REFRESH_PATH, json={"yaml": secret_bearing_yaml})
     body_text = response.text
     assert "sk-super-secret-value-should-not-leak" not in body_text
+
+
+# ---------------------------------------------------------------------------
+# Pass 3: readiness/status reflects live active snapshot after refresh
+# ---------------------------------------------------------------------------
+
+_STARTUP_YAML = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 100
+"""
+
+_REFRESH_YAML = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: openrouter/pass3-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
+"""
+
+
+@pytest.fixture()
+def _startup_dir(tmp_path: Path) -> Iterator[Path]:
+    """Create a temp config directory with a startup YAML and activate it."""
+    config_dir = tmp_path / "alias_config"
+    config_dir.mkdir()
+    (config_dir / "read.yaml").write_text(_STARTUP_YAML, encoding="utf-8")
+    config_startup.reset_startup_state()
+    config_startup.activate_alias_config_directory(config_dir)
+    assert config_startup.is_startup_healthy()
+    yield config_dir
+    config_startup.reset_startup_state()
+
+
+def test_readiness_reflects_refreshed_identity(_startup_dir: Path) -> None:
+    """After live refresh, get_startup_status hash/version/epoch/aliases match active snapshot."""
+    original_status = config_startup.get_startup_status()
+    assert original_status["state"] == "active"
+    original_hash = original_status["config_hash"]
+
+    client = _client()
+    response = client.post(REFRESH_PATH, json={"yaml": _REFRESH_YAML})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["changed"] is True
+    refreshed_hash = payload["active_config_hash"]
+    assert refreshed_hash != original_hash
+
+    # Readiness/status must now reflect the refreshed snapshot.
+    status = config_startup.get_startup_status()
+    assert status["state"] == "active"
+    assert status["config_hash"] == refreshed_hash
+    assert status["config_version"] == payload["config_version"]
+
+    # Active snapshot holder agrees.
+    active = config_snapshot.get_active_snapshot()
+    assert active is not None
+    assert active.config_hash == status["config_hash"]
+    assert active.config_version == status["config_version"]
+    assert active.config_epoch == status["config_epoch"]
+
+    # Alias identity from status matches the active snapshot.
+    assert sorted(active.aliases.keys()) == status["aliases"]
+    assert len(active.aliases) == status["alias_count"]
+
+
+def test_readiness_restores_original_identity_after_restore(
+    _startup_dir: Path,
+) -> None:
+    """After refresh then restore, readiness returns original hash/version."""
+    original_status = config_startup.get_startup_status()
+    original_hash = original_status["config_hash"]
+    original_version = original_status["config_version"]
+
+    client = _client()
+
+    # Refresh to new config.
+    r1 = client.post(REFRESH_PATH, json={"yaml": _REFRESH_YAML})
+    assert r1.status_code == 200
+    assert r1.json()["changed"] is True
+
+    # Restore original config.
+    r2 = client.post(REFRESH_PATH, json={"yaml": _STARTUP_YAML})
+    assert r2.status_code == 200
+    assert r2.json()["changed"] is True
+
+    status = config_startup.get_startup_status()
+    assert status["state"] == "active"
+    assert status["config_hash"] == original_hash
+    assert status["config_version"] == original_version
+
+
+def test_readiness_coherent_after_unchanged_refresh(
+    _startup_dir: Path,
+) -> None:
+    """Unchanged refresh (changed=false) keeps readiness identity stable."""
+    client = _client()
+    r1 = client.post(REFRESH_PATH, json={"yaml": _REFRESH_YAML})
+    assert r1.status_code == 200
+    hash_after_first = r1.json()["active_config_hash"]
+
+    r2 = client.post(REFRESH_PATH, json={"yaml": _REFRESH_YAML})
+    assert r2.status_code == 200
+    assert r2.json()["changed"] is False
+
+    status = config_startup.get_startup_status()
+    assert status["config_hash"] == hash_after_first
+    active = config_snapshot.get_active_snapshot()
+    assert active is not None
+    assert active.config_hash == status["config_hash"]
+
+
+def test_readiness_preserves_lkg_after_invalid_refresh(
+    _startup_dir: Path,
+) -> None:
+    """Invalid refresh preserves LKG; readiness still reflects last good snapshot."""
+    client = _client()
+    good = client.post(REFRESH_PATH, json={"yaml": _REFRESH_YAML})
+    assert good.status_code == 200
+    good_hash = good.json()["active_config_hash"]
+
+    bad = client.post(REFRESH_PATH, json={"yaml": _INVALID_YAML})
+    assert bad.status_code in (400, 422)
+
+    status = config_startup.get_startup_status()
+    assert status["state"] == "active"
+    assert status["config_hash"] == good_hash
+
+
+def test_startup_failed_status_not_affected_by_refresh_holder() -> None:
+    """Failed startup state still reports failed regardless of holder contents."""
+    config_startup.reset_startup_state()
+    # Simulate a failed startup by activating a nonexistent directory.
+    config_startup.activate_alias_config_directory(Path("/nonexistent_dir_xyz"))
+    assert config_startup.is_startup_failed()
+
+    status = config_startup.get_startup_status()
+    assert status["state"] == "failed"
+    assert "error_class" in status
+
+
+def test_not_loaded_status() -> None:
+    """Not-loaded startup state reports not_loaded."""
+    config_startup.reset_startup_state()
+    status = config_startup.get_startup_status()
+    assert status["state"] == "not_loaded"

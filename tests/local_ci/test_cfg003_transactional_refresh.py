@@ -6501,3 +6501,84 @@ class TestOperatorAssertionExactPairSelection:
         # The intervening positive DB candidate is excluded from the pair.
         assert (intervening["provider"], intervening["model"]) not in (first, second)
         assert load["eligible_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Pass 3 Fix 3: _cfg003_extract_observed_selection alias-child preference
+# ---------------------------------------------------------------------------
+
+
+class TestCfg003ExtractObservedSelectionAliasChild:
+    """Fix 3: selection extraction must prefer alias-child session records."""
+
+    def test_prefers_alias_child_record_over_native_parent(self, adapter):
+        """When multiple records exist, the one with alias metadata wins."""
+        parent_record = {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "metadata": {"passthrough_route_family": "anthropic_messages"},
+        }
+        child_record = {
+            "provider": "openrouter",
+            "model": "openrouter/owl-alpha",
+            "metadata": {
+                "model_alias_label": "read",
+                "anthropic_auto_agent_alias": "read",
+                "anthropic_auto_agent_selected_route_family": "anthropic_openrouter_completion_adapter",
+            },
+        }
+        case_result = {
+            "session_history": {
+                "record": parent_record,
+                "records": [parent_record, child_record],
+            }
+        }
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection["provider"] == "openrouter"
+        assert selection["model"] == "openrouter/owl-alpha"
+        assert selection["route_family"] == "anthropic_openrouter_completion_adapter"
+
+    def test_falls_back_to_first_record_without_alias_metadata(self, adapter):
+        """Without alias metadata in any record, first record is used."""
+        rec_a = {
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "metadata": {"passthrough_route_family": "openai_responses"},
+        }
+        rec_b = {
+            "provider": "openrouter",
+            "model": "openrouter/nemotron",
+            "metadata": {},
+        }
+        case_result = {
+            "session_history": {
+                "record": rec_a,
+                "records": [rec_a, rec_b],
+            }
+        }
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection["provider"] == "openai"
+        assert selection["model"] == "gpt-5.5"
+        assert selection["route_family"] == "openai_responses"
+
+    def test_single_record_uses_default_path(self, adapter):
+        """Single-record session_history uses the standard extraction."""
+        rec = {
+            "provider": "kimi_code",
+            "model": "kimi_code/kimi-for-coding",
+            "metadata": {
+                "requested_model_alias": "read",
+                "codex_auto_agent_selected_route_family": "anthropic_kimi_chat_completions_adapter",
+            },
+        }
+        case_result = {
+            "session_history": {"record": rec, "records": [rec]}
+        }
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection["provider"] == "kimi_code"
+        assert selection["route_family"] == "anthropic_kimi_chat_completions_adapter"
+
+    def test_empty_session_history_returns_nones(self, adapter):
+        case_result = {"session_history": {}}
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection == {"provider": None, "model": None, "route_family": None}
