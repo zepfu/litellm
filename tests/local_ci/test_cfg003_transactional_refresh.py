@@ -6582,3 +6582,139 @@ class TestCfg003ExtractObservedSelectionAliasChild:
         case_result = {"session_history": {}}
         selection = adapter._cfg003_extract_observed_selection(case_result)
         assert selection == {"provider": None, "model": None, "route_family": None}
+
+    def test_skips_alias_row_with_empty_provider_for_later_usable_alias_row(
+        self, adapter
+    ):
+        """An alias-marked row with empty provider is skipped for a later usable one."""
+        broken_alias = {
+            "provider": "",
+            "model": "openrouter/owl-alpha",
+            "metadata": {
+                "model_alias_label": "read",
+                "anthropic_auto_agent_selected_route_family": "anthropic_openrouter_completion_adapter",
+            },
+        }
+        usable_alias = {
+            "provider": "openrouter",
+            "model": "openrouter/north-mini-code:free",
+            "metadata": {
+                "model_alias_label": "read",
+                "codex_auto_agent_selected_route_family": "codex_openrouter_completion_adapter",
+            },
+        }
+        case_result = {
+            "session_history": {
+                "record": broken_alias,
+                "records": [broken_alias, usable_alias],
+            }
+        }
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection["provider"] == "openrouter"
+        assert selection["model"] == "openrouter/north-mini-code:free"
+        assert selection["route_family"] == "codex_openrouter_completion_adapter"
+
+    def test_skips_alias_row_with_whitespace_model_for_later_usable_alias_row(
+        self, adapter
+    ):
+        """An alias-marked row with whitespace-only model is skipped."""
+        broken_alias = {
+            "provider": "alibaba_token_plan",
+            "model": "   ",
+            "metadata": {
+                "requested_model_alias": "read",
+                "codex_auto_agent_selected_route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+            },
+        }
+        usable_alias = {
+            "provider": "alibaba_token_plan",
+            "model": "alibaba_token_plan/qwen3.6-flash",
+            "metadata": {
+                "requested_model_alias": "read",
+                "codex_auto_agent_selected_route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+            },
+        }
+        case_result = {
+            "session_history": {
+                "record": broken_alias,
+                "records": [broken_alias, usable_alias],
+            }
+        }
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection["provider"] == "alibaba_token_plan"
+        assert selection["model"] == "alibaba_token_plan/qwen3.6-flash"
+        assert (
+            selection["route_family"]
+            == "codex_alibaba_token_plan_chat_completions_adapter"
+        )
+
+    def test_skips_alias_row_lacking_route_family_for_later_usable_alias_row(
+        self, adapter
+    ):
+        """An alias-marked row missing a route-family field is skipped (full triple required)."""
+        no_route = {
+            "provider": "openrouter",
+            "model": "openrouter/owl-alpha",
+            "metadata": {"model_alias_label": "read"},
+        }
+        usable_alias = {
+            "provider": "openrouter",
+            "model": "openrouter/north-mini-code:free",
+            "metadata": {
+                "model_alias_label": "read",
+                "passthrough_route_family": "codex_openrouter_completion_adapter",
+            },
+        }
+        case_result = {
+            "session_history": {
+                "record": no_route,
+                "records": [no_route, usable_alias],
+            }
+        }
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection["provider"] == "openrouter"
+        assert selection["model"] == "openrouter/north-mini-code:free"
+        assert selection["route_family"] == "codex_openrouter_completion_adapter"
+
+    def test_fallback_prefers_usable_record_over_unusable_canonical_record(
+        self, adapter
+    ):
+        """When no alias row qualifies, fallback searches for a full-identity record
+        rather than blindly returning the unusable canonical record."""
+        unusable_canonical = {
+            "provider": None,
+            "model": None,
+            "metadata": {},
+        }
+        usable_plain = {
+            "provider": "openrouter",
+            "model": "openrouter/north-mini-code:free",
+            "metadata": {"passthrough_route_family": "codex_openrouter_completion_adapter"},
+        }
+        case_result = {
+            "session_history": {
+                "record": unusable_canonical,
+                "records": [unusable_canonical, usable_plain],
+            }
+        }
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection["provider"] == "openrouter"
+        assert selection["model"] == "openrouter/north-mini-code:free"
+        assert selection["route_family"] == "codex_openrouter_completion_adapter"
+
+    def test_fallback_returns_empty_when_no_usable_record_exists(self, adapter):
+        """When no record carries a full identity, selection is all None."""
+        unusable_a = {"provider": None, "model": None, "metadata": {}}
+        unusable_b = {
+            "provider": "openrouter",
+            "model": "openrouter/owl-alpha",
+            "metadata": {},  # missing route-family
+        }
+        case_result = {
+            "session_history": {
+                "record": unusable_a,
+                "records": [unusable_a, unusable_b],
+            }
+        }
+        selection = adapter._cfg003_extract_observed_selection(case_result)
+        assert selection == {"provider": None, "model": None, "route_family": None}

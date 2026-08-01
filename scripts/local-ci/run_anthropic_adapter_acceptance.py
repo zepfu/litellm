@@ -7522,8 +7522,10 @@ def _cfg003_prefer_alias_child_session_record(
 
     Prefers records whose metadata contains alias-child markers
     (model_alias_label, anthropic_auto_agent_alias, or
-    requested_model_alias).  Falls back to the default first-record
-    behavior when no alias-child record is found.
+    requested_model_alias) AND carry a usable full identity (non-empty
+    provider, model, and an accepted route-family metadata field).
+    Falls back to searching all records for any with full identity.
+    Returns ``{}`` only when no usable record exists.
     """
     _ALIAS_METADATA_KEYS = (
         "model_alias_label",
@@ -7545,8 +7547,51 @@ def _cfg003_prefer_alias_child_session_record(
                 isinstance(metadata.get(k), str) and metadata[k].strip()
                 for k in _ALIAS_METADATA_KEYS
             ):
+                if _cfg003_record_has_full_identity(candidate):
+                    return candidate
+    # Fallback: search all records for any with full identity rather than
+    # blindly returning session_history.record / first record.
+    return _cfg003_fallback_usable_record(session_history)
+
+
+_CFG003_ROUTE_FAMILY_KEYS = (
+    "codex_auto_agent_selected_route_family",
+    "anthropic_auto_agent_selected_route_family",
+    "passthrough_route_family",
+)
+
+
+def _cfg003_record_has_full_identity(record: dict[str, Any]) -> bool:
+    """True when *record* carries provider, model, AND a route-family field."""
+    prov = record.get("provider")
+    mod = record.get("model")
+    if not (isinstance(prov, str) and prov.strip()):
+        return False
+    if not (isinstance(mod, str) and mod.strip()):
+        return False
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return any(
+        isinstance(metadata.get(k), str) and metadata[k].strip()
+        for k in _CFG003_ROUTE_FAMILY_KEYS
+    )
+
+
+def _cfg003_fallback_usable_record(
+    session_history: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the first record with full identity, or ``{}``."""
+    # Prefer the canonical single-record slot when it is usable.
+    record = session_history.get("record")
+    if isinstance(record, dict) and _cfg003_record_has_full_identity(record):
+        return record
+    records = session_history.get("records")
+    if isinstance(records, list):
+        for candidate in records:
+            if isinstance(candidate, dict) and _cfg003_record_has_full_identity(candidate):
                 return candidate
-    return _case_result_session_history_record(case_result)
+    return {}
 
 
 def _cfg003_run_proof_case(
